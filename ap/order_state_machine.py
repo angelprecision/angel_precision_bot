@@ -1773,6 +1773,71 @@ class APOrderStateMachine:
             )
             return False
 
+    def persist_materialized_submit_intent(
+        self,
+        local_order_id: str,
+        *,
+        generation: int,
+        payload_hash: str,
+        broker_submit_key: str,
+    ) -> bool:
+        """Atomically claim broker submit intent for a watcher-owned BROKER_READY row.
+
+        This closes the watcher-vs-recovery race on materialized deferred rows.
+        A normal live watcher may proceed only while no recovery worker has
+        fenced submit ownership and no prior submit intent has landed.
+        """
+        import json as _json_local
+        payload_hash = str(payload_hash or "").strip()
+        submit_key = str(broker_submit_key or "").strip()[:32]
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if generation < 1 or not payload_hash or not submit_key:
+            return False
+        now = now_utc_iso()
+        patch = _json_local.dumps({
+            "lifecycle_state": "SUBMITTING",
+            "submit_started_at": now,
+            "submit_intent_at": now,
+            "broker_submit_key": submit_key,
+            "broker_submit_payload_hash": payload_hash,
+            "current_owner": f"broker_submit:{submit_key}",
+        })
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                      AND COALESCE((meta->>'broker_ready')::boolean, false) = true
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND COALESCE(meta->>'recovery_submit_owner','') = ''
+                    """,
+                    (patch, local_order_id, self.client_id, generation),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_materialized_submit_intent failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def terminalize_recovered_entry(
         self,
         local_order_id: str,
@@ -2995,6 +3060,10 @@ class APOrderStateMachine:
         _recovery_owner = str(_plan_meta.get("recovery_submit_owner") or "").strip()
         _recovery_generation = _plan_meta.get("recovery_submit_generation")
         _is_recovery_submit = bool(_plan_meta.get("recovery_submit_fenced") or _recovery_owner)
+        try:
+            _materialization_generation = int(_raw_meta.get("materialization_generation") or 0)
+        except (TypeError, ValueError):
+            _materialization_generation = 0
         if _is_recovery_submit:
             _intent_ok = self.persist_deferred_submit_intent(
                 local_order_id,
@@ -3005,6 +3074,45 @@ class APOrderStateMachine:
                 broker_submit_key=str(local_order_id)[:32],
             )
             _intent_error = "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
+        elif _is_materialized_deferred:
+            _intent_ok = (
+                _materialization_generation > 0
+                and self.persist_materialized_submit_intent(
+                    local_order_id,
+                    generation=_materialization_generation,
+                    payload_hash=_payload_hash,
+                    broker_submit_key=str(local_order_id)[:32],
+                )
+            )
+            if not _intent_ok:
+                _latest_after_claim = self._get_order(local_order_id) or {}
+                _latest_meta_after_claim = _latest_after_claim.get("meta") or {}
+                if isinstance(_latest_meta_after_claim, str):
+                    try:
+                        _latest_meta_after_claim = json.loads(_latest_meta_after_claim)
+                    except Exception:
+                        _latest_meta_after_claim = {}
+                if not isinstance(_latest_meta_after_claim, dict):
+                    _latest_meta_after_claim = {}
+                _latest_status_after_claim = str(_latest_after_claim.get("status") or "").upper()
+                if (
+                    str(_latest_meta_after_claim.get("submit_intent_at") or "").strip()
+                    or str(_latest_meta_after_claim.get("recovery_submit_owner") or "").strip()
+                    or str(_latest_meta_after_claim.get("lifecycle_state") or "").upper() == "SUBMITTING"
+                    or str(_latest_after_claim.get("broker_order_id") or "").strip()
+                    or _latest_after_claim.get("submitted_ts")
+                    or _latest_status_after_claim in (
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.ACKNOWLEDGED,
+                        OrderStatus.PARTIAL_FILL,
+                        OrderStatus.FILLED,
+                    )
+                ):
+                    _intent_error = "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+                else:
+                    _intent_error = "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent"
+            else:
+                _intent_error = "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent"
         else:
             # Preserve the established non-recovery submission path.
             _intent_ok = self.update_order_meta(local_order_id, {

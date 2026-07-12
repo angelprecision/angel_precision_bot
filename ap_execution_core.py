@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -1922,6 +1923,9 @@ class APExecutionCore:
             "owner": _owner_label,
             "attempt": None,
             "max_attempts": None,
+            "configured_max_attempts": None,
+            "effective_max_attempts": None,
+            "remaining_recovery_window_seconds": None,
             "generation": None,
             "next_retry_at": None,
         }
@@ -2001,11 +2005,11 @@ class APExecutionCore:
         except (TypeError, ValueError):
             _max_trigger_age = 300
         try:
-            _max_attempts = int(os.getenv(
+            _configured_max_attempts = int(os.getenv(
                 "DEFERRED_RECOVERY_MAX_ATTEMPTS", "20"
             ))
         except (TypeError, ValueError):
-            _max_attempts = 20
+            _configured_max_attempts = 20
         try:
             _retry_delay_seconds = int(os.getenv(
                 "DEFERRED_RECOVERY_RETRY_DELAY_SECONDS", "30"
@@ -2028,6 +2032,12 @@ class APExecutionCore:
             return _term("RECOVERY_INVALID_TRIGGER_TIMESTAMP", status="EXPIRED")
         if _trigger_age > _max_trigger_age:
             return _term("RECOVERY_TRIGGER_TOO_OLD", status="EXPIRED")
+        _remaining_recovery_window = max(0.0, float(_max_trigger_age) - max(0.0, _trigger_age))
+        _effective_max_attempts = max(
+            1,
+            int(math.ceil(_remaining_recovery_window / max(1, _retry_delay_seconds))),
+        )
+        _max_attempts = max(1, min(_configured_max_attempts, _effective_max_attempts))
 
         # ── Retry exhaustion ────────────────────────────────────────
         try:
@@ -2045,7 +2055,14 @@ class APExecutionCore:
             _generation = int(meta.get("materialization_generation") or 1)
         except (TypeError, ValueError):
             _generation = 1
-        _base.update(attempt=_attempt, max_attempts=_max_attempts, generation=_generation)
+        _base.update(
+            attempt=_attempt,
+            max_attempts=_max_attempts,
+            configured_max_attempts=_configured_max_attempts,
+            effective_max_attempts=_effective_max_attempts,
+            remaining_recovery_window_seconds=int(_remaining_recovery_window),
+            generation=_generation,
+        )
 
         mode = str(row.get("execution_mode") or meta.get("execution_mode") or "").lower()
         if mode not in {"live", "paper"} or mode != str(self.execution_mode or "").lower():
@@ -6265,17 +6282,22 @@ class APExecutionCore:
             )
             return
 
-        if submit_res.get("error") == "RECOVERY_SUBMIT_INTENT_FENCE_LOST":
+        if (
+            submit_res.get("error") == "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
+            or submit_res.get("error") == "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+        ):
             # Ownership loss is not an order failure.  A winner may already own
             # the row or have durable submit intent; never cancel/expire it.
             disposition = self._classify_recovered_ownership_loss(queue_local_order_id)
             log.warning(
-                "[%s] RECOVERY_SUBMIT_FENCE_LOST order=%s disposition=%s",
-                ticker, queue_local_order_id, disposition,
+                "[%s] SUBMIT_OWNERSHIP_TRANSFERRED order=%s disposition=%s error=%s",
+                ticker, queue_local_order_id, disposition, submit_res.get("error"),
             )
             return {
                 "disposition": disposition,
-                "reason_code": "RECOVERY_SUBMIT_INTENT_FENCE_LOST",
+                "reason_code": str(
+                    submit_res.get("error") or "SUBMIT_OWNERSHIP_TRANSFERRED"
+                ),
             }
 
         log.error(

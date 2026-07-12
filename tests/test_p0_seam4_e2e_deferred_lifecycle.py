@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import sys
+import threading
 import types
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -13,6 +14,8 @@ import pytest
 os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@127.0.0.1:1/dummy")
 
 import ap_execution_core as core_mod
+import ap.db as db_mod
+import ap.order_state_machine as osm_mod
 from ap.order_state_machine import APOrderStateMachine
 from ap_entry_watcher import APEntryWatcher
 from ap_recovery import APStartupRecovery
@@ -414,6 +417,358 @@ class _NoopConn:
         return False
 
 
+def _broker_ready_row() -> dict:
+    row = _row()
+    row["contract"] = REAL_OCC
+    row["qty"] = 1
+    row["limit_price"] = 2.10
+    row["reserved_cost"] = 210.0
+    row["meta"] = {
+        "contract_deferred": False,
+        "materialization_status": "SELECTED",
+        "materialization_generation": 1,
+        "broker_ready": True,
+        "execution_mode": "live",
+        "lifecycle_state": "BROKER_READY",
+        "selected_contract": REAL_OCC,
+        "selected_limit": 2.10,
+        "selected_qty": 1,
+        "selected_reserved_cost": 210.0,
+        "trigger_crossed_at": _iso(_now() - timedelta(seconds=10)),
+        "trigger_price": 600.0,
+        "observed_underlying_price": 600.20,
+        "entry_cutoff_et": "1530",
+    }
+    return row
+
+
+def _live_broker_ready_plan() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        contract_symbol=REAL_OCC,
+        limit_price=2.10,
+        contracts=1,
+        max_position_usd=210.0,
+        side="CALL",
+        direction="CALL",
+        execution_mode="live",
+        client_id=CLIENT_ID,
+        signal_id=SIGNAL_ID,
+        trigger_price=600.0,
+        underlying_price=600.20,
+        stop_underlying=595.0,
+        target_underlying=605.0,
+        metadata={
+            "contract_deferred": False,
+            "materialization_generation": 1,
+            "broker_ready": True,
+            "lifecycle_state": "BROKER_READY",
+            "selected_contract": REAL_OCC,
+            "selected_limit": 2.10,
+            "selected_qty": 1,
+            "trigger_crossed_at": _iso(_now() - timedelta(seconds=10)),
+            "trigger_price": 600.0,
+        },
+        ticker="SPY",
+        plan_id="plan-pr323-concurrency",
+        score=92.0,
+        tier="A",
+        timeframe="1d",
+        pattern="breakout",
+    )
+
+
+def _live_broker_ready_watched(plan) -> types.SimpleNamespace:
+    crossed = datetime.fromisoformat(str(plan.metadata["trigger_crossed_at"]))
+    if crossed.tzinfo is None:
+        crossed = crossed.replace(tzinfo=timezone.utc)
+    signal = {
+        "signal_id": SIGNAL_ID,
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "live",
+        "ticker": "SPY",
+        "side": "CALL",
+        "entry_price": 600.0,
+        "stop_price": 595.0,
+        "target_price": 605.0,
+        "contract_symbol": REAL_OCC,
+        "contracts": 1,
+        "limit_price": 2.10,
+        "reserved_cost": 210.0,
+        "contract_deferred": False,
+        "_approved_plan": plan,
+    }
+    return types.SimpleNamespace(
+        signal=signal,
+        ticker="SPY",
+        side="CALL",
+        trigger_price=600.0,
+        entry_trigger=600.0,
+        stop_level=595.0,
+        target_price=605.0,
+        trigger_crossed_at=crossed,
+        triggered_at=crossed,
+        breach_price=600.20,
+    )
+
+
+class _ConcurrentTxnStore:
+    def __init__(self, row: dict) -> None:
+        self.row = copy.deepcopy(row)
+        self.lock = threading.Lock()
+        self.intent_barrier = threading.Barrier(2)
+        self.watcher_intent_ready = threading.Event()
+        self.recovery_intent_ready = threading.Event()
+        self.recovery_persist_finished = threading.Event()
+        self.recovery_claim_successes = 0
+        self.recovery_claim_attempts = 0
+        self.recovery_intent_successes = 0
+        self.recovery_intent_attempts = 0
+        self.watcher_intent_successes = 0
+        self.watcher_intent_attempts = 0
+        self.watcher_intent_errors: list[str] = []
+
+    @staticmethod
+    def _merge_meta(target: dict, patch: dict) -> None:
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                target[key].update(value)
+            else:
+                target[key] = copy.deepcopy(value)
+
+    def get_row_copy(self) -> dict:
+        with self.lock:
+            return copy.deepcopy(self.row)
+
+    def update_order_meta(self, patch: dict) -> None:
+        with self.lock:
+            self._merge_meta(self.row.setdefault("meta", {}), patch)
+
+    def transition(self, to_status: str, **kwargs) -> None:
+        with self.lock:
+            self.row["status"] = str(to_status)
+            if "broker_order_id" in kwargs:
+                self.row["broker_order_id"] = kwargs["broker_order_id"]
+            if "submitted_ts" in kwargs:
+                self.row["submitted_ts"] = kwargs["submitted_ts"]
+            if "last_error" in kwargs:
+                self.row["last_error"] = kwargs["last_error"]
+
+    def execute(self, sql: str, params: tuple) -> int:
+        if (
+            "recovery_submit_lease_until" in sql
+            and len(params) == 5
+        ):
+            return self._execute_recovery_claim(params)
+        if "LOWER(COALESCE(execution_mode,'')) = %s" in sql and len(params) == 6:
+            return self._execute_recovery_submit_intent(params)
+        if "COALESCE(meta->>'recovery_submit_owner','') = ''" in sql and len(params) == 4:
+            return self._execute_watcher_submit_intent(params)
+        raise AssertionError(sql)
+
+    def _execute_recovery_claim(self, params: tuple) -> int:
+        patch_json, local_order_id, client_id, generation, now_iso = params
+        patch = json.loads(patch_json)
+        self.recovery_claim_attempts += 1
+        with self.lock:
+            meta = self.row["meta"]
+            ok = (
+                self.row["local_order_id"] == local_order_id
+                and self.row["client_id"] == client_id
+                and str(self.row["status"] or "").upper() == "PENDING_TRIGGER"
+                and not self.row.get("broker_order_id")
+                and self.row.get("submitted_ts") is None
+                and meta.get("broker_ready") is True
+                and str(meta.get("lifecycle_state") or "") == "BROKER_READY"
+                and int(meta.get("materialization_generation") or 0) == int(generation)
+                and str(meta.get("submit_intent_at") or "") == ""
+                and (
+                    str(meta.get("recovery_submit_owner") or "") == ""
+                    or str(meta.get("recovery_submit_lease_until") or "") < str(now_iso)
+                )
+            )
+            if ok:
+                self._merge_meta(meta, patch)
+                self.recovery_claim_successes += 1
+                return 1
+        return 0
+
+    def _execute_recovery_submit_intent(self, params: tuple) -> int:
+        patch_json, local_order_id, client_id, mode, generation, owner = params
+        patch = json.loads(patch_json)
+        self.recovery_intent_attempts += 1
+        self.recovery_intent_ready.set()
+        self.intent_barrier.wait(timeout=5)
+        with self.lock:
+            meta = self.row["meta"]
+            ok = (
+                self.row["local_order_id"] == local_order_id
+                and self.row["client_id"] == client_id
+                and str(self.row["execution_mode"] or "").lower() == str(mode)
+                and str(self.row["status"] or "").upper() == "PENDING_TRIGGER"
+                and not self.row.get("broker_order_id")
+                and self.row.get("submitted_ts") is None
+                and str(meta.get("lifecycle_state") or "") == "BROKER_READY"
+                and meta.get("broker_ready") is True
+                and int(meta.get("materialization_generation") or 0) == int(generation)
+                and str(meta.get("recovery_submit_owner") or "") == str(owner)
+                and str(meta.get("submit_intent_at") or "") == ""
+            )
+            if ok:
+                self._merge_meta(meta, patch)
+                self.recovery_intent_successes += 1
+                rc = 1
+            else:
+                rc = 0
+        self.recovery_persist_finished.set()
+        return rc
+
+    def _execute_watcher_submit_intent(self, params: tuple) -> int:
+        patch_json, local_order_id, client_id, generation = params
+        patch = json.loads(patch_json)
+        self.watcher_intent_attempts += 1
+        self.watcher_intent_ready.set()
+        self.intent_barrier.wait(timeout=5)
+        self.recovery_persist_finished.wait(timeout=5)
+        with self.lock:
+            meta = self.row["meta"]
+            ok = (
+                self.row["local_order_id"] == local_order_id
+                and self.row["client_id"] == client_id
+                and str(self.row["status"] or "").upper() == "PENDING_TRIGGER"
+                and not self.row.get("broker_order_id")
+                and self.row.get("submitted_ts") is None
+                and str(meta.get("lifecycle_state") or "") == "BROKER_READY"
+                and meta.get("broker_ready") is True
+                and int(meta.get("materialization_generation") or 0) == int(generation)
+                and str(meta.get("submit_intent_at") or "") == ""
+                and str(meta.get("recovery_submit_owner") or "") == ""
+            )
+            if ok:
+                self._merge_meta(meta, patch)
+                self.watcher_intent_successes += 1
+                return 1
+        return 0
+
+
+class _ConcurrentCursor:
+    def __init__(self, store: _ConcurrentTxnStore) -> None:
+        self.store = store
+        self.rowcount = 0
+
+    def execute(self, sql, params):
+        self.rowcount = self.store.execute(sql, params)
+        return self
+
+
+class _ConcurrentConn:
+    def __init__(self, store: _ConcurrentTxnStore) -> None:
+        self.store = store
+
+    def __enter__(self):
+        return _ConcurrentCursor(self.store)
+
+    def __exit__(self, *_args):
+        return False
+
+
+class _ConcurrentOSM:
+    def __init__(self, store: _ConcurrentTxnStore) -> None:
+        self.client_id = CLIENT_ID
+        self.execution_mode = "live"
+        self.store = store
+        self.post_payloads: list[dict] = []
+        self.post_submit_intents: list[str] = []
+        self.cancel_calls = 0
+        self.expire_calls = 0
+        self.terminalizations: list[tuple[str, str]] = []
+        self.submit_existing_entry = APOrderStateMachine.submit_existing_entry.__get__(self, type(self))
+        self.claim_deferred_broker_ready_submit = APOrderStateMachine.claim_deferred_broker_ready_submit.__get__(self, type(self))
+        self.persist_deferred_submit_intent = APOrderStateMachine.persist_deferred_submit_intent.__get__(self, type(self))
+        self.persist_materialized_submit_intent = APOrderStateMachine.persist_materialized_submit_intent.__get__(self, type(self))
+        self._is_broker_accept_status = APOrderStateMachine._is_broker_accept_status
+
+    def has_order(self, local_order_id):
+        return local_order_id == LOCAL_ORDER_ID
+
+    def get_order_by_signal(self, signal_id):
+        return self.get_order(LOCAL_ORDER_ID) if signal_id == SIGNAL_ID else None
+
+    def _get_order(self, local_order_id):
+        return self.get_order(local_order_id)
+
+    def get_order(self, local_order_id):
+        if local_order_id != LOCAL_ORDER_ID:
+            return None
+        return self.store.get_row_copy()
+
+    def update_order_meta(self, local_order_id, patch):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.store.update_order_meta(patch)
+        return True
+
+    def transition(self, local_order_id, to_status, **kwargs):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.store.transition(to_status, **kwargs)
+        return True
+
+    def terminalize_deferred_breach(
+        self,
+        local_order_id,
+        *,
+        reason_code,
+        terminal_status,
+        diagnostics=None,
+        **_kwargs,
+    ):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.terminalizations.append((reason_code, terminal_status))
+        self.store.transition(terminal_status, last_error=reason_code)
+        self.store.update_order_meta({
+            "lifecycle_state": terminal_status,
+            "reason_code": reason_code,
+            "final_reason": reason_code,
+            "terminal_diagnostics": diagnostics or {},
+            "current_owner": "",
+            "broker_ready": False,
+        })
+        return True
+
+    def expire_pending_entry(self, local_order_id, reason):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.expire_calls += 1
+        return False
+
+    def cancel_pending_entry(self, local_order_id, reason):
+        assert local_order_id == LOCAL_ORDER_ID
+        self.cancel_calls += 1
+        return False
+
+    def _lookup_order_by_tag(self, *_args, **_kwargs):
+        current = self.store.get_row_copy()
+        return current.get("broker_order_id")
+
+    def _flag_split_brain_order(self, *_args, **_kwargs):
+        return None
+
+    def _emit_transition_event(self, **_kwargs):
+        return None
+
+    def _submit_order_with_retry(self, **kwargs):
+        current = self.store.get_row_copy()
+        current_meta = current.get("meta") or {}
+        submit_intent_at = str(current_meta.get("submit_intent_at") or "").strip()
+        assert submit_intent_at, "broker POST attempted before durable submit intent"
+        self.post_submit_intents.append(submit_intent_at)
+        self.post_payloads.append(copy.deepcopy(kwargs["order_data"]))
+        return (
+            {"id": "TR-323", "status": "open"},
+            None,
+            "TR-323",
+            "ACK",
+        )
+
+
 def _approved_plan() -> types.SimpleNamespace:
     return types.SimpleNamespace(
         contract_symbol="DEFERRED:SPY",
@@ -470,6 +825,7 @@ def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
     core._current_pending_entry_count = lambda: 0
     core._refresh_hydrated_prebreach_plan = lambda *a, **k: False
     core._cleanup_pending_entry_order = core_mod.APExecutionCore._cleanup_pending_entry_order.__get__(core, type(core))
+    core._classify_recovered_ownership_loss = core_mod.APExecutionCore._classify_recovered_ownership_loss.__get__(core, type(core))
     core._is_real_occ_contract = core_mod.APExecutionCore._is_real_occ_contract
     core.resume_deferred_broker_ready_order = core_mod.APExecutionCore.resume_deferred_broker_ready_order.__get__(core, type(core))
     core._on_entry_trigger = core_mod.APExecutionCore._on_entry_trigger.__get__(core, type(core))
@@ -479,6 +835,8 @@ def _build_core(osm: _StatefulOSM, broker: _Broker, selector: _Selector):
 def _build_watcher(osm: _StatefulOSM, core):
     watcher = APEntryWatcher(None, order_state_machine=osm, mode="LIVE")
     _orig_watch = watcher.watch
+    _quote_calls = {"count": 0}
+    _single_quote_calls = {"count": 0}
     watcher.watch = lambda plan, local_order_id, **kwargs: _orig_watch(
         plan,
         local_order_id,
@@ -488,13 +846,42 @@ def _build_watcher(osm: _StatefulOSM, core):
     watcher.on_trigger = core._on_entry_trigger
     watcher._insert_watcher_audit_row = lambda *a, **k: None
     watcher._persist_watcher_audit = lambda *a, **k: None
-    watcher._fetch_quotes = lambda _tickers: {
-        "SPY": {
+
+    def _get_quote(_ticker):
+        _single_quote_calls["count"] += 1
+        if _single_quote_calls["count"] <= 2:
+            return {
+                "bid": 599.80,
+                "ask": 599.82,
+                "quote_age_ms": 10,
+            }
+        return {
             "bid": 600.20,
             "ask": 600.22,
             "quote_age_ms": 10,
         }
-    }
+
+    watcher._get_quote = _get_quote
+
+    def _fetch_quotes(_tickers):
+        _quote_calls["count"] += 1
+        if _quote_calls["count"] == 1:
+            return {
+                "SPY": {
+                    "bid": 599.80,
+                    "ask": 599.82,
+                    "quote_age_ms": 10,
+                }
+            }
+        return {
+            "SPY": {
+                "bid": 600.20,
+                "ask": 600.22,
+                "quote_age_ms": 10,
+            }
+        }
+
+    watcher._fetch_quotes = _fetch_quotes
     return watcher
 
 
@@ -532,16 +919,16 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
 
     def _refresh_ask_at_submit(_broker, _contract):
         return (
-            2.10,
+            2.09,
             15,
             True,
             "ok",
             {
                 "spread_pct": 0.02,
-                "submit_bid": 2.09,
-                "submit_ask": 2.10,
-                "submit_mid": 2.095,
-                "submit_last": 2.10,
+                "submit_bid": 2.08,
+                "submit_ask": 2.09,
+                "submit_mid": 2.085,
+                "submit_last": 2.09,
             },
         )
 
@@ -563,6 +950,7 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
 
         watcher1._poll_active_signals(open_protect_active=False)
         watcher1._poll_active_signals(open_protect_active=False)
+        watcher1._poll_active_signals(open_protect_active=False)
 
         row_after_first_trigger = osm.get_order(LOCAL_ORDER_ID)
         meta_after_first_trigger = row_after_first_trigger["meta"]
@@ -578,6 +966,7 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
         for watched in watcher2._pending:
             watched.overnight = False
 
+        watcher2._poll_active_signals(open_protect_active=False)
         watcher2._poll_active_signals(open_protect_active=False)
         watcher2._poll_active_signals(open_protect_active=False)
 
@@ -617,3 +1006,183 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
         assert final_meta["proof_retry_deadline"] == final_meta["absolute_entry_deadline"]
         assert str(final_meta.get("selector_failure", {}).get("reason_code") or "") == "CHAIN_ROW_ZERO_BID_ASK"
         assert selector.calls == 2
+
+
+@pytest.mark.parametrize(
+    "interleaving",
+    [
+        "watcher_reaches_pre_submit_first",
+        "recovery_reaches_pre_submit_first",
+    ],
+)
+def test_live_watcher_and_recovery_worker_race_to_single_broker_post(monkeypatch, interleaving):
+    broker = _Broker()
+    store = _ConcurrentTxnStore(_broker_ready_row())
+    osm = _ConcurrentOSM(store)
+    watcher_plan = _live_broker_ready_plan()
+    recovery_plan = copy.deepcopy(watcher_plan)
+    watched = _live_broker_ready_watched(watcher_plan)
+
+    watcher_core = _build_core(osm, broker, _Selector())
+    recovery_core = _build_core(osm, broker, _Selector())
+    watcher = _build_watcher(osm, watcher_core)
+
+    monkeypatch.setenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "0")
+    monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "1")
+    monkeypatch.setenv("DEFERRED_RECOVERY_MAX_TRIGGER_AGE_SECONDS", "300")
+    monkeypatch.setenv("DEFERRED_RECOVERY_MAX_ATTEMPTS", "20")
+    monkeypatch.setenv("DEFERRED_RECOVERY_RETRY_DELAY_SECONDS", "30")
+
+    def _refresh_ask_at_submit(_broker, _contract):
+        return (
+            2.09,
+            15,
+            True,
+            "ok",
+            {
+                "spread_pct": 0.02,
+                "submit_bid": 2.08,
+                "submit_ask": 2.09,
+                "submit_mid": 2.085,
+                "submit_last": 2.09,
+            },
+        )
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = _refresh_ask_at_submit
+
+    watcher_result = {}
+    recovery_result = {}
+    thread_errors = {}
+
+    monkeypatch.setattr(osm_mod, "conn", lambda: _ConcurrentConn(store))
+    monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(db_mod, "conn", lambda: _ConcurrentConn(store))
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setitem(
+        APOrderStateMachine.claim_deferred_broker_ready_submit.__globals__,
+        "conn",
+        lambda: _ConcurrentConn(store),
+    )
+    monkeypatch.setitem(
+        APOrderStateMachine.persist_deferred_submit_intent.__globals__,
+        "conn",
+        lambda: _ConcurrentConn(store),
+    )
+    monkeypatch.setitem(
+        APOrderStateMachine.persist_materialized_submit_intent.__globals__,
+        "conn",
+        lambda: _ConcurrentConn(store),
+    )
+    monkeypatch.setitem(
+        APOrderStateMachine.claim_deferred_broker_ready_submit.__globals__,
+        "run_with_retry",
+        lambda fn, *a, **k: fn(),
+    )
+    monkeypatch.setitem(
+        APOrderStateMachine.persist_deferred_submit_intent.__globals__,
+        "run_with_retry",
+        lambda fn, *a, **k: fn(),
+    )
+    monkeypatch.setitem(
+        APOrderStateMachine.persist_materialized_submit_intent.__globals__,
+        "run_with_retry",
+        lambda fn, *a, **k: fn(),
+    )
+
+    def _run_watcher():
+        try:
+            watcher_result["value"] = watcher.on_trigger(watched)
+        except Exception as exc:
+            thread_errors["watcher"] = exc
+
+    def _run_recovery():
+        try:
+            recovery_result["value"] = recovery_core.resume_deferred_broker_ready_order(
+                local_order_id=LOCAL_ORDER_ID,
+                plan=recovery_plan,
+            )
+        except Exception as exc:
+            thread_errors["recovery"] = exc
+
+    with patch.dict(sys.modules, {"ap.execution": fake_execution}), patch(
+        "ap_entry_confirmation.check_entry_confirmation",
+        return_value=_FakeConfirmResult(),
+    ):
+        watcher_thread = threading.Thread(target=_run_watcher, name="watcher-race")
+        recovery_thread = threading.Thread(target=_run_recovery, name="recovery-race")
+
+        if interleaving == "watcher_reaches_pre_submit_first":
+            watcher_thread.start()
+            assert store.watcher_intent_ready.wait(timeout=5)
+            recovery_thread.start()
+        else:
+            recovery_thread.start()
+            assert store.recovery_intent_ready.wait(timeout=5)
+            watcher_thread.start()
+
+        watcher_thread.join(timeout=10)
+        recovery_thread.join(timeout=10)
+
+    assert not watcher_thread.is_alive()
+    assert not recovery_thread.is_alive()
+    assert thread_errors == {}
+
+    final_row = osm.get_order(LOCAL_ORDER_ID)
+    final_meta = final_row["meta"]
+    watcher_outcome = watcher_result.get("value") or {}
+    recovery_outcome = recovery_result.get("value") or {}
+
+    assert store.recovery_claim_attempts == 1
+    assert store.recovery_claim_successes == 1
+    assert store.recovery_intent_attempts == 1
+    assert store.recovery_intent_successes == 1
+    assert store.watcher_intent_attempts == 1
+    assert store.watcher_intent_successes == 0
+
+    assert len(osm.post_payloads) == 1
+    assert len(osm.post_submit_intents) == 1
+    assert osm.post_payloads[0]["tag"] == LOCAL_ORDER_ID[:32]
+    assert osm.post_payloads[0]["option_symbol"] == REAL_OCC
+    assert osm.post_payloads[0]["price"] > 0.01
+    assert not osm.post_payloads[0]["option_symbol"].startswith("DEFERRED:")
+
+    assert recovery_outcome["configured_max_attempts"] == 20
+    assert recovery_outcome["effective_max_attempts"] == 10
+    assert recovery_outcome["max_attempts"] == 10
+    assert recovery_outcome["remaining_recovery_window_seconds"] >= 289
+    assert recovery_outcome["disposition"] == "SUBMITTED"
+    assert recovery_outcome["reason_code"] == "RECOVERY_CANONICAL_SUBMIT_ACCEPTED"
+
+    assert watcher_outcome["disposition"] in {"RECONCILE_PENDING", "OWNERSHIP_TRANSFERRED", "SUBMITTED"}
+    assert watcher_outcome["reason_code"] == "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+
+    assert osm.cancel_calls == 0
+    assert osm.expire_calls == 0
+    assert osm.terminalizations == []
+    assert final_row["status"] == "SUBMITTED"
+    assert final_row["broker_order_id"] == "TR-323"
+    assert final_row["submitted_ts"] is not None
+    assert final_row["client_id"] == CLIENT_ID
+    assert final_row["execution_mode"] == "live"
+    assert final_row["local_order_id"] == LOCAL_ORDER_ID
+    assert final_row["contract"] == REAL_OCC
+    assert final_meta["selected_contract"] == REAL_OCC
+    assert final_meta["broker_ready"] is True
+    assert str(final_meta.get("lifecycle_state") or "") in {"SUBMITTING", "SUBMITTED", "ACKNOWLEDGED"}
+    assert str(final_meta.get("recovery_submit_owner") or "").startswith("recovery_submit:")
+    assert str(final_meta.get("submit_intent_at") or "").strip()
+
+    watcher_again = watcher.on_trigger(watched)
+    recovery_again = recovery_core.resume_deferred_broker_ready_order(
+        local_order_id=LOCAL_ORDER_ID,
+        plan=recovery_plan,
+    )
+
+    assert len(osm.post_payloads) == 1
+    assert watcher_again is None
+    assert recovery_again["disposition"] == "KEEP_WATCHER"
+    assert recovery_again["reason_code"] in {
+        "RECOVERY_ALREADY_SUBMITTED",
+        "RECOVERY_STATUS_NOT_ELIGIBLE:SUBMITTED",
+    }
