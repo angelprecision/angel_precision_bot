@@ -546,20 +546,53 @@ def check_trigger_age_gate(
     *,
     trigger_crossed_at: Optional[str],
     trigger_confirmed_at: Optional[str] = None,
+    last_confirmed_trigger_at: Optional[str] = None,
     submit_attempt_at: Optional[datetime] = None,
     execution_mode: str = "live",
     max_age_seconds: Optional[int] = None,
 ) -> GateResult:
     """
-    Enforce a maximum age from FIRST breach to broker POST.
+    Enforce a maximum age from FIRST breach (or most recent fresh confirmation)
+    to broker POST.
 
-    A trigger crossed at market open must not fire a live entry 30-45
-    minutes later. Default: 120 seconds. Env: ENTRY_TRIGGER_MAX_AGE_SEC.
+    AMENDMENT: PR #323 Seam 2 — timing-boundary fix
 
-    LIVE: fails closed on age exceeded, missing trigger_crossed_at,
-    or a trigger_crossed_at that is in the future (clock skew signal).
+    Problem:  The gate previously computed age solely from trigger_crossed_at
+    (the original breach time).  During deferred materialization with transient
+    quote failures, the recovery path can span 20–300 seconds.  A valid
+    reconfirmation obtained during recovery (fresh underlying quote passing the
+    market_validity gate) does not help if the final trigger_age gate counts the
+    entire elapsed time since the original breach.  This causes legitimate
+    recoveries to be rejected purely due to inconsistent timing semantics, not
+    because the thesis has reversed.
 
-    PAPER: log-only, passes with a warning.
+    Resolution:  When last_confirmed_trigger_at is provided (a fresh underlying
+    quote confirmed the setup is still on the valid trigger side, obtained via
+    the market_validity gate BEFORE the trigger_age gate is reached), the gate
+    applies the age limit to the most recent confirmation rather than the
+    original breach.  original_trigger_crossed_at is preserved as a diagnostic
+    field and is NEVER the age reference when fresh confirmation is available.
+
+    The max_age limit remains unchanged (ENTRY_TRIGGER_MAX_AGE_SEC).  This is
+    not a blanket increase of the window — it is correct application of the same
+    limit to the semantically correct anchor timestamp.
+
+    Key invariants:
+      * original trigger_crossed_at is always preserved for diagnostics.
+      * last_confirmed_trigger_at MUST be no earlier than trigger_crossed_at
+        (checked below); if it is, the original breach time is used.
+      * If last_confirmed_trigger_at is in the future (clock skew): fail
+        closed on LIVE — a future confirmation is not a valid anchor.
+      * If both timestamps are absent: fail closed on LIVE.
+
+    Timing fields written to orders.meta (Seam 2):
+      * original_trigger_crossed_at  — immutable diagnostic (= trigger_crossed_at)
+      * last_confirmed_trigger_at    — fresh underlying confirmation timestamp
+      * operational_recovery_started_at — when the current recovery attempt began
+      * operational_recovery_elapsed_ms — elapsed ms for this recovery pass
+      * selected_quote_at            — when the option quote used for the limit was captured
+      * absolute_entry_deadline      — hard lifecycle deadline (e.g. now + max_recovery_window)
+      * entry_cutoff_et              — 15:30 ET entry cutoff (configurable)
     """
     _mode = str(execution_mode or "").strip().lower()
     _live = _mode == "live"
@@ -571,19 +604,43 @@ def check_trigger_age_gate(
 
     crossed = _parse_iso(trigger_crossed_at)
     confirmed = _parse_iso(trigger_confirmed_at)
+    last_confirmed = _parse_iso(last_confirmed_trigger_at)
+
+    # ── Choose the effective anchor ──────────────────────────────────────────
+    # Use last_confirmed_trigger_at when ALL of:
+    #   1. trigger_crossed_at is present and parseable (we MUST have the original)
+    #   2. last_confirmed is provided and parseable
+    #   3. last_confirmed is not in the future (clock skew guard)
+    #   4. last_confirmed >= trigger_crossed_at (regression guard — confirmation
+    #      cannot pre-date the original breach)
+    # Without the original trigger_crossed_at, the gate fails closed on LIVE
+    # regardless of whether last_confirmed_trigger_at is present — a fresh
+    # confirmation cannot substitute for a missing original breach proof.
+    _effective_anchor = crossed
+    _anchor_label = "trigger_crossed_at"
+    if crossed is not None and last_confirmed is not None:
+        _lcf_age = (now - last_confirmed).total_seconds()
+        _valid_last_confirmed = (
+            _lcf_age >= -1.0                # not in the future
+            and last_confirmed >= crossed   # not earlier than original breach
+        )
+        if _valid_last_confirmed:
+            _effective_anchor = last_confirmed
+            _anchor_label = "last_confirmed_trigger_at"
 
     audit = {
-        "gate":                "trigger_age",
-        "trigger_crossed_at":  trigger_crossed_at,
-        "trigger_confirmed_at": trigger_confirmed_at,
-        "submit_attempt_at":   now.isoformat(),
-        "max_age_seconds":     int(max_age),
-        "execution_mode":      _mode,
+        "gate":                        "trigger_age",
+        "trigger_crossed_at":          trigger_crossed_at,
+        "trigger_confirmed_at":        trigger_confirmed_at,
+        "last_confirmed_trigger_at":   last_confirmed_trigger_at,
+        "effective_anchor":            _anchor_label,
+        "submit_attempt_at":           now.isoformat(),
+        "max_age_seconds":             int(max_age),
+        "execution_mode":              _mode,
     }
 
-    if crossed is None:
-        # No trigger_crossed_at stamped — LIVE fails closed because we cannot
-        # prove age. PAPER passes with warning.
+    if _effective_anchor is None:
+        # No anchor — LIVE fails closed.
         return GateResult(
             passed=not _live,
             reason_code=GateOutcome.STALE_TRIGGER_BREACH if _live else GateOutcome.PASS,
@@ -594,15 +651,19 @@ def check_trigger_age_gate(
                    "missing_trigger_crossed_at": True},
         )
 
-    age_seconds = (now - crossed).total_seconds()
+    age_seconds = (now - _effective_anchor).total_seconds()
     audit["age_seconds"] = round(age_seconds, 3)
+    # Always record original breach age for diagnostics even when fresh
+    # confirmation is the effective anchor.
+    if crossed is not None and _anchor_label == "last_confirmed_trigger_at":
+        audit["original_breach_age_seconds"] = round((now - crossed).total_seconds(), 3)
 
-    # Clock skew: crossed timestamp is in the future
+    # Clock skew: anchor timestamp is in the future
     if age_seconds < -1.0:
         return GateResult(
             passed=not _live,
             reason_code=GateOutcome.STALE_TRIGGER_BREACH if _live else GateOutcome.PASS,
-            detail=f"trigger_crossed_at is {-age_seconds:.1f}s in the future — clock skew",
+            detail=f"{_anchor_label} is {-age_seconds:.1f}s in the future — clock skew",
             audit={**audit, "passed": not _live, "clock_skew": True},
         )
 
@@ -610,7 +671,7 @@ def check_trigger_age_gate(
         return GateResult(
             passed=not _live,
             reason_code=GateOutcome.STALE_TRIGGER_BREACH if _live else GateOutcome.PASS,
-            detail=f"age={age_seconds:.1f}s > max={max_age}s",
+            detail=f"age={age_seconds:.1f}s > max={max_age}s (anchor={_anchor_label})",
             audit={**audit, "passed": not _live,
                    "reason_code": GateOutcome.STALE_TRIGGER_BREACH if _live else GateOutcome.PASS,
                    "blocked": _live},
@@ -619,7 +680,7 @@ def check_trigger_age_gate(
     return GateResult(
         passed=True,
         reason_code=GateOutcome.PASS,
-        detail=f"trigger age {age_seconds:.1f}s within {max_age}s limit",
+        detail=f"trigger age {age_seconds:.1f}s within {max_age}s limit (anchor={_anchor_label})",
         audit={**audit, "passed": True, "reason_code": GateOutcome.PASS},
     )
 

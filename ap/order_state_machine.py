@@ -2161,6 +2161,116 @@ class APOrderStateMachine:
             )
             return False
 
+    def persist_pre_submit_proof_retry(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        retry_attempt: int,
+        max_attempts: int,
+        next_retry_at: str,
+        retry_deadline: str,
+        read_error: str,
+        selected_at: str,
+        selected_quote_at: str,
+    ) -> bool:
+        """Durably transition a BROKER_READY row to PRE_SUBMIT_PROOF_RETRY state.
+
+        AMENDMENT: PR #323 Seam 1
+
+        When the pre-submit order-row read fails transiently (BLOCK_RETRY verdict),
+        the selected OCC contract, limit, qty, and all selector diagnostics are
+        already persisted in the row (via persist_deferred_broker_ready).  This
+        method writes ONLY the retry-tracking state to meta using the non-destructive
+        JSONB merge — none of the trade-policy fields (contract, qty, limit_price,
+        reserved_cost, direction, broker_ready) are touched.
+
+        The CAS predicate requires:
+          * exact owner + generation match (prevents stale workers from hijacking)
+          * lifecycle_state = 'BROKER_READY' (transition FROM broker-ready state)
+          * broker_ready = true (selector succeeded)
+          * status = 'PENDING_TRIGGER', no broker order yet
+
+        Returns True only on Postgres rowcount > 0.  Returns False on CAS miss,
+        validation failure, or write error — caller must treat False as the row
+        not transitioning (still BROKER_READY) and either retry or terminalize.
+        """
+        import json as _json_local
+
+        _owner = str(owner or "").strip()
+        try:
+            _generation = int(generation or 1)
+            _attempt = max(1, int(retry_attempt or 1))
+            _max = max(_attempt, int(max_attempts or _attempt))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _owner
+            or not str(next_retry_at or "").strip()
+            or not str(retry_deadline or "").strip()
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            # Lifecycle transition — still in the PENDING_TRIGGER/BROKER_READY
+            # family so watcher and recovery loops handle it correctly.
+            "lifecycle_state":              "PRE_SUBMIT_PROOF_RETRY",
+            "materialization_status":       "SELECTED",     # contract is still selected
+            "broker_ready":                 True,           # contract IS selected; proof retry is the blocker
+            # Ownership preserved for CAS on downstream writes.
+            "materialization_owner":        _owner,
+            "current_owner":                _owner,
+            "materialization_generation":   _generation,
+            # Retry tracking.
+            "proof_retry_attempt":          _attempt,
+            "proof_retry_max_attempts":     _max,
+            "proof_retry_next_at":          str(next_retry_at),
+            "proof_retry_deadline":         str(retry_deadline),
+            "proof_retry_last_read_error":  str(read_error or ""),
+            "proof_retry_owner":            _owner,
+            "proof_retry_scheduled_at":     _now,
+            # Temporal diagnostics for Seam 2 timing audit.
+            "selected_at":                  str(selected_at or _now),
+            "selected_quote_at":            str(selected_quote_at or _now),
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE((meta->>'broker_ready')::boolean, false) = true
+                      AND COALESCE(meta->>'lifecycle_state','') = 'BROKER_READY'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                    """,
+                    (_patch_json, local_order_id, self.client_id, _owner, _generation),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_pre_submit_proof_retry failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def terminalize_deferred_breach(
         self,
         local_order_id: str,

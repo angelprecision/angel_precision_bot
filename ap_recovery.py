@@ -1369,6 +1369,50 @@ class APStartupRecovery:
                 # error, already-submitted) → row untouched.
                 continue
 
+            # ── AMENDMENT: PR #323 Seam 1 — PRE_SUBMIT_PROOF_RETRY recovery ──
+            # A row in PRE_SUBMIT_PROOF_RETRY has a real OCC contract already
+            # persisted in the row columns; only the order-row read proof failed
+            # transiently.  On recovery startup, if the deadline has not passed
+            # we retain durable ownership (the watcher will re-attempt the proof
+            # on the next materialization pass).  If the deadline has expired we
+            # terminalize with exact reason.  We do NOT rearm the watcher here —
+            # the watcher's normal materialization path already handles the proof
+            # read.  Retaining ownership is sufficient for the next watcher pass.
+            if lifecycle == "PRE_SUBMIT_PROOF_RETRY":
+                _proof_deadline_raw = meta.get("proof_retry_deadline")
+                _deadline_expired = False
+                if _proof_deadline_raw:
+                    try:
+                        _proof_deadline_ts = datetime.fromisoformat(str(_proof_deadline_raw))
+                        if _proof_deadline_ts.tzinfo is None:
+                            _proof_deadline_ts = _proof_deadline_ts.replace(tzinfo=timezone.utc)
+                        _deadline_expired = now >= _proof_deadline_ts
+                    except Exception:
+                        _deadline_expired = True  # unparseable deadline → fail closed
+                else:
+                    _deadline_expired = True  # no deadline recorded → fail closed
+
+                if _deadline_expired:
+                    _terminalize_verified(
+                        local_order_id,
+                        reason_code=str(
+                            meta.get("proof_retry_last_read_error")
+                            or "MATERIALIZATION_ORDER_ROW_UNREADABLE_DEADLINE_EXPIRED"
+                        ),
+                        terminal_status="EXPIRED",
+                        diagnostics={
+                            "recovery_classification": "pre_submit_proof_retry_deadline_expired",
+                            "proof_retry_deadline":    _proof_deadline_raw,
+                            "selected_contract":       str(order.get("contract") or ""),
+                        },
+                    )
+                else:
+                    # Deadline still valid — retain ownership, watcher will resume
+                    _retain_recovery_ownership(
+                        local_order_id, reason="pre_submit_proof_retry_pending",
+                    )
+                continue
+
             should_resume = False
             materialization_resume = False
             if lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING":

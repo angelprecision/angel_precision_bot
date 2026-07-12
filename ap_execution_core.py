@@ -135,30 +135,21 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 #   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
 #   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 1530 (= 3:30 PM ET; last-entry
 #                                        boundary — see _breach_retry_cutoff_hhmm)
-RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
-    "NO_CHAIN_DATA",                    # legacy compat — broad code kept until all paths emit exact codes
-    "CHAIN_PROVIDER_ERROR",             # Tradier HTTP/network transient failure
-    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", # expirations endpoint returned nothing (can be transient at 9:30–9:36)
-    "CHAIN_PROVIDER_EMPTY_OPTIONS",     # chain endpoint returned zero rows for this expiration
-    "CHAIN_PARSE_EMPTY",                # chain parsed to zero rows after direction filter
-    "NO_EXPIRATION_IN_DTE_WINDOW",      # no eligible expiration in the current DTE probe window
-    "DIRECT_QUOTE_UNAVAILABLE",         # direct-quote revalidation fetch failed
-    # ── PR #219 amendment: Jason LIVE 2026-07-01 recovery additions ──
-    "CHAIN_ROW_ZERO_BID_ASK",           # per-chain-row zero bid or ask — top failure on Jason LIVE today
-    "DIRECT_QUOTE_ZERO_BID_ASK",        # direct OCC quote came back zero — 2nd top failure on Jason LIVE
-    "QUOTE_FETCH_FAILED",               # quote endpoint returned an error/timeout
-    "CHAIN_EMPTY",                      # historical variant emitted when chain returns no rows
-    "SELECTOR_REQUEST_BUDGET_EXHAUSTED",# bounded request budget consumed by transient provider failures
-    "MARKET_DATA_THROTTLE_UNAVAILABLE", # provider throttle unavailable/429 path
-    "PROVIDER_RATE_LIMITED",             # normalized provider 429 taxonomy
-    "PROVIDER_TIMEOUT",                  # normalized transient timeout taxonomy
-    # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is intentionally excluded here.
-    # It is the DTE-ladder aggregation reason and may reflect structural quality
-    # rejects (OI_TOO_LOW, SPREAD_TOO_WIDE) as well as transient data-miss reasons.
-    # When the ladder emits it, execution_core inspects the dte_ladder_audit to
-    # determine whether the exhaustion came from data-miss (retryable) or quality
-    # rejects (terminal). See _is_ladder_exhaustion_retryable() below.
-})
+# ── Seam 3 (PR #323): canonical retry taxonomy now lives in one place ──────────
+# ap/selector_retry_policy.py is the single source of truth for which selector
+# reason codes are retryable.  Import the frozenset for back-compat; the module
+# also exports is_retryable_selector_reason() and classify_selector_reason()
+# for callers that want richer metadata.
+from ap.selector_retry_policy import (
+    RETRYABLE_BREACH_SELECTOR_REASONS,
+    is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
+)
+# NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
+# It is the DTE-ladder aggregation reason and may reflect structural quality
+# rejects (OI_TOO_LOW, SPREAD_TOO_WIDE) as well as transient data-miss reasons.
+# When the ladder emits it, execution_core inspects the dte_ladder_audit to
+# determine whether the exhaustion came from data-miss (retryable) or quality
+# rejects (terminal). See _is_ladder_exhaustion_retryable() below.
 
 
 # ── P0 (monday-trade-flow-readiness, amended): acceptance ask-cap resolver ───
@@ -5010,39 +5001,128 @@ class APExecutionCore:
                 # re-running the full breach/selector cycle. Expiring the order and
                 # stamping a clear terminal detail is better than claiming
                 # RETRY_LATER while immediately expiring the row.
-                _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
-                log.critical(
-                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
-                    "reason=%s local_order_id=%s | "
-                    "selector proved real OCC contract but persisted "
-                    "order row is unreadable before broker POST — "
-                    "broker_order_id=null; terminalizing (Option B: terminal)",
-                    ticker, _inv_err, _row_read_reason, queue_local_order_id,
-                )
-                _emit_deferred_outcome(
-                    "DEFERRED_ORDER_ROW_UNREADABLE",
-                    reason=f"order_row_unreadable:{_row_read_reason}",
-                    contract=str(_pre_contract or ""),
-                    extra={
-                        "failure_stage":                   "handoff_order_row_read",
-                        "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
-                        "order_row_read_error":            _row_read_reason,
-                        "order_row_read_attempts":         _order_row_read_attempts,
-                        "selector_contract":               _handoff_snapshot.get("selector_contract"),
-                        "selector_bid":                    _handoff_snapshot.get("selector_bid"),
-                        "selector_ask":                    _handoff_snapshot.get("selector_ask"),
-                        "selector_mid":                    _handoff_snapshot.get("selector_mid"),
-                        "copied_plan_contract":            _handoff_snapshot.get("copied_plan_contract"),
-                        "pre_submit_contract":             _pre_contract,
-                        "pre_submit_limit":                _pre_limit,
-                        "pre_submit_qty":                  _pre_qty,
-                        "local_order_id":                  str(queue_local_order_id or ""),
-                        "client_id":                       _proof_client_id,
-                        "execution_mode":                  _proof_execution_mode,
-                    },
-                )
-                _terminalize_breach_failure(_inv_err)
-                return
+                # ── AMENDMENT: PR #323 Seam 1 — PRE_SUBMIT_PROOF_RETRY ──────
+                # Previously this path terminalized immediately on a transient
+                # DB read failure. That destroyed a valid selected contract.
+                #
+                # Required behaviour: durably transition to PRE_SUBMIT_PROOF_RETRY,
+                # preserving the real OCC contract (already in the row columns from
+                # persist_deferred_broker_ready), and schedule a bounded proof retry
+                # that only re-reads the row — it does NOT rerun selector unless
+                # the quote becomes stale (Seam 2).  On exhaustion the row is
+                # terminalized with the exact read failure reason.
+                #
+                # Two recovery workers cannot double-submit: the OSM CAS on the
+                # proof-retry transition requires exact owner+generation, and the
+                # downstream submit-intent CAS from the original BROKER_READY path
+                # is still required before any broker POST.
+
+                _proof_retry_fn = getattr(
+                    self.order_state_machine, "persist_pre_submit_proof_retry", None
+                ) if self.order_state_machine is not None else None
+
+                _proof_retry_max = int(os.getenv("PRE_SUBMIT_PROOF_RETRY_MAX", "3"))
+                _proof_retry_delay = int(os.getenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "5"))
+                _proof_retry_deadline_s = int(os.getenv("PRE_SUBMIT_PROOF_RETRY_DEADLINE_SECONDS", "60"))
+                _now_proof = datetime.now(timezone.utc)
+                _proof_next_retry_at = (
+                    _now_proof + timedelta(seconds=_proof_retry_delay)
+                ).isoformat()
+                _proof_deadline = (
+                    _now_proof + timedelta(seconds=_proof_retry_deadline_s)
+                ).isoformat()
+
+                _proof_persist_ok = False
+                if callable(_proof_retry_fn):
+                    try:
+                        _proof_persist_ok = bool(_proof_retry_fn(
+                            queue_local_order_id,
+                            owner=str(_deferred_claim_context.get("owner") or ""),
+                            generation=int(_deferred_claim_context.get("generation") or 1),
+                            retry_attempt=1,
+                            max_attempts=_proof_retry_max,
+                            next_retry_at=_proof_next_retry_at,
+                            retry_deadline=_proof_deadline,
+                            read_error=str(_row_read_reason or ""),
+                            selected_at=str(_handoff_snapshot.get("selected_at") or _now_proof.isoformat()),
+                            selected_quote_at=str(_handoff_snapshot.get("selected_quote_at") or _now_proof.isoformat()),
+                        ))
+                    except Exception as _pfr_exc:
+                        log.critical(
+                            "[%s] PRE_SUBMIT_PROOF_RETRY persist raised local_order_id=%s exc=%s",
+                            ticker, queue_local_order_id, _pfr_exc,
+                        )
+
+                if _proof_persist_ok:
+                    # Row is now in PRE_SUBMIT_PROOF_RETRY.  Selected contract,
+                    # qty, limit are preserved in the row.  Recovery will retry
+                    # the order-row proof via the recovery loop on next startup.
+                    # Emit a diagnostic outcome (not a terminal outcome).
+                    log.warning(
+                        "[%s] PRE_SUBMIT_PROOF_RETRY scheduled local_order_id=%s "
+                        "read_error=%s contract=%s owner=%s generation=%s "
+                        "next_retry_at=%s deadline=%s",
+                        ticker, queue_local_order_id, _row_read_reason,
+                        _pre_contract,
+                        _deferred_claim_context.get("owner"),
+                        _deferred_claim_context.get("generation"),
+                        _proof_next_retry_at, _proof_deadline,
+                    )
+                    _emit_deferred_outcome(
+                        "DEFERRED_PRE_SUBMIT_PROOF_RETRY",
+                        reason=f"order_row_unreadable_proof_retry_scheduled:{_row_read_reason}",
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            "failure_stage":         "handoff_order_row_read",
+                            "proof_retry_scheduled": True,
+                            "proof_retry_deadline":  _proof_deadline,
+                            "order_row_read_error":  _row_read_reason,
+                            "pre_submit_contract":   _pre_contract,
+                            "pre_submit_limit":      _pre_limit,
+                            "pre_submit_qty":        _pre_qty,
+                            "local_order_id":        str(queue_local_order_id or ""),
+                            "client_id":             _proof_client_id,
+                            "execution_mode":        _proof_execution_mode,
+                        },
+                    )
+                    return
+                else:
+                    # Proof-retry persistence failed (CAS miss, OSM unavailable, etc.).
+                    # Fall back to the previous terminal behaviour — better to
+                    # terminalize with a clear reason than leave an orphan row.
+                    _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
+                        "reason=%s local_order_id=%s | "
+                        "selector proved real OCC contract but persisted "
+                        "order row is unreadable and proof_retry persistence failed — "
+                        "broker_order_id=null; terminalizing",
+                        ticker, _inv_err, _row_read_reason, queue_local_order_id,
+                    )
+                    _emit_deferred_outcome(
+                        "DEFERRED_ORDER_ROW_UNREADABLE",
+                        reason=f"order_row_unreadable:{_row_read_reason}",
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            "failure_stage":                   "handoff_order_row_read",
+                            "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
+                            "order_row_read_error":            _row_read_reason,
+                            "order_row_read_attempts":         _order_row_read_attempts,
+                            "proof_retry_persist_failed":      True,
+                            "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                            "selector_bid":                    _handoff_snapshot.get("selector_bid"),
+                            "selector_ask":                    _handoff_snapshot.get("selector_ask"),
+                            "selector_mid":                    _handoff_snapshot.get("selector_mid"),
+                            "pre_submit_contract":             _pre_contract,
+                            "pre_submit_limit":                _pre_limit,
+                            "pre_submit_qty":                  _pre_qty,
+                            "local_order_id":                  str(queue_local_order_id or ""),
+                            "client_id":                       _proof_client_id,
+                            "execution_mode":                  _proof_execution_mode,
+                        },
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
 
             # Stage C: row is readable (PASS or proof not applicable). Extract
             # order_row_contract into the snapshot for the handoff classifier
