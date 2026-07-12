@@ -666,6 +666,35 @@ def _make_eval_key(
     return hashlib.sha1(raw.encode()).hexdigest()[:20]
 
 
+def make_phase_intelligence_key(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str = "",
+    phase: str,
+    context_revision: int = 1,
+    profile_version: str = INTELLIGENCE_EVAL_VERSION,
+) -> str:
+    """
+    Stable phase-aware key for durable intelligence context snapshots.
+    Preserves the legacy intelligence_evaluation metadata key while giving
+    PRETRIGGER/PREOPEN/BREACH/CONTRACT_SELECTED independent identities.
+    """
+    raw = "|".join(
+        (
+            str(client_id or ""),
+            str(execution_mode or "").upper(),
+            str(canonical_signal_id or ""),
+            str(local_order_id or "").strip() or "__none__",
+            str(phase or "").upper(),
+            str(int(context_revision or 1)),
+            str(profile_version or ""),
+        )
+    )
+    return hashlib.sha1(raw.encode()).hexdigest()[:24]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Req 2: Safe plan accessor — handles both object and dict approved plans
 # ─────────────────────────────────────────────────────────────────────────────

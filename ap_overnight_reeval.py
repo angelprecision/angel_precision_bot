@@ -1409,6 +1409,32 @@ def run_overnight_reeval(
             _contract_sym = str(getattr(decision.plan, "contract_symbol", "") or "")
             _arm_label    = _contract_sym if _contract_sym else "DEFERRED_AT_BREACH"
             try:
+                try:
+                    from ap.intelligence_context_materializer import enqueue_preopen_context
+
+                    _preopen_intel = enqueue_preopen_context(
+                        signal,
+                        client_id=client_id,
+                        execution_mode=_execution_mode,
+                        canonical_signal_id=_resolve_canonical_signal_id(signal_id, signal),
+                        local_order_id=str(local_order_id),
+                    )
+                    if not _preopen_intel.get("ok"):
+                        log.warning(
+                            "[%s] PREOPEN intelligence enqueue failed signal_id=%s local_order_id=%s reason=%s",
+                            ticker,
+                            signal_id,
+                            local_order_id,
+                            _preopen_intel.get("error"),
+                        )
+                except Exception as _preopen_intel_exc:
+                    log.warning(
+                        "[%s] PREOPEN intelligence enqueue error signal_id=%s local_order_id=%s: %s",
+                        ticker,
+                        signal_id,
+                        local_order_id,
+                        _preopen_intel_exc,
+                    )
                 armed = entry_watcher.watch(decision.plan, local_order_id)
                 if armed:
                     # Overnight reeval creates a LOCAL entry order before broker

@@ -649,6 +649,7 @@ class ClientRunner(threading.Thread):
         self.databroker = None
         self.fill_monitor_thread = None
         self.worker_thread = None
+        self.intelligence_context_thread = None
         self.equity_thread = None
         self.health_thread = None
         self.failure_reason: str = ""
@@ -3430,6 +3431,20 @@ class ClientRunner(threading.Thread):
             raise RuntimeError(f"[{self.email}] ENTRY WATCHER MISSING — worker startup aborted")
 
         is_live = self.mode == "LIVE"
+
+        try:
+            from ap.intelligence_context_worker import start_intelligence_context_worker
+
+            self.intelligence_context_thread = start_intelligence_context_worker(
+                client_id=self.email,
+                stop_event=self.stopped,
+            )
+        except Exception as _intel_worker_exc:
+            logger.warning(
+                "[%s] intelligence context worker startup skipped: %s",
+                self.email,
+                _intel_worker_exc,
+            )
 
         # WIRE-3: capture the callback reference once here so the closure is
         # stable across worker restarts. worker_loop must call this with
