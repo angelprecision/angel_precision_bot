@@ -161,6 +161,9 @@ class SelectorRequestContext:
     playbook_ordered_expirations: list[str] = field(default_factory=list)
     playbook_candidate_context: dict | None = None
     playbook_audit: dict | None = None
+    playbook_enabled: bool | None = None
+    playbook_now_et: datetime | None = None
+    playbook_today_et: date | None = None
 
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
     "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
@@ -596,6 +599,15 @@ def _bind_selector_request_diagnostics(plan, ctx: SelectorRequestContext | None)
         pass
 
 
+def _request_playbook_enabled(ctx: SelectorRequestContext | None) -> bool:
+    if ctx is None:
+        return playbook_contract_selection_enabled()
+    if getattr(ctx, "playbook_enabled", None) is None:
+        ctx.playbook_enabled = playbook_contract_selection_enabled()
+        _ctx_refresh_diagnostics(ctx)
+    return bool(ctx.playbook_enabled)
+
+
 def _ctx_assert_budget(
     ctx: SelectorRequestContext | None,
     *,
@@ -698,6 +710,8 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "execution_mode": str(ctx.execution_mode or "unknown"),
         "playbook_ordered_expirations": list(ctx.playbook_ordered_expirations or []),
         "playbook_audit": dict(ctx.playbook_audit or {}) if isinstance(ctx.playbook_audit, dict) else None,
+        "playbook_enabled": ctx.playbook_enabled,
+        "playbook_today_et": ctx.playbook_today_et.isoformat() if isinstance(ctx.playbook_today_et, date) else None,
     }
 
 
@@ -901,6 +915,9 @@ def _build_candidate_row(
         "volume": int(_safe_float(opt.get("volume"))),
         "premium": _round_or_none(premium, 2),
         "rank_score": _round_or_none(rank_score),
+        "playbook_strike_match": bool(opt.get("_playbook_strike_match")) if "_playbook_strike_match" in opt else None,
+        "playbook_distance_to_preferred": _round_or_none(opt.get("_playbook_distance_to_preferred")),
+        "playbook_original_rank_score": _round_or_none(opt.get("_playbook_original_rank_score")),
         "rejected_at_step": rejected_at_step,
         "rejection_reason": rejection_reason,
         "selected": bool(selected),
@@ -1645,6 +1662,7 @@ class APContractSelectionEngine:
                 self.mode,
             )
         _bind_selector_request_diagnostics(plan, request_context)
+        _request_playbook_enabled(request_context)
 
         _selector_mode = _normalized_selector_mode(self.mode)
         _plan_mode = _normalized_selector_mode(
@@ -2214,7 +2232,7 @@ class APContractSelectionEngine:
         # No self-mutation: effective thresholds passed directly to _quality_filter.
         # This is thread-safe when worker_loop and entry_watcher breach both call
         # select() on the same instance simultaneously.
-        today      = date.today()
+        today = getattr(request_context, "playbook_today_et", None) or date.today()
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
@@ -2632,7 +2650,7 @@ class APContractSelectionEngine:
         _playbook_candidate_ctx = None
         if (
             request_context is not None
-            and self.playbook_contract_selection_enabled
+            and bool(getattr(request_context, "playbook_enabled", False))
             and request_context.playbook_spec is not None
             and expiration_override is not None
         ):
@@ -2660,13 +2678,24 @@ class APContractSelectionEngine:
             if _playbook_candidate_ctx is not None:
                 _symbol = str(opt.get("symbol") or "")
                 _playbook_fit = ((_playbook_candidate_ctx.get("per_symbol") or {}).get(_symbol) or {})
-                s += float(_playbook_fit.get("bounded_bonus") or 0.0)
-                opt["_playbook_strike_match"] = bool(_playbook_fit.get("strike_match"))
-                opt["_playbook_bonus"] = float(_playbook_fit.get("bounded_bonus") or 0.0)
+                opt["_playbook_strike_match"] = bool(_playbook_fit.get("strike_policy_match"))
                 opt["_playbook_distance_to_preferred"] = _playbook_fit.get("distance_to_preferred")
+                opt["_playbook_original_rank_score"] = s
             scored.append((s, opt))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        if _playbook_candidate_ctx is not None:
+            def _playbook_sort_key(item):
+                _score, _opt = item
+                _distance = _opt.get("_playbook_distance_to_preferred")
+                return (
+                    not bool(_opt.get("_playbook_strike_match")),
+                    float(_distance) if _distance is not None else float("inf"),
+                    -float(_score),
+                )
+
+            scored.sort(key=_playbook_sort_key)
+        else:
+            scored.sort(key=lambda x: x[0], reverse=True)
 
         # ── CANDIDATE AUDIT — log why every contract won or lost ──────────────
         # This is how you answer "why did we pick $0.11 instead of $0.50?"
@@ -3773,6 +3802,17 @@ class APContractSelectionEngine:
         except Exception:
             pass
 
+    def _plan_expiration_override(self, plan) -> str | None:
+        override = _safe_plan_attr(plan, "expiration_override", None)
+        if override:
+            return str(override)
+        metadata = _safe_plan_attr(plan, "metadata", None) or {}
+        if isinstance(metadata, dict):
+            meta_override = metadata.get("expiration_override")
+            if meta_override:
+                return str(meta_override)
+        return None
+
     def _resolve_playbook_probe_order(
         self,
         plan,
@@ -3807,6 +3847,12 @@ class APContractSelectionEngine:
             request_context=request_context,
         )
         now_et = self._playbook_now_et()
+        today_et = now_et.date()
+        expiration_override = self._plan_expiration_override(plan)
+        if request_context is not None:
+            request_context.playbook_now_et = now_et
+            request_context.playbook_today_et = today_et
+            _ctx_refresh_diagnostics(request_context)
         spec = resolve_contract_playbook(
             ticker=ticker,
             side=_safe_plan_attr(plan, "side", ""),
@@ -3817,16 +3863,17 @@ class APContractSelectionEngine:
             target_underlying=_safe_plan_attr(plan, "target_underlying", None),
             wick_targets=_safe_plan_attr(plan, "wick_targets", None) or [],
             available_expirations=dates,
-            today=date.today(),
+            today=today_et,
             min_dte=int(self.min_dte),
             max_dte=int(self.max_dte),
             metadata=_safe_plan_attr(plan, "metadata", None) or {},
             now_et=now_et,
+            expiration_override=expiration_override,
         )
         ordered = resolve_playbook_expiration_order(
             spec,
             dates,
-            today=date.today(),
+            today=today_et,
             min_dte=int(self.min_dte),
             max_dte=int(self.max_dte),
         )
@@ -3861,6 +3908,7 @@ class APContractSelectionEngine:
         }
         audit.update(evidence)
         audit["resolved_now_et"] = now_et.isoformat()
+        audit["resolved_today_et"] = today_et.isoformat()
         return ordered, audit
 
     def _playbook_now_et(self) -> datetime:
@@ -3907,6 +3955,14 @@ class APContractSelectionEngine:
         Returns the selected contract, or None (records NO_VALID_PLAYBOOK_DTE_CONTRACT).
         """
         ticker = _safe_plan_attr(plan, "ticker")
+        if request_context is None and playbook_contract_selection_enabled():
+            request_context = _new_selector_request_context(
+                ticker,
+                getattr(self, "mode", "unknown"),
+            )
+            _bind_selector_request_diagnostics(plan, request_context)
+        if request_context is not None:
+            _request_playbook_enabled(request_context)
         audit: dict = {
             "ladder": True,
             "ticker": ticker,
@@ -4012,7 +4068,7 @@ class APContractSelectionEngine:
         try:
             playbook_audit: dict | None = None
             try:
-                if getattr(self, "playbook_contract_selection_enabled", False):
+                if bool(getattr(request_context, "playbook_enabled", False)):
                     dates, playbook_audit = self._resolve_playbook_probe_order(
                         plan,
                         ticker,
@@ -4050,7 +4106,7 @@ class APContractSelectionEngine:
             except ChainProviderError as exc:
                 return _expiration_failure("CHAIN_PROVIDER_ERROR", exc, allow_fallback=True)
 
-            today = date.today()
+            today = getattr(request_context, "playbook_today_et", None) or date.today()
 
             # Terminal non-DTE reason codes: a verdict that cannot improve by
             # trying another expiration. The ladder stops immediately when one
@@ -4086,18 +4142,24 @@ class APContractSelectionEngine:
             _preserved_retryable = None
             _preserved_quality = None
 
-            if getattr(self, "playbook_contract_selection_enabled", False):
+            if bool(getattr(request_context, "playbook_enabled", False)):
                 ordered_expirations = list(dates)
                 if not ordered_expirations:
+                    _playbook_reason = None
+                    _playbook_explanation = None
+                    if isinstance(playbook_audit, dict):
+                        _playbook_reason = ((playbook_audit.get("diagnostics") or {}).get("error_reason"))
+                        _playbook_explanation = ((playbook_audit.get("diagnostics") or {}).get("error_explanation"))
+                    _reason_code = _playbook_reason or "PLAYBOOK_NO_POLICY_MATCH"
                     self._set_last_failure({
                         "stage": "dte_ladder",
-                        "reason_code": "PLAYBOOK_NO_POLICY_MATCH",
-                        "explanation": "Playbook produced no approved expiration inside the DTE window",
+                        "reason_code": _reason_code,
+                        "explanation": _playbook_explanation or "Playbook produced no approved expiration inside the DTE window",
                     })
                     if playbook_audit is not None:
-                        playbook_audit["selection_reason"] = "PLAYBOOK_NO_POLICY_MATCH"
+                        playbook_audit["selection_reason"] = _reason_code
                         self._set_playbook_audit(plan, request_context, playbook_audit)
-                    _persist("PLAYBOOK_NO_POLICY_MATCH")
+                    _persist(_reason_code)
                     return None
                 probe_cap = max(1, self.dte_ladder_probe_per_bucket * 3)
                 buckets = {"PLAYBOOK": ordered_expirations[:probe_cap]}
@@ -4233,7 +4295,7 @@ class APContractSelectionEngine:
                     ticker, _preserved_retryable.get("reason_code"),
                 )
                 return None
-            _final_reason = "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT" if getattr(self, "playbook_contract_selection_enabled", False) else "NO_VALID_PLAYBOOK_DTE_CONTRACT"
+            _final_reason = "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT" if bool(getattr(request_context, "playbook_enabled", False)) else "NO_VALID_PLAYBOOK_DTE_CONTRACT"
             self._set_last_failure({
                 "stage": "dte_ladder",
                 "reason_code": _final_reason,
