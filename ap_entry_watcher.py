@@ -411,6 +411,8 @@ class WatchedSignal:
         self.cleanup_retry_attempt: int = 0
         self.cleanup_retry_next_at: Optional[datetime] = None
         self.cleanup_retry_deadline: Optional[datetime] = None
+        # Final amendment §5: exposed in watcher status diagnostics.
+        self.quarantine_metadata_persist_failed: bool = False
 
         # PR #324 — overnight LIVE quote retry state (Failure A fix).
         # overnight_live_quote_unavailable becomes bounded retry, not inert INVALIDATED.
@@ -3245,6 +3247,13 @@ class APEntryWatcher:
                         if getattr(w, "rearm_expires_at", None) else None
                     ),
                     "rearm_reason": getattr(w, "rearm_reason", ""),
+                    # Final amendment §5: quarantine ownership diagnostics.
+                    "ownership_quarantine": getattr(w, "_ownership_quarantine", False),
+                    "quarantine_reason": getattr(w, "_quarantine_reason", ""),
+                    "quarantine_metadata_persist_failed": getattr(
+                        w, "quarantine_metadata_persist_failed", False
+                    ),
+                    "cleanup_retry_attempt": getattr(w, "cleanup_retry_attempt", 0),
                 }
                 for w in self._pending
             ]
@@ -4473,8 +4482,38 @@ class APEntryWatcher:
         if not cb_result.local_order_id:
             return _failed("missing_local_order_id")
 
-        # ── Step 2: TERMINALIZED — full identity + durable terminal reread ─
+        def _extract_meta(row: dict) -> dict:
+            _m = row.get("meta") or {}
+            if isinstance(_m, str):
+                try:
+                    import json as _jj; _m = _jj.loads(_m)
+                except Exception:
+                    _m = {}
+            return _m if isinstance(_m, dict) else {}
+
+        def _resolve_signal_id(_w) -> str:
+            # Final amendment §3: canonical signal_id resolution.
+            return str(
+                getattr(_w, "signal_id", None)
+                or (getattr(_w, "signal", {}) or {}).get("signal_id")
+                or ""
+            ).strip()
+
+        # ── Step 2: TERMINALIZED — complete identity + durable-reason match ─
         if cb_result.outcome == _WCO.TERMINALIZED:
+            # Final amendment §1: ALL identity values must be present and equal.
+            _cb_oid = str(cb_result.local_order_id or "").strip()
+            if not _cb_oid:
+                return _failed("terminalized_missing_callback_local_order_id")
+            if not _local_oid:
+                return _failed("terminalized_missing_watcher_local_order_id")
+            if _cb_oid != _local_oid:
+                return _failed(f"terminalized_callback_watcher_oid_mismatch:{_cb_oid}!={_local_oid}")
+            if not _watcher_client:
+                return _failed("terminalized_missing_watcher_client_id")
+            if not _watcher_mode:
+                return _failed("terminalized_missing_watcher_execution_mode")
+
             osm = getattr(self, "order_state_machine", None)
             if osm is None:
                 return _failed("terminalized_osm_unavailable")
@@ -4494,12 +4533,19 @@ class APEntryWatcher:
             row_client = str(row.get("client_id") or row.get("client_email") or "").strip().lower()
             row_mode = str(row.get("execution_mode") or "").strip().lower()
 
-            if row_oid and _local_oid and row_oid != _local_oid:
+            if not row_oid:
+                return _failed("terminalized_row_missing_local_order_id")
+            if row_oid != _local_oid:
                 return _failed(f"terminalized_identity_mismatch_local_order_id:{row_oid}!={_local_oid}")
-            if row_client and _watcher_client and row_client != _watcher_client:
-                return _failed(f"terminalized_identity_mismatch_client_id")
-            if row_mode and _watcher_mode and row_mode != _watcher_mode:
+            if not row_client:
+                return _failed("terminalized_row_missing_client_id")
+            if row_client != _watcher_client:
+                return _failed("terminalized_identity_mismatch_client_id")
+            if not row_mode:
+                return _failed("terminalized_row_missing_execution_mode")
+            if row_mode != _watcher_mode:
                 return _failed(f"terminalized_identity_mismatch_execution_mode:{row_mode}!={_watcher_mode}")
+
             if row_status == "PENDING_TRIGGER":
                 log.critical(
                     "[%s] TERMINALIZED claimed but row still PENDING_TRIGGER local_order_id=%s",
@@ -4512,54 +4558,152 @@ class APEntryWatcher:
                     w.ticker, row_status, sorted(_TERMINAL_STATUSES), _local_oid,
                 )
                 return _failed(f"terminalized_nonterminal_status:{row_status}")
-            row_meta = row.get("meta") or {}
-            if isinstance(row_meta, str):
-                try:
-                    import json as _jj; row_meta = _jj.loads(row_meta)
-                except Exception: row_meta = {}
-            if not isinstance(row_meta, dict): row_meta = {}
-            if str(row_meta.get("submit_intent_owner") or "").strip() or                str(row_meta.get("recovery_submit_owner") or "").strip():
+
+            row_meta = _extract_meta(row)
+            if str(row_meta.get("submit_intent_owner") or "").strip() or \
+               str(row_meta.get("recovery_submit_owner") or "").strip():
                 return _failed("terminalized_active_submit_or_recovery_owner_present")
+
+            # Final amendment §2: callback exact reason must match a durable reason.
+            _cb_reason = str(cb_result.reason_code or "").strip()
+            if _cb_reason:
+                _wa = row_meta.get("watcher_audit")
+                _wa_reason = str((_wa or {}).get("reason_code") or "").strip() if isinstance(_wa, dict) else ""
+                _durable_candidates = {
+                    str(row.get("last_error") or "").strip(),
+                    str(row_meta.get("watcher_invalidation_reason") or "").strip(),
+                    str(row_meta.get("terminal_reason") or "").strip(),
+                    _wa_reason,
+                }
+                _durable_candidates.discard("")
+                if not _durable_candidates:
+                    return _failed(
+                        f"terminalized_no_durable_reason_for_callback_reason:{_cb_reason}"
+                    )
+                if _cb_reason not in _durable_candidates:
+                    log.critical(
+                        "[%s] TERMINALIZED reason '%s' not in durable %s local_order_id=%s",
+                        w.ticker, _cb_reason, sorted(_durable_candidates), _local_oid,
+                    )
+                    return _failed(
+                        f"terminalized_reason_mismatch:{_cb_reason}",
+                        f"durable={sorted(_durable_candidates)}",
+                    )
             return cb_result
 
-        # ── Step 3: RETRY_OWNED — physical registry + durable metadata ────
+        # ── Step 3: RETRY_OWNED — registry + reread + durable metadata agreement ─
         if cb_result.outcome == _WCO.RETRY_OWNED:
             with self._lock:
                 _in_pending = any(id(p) == id(w) for p in self._pending)
             if not _in_pending:
                 return _failed("retry_owned_watcher_not_in_pending")
-            _sid = str(getattr(w, "signal_id", "") or "").strip()
-            if _sid and _sid not in self._dedup_set:
+            _sid = _resolve_signal_id(w)
+            if not _sid:
+                return _failed("retry_owned_missing_signal_id")
+            if _sid not in self._dedup_set:
                 return _failed("retry_owned_dedup_key_not_held")
-            osm = getattr(self, "order_state_machine", None)
-            if osm is not None and _local_oid:
-                _gf = getattr(osm, "get_order", None)
-                if callable(_gf):
-                    try:
-                        _r = _gf(_local_oid)
-                        if isinstance(_r, dict):
-                            _rs = str(_r.get("status") or "").strip().upper()
-                            if _rs and _rs != "PENDING_TRIGGER":
-                                return _failed(f"retry_owned_order_not_pending_trigger:{_rs}")
-                    except Exception:
-                        pass
             if not cb_result.retry_next_at:
                 return _failed("retry_owned_retry_next_at_not_durable")
             if not cb_result.retry_deadline:
                 return _failed("retry_owned_retry_deadline_not_durable")
+
+            osm = getattr(self, "order_state_machine", None)
+            if osm is None:
+                return _failed("retry_owned_osm_unavailable")
+            _gf = getattr(osm, "get_order", None)
+            if not callable(_gf):
+                return _failed("retry_owned_get_order_unavailable")
+            try:
+                _r = _gf(_local_oid)
+            except Exception as _rre:
+                return _failed("retry_owned_reread_raised", str(_rre))
+            if _r is None:
+                return _failed("retry_owned_reread_returned_none")
+
+            _rs = str(_r.get("status") or "").strip().upper()
+            if _rs != "PENDING_TRIGGER":
+                return _failed(f"retry_owned_order_not_pending_trigger:{_rs}")
+            _r_oid = str(_r.get("local_order_id") or "").strip()
+            _r_client = str(_r.get("client_id") or _r.get("client_email") or "").strip().lower()
+            _r_mode = str(_r.get("execution_mode") or "").strip().lower()
+            if not _r_oid or _r_oid != _local_oid:
+                return _failed("retry_owned_local_order_id_mismatch")
+            if _watcher_client and (not _r_client or _r_client != _watcher_client):
+                return _failed("retry_owned_client_id_mismatch")
+            if _watcher_mode and (not _r_mode or _r_mode != _watcher_mode):
+                return _failed("retry_owned_execution_mode_mismatch")
+
+            _rmeta = _extract_meta(_r)
+            _d_owner = str(_rmeta.get("watcher_retry_owner") or "").strip()
+            _d_reason = str(_rmeta.get("watcher_invalidation_reason") or "").strip()
+            _d_attempt = _rmeta.get("watcher_retry_attempt")
+            _d_next = str(_rmeta.get("watcher_retry_next_at") or "").strip()
+            _d_deadline = str(_rmeta.get("watcher_retry_deadline") or "").strip()
+            if not _d_owner:
+                return _failed("retry_owned_durable_owner_missing")
+            if not _d_reason:
+                return _failed("retry_owned_durable_reason_missing")
+            if _d_attempt is None:
+                return _failed("retry_owned_durable_attempt_missing")
+            if not _d_next:
+                return _failed("retry_owned_durable_next_at_missing")
+            if not _d_deadline:
+                return _failed("retry_owned_durable_deadline_missing")
+            if str(cb_result.retry_next_at).strip() != _d_next:
+                return _failed("retry_owned_next_at_disagrees_with_durable")
+            if str(cb_result.retry_deadline).strip() != _d_deadline:
+                return _failed("retry_owned_deadline_disagrees_with_durable")
             return cb_result
 
-        # ── Step 4: REARMED — physical registry + rearm state ─────────────
+        # ── Step 4: REARMED — registry + reread + durable rearm metadata ──
         if cb_result.outcome == _WCO.REARMED:
             with self._lock:
                 _in_pending = any(id(p) == id(w) for p in self._pending)
             if not _in_pending:
                 return _failed("rearmed_watcher_not_in_pending")
-            _sid = str(getattr(w, "signal_id", "") or "").strip()
-            if _sid and _sid not in self._dedup_set:
+            _sid = _resolve_signal_id(w)
+            if not _sid:
+                return _failed("rearmed_missing_signal_id")
+            if _sid not in self._dedup_set:
                 return _failed("rearmed_dedup_key_not_held")
             if not getattr(w, "rearm_mode", False):
                 return _failed("rearmed_watcher_not_in_rearm_state")
+
+            osm = getattr(self, "order_state_machine", None)
+            if osm is None:
+                return _failed("rearmed_osm_unavailable")
+            _gf = getattr(osm, "get_order", None)
+            if not callable(_gf):
+                return _failed("rearmed_get_order_unavailable")
+            try:
+                _r = _gf(_local_oid)
+            except Exception as _rre:
+                return _failed("rearmed_reread_raised", str(_rre))
+            if _r is None:
+                return _failed("rearmed_reread_returned_none")
+            _rs = str(_r.get("status") or "").strip().upper()
+            if _rs != "PENDING_TRIGGER":
+                return _failed(f"rearmed_order_not_pending_trigger:{_rs}")
+            _r_oid = str(_r.get("local_order_id") or "").strip()
+            _r_client = str(_r.get("client_id") or _r.get("client_email") or "").strip().lower()
+            _r_mode = str(_r.get("execution_mode") or "").strip().lower()
+            if not _r_oid or _r_oid != _local_oid:
+                return _failed("rearmed_local_order_id_mismatch")
+            if _watcher_client and (not _r_client or _r_client != _watcher_client):
+                return _failed("rearmed_client_id_mismatch")
+            if _watcher_mode and (not _r_mode or _r_mode != _watcher_mode):
+                return _failed("rearmed_execution_mode_mismatch")
+
+            _rmeta = _extract_meta(_r)
+            _rr_reason = str(_rmeta.get("rearm_reason") or _rmeta.get("watcher_rearm_reason") or "").strip()
+            _rr_attempt = _rmeta.get("rearm_attempt", _rmeta.get("watcher_rearm_attempt"))
+            _rr_deadline = str(_rmeta.get("rearm_deadline") or _rmeta.get("watcher_rearm_deadline") or "").strip()
+            if not _rr_reason:
+                return _failed("rearmed_durable_reason_missing")
+            if _rr_attempt is None:
+                return _failed("rearmed_durable_attempt_missing")
+            if not _rr_deadline:
+                return _failed("rearmed_durable_deadline_missing")
             return cb_result
 
         return _failed("unhandled_outcome", str(cb_result.outcome))
@@ -4597,13 +4741,17 @@ class APEntryWatcher:
         w.cleanup_retry_next_at = now + timedelta(seconds=_retry_delay)
 
         _local_oid = str(w.signal.get("local_order_id") or "").strip()
-        # Best-effort persist quarantine metadata.
+        # Final amendment §5: check the boolean return of update_order_meta.
+        # Success → durable diagnostic confirmed. False/raise → watcher remains
+        # quarantined, dedup held, CRITICAL emitted, in-memory marker set.
+        w.quarantine_metadata_persist_failed = False
         osm = getattr(self, "order_state_machine", None)
         if osm is not None and _local_oid:
             _upd = getattr(osm, "update_order_meta", None)
             if callable(_upd):
+                _persist_ok = False
                 try:
-                    _upd(_local_oid, {
+                    _persist_ok = bool(_upd(_local_oid, {
                         "watcher_invalidation_class": "INVALIDATED_NO_WATCHER_OWNER",
                         "watcher_quarantine_reason": w._quarantine_reason,
                         "cleanup_retry_attempt": w.cleanup_retry_attempt,
@@ -4612,11 +4760,36 @@ class APEntryWatcher:
                             w.cleanup_retry_deadline.isoformat()
                             if w.cleanup_retry_deadline else None
                         ),
-                    })
+                    }))
                 except Exception as _meta_exc:
-                    log.warning(
-                        "[%s] quarantine meta write failed: %s", w.ticker, _meta_exc
+                    _persist_ok = False
+                    log.critical(
+                        "[%s] QUARANTINE_METADATA_PERSIST_FAILED (raised) local_order_id=%s "
+                        "err=%s — watcher remains quarantined, dedup held.",
+                        w.ticker, _local_oid, _meta_exc,
                     )
+                if not _persist_ok:
+                    w.quarantine_metadata_persist_failed = True
+                    log.critical(
+                        "[%s] QUARANTINE_METADATA_PERSIST_FAILED local_order_id=%s — "
+                        "durable diagnostic NOT confirmed; watcher remains quarantined, "
+                        "dedup held, marker set.",
+                        w.ticker, _local_oid,
+                    )
+            else:
+                w.quarantine_metadata_persist_failed = True
+                log.critical(
+                    "[%s] QUARANTINE_METADATA_PERSIST_FAILED — update_order_meta unavailable "
+                    "local_order_id=%s; watcher remains quarantined.",
+                    w.ticker, _local_oid,
+                )
+        else:
+            w.quarantine_metadata_persist_failed = True
+            log.critical(
+                "[%s] QUARANTINE_METADATA_PERSIST_FAILED — OSM or local_order_id missing; "
+                "watcher remains quarantined.",
+                w.ticker,
+            )
 
     def _retry_quarantined_cleanup(self) -> None:
         """Attempt to retry cleanup for quarantined watchers.

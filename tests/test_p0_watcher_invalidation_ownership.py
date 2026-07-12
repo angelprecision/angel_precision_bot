@@ -107,6 +107,8 @@ class _MockOSM:
         if self._cancel_returns:
             self._ensure(local_order_id)
             self._row_status[local_order_id] = "CANCELED"
+            # Persist durable reason so the strengthened verifier can match it.
+            self._row_meta[local_order_id]["watcher_invalidation_reason"] = reason
         return self._cancel_returns
 
     def expire_pending_entry(self, local_order_id: str, *, reason: str = "watcher_expired") -> bool:
@@ -116,6 +118,7 @@ class _MockOSM:
         if self._expire_returns:
             self._ensure(local_order_id)
             self._row_status[local_order_id] = "EXPIRED"
+            self._row_meta[local_order_id]["watcher_invalidation_reason"] = reason
         return self._expire_returns
 
     def update_order_meta(self, local_order_id: str, meta_patch: dict) -> bool:
@@ -493,20 +496,32 @@ class TestDetachedDeferredRestorationImpossible:
         """PR #324 Failure B fix: a RETRY_OWNED result for a DEFERRED watcher
         must leave the actual watcher object in _pending — not just set state
         on a detached object after removal."""
-        w, watched, sig = _arm_watcher(mode="paper")
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
         # Simulate deferred contract.
         sig["contract_symbol"] = "DEFERRED:SPY"
         watched.signal["contract_symbol"] = "DEFERRED:SPY"
 
         # The callback returns RETRY_OWNED (benign deferred invalidation).
-        # PR #324 §3: must include retry_next_at + retry_deadline.
+        # Final amendment §3: durable metadata must be present + agree.
         _now = datetime.now(timezone.utc)
+        _next = (_now + timedelta(seconds=30)).isoformat()
+        _deadline = (_now + timedelta(seconds=300)).isoformat()
+        oid = sig["local_order_id"]
+        osm._ensure(oid)
+        osm._row_meta[oid].update({
+            "watcher_retry_owner": f"deferred_retry:{oid}",
+            "watcher_invalidation_reason": "overnight_live_quote_unavailable",
+            "watcher_retry_attempt": 1,
+            "watcher_retry_next_at": _next,
+            "watcher_retry_deadline": _deadline,
+        })
         retry_result = WatcherCompletionResult(
             outcome=WatcherCompletionOutcome.RETRY_OWNED,
             reason_code="overnight_live_quote_unavailable",
-            local_order_id=sig["local_order_id"],
-            retry_next_at=(_now + timedelta(seconds=30)).isoformat(),
-            retry_deadline=(_now + timedelta(seconds=300)).isoformat(),
+            local_order_id=oid,
+            retry_next_at=_next,
+            retry_deadline=_deadline,
         )
 
         # Normalize (no exception, no TERMINALIZED to verify).
@@ -811,14 +826,25 @@ class TestCompletionResultTruthTable:
         w, watched, sig = _arm_watcher(mode="paper", osm=osm)
         oid = sig["local_order_id"]
         _now = datetime.now(timezone.utc)
+        _next = (_now + timedelta(seconds=30)).isoformat()
+        _deadline = (_now + timedelta(seconds=180)).isoformat()
 
-        # PR #324 §3: RETRY_OWNED requires durable retry_next_at + retry_deadline.
+        # Final amendment §3: seed durable retry metadata agreeing with the result.
+        osm._ensure(oid)
+        osm._row_meta[oid].update({
+            "watcher_retry_owner": f"overnight_quote_retry:{oid}",
+            "watcher_invalidation_reason": "overnight_live_quote_unavailable",
+            "watcher_retry_attempt": 1,
+            "watcher_retry_next_at": _next,
+            "watcher_retry_deadline": _deadline,
+        })
+
         result = WatcherCompletionResult(
             outcome=WatcherCompletionOutcome.RETRY_OWNED,
             reason_code="overnight_live_quote_unavailable",
             local_order_id=oid,
-            retry_next_at=(_now + timedelta(seconds=30)).isoformat(),
-            retry_deadline=(_now + timedelta(seconds=180)).isoformat(),
+            retry_next_at=_next,
+            retry_deadline=_deadline,
         )
         ack = w._normalize_and_verify_completion(watched, result, None)
         assert ack.outcome == WatcherCompletionOutcome.RETRY_OWNED
@@ -830,8 +856,15 @@ class TestCompletionResultTruthTable:
         osm = _MockOSM()
         w, watched, sig = _arm_watcher(mode="paper", osm=osm)
         oid = sig["local_order_id"]
-        # PR #324 §3: REARMED requires rearm_mode=True on the watcher.
+        # Final amendment §4: REARMED requires rearm_mode=True + durable rearm metadata.
         watched.rearm_mode = True
+        _now = datetime.now(timezone.utc)
+        osm._ensure(oid)
+        osm._row_meta[oid].update({
+            "rearm_reason": "arm_below_stop_reclaim_wait",
+            "rearm_attempt": 1,
+            "rearm_deadline": (_now + timedelta(seconds=180)).isoformat(),
+        })
 
         result = WatcherCompletionResult(
             outcome=WatcherCompletionOutcome.REARMED,
@@ -1560,3 +1593,450 @@ class TestProductionPathRegressions:
         )
         assert watched in w._pending
         assert sig["signal_id"] in w._dedup_set
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Final amendment §1 — blank/whitespace/unknown LIVE reason → FAILED quarantine
+# ══════════════════════════════════════════════════════════════════════════
+
+def _make_min_ec(osm, *, mode="live"):
+    """Build a minimal execution-core stub bound to the real _on_signal_invalidate."""
+    from ap_execution_core import APExecutionCore
+
+    class _MinEC:
+        _REAL_UNDERLYING_INVALIDATION_REASONS = frozenset()
+        client_id = "client@test.com"
+
+        class store:
+            @staticmethod
+            def update_status(*a, **kw): pass
+
+        def _is_real_underlying_invalidation(self, reason_code: str) -> bool:
+            from ap.pending_trigger_classifier import (
+                classify_watcher_reason, WatcherInvalidationClass,
+            )
+            cls = classify_watcher_reason(reason_code)
+            return cls in (
+                WatcherInvalidationClass.TERMINAL,
+                WatcherInvalidationClass.ALREADY_BREACHED,
+            )
+
+        def _cleanup_pending_entry_order(self, ws, *, action, reason):
+            return False
+
+    # Assign mode-dependent attrs after class body (class bodies can't close over locals)
+    _MinEC.order_state_machine = osm
+    _MinEC.execution_mode = mode
+    _MinEC._mode = mode
+    _MinEC.paper = (mode != "live")
+
+    ec = _MinEC()
+    ec._on_signal_invalidate = APExecutionCore._on_signal_invalidate.__get__(ec)
+    return ec
+
+
+def _make_deferred_live_watcher(osm, reason_code, *, mode="live"):
+    from ap_entry_watcher import APEntryWatcher, WatchedSignal, WatchState
+    broker = MagicMock()
+    w = APEntryWatcher(broker, order_state_machine=osm, mode=mode.upper())
+    sig = {
+        "signal_id": str(uuid.uuid4()),
+        "local_order_id": str(uuid.uuid4()),
+        "client_id": "client@test.com",
+        "client_email": "client@test.com",
+        "execution_mode": mode,
+        "timeframe": "1w", "ticker": "SPY", "side": "CALL",
+        "entry_price": 450.0, "stop_price": 447.0, "target_price": 455.0,
+        "contract_symbol": "DEFERRED:SPY",
+        "contracts": 1, "limit_price": 1.5, "score": 0.8, "tier": "A",
+        "queue_status": "QUEUED",
+    }
+    watched = WatchedSignal(sig, overnight=False)
+    watched._watcher_ref = w
+    w._pending.append(watched)
+    w._dedup_set.add(sig["signal_id"])
+    if reason_code is not None:
+        watched._pending_audit = {"reason_code": reason_code}
+    watched.state = WatchState.INVALIDATED
+    return w, watched, sig
+
+
+class TestBlankLiveReasonQuarantine:
+    """Final amendment §1 — every LIVE INVALIDATED_NO_WATCHER_OWNER is unknown,
+    regardless of whether the raw reason is blank/whitespace/unrecognized."""
+
+    def _assert_failed_quarantine(self, ec, w, watched, sig, osm):
+        result = ec._on_signal_invalidate(watched)
+        # Must be FAILED (not RETRY_OWNED, not None-as-success)
+        from ap.pending_trigger_classifier import WatcherCompletionResult as _WCR
+        assert isinstance(result, _WCR), f"Expected WatcherCompletionResult, got {type(result)}"
+        assert result.outcome == WatcherCompletionOutcome.FAILED, (
+            f"Blank/unknown LIVE reason must be FAILED, got {result.outcome}"
+        )
+        assert result.reason_code.startswith("unknown_live_reason:")
+        # Watcher retained, dedup held
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+        # No cancel/expire happened
+        assert not osm.cancel_calls, "No cancel on unknown LIVE reason"
+        assert not osm.expire_calls, "No expire on unknown LIVE reason"
+
+    def test_A_live_blank_reason_failed_quarantine(self):
+        """A. LIVE + reason_code='' → FAILED quarantine, retained, no cleanup."""
+        osm = _MockOSM()
+        w, watched, sig = _make_deferred_live_watcher(osm, "")
+        ec = _make_min_ec(osm, mode="live")
+        # rebind to same OSM + client identity
+        ec.client_id = sig["client_id"]
+        self._assert_failed_quarantine(ec, w, watched, sig, osm)
+
+    def test_B_live_whitespace_reason_failed_quarantine(self):
+        """B. LIVE + whitespace reason → same."""
+        osm = _MockOSM()
+        w, watched, sig = _make_deferred_live_watcher(osm, "   ")
+        ec = _make_min_ec(osm, mode="live")
+        ec.client_id = sig["client_id"]
+        self._assert_failed_quarantine(ec, w, watched, sig, osm)
+
+    def test_C_live_unknown_nonblank_reason_failed_quarantine(self):
+        """C. LIVE + unknown nonblank reason → same."""
+        osm = _MockOSM()
+        w, watched, sig = _make_deferred_live_watcher(osm, "totally_unknown_reason_xyz_final")
+        ec = _make_min_ec(osm, mode="live")
+        ec.client_id = sig["client_id"]
+        self._assert_failed_quarantine(ec, w, watched, sig, osm)
+
+    def test_D_paper_blank_reason_documented_behavior(self):
+        """D. PAPER + blank reason: NOT forced into unknown-live quarantine.
+        PAPER benign deferred invalidation keeps the watcher alive (RETRY_OWNED
+        or benign) — the unknown-LIVE fail-closed path is LIVE-only by design."""
+        osm = _MockOSM()
+        w, watched, sig = _make_deferred_live_watcher(osm, "", mode="paper")
+        ec = _make_min_ec(osm, mode="paper")
+        ec.client_id = sig["client_id"]
+        result = ec._on_signal_invalidate(watched)
+        # PAPER must NOT take the unknown-live FAILED branch.
+        if result is not None:
+            from ap.pending_trigger_classifier import WatcherCompletionResult as _WCR
+            if isinstance(result, _WCR):
+                assert not (
+                    result.outcome == WatcherCompletionOutcome.FAILED
+                    and result.reason_code.startswith("unknown_live_reason:")
+                ), "PAPER must not enter unknown-LIVE FAILED quarantine"
+        # Watcher retained regardless (benign deferred stays owned)
+        assert watched in w._pending
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Final amendment §6 — strengthened verifier production-path tests
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestStrengthenedVerifier:
+
+    def test_terminalized_rejects_missing_row_local_order_id(self):
+        class _NoOidOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"status": "CANCELED", "meta": {"watcher_invalidation_reason": "stop_bid_below_call_stop"},
+                        "client_id": "client@test.com", "execution_mode": "paper"}  # no local_order_id
+        osm = _NoOidOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "row_missing_local_order_id" in ack.reason_code
+
+    def test_terminalized_rejects_missing_row_client_id(self):
+        class _NoClientOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "CANCELED",
+                        "meta": {"watcher_invalidation_reason": "stop_bid_below_call_stop"},
+                        "client_id": "", "execution_mode": "paper"}
+        osm = _NoClientOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "row_missing_client_id" in ack.reason_code
+
+    def test_terminalized_rejects_missing_row_execution_mode(self):
+        class _NoModeOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "CANCELED",
+                        "meta": {"watcher_invalidation_reason": "stop_bid_below_call_stop"},
+                        "client_id": "client@test.com", "execution_mode": ""}
+        osm = _NoModeOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "row_missing_execution_mode" in ack.reason_code
+
+    def test_terminalized_rejects_missing_durable_reason(self):
+        """Row terminal but no durable reason, callback carries exact reason → FAILED."""
+        class _NoReasonOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "CANCELED", "meta": {},
+                        "client_id": "client@test.com", "execution_mode": "paper"}
+        osm = _NoReasonOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "no_durable_reason" in ack.reason_code
+
+    def test_terminalized_rejects_wrong_durable_reason(self):
+        """Row terminal with a DIFFERENT durable reason than callback → FAILED."""
+        class _WrongReasonOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "CANCELED",
+                        "meta": {"watcher_invalidation_reason": "some_other_reason"},
+                        "client_id": "client@test.com", "execution_mode": "paper"}
+        osm = _WrongReasonOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.TERMINALIZED,
+            reason_code="stop_bid_below_call_stop", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "reason_mismatch" in ack.reason_code
+
+    def test_retry_owned_rejects_blank_signal_id(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        # Blank the signal_id everywhere
+        watched.signal_id = ""
+        watched.signal["signal_id"] = ""
+        _now = datetime.now(timezone.utc)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=sig["local_order_id"],
+            retry_next_at=(_now + timedelta(seconds=30)).isoformat(),
+            retry_deadline=(_now + timedelta(seconds=180)).isoformat(),
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "missing_signal_id" in ack.reason_code
+
+    def test_retry_owned_rejects_reread_exception(self):
+        class _RaiseOSM(_MockOSM):
+            def get_order(self, oid):
+                raise ConnectionError("reread_error")
+        osm = _RaiseOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        _now = datetime.now(timezone.utc)
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=sig["local_order_id"],
+            retry_next_at=(_now + timedelta(seconds=30)).isoformat(),
+            retry_deadline=(_now + timedelta(seconds=180)).isoformat(),
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "reread_raised" in ack.reason_code
+
+    def test_retry_owned_rejects_missing_durable_owner(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        oid = sig["local_order_id"]
+        _now = datetime.now(timezone.utc)
+        _next = (_now + timedelta(seconds=30)).isoformat()
+        _deadline = (_now + timedelta(seconds=180)).isoformat()
+        # Seed metadata WITHOUT owner
+        osm._ensure(oid)
+        osm._row_meta[oid].update({
+            "watcher_invalidation_reason": "overnight_live_quote_unavailable",
+            "watcher_retry_attempt": 1,
+            "watcher_retry_next_at": _next,
+            "watcher_retry_deadline": _deadline,
+        })
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=oid, retry_next_at=_next, retry_deadline=_deadline,
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "durable_owner_missing" in ack.reason_code
+
+    def test_retry_owned_rejects_missing_durable_attempt(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        oid = sig["local_order_id"]
+        _now = datetime.now(timezone.utc)
+        _next = (_now + timedelta(seconds=30)).isoformat()
+        _deadline = (_now + timedelta(seconds=180)).isoformat()
+        osm._ensure(oid)
+        osm._row_meta[oid].update({
+            "watcher_retry_owner": f"x:{oid}",
+            "watcher_invalidation_reason": "overnight_live_quote_unavailable",
+            "watcher_retry_next_at": _next,
+            "watcher_retry_deadline": _deadline,
+            # no attempt
+        })
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=oid, retry_next_at=_next, retry_deadline=_deadline,
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "durable_attempt_missing" in ack.reason_code
+
+    def test_retry_owned_rejects_mismatched_next_at(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        oid = sig["local_order_id"]
+        _now = datetime.now(timezone.utc)
+        _next = (_now + timedelta(seconds=30)).isoformat()
+        _deadline = (_now + timedelta(seconds=180)).isoformat()
+        osm._ensure(oid)
+        osm._row_meta[oid].update({
+            "watcher_retry_owner": f"x:{oid}",
+            "watcher_invalidation_reason": "overnight_live_quote_unavailable",
+            "watcher_retry_attempt": 1,
+            "watcher_retry_next_at": _next,
+            "watcher_retry_deadline": _deadline,
+        })
+        # Result carries a DIFFERENT next_at than durable
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=oid,
+            retry_next_at=(_now + timedelta(seconds=999)).isoformat(),  # mismatch
+            retry_deadline=_deadline,
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "next_at_disagrees" in ack.reason_code
+
+    def test_retry_owned_rejects_wrong_client_mode(self):
+        class _WrongClientOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "PENDING_TRIGGER",
+                        "client_id": "other@x.com", "execution_mode": "paper",
+                        "meta": {
+                            "watcher_retry_owner": f"x:{oid}",
+                            "watcher_invalidation_reason": "overnight_live_quote_unavailable",
+                            "watcher_retry_attempt": 1,
+                            "watcher_retry_next_at": "2026-01-01T00:00:00+00:00",
+                            "watcher_retry_deadline": "2026-01-01T00:03:00+00:00",
+                        }}
+        osm = _WrongClientOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        oid = sig["local_order_id"]
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.RETRY_OWNED,
+            reason_code="overnight_live_quote_unavailable",
+            local_order_id=oid,
+            retry_next_at="2026-01-01T00:00:00+00:00",
+            retry_deadline="2026-01-01T00:03:00+00:00",
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "client_id_mismatch" in ack.reason_code
+
+    def test_rearmed_rejects_missing_durable_metadata(self):
+        osm = _MockOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        oid = sig["local_order_id"]
+        watched.rearm_mode = True
+        # No rearm metadata seeded
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.REARMED,
+            reason_code="arm_below_stop_reclaim_wait", local_order_id=oid,
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "rearmed_durable" in ack.reason_code
+
+    def test_rearmed_rejects_non_pending_trigger_row(self):
+        class _CanceledOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "CANCELED",
+                        "client_id": "client@test.com", "execution_mode": "paper",
+                        "meta": {"rearm_reason": "x", "rearm_attempt": 1,
+                                 "rearm_deadline": "2026-01-01T00:00:00+00:00"}}
+        osm = _CanceledOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched.rearm_mode = True
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.REARMED,
+            reason_code="arm_below_stop_reclaim_wait", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "not_pending_trigger" in ack.reason_code
+
+    def test_rearmed_rejects_wrong_client_mode(self):
+        class _WrongModeOSM(_MockOSM):
+            def get_order(self, oid):
+                return {"local_order_id": oid, "status": "PENDING_TRIGGER",
+                        "client_id": "client@test.com", "execution_mode": "live",  # watcher paper
+                        "meta": {"rearm_reason": "x", "rearm_attempt": 1,
+                                 "rearm_deadline": "2026-01-01T00:00:00+00:00"}}
+        osm = _WrongModeOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        watched.rearm_mode = True
+        result = WatcherCompletionResult(
+            outcome=WatcherCompletionOutcome.REARMED,
+            reason_code="arm_below_stop_reclaim_wait", local_order_id=sig["local_order_id"],
+        )
+        ack = w._normalize_and_verify_completion(watched, result, None)
+        assert ack.outcome == WatcherCompletionOutcome.FAILED
+        assert "execution_mode_mismatch" in ack.reason_code
+
+    def test_quarantine_metadata_false_return_owned_and_marker_set(self):
+        """update_order_meta returns False → watcher stays owned, dedup held,
+        quarantine_metadata_persist_failed marker set."""
+        class _FalseMetaOSM(_MockOSM):
+            def update_order_meta(self, oid, patch):
+                return False
+        osm = _FalseMetaOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        from ap.pending_trigger_classifier import (
+            WatcherCompletionResult as _WCR, WatcherCompletionOutcome as _WCO,
+        )
+        ack = _WCR(outcome=_WCO.FAILED, reason_code="cleanup_failed",
+                   local_order_id=sig["local_order_id"])
+        w._enter_ownership_quarantine(watched, ack)
+        assert watched._ownership_quarantine is True
+        assert watched in w._pending
+        assert sig["signal_id"] in w._dedup_set
+        assert watched.quarantine_metadata_persist_failed is True, (
+            "Marker must be set when update_order_meta returns False"
+        )
+        # Marker exposed in status diagnostics
+        statuses = w.status()
+        me = [s for s in statuses if s["local_order_id"] == sig["local_order_id"]]
+        assert me and me[0]["quarantine_metadata_persist_failed"] is True
+
+    def test_quarantine_metadata_raises_owned_and_marker_set(self):
+        class _RaiseMetaOSM(_MockOSM):
+            def update_order_meta(self, oid, patch):
+                raise RuntimeError("meta_write_error")
+        osm = _RaiseMetaOSM()
+        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        from ap.pending_trigger_classifier import (
+            WatcherCompletionResult as _WCR, WatcherCompletionOutcome as _WCO,
+        )
+        ack = _WCR(outcome=_WCO.FAILED, reason_code="cleanup_failed",
+                   local_order_id=sig["local_order_id"])
+        w._enter_ownership_quarantine(watched, ack)
+        assert watched._ownership_quarantine is True
+        assert sig["signal_id"] in w._dedup_set
+        assert watched.quarantine_metadata_persist_failed is True

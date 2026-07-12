@@ -7100,15 +7100,18 @@ class APExecutionCore:
                 and _inv_class == "INVALIDATED_NO_WATCHER_OWNER"
                 and not _is_real_underlying_invalidation
             )
-            if _is_unknown_live_reason and _inv_reason_code:
-                # PR #324 §5: unknown LIVE reason must NOT auto-terminalize.
-                # Retain watcher + quarantine.
+            # PR #324 final amendment §1: blank/whitespace/malformed/unrecognized LIVE
+            # reason must ALSO enter FAILED quarantine. Do NOT require _inv_reason_code
+            # to be truthy — an empty reason on a LIVE watcher is precisely the case
+            # where falling into the benign RETRY_OWNED path violates the ownership contract.
+            if _is_unknown_live_reason:
+                _unknown_reason = _inv_reason_code or "blank_live_invalidation_reason"
                 log.critical(
                     "[%s] DEFERRED_CONTRACT_UNKNOWN_LIVE_REASON — signal_id=%s "
-                    "reason_code=%s class=%s — FAILED quarantine (watcher retained, "
+                    "reason_code=%r class=%s — FAILED quarantine (watcher retained, "
                     "dedup held, exact reason preserved, no cancel).",
                     watched.ticker, signal_id or "?",
-                    _inv_reason_code, _inv_class,
+                    _unknown_reason, _inv_class,
                 )
                 funnel.inc("deferred_contract_unknown_live_reason_quarantine")
                 try:
@@ -7117,7 +7120,7 @@ class APExecutionCore:
                     )
                     return _UWCR(
                         outcome=_UWCO.FAILED,
-                        reason_code=f"unknown_live_reason:{_inv_reason_code}",
+                        reason_code=f"unknown_live_reason:{_unknown_reason}",
                         local_order_id=str(
                             (getattr(watched, "signal", {}) or {}).get("local_order_id") or ""
                         ),
