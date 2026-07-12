@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -63,6 +64,27 @@ def test_losing_recovery_worker_never_enters_canonical_callback():
     result = core.resume_deferred_broker_ready_order(local_order_id="oid-1")
     assert result["reason_code"] == "RECOVERY_SUBMIT_CLAIM_NOT_ACQUIRED"
     core._on_entry_trigger.assert_not_called()
+
+
+def test_placeholder_broker_ready_row_fails_closed_before_claim():
+    core = _core()
+    bad = _row()
+    bad["contract"] = "DEFERRED:SPY"
+    bad["limit_price"] = 0.01
+    bad["meta"]["selected_contract"] = "SPY260717C00600000"
+    bad["meta"]["selected_limit"] = 2.10
+    bad["meta"]["selected_qty"] = 1
+    core.order_state_machine.get_order.return_value = bad
+    result = core.resume_deferred_broker_ready_order(local_order_id="oid-1")
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == "RECOVERY_INVALID_OCC_CONTRACT"
+    core.order_state_machine.claim_deferred_broker_ready_submit.assert_not_called()
+
+
+def test_deferred_breach_path_has_penny_limit_fail_closed_guard():
+    source = inspect.getsource(ap_execution_core.APExecutionCore._on_entry_trigger)
+    assert "_plan_limit <= 0.01" in source
+    assert "deferred selection produced penny limit" in source
 
 
 def _remote(status="open", **overrides):

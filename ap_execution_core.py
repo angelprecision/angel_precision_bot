@@ -2047,6 +2047,28 @@ class APExecutionCore:
             _generation = 1
         _base.update(attempt=_attempt, max_attempts=_max_attempts, generation=_generation)
 
+        mode = str(row.get("execution_mode") or meta.get("execution_mode") or "").lower()
+        if mode not in {"live", "paper"} or mode != str(self.execution_mode or "").lower():
+            return _term("RECOVERY_EXECUTION_MODE_MISMATCH", status="ERROR")
+        contract = str(row.get("contract") or "").strip()
+        qty = int(row.get("qty") or 0)
+        limit_price = float(row.get("limit_price") or 0)
+        reserved_cost = float(row.get("reserved_cost") or 0)
+        if not self._is_real_occ_contract(contract, str(row.get("symbol") or "")):
+            return _term("RECOVERY_INVALID_OCC_CONTRACT", status="ERROR")
+        if qty <= 0 or limit_price <= 0 or reserved_cost <= 0:
+            return _term("RECOVERY_INVALID_DURABLE_PRICING", status="ERROR")
+        selected_contract = str(meta.get("selected_contract") or "").strip()
+        if not selected_contract or selected_contract != contract:
+            return _term("RECOVERY_SELECTOR_PROOF_MISMATCH", status="ERROR")
+        try:
+            selected_limit = float(meta.get("selected_limit") or 0)
+            selected_qty = int(meta.get("selected_qty") or 0)
+        except (TypeError, ValueError):
+            return _term("RECOVERY_SELECTOR_PROOF_MISMATCH", status="ERROR")
+        if selected_limit <= 0.01 or selected_qty <= 0:
+            return _term("RECOVERY_SELECTOR_PROOF_MISMATCH", status="ERROR")
+
         # The recovery path deliberately enters the same callback used by a
         # live watcher.  That keeps kill switches, exposure, quote/spread/drift,
         # confirmation, final-cap, durable identity and submit_existing_entry
@@ -2068,18 +2090,6 @@ class APExecutionCore:
                 "owner": _claim_owner,
                 "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
             }
-
-        mode = str(row.get("execution_mode") or meta.get("execution_mode") or "").lower()
-        if mode not in {"live", "paper"} or mode != str(self.execution_mode or "").lower():
-            return _term("RECOVERY_EXECUTION_MODE_MISMATCH", status="ERROR")
-        contract = str(row.get("contract") or "").strip()
-        qty = int(row.get("qty") or 0)
-        limit_price = float(row.get("limit_price") or 0)
-        reserved_cost = float(row.get("reserved_cost") or 0)
-        if not self._is_real_occ_contract(contract, str(row.get("symbol") or "")):
-            return _term("RECOVERY_INVALID_OCC_CONTRACT", status="ERROR")
-        if qty <= 0 or limit_price <= 0 or reserved_cost <= 0:
-            return _term("RECOVERY_INVALID_DURABLE_PRICING", status="ERROR")
 
         recovered_plan = plan or SimpleNamespace(
             plan_id=str(row.get("plan_id") or local_order_id),
@@ -4171,6 +4181,37 @@ class APExecutionCore:
         if _plan_limit <= 0:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing valid limit_price", ticker)
             _terminalize_breach_failure("approved_plan_missing_limit_price")
+            return
+
+        if queue_local_order_id and _plan_limit <= 0.01:
+            _selector_failure_meta = {}
+            try:
+                _selector_failure_meta = (
+                    (getattr(approved_plan, "metadata", None) or {}).get("selector_failure") or {}
+                )
+            except Exception:
+                _selector_failure_meta = {}
+            _limit_reason = str(
+                _selector_failure_meta.get("reason_code") or "INVALID_EXECUTABLE_LIMIT"
+            ).strip() or "INVALID_EXECUTABLE_LIMIT"
+            log.critical(
+                "[%s] PRODUCTION_ENTRY_BLOCK — deferred selection produced penny limit "
+                "contract=%s limit=%.4f reason=%s",
+                ticker,
+                str(getattr(approved_plan, "contract_symbol", "") or ""),
+                _plan_limit,
+                _limit_reason,
+            )
+            _terminalize_deferred_breach_failure(
+                _limit_reason,
+                extra_meta={
+                    "failure_stage": "deferred_contract_selection",
+                    "selected_contract": str(getattr(approved_plan, "contract_symbol", "") or ""),
+                    "selected_limit_price": _plan_limit,
+                    "deferred_selector_audit": _deferred_selector_audit,
+                    "selector_failure": _selector_failure_meta,
+                },
+            )
             return
 
         # Optional hard guards: require contract + nonzero qty from the approved plan.

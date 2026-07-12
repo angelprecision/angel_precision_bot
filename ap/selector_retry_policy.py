@@ -258,6 +258,13 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
         final_reason_code="FINAL_SPREAD_TOO_WIDE",
         queue_facing_reason="TERMINAL_NO_TRADEABLE_CONTRACT",
     ),
+    "CHEAP_CONTRACT_NO_UPGRADE": SelectorRetryPolicy(
+        classification=TERMINAL_QUALITY,
+        selector_rerun_allowed=False, retain_existing_contract=False,
+        retry_delay_applies=False, max_attempts_applies=False,
+        final_reason_code="CHEAP_CONTRACT_NO_UPGRADE",
+        queue_facing_reason="TERMINAL_NO_TRADEABLE_CONTRACT",
+    ),
     "BID_BELOW_MIN": SelectorRetryPolicy(
         classification=TERMINAL_QUALITY,
         selector_rerun_allowed=False, retain_existing_contract=False,
@@ -385,6 +392,13 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
         selector_rerun_allowed=False, retain_existing_contract=False,
         retry_delay_applies=False, max_attempts_applies=False,
         final_reason_code="UNTRADEABLE_FOR_ACCOUNT_SIZE",
+        queue_facing_reason="TERMINAL_POLICY_BLOCK",
+    ),
+    "CHEAP_CONTRACT_ONLY_CHOICE": SelectorRetryPolicy(
+        classification=TERMINAL_POLICY,
+        selector_rerun_allowed=False, retain_existing_contract=False,
+        retry_delay_applies=False, max_attempts_applies=False,
+        final_reason_code="CHEAP_CONTRACT_ONLY_CHOICE",
         queue_facing_reason="TERMINAL_POLICY_BLOCK",
     ),
     "NO_AFFORDABLE_CONTRACT": SelectorRetryPolicy(
