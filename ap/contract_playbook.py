@@ -16,6 +16,14 @@ TIMEFRAME_OVERNIGHT = "OVERNIGHT"
 TIMEFRAME_WEEKLY = "WEEKLY"
 TIMEFRAME_UNKNOWN = "UNKNOWN"
 
+STRIKE_POLICY_TIER_ATM = 0
+STRIKE_POLICY_TIER_ONE_STEP_OTM = 1
+STRIKE_POLICY_TIER_NONMATCH = 2
+
+STRIKE_POLICY_LABEL_ATM = "ATM"
+STRIKE_POLICY_LABEL_ONE_STEP_OTM = "ONE_STEP_OTM"
+STRIKE_POLICY_LABEL_NONMATCH = "NONMATCH"
+
 
 def _env_flag(name: str, default: str = "0") -> bool:
     return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
@@ -519,6 +527,7 @@ def build_playbook_candidate_context(
     if not strikes:
         return {
             "atm_strike": None,
+            "one_step_otm_strike": None,
             "preferred_strikes": [],
             "strike_band_low": spec.strike_band_low,
             "strike_band_high": spec.strike_band_high,
@@ -526,24 +535,17 @@ def build_playbook_candidate_context(
         }
     underlying = float(spec.underlying_price or 0.0)
     target = _safe_float(spec.target_underlying)
-    strike_diffs = sorted(
-        {
-            round(abs(curr - prev), 6)
-            for prev, curr in zip(strikes, strikes[1:])
-            if abs(curr - prev) > 0
-        }
-    )
-    strike_increment = strike_diffs[0] if strike_diffs else 1.0
     if underlying > 0:
-        atm = round(round(underlying / strike_increment) * strike_increment, 6)
+        atm = min(strikes, key=lambda strike: (abs(strike - underlying), strike))
     else:
         atm = strikes[0]
     if spec.side == "PUT":
-        next_step = round(atm - strike_increment, 6)
+        otm_candidates = sorted((strike for strike in strikes if strike < atm), reverse=True)
     else:
-        next_step = round(atm + strike_increment, 6)
+        otm_candidates = sorted(strike for strike in strikes if strike > atm)
+    next_step = otm_candidates[0] if otm_candidates else None
     preferred = [atm]
-    if next_step != atm:
+    if next_step is not None:
         preferred.append(next_step)
     band_low = spec.strike_band_low if spec.strike_band_low is not None else min(preferred)
     band_high = spec.strike_band_high if spec.strike_band_high is not None else max(preferred)
@@ -556,18 +558,31 @@ def build_playbook_candidate_context(
         strike = _safe_float(opt.get("strike"))
         if strike is None:
             per_symbol[symbol] = {
+                "strike_policy_tier": STRIKE_POLICY_TIER_NONMATCH,
+                "strike_policy_label": STRIKE_POLICY_LABEL_NONMATCH,
                 "strike_policy_match": False,
                 "distance_to_preferred": None,
             }
             continue
         distance = min(abs(strike - pref) for pref in preferred) if preferred else None
-        strike_policy_match = any(abs(strike - pref) < 1e-9 for pref in preferred)
+        if abs(strike - atm) < 1e-9:
+            tier = STRIKE_POLICY_TIER_ATM
+            label = STRIKE_POLICY_LABEL_ATM
+        elif next_step is not None and abs(strike - next_step) < 1e-9:
+            tier = STRIKE_POLICY_TIER_ONE_STEP_OTM
+            label = STRIKE_POLICY_LABEL_ONE_STEP_OTM
+        else:
+            tier = STRIKE_POLICY_TIER_NONMATCH
+            label = STRIKE_POLICY_LABEL_NONMATCH
         per_symbol[symbol] = {
-            "strike_policy_match": strike_policy_match,
-            "distance_to_preferred": distance,
+            "strike_policy_tier": tier,
+            "strike_policy_label": label,
+            "strike_policy_match": tier != STRIKE_POLICY_TIER_NONMATCH,
+            "distance_to_preferred": 0.0 if tier != STRIKE_POLICY_TIER_NONMATCH else distance,
         }
     return {
         "atm_strike": atm,
+        "one_step_otm_strike": next_step,
         "preferred_strikes": preferred,
         "strike_band_low": band_low,
         "strike_band_high": band_high,

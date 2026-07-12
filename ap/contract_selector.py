@@ -51,6 +51,8 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from ap.contract_playbook import (
     ContractPlaybookSpec,
+    STRIKE_POLICY_LABEL_NONMATCH,
+    STRIKE_POLICY_TIER_NONMATCH,
     build_playbook_candidate_context,
     playbook_contract_selection_enabled,
     resolve_contract_playbook,
@@ -915,6 +917,8 @@ def _build_candidate_row(
         "volume": int(_safe_float(opt.get("volume"))),
         "premium": _round_or_none(premium, 2),
         "rank_score": _round_or_none(rank_score),
+        "playbook_strike_policy_tier": opt.get("_playbook_strike_policy_tier"),
+        "playbook_strike_policy_label": opt.get("_playbook_strike_policy_label"),
         "playbook_strike_match": bool(opt.get("_playbook_strike_match")) if "_playbook_strike_match" in opt else None,
         "playbook_distance_to_preferred": _round_or_none(opt.get("_playbook_distance_to_preferred")),
         "playbook_original_rank_score": _round_or_none(opt.get("_playbook_original_rank_score")),
@@ -2662,6 +2666,7 @@ class APContractSelectionEngine:
                 request_context.playbook_candidate_context = dict(_playbook_candidate_ctx)
                 if isinstance(request_context.playbook_audit, dict):
                     request_context.playbook_audit["atm_strike"] = _playbook_candidate_ctx.get("atm_strike")
+                    request_context.playbook_audit["one_step_otm_strike"] = _playbook_candidate_ctx.get("one_step_otm_strike")
                     request_context.playbook_audit["preferred_strikes"] = list(_playbook_candidate_ctx.get("preferred_strikes") or [])
                     request_context.playbook_audit["strike_band_low"] = _playbook_candidate_ctx.get("strike_band_low")
                     request_context.playbook_audit["strike_band_high"] = _playbook_candidate_ctx.get("strike_band_high")
@@ -2678,6 +2683,12 @@ class APContractSelectionEngine:
             if _playbook_candidate_ctx is not None:
                 _symbol = str(opt.get("symbol") or "")
                 _playbook_fit = ((_playbook_candidate_ctx.get("per_symbol") or {}).get(_symbol) or {})
+                opt["_playbook_strike_policy_tier"] = int(
+                    _playbook_fit.get("strike_policy_tier", STRIKE_POLICY_TIER_NONMATCH)
+                )
+                opt["_playbook_strike_policy_label"] = str(
+                    _playbook_fit.get("strike_policy_label", STRIKE_POLICY_LABEL_NONMATCH)
+                )
                 opt["_playbook_strike_match"] = bool(_playbook_fit.get("strike_policy_match"))
                 opt["_playbook_distance_to_preferred"] = _playbook_fit.get("distance_to_preferred")
                 opt["_playbook_original_rank_score"] = s
@@ -2686,10 +2697,8 @@ class APContractSelectionEngine:
         if _playbook_candidate_ctx is not None:
             def _playbook_sort_key(item):
                 _score, _opt = item
-                _distance = _opt.get("_playbook_distance_to_preferred")
                 return (
-                    not bool(_opt.get("_playbook_strike_match")),
-                    float(_distance) if _distance is not None else float("inf"),
+                    int(_opt.get("_playbook_strike_policy_tier", STRIKE_POLICY_TIER_NONMATCH)),
                     -float(_score),
                 )
 
@@ -3224,10 +3233,20 @@ class APContractSelectionEngine:
             selected.candidate_audit["selection_diagnostics"] = _selection_diagnostics
         if request_context is not None and isinstance(request_context.playbook_audit, dict):
             try:
-                request_context.playbook_audit["selected_initial_rank"] = next(
-                    idx + 1
+                selected_rank, selected_opt = next(
+                    (idx + 1, opt)
                     for idx, (_, opt) in enumerate(scored)
                     if str(opt.get("symbol") or "") == str(selected.contract_symbol or "")
+                )
+                request_context.playbook_audit["selected_initial_rank"] = selected_rank
+                request_context.playbook_audit["selected_strike_policy_tier"] = int(
+                    selected_opt.get("_playbook_strike_policy_tier", STRIKE_POLICY_TIER_NONMATCH)
+                )
+                request_context.playbook_audit["selected_strike_policy_label"] = str(
+                    selected_opt.get("_playbook_strike_policy_label", STRIKE_POLICY_LABEL_NONMATCH)
+                )
+                request_context.playbook_audit["selected_original_rank_score"] = _safe_float(
+                    selected_opt.get("_playbook_original_rank_score")
                 )
             except Exception:
                 pass
@@ -3897,11 +3916,15 @@ class APContractSelectionEngine:
             "trigger_price": spec.trigger_price,
             "target_underlying": spec.target_underlying,
             "atm_strike": None,
+            "one_step_otm_strike": None,
             "preferred_strikes": list(spec.preferred_strikes),
             "strike_band_low": spec.strike_band_low,
             "strike_band_high": spec.strike_band_high,
             "selected_strike": None,
             "selected_initial_rank": None,
+            "selected_strike_policy_tier": None,
+            "selected_strike_policy_label": None,
+            "selected_original_rank_score": None,
             "selection_reason": None,
             "policy_reason": spec.policy_reason,
             "diagnostics": dict(spec.diagnostics),
