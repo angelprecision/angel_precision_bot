@@ -402,6 +402,27 @@ class WatchedSignal:
         self.rearm_reason: str = ""                     # original arm_below_stop raw_reason
         self.rearm_count: int = 0                       # how many disarm→reclaim cycles completed
 
+        # PR #324 — ownership quarantine state (FAILED completion result).
+        # When a cleanup callback fails or cannot be verified, the watcher
+        # enters quarantine: stays in _pending, dedup held, cannot trigger,
+        # retries cleanup on a bounded schedule.
+        self._ownership_quarantine: bool = False
+        self._quarantine_reason: str = ""
+        self.cleanup_retry_attempt: int = 0
+        self.cleanup_retry_next_at: Optional[datetime] = None
+        self.cleanup_retry_deadline: Optional[datetime] = None
+
+        # PR #324 — overnight LIVE quote retry state (Failure A fix).
+        # overnight_live_quote_unavailable becomes bounded retry, not inert INVALIDATED.
+        self._overnight_quote_retry_attempt: int = 0
+        self._overnight_quote_retry_first_failed_at: Optional[datetime] = None
+        self._overnight_quote_retry_last_failed_at: Optional[datetime] = None
+        self._overnight_quote_retry_deadline: Optional[datetime] = None
+
+        # PR #324 — trigger/stop collision on the same poll (Failure D fix).
+        # Set in check() when both trigger AND stop conditions are simultaneously true.
+        self._trigger_stop_collision: bool = False
+
         if self.overnight and _safe_is_daily_signal(self):
             self.signal["queue_status"] = OvernightWatchState.OVERNIGHT_QUEUED
 
@@ -431,7 +452,13 @@ class WatchedSignal:
         # rearm_mode signals are PENDING but NOT active — they are waiting for
         # price to reclaim the valid side of stop and must not enter normal
         # breach/trigger/stale-drift poll logic until reclaimed.
-        return self.state == WatchState.PENDING and not self.rearm_mode
+        # PR #324: quarantined watchers (FAILED cleanup) must also not trigger
+        # or submit; they stay in _pending for ownership but cannot fire.
+        return (
+            self.state == WatchState.PENDING
+            and not self.rearm_mode
+            and not self._ownership_quarantine
+        )
 
     @property
     def minutes_watching(self) -> float:
@@ -556,32 +583,78 @@ class WatchedSignal:
             ):
                 _call_stop_mid = (bid + ask) / 2.0 if (bid and ask) else max(bid, ask)
                 _call_wref = getattr(self, "_watcher_ref", None)
-                if _call_wref is not None:
-                    self._pending_audit = _call_wref._build_watcher_audit_payload(
-                        self,
-                        trigger_type="intraday_check",
-                        current_bid=bid,
-                        current_ask=ask,
-                        current_mid=_call_stop_mid,
-                        arm_condition=f"trigger_{self.entry_trigger:.4f}",
-                        stop_condition=f"bid_{bid:.4f}_le_call_stop_{self.stop_level:.4f}",
-                        reason_code="stop_bid_below_call_stop",
-                        raw_reason=f"bid_{bid:.4f}_broke_call_stop_{self.stop_level:.4f}",
-                        extra={
-                            "overnight": self.overnight,
-                            "is_daily": _safe_is_daily_signal(self),
-                            "pre_open_skip": _pre_open_skip,
-                        },
+                # PR #324 — Failure D fix: detect trigger/stop same-poll collision.
+                # If the CALL trigger was already confirmed on this same tick
+                # (state == TRIGGERED), the stop check must NOT silently overwrite
+                # it.  Preserve trigger evidence; set a dedicated collision outcome.
+                if self.state == WatchState.TRIGGERED:
+                    self._trigger_stop_collision = True
+                    _collision_mid = _call_stop_mid
+                    if _call_wref is not None:
+                        self._pending_audit = _call_wref._build_watcher_audit_payload(
+                            self,
+                            trigger_type="intraday_check",
+                            current_bid=bid,
+                            current_ask=ask,
+                            current_mid=_collision_mid,
+                            arm_condition=f"trigger_{self.entry_trigger:.4f}",
+                            stop_condition=f"bid_{bid:.4f}_le_call_stop_{self.stop_level:.4f}",
+                            reason_code="trigger_stop_same_poll_collision",
+                            raw_reason=(
+                                f"call_trigger_confirmed_and_bid_{bid:.4f}"
+                                f"_broke_call_stop_{self.stop_level:.4f}_same_poll"
+                            ),
+                            extra={
+                                "trigger_crossed_at": (
+                                    self.trigger_crossed_at.isoformat()
+                                    if self.trigger_crossed_at else None
+                                ),
+                                "trigger_confirmed_at": now.isoformat(),
+                                "trigger_price": self.trigger_price,
+                                "first_breach_bid": self.first_breach_bid,
+                                "first_breach_ask": self.first_breach_ask,
+                                "stop_level": self.stop_level,
+                                "collision": True,
+                                "overnight": self.overnight,
+                            },
+                        )
+                    self.state = WatchState.INVALIDATED
+                    self.breach_count = 0
+                    self._release_dedup_key()
+                    log.warning(
+                        "[%s] TRIGGER_STOP_SAME_POLL_COLLISION — CALL trigger confirmed "
+                        "but bid=$%.2f also broke stop=$%.2f on same poll. "
+                        "classification=INVALIDATED_ALREADY_BREACHED "
+                        "reason=trigger_stop_same_poll_collision — NOT submitting.",
+                        self.ticker, bid, self.stop_level,
                     )
-                self.state = WatchState.INVALIDATED
-                self.breach_count = 0
-                self._release_dedup_key()
-                log.info(
-                    "[%s] INVALIDATED — bid=$%.2f broke stop=$%.2f before trigger",
-                    self.ticker,
-                    bid,
-                    self.stop_level,
-                )
+                else:
+                    if _call_wref is not None:
+                        self._pending_audit = _call_wref._build_watcher_audit_payload(
+                            self,
+                            trigger_type="intraday_check",
+                            current_bid=bid,
+                            current_ask=ask,
+                            current_mid=_call_stop_mid,
+                            arm_condition=f"trigger_{self.entry_trigger:.4f}",
+                            stop_condition=f"bid_{bid:.4f}_le_call_stop_{self.stop_level:.4f}",
+                            reason_code="stop_bid_below_call_stop",
+                            raw_reason=f"bid_{bid:.4f}_broke_call_stop_{self.stop_level:.4f}",
+                            extra={
+                                "overnight": self.overnight,
+                                "is_daily": _safe_is_daily_signal(self),
+                                "pre_open_skip": _pre_open_skip,
+                            },
+                        )
+                    self.state = WatchState.INVALIDATED
+                    self.breach_count = 0
+                    self._release_dedup_key()
+                    log.info(
+                        "[%s] INVALIDATED — bid=$%.2f broke stop=$%.2f before trigger",
+                        self.ticker,
+                        bid,
+                        self.stop_level,
+                    )
             elif _pre_open_skip and self.stop_level and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT):
                 log.debug(
                     "[%s] pre-open stop touch ignored for daily/overnight setup "
@@ -633,32 +706,74 @@ class WatchedSignal:
             ):
                 _put_stop_mid = (bid + ask) / 2.0 if (bid and ask) else max(bid, ask)
                 _put_wref = getattr(self, "_watcher_ref", None)
-                if _put_wref is not None:
-                    self._pending_audit = _put_wref._build_watcher_audit_payload(
-                        self,
-                        trigger_type="intraday_check",
-                        current_bid=bid,
-                        current_ask=ask,
-                        current_mid=_put_stop_mid,
-                        arm_condition=f"trigger_{self.entry_trigger:.4f}",
-                        stop_condition=f"ask_{ask:.4f}_ge_put_stop_{self.stop_level:.4f}",
-                        reason_code="stop_ask_above_put_stop",
-                        raw_reason=f"ask_{ask:.4f}_broke_put_stop_{self.stop_level:.4f}",
-                        extra={
-                            "overnight": self.overnight,
-                            "is_daily": _safe_is_daily_signal(self),
-                            "pre_open_skip": _pre_open_skip,
-                        },
+                # PR #324 — Failure D fix: PUT trigger/stop collision.
+                if self.state == WatchState.TRIGGERED:
+                    self._trigger_stop_collision = True
+                    if _put_wref is not None:
+                        self._pending_audit = _put_wref._build_watcher_audit_payload(
+                            self,
+                            trigger_type="intraday_check",
+                            current_bid=bid,
+                            current_ask=ask,
+                            current_mid=_put_stop_mid,
+                            arm_condition=f"trigger_{self.entry_trigger:.4f}",
+                            stop_condition=f"ask_{ask:.4f}_ge_put_stop_{self.stop_level:.4f}",
+                            reason_code="trigger_stop_same_poll_collision",
+                            raw_reason=(
+                                f"put_trigger_confirmed_and_ask_{ask:.4f}"
+                                f"_broke_put_stop_{self.stop_level:.4f}_same_poll"
+                            ),
+                            extra={
+                                "trigger_crossed_at": (
+                                    self.trigger_crossed_at.isoformat()
+                                    if self.trigger_crossed_at else None
+                                ),
+                                "trigger_confirmed_at": now.isoformat(),
+                                "trigger_price": self.trigger_price,
+                                "first_breach_bid": self.first_breach_bid,
+                                "first_breach_ask": self.first_breach_ask,
+                                "stop_level": self.stop_level,
+                                "collision": True,
+                                "overnight": self.overnight,
+                            },
+                        )
+                    self.state = WatchState.INVALIDATED
+                    self.breach_count = 0
+                    self._release_dedup_key()
+                    log.warning(
+                        "[%s] TRIGGER_STOP_SAME_POLL_COLLISION — PUT trigger confirmed "
+                        "but ask=$%.2f also broke stop=$%.2f on same poll. "
+                        "classification=INVALIDATED_ALREADY_BREACHED "
+                        "reason=trigger_stop_same_poll_collision — NOT submitting.",
+                        self.ticker, ask, self.stop_level,
                     )
-                self.state = WatchState.INVALIDATED
-                self.breach_count = 0
-                self._release_dedup_key()
-                log.info(
-                    "[%s] INVALIDATED — ask=$%.2f broke stop=$%.2f before trigger",
-                    self.ticker,
-                    ask,
-                    self.stop_level,
-                )
+                else:
+                    if _put_wref is not None:
+                        self._pending_audit = _put_wref._build_watcher_audit_payload(
+                            self,
+                            trigger_type="intraday_check",
+                            current_bid=bid,
+                            current_ask=ask,
+                            current_mid=_put_stop_mid,
+                            arm_condition=f"trigger_{self.entry_trigger:.4f}",
+                            stop_condition=f"ask_{ask:.4f}_ge_put_stop_{self.stop_level:.4f}",
+                            reason_code="stop_ask_above_put_stop",
+                            raw_reason=f"ask_{ask:.4f}_broke_put_stop_{self.stop_level:.4f}",
+                            extra={
+                                "overnight": self.overnight,
+                                "is_daily": _safe_is_daily_signal(self),
+                                "pre_open_skip": _pre_open_skip,
+                            },
+                        )
+                    self.state = WatchState.INVALIDATED
+                    self.breach_count = 0
+                    self._release_dedup_key()
+                    log.info(
+                        "[%s] INVALIDATED — ask=$%.2f broke stop=$%.2f before trigger",
+                        self.ticker,
+                        ask,
+                        self.stop_level,
+                    )
 
         return self.state
 
@@ -3235,6 +3350,7 @@ class APEntryWatcher:
         self._revalidate_overnight_at_open()
         self._poll_active_signals(open_protect_active=open_protect_active)
         self._check_rearm_signals()
+        self._retry_quarantined_cleanup()  # PR #324: retry FAILED cleanup owners
 
     def _revalidate_overnight_at_open(self) -> None:
         with self._lock:
@@ -3460,32 +3576,136 @@ class APEntryWatcher:
 
             if not (bid or ask) or not w.entry_trigger:
                 # Mode-aware failure policy:
-                # LIVE: quote outage = invalidate. Never arm with stale/zero quotes.
-                #       Premium clients cannot have positions opened without verified price.
-                # PAPER: fail open (arm watcher) — sandbox is for learning, not money protection.
+                # LIVE: PR #324 Failure A fix — bounded retry, NOT inert INVALIDATED.
+                #       Quote outage at open is transient; hold ownership until deadline.
+                # PAPER: fail open (arm watcher) — sandbox, not money protection.
                 _is_live_watcher = self._is_live_runtime()
                 if _is_live_watcher:
-                    _ov_quot_audit = self._build_watcher_audit_payload(
-                        w,
-                        trigger_type="overnight_revalidation",
-                        current_bid=0.0,
-                        current_ask=0.0,
-                        current_mid=0.0,
-                        reason_code="overnight_live_quote_unavailable",
-                        raw_reason="live_overnight_recheck_quote_zero_invalidated",
-                        extra={
+                    _now_retry = datetime.now(timezone.utc)
+                    # Read env-controlled bounds; clamp to safe ranges.
+                    try:
+                        _retry_delay = max(5, int(os.getenv(
+                            "WATCHER_OVERNIGHT_QUOTE_RETRY_DELAY_SECONDS", "30"
+                        )))
+                    except (TypeError, ValueError):
+                        _retry_delay = 30
+                    try:
+                        _retry_deadline_secs = max(60, int(os.getenv(
+                            "WATCHER_OVERNIGHT_QUOTE_RETRY_DEADLINE_SECONDS", "180"
+                        )))
+                    except (TypeError, ValueError):
+                        _retry_deadline_secs = 180
+                    try:
+                        _retry_max = max(1, int(os.getenv(
+                            "WATCHER_OVERNIGHT_QUOTE_RETRY_MAX_ATTEMPTS", "6"
+                        )))
+                    except (TypeError, ValueError):
+                        _retry_max = 6
+
+                    # Initialise deadline on first failure.
+                    if w._overnight_quote_retry_first_failed_at is None:
+                        w._overnight_quote_retry_first_failed_at = _now_retry
+                        w._overnight_quote_retry_deadline = (
+                            _now_retry + timedelta(seconds=_retry_deadline_secs)
+                        )
+                    w._overnight_quote_retry_attempt += 1
+                    w._overnight_quote_retry_last_failed_at = _now_retry
+
+                    _deadline = w._overnight_quote_retry_deadline
+                    _attempts = w._overnight_quote_retry_attempt
+                    _deadline_expired = (
+                        _deadline is not None and _now_retry >= _deadline
+                    ) or _attempts > _retry_max
+
+                    if not _deadline_expired:
+                        # Within bounds — keep watcher alive, persist retry metadata.
+                        _ov_retry_meta = {
+                            "watcher_invalidation_class":   "INVALIDATED_RETRYABLE",
+                            "watcher_invalidation_reason":  "overnight_live_quote_unavailable",
+                            "watcher_retry_owner":          f"overnight_quote_retry:{w.signal.get('local_order_id', '')}",
+                            "watcher_retry_attempt":        _attempts,
+                            "watcher_retry_first_failed_at": w._overnight_quote_retry_first_failed_at.isoformat(),
+                            "watcher_retry_last_failed_at":  _now_retry.isoformat(),
+                            "watcher_retry_next_at": (
+                                _now_retry + timedelta(seconds=_retry_delay)
+                            ).isoformat(),
+                            "watcher_retry_deadline": (
+                                _deadline.isoformat() if _deadline else None
+                            ),
                             "mode": "LIVE",
-                            "quote_available": False,
-                        },
-                    )
-                    self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_quot_audit)
-                    w.state = WatchState.INVALIDATED
-                    w._release_dedup_key()
-                    log.warning(
-                        "[%s] LIVE overnight recheck: quote unavailable — INVALIDATING setup "
-                        "(fail closed). Will need fresh signal at market open.",
-                        w.ticker,
-                    )
+                        }
+                        _osm = self.order_state_machine
+                        _local_oid = str(w.signal.get("local_order_id") or "").strip()
+                        if _osm is not None and _local_oid:
+                            _upd = getattr(_osm, "update_order_meta", None)
+                            if callable(_upd):
+                                try:
+                                    _upd(_local_oid, _ov_retry_meta)
+                                except Exception as _meta_exc:
+                                    log.warning(
+                                        "[%s] overnight_quote_retry meta write failed: %s",
+                                        w.ticker, _meta_exc,
+                                    )
+                        _ov_quot_audit = self._build_watcher_audit_payload(
+                            w,
+                            trigger_type="overnight_revalidation",
+                            current_bid=0.0, current_ask=0.0, current_mid=0.0,
+                            reason_code="overnight_live_quote_unavailable",
+                            raw_reason="live_overnight_recheck_quote_zero_retry",
+                            extra={
+                                "mode": "LIVE",
+                                "quote_available": False,
+                                "retry_attempt": _attempts,
+                                "retry_deadline": _deadline.isoformat() if _deadline else None,
+                            },
+                        )
+                        self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_quot_audit)
+                        log.warning(
+                            "[%s] LIVE overnight recheck: quote unavailable — "
+                            "RETRY_OWNED (attempt %d, deadline %s). "
+                            "Watcher retained; dedup held.",
+                            w.ticker, _attempts,
+                            _deadline.isoformat() if _deadline else "none",
+                        )
+                        # Do NOT set INVALIDATED. Do NOT release dedup. Do NOT add to to_remove.
+                        continue
+
+                    else:
+                        # Deadline/attempts exhausted — terminalize with exact timeout reason.
+                        _timeout_reason = "overnight_live_quote_unavailable_timeout"
+                        _ov_timeout_audit = self._build_watcher_audit_payload(
+                            w,
+                            trigger_type="overnight_revalidation",
+                            current_bid=0.0, current_ask=0.0, current_mid=0.0,
+                            reason_code=_timeout_reason,
+                            raw_reason=(
+                                f"live_overnight_quote_unavailable_after_{_attempts}_attempts"
+                                f"_deadline_{_deadline.isoformat() if _deadline else 'none'}"
+                            ),
+                            extra={
+                                "mode": "LIVE",
+                                "retry_attempts": _attempts,
+                                "retry_deadline": _deadline.isoformat() if _deadline else None,
+                                "first_failed_at": (
+                                    w._overnight_quote_retry_first_failed_at.isoformat()
+                                    if w._overnight_quote_retry_first_failed_at else None
+                                ),
+                                "watcher_invalidation_class": "INVALIDATED_TERMINAL",
+                                "watcher_invalidation_reason": _timeout_reason,
+                            },
+                        )
+                        self._persist_watcher_audit(w.signal.get("local_order_id"), _ov_timeout_audit)
+                        w.state = WatchState.EXPIRED
+                        w.signal["queue_status"] = OvernightWatchState.INVALIDATED
+                        w._release_dedup_key()
+                        log.warning(
+                            "[%s] LIVE overnight recheck: quote unavailable after %d attempts — "
+                            "terminalizing with reason=%s. "
+                            "Will remove watcher + release dedup after durable cleanup.",
+                            w.ticker, _attempts, _timeout_reason,
+                        )
+                        to_remove.append(w)
+                        continue
                 else:
                     w.overnight = False
                     log.warning("[%s] PAPER overnight recheck: quote unavailable — arming fail-open", w.ticker)
@@ -3678,16 +3898,21 @@ class APEntryWatcher:
                     completed.append(("done", w))
 
             # ── P0 (PR #304) Bug B fix: DO NOT remove triggered watchers here.
-            # The old code removed EVERY completed watcher including triggers,
-            # so when on_trigger failed with attempts<3 and did `continue`
-            # claiming "will retry", the watcher had ALREADY been removed from
-            # _pending — the retry was a lie and the row zombied.
+            # ── PR #324: DO NOT remove EXPIRED/INVALIDATED watchers here either.
             #
-            # Now: only remove EXPIRED/INVALIDATED watchers upfront (they have
-            # no callback that can fail). Triggered watchers stay in _pending
-            # and are removed below ONLY on on_trigger success or exhaustion.
-            done_ids = {id(w) for action, w in completed if action == "done"}
-            self._pending = [w for w in self._pending if id(w) not in done_ids]
+            # Triggered watchers stay in _pending and are removed below ONLY on
+            # on_trigger success or exhaustion (PR #304 Bug B fix, unchanged).
+            #
+            # EXPIRED/INVALIDATED watchers must also stay in _pending until their
+            # cleanup callback is verified against the durable row (PR #324 Failure C
+            # fix).  Upfront removal made the callback fire-and-forget: if on_expire
+            # or on_invalidate raised or persisted nothing, the watcher was already
+            # gone and the row zombied as ownerless PENDING_TRIGGER.
+            #
+            # New ordering (see dispatch loop below):
+            #   check() → classify → callback → verify result → then remove + dedup release
+            #   FAILED: enter quarantine (stay in _pending, dedup held, not active)
+            pass  # removal now handled per-watcher after callback verification
 
         for action, w in completed:
             _sig_id = str(w.signal.get("signal_id", ""))
@@ -4048,31 +4273,345 @@ class APEntryWatcher:
                         _wid = id(w)
                         self._pending = [_p for _p in self._pending if id(_p) != _wid]
                     w._release_dedup_key()
-            elif w.state == WatchState.EXPIRED:
-                # BUG TRAP: log every expiry with the reason it was in.
+            elif w.state in (WatchState.EXPIRED, WatchState.INVALIDATED):
+                # PR #324 Failure C fix: callback-first, then verify, then remove.
+                # Previously the watcher was removed from _pending by done_ids BEFORE
+                # the callback ran.  If on_expire/on_invalidate raised or wrote nothing,
+                # the row zombied as ownerless PENDING_TRIGGER with no watcher, no retry,
+                # no rearm.  Now: watcher stays in _pending until we confirm the durable
+                # outcome.  Only TERMINALIZED (order verified no longer PENDING_TRIGGER)
+                # allows removal.  FAILED enters quarantine (retained in _pending).
+
+                _is_invalidated = w.state == WatchState.INVALIDATED
+                _state_name = "INVALIDATED" if _is_invalidated else "EXPIRED"
+
+                # Persist pending audit before callback (audit must exist in DB before
+                # the cleanup tries to read the row).
+                if _is_invalidated:
+                    _pending_audit = getattr(w, "_pending_audit", None)
+                    if _pending_audit:
+                        self._persist_watcher_audit(
+                            w.signal.get("local_order_id"), _pending_audit
+                        )
+
                 if _sig_id and _ticker:
-                    _ew_record(_sig_id, _ticker, "EXPIRED",
-                               "signal_expired_in_poll_loop",
-                               minutes_watching=str(getattr(w, "minutes_watching", "?")))
-                if self.on_expire:
-                    try:
-                        self.on_expire(w)
-                    except Exception as exc:
-                        log.error("[%s] on_expire callback failed: %s", w.ticker, exc, exc_info=True)
-            elif w.state == WatchState.INVALIDATED:
-                _pending_audit = getattr(w, "_pending_audit", None)
-                if _pending_audit:
-                    self._persist_watcher_audit(
-                        w.signal.get("local_order_id"), _pending_audit
+                    _ew_record(
+                        _sig_id, _ticker, _state_name,
+                        "signal_invalidated_in_poll_loop" if _is_invalidated
+                        else "signal_expired_in_poll_loop",
+                        minutes_watching=str(getattr(w, "minutes_watching", "?")),
                     )
-                if _sig_id and _ticker:
-                    _ew_record(_sig_id, _ticker, "INVALIDATED",
-                               "signal_invalidated_in_poll_loop")
-                if self.on_invalidate:
+
+                _cb = self.on_invalidate if _is_invalidated else self.on_expire
+                _cb_name = "on_invalidate" if _is_invalidated else "on_expire"
+                _cb_result = None
+                _cb_exc_caught = None
+                if _cb:
                     try:
-                        self.on_invalidate(w)
-                    except Exception as exc:
-                        log.error("[%s] on_invalidate callback failed: %s", w.ticker, exc, exc_info=True)
+                        _cb_result = _cb(w)
+                    except Exception as _cb_exc:
+                        _cb_exc_caught = _cb_exc
+                        log.error(
+                            "[%s] %s callback raised: %s",
+                            w.ticker, _cb_name, _cb_exc, exc_info=True,
+                        )
+
+                # Normalize and verify the result.
+                _ack = self._normalize_and_verify_completion(w, _cb_result, _cb_exc_caught)
+
+                _local_oid_done = str(w.signal.get("local_order_id") or "").strip()
+                if _ack.outcome == "TERMINALIZED":
+                    # Durable outcome proven — remove from _pending and release dedup.
+                    with self._lock:
+                        _wid_done = id(w)
+                        self._pending = [_p for _p in self._pending if id(_p) != _wid_done]
+                    try:
+                        w._release_dedup_key()
+                    except Exception:
+                        pass
+                    log.info(
+                        "[%s] WATCHER_COMPLETION_TERMINALIZED %s local_order_id=%s "
+                        "removed_from_pending=true dedup_released=true",
+                        w.ticker, _state_name, _local_oid_done or "?",
+                    )
+                elif _ack.outcome == "FAILED":
+                    # Cleanup failed — enter quarantine; watcher stays in _pending.
+                    # is_active returns False for quarantined watchers so it cannot
+                    # re-trigger or re-submit.  Cleanup is retried on a schedule.
+                    self._enter_ownership_quarantine(w, _ack)
+                    log.critical(
+                        "[%s] WATCHER_OWNERSHIP_QUARANTINE %s local_order_id=%s "
+                        "reason=%s — watcher retained in _pending, dedup held, "
+                        "cleanup will be retried. This is a P0 invariant violation.",
+                        w.ticker, _state_name, _local_oid_done or "?",
+                        _ack.reason_code,
+                    )
+                else:
+                    # RETRY_OWNED — watcher retained in _pending as-is (callback
+                    # established a bounded retry; ownership is alive).
+                    log.info(
+                        "[%s] WATCHER_COMPLETION_RETRY_OWNED %s local_order_id=%s "
+                        "reason=%s — watcher retained in _pending",
+                        w.ticker, _state_name, _local_oid_done or "?",
+                        _ack.reason_code,
+                    )
+
+    # ── PR #324: watcher completion verification helpers ─────────────────────
+
+    def _normalize_and_verify_completion(
+        self,
+        w: "WatchedSignal",
+        cb_result,
+        cb_exc: Optional[Exception] = None,
+    ) -> "WatcherCompletionResult":
+        """Normalize a callback return value and verify it against actual state.
+
+        A callback that returns None or raises is treated as FAILED unless the
+        durable row independently proves terminalization.
+
+        Imports WatcherCompletionResult from the classifier module to avoid
+        circular imports; the classifier is a leaf with no watcher dependency.
+        """
+        try:
+            from ap.pending_trigger_classifier import (
+                WatcherCompletionResult as _WCR,
+                WatcherCompletionOutcome as _WCO,
+            )
+        except Exception as _ie:
+            log.error("Cannot import WatcherCompletionResult: %s", _ie)
+            # Without the type we cannot verify — fail closed.
+            return type("_FallbackResult", (), {
+                "outcome": "FAILED", "reason_code": "import_error",
+                "local_order_id": None, "retry_next_at": None,
+                "retry_deadline": None, "detail": str(_ie)[:200],
+            })()
+
+        _sig = getattr(w, "signal", {}) or {}
+        _local_oid = str(_sig.get("local_order_id") or "").strip()
+
+        # ── Step 1: normalize raw callback result ──────────────────────────
+        if cb_exc is not None:
+            # Callback raised — FAILED
+            return _WCR(
+                outcome=_WCO.FAILED,
+                reason_code="callback_raised",
+                local_order_id=_local_oid,
+                detail=str(cb_exc)[:200],
+            )
+
+        if isinstance(cb_result, _WCR):
+            normalized = cb_result
+        elif cb_result is None:
+            # Legacy callback returning None — try to independently verify.
+            normalized = _WCR(
+                outcome=_WCO.FAILED,
+                reason_code="callback_returned_none",
+                local_order_id=_local_oid,
+            )
+        elif isinstance(cb_result, dict):
+            _out = str(cb_result.get("outcome") or "FAILED").upper()
+            normalized = _WCR(
+                outcome=_out,
+                reason_code=str(cb_result.get("reason_code") or "unknown"),
+                local_order_id=_local_oid,
+                retry_next_at=cb_result.get("retry_next_at"),
+                retry_deadline=cb_result.get("retry_deadline"),
+                detail=str(cb_result.get("detail") or "")[:200] or None,
+            )
+        else:
+            normalized = _WCR(
+                outcome=_WCO.FAILED,
+                reason_code="callback_unrecognized_result_type",
+                local_order_id=_local_oid,
+                detail=repr(type(cb_result))[:100],
+            )
+
+        # ── Step 2: if TERMINALIZED, verify durable row ───────────────────
+        if normalized.outcome == _WCO.TERMINALIZED:
+            osm = getattr(self, "order_state_machine", None)
+            if osm is not None and _local_oid:
+                try:
+                    row = osm.get_order(_local_oid)
+                    if isinstance(row, dict):
+                        row_status = str(row.get("status") or "").upper()
+                        if row_status == "PENDING_TRIGGER":
+                            # Callback claims TERMINALIZED but row is still PENDING_TRIGGER.
+                            log.critical(
+                                "[%s] WATCHER_COMPLETION_VERIFY_FAILED — callback "
+                                "returned TERMINALIZED but row reread is still "
+                                "PENDING_TRIGGER local_order_id=%s. Converting to FAILED.",
+                                w.ticker, _local_oid,
+                            )
+                            return _WCR(
+                                outcome=_WCO.FAILED,
+                                reason_code="terminalized_claimed_but_row_still_pending_trigger",
+                                local_order_id=_local_oid,
+                            )
+                except Exception as _verify_exc:
+                    log.warning(
+                        "[%s] TERMINALIZED reread failed (OSM error): %s — "
+                        "accepting TERMINALIZED without row confirmation.",
+                        w.ticker, _verify_exc,
+                    )
+
+        return normalized
+
+    def _enter_ownership_quarantine(
+        self, w: "WatchedSignal", ack: "WatcherCompletionResult"
+    ) -> None:
+        """Put a watcher into cleanup-retry quarantine after a FAILED completion.
+
+        The watcher stays in _pending, is NOT active (cannot trigger/submit),
+        and its dedup key remains held.  Cleanup is retried on a bounded
+        schedule.  Deadline exhaustion escalates diagnostics but never releases
+        ownership.
+        """
+        try:
+            _retry_delay = max(10, int(os.getenv(
+                "WATCHER_CLEANUP_RETRY_DELAY_SECONDS", "30"
+            )))
+        except (TypeError, ValueError):
+            _retry_delay = 30
+        try:
+            _deadline_secs = max(120, int(os.getenv(
+                "WATCHER_CLEANUP_RETRY_DEADLINE_SECONDS", "600"
+            )))
+        except (TypeError, ValueError):
+            _deadline_secs = 600
+
+        now = datetime.now(timezone.utc)
+        w._ownership_quarantine = True
+        w._quarantine_reason = str(getattr(ack, "reason_code", "unknown"))
+        if w.cleanup_retry_attempt == 0:
+            # First entry into quarantine — set deadline.
+            w.cleanup_retry_deadline = now + timedelta(seconds=_deadline_secs)
+        w.cleanup_retry_attempt += 1
+        w.cleanup_retry_next_at = now + timedelta(seconds=_retry_delay)
+
+        _local_oid = str(w.signal.get("local_order_id") or "").strip()
+        # Best-effort persist quarantine metadata.
+        osm = getattr(self, "order_state_machine", None)
+        if osm is not None and _local_oid:
+            _upd = getattr(osm, "update_order_meta", None)
+            if callable(_upd):
+                try:
+                    _upd(_local_oid, {
+                        "watcher_invalidation_class": "INVALIDATED_NO_WATCHER_OWNER",
+                        "watcher_quarantine_reason": w._quarantine_reason,
+                        "cleanup_retry_attempt": w.cleanup_retry_attempt,
+                        "cleanup_retry_next_at": w.cleanup_retry_next_at.isoformat(),
+                        "cleanup_retry_deadline": (
+                            w.cleanup_retry_deadline.isoformat()
+                            if w.cleanup_retry_deadline else None
+                        ),
+                    })
+                except Exception as _meta_exc:
+                    log.warning(
+                        "[%s] quarantine meta write failed: %s", w.ticker, _meta_exc
+                    )
+
+    def _retry_quarantined_cleanup(self) -> None:
+        """Attempt to retry cleanup for quarantined watchers.
+
+        Called from the poll loop.  Quarantined watchers whose cleanup_retry_next_at
+        is due are processed.  Deadline exhaustion escalates diagnostics but does NOT
+        release ownership — the watcher remains quarantined forever until cleanup succeeds.
+        """
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            quarantined = [
+                w for w in self._pending
+                if getattr(w, "_ownership_quarantine", False)
+                and w.cleanup_retry_next_at is not None
+                and now >= w.cleanup_retry_next_at
+            ]
+        if not quarantined:
+            return
+
+        for w in quarantined:
+            _local_oid = str(w.signal.get("local_order_id") or "").strip()
+            _deadline = w.cleanup_retry_deadline
+            _deadline_expired = (_deadline is not None and now > _deadline)
+
+            if _deadline_expired:
+                log.critical(
+                    "[%s] WATCHER_QUARANTINE_DEADLINE_EXHAUSTED local_order_id=%s "
+                    "attempt=%d — escalating diagnostics; ownership retained.",
+                    w.ticker, _local_oid or "?", w.cleanup_retry_attempt,
+                )
+                osm = getattr(self, "order_state_machine", None)
+                if osm is not None and _local_oid:
+                    _upd = getattr(osm, "update_order_meta", None)
+                    if callable(_upd):
+                        try:
+                            _upd(_local_oid, {
+                                "watcher_quarantine_deadline_exhausted": True,
+                                "watcher_quarantine_escalated_at": now.isoformat(),
+                            })
+                        except Exception:
+                            pass
+                # Do NOT release — bump next_at so we log again later.
+                w.cleanup_retry_next_at = now + timedelta(seconds=300)
+                continue
+
+            # Retry: re-invoke the appropriate cleanup callback.
+            _state_name = "INVALIDATED" if w.state == WatchState.INVALIDATED else "EXPIRED"
+            _cb = self.on_invalidate if w.state == WatchState.INVALIDATED else self.on_expire
+            _cb_result = None
+            _cb_exc = None
+            if _cb:
+                try:
+                    _cb_result = _cb(w)
+                except Exception as _exc:
+                    _cb_exc = _exc
+                    log.warning(
+                        "[%s] quarantine cleanup retry raised: %s", w.ticker, _exc
+                    )
+            else:
+                # No callback — try direct OSM terminalization.
+                osm = getattr(self, "order_state_machine", None)
+                if osm is not None and _local_oid:
+                    _cancel = getattr(osm, "cancel_pending_entry", None)
+                    if callable(_cancel):
+                        try:
+                            if _cancel(_local_oid, reason="watcher_quarantine_cleanup_retry"):
+                                _cb_result = type("_R", (), {
+                                    "outcome": "TERMINALIZED",
+                                    "reason_code": "direct_osm_cancel_ok",
+                                })()
+                        except Exception as _oexc:
+                            _cb_exc = _oexc
+
+            _ack = self._normalize_and_verify_completion(w, _cb_result, _cb_exc)
+            if _ack.outcome == "TERMINALIZED":
+                with self._lock:
+                    _wid = id(w)
+                    self._pending = [_p for _p in self._pending if id(_p) != _wid]
+                try:
+                    w._release_dedup_key()
+                except Exception:
+                    pass
+                log.info(
+                    "[%s] WATCHER_QUARANTINE_CLEANUP_SUCCEEDED %s local_order_id=%s "
+                    "attempt=%d — removed from _pending, dedup released.",
+                    w.ticker, _state_name, _local_oid or "?", w.cleanup_retry_attempt,
+                )
+            else:
+                # Still failing — update retry state and keep quarantined.
+                try:
+                    _retry_delay = max(10, int(os.getenv(
+                        "WATCHER_CLEANUP_RETRY_DELAY_SECONDS", "30"
+                    )))
+                except (TypeError, ValueError):
+                    _retry_delay = 30
+                w.cleanup_retry_attempt += 1
+                w.cleanup_retry_next_at = now + timedelta(seconds=_retry_delay)
+                log.warning(
+                    "[%s] WATCHER_QUARANTINE_CLEANUP_STILL_FAILING %s "
+                    "local_order_id=%s attempt=%d reason=%s",
+                    w.ticker, _state_name, _local_oid or "?",
+                    w.cleanup_retry_attempt, _ack.reason_code,
+                )
 
     # ── P0 (PR #304) Bugs C & D: arm-time already-through-trigger safety ────
     @staticmethod
