@@ -46,8 +46,18 @@ from ap.trace import trace_gate
 import os
 import time
 from dataclasses import dataclass, field, replace as _dc_replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
+from ap.contract_playbook import (
+    ContractPlaybookSpec,
+    STRIKE_POLICY_LABEL_NONMATCH,
+    STRIKE_POLICY_TIER_NONMATCH,
+    build_playbook_candidate_context,
+    playbook_contract_selection_enabled,
+    resolve_contract_playbook,
+    resolve_playbook_expiration_order,
+)
 
 # P0A: direct option quote revalidation (do not remove — restores flow for
 # liquid tickers with stale/zero chain data without weakening safety rules).
@@ -149,6 +159,13 @@ class SelectorRequestContext:
     expiration_provider_latency_ms: float | None = None
     retry_after_ms: int | None = None
     diagnostics_sink: dict | None = None
+    playbook_spec: ContractPlaybookSpec | None = None
+    playbook_ordered_expirations: list[str] = field(default_factory=list)
+    playbook_candidate_context: dict | None = None
+    playbook_audit: dict | None = None
+    playbook_enabled: bool | None = None
+    playbook_now_et: datetime | None = None
+    playbook_today_et: date | None = None
 
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
     "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
@@ -584,6 +601,15 @@ def _bind_selector_request_diagnostics(plan, ctx: SelectorRequestContext | None)
         pass
 
 
+def _request_playbook_enabled(ctx: SelectorRequestContext | None) -> bool:
+    if ctx is None:
+        return playbook_contract_selection_enabled()
+    if getattr(ctx, "playbook_enabled", None) is None:
+        ctx.playbook_enabled = playbook_contract_selection_enabled()
+        _ctx_refresh_diagnostics(ctx)
+    return bool(ctx.playbook_enabled)
+
+
 def _ctx_assert_budget(
     ctx: SelectorRequestContext | None,
     *,
@@ -684,6 +710,10 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "budget_exhausted_detail": ctx.budget_exhausted_detail,
         "legacy_fallback_used": bool(ctx.legacy_fallback_used),
         "execution_mode": str(ctx.execution_mode or "unknown"),
+        "playbook_ordered_expirations": list(ctx.playbook_ordered_expirations or []),
+        "playbook_audit": dict(ctx.playbook_audit or {}) if isinstance(ctx.playbook_audit, dict) else None,
+        "playbook_enabled": ctx.playbook_enabled,
+        "playbook_today_et": ctx.playbook_today_et.isoformat() if isinstance(ctx.playbook_today_et, date) else None,
     }
 
 
@@ -887,6 +917,11 @@ def _build_candidate_row(
         "volume": int(_safe_float(opt.get("volume"))),
         "premium": _round_or_none(premium, 2),
         "rank_score": _round_or_none(rank_score),
+        "playbook_strike_policy_tier": opt.get("_playbook_strike_policy_tier"),
+        "playbook_strike_policy_label": opt.get("_playbook_strike_policy_label"),
+        "playbook_strike_match": bool(opt.get("_playbook_strike_match")) if "_playbook_strike_match" in opt else None,
+        "playbook_distance_to_preferred": _round_or_none(opt.get("_playbook_distance_to_preferred")),
+        "playbook_original_rank_score": _round_or_none(opt.get("_playbook_original_rank_score")),
         "rejected_at_step": rejected_at_step,
         "rejection_reason": rejection_reason,
         "selected": bool(selected),
@@ -1421,6 +1456,7 @@ class APContractSelectionEngine:
         self.dte_bucket_b_max = int(os.getenv("DTE_BUCKET_B_MAX", "7"))   # 3–7 DTE
         # Max expirations to probe per bucket (bounds Tradier calls per breach).
         self.dte_ladder_probe_per_bucket = int(os.getenv("DTE_LADDER_PROBE_PER_BUCKET", "2"))
+        self.playbook_contract_selection_enabled = playbook_contract_selection_enabled()
         # Records the last ladder run for diagnostics (observability only).
         self._last_dte_ladder_audit: Optional[dict] = None
         self._last_dte_ladder_audit_ctx = contextvars.ContextVar(
@@ -1472,6 +1508,7 @@ class APContractSelectionEngine:
             "max_trade_usd":          _max_trade_usd(),
             "max_ideal_premium":      float(os.getenv("MAX_IDEAL_PREMIUM", "3.50")),
             "ticker_premium_caps":    TICKER_MAX_PREMIUM_PER_CONTRACT,
+            "playbook_contract_selection_enabled": self.playbook_contract_selection_enabled,
         })
 
         log.info(
@@ -1629,6 +1666,7 @@ class APContractSelectionEngine:
                 self.mode,
             )
         _bind_selector_request_diagnostics(plan, request_context)
+        _request_playbook_enabled(request_context)
 
         _selector_mode = _normalized_selector_mode(self.mode)
         _plan_mode = _normalized_selector_mode(
@@ -2198,7 +2236,7 @@ class APContractSelectionEngine:
         # No self-mutation: effective thresholds passed directly to _quality_filter.
         # This is thread-safe when worker_loop and entry_watcher breach both call
         # select() on the same instance simultaneously.
-        today      = date.today()
+        today = getattr(request_context, "playbook_today_et", None) or date.today()
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
@@ -2613,6 +2651,27 @@ class APContractSelectionEngine:
             log.info("[%s] %d contracts passed quality filter", ticker, len(survivors))
 
         # ── C. RANK ───────────────────────────────────────────────────────────
+        _playbook_candidate_ctx = None
+        if (
+            request_context is not None
+            and bool(getattr(request_context, "playbook_enabled", False))
+            and request_context.playbook_spec is not None
+            and expiration_override is not None
+        ):
+            try:
+                _playbook_candidate_ctx = build_playbook_candidate_context(
+                    request_context.playbook_spec,
+                    survivors,
+                )
+                request_context.playbook_candidate_context = dict(_playbook_candidate_ctx)
+                if isinstance(request_context.playbook_audit, dict):
+                    request_context.playbook_audit["atm_strike"] = _playbook_candidate_ctx.get("atm_strike")
+                    request_context.playbook_audit["one_step_otm_strike"] = _playbook_candidate_ctx.get("one_step_otm_strike")
+                    request_context.playbook_audit["preferred_strikes"] = list(_playbook_candidate_ctx.get("preferred_strikes") or [])
+                    request_context.playbook_audit["strike_band_low"] = _playbook_candidate_ctx.get("strike_band_low")
+                    request_context.playbook_audit["strike_band_high"] = _playbook_candidate_ctx.get("strike_band_high")
+            except Exception:
+                _playbook_candidate_ctx = None
         scored = []
         for opt in survivors:
             s = self._rank_score(
@@ -2621,9 +2680,31 @@ class APContractSelectionEngine:
                 underlying_price=underlying_price or 0.0,
                 tier=_safe_plan_attr(plan, "tier", "B") or "B",
             )
+            if _playbook_candidate_ctx is not None:
+                _symbol = str(opt.get("symbol") or "")
+                _playbook_fit = ((_playbook_candidate_ctx.get("per_symbol") or {}).get(_symbol) or {})
+                opt["_playbook_strike_policy_tier"] = int(
+                    _playbook_fit.get("strike_policy_tier", STRIKE_POLICY_TIER_NONMATCH)
+                )
+                opt["_playbook_strike_policy_label"] = str(
+                    _playbook_fit.get("strike_policy_label", STRIKE_POLICY_LABEL_NONMATCH)
+                )
+                opt["_playbook_strike_match"] = bool(_playbook_fit.get("strike_policy_match"))
+                opt["_playbook_distance_to_preferred"] = _playbook_fit.get("distance_to_preferred")
+                opt["_playbook_original_rank_score"] = s
             scored.append((s, opt))
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        if _playbook_candidate_ctx is not None:
+            def _playbook_sort_key(item):
+                _score, _opt = item
+                return (
+                    int(_opt.get("_playbook_strike_policy_tier", STRIKE_POLICY_TIER_NONMATCH)),
+                    -float(_score),
+                )
+
+            scored.sort(key=_playbook_sort_key)
+        else:
+            scored.sort(key=lambda x: x[0], reverse=True)
 
         # ── CANDIDATE AUDIT — log why every contract won or lost ──────────────
         # This is how you answer "why did we pick $0.11 instead of $0.50?"
@@ -3150,6 +3231,26 @@ class APContractSelectionEngine:
         _selection_diagnostics = _selector_request_diagnostics(request_context)
         if isinstance(selected.candidate_audit, dict):
             selected.candidate_audit["selection_diagnostics"] = _selection_diagnostics
+        if request_context is not None and isinstance(request_context.playbook_audit, dict):
+            try:
+                selected_rank, selected_opt = next(
+                    (idx + 1, opt)
+                    for idx, (_, opt) in enumerate(scored)
+                    if str(opt.get("symbol") or "") == str(selected.contract_symbol or "")
+                )
+                request_context.playbook_audit["selected_initial_rank"] = selected_rank
+                request_context.playbook_audit["selected_strike_policy_tier"] = int(
+                    selected_opt.get("_playbook_strike_policy_tier", STRIKE_POLICY_TIER_NONMATCH)
+                )
+                request_context.playbook_audit["selected_strike_policy_label"] = str(
+                    selected_opt.get("_playbook_strike_policy_label", STRIKE_POLICY_LABEL_NONMATCH)
+                )
+                request_context.playbook_audit["selected_original_rank_score"] = _safe_float(
+                    selected_opt.get("_playbook_original_rank_score")
+                )
+            except Exception:
+                pass
+            self._set_playbook_audit(plan, request_context, request_context.playbook_audit)
         if self.mutate_plan:
             if isinstance(plan, dict):
                 plan["contract_symbol"] = selected.contract_symbol
@@ -3698,6 +3799,144 @@ class APContractSelectionEngine:
             )
         return dates, evidence
 
+    def _set_playbook_audit(
+        self,
+        plan,
+        request_context: Optional[SelectorRequestContext],
+        payload: dict,
+    ) -> None:
+        if request_context is not None:
+            request_context.playbook_audit = dict(payload)
+            _ctx_refresh_diagnostics(request_context)
+        try:
+            if isinstance(plan, dict):
+                selector_metadata = plan.setdefault("selector_metadata", {})
+            else:
+                selector_metadata = getattr(plan, "selector_metadata", None)
+                if not isinstance(selector_metadata, dict):
+                    selector_metadata = {}
+                    setattr(plan, "selector_metadata", selector_metadata)
+            if isinstance(selector_metadata, dict):
+                selector_metadata["playbook"] = dict(payload)
+        except Exception:
+            pass
+
+    def _plan_expiration_override(self, plan) -> str | None:
+        override = _safe_plan_attr(plan, "expiration_override", None)
+        if override:
+            return str(override)
+        metadata = _safe_plan_attr(plan, "metadata", None) or {}
+        if isinstance(metadata, dict):
+            meta_override = metadata.get("expiration_override")
+            if meta_override:
+                return str(meta_override)
+        return None
+
+    def _resolve_playbook_probe_order(
+        self,
+        plan,
+        ticker: str,
+        *,
+        request_context: Optional[SelectorRequestContext],
+    ) -> tuple[list[str], dict]:
+        import requests
+
+        _session = getattr(self.data_broker, "session", None) or requests
+        cfg = getattr(self.data_broker, "cfg", None)
+        base_url = (
+            getattr(cfg, "base_url", None)
+            or getattr(self.data_broker, "base_url", "https://sandbox.tradier.com")
+        )
+        token = (
+            getattr(cfg, "access_token", None)
+            or getattr(cfg, "token", None)
+            or getattr(self.data_broker, "access_token", None)
+            or getattr(self.data_broker, "token", "")
+        ) or ""
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        underlying_price = self._fetch_underlying_quote(
+            _session,
+            base_url,
+            headers,
+            ticker,
+            request_context=request_context,
+        )
+        dates, evidence = self._fetch_expirations_list(
+            ticker,
+            request_context=request_context,
+        )
+        now_et = self._playbook_now_et()
+        today_et = now_et.date()
+        expiration_override = self._plan_expiration_override(plan)
+        if request_context is not None:
+            request_context.playbook_now_et = now_et
+            request_context.playbook_today_et = today_et
+            _ctx_refresh_diagnostics(request_context)
+        spec = resolve_contract_playbook(
+            ticker=ticker,
+            side=_safe_plan_attr(plan, "side", ""),
+            timeframe=_safe_plan_attr(plan, "timeframe", ""),
+            pattern=_safe_plan_attr(plan, "pattern", None),
+            underlying_price=float(underlying_price or 0.0),
+            trigger_price=_safe_plan_attr(plan, "trigger_price", None),
+            target_underlying=_safe_plan_attr(plan, "target_underlying", None),
+            wick_targets=_safe_plan_attr(plan, "wick_targets", None) or [],
+            available_expirations=dates,
+            today=today_et,
+            min_dte=int(self.min_dte),
+            max_dte=int(self.max_dte),
+            metadata=_safe_plan_attr(plan, "metadata", None) or {},
+            now_et=now_et,
+            expiration_override=expiration_override,
+        )
+        ordered = resolve_playbook_expiration_order(
+            spec,
+            dates,
+            today=today_et,
+            min_dte=int(self.min_dte),
+            max_dte=int(self.max_dte),
+        )
+        if request_context is not None:
+            request_context.playbook_spec = spec
+            request_context.playbook_ordered_expirations = list(ordered)
+        audit = {
+            "enabled": True,
+            "policy_version": "pr303-amendment-v1",
+            "instrument_class": spec.instrument_class,
+            "timeframe": spec.timeframe,
+            "available_expirations": list(dates),
+            "ordered_expirations": list(ordered),
+            "expirations_probed": [],
+            "preferred_dte_order": list(spec.preferred_dte_order),
+            "selected_expiration": None,
+            "selected_dte": None,
+            "expiration_fallback_used": False,
+            "expiration_fallback_reason": None,
+            "underlying_price": spec.underlying_price,
+            "trigger_price": spec.trigger_price,
+            "target_underlying": spec.target_underlying,
+            "atm_strike": None,
+            "one_step_otm_strike": None,
+            "preferred_strikes": list(spec.preferred_strikes),
+            "strike_band_low": spec.strike_band_low,
+            "strike_band_high": spec.strike_band_high,
+            "selected_strike": None,
+            "selected_initial_rank": None,
+            "selected_strike_policy_tier": None,
+            "selected_strike_policy_label": None,
+            "selected_original_rank_score": None,
+            "selection_reason": None,
+            "policy_reason": spec.policy_reason,
+            "diagnostics": dict(spec.diagnostics),
+        }
+        audit.update(evidence)
+        audit["resolved_now_et"] = now_et.isoformat()
+        audit["resolved_today_et"] = today_et.isoformat()
+        return ordered, audit
+
+    def _playbook_now_et(self) -> datetime:
+        return datetime.now(ZoneInfo("America/New_York"))
+
     def _bucket_expirations(self, dates: list[str]) -> dict[str, list[str]]:
         """Group expirations into DTE buckets A (0–a), B (a+1–b), C (b+1+).
         Each bucket's list is sorted nearest-first. Weekends skipped."""
@@ -3739,6 +3978,14 @@ class APContractSelectionEngine:
         Returns the selected contract, or None (records NO_VALID_PLAYBOOK_DTE_CONTRACT).
         """
         ticker = _safe_plan_attr(plan, "ticker")
+        if request_context is None and playbook_contract_selection_enabled():
+            request_context = _new_selector_request_context(
+                ticker,
+                getattr(self, "mode", "unknown"),
+            )
+            _bind_selector_request_diagnostics(plan, request_context)
+        if request_context is not None:
+            _request_playbook_enabled(request_context)
         audit: dict = {
             "ladder": True,
             "ticker": ticker,
@@ -3842,21 +4089,33 @@ class APContractSelectionEngine:
             return None
 
         try:
+            playbook_audit: dict | None = None
             try:
-                _fetch_result = self._fetch_expirations_list(
-                    ticker,
-                    request_context=request_context,
-                )
-                if (
-                    isinstance(_fetch_result, tuple)
-                    and len(_fetch_result) == 2
-                    and isinstance(_fetch_result[1], dict)
-                ):
-                    dates, _fetch_evidence = _fetch_result
-                    audit.update(_fetch_evidence)
+                if bool(getattr(request_context, "playbook_enabled", False)):
+                    dates, playbook_audit = self._resolve_playbook_probe_order(
+                        plan,
+                        ticker,
+                        request_context=request_context,
+                    )
+                    audit["playbook_enabled"] = True
+                    audit["playbook_ordered_expirations"] = list(dates)
+                    if playbook_audit is not None:
+                        self._set_playbook_audit(plan, request_context, playbook_audit)
                 else:
-                    dates = _fetch_result
-                    audit["expiration_fetch_attempts"] = 1
+                    _fetch_result = self._fetch_expirations_list(
+                        ticker,
+                        request_context=request_context,
+                    )
+                    if (
+                        isinstance(_fetch_result, tuple)
+                        and len(_fetch_result) == 2
+                        and isinstance(_fetch_result[1], dict)
+                    ):
+                        dates, _fetch_evidence = _fetch_result
+                        audit.update(_fetch_evidence)
+                    else:
+                        dates = _fetch_result
+                        audit["expiration_fetch_attempts"] = 1
             except ChainAuthError as exc:
                 return _expiration_failure("CHAIN_AUTH_ERROR", exc, allow_fallback=False)
             except SelectorRequestBudgetExhausted as exc:
@@ -3870,10 +4129,7 @@ class APContractSelectionEngine:
             except ChainProviderError as exc:
                 return _expiration_failure("CHAIN_PROVIDER_ERROR", exc, allow_fallback=True)
 
-            buckets = self._bucket_expirations(dates)
-            order = self._preferred_bucket_order(plan)
-            audit["bucket_order"] = order
-            today = date.today()
+            today = getattr(request_context, "playbook_today_et", None) or date.today()
 
             # Terminal non-DTE reason codes: a verdict that cannot improve by
             # trying another expiration. The ladder stops immediately when one
@@ -3909,12 +4165,46 @@ class APContractSelectionEngine:
             _preserved_retryable = None
             _preserved_quality = None
 
+            if bool(getattr(request_context, "playbook_enabled", False)):
+                ordered_expirations = list(dates)
+                if not ordered_expirations:
+                    _playbook_reason = None
+                    _playbook_explanation = None
+                    if isinstance(playbook_audit, dict):
+                        _playbook_reason = ((playbook_audit.get("diagnostics") or {}).get("error_reason"))
+                        _playbook_explanation = ((playbook_audit.get("diagnostics") or {}).get("error_explanation"))
+                    _reason_code = _playbook_reason or "PLAYBOOK_NO_POLICY_MATCH"
+                    self._set_last_failure({
+                        "stage": "dte_ladder",
+                        "reason_code": _reason_code,
+                        "explanation": _playbook_explanation or "Playbook produced no approved expiration inside the DTE window",
+                    })
+                    if playbook_audit is not None:
+                        playbook_audit["selection_reason"] = _reason_code
+                        self._set_playbook_audit(plan, request_context, playbook_audit)
+                    _persist(_reason_code)
+                    return None
+                probe_cap = max(1, self.dte_ladder_probe_per_bucket * 3)
+                buckets = {"PLAYBOOK": ordered_expirations[:probe_cap]}
+                order = ["PLAYBOOK"]
+                audit["bucket_order"] = order
+                audit["playbook_probe_cap"] = probe_cap
+            else:
+                buckets = self._bucket_expirations(dates)
+                order = self._preferred_bucket_order(plan)
+                audit["bucket_order"] = order
+
             for bucket_name in order:
-                exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket]
+                exps = buckets.get(bucket_name, [])[: self.dte_ladder_probe_per_bucket] if bucket_name != "PLAYBOOK" else buckets.get(bucket_name, [])
                 bucket_rec = {"bucket": bucket_name, "expirations_probed": [], "survivor": False}
                 for exp in exps:
                     if request_context is not None:
                         request_context.expirations_probed.append(exp)
+                    if playbook_audit is not None:
+                        playbook_audit["expirations_probed"].append(exp)
+                        playbook_audit["expiration_fallback_used"] = bool(playbook_audit["expirations_probed"][:-1])
+                        if playbook_audit["expiration_fallback_used"] and playbook_audit["expiration_fallback_reason"] is None:
+                            playbook_audit["expiration_fallback_reason"] = "preferred_expiration_rejected"
                     try:
                         _dte = (date.fromisoformat(exp) - today).days
                     except Exception:
@@ -3970,6 +4260,12 @@ class APContractSelectionEngine:
                         audit["selected_bucket"] = bucket_name
                         audit["selected_dte"] = _dte
                         audit["selected_expiration"] = exp
+                        if playbook_audit is not None:
+                            playbook_audit["selected_expiration"] = exp
+                            playbook_audit["selected_dte"] = _dte
+                            playbook_audit["selected_strike"] = _safe_float(getattr(result, "strike", None))
+                            playbook_audit["selection_reason"] = "highest_ranked_fully_eligible_playbook_candidate"
+                            self._set_playbook_audit(plan, request_context, playbook_audit)
                         _persist("SELECTED")
                         log.info(
                             "[%s] DTE_LADDER_SELECTED bucket=%s dte=%s exp=%s",
@@ -3995,6 +4291,9 @@ class APContractSelectionEngine:
                     "explanation": str(_preserved_quality.get("explanation") or ""),
                 })
                 _restore_selector_failure(plan, _preserved_quality)
+                if playbook_audit is not None:
+                    playbook_audit["selection_reason"] = str(_preserved_quality.get("reason_code") or "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT")
+                    self._set_playbook_audit(plan, request_context, playbook_audit)
                 _persist(str(_preserved_quality.get("reason_code") or "UNKNOWN_REJECTION"))
                 log.warning(
                     "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s "
@@ -4009,6 +4308,9 @@ class APContractSelectionEngine:
                     "explanation": str(_preserved_retryable.get("explanation") or ""),
                 })
                 _restore_selector_failure(plan, _preserved_retryable)
+                if playbook_audit is not None:
+                    playbook_audit["selection_reason"] = str(_preserved_retryable.get("reason_code") or "CHAIN_PROVIDER_ERROR")
+                    self._set_playbook_audit(plan, request_context, playbook_audit)
                 _persist(str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"))
                 log.warning(
                     "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
@@ -4016,9 +4318,10 @@ class APContractSelectionEngine:
                     ticker, _preserved_retryable.get("reason_code"),
                 )
                 return None
+            _final_reason = "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT" if bool(getattr(request_context, "playbook_enabled", False)) else "NO_VALID_PLAYBOOK_DTE_CONTRACT"
             self._set_last_failure({
                 "stage": "dte_ladder",
-                "reason_code": "NO_VALID_PLAYBOOK_DTE_CONTRACT",
+                "reason_code": _final_reason,
                 "explanation": (
                     "No quality survivor in any evaluated DTE bucket "
                     f"(order={order}, buckets={ {k: len(v) for k, v in buckets.items()} })"
@@ -4028,7 +4331,10 @@ class APContractSelectionEngine:
                 "[%s] DTE_LADDER_NO_SURVIVOR order=%s buckets=%s",
                 ticker, order, {k: len(v) for k, v in buckets.items()},
             )
-            _persist("NO_VALID_PLAYBOOK_DTE_CONTRACT")
+            if playbook_audit is not None:
+                playbook_audit["selection_reason"] = _final_reason
+                self._set_playbook_audit(plan, request_context, playbook_audit)
+            _persist(_final_reason)
             return None
         except Exception as exc:
             log.warning("[%s] DTE_LADDER_ERROR fail-closed: %s", ticker, exc)
