@@ -90,6 +90,7 @@ def mock_osm():
         def create_exit_order(self, **kw): return "L-EXIT-001"
         def create_entry_order(self, plan, **kw): return "L-ENTRY-001"
         def transition(self, *a, **kw): return True
+        def update_order_meta(self, *a, **kw): return True
         def _resolve_underlying_symbol(self, *, symbol, contract): return symbol
         @staticmethod
         def _is_broker_accept_status(s): return s in ("open", "pending", "ok", "accepted")

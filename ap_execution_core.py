@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import re
 import time
@@ -23,7 +25,7 @@ import logging
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Optional
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from ap_entry_watcher        import APEntryWatcher, WatchedSignal
@@ -33,6 +35,7 @@ from ap_tier_engine          import APShadowTracker
 from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
+from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -77,6 +80,33 @@ def _resolve_submit_execution_mode(approved_plan, signal, runtime_mode, paper_fl
 ET  = ZoneInfo("America/New_York")
 _OCC_CONTRACT_RE = re.compile(r"\d{6}[CP]\d{5,8}")
 
+
+def _validate_deferred_selector_result(selection, ticker: str = "") -> tuple[bool, str, float, int]:
+    """Return the broker-critical selector values only when all are valid."""
+    contract = str(getattr(selection, "contract_symbol", "") or "").strip()
+    contract_upper = contract.upper()
+    ticker_upper = str(ticker or "").strip().upper()
+    is_occ = bool(
+        contract
+        and not contract_upper.startswith("DEFERRED:")
+        and contract_upper != ticker_upper
+        and _OCC_CONTRACT_RE.search(contract_upper)
+    )
+    try:
+        price = float(
+            getattr(selection, "execution_price_per_share", 0)
+            or getattr(selection, "ask", 0)
+            or getattr(selection, "mid", 0)
+            or 0
+        )
+    except (TypeError, ValueError):
+        price = 0.0
+    try:
+        qty = int(getattr(selection, "affordable_contracts", 0) or 0)
+    except (TypeError, ValueError):
+        qty = 0
+    return bool(is_occ and price > 0 and qty > 0), contract, price, qty
+
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 BOT_MODE            = (os.getenv("AP_MODE") or os.getenv("BOT_MODE") or "PAPER").upper()
 MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
@@ -106,26 +136,21 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 #   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
 #   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 1530 (= 3:30 PM ET; last-entry
 #                                        boundary — see _breach_retry_cutoff_hhmm)
-RETRYABLE_BREACH_SELECTOR_REASONS: frozenset = frozenset({
-    "NO_CHAIN_DATA",                    # legacy compat — broad code kept until all paths emit exact codes
-    "CHAIN_PROVIDER_ERROR",             # Tradier HTTP/network transient failure
-    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", # expirations endpoint returned nothing (can be transient at 9:30–9:36)
-    "CHAIN_PROVIDER_EMPTY_OPTIONS",     # chain endpoint returned zero rows for this expiration
-    "CHAIN_PARSE_EMPTY",                # chain parsed to zero rows after direction filter
-    "NO_EXPIRATION_IN_DTE_WINDOW",      # no eligible expiration in the current DTE probe window
-    "DIRECT_QUOTE_UNAVAILABLE",         # direct-quote revalidation fetch failed
-    # ── PR #219 amendment: Jason LIVE 2026-07-01 recovery additions ──
-    "CHAIN_ROW_ZERO_BID_ASK",           # per-chain-row zero bid or ask — top failure on Jason LIVE today
-    "DIRECT_QUOTE_ZERO_BID_ASK",        # direct OCC quote came back zero — 2nd top failure on Jason LIVE
-    "QUOTE_FETCH_FAILED",               # quote endpoint returned an error/timeout
-    "CHAIN_EMPTY",                      # historical variant emitted when chain returns no rows
-    # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is intentionally excluded here.
-    # It is the DTE-ladder aggregation reason and may reflect structural quality
-    # rejects (OI_TOO_LOW, SPREAD_TOO_WIDE) as well as transient data-miss reasons.
-    # When the ladder emits it, execution_core inspects the dte_ladder_audit to
-    # determine whether the exhaustion came from data-miss (retryable) or quality
-    # rejects (terminal). See _is_ladder_exhaustion_retryable() below.
-})
+# ── Seam 3 (PR #323): canonical retry taxonomy now lives in one place ──────────
+# ap/selector_retry_policy.py is the single source of truth for which selector
+# reason codes are retryable.  Import the frozenset for back-compat; the module
+# also exports is_retryable_selector_reason() and classify_selector_reason()
+# for callers that want richer metadata.
+from ap.selector_retry_policy import (
+    RETRYABLE_BREACH_SELECTOR_REASONS,
+    is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
+)
+# NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
+# It is the DTE-ladder aggregation reason and may reflect structural quality
+# rejects (OI_TOO_LOW, SPREAD_TOO_WIDE) as well as transient data-miss reasons.
+# When the ladder emits it, execution_core inspects the dte_ladder_audit to
+# determine whether the exhaustion came from data-miss (retryable) or quality
+# rejects (terminal). See _is_ladder_exhaustion_retryable() below.
 
 
 # ── P0 (monday-trade-flow-readiness, amended): acceptance ask-cap resolver ───
@@ -228,6 +253,8 @@ def _classify_materialization_handoff(
     pre_submit_limit: float,
     pre_submit_qty: int,
     order_row_contract: "str | None" = None,
+    order_row_limit: "float | None" = None,
+    order_row_qty: "int | None" = None,
 ) -> "tuple[bool | None, str | None]":
     if not handoff_snapshot or not handoff_snapshot.get("captured"):
         return None, None
@@ -273,6 +300,19 @@ def _classify_materialization_handoff(
             return False, (
                 "order_row_contract_diverges_from_selector:"
                 f"selector={selector_contract}:order_row={order_row_str}"
+            )
+        if order_row_limit is not None and abs(
+            float(order_row_limit or 0) - float(pre_submit_limit or 0)
+        ) > 0.001:
+            return False, (
+                "order_row_limit_diverges_from_pre_submit:"
+                f"row={float(order_row_limit or 0):.4f}:"
+                f"pre_submit={float(pre_submit_limit or 0):.4f}"
+            )
+        if order_row_qty is not None and int(order_row_qty or 0) != int(pre_submit_qty or 0):
+            return False, (
+                "order_row_qty_diverges_from_pre_submit:"
+                f"row={int(order_row_qty or 0)}:pre_submit={int(pre_submit_qty or 0)}"
             )
 
     return True, None
@@ -473,7 +513,7 @@ def _classify_deferred_breach_retry_decision(
         _retryable_reason
         and retry_enabled
         and bool(queue_local_order_id)
-        and attempt <= max_attempts
+        and attempt < max_attempts
         and not past_cutoff
     ):
         return {
@@ -488,12 +528,12 @@ def _classify_deferred_breach_retry_decision(
             "retryable_reason": True,
             "terminal_reason": f"breach_retry_cutoff:{_reason_code}",
         }
-    if _retryable_reason and attempt > max_attempts:
+    if _retryable_reason and attempt >= max_attempts:
         return {
             "action": "retry_exhausted",
             "reason_code": _reason_code,
             "retryable_reason": True,
-            "terminal_reason": f"breach_retry_exhausted:{_reason_code}",
+            "terminal_reason": f"BREACH_RETRY_EXHAUSTED:{_reason_code}",
         }
     if _retryable_reason and not retry_enabled:
         return {
@@ -1233,6 +1273,23 @@ class APExecutionCore:
             return None
 
         try:
+            _order_meta = order.get("meta") or {}
+            if isinstance(_order_meta, str):
+                try:
+                    _order_meta = json.loads(_order_meta)
+                except Exception:
+                    _order_meta = {}
+            if not isinstance(_order_meta, dict):
+                _order_meta = {}
+            _recovered_mode = str(
+                order.get("execution_mode") or _order_meta.get("execution_mode") or ""
+            ).strip().lower()
+            if _recovered_mode not in ("live", "paper"):
+                log.critical(
+                    "[%s] Recovered OSM order %s has invalid execution_mode=%r",
+                    watched.ticker, local_order_id, _recovered_mode,
+                )
+                return None
             qty = int(order.get("qty") or 0)
             reserved = float(order.get("reserved_cost") or 0)
             limit_price = float(order.get("limit_price") or 0)
@@ -1248,6 +1305,7 @@ class APExecutionCore:
                 plan_id=str(order.get("plan_id") or sig.get("plan_id") or local_order_id),
                 signal_id=str(order.get("signal_id") or sig.get("signal_id") or local_order_id),
                 client_id=str(order.get("client_id") or self.email or "default"),
+                execution_mode=_recovered_mode,
                 ticker=str(order.get("symbol") or watched.ticker),
                 side=str(order.get("direction") or watched.side),
                 direction=str(order.get("direction") or watched.side),
@@ -1263,6 +1321,7 @@ class APExecutionCore:
                 target_underlying=watched.target_price,
                 contract_symbol=str(order.get("contract") or sig.get("contract_symbol") or ""),
                 limit_price=limit_price if limit_price > 0 else None,
+                metadata=dict(_order_meta),
             )
             sig["_approved_plan"] = recovered
             log.info(
@@ -1806,6 +1865,499 @@ class APExecutionCore:
 
     # ── CALLBACK: Breach Confirmed -> Execute ─────────────────────────────────
 
+    def resume_deferred_broker_ready_order(
+        self,
+        *,
+        local_order_id: str,
+        plan=None,
+    ) -> dict:
+        """Resume BROKER_READY through the canonical breach callback.
+
+        The canonical entry-time gate stack (kill switch, exposure
+        revalidation, fresh option quote, spread policy, drift policy,
+        entry confirmation, account-size cap, submit-intent CAS, broker
+        POST) lives inside ``_on_entry_trigger`` and its ~2000 lines of
+        supporting infrastructure.  Reproducing that surface here would
+        risk drift and duplicate submissions.
+
+        The durable row is fenced before the normal callback is invoked, so
+        recovery shares the production policy stack without a second copy.
+        It returns an explicit disposition that keeps ownership durable:
+
+          * TERMINAL_DURABLE  — only on a truthful boundary:
+                * client identity mismatch
+                * wrong kind
+                * invalid status (not PENDING_TRIGGER/CREATED)
+                * missing trigger evidence
+                * malformed trigger timestamp
+                * trigger older than DEFERRED_RECOVERY_MAX_TRIGGER_AGE_SECONDS
+                * recovery attempt count exhausted
+          * KEEP_WATCHER      — inspection could not complete (OSM
+                                unavailable, row read raised, row is
+                                already-submitted-family) — retain
+                                current owner without change.
+          * RETRY_WAIT / RECONCILE_PENDING — transient or ambiguous outcome.
+
+        The method never mutates the row directly.  The caller
+        (``ap_recovery.APStartupRecovery._recover_deferred_breach_lifecycles``)
+        applies the disposition via existing OSM helpers, preserving
+        broker_ready, contract, qty, limit, selector evidence, submit
+        intent fields, client_id, execution_mode and diagnostics.
+
+        Args:
+            local_order_id: the durable row identifier.
+            plan: optional prebuilt plan snapshot (ignored by scaffold,
+                  reserved for the fully-gated future implementation).
+
+        Returns:
+            dict with keys: disposition, reason_code, terminal_status
+            (when TERMINAL_DURABLE), next_retry_at (when RETRY_WAIT),
+            attempt, max_attempts, owner, generation, local_order_id.
+        """
+        _now = datetime.now(timezone.utc)
+        # Owner label used in returned metadata so downstream code can
+        # attribute the recovery pass without additional lookups.
+        _owner_label = f"recovery_scheduler:{self.client_id or self.email or ''}"
+        _base = {
+            "local_order_id": local_order_id,
+            "owner": _owner_label,
+            "attempt": None,
+            "max_attempts": None,
+            "configured_max_attempts": None,
+            "effective_max_attempts": None,
+            "remaining_recovery_window_seconds": None,
+            "generation": None,
+            "next_retry_at": None,
+        }
+
+        def _keep(reason: str) -> dict:
+            return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
+
+        def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
+            return {
+                **_base, **extra,
+                "disposition": "TERMINAL_DURABLE",
+                "reason_code": reason,
+                "terminal_status": status,
+            }
+
+        # ── OSM reachability ────────────────────────────────────────
+        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
+        if osm is None:
+            return _keep("RECOVERY_OSM_UNAVAILABLE")
+
+        # ── Row read ────────────────────────────────────────────────
+        try:
+            row = osm.get_order(local_order_id)
+        except Exception as exc:
+            log.error(
+                "[%s] resume_deferred_broker_ready_order row_read_failed "
+                "local_order_id=%s exc=%s",
+                self.client_id, local_order_id, exc,
+            )
+            return _keep(f"RECOVERY_ROW_READ_ERROR:{type(exc).__name__}")
+        if not isinstance(row, dict):
+            return _keep("RECOVERY_ROW_MISSING")
+
+        # ── Identity: client_id ─────────────────────────────────────
+        row_client_id = str(row.get("client_id") or "").strip().lower()
+        expected_client_id = str(self.client_id or self.email or "").strip().lower()
+        if row_client_id and expected_client_id and row_client_id != expected_client_id:
+            return _term("RECOVERY_CLIENT_ID_MISMATCH", status="ERROR")
+
+        # ── Identity: kind ──────────────────────────────────────────
+        kind = str(row.get("kind") or "").upper()
+        if kind != "ENTRY":
+            return _term(f"RECOVERY_WRONG_KIND:{kind}", status="ERROR")
+
+        # ── Durable state: status ───────────────────────────────────
+        status = str(row.get("status") or "").upper()
+        if status not in {"PENDING_TRIGGER", "CREATED"}:
+            # Any other status (SUBMITTED family, terminal family) means
+            # this row is not eligible for recovery submit — reconciler
+            # or order monitor owns it.
+            return _keep(f"RECOVERY_STATUS_NOT_ELIGIBLE:{status}")
+
+        # ── Durable state: already submitted (belt-and-suspenders) ──
+        broker_order_id = str(row.get("broker_order_id") or "").strip()
+        submitted_ts = row.get("submitted_ts")
+        if broker_order_id or submitted_ts:
+            return _keep("RECOVERY_ALREADY_SUBMITTED")
+
+        # ── Meta hydration ──────────────────────────────────────────
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        meta = meta or {}
+
+        # ── Trigger evidence & age ──────────────────────────────────
+        # Config with safe defaults.  The chosen defaults intentionally
+        # bias to short windows — restart windows are usually well
+        # under a minute, and a stale trigger should never become a
+        # live submit.
+        try:
+            _max_trigger_age = int(os.getenv(
+                "DEFERRED_RECOVERY_MAX_TRIGGER_AGE_SECONDS", "300"
+            ))
+        except (TypeError, ValueError):
+            _max_trigger_age = 300
+        try:
+            _configured_max_attempts = int(os.getenv(
+                "DEFERRED_RECOVERY_MAX_ATTEMPTS", "20"
+            ))
+        except (TypeError, ValueError):
+            _configured_max_attempts = 20
+        try:
+            _retry_delay_seconds = int(os.getenv(
+                "DEFERRED_RECOVERY_RETRY_DELAY_SECONDS", "30"
+            ))
+        except (TypeError, ValueError):
+            _retry_delay_seconds = 30
+
+        trigger_crossed_at = (
+            meta.get("trigger_crossed_at")
+            or meta.get("trigger_confirmed_at")
+        )
+        if not trigger_crossed_at:
+            return _term("RECOVERY_MISSING_TRIGGER_EVIDENCE", status="EXPIRED")
+        try:
+            _crossed = datetime.fromisoformat(str(trigger_crossed_at))
+            if _crossed.tzinfo is None:
+                _crossed = _crossed.replace(tzinfo=timezone.utc)
+            _trigger_age = (_now - _crossed).total_seconds()
+        except Exception:
+            return _term("RECOVERY_INVALID_TRIGGER_TIMESTAMP", status="EXPIRED")
+        if _trigger_age > _max_trigger_age:
+            return _term("RECOVERY_TRIGGER_TOO_OLD", status="EXPIRED")
+        _remaining_recovery_window = max(0.0, float(_max_trigger_age) - max(0.0, _trigger_age))
+        _effective_max_attempts = max(
+            1,
+            int(math.ceil(_remaining_recovery_window / max(1, _retry_delay_seconds))),
+        )
+        _max_attempts = max(1, min(_configured_max_attempts, _effective_max_attempts))
+
+        # ── Retry exhaustion ────────────────────────────────────────
+        try:
+            _prior_attempts = int(meta.get("recovery_attempt_count") or 0)
+        except (TypeError, ValueError):
+            _prior_attempts = 0
+        _attempt = _prior_attempts + 1
+        if _attempt > _max_attempts:
+            return _term(
+                "RECOVERY_RETRY_EXHAUSTED", status="EXPIRED",
+                attempt=_attempt, max_attempts=_max_attempts,
+            )
+
+        try:
+            _generation = int(meta.get("materialization_generation") or 1)
+        except (TypeError, ValueError):
+            _generation = 1
+        _base.update(
+            attempt=_attempt,
+            max_attempts=_max_attempts,
+            configured_max_attempts=_configured_max_attempts,
+            effective_max_attempts=_effective_max_attempts,
+            remaining_recovery_window_seconds=int(_remaining_recovery_window),
+            generation=_generation,
+        )
+
+        mode = str(row.get("execution_mode") or meta.get("execution_mode") or "").lower()
+        if mode not in {"live", "paper"} or mode != str(self.execution_mode or "").lower():
+            return _term("RECOVERY_EXECUTION_MODE_MISMATCH", status="ERROR")
+        contract = str(row.get("contract") or "").strip()
+        qty = int(row.get("qty") or 0)
+        limit_price = float(row.get("limit_price") or 0)
+        reserved_cost = float(row.get("reserved_cost") or 0)
+        if not self._is_real_occ_contract(contract, str(row.get("symbol") or "")):
+            return _term("RECOVERY_INVALID_OCC_CONTRACT", status="ERROR")
+        if qty <= 0 or limit_price <= 0 or reserved_cost <= 0:
+            return _term("RECOVERY_INVALID_DURABLE_PRICING", status="ERROR")
+        selected_contract = str(meta.get("selected_contract") or "").strip()
+        if not selected_contract or selected_contract != contract:
+            return _term("RECOVERY_SELECTOR_PROOF_MISMATCH", status="ERROR")
+        try:
+            selected_limit = float(meta.get("selected_limit") or 0)
+            selected_qty = int(meta.get("selected_qty") or 0)
+        except (TypeError, ValueError):
+            return _term("RECOVERY_SELECTOR_PROOF_MISMATCH", status="ERROR")
+        if selected_limit <= 0.01 or selected_qty <= 0:
+            return _term("RECOVERY_SELECTOR_PROOF_MISMATCH", status="ERROR")
+
+        # The recovery path deliberately enters the same callback used by a
+        # live watcher.  That keeps kill switches, exposure, quote/spread/drift,
+        # confirmation, final-cap, durable identity and submit_existing_entry
+        # policy in one place instead of maintaining a recovery clone.
+        claim = getattr(osm, "claim_deferred_broker_ready_submit", None)
+        if not callable(claim):
+            return {
+                **_base, "disposition": "RETRY_WAIT",
+                "reason_code": "RECOVERY_SUBMIT_CLAIM_UNAVAILABLE",
+                "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+            }
+        _claim_owner = f"recovery_submit:{local_order_id}:{uuid.uuid4().hex[:12]}"
+        if not claim(local_order_id, owner=_claim_owner, generation=_generation):
+            # A peer, submit intent, status transition, or generation change won
+            # the CAS. Re-read on the next scheduler pass; never POST here.
+            return {
+                **_base, "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECOVERY_SUBMIT_CLAIM_NOT_ACQUIRED",
+                "owner": _claim_owner,
+                "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+            }
+
+        recovered_plan = plan or SimpleNamespace(
+            plan_id=str(row.get("plan_id") or local_order_id),
+            signal_id=str(row.get("signal_id") or meta.get("signal_id") or ""),
+            client_id=str(row.get("client_id") or ""), execution_mode=mode,
+            ticker=str(row.get("symbol") or ""),
+            side=str(row.get("direction") or meta.get("side") or "CALL").upper(),
+            direction=str(row.get("direction") or meta.get("side") or "CALL").upper(),
+            contracts=qty, limit_price=limit_price, max_position_usd=reserved_cost,
+            contract_symbol=contract,
+            trigger_price=float(meta.get("trigger_price") or row.get("trigger_price") or 0),
+            stop_underlying=meta.get("stop_underlying") or meta.get("stop_price"),
+            target_underlying=meta.get("target_underlying") or meta.get("target_price"),
+            metadata=dict(meta), pattern=str(meta.get("pattern") or ""),
+            timeframe=str(meta.get("timeframe") or "1d"), tier=str(meta.get("tier") or "B"),
+            score=float(meta.get("score") or 0), trigger_type="breach",
+        )
+        if not isinstance(getattr(recovered_plan, "metadata", None), dict):
+            recovered_plan.metadata = {}
+        recovered_plan.metadata.update({
+            "contract_deferred": False,
+            "recovery_submit_owner": _claim_owner,
+            "recovery_submit_generation": _generation,
+            "recovery_submit_fenced": True,
+        })
+        signal = {
+            "signal_id": recovered_plan.signal_id, "local_order_id": local_order_id,
+            "client_id": recovered_plan.client_id, "execution_mode": mode,
+            "ticker": recovered_plan.ticker, "side": recovered_plan.side,
+            "entry_price": recovered_plan.trigger_price,
+            "stop_price": recovered_plan.stop_underlying,
+            "target_price": recovered_plan.target_underlying,
+            "contract_symbol": contract, "contracts": qty,
+            "limit_price": limit_price, "reserved_cost": reserved_cost,
+            "contract_deferred": False, "_approved_plan": recovered_plan,
+            "recovery_submit_owner": _claim_owner,
+            "recovery_submit_generation": _generation,
+        }
+        crossed = datetime.fromisoformat(str(trigger_crossed_at))
+        if crossed.tzinfo is None:
+            crossed = crossed.replace(tzinfo=timezone.utc)
+        watched = SimpleNamespace(
+            signal=signal, ticker=recovered_plan.ticker, side=recovered_plan.side,
+            trigger_price=recovered_plan.trigger_price,
+            entry_trigger=recovered_plan.trigger_price,
+            stop_level=recovered_plan.stop_underlying,
+            target_price=recovered_plan.target_underlying,
+            trigger_crossed_at=crossed, triggered_at=crossed,
+            breach_price=float(meta.get("observed_underlying_price") or recovered_plan.trigger_price or 0),
+        )
+        try:
+            self._on_entry_trigger(watched)
+        except Exception as exc:
+            log.exception("[%s] recovered canonical entry callback failed", recovered_plan.ticker)
+            return {
+                **_base, "disposition": "RETRY_WAIT",
+                "reason_code": f"RECOVERY_CANONICAL_GATES_EXCEPTION:{type(exc).__name__}",
+                "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+            }
+
+        after = osm.get_order(local_order_id) or {}
+        after_status = str(after.get("status") or "").upper()
+        after_meta = after.get("meta") or {}
+        if isinstance(after_meta, str):
+            try: after_meta = json.loads(after_meta)
+            except Exception: after_meta = {}
+        if after.get("broker_order_id") and after_status in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}:
+            return {**_base, "disposition": "SUBMITTED", "reason_code": "RECOVERY_CANONICAL_SUBMIT_ACCEPTED", "broker_order_id": after.get("broker_order_id")}
+        if after_meta.get("submit_intent_at"):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECOVERY_SUBMIT_INTENT_REQUIRES_RECONCILIATION"}
+        if after_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return {**_base, "disposition": "TERMINAL_DURABLE", "reason_code": str(after.get("last_error") or "RECOVERY_CANONICAL_GATE_REJECTED"), "terminal_status": after_status}
+        return {
+            **_base, "disposition": "RETRY_WAIT",
+            "reason_code": "RECOVERY_CANONICAL_GATES_NO_DURABLE_OUTCOME",
+            "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
+        }
+
+    def reconcile_deferred_broker_intent(
+        self,
+        *,
+        local_order_id: str,
+    ) -> dict:
+        """Reconcile a submit-intent crash window against broker truth.
+
+        The submit path persists ``submit_intent_at`` and the Tradier
+        idempotency tag (``broker_submit_key`` = local_order_id) BEFORE
+        any broker bytes leave the process.  If the process crashes after
+        the broker accepted the order but before ``broker_order_id`` was
+        committed to the row, the durable row shows:
+
+            submit_intent_at present, broker_order_id absent
+
+        while a LIVE order may exist at the broker.  This is the
+        double-submit hazard: naively "resuming" such a row (the §2 path)
+        could place a second live order for Jason.
+
+        The broker account order list is queried by the durable tag and the
+        result is strongly checked against contract, side and quantity before
+        an existing order is adopted. Ambiguity remains fail-closed.
+
+          * ALREADY_RECONCILED — broker_order_id already present; the
+            order monitor owns the row.  (Defensive; the recovery load
+            filter normally excludes these.)
+          * NOT_IN_CRASH_WINDOW — no submit_intent_at; the row never
+            reached the broker-submit boundary and is safe for the normal
+            resume path.
+          * RECONCILE_PENDING — broker truth is unavailable or ambiguous.
+          * KEEP_WATCHER — inspection could not complete (OSM unavailable,
+            row read raised, row missing).
+
+        This method never POSTs. It only reads broker truth and adopts an exact
+        match through the existing order state machine.
+        """
+        _owner_label = f"broker_reconciler:{self.client_id or self.email or ''}"
+        _base = {
+            "local_order_id": local_order_id,
+            "owner": _owner_label,
+            "submit_intent_at": None,
+            "broker_submit_key": None,
+        }
+
+        def _keep(reason: str) -> dict:
+            return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
+
+        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
+        if osm is None:
+            return _keep("RECONCILE_OSM_UNAVAILABLE")
+        try:
+            row = osm.get_order(local_order_id)
+        except Exception as exc:
+            log.error(
+                "[%s] reconcile_deferred_broker_intent row_read_failed "
+                "local_order_id=%s exc=%s",
+                self.client_id, local_order_id, exc,
+            )
+            return _keep(f"RECONCILE_ROW_READ_ERROR:{type(exc).__name__}")
+        if not isinstance(row, dict):
+            return _keep("RECONCILE_ROW_MISSING")
+
+        # Identity: client_id (never touch another client's row)
+        row_client_id = str(row.get("client_id") or "").strip().lower()
+        expected_client_id = str(self.client_id or self.email or "").strip().lower()
+        if row_client_id and expected_client_id and row_client_id != expected_client_id:
+            return _keep("RECONCILE_CLIENT_ID_MISMATCH")
+        row_mode = str(row.get("execution_mode") or "").strip().lower()
+        expected_mode = str(getattr(self, "execution_mode", None) or getattr(self, "mode", None) or "").strip().lower()
+        if row_mode and expected_mode and row_mode != expected_mode:
+            return _keep("RECONCILE_EXECUTION_MODE_MISMATCH")
+
+        broker_order_id = str(row.get("broker_order_id") or "").strip()
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        meta = meta or {}
+        submit_intent_at = meta.get("submit_intent_at")
+        broker_submit_key = meta.get("broker_submit_key")
+        _base["submit_intent_at"] = submit_intent_at
+        _base["broker_submit_key"] = broker_submit_key
+
+        # ── Already has a broker order → adopted, not our concern ────
+        if broker_order_id:
+            return {
+                **_base,
+                "disposition": "ALREADY_RECONCILED",
+                "reason_code": "RECONCILE_BROKER_ORDER_PRESENT",
+                "broker_order_id": broker_order_id,
+            }
+
+        # ── No submit intent → not a crash-window row ────────────────
+        if not submit_intent_at:
+            return {
+                **_base,
+                "disposition": "NOT_IN_CRASH_WINDOW",
+                "reason_code": "RECONCILE_NO_SUBMIT_INTENT",
+            }
+
+        broker = getattr(self, "broker", None)
+        list_orders = getattr(broker, "list_orders", None)
+        if not callable(list_orders):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_BROKER_QUERY_UNAVAILABLE"}
+        try:
+            broker_orders = list_orders()
+        except Exception as exc:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
+
+        tag = str(broker_submit_key or local_order_id)[:32]
+        exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
+        expected_contract = str(row.get("contract") or "")
+        expected_qty = int(row.get("qty") or 0)
+        strong = [
+            o for o in exact_tag
+            if str(o.get("option_symbol") or o.get("contract") or o.get("symbol") or "") == expected_contract
+            and str(o.get("side") or "").lower() == "buy_to_open"
+            and int(float(o.get("quantity") or 0)) == expected_qty
+        ]
+        if len(exact_tag) > 1 or len(strong) > 1:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MULTIPLE_MATCHES", "match_count": len(exact_tag)}
+        if exact_tag and not strong:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
+        if not strong:
+            # An empty authoritative response is still held through the
+            # ambiguity window. The next recovery pass can re-enter Part A.
+            try:
+                intent_dt = datetime.fromisoformat(str(submit_intent_at))
+                if intent_dt.tzinfo is None: intent_dt = intent_dt.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(timezone.utc) - intent_dt).total_seconds()
+            except Exception:
+                elapsed = 0
+            window = int(os.getenv("DEFERRED_BROKER_AMBIGUITY_SECONDS", "30"))
+            if elapsed < window:
+                return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_AMBIGUITY_WINDOW_ACTIVE"}
+            osm.update_order_meta(local_order_id, {
+                "submit_intent_at": None, "broker_submit_key": None,
+                "recovery_submit_owner": "", "current_owner": _owner_label,
+                "reconcile_authoritative_no_match_at": now_utc_iso(),
+            })
+            return {**_base, "disposition": "NOT_IN_CRASH_WINDOW", "reason_code": "RECONCILE_AUTHORITATIVE_NO_MATCH"}
+
+        remote = strong[0]
+        remote_id = str(remote.get("id") or remote.get("order_id") or "")
+        remote_status = str(remote.get("status") or "").lower().replace("-", "_")
+        if not remote_id:
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_MATCH_MISSING_ORDER_ID"}
+        status_map = {
+            "filled": "FILLED", "partially_filled": "PARTIAL_FILL",
+            "partial_filled": "PARTIAL_FILL", "rejected": "REJECTED",
+            "canceled": "CANCELED", "cancelled": "CANCELED", "expired": "EXPIRED",
+        }
+        local_status = status_map.get(remote_status, "SUBMITTED")
+        # Establish the accepted boundary first so the existing state machine
+        # owns all subsequent fill/terminal transitions.
+        if not osm.transition(local_order_id, "SUBMITTED", broker_order_id=remote_id, submitted_ts=now_utc_iso()):
+            return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_ADOPTION_TRANSITION_FAILED"}
+        if local_status != "SUBMITTED":
+            osm.transition(
+                local_order_id, local_status, broker_order_id=remote_id,
+                filled_qty=remote.get("exec_quantity") or remote.get("filled_quantity"),
+                fill_price=remote.get("avg_fill_price"),
+                last_error=(str(remote.get("reason") or remote.get("message") or "") or None),
+            )
+        osm.update_order_meta(local_order_id, {
+            "reconciled_at": now_utc_iso(), "recovery_classification": "BROKER_ORDER_ADOPTED",
+            "broker_reconcile_status": remote_status, "broker_reconcile_response": remote,
+            "current_owner": "ORDER_MONITOR", "lifecycle_state": local_status,
+        })
+        return {**_base, "disposition": "ALREADY_RECONCILED", "reason_code": "BROKER_ORDER_ADOPTED", "broker_order_id": remote_id, "status": local_status}
+
     def _on_entry_trigger(self, watched: WatchedSignal):
         """Called by watcher when price holds above/below trigger for 2 polls.
 
@@ -1821,6 +2373,62 @@ class APExecutionCore:
         sig = watched.signal or {}
         ticker = watched.ticker
         signal_id = str(sig.get("signal_id", "") or "")
+
+        # Recovery ownership must exist before the first policy gate.  Store one
+        # immutable context on the callback payload so every cleanup path uses
+        # the same exact owner/generation/mode/local-order identity.
+        _initial_plan = sig.get("_approved_plan")
+        _initial_meta = getattr(_initial_plan, "metadata", None) or {}
+        if not isinstance(_initial_meta, dict):
+            _initial_meta = {}
+        _is_recovered = bool(
+            sig.get("recovery_submit_fenced")
+            or _initial_meta.get("recovery_submit_fenced")
+        )
+        _recovery_owner = str(
+            sig.get("recovery_submit_owner")
+            or _initial_meta.get("recovery_submit_owner")
+            or ""
+        ).strip()
+        _recovery_generation_raw = (
+            sig.get("recovery_submit_generation")
+            if sig.get("recovery_submit_generation") is not None
+            else _initial_meta.get("recovery_submit_generation")
+        )
+        try:
+            _recovery_generation = int(_recovery_generation_raw)
+        except (TypeError, ValueError):
+            _recovery_generation = None
+        _callback_mode = str(
+            sig.get("execution_mode")
+            or getattr(_initial_plan, "execution_mode", None)
+            or getattr(self, "execution_mode", None)
+            or ""
+        ).strip().lower()
+        _callback_local_order_id = str(sig.get("local_order_id") or "").strip()
+        _ownership_context = MappingProxyType({
+            "is_recovered": _is_recovered,
+            "owner": _recovery_owner,
+            "generation": _recovery_generation,
+            "execution_mode": _callback_mode,
+            "local_order_id": _callback_local_order_id,
+        })
+        sig["_callback_ownership_context"] = _ownership_context
+        if _is_recovered and (
+            not _recovery_owner
+            or _recovery_generation is None
+            or _callback_mode not in {"live", "paper"}
+            or not _callback_local_order_id
+        ):
+            log.critical(
+                "[%s] RECOVERY_CALLBACK_OWNERSHIP_INVALID order=%s owner=%r generation=%r mode=%r",
+                ticker, _callback_local_order_id, _recovery_owner,
+                _recovery_generation, _callback_mode,
+            )
+            return {
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "RECOVERY_CALLBACK_OWNERSHIP_INVALID",
+            }
 
         # P0 hotfix — resolve client identity from the signal dict first, then
         # fall back to self.client_id (set in __init__), then self.email.
@@ -1869,7 +2477,22 @@ class APExecutionCore:
                 max_positions=getattr(self, "_max_positions", "n/a"),
                 level="info",
             )
-            return
+            # A normal callback return causes watcher ownership to be released.
+            # Therefore every breach-risk block must first make the order
+            # terminal; logging/decision_status alone is not lifecycle truth.
+            _risk_terminalized = self._cleanup_pending_entry_order(
+                watched,
+                action="expire",
+                reason="breach_risk_check_false",
+            )
+            return {
+                "disposition": (
+                    "TERMINAL_DURABLE" if _risk_terminalized
+                    else str(sig.get("_recovery_cleanup_disposition") or "KEEP_WATCHER")
+                ),
+                "reason_code": "breach_risk_check_false",
+                "retry_after_seconds": 5,
+            }
 
         # 2) Require OSM + existing queue-created local order id.
         if self.order_state_machine is None:
@@ -1893,6 +2516,8 @@ class APExecutionCore:
                 })
             return
 
+        _deferred_claim_context = {"owner": "", "generation": None}
+
         if not hasattr(self.order_state_machine, "submit_existing_entry"):
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — OSM missing submit_existing_entry", ticker)
             _reason = "osm_missing_submit_existing_entry"
@@ -1914,6 +2539,22 @@ class APExecutionCore:
             context_notes: str | None = None,
             funnel_key: str = "order_failed",
         ) -> None:
+            if _ownership_context.get("is_recovered"):
+                # Recovery terminal truth belongs to the exact callback owner.
+                # Never write generic diagnostics or signal state before its
+                # owner/generation/lease CAS succeeds.
+                _recovered_ok = self._cleanup_pending_entry_order(
+                    watched, action=cleanup_action, reason=reason,
+                )
+                if _recovered_ok:
+                    if funnel_key:
+                        funnel.inc(funnel_key)
+                    if signal_id:
+                        self.store.update_signal_fields(signal_id, {
+                            "decision_status": decision_status,
+                            "context_notes": context_notes or reason,
+                        })
+                return
             if funnel_key:
                 funnel.inc(funnel_key)
             if signal_id:
@@ -1921,6 +2562,31 @@ class APExecutionCore:
                     "decision_status": decision_status,
                     "context_notes": context_notes or reason,
                 })
+            _claim_owner = str(_deferred_claim_context.get("owner") or "")
+            _claim_generation = _deferred_claim_context.get("generation")
+            _atomic_terminalize = getattr(
+                self.order_state_machine, "terminalize_deferred_breach", None,
+            )
+            if _claim_owner and callable(_atomic_terminalize):
+                try:
+                    if _atomic_terminalize(
+                        queue_local_order_id,
+                        reason_code=str(reason or "UNKNOWN_BREACH_FAILURE"),
+                        terminal_status=("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
+                        owner=_claim_owner,
+                        generation=_claim_generation,
+                        diagnostics=meta_patch or {},
+                    ):
+                        return {
+                            "disposition": "TERMINAL_DURABLE",
+                            "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
+                            "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
+                        }
+                except Exception as _atomic_terminal_exc:
+                    log.critical(
+                        "[%s] breach atomic terminal write failed order=%s error=%s",
+                        ticker, queue_local_order_id, _atomic_terminal_exc,
+                    )
             if queue_local_order_id and self.order_state_machine is not None and meta_patch:
                 try:
                     update_meta = getattr(self.order_state_machine, "update_order_meta", None)
@@ -1928,10 +2594,22 @@ class APExecutionCore:
                         update_meta(queue_local_order_id, meta_patch)
                 except Exception as _meta_exc:
                     log.warning("[%s] breach failure meta persist failed: %s", ticker, _meta_exc)
-            self._cleanup_pending_entry_order(watched, action=cleanup_action, reason=reason)
-            return
+            _cleanup_ok = self._cleanup_pending_entry_order(
+                watched, action=cleanup_action, reason=reason,
+            )
+            if not _cleanup_ok:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "BREACH_TERMINAL_WRITE_FAILED",
+                    "retry_after_seconds": 5,
+                }
+            return {
+                "disposition": "TERMINAL_DURABLE",
+                "reason_code": str(reason or "UNKNOWN_BREACH_FAILURE"),
+                "terminal_status": ("CANCELED" if cleanup_action == "cancel" else "EXPIRED"),
+            }
 
-        def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> None:
+        def _terminalize_deferred_breach_failure(reason: str, *, extra_meta: dict | None = None) -> dict:
             """Best-effort cleanup for deferred breach failures.
 
             Acceptance contract:
@@ -1945,13 +2623,48 @@ class APExecutionCore:
             }
             if extra_meta:
                 meta_patch.update(extra_meta)
-            _terminalize_breach_failure(
+            if _ownership_context.get("is_recovered"):
+                return _terminalize_breach_failure(
+                    reason,
+                    cleanup_action="expire",
+                    meta_patch=meta_patch,
+                    context_notes=reason,
+                )
+            _atomic_terminalize = getattr(
+                self.order_state_machine, "terminalize_deferred_breach", None,
+            )
+            if callable(_atomic_terminalize):
+                try:
+                    if _atomic_terminalize(
+                        queue_local_order_id,
+                        reason_code=str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
+                        terminal_status="EXPIRED",
+                        owner=str(_deferred_claim_context.get("owner") or ""),
+                        generation=_deferred_claim_context.get("generation"),
+                        diagnostics=meta_patch,
+                    ):
+                        if signal_id:
+                            self.store.update_signal_fields(signal_id, {
+                                "decision_status": "blocked_at_breach",
+                                "context_notes": reason,
+                            })
+                        funnel.inc("order_failed")
+                        return {
+                            "disposition": "TERMINAL_DURABLE",
+                            "reason_code": str(reason or "UNKNOWN_DEFERRED_BREACH_FAILURE"),
+                            "terminal_status": "EXPIRED",
+                        }
+                except Exception as _atomic_terminal_exc:
+                    log.critical(
+                        "[%s] deferred terminal CAS failed order=%s error=%s",
+                        ticker, queue_local_order_id, _atomic_terminal_exc,
+                    )
+            return _terminalize_breach_failure(
                 reason,
                 cleanup_action="expire",
                 meta_patch=meta_patch,
                 context_notes=reason,
             )
-            return
 
         # ── PR3 (no-silent-deferred-trigger-exits): canonical terminal outcome ──
         # Every triggered deferred row MUST leave exactly one explicit TERMINAL
@@ -2244,6 +2957,15 @@ class APExecutionCore:
         # select the contract before the limit_price and contract_symbol checks.
         _sig_meta   = getattr(approved_plan, "metadata", {}) or {}
         _sig_dict   = sig or {}
+        _proof_client_id = str(
+            getattr(approved_plan, "client_id", None) or _breach_client_id or ""
+        )
+        _proof_execution_mode = str(
+            getattr(approved_plan, "execution_mode", None)
+            or sig.get("execution_mode")
+            or getattr(self, "execution_mode", None)
+            or ""
+        )
         _candidate_audit = None  # Item 3 — set if breach-time selection runs
         _contract_sym_raw = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
         _deferred   = (
@@ -2288,6 +3010,8 @@ class APExecutionCore:
             # not-applicable paths. Any non-None value is authoritative and
             # participates in the mismatch decision.
             "order_row_contract":     None,
+            "order_row_limit":        None,
+            "order_row_qty":          None,
         }
         if _deferred:
             if self.contract_selector is None:
@@ -2300,7 +3024,7 @@ class APExecutionCore:
                     "BREACH_SELECTOR_RETURNED_NONE",
                     reason=_reason,
                 )
-                _terminalize_deferred_breach_failure(
+                return _terminalize_deferred_breach_failure(
                     _reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
@@ -2325,46 +3049,108 @@ class APExecutionCore:
                 str(_contract_sym_raw or ""),
                 float(getattr(approved_plan, "limit_price", 0) or 0),
             )
-            # P0 (PR #300): stamp QUEUED then RUNNING into orders.meta so the
-            # materialization bucket is visible in Supabase from the moment
-            # price triggers. broker_ready stays False until stamp_selected()
-            # is called on the success path below.
+            # Atomically fence the breach worker before selector/network work.
+            # A failed claim never falls through to broker submission.  The
+            # watcher keeps ownership and retries the durable write later.
             _mat_client_id    = str(_breach_client_id or "")
             _mat_exec_mode    = str(getattr(approved_plan, "execution_mode", "") or "")
             _mat_direction    = str(getattr(approved_plan, "side", "") or "")
             _mat_trigger_price = float(getattr(watched, "trigger_price", 0) or 0)
+            _mat_owner = str(
+                sig.get("watcher_token")
+                or sig.get("materialization_owner")
+                or f"execution-core:{getattr(self, 'client_id', '')}:{queue_local_order_id}"
+            )
             _prior_mat_attempt = 0
             try:
                 _meta_for_attempt = getattr(approved_plan, "metadata", None) or {}
                 _prior_mat_attempt = int(_meta_for_attempt.get("materialization_attempts", 0) or 0)
             except Exception:
                 _prior_mat_attempt = 0
+            # ── AMENDMENT §3: strictly monotonic generation ──────────
+            # Read the *current* persisted generation directly from the
+            # durable row.  The plan's metadata carries a stale
+            # snapshot; using it would cause a reclaim after lease
+            # expiry to compute the wrong new_generation and the CAS
+            # would fail.  Fresh read is authoritative.
+            _persisted_generation = 0
             try:
-                from ap.deferred_materializer import (
-                    stamp_trigger_queued, stamp_running, _cfg as _mat_cfg,
+                _durable_row = self.order_state_machine.get_order(queue_local_order_id)
+                if isinstance(_durable_row, dict):
+                    _dur_meta = _durable_row.get("meta") or {}
+                    if isinstance(_dur_meta, str):
+                        try:
+                            _dur_meta = json.loads(_dur_meta)
+                        except Exception:
+                            _dur_meta = {}
+                    _persisted_generation = int(
+                        (_dur_meta or {}).get("materialization_generation") or 0
+                    )
+            except Exception:
+                _persisted_generation = 0
+            _mat_generation = _persisted_generation + 1
+            _deferred_claim_context.update({
+                "owner": _mat_owner,
+                "generation": _mat_generation,
+            })
+            _mat_claim = getattr(
+                self.order_state_machine, "claim_deferred_materialization", None,
+            )
+            _mat_claimed = False
+            if callable(_mat_claim):
+                try:
+                    _lease_until = (
+                        datetime.now(timezone.utc) + timedelta(seconds=120)
+                    ).isoformat()
+                    _crossed_at = getattr(watched, "trigger_crossed_at", None)
+                    _crossed_at = (
+                        _crossed_at.isoformat()
+                        if hasattr(_crossed_at, "isoformat")
+                        else str(_crossed_at or datetime.now(timezone.utc).isoformat())
+                    )
+                    _observed_underlying = float(
+                        getattr(watched, "last_quote_ask", 0)
+                        or getattr(watched, "last_quote_bid", 0)
+                        or _mat_trigger_price
+                        or 0
+                    )
+                    _mat_claimed = bool(_mat_claim(
+                        str(queue_local_order_id or ""),
+                        owner=_mat_owner,
+                        generation=_mat_generation,
+                        lease_until=_lease_until,
+                        trigger_crossed_at=_crossed_at,
+                        trigger_price=_mat_trigger_price,
+                        observed_underlying_price=_observed_underlying,
+                        signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                        execution_mode=_mat_exec_mode,
+                    ))
+                except Exception as _mat_claim_exc:
+                    log.critical(
+                        "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
+                        ticker, queue_local_order_id, _mat_claim_exc,
+                    )
+            if not _mat_claimed:
+                try:
+                    _claim_row = self.order_state_machine.get_order(queue_local_order_id)
+                except Exception:
+                    _claim_row = None
+                if isinstance(_claim_row, dict):
+                    _claim_status = str(_claim_row.get("status") or "").upper()
+                    if _claim_status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
+                        return {"disposition": "SUBMITTED"}
+                    if _claim_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                        return {"disposition": "TERMINAL_DURABLE"}
+                log.critical(
+                    "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s — "
+                    "selector and broker submission blocked; watcher retains ownership",
+                    ticker, queue_local_order_id,
                 )
-                stamp_trigger_queued(
-                    self.order_state_machine,
-                    str(queue_local_order_id or ""),
-                    client_id=_mat_client_id,
-                    execution_mode=_mat_exec_mode,
-                    symbol=ticker,
-                    direction=_mat_direction,
-                    triggered_price=_mat_trigger_price,
-                    signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                )
-                stamp_running(
-                    self.order_state_machine,
-                    str(queue_local_order_id or ""),
-                    client_id=_mat_client_id,
-                    execution_mode=_mat_exec_mode,
-                    symbol=ticker,
-                    attempt=_prior_mat_attempt + 1,
-                    lock_ttl_s=_mat_cfg().get("lock_ttl_s", 120),
-                )
-            except Exception as _mat_stamp_exc:
-                log.debug("[%s] materialization lifecycle stamp (non-critical): %s",
-                          ticker, _mat_stamp_exc)
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_STATE_WRITE_FAILED",
+                    "retry_after_seconds": 5,
+                }
             try:
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
@@ -2398,22 +3184,36 @@ class APExecutionCore:
                 except Exception:
                     pass
                 _sel = self.contract_selector.select(approved_plan)
-                _sel_contract = str(getattr(_sel, "contract_symbol", "") or "").strip()
+                (
+                    _sel_result_valid,
+                    _sel_contract,
+                    _sel_price_candidate,
+                    _sel_qty_candidate,
+                ) = _validate_deferred_selector_result(_sel, ticker)
                 _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
                 _plan_is_placeholder = (not _live_contract) or _live_contract.upper().startswith("DEFERRED:")
-                _sel_is_real = bool(_sel_contract) and not _sel_contract.upper().startswith("DEFERRED:")
+                _sel_is_real = self._is_real_occ_contract(_sel_contract, ticker)
+
+                if _sel is not None and not _sel_result_valid:
+                    _invalid_reason = "SELECTOR_RESULT_INVALID"
+                    _terminalize_deferred_breach_failure(
+                        _invalid_reason,
+                        extra_meta={
+                            "failure_stage": "selector_result_validation",
+                            "selector_contract": _sel_contract,
+                            "selector_price": _sel_price_candidate,
+                            "selector_qty": _sel_qty_candidate,
+                        },
+                    )
+                    return {"disposition": "TERMINAL_DURABLE"}
 
                 if _sel_is_real and _plan_is_placeholder:
                     try:
                         approved_plan.contract_symbol = _sel_contract
-                        _sel_price = (
-                            getattr(_sel, "execution_price_per_share", None)
-                            or getattr(_sel, "ask", None)
-                            or getattr(_sel, "mid", None)
-                        )
+                        _sel_price = _sel_price_candidate
                         if _sel_price:
                             approved_plan.limit_price = float(_sel_price)
-                        _sel_qty = int(getattr(_sel, "affordable_contracts", 0) or 0)
+                        _sel_qty = _sel_qty_candidate
                         if _sel_qty > 0:
                             approved_plan.contracts = _sel_qty
                             _prem_per_contract = float(getattr(_sel, "premium_per_contract", 0) or 0)
@@ -2508,7 +3308,7 @@ class APExecutionCore:
                         except Exception as _cap_obs_exc:
                             log.debug("[%s] cap misconfigured queue write non-critical: %s",
                                       ticker, _cap_obs_exc)
-                        _terminalize_deferred_breach_failure(
+                        return _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
                                 "failure_stage": "acceptance_ask_cap",
@@ -2516,7 +3316,6 @@ class APExecutionCore:
                                 "selected_contract": _sel_contract,
                             },
                         )
-                        return
                     _sel_ask = float(getattr(_sel, "ask", 0) or 0)
                     if _sel_ask <= 0 or _sel_ask > _accept_cap:
                         _cap_reason = (
@@ -2556,7 +3355,7 @@ class APExecutionCore:
                         except Exception as _cap_obs_exc2:
                             log.debug("[%s] cap exceeded queue write non-critical: %s",
                                       ticker, _cap_obs_exc2)
-                        _terminalize_deferred_breach_failure(
+                        return _terminalize_deferred_breach_failure(
                             _cap_reason,
                             extra_meta={
                                 "failure_stage": "acceptance_ask_cap",
@@ -2565,7 +3364,6 @@ class APExecutionCore:
                                 "acceptance_cap": _accept_cap,
                             },
                         )
-                        return
                     # Cap passed — acceptance mode trades exactly one
                     # contract at the selected premium.
                     try:
@@ -2822,70 +3620,69 @@ class APExecutionCore:
                             str(_contract_sym_raw or ""),
                             float(getattr(approved_plan, "limit_price", 0) or 0),
                         )
-                        # P0 (PR #300): stamp RETRY_PENDING lifecycle state.
-                        try:
-                            from ap.deferred_materializer import stamp_retry_pending, _retry_delay_seconds, _cfg as _mat_cfg
-                            _mat_cfg_v = _mat_cfg()
-                            stamp_retry_pending(
-                                self.order_state_machine,
-                                str(queue_local_order_id or ""),
-                                client_id=str(_breach_client_id or ""),
-                                execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                                symbol=ticker,
-                                direction=str(getattr(approved_plan, "side", "") or ""),
-                                reason_code=str(_obs_rc_a or ""),
-                                attempt=int(_this_attempt_a),
-                                max_attempts=int(_MAX_RETRIES_A),
-                                retry_delay_s=int(_RETRY_DELAY_A),
-                                selector_failure=_deferred_selector_audit or {},
-                            )
-                        except Exception as _rp_exc:
-                            log.debug("[%s] stamp_retry_pending non-critical: %s", ticker, _rp_exc)
-                        # Update attempt count — do NOT expire/cancel the order
+                        # Transfer the fenced claim to a durable RETRY_WAIT row.
+                        # The watcher remains the runnable owner in this process;
+                        # startup recovery consumes the same next_retry_at after a
+                        # restart.  There is no thread-only scheduler or sleep.
+                        _next_retry_at_a = (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=int(_RETRY_DELAY_A))
+                        ).isoformat()
+                        _schedule_retry = getattr(
+                            self.order_state_machine,
+                            "schedule_deferred_materialization_retry",
+                            None,
+                        )
+                        _retry_persisted = False
+                        if callable(_schedule_retry):
+                            try:
+                                _retry_persisted = bool(_schedule_retry(
+                                    str(queue_local_order_id or ""),
+                                    owner=_mat_owner,
+                                    generation=_mat_generation,
+                                    reason_code=str(_obs_rc_a or ""),
+                                    attempt=int(_this_attempt_a),
+                                    max_attempts=int(_MAX_RETRIES_A),
+                                    next_retry_at=_next_retry_at_a,
+                                    selector_failure={
+                                        **(_deferred_selector_audit or {}),
+                                        **_build_deferred_retry_schedule_meta(
+                                            reason_code=_obs_rc_a,
+                                            selector_audit=_deferred_selector_audit or {},
+                                            attempt=_this_attempt_a,
+                                            max_attempts=_MAX_RETRIES_A,
+                                            delay_seconds=_RETRY_DELAY_A,
+                                            client_id=_breach_client_id,
+                                            execution_mode=str(
+                                                getattr(approved_plan, "execution_mode", "") or ""
+                                            ),
+                                            local_order_id=str(queue_local_order_id or ""),
+                                            signal_id=str(
+                                                getattr(approved_plan, "signal_id", "") or ""
+                                            ),
+                                        ),
+                                    },
+                                ))
+                            except Exception as _schedule_exc:
+                                log.critical(
+                                    "[%s] MATERIALIZATION_RETRY_SCHEDULE_WRITE_FAILED "
+                                    "order=%s error=%s",
+                                    ticker, queue_local_order_id, _schedule_exc,
+                                )
+                        if not _retry_persisted:
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": "MATERIALIZATION_RETRY_SCHEDULE_WRITE_FAILED",
+                                "retry_after_seconds": 5,
+                            }
+
                         try:
                             _ap_meta_a = getattr(approved_plan, "metadata", None)
                             if isinstance(_ap_meta_a, dict):
                                 _ap_meta_a["breach_attempt_count"] = _this_attempt_a
+                                _ap_meta_a["materialization_generation"] = _mat_generation
                         except Exception:
                             pass
-                        try:
-                            # Fix B: build flat selector audit fields and merge atomically
-                            # into the existing retry meta write — single DB write, no regression.
-                            _fix_b_retry: dict = {}
-                            try:
-                                _fix_b_retry = _build_flat_selector_audit_fields(
-                                    selector_audit=_deferred_selector_audit or {},
-                                    attempt_number=_this_attempt_a,
-                                    execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                                    is_paper=bool(getattr(self, "paper", False)),
-                                    broker_base_url=str(
-                                        getattr(getattr(self.broker, "cfg", None), "base_url", "") or ""
-                                    ),
-                                )
-                            except Exception:
-                                pass
-                            _upd_retry_a = getattr(self.order_state_machine, "update_order_meta", None)
-                            if callable(_upd_retry_a) and queue_local_order_id:
-                                _upd_retry_a(queue_local_order_id, {
-                                    "breach_attempt_count":            _this_attempt_a,
-                                    "last_breach_failure_reason":      str(_reason or ""),
-                                    "last_breach_failure_reason_code": str(_obs_rc_a),
-                                    "last_breach_failure_at":          datetime.now(timezone.utc).isoformat(),
-                                    **_build_deferred_retry_schedule_meta(
-                                        reason_code=_obs_rc_a,
-                                        selector_audit=_deferred_selector_audit or {},
-                                        attempt=_this_attempt_a,
-                                        max_attempts=_MAX_RETRIES_A,
-                                        delay_seconds=_RETRY_DELAY_A,
-                                        client_id=_breach_client_id,
-                                        execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                                        local_order_id=str(queue_local_order_id or ""),
-                                        signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                                    ),
-                                    **_fix_b_retry,   # Fix B merged atomically
-                                })
-                        except Exception as _retry_meta_exc_a:
-                            log.debug("[%s] retry meta update non-critical: %s", ticker, _retry_meta_exc_a)
                         try:
                             from ap.queue import write_deferred_breach_last_error
                             _queue_id_retry_a = (
@@ -2906,180 +3703,12 @@ class APExecutionCore:
                             )
                         except Exception as _retry_obs_exc_a:
                             log.debug("[%s] retry queue write non-critical: %s", ticker, _retry_obs_exc_a)
-                        # Rearm: fire _on_entry_trigger again after delay.
-                        # `watched` is still valid — the price already breached.
-                        import threading as _threading_retry
-                        _retry_key_a = (
-                            str(queue_local_order_id or ""),
-                            int(_this_attempt_a),
-                        )
-                        _retry_inflight_a = getattr(self, "_deferred_breach_retry_inflight", None)
-                        if not isinstance(_retry_inflight_a, set):
-                            _retry_inflight_a = set()
-                            setattr(self, "_deferred_breach_retry_inflight", _retry_inflight_a)
-                        if _retry_key_a in _retry_inflight_a:
-                            log.warning(
-                                "[%s] DEFERRED_BREACH_RETRY_DUPLICATE_SUPPRESSED order=%s attempt=%d",
-                                ticker, queue_local_order_id, _this_attempt_a,
-                            )
-                            return
-                        _retry_inflight_a.add(_retry_key_a)
-                        _watched_ref = watched
-                        def _retry_deferred_breach_a(_w=_watched_ref, _t=ticker,
-                                                      _att=_this_attempt_a, _d=_RETRY_DELAY_A,
-                                                      _retry_key=_retry_key_a,
-                                                      _oid=queue_local_order_id):
-                            try:
-                                time.sleep(_d)
-                                # PR #219 Fix B: stale-state guard.
-                                # Between the first _on_entry_trigger call and now, the
-                                # pending entry row may have been terminalized externally:
-                                # - order_monitor EOD cleanup / cancel
-                                # - watcher expiry from a separate watcher poll
-                                # - a concurrent retry thread that already succeeded
-                                # - manual operator DB update
-                                # Re-entering _on_entry_trigger on a non-PENDING_TRIGGER
-                                # row causes duplicate OSM transitions, phantom broker
-                                # submits, or worst-case a double-fill on Jason's LIVE
-                                # account. Abort if the order is no longer in a
-                                # retry-eligible state.
-                                if _oid:
-                                    try:
-                                        _stale_check_osm = getattr(self, "order_state_machine", None)
-                                        _stale_check_fn = getattr(_stale_check_osm, "get_order", None)
-                                        if callable(_stale_check_fn):
-                                            _stale_row = _stale_check_fn(_oid)
-                                            if isinstance(_stale_row, dict):
-                                                _current_status = str(
-                                                    _stale_row.get("status") or ""
-                                                ).upper()
-                                                _current_broker_id = str(
-                                                    _stale_row.get("broker_order_id") or ""
-                                                ).strip()
-                                                _current_submitted_ts = _stale_row.get("submitted_ts")
-                                                _current_contract = str(
-                                                    _stale_row.get("contract") or ""
-                                                )
-                                                _current_meta = _stale_row.get("meta") or {}
-                                                try:
-                                                    _current_attempt = int(
-                                                        _current_meta.get("breach_attempt_count") or 0
-                                                    )
-                                                except Exception:
-                                                    _current_attempt = 0
-                                                _is_still_deferred = (
-                                                    _current_contract.startswith("DEFERRED:")
-                                                    or bool(_current_meta.get("contract_deferred"))
-                                                    or bool(_current_meta.get("deferred_breach_selection"))
-                                                )
-
-                                                def _record_stale_abort(_reason_code: str) -> None:
-                                                    try:
-                                                        _upd_abort = getattr(self.order_state_machine, "update_order_meta", None)
-                                                        if callable(_upd_abort):
-                                                            _upd_abort(_oid, _build_deferred_retry_stale_abort_meta(
-                                                                current_status=_current_status,
-                                                                broker_order_id=_current_broker_id,
-                                                                submitted_ts=_current_submitted_ts,
-                                                                current_contract=_current_contract,
-                                                                current_attempt=_current_attempt,
-                                                                thread_attempt=int(_att),
-                                                                selector_audit=_current_meta.get("last_breach_selector_audit") or {},
-                                                                client_id=_breach_client_id,
-                                                                execution_mode=str(_current_meta.get("execution_mode") or ""),
-                                                                local_order_id=str(_oid or ""),
-                                                                signal_id=str(_current_meta.get("signal_id") or signal_id or ""),
-                                                                reason=_reason_code,
-                                                            ))
-                                                    except Exception:
-                                                        pass
-
-                                                # Guard 1: status must still be retryable
-                                                if _current_status not in {"PENDING_TRIGGER", "CREATED"}:
-                                                    _record_stale_abort("status_changed")
-                                                    log.warning(
-                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=status_changed "
-                                                        "current_status=%s attempt=%d",
-                                                        _t, _oid, _current_status, _att,
-                                                    )
-                                                    return
-                                                # Guard 2: must not already have a broker order
-                                                if _current_broker_id:
-                                                    _record_stale_abort("broker_id_present")
-                                                    log.warning(
-                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=broker_id_present "
-                                                        "broker_order_id=%s attempt=%d",
-                                                        _t, _oid, _current_broker_id, _att,
-                                                    )
-                                                    return
-                                                # Guard 3: must not have been submitted already
-                                                if _current_submitted_ts:
-                                                    _record_stale_abort("submitted_ts_present")
-                                                    log.warning(
-                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=submitted_ts_present "
-                                                        "submitted_ts=%s attempt=%d",
-                                                        _t, _oid, _current_submitted_ts, _att,
-                                                    )
-                                                    return
-                                                # Guard 4: contract must still be deferred
-                                                if not _is_still_deferred:
-                                                    _record_stale_abort("no_longer_deferred")
-                                                    log.warning(
-                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=no_longer_deferred "
-                                                        "contract=%s attempt=%d",
-                                                        _t, _oid, _current_contract, _att,
-                                                    )
-                                                    return
-                                                # Guard 5: attempt counter must be consistent.
-                                                # If meta.breach_attempt_count > _att it means
-                                                # another thread already incremented the counter
-                                                # beyond this thread's slot — abort to avoid
-                                                # duplicate entry attempts.
-                                                if _current_attempt > int(_att):
-                                                    _record_stale_abort("attempt_count_advanced")
-                                                    log.warning(
-                                                        "[%s] DEFERRED_BREACH_RETRY_STALE_STATE_ABORT "
-                                                        "order=%s reason=attempt_count_advanced "
-                                                        "db_attempt=%d thread_attempt=%d",
-                                                        _t, _oid, _current_attempt, _att,
-                                                    )
-                                                    return
-                                    except Exception as _stale_exc:
-                                        # Stale check is best-effort — if it fails, proceed
-                                        # with the retry rather than silently dropping it.
-                                        # The inflight-key dedup set still prevents true
-                                        # duplicates within the same process.
-                                        log.debug(
-                                            "[%s] DEFERRED_BREACH_RETRY stale-state check failed "
-                                            "(non-fatal, proceeding): %s",
-                                            _t, _stale_exc,
-                                        )
-                                log.info(
-                                    "[%s] DEFERRED_BREACH_RETRY firing attempt=%d",
-                                    _t, _att,
-                                )
-                                self._on_entry_trigger(_w)
-                            except Exception as _retry_exc_a:
-                                log.error(
-                                    "[%s] DEFERRED_BREACH_RETRY thread error attempt=%d: %s",
-                                    _t, _att, _retry_exc_a,
-                                )
-                            finally:
-                                try:
-                                    getattr(self, "_deferred_breach_retry_inflight", set()).discard(_retry_key)
-                                except Exception:
-                                    pass
-                        _rt_a = _threading_retry.Thread(
-                            target=_retry_deferred_breach_a,
-                            daemon=True,
-                            name=f"deferred_retry_{ticker}_{_this_attempt_a}",
-                        )
-                        _rt_a.start()
-                        return  # do NOT terminalize — retry thread owns the outcome
+                        return {
+                            "disposition": "RETRY_WAIT",
+                            "reason_code": str(_obs_rc_a or ""),
+                            "next_retry_at": _next_retry_at_a,
+                            "retry_attempt": int(_this_attempt_a),
+                        }
 
                     # Not retryable (quality reject, max retries exceeded, or past cutoff).
                     # Classify into specific dashboard taxonomy before terminalizing.
@@ -3274,7 +3903,7 @@ class APExecutionCore:
                         )
                     except Exception:
                         pass  # audit write is non-critical
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         _final_reason_a,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
@@ -3420,7 +4049,7 @@ class APExecutionCore:
                         )
                     except Exception:
                         pass  # audit write is non-critical
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         _reason,
                         extra_meta={
                             "failure_stage":           "deferred_contract_selection",
@@ -3498,61 +4127,43 @@ class APExecutionCore:
                     float(getattr(approved_plan, "limit_price", 0) or 0),
                     int(getattr(approved_plan, "contracts", 0) or 0),
                 )
-                # P0 (PR #300) — Amendment: stamp SELECTED + broker_ready=True into orders.meta.
-                # INVARIANT: broker_ready=True may ONLY be set after stamp_selected() returns True.
-                # A failed or non-True return is fatal — no broker POST may follow.
-                from ap.deferred_materializer import stamp_selected
+                # Capture complete selector evidence, but do not mark the row
+                # broker-ready yet.  The final refreshed submit price is not
+                # known until later; readiness is committed atomically with the
+                # contract/price/quantity columns immediately before submit.
                 _sel_bid  = float(getattr(_sel, "bid", 0) or 0)
                 _sel_ask  = float(getattr(_sel, "ask", 0) or 0)
                 _sel_mid  = (_sel_bid + _sel_ask) / 2.0 if _sel_bid and _sel_ask else 0.0
                 _sel_qty  = int(getattr(approved_plan, "contracts", 1) or 1)
                 _sel_lim  = float(getattr(approved_plan, "limit_price", 0) or 0)
                 _sel_cost = round(_sel_qty * _sel_lim * 100, 2)
-                _selected_persisted = stamp_selected(
-                    self.order_state_machine,
-                    str(queue_local_order_id or ""),
-                    client_id=str(_breach_client_id or ""),
-                    execution_mode=str(getattr(approved_plan, "execution_mode", "") or ""),
-                    symbol=ticker,
-                    direction=str(getattr(approved_plan, "side", "") or ""),
-                    contract=str(_live_contract or ""),
-                    bid=_sel_bid,
-                    ask=_sel_ask,
-                    mid=_sel_mid,
-                    limit_price=_sel_lim,
-                    qty=_sel_qty,
-                    reserved_cost=_sel_cost,
-                    dte=int(getattr(_sel, "dte", 0) or 0) or None,
-                    expiration=str(getattr(_sel, "expiration_date", "") or "") or None,
-                    delta=float(getattr(_sel, "delta", 0) or 0) or None,
-                    open_interest=int(getattr(_sel, "open_interest", 0) or 0) or None,
-                    volume=int(getattr(_sel, "volume", 0) or 0) or None,
-                    attempt=_prior_mat_attempt + 1,
-                )
-                if _selected_persisted is not True:
-                    _persist_err = "materialization_selected_meta_persist_failed"
-                    log.critical(
-                        "MATERIALIZATION_PRE_SUBMIT_INVARIANT_FAILED "
-                        "order_id=%s client_id=%s execution_mode=%s symbol=%s "
-                        "failure_reason=%s contract_after=%s limit_after=%.4f qty=%d "
-                        "materialization_status=selected_persist_failed broker_ready=false",
-                        str(queue_local_order_id or ""),
-                        str(_breach_client_id or ""),
-                        str(getattr(approved_plan, "execution_mode", "") or ""),
-                        ticker,
-                        _persist_err,
-                        str(_live_contract or ""),
-                        float(_sel_lim or 0),
-                        int(_sel_qty or 0),
-                    )
-                    _terminalize_breach_failure(_persist_err)
-                    return
-                # stamp_selected returned True — durable SELECTED row confirmed.
-                # Safe to mirror into in-memory plan metadata for the pre-submit gate.
-                _ap_meta_sel = getattr(approved_plan, "metadata", None)
-                if isinstance(_ap_meta_sel, dict):
-                    _ap_meta_sel["broker_ready"] = True
-                    _ap_meta_sel["materialization_status"] = "SELECTED"
+                _selector_materialization_meta = {
+                    "selected_bid": _sel_bid,
+                    "selected_ask": _sel_ask,
+                    "selected_mid": _sel_mid,
+                    "selector_pricing_basis": str(
+                        getattr(_sel, "pricing_basis", "")
+                        or "execution_price_per_share_or_ask"
+                    ),
+                    "selector_effective_budget": float(
+                        getattr(approved_plan, "max_position_usd", 0) or 0
+                    ),
+                    "selected_expiration": str(
+                        getattr(_sel, "expiration_date", "") or ""
+                    ) or None,
+                    "selected_strike": float(getattr(_sel, "strike", 0) or 0) or None,
+                    "selected_option_type": str(
+                        getattr(_sel, "option_type", "")
+                        or getattr(approved_plan, "side", "")
+                    ),
+                    "selected_dte": int(getattr(_sel, "dte", 0) or 0) or None,
+                    "selected_delta": float(getattr(_sel, "delta", 0) or 0) or None,
+                    "selected_open_interest": int(
+                        getattr(_sel, "open_interest", 0) or 0
+                    ) or None,
+                    "selected_volume": int(getattr(_sel, "volume", 0) or 0) or None,
+                    "selector_diagnostics": getattr(_sel, "candidate_audit", None) or {},
+                }
                 log.info(
                     "[%s] Breach-time contract selected: %s @ $%.2f x%s",
                     ticker, _live_contract,
@@ -3590,7 +4201,7 @@ class APExecutionCore:
                     reason=_reason,
                     extra={"exception_type": type(_cs_err).__name__},
                 )
-                _terminalize_deferred_breach_failure(
+                return _terminalize_deferred_breach_failure(
                     _reason,
                     extra_meta={"failure_stage": "deferred_contract_selection"},
                 )
@@ -3614,6 +4225,53 @@ class APExecutionCore:
             log.critical("[%s] PRODUCTION_ENTRY_BLOCK — approved plan missing valid limit_price", ticker)
             _terminalize_breach_failure("approved_plan_missing_limit_price")
             return
+
+        if queue_local_order_id and _plan_limit <= 0.01:
+            _selector_failure_meta = {}
+            try:
+                _selector_failure_meta = (
+                    (getattr(approved_plan, "metadata", None) or {}).get("selector_failure") or {}
+                )
+            except Exception:
+                _selector_failure_meta = {}
+            if not isinstance(_selector_failure_meta, dict) or not _selector_failure_meta:
+                try:
+                    _selected_meta = getattr(locals().get("_sel"), "metadata", None) or {}
+                    if isinstance(_selected_meta, dict):
+                        _selector_failure_meta = _selected_meta.get("selector_failure") or {}
+                except Exception:
+                    _selector_failure_meta = {}
+            if not isinstance(_selector_failure_meta, dict) or not _selector_failure_meta:
+                try:
+                    _last_failure = getattr(self.contract_selector, "get_last_failure", lambda: None)()
+                    if isinstance(_last_failure, dict):
+                        _selector_failure_meta = _last_failure
+                except Exception:
+                    _selector_failure_meta = {}
+            _deferred_selector_audit = (
+                dict(_selector_failure_meta) if isinstance(_selector_failure_meta, dict) else {}
+            )
+            _limit_reason = str(
+                _selector_failure_meta.get("reason_code") or "INVALID_EXECUTABLE_LIMIT"
+            ).strip() or "INVALID_EXECUTABLE_LIMIT"
+            log.critical(
+                "[%s] PRODUCTION_ENTRY_BLOCK — deferred selection produced penny limit "
+                "contract=%s limit=%.4f reason=%s",
+                ticker,
+                str(getattr(approved_plan, "contract_symbol", "") or ""),
+                _plan_limit,
+                _limit_reason,
+            )
+            return _terminalize_deferred_breach_failure(
+                _limit_reason,
+                extra_meta={
+                    "failure_stage": "deferred_contract_selection",
+                    "selected_contract": str(getattr(approved_plan, "contract_symbol", "") or ""),
+                    "selected_limit_price": _plan_limit,
+                    "deferred_selector_audit": _deferred_selector_audit,
+                    "selector_failure": _selector_failure_meta,
+                },
+            )
 
         # Optional hard guards: require contract + nonzero qty from the approved plan.
         approved_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
@@ -3959,20 +4617,24 @@ class APExecutionCore:
                     try:
                         _rec_fn = getattr(
                             self.order_state_machine,
-                            "record_deferred_hydration_result",
+                            "persist_deferred_broker_ready",
                             None,
                         ) if self.order_state_machine is not None else None
                         if callable(_rec_fn):
                             _copyback_write_ok = bool(_rec_fn(
                                 queue_local_order_id,
-                                success=True,
-                                status="PENDING_TRIGGER",
+                                owner=_mat_owner,
+                                generation=_mat_generation,
+                                signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                                execution_mode=str(
+                                    getattr(approved_plan, "execution_mode", "") or ""
+                                ),
                                 contract=_cb_contract,
                                 limit_price=_cb_limit,
                                 qty=_cb_qty,
                                 reserved_cost=_cb_cost,
-                                contract_selection_status="CONTRACT_SELECTED",
-                                hydration_meta={
+                                selector_meta={
+                                    **(locals().get("_selector_materialization_meta") or {}),
                                     "hydration_stage":             "deferred_breach_pre_submit_copyback",
                                     "materialization_entry_path":  "DEFERRED_BREACH_MATERIALIZATION",
                                     "selector_contract":           _cb_contract,
@@ -4002,6 +4664,11 @@ class APExecutionCore:
                             "local_order_id=%s contract=%s limit=%.4f qty=%d",
                             queue_local_order_id, _cb_contract, _cb_limit, _cb_qty,
                         )
+                        _ap_meta_sel = getattr(approved_plan, "metadata", None)
+                        if isinstance(_ap_meta_sel, dict):
+                            _ap_meta_sel["broker_ready"] = True
+                            _ap_meta_sel["materialization_status"] = "SELECTED"
+                            _ap_meta_sel["lifecycle_state"] = "BROKER_READY"
                     else:
                         # CAS missed: row was not in the expected PENDING_TRIGGER /
                         # DEFERRED state. Treat as a stale/already-submitted row —
@@ -4347,7 +5014,7 @@ class APExecutionCore:
             _pre_qty      = int(getattr(approved_plan, "contracts", 0) or 0)
 
             # ── P0 (PR #300): broker_ready gate — FIRST check.
-            # broker_ready=True is ONLY set by ap.deferred_materializer.stamp_selected()
+            # broker_ready=True is set by the OSM atomic deferred copyback CAS
             # when a real OCC contract is materialized with limit>0.01 and qty>=1.
             # If it's not True here, the materialization lifecycle did not complete
             # successfully; block broker POST immediately with a clear reason.
@@ -4434,39 +5101,133 @@ class APExecutionCore:
                 # re-running the full breach/selector cycle. Expiring the order and
                 # stamping a clear terminal detail is better than claiming
                 # RETRY_LATER while immediately expiring the row.
-                _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
-                log.critical(
-                    "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
-                    "reason=%s local_order_id=%s | "
-                    "selector proved real OCC contract but persisted "
-                    "order row is unreadable before broker POST — "
-                    "broker_order_id=null; terminalizing (Option B: terminal)",
-                    ticker, _inv_err, _row_read_reason, queue_local_order_id,
-                )
-                _emit_deferred_outcome(
-                    "DEFERRED_ORDER_ROW_UNREADABLE",
-                    reason=f"order_row_unreadable:{_row_read_reason}",
-                    contract=str(_pre_contract or ""),
-                    extra={
-                        "failure_stage":                   "handoff_order_row_read",
-                        "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
-                        "order_row_read_error":            _row_read_reason,
-                        "order_row_read_attempts":         _order_row_read_attempts,
-                        "selector_contract":               _handoff_snapshot.get("selector_contract"),
-                        "selector_bid":                    _handoff_snapshot.get("selector_bid"),
-                        "selector_ask":                    _handoff_snapshot.get("selector_ask"),
-                        "selector_mid":                    _handoff_snapshot.get("selector_mid"),
-                        "copied_plan_contract":            _handoff_snapshot.get("copied_plan_contract"),
-                        "pre_submit_contract":             _pre_contract,
-                        "pre_submit_limit":                _pre_limit,
-                        "pre_submit_qty":                  _pre_qty,
-                        "local_order_id":                  str(queue_local_order_id or ""),
-                        "client_id":                       _proof_client_id,
-                        "execution_mode":                  _proof_execution_mode,
-                    },
-                )
-                _terminalize_breach_failure(_inv_err)
-                return
+                # ── AMENDMENT: PR #323 Seam 1 — PRE_SUBMIT_PROOF_RETRY ──────
+                # Previously this path terminalized immediately on a transient
+                # DB read failure. That destroyed a valid selected contract.
+                #
+                # Required behaviour: durably transition to PRE_SUBMIT_PROOF_RETRY,
+                # preserving the real OCC contract (already in the row columns from
+                # persist_deferred_broker_ready), and schedule a bounded proof retry
+                # that only re-reads the row — it does NOT rerun selector unless
+                # the quote becomes stale (Seam 2).  On exhaustion the row is
+                # terminalized with the exact read failure reason.
+                #
+                # Two recovery workers cannot double-submit: the OSM CAS on the
+                # proof-retry transition requires exact owner+generation, and the
+                # downstream submit-intent CAS from the original BROKER_READY path
+                # is still required before any broker POST.
+
+                _proof_retry_fn = getattr(
+                    self.order_state_machine, "persist_pre_submit_proof_retry", None
+                ) if self.order_state_machine is not None else None
+
+                _proof_retry_max = int(os.getenv("PRE_SUBMIT_PROOF_RETRY_MAX", "3"))
+                _proof_retry_delay = int(os.getenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "5"))
+                _proof_retry_deadline_s = int(os.getenv("PRE_SUBMIT_PROOF_RETRY_DEADLINE_SECONDS", "60"))
+                _now_proof = datetime.now(timezone.utc)
+                _proof_next_retry_at = (
+                    _now_proof + timedelta(seconds=_proof_retry_delay)
+                ).isoformat()
+                _proof_deadline = (
+                    _now_proof + timedelta(seconds=_proof_retry_deadline_s)
+                ).isoformat()
+
+                _proof_persist_ok = False
+                if callable(_proof_retry_fn):
+                    try:
+                        _proof_persist_ok = bool(_proof_retry_fn(
+                            queue_local_order_id,
+                            owner=str(_deferred_claim_context.get("owner") or ""),
+                            generation=int(_deferred_claim_context.get("generation") or 1),
+                            retry_attempt=1,
+                            max_attempts=_proof_retry_max,
+                            next_retry_at=_proof_next_retry_at,
+                            retry_deadline=_proof_deadline,
+                            read_error=str(_row_read_reason or ""),
+                            selected_at=str(_handoff_snapshot.get("selected_at") or _now_proof.isoformat()),
+                            selected_quote_at=str(_handoff_snapshot.get("selected_quote_at") or _now_proof.isoformat()),
+                        ))
+                    except Exception as _pfr_exc:
+                        log.critical(
+                            "[%s] PRE_SUBMIT_PROOF_RETRY persist raised local_order_id=%s exc=%s",
+                            ticker, queue_local_order_id, _pfr_exc,
+                        )
+
+                if _proof_persist_ok:
+                    # Row is now in PRE_SUBMIT_PROOF_RETRY.  Selected contract,
+                    # qty, limit are preserved in the row.  Recovery will retry
+                    # the order-row proof via the recovery loop on next startup.
+                    # Emit a diagnostic outcome (not a terminal outcome).
+                    log.warning(
+                        "[%s] PRE_SUBMIT_PROOF_RETRY scheduled local_order_id=%s "
+                        "read_error=%s contract=%s owner=%s generation=%s "
+                        "next_retry_at=%s deadline=%s",
+                        ticker, queue_local_order_id, _row_read_reason,
+                        _pre_contract,
+                        _deferred_claim_context.get("owner"),
+                        _deferred_claim_context.get("generation"),
+                        _proof_next_retry_at, _proof_deadline,
+                    )
+                    _emit_deferred_outcome(
+                        "DEFERRED_PRE_SUBMIT_PROOF_RETRY",
+                        reason=f"order_row_unreadable_proof_retry_scheduled:{_row_read_reason}",
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            "failure_stage":         "handoff_order_row_read",
+                            "proof_retry_scheduled": True,
+                            "proof_retry_deadline":  _proof_deadline,
+                            "absolute_entry_deadline": _proof_deadline,
+                            "original_trigger_crossed_at": str(
+                                _handoff_snapshot.get("trigger_crossed_at")
+                                or getattr(watched, "trigger_crossed_at", "")
+                            ),
+                            "order_row_read_error":  _row_read_reason,
+                            "pre_submit_contract":   _pre_contract,
+                            "pre_submit_limit":      _pre_limit,
+                            "pre_submit_qty":        _pre_qty,
+                            "local_order_id":        str(queue_local_order_id or ""),
+                            "client_id":             _proof_client_id,
+                            "execution_mode":        _proof_execution_mode,
+                        },
+                    )
+                    return
+                else:
+                    # Proof-retry persistence failed (CAS miss, OSM unavailable, etc.).
+                    # Fall back to the previous terminal behaviour — better to
+                    # terminalize with a clear reason than leave an orphan row.
+                    _inv_err = "MATERIALIZATION_ORDER_ROW_UNREADABLE"
+                    log.critical(
+                        "[%s] PRE_SUBMIT_INVARIANT_FAILED — %s | "
+                        "reason=%s local_order_id=%s | "
+                        "selector proved real OCC contract but persisted "
+                        "order row is unreadable and proof_retry persistence failed — "
+                        "broker_order_id=null; terminalizing",
+                        ticker, _inv_err, _row_read_reason, queue_local_order_id,
+                    )
+                    _emit_deferred_outcome(
+                        "DEFERRED_ORDER_ROW_UNREADABLE",
+                        reason=f"order_row_unreadable:{_row_read_reason}",
+                        contract=str(_pre_contract or ""),
+                        extra={
+                            "failure_stage":                   "handoff_order_row_read",
+                            "materialization_detail_override": "MATERIALIZATION_ORDER_ROW_UNREADABLE",
+                            "order_row_read_error":            _row_read_reason,
+                            "order_row_read_attempts":         _order_row_read_attempts,
+                            "proof_retry_persist_failed":      True,
+                            "selector_contract":               _handoff_snapshot.get("selector_contract"),
+                            "selector_bid":                    _handoff_snapshot.get("selector_bid"),
+                            "selector_ask":                    _handoff_snapshot.get("selector_ask"),
+                            "selector_mid":                    _handoff_snapshot.get("selector_mid"),
+                            "pre_submit_contract":             _pre_contract,
+                            "pre_submit_limit":                _pre_limit,
+                            "pre_submit_qty":                  _pre_qty,
+                            "local_order_id":                  str(queue_local_order_id or ""),
+                            "client_id":                       _proof_client_id,
+                            "execution_mode":                  _proof_execution_mode,
+                        },
+                    )
+                    _terminalize_breach_failure(_inv_err)
+                    return
 
             # Stage C: row is readable (PASS or proof not applicable). Extract
             # order_row_contract into the snapshot for the handoff classifier
@@ -4481,6 +5242,10 @@ class APExecutionCore:
                     _handoff_snapshot["order_row_contract"] = (
                         str(_row_d.get("contract") or "") or None
                     )
+                    _handoff_snapshot["order_row_limit"] = float(
+                        _row_d.get("limit_price") or 0
+                    )
+                    _handoff_snapshot["order_row_qty"] = int(_row_d.get("qty") or 0)
                 except Exception as _extract_exc:
                     # Row was readable but contract extraction failed. This
                     # is structurally the same as "row unreadable" — emit the
@@ -4523,6 +5288,8 @@ class APExecutionCore:
                 pre_submit_limit=_pre_limit,
                 pre_submit_qty=_pre_qty,
                 order_row_contract=_handoff_snapshot.get("order_row_contract"),
+                order_row_limit=_handoff_snapshot.get("order_row_limit"),
+                order_row_qty=_handoff_snapshot.get("order_row_qty"),
             )
 
             # Structured proof log — one line per deferred trigger that
@@ -5206,13 +5973,20 @@ class APExecutionCore:
                         or _mv_q.get("provider")
                         or "unknown"
                     )
-                    # Fix 2: synchronous fetch with valid bid/ask → treat as age=0.
-                    # We called the broker synchronously right now. If the adapter
-                    # does not return quote_age_ms, the quote is effectively 0ms old
-                    # (we just got it). Stamp 0 so the gate gets honest freshness
-                    # rather than treating None as "unknown = skip stale check".
-                    if _mv_quote_age_ms is None and _mv_bid is not None and _mv_ask is not None:
-                        _mv_quote_age_ms = 0  # synchronous fetch — age assumed 0ms
+                    if _mv_quote_age_ms is None:
+                        _quote_ts_raw = (
+                            _mv_q.get("quote_timestamp")
+                            or _mv_q.get("timestamp")
+                            or _mv_q.get("as_of")
+                        )
+                        if _quote_ts_raw:
+                            _quote_ts = datetime.fromisoformat(str(_quote_ts_raw).replace("Z", "+00:00"))
+                            if _quote_ts.tzinfo is None:
+                                _quote_ts = _quote_ts.replace(tzinfo=timezone.utc)
+                            _mv_quote_age_ms = max(
+                                0.0,
+                                (datetime.now(timezone.utc) - _quote_ts).total_seconds() * 1000.0,
+                            )
             except Exception as _mv_exc:
                 log.warning(
                     "[%s] LIVE_SUBMIT_GATE market quote fetch failed "
@@ -5267,10 +6041,65 @@ class APExecutionCore:
                     ticker, _mv_res.audit.get("current_mid"),
                 )
 
-            # ── Gate 3: trigger age (uses durable timestamps from Amendment 2)
+            # A market-valid quote is the only event allowed to advance the
+            # trigger confirmation anchor. Persist it, then reread the exact
+            # durable value used by the age gate. The original breach timestamp
+            # is never rewritten.
+            _confirm_now = datetime.now(timezone.utc)
+            _absolute_deadline_raw = _meta_for_ts.get("absolute_entry_deadline")
+            if _absolute_deadline_raw:
+                try:
+                    _absolute_deadline = datetime.fromisoformat(
+                        str(_absolute_deadline_raw).replace("Z", "+00:00")
+                    )
+                    if _absolute_deadline.tzinfo is None:
+                        _absolute_deadline = _absolute_deadline.replace(tzinfo=timezone.utc)
+                except Exception:
+                    _absolute_deadline = None
+                if _absolute_deadline is None or _confirm_now >= _absolute_deadline:
+                    _terminalize_breach_failure("live_submit_gate:ABSOLUTE_ENTRY_DEADLINE_EXCEEDED")
+                    return
+
+            from zoneinfo import ZoneInfo as _ZoneInfo
+            _entry_cutoff_hhmm = int(
+                _meta_for_ts.get("entry_cutoff_et")
+                or os.getenv("ENTRY_CUTOFF_ET_HHMM", "1530")
+            )
+            _confirm_et = _confirm_now.astimezone(_ZoneInfo("America/New_York"))
+            if _gate_is_live and (_confirm_et.hour * 100 + _confirm_et.minute) >= _entry_cutoff_hhmm:
+                _terminalize_breach_failure("live_submit_gate:ENTRY_CUTOFF_EXCEEDED")
+                return
+
+            _last_confirmed_candidate = _confirm_now.isoformat()
+            if not self.order_state_machine.update_order_meta(
+                str(queue_local_order_id or ""),
+                {
+                    "last_confirmed_trigger_at": _last_confirmed_candidate,
+                    "original_trigger_crossed_at": (
+                        _meta_for_ts.get("original_trigger_crossed_at")
+                        or _ta_crossed_at
+                    ),
+                    "last_trigger_confirmation_quote": _mv_res.audit,
+                },
+            ):
+                _terminalize_breach_failure("live_submit_gate:TRIGGER_CONFIRMATION_PERSIST_FAILED")
+                return
+            _confirmed_row = self.order_state_machine.get_order(
+                str(queue_local_order_id or "")
+            ) or {}
+            _confirmed_meta = _confirmed_row.get("meta") or {}
+            if isinstance(_confirmed_meta, str):
+                _confirmed_meta = json.loads(_confirmed_meta)
+            _last_confirmed_durable = _confirmed_meta.get("last_confirmed_trigger_at")
+            if _last_confirmed_durable != _last_confirmed_candidate:
+                _terminalize_breach_failure("live_submit_gate:TRIGGER_CONFIRMATION_REREAD_MISMATCH")
+                return
+
+            # ── Gate 3: trigger age (uses the exact durable confirmation)
             _ta_res = check_trigger_age_gate(
                 trigger_crossed_at=_ta_crossed_at,
                 trigger_confirmed_at=_ta_confirmed_at,
+                last_confirmed_trigger_at=_last_confirmed_durable,
                 execution_mode=_gate_exec_mode,
             )
             if not _ta_res.passed:
@@ -5484,6 +6313,24 @@ class APExecutionCore:
                 },
             )
             return
+
+        if (
+            submit_res.get("error") == "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
+            or submit_res.get("error") == "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+        ):
+            # Ownership loss is not an order failure.  A winner may already own
+            # the row or have durable submit intent; never cancel/expire it.
+            disposition = self._classify_recovered_ownership_loss(queue_local_order_id)
+            log.warning(
+                "[%s] SUBMIT_OWNERSHIP_TRANSFERRED order=%s disposition=%s error=%s",
+                ticker, queue_local_order_id, disposition, submit_res.get("error"),
+            )
+            return {
+                "disposition": disposition,
+                "reason_code": str(
+                    submit_res.get("error") or "SUBMIT_OWNERSHIP_TRANSFERRED"
+                ),
+            }
 
         log.error(
             "[%s] Entry submit failed via OSM | local=%s error=%s",
@@ -5969,7 +6816,7 @@ class APExecutionCore:
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
-    def _cleanup_pending_entry_order(self, watched: WatchedSignal, *, action: str, reason: str) -> None:
+    def _cleanup_pending_entry_order(self, watched: WatchedSignal, *, action: str, reason: str) -> bool:
         """Best-effort OSM cleanup for watcher terminal outcomes.
 
         The queue creates an ENTRY order before arming the watcher. If the
@@ -5979,7 +6826,32 @@ class APExecutionCore:
         sig = getattr(watched, "signal", {}) or {}
         local_order_id = str(sig.get("local_order_id") or "").strip()
         if not local_order_id or self.order_state_machine is None:
-            return
+            return False
+
+        ownership = sig.get("_callback_ownership_context") or {}
+        if ownership.get("is_recovered"):
+            terminalize = getattr(self.order_state_machine, "terminalize_recovered_entry", None)
+            if not callable(terminalize):
+                sig["_recovery_cleanup_disposition"] = "KEEP_WATCHER"
+                return False
+            terminal_status = "EXPIRED" if action == "expire" else "CANCELED"
+            try:
+                ok = bool(terminalize(
+                    local_order_id,
+                    owner=str(ownership.get("owner") or ""),
+                    generation=ownership.get("generation"),
+                    execution_mode=str(ownership.get("execution_mode") or ""),
+                    terminal_status=terminal_status,
+                    reason=reason,
+                ))
+            except Exception as exc:
+                log.error("[%s] recovered terminal CAS raised: %s", watched.ticker, exc)
+                ok = False
+            if not ok:
+                sig["_recovery_cleanup_disposition"] = self._classify_recovered_ownership_loss(
+                    local_order_id
+                )
+            return ok
 
         try:
             if action == "expire" and hasattr(self.order_state_machine, "expire_pending_entry"):
@@ -5989,7 +6861,7 @@ class APExecutionCore:
                         "[%s] OSM expire_pending_entry returned false | order=%s reason=%s",
                         watched.ticker, local_order_id, reason,
                     )
-                return
+                return bool(ok)
 
             if action == "cancel" and hasattr(self.order_state_machine, "cancel_pending_entry"):
                 ok = self.order_state_machine.cancel_pending_entry(local_order_id, reason=reason)
@@ -5998,23 +6870,52 @@ class APExecutionCore:
                         "[%s] OSM cancel_pending_entry returned false | order=%s reason=%s",
                         watched.ticker, local_order_id, reason,
                     )
-                return
+                return bool(ok)
 
             # Compatibility fallback for older OSM versions that do not expose
             # helper methods yet. Only legal CREATED/PENDING_TRIGGER orders will
             # transition; illegal/terminal states are blocked by OSM.transition().
             fallback_status = "EXPIRED" if action == "expire" else "CANCELED"
             if hasattr(self.order_state_machine, "transition"):
-                self.order_state_machine.transition(
+                return bool(self.order_state_machine.transition(
                     local_order_id,
                     fallback_status,
                     last_error=reason,
-                )
+                ))
         except Exception as exc:
             log.error(
                 "[%s] OSM pending-entry cleanup failed | order=%s action=%s reason=%s error=%s",
                 watched.ticker, local_order_id, action, reason, exc, exc_info=True,
             )
+        return False
+
+    def _classify_recovered_ownership_loss(self, local_order_id: str) -> str:
+        """Classify a lost recovery CAS without mutating lifecycle state."""
+        osm = getattr(self, "order_state_machine", None)
+        if osm is None or not hasattr(osm, "get_order"):
+            return "KEEP_WATCHER"
+        try:
+            row = osm.get_order(local_order_id) or {}
+        except Exception:
+            return "KEEP_WATCHER"
+        status = str(row.get("status") or "").upper()
+        if status in {"SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"}:
+            return "SUBMITTED"
+        if status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return "TERMINAL_DURABLE"
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        if str(meta.get("lifecycle_state") or "").upper() == "SUBMITTING" or meta.get("submit_intent_at"):
+            return "RECONCILE_PENDING"
+        if str(meta.get("recovery_submit_owner") or "").strip():
+            return "OWNERSHIP_TRANSFERRED"
+        return "KEEP_WATCHER"
 
     def _on_signal_expire(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))

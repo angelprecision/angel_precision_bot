@@ -40,7 +40,10 @@ class _FakeCursor:
 
     def execute(self, sql: str, params: tuple):
         if "UPDATE trade_queue" in sql:
-            client_id, cutoff_utc = params
+            if len(params) == 3:
+                _, client_id, cutoff_utc = params
+            else:
+                client_id, cutoff_utc = params
             cutoff_text = str(cutoff_utc)
             count = 0
             for row in self.state.trade_queue_rows:

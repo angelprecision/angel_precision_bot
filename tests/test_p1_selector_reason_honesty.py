@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import inspect
 import types
 import pytest
 from unittest.mock import MagicMock, patch
@@ -155,6 +156,27 @@ class TestEmptyChain:
         lf = sel.get_last_failure()
         assert lf is not None
         assert lf["reason_code"] == "CHAIN_EMPTY"
+
+
+def test_selector_accepts_legacy_plan_mode_without_execution_mode(monkeypatch):
+    sel = _make_selector()
+    monkeypatch.setattr(
+        sel, "_fetch_chain_with_price",
+        lambda ticker, direction, **kw: ([], 227.62),
+    )
+    plan = _make_plan()
+    assert not hasattr(plan, "execution_mode")
+    sel.select(plan)
+    sf = _selector_failure(plan)
+    assert sf["reason_code"] != "INVALID_EXECUTION_MODE"
+
+
+def test_cheap_contract_reject_preserves_specific_reason_in_source():
+    from ap import contract_selector as selector_mod
+
+    source = inspect.getsource(selector_mod.APContractSelectionEngine.select)
+    assert 'reason_code="CHEAP_CONTRACT_NO_UPGRADE"' in source
+    assert 'ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "false"' in source
 
 
 # ---------------------------------------------------------------------------

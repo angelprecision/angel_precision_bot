@@ -32,9 +32,10 @@ dashboard queries that filter on the existing PENDING_TRIGGER status):
 
 HARD INVARIANT
 ──────────────
-meta.broker_ready=true is ONLY set by this module's `stamp_selected()` helper.
-Execution core checks it at pre-submit: if false, broker POST is blocked
-regardless of what the contract field contains.
+Legacy callers set meta.broker_ready through this module's `stamp_selected()`
+helper. The production breach path now uses the OSM atomic copyback CAS so the
+contract, price, quantity, reserved cost, and broker_ready flag commit together.
+Execution core checks readiness at pre-submit: if false, broker POST is blocked.
 
 DESIGN NOTES
 ────────────
@@ -66,21 +67,14 @@ RETRY_PENDING       = "RETRY_PENDING"
 SELECTED            = "SELECTED"
 FAILED_TERMINAL     = "FAILED_TERMINAL"
 
-# ── Retryable reason codes — shared subset of RETRYABLE_BREACH_SELECTOR_REASONS
-# in ap_execution_core. Transient data-miss at market open; chain warmup; 429s.
-RETRYABLE_MATERIALIZATION_REASONS: frozenset[str] = frozenset({
-    "NO_CHAIN_DATA",
-    "CHAIN_PROVIDER_ERROR",
-    "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
-    "CHAIN_PROVIDER_EMPTY_OPTIONS",
-    "CHAIN_PARSE_EMPTY",
-    "NO_EXPIRATION_IN_DTE_WINDOW",
-    "DIRECT_QUOTE_UNAVAILABLE",
-    "CHAIN_ROW_ZERO_BID_ASK",
-    "DIRECT_QUOTE_ZERO_BID_ASK",
-    "QUOTE_FETCH_FAILED",
-    "CHAIN_EMPTY",
-})
+# ── Seam 3 (PR #323): canonical retry taxonomy — single source of truth ────────
+# RETRYABLE_MATERIALIZATION_REASONS is now derived from the same policy table as
+# RETRYABLE_BREACH_SELECTOR_REASONS.  They are guaranteed to be identical.
+# Import from canonical module; the old inline frozenset is removed.
+from ap.selector_retry_policy import (  # noqa: E402
+    RETRYABLE_MATERIALIZATION_REASONS,
+    RETRYABLE_BREACH_SELECTOR_REASONS as _RETRYABLE_BREACH_SELECTOR_REASONS_DM,  # noqa: F401
+)
 
 # ── Config helpers (hot-read from env; no restart needed for tuning) ──────────
 

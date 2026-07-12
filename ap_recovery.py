@@ -255,6 +255,141 @@ def _position_reserved_cost(pos: dict) -> float:
     return 0.0
 
 
+def resume_pre_submit_proof_retry(order_row: dict, osm, execution_core) -> dict:
+    """Consume one due PRE_SUBMIT_PROOF_RETRY row without watcher ownership.
+
+    The first CAS advances the durable materialization generation and restores
+    BROKER_READY.  The canonical execution-core recovery callback then performs
+    the persisted-row handoff proof, fresh market validation, final LIVE gates,
+    submit-intent CAS, and broker submit.
+    """
+    row = dict(order_row or {})
+    meta = row.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    now = datetime.now(timezone.utc)
+    local_order_id = str(row.get("local_order_id") or "").strip()
+    client_id = str(row.get("client_id") or "").strip().lower()
+    mode = _normalize_execution_mode(row.get("execution_mode"))
+    if not local_order_id or not client_id or mode is None:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_INVALID_IDENTITY", "terminal_status": "ERROR"}
+    def _parse_ts(value):
+        try:
+            parsed = datetime.fromisoformat(str(value))
+            return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+        except Exception:
+            return None
+
+    due_at = _parse_ts(meta.get("proof_retry_next_at"))
+    deadline = _parse_ts(meta.get("proof_retry_deadline") or meta.get("absolute_entry_deadline"))
+    attempt = _safe_int(meta.get("proof_retry_attempt"), 0) + 1
+    max_attempts = _safe_int(meta.get("proof_retry_max_attempts"), 3)
+    if due_at is None or due_at > now:
+        return {"disposition": "NOT_DUE", "reason_code": "PROOF_RETRY_NOT_DUE"}
+    if deadline is None or now >= deadline:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_DEADLINE_EXCEEDED", "terminal_status": "EXPIRED"}
+    if attempt > max_attempts:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_MAX_ATTEMPTS", "terminal_status": "EXPIRED"}
+    if osm is None or execution_core is None:
+        return {"disposition": "RETRY_WAIT", "reason_code": "PROOF_RETRY_CONSUMER_UNAVAILABLE"}
+    if client_id != str(getattr(osm, "client_id", "") or "").strip().lower():
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_CLIENT_ID_MISMATCH", "terminal_status": "ERROR"}
+    core_mode = _normalize_execution_mode(
+        getattr(execution_core, "execution_mode", None) or getattr(execution_core, "mode", None)
+    )
+    if core_mode != mode:
+        return {"disposition": "TERMINAL_DURABLE", "reason_code": "PROOF_RETRY_EXECUTION_MODE_MISMATCH", "terminal_status": "ERROR"}
+
+    generation = _safe_int(meta.get("materialization_generation"), 0)
+    owner = f"proof_retry:{client_id}:{local_order_id}:{generation + 1}"
+    claim = getattr(osm, "claim_pre_submit_proof_retry", None)
+    if not callable(claim) or not claim(
+        local_order_id,
+        owner=owner,
+        expected_generation=generation,
+        new_generation=generation + 1,
+        attempt=attempt,
+        claimed_at=now.isoformat(),
+    ):
+        return {"disposition": "CLAIM_LOST", "reason_code": "PROOF_RETRY_CLAIM_NOT_ACQUIRED"}
+
+    try:
+        persisted = osm.get_order(local_order_id)
+    except Exception as exc:
+        persisted = None
+        read_error = f"read_error:{type(exc).__name__}"
+    else:
+        read_error = "row_missing" if not isinstance(persisted, dict) else ""
+    if not isinstance(persisted, dict):
+        delay = max(1, int(os.getenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "5")))
+        reschedule = getattr(osm, "persist_pre_submit_proof_retry", None)
+        ok = bool(callable(reschedule) and reschedule(
+            local_order_id,
+            owner=owner,
+            generation=generation + 1,
+            retry_attempt=attempt,
+            max_attempts=max_attempts,
+            next_retry_at=(now + timedelta(seconds=delay)).isoformat(),
+            retry_deadline=deadline.isoformat(),
+            read_error=read_error,
+            selected_at=str(meta.get("selected_at") or now.isoformat()),
+            selected_quote_at=str(meta.get("selected_quote_at") or now.isoformat()),
+        ))
+        return {
+            "disposition": "RETRY_WAIT" if ok else "TERMINAL_DURABLE",
+            "reason_code": read_error if ok else "PROOF_RETRY_RESCHEDULE_FAILED",
+            "terminal_status": "ERROR",
+        }
+
+    # Run the same persisted-row proof primitives used by the breach callback.
+    from ap_execution_core import _classify_materialization_handoff, _classify_order_row_read
+    proof_snapshot = {
+        "captured": True,
+        "selector_contract": str(meta.get("selected_contract") or ""),
+        "selector_qty": _safe_int(meta.get("selected_qty"), 0),
+        "copied_plan_contract": str(persisted.get("contract") or ""),
+        "copied_plan_limit": _safe_float(persisted.get("limit_price"), 0.0),
+        "copied_plan_qty": _safe_int(persisted.get("qty"), 0),
+    }
+    verdict, proof_reason = _classify_order_row_read(
+        handoff_snapshot=proof_snapshot,
+        order_row_raw=persisted,
+        read_error=None,
+    )
+    if verdict != "PASS":
+        return {
+            "disposition": "TERMINAL_DURABLE",
+            "reason_code": f"PROOF_RETRY_HANDOFF_FAILED:{proof_reason}",
+            "terminal_status": "ERROR",
+        }
+    aligned, mismatch = _classify_materialization_handoff(
+        handoff_snapshot=proof_snapshot,
+        pre_submit_contract=proof_snapshot["copied_plan_contract"],
+        pre_submit_limit=proof_snapshot["copied_plan_limit"],
+        pre_submit_qty=proof_snapshot["copied_plan_qty"],
+        order_row_contract=str(persisted.get("contract") or ""),
+        order_row_limit=_safe_float(persisted.get("limit_price"), 0.0),
+        order_row_qty=_safe_int(persisted.get("qty"), 0),
+    )
+    if not aligned:
+        return {
+            "disposition": "TERMINAL_DURABLE",
+            "reason_code": f"PROOF_RETRY_HANDOFF_MISMATCH:{mismatch}",
+            "terminal_status": "ERROR",
+        }
+
+    outcome = execution_core.resume_deferred_broker_ready_order(
+        local_order_id=local_order_id,
+        plan=None,
+    ) or {}
+    outcome.setdefault("proof_retry_attempt", attempt)
+    outcome.setdefault("proof_retry_owner", owner)
+    return outcome
+
+
 class APStartupRecovery:
     """
     Runs once on ClientRunner startup to restore in-memory state from DB.
@@ -270,6 +405,7 @@ class APStartupRecovery:
         master_control,   # APMasterControl
         exit_engine=None, # APExitEngine (optional — needed for exit re-attachment)
         entry_watcher=None,  # APEntryWatcher (optional — needed for watcher reseed)
+        execution_core=None, # APExecutionCore (optional — required for §2 safe BROKER_READY recovery)
     ):
         self.client_id     = str(client_id or "").strip().lower()
         self.broker        = broker
@@ -278,6 +414,7 @@ class APStartupRecovery:
         self.mc            = master_control
         self.exit_engine   = exit_engine
         self.entry_watcher = entry_watcher
+        self.execution_core = execution_core
 
     # ──────────────────────────────────────────────────────────────────────────
     # Entry point
@@ -293,6 +430,7 @@ class APStartupRecovery:
             "buying_power_reserved": 0.0,
             "dedup_seeded":        0,
             "watchers_requeued":   0,
+            "deferred_lifecycles_recovered": 0,
             "errors":              [],
         }
 
@@ -302,6 +440,12 @@ class APStartupRecovery:
             log.error("[%s] RECOVERY_BLOCKED unknown execution_mode", self.client_id)
             result["errors"].append("recovery_unknown_execution_mode")
             return result
+
+        try:
+            self._recover_deferred_breach_lifecycles(result)
+        except Exception as e:
+            log.error("[%s] Deferred breach lifecycle recovery error: %s", self.client_id, e)
+            result["errors"].append(f"deferred_lifecycle: {e}")
 
         try:
             self._recover_positions(result)
@@ -353,6 +497,22 @@ class APStartupRecovery:
             result["buying_power_reserved"],
             len(result["errors"]),
         )
+        return result
+
+    def recover_deferred_lifecycles(self) -> dict:
+        """Lightweight runtime pass for durable deferred-breach ownership."""
+        result = {
+            "client_id": self.client_id,
+            "deferred_lifecycles_recovered": 0,
+            "errors": [],
+        }
+        if self._execution_mode() is None:
+            result["errors"].append("recovery_unknown_execution_mode")
+            return result
+        try:
+            self._recover_deferred_breach_lifecycles(result)
+        except Exception as exc:
+            result["errors"].append(f"deferred_lifecycle:{exc}")
         return result
 
     def _execution_mode(self) -> str | None:
@@ -902,7 +1062,536 @@ class APStartupRecovery:
             prior_day_low=meta.get("prior_day_low"),
             strategy_type=str(meta.get("strategy_type") or ""),
             metadata=metadata,
+            client_id=str(order.get("client_id") or self.client_id),
+            execution_mode=str(
+                order.get("execution_mode")
+                or meta.get("execution_mode")
+                or ""
+            ).strip().lower(),
+            contracts=int(order.get("qty") or meta.get("selected_qty") or 0),
+            limit_price=float(
+                order.get("limit_price") or meta.get("selected_limit") or 0
+            ),
+            max_position_usd=float(
+                order.get("reserved_cost")
+                or meta.get("selected_reserved_cost")
+                or 0
+            ),
         )
+
+    def _recover_deferred_breach_lifecycles(self, result: dict) -> None:
+        """Resume fenced deferred rows before normal startup entry processing.
+
+        AMENDMENT 1 (execution_mode scoping + identity proof)
+        -----------------------------------------------------
+        Every load and every mutation in this pass is scoped to the exact
+        runner mode. A paper runner MUST NOT observe or mutate LIVE rows,
+        and a LIVE runner MUST NOT observe or mutate paper rows, even for
+        the same client_id. The runner mode is resolved once at the top;
+        the SQL query filters by `LOWER(TRIM(COALESCE(execution_mode,'')))`;
+        each row is re-verified in Python (defence in depth); the plan
+        built from the row is re-verified before any watcher rearm or
+        submit path. The plan builder no longer infers a missing row mode
+        from the runner (see `_build_recovery_plan_from_order`), so a row
+        with a blank/malformed persisted mode fails identity closed here.
+        """
+        from ap.db import conn, run_with_retry
+
+        # ── Runner mode resolve (once) ─────────────────────────────────
+        recovery_mode = self._execution_mode()  # "PAPER" | "LIVE" | None
+        if recovery_mode is None:
+            log.error(
+                "[%s] RECOVERY_BLOCKED unknown_execution_mode — deferred lifecycle recovery skipped",
+                self.client_id,
+            )
+            result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            return
+        recovery_mode_sql = recovery_mode.lower()  # SQL predicate is case-insensitive lower
+
+        # ── OSM identity proof (once) ──────────────────────────────────
+        osm_client_id = str(getattr(self.osm, "client_id", "") or "").strip().lower()
+        if osm_client_id and osm_client_id != self.client_id:
+            log.critical(
+                "[%s] RECOVERY_BLOCKED osm_client_id_mismatch osm=%r recovery=%r — "
+                "deferred lifecycle recovery skipped",
+                self.client_id, osm_client_id, self.client_id,
+            )
+            result.setdefault("errors", []).append("recovery_osm_client_id_mismatch")
+            return
+
+        def _load():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT local_order_id, client_id, signal_id, plan_id,
+                           symbol, contract, direction, score, tier,
+                           trigger_price, stop_underlying, target_underlying,
+                           pattern, timeframe, execution_mode, qty, limit_price,
+                           reserved_cost, status, broker_order_id, submitted_ts, meta
+                           , created_ts
+                    FROM orders
+                    WHERE client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                    ORDER BY created_ts ASC
+                    """,
+                    (self.client_id, recovery_mode_sql),
+                )
+                return c.fetchall()
+
+        rows = run_with_retry(_load) or []
+        now = datetime.now(timezone.utc)
+        recovered = 0
+
+        # ── AMENDMENT §7: verified terminalization ─────────────────────
+        # terminalize_deferred_breach returns True only when Postgres
+        # confirmed rowcount > 0. A False return means the row was NOT
+        # terminalized (CAS miss, not-found, or write error) and is still
+        # live as PENDING_TRIGGER. Ignoring that return value lets a failed
+        # terminalize masquerade as success, silently dropping the row.
+        # Every terminalize in this pass now routes through this helper so
+        # a failed durable write is surfaced (critical log + errors entry)
+        # rather than swallowed.
+        def _terminalize_verified(loid, *, reason_code, terminal_status, diagnostics):
+            terminalize = getattr(self.osm, "terminalize_deferred_breach", None)
+            if not callable(terminalize):
+                log.critical(
+                    "[%s] RECOVERY_TERMINALIZE_UNAVAILABLE local_order_id=%s "
+                    "reason=%s — row NOT terminalized",
+                    self.client_id, loid, reason_code,
+                )
+                result.setdefault("errors", []).append("recovery_terminalize_unavailable")
+                return False
+            try:
+                ok = bool(terminalize(
+                    loid,
+                    reason_code=reason_code,
+                    terminal_status=terminal_status,
+                    diagnostics=diagnostics,
+                ))
+            except Exception as exc:
+                log.critical(
+                    "[%s] RECOVERY_TERMINALIZE_RAISED local_order_id=%s reason=%s exc=%s",
+                    self.client_id, loid, reason_code, exc,
+                )
+                result.setdefault("errors", []).append("recovery_terminalize_raised")
+                return False
+            if not ok:
+                log.critical(
+                    "[%s] RECOVERY_TERMINALIZE_FAILED local_order_id=%s reason=%s "
+                    "— durable write returned no rows; row still PENDING_TRIGGER",
+                    self.client_id, loid, reason_code,
+                )
+                result.setdefault("errors", []).append("recovery_terminalize_failed")
+            return ok
+
+        # ── AMENDMENT §5: durable ownership on failed/impossible rearm ──
+        # A resumable row must never be left ownerless. When a rearm cannot
+        # happen (no entry_watcher wired) or the rearm returns False, we do
+        # NOT silently drop the row. We record a durable recovery-ownership
+        # marker via a non-destructive meta patch so the row is diagnosably
+        # owned by the recovery scheduler and a future recovery pass will
+        # resume it. Only recovery_* keys are written — contract, qty,
+        # limit, selector evidence, tp/sl, direction and every trade-policy
+        # field are preserved untouched.
+        def _retain_recovery_ownership(loid, *, reason):
+            update_meta = getattr(self.osm, "update_order_meta", None)
+            if not callable(update_meta):
+                log.critical(
+                    "[%s] RECOVERY_RETENTION_UNAVAILABLE local_order_id=%s reason=%s "
+                    "— cannot record durable ownership",
+                    self.client_id, loid, reason,
+                )
+                result.setdefault("errors", []).append("recovery_retention_unavailable")
+                return False
+            try:
+                ok = bool(update_meta(loid, {
+                    "recovery_ownership": "recovery_scheduler",
+                    "recovery_owner": f"recovery_scheduler:{self.client_id}",
+                    "recovery_retained_at": now.isoformat(),
+                    "recovery_retention_reason": reason,
+                    "recovery_retention_mode": recovery_mode,
+                }))
+            except Exception as exc:
+                log.critical(
+                    "[%s] RECOVERY_RETENTION_RAISED local_order_id=%s reason=%s exc=%s",
+                    self.client_id, loid, reason, exc,
+                )
+                result.setdefault("errors", []).append("recovery_retention_raised")
+                return False
+            if not ok:
+                log.critical(
+                    "[%s] RECOVERY_RETENTION_WRITE_FAILED local_order_id=%s reason=%s "
+                    "— durable ownership marker not persisted",
+                    self.client_id, loid, reason,
+                )
+                result.setdefault("errors", []).append("recovery_retention_write_failed")
+            return ok
+
+        for raw in rows:
+            order = dict(raw or {})
+            local_order_id = str(order.get("local_order_id") or "").strip()
+            if not local_order_id:
+                continue
+
+            # ── Per-row identity proof (defence in depth vs. SQL filter) ──
+            # The SQL predicate above SHOULD prevent any cross-mode or
+            # cross-client row from loading. These checks are belt-and-
+            # suspenders against DB whitespace, mocked/tested paths, or
+            # any future refactor that widens the SELECT. On mismatch we
+            # SKIP (never terminalize) because a mode/client mismatch
+            # likely means the row belongs to a DIFFERENT runner and
+            # terminalizing would destroy someone else's live row.
+            row_client_id = str(order.get("client_id") or "").strip().lower()
+            if row_client_id and row_client_id != self.client_id:
+                log.error(
+                    "[%s] RECOVERY_SKIP client_id_mismatch local_order_id=%s row=%r",
+                    self.client_id, local_order_id, row_client_id,
+                )
+                continue
+            row_mode = _normalize_execution_mode(order.get("execution_mode"))
+            if row_mode is None:
+                # Blank/malformed persisted mode. Per amendment §1, this is
+                # RECOVERY_INVALID_EXECUTION_MODE. SQL should already have
+                # filtered it out; if we're here it's a defensive catch.
+                # We QUARANTINE (skip + log) rather than terminalize, because
+                # we cannot prove the row is ours without a valid mode field.
+                log.error(
+                    "[%s] RECOVERY_SKIP RECOVERY_INVALID_EXECUTION_MODE "
+                    "local_order_id=%s raw_mode=%r",
+                    self.client_id, local_order_id, order.get("execution_mode"),
+                )
+                continue
+            if row_mode != recovery_mode:
+                log.error(
+                    "[%s] RECOVERY_SKIP execution_mode_mismatch local_order_id=%s "
+                    "row_mode=%s recovery_mode=%s",
+                    self.client_id, local_order_id, row_mode, recovery_mode,
+                )
+                continue
+
+            meta = self._coerce_order_meta(order.get("meta"))
+            lifecycle = str(meta.get("lifecycle_state") or "").upper()
+            materialization_status = str(meta.get("materialization_status") or "").upper()
+
+            created_raw = order.get("created_ts")
+            try:
+                created_at = (
+                    created_raw
+                    if isinstance(created_raw, datetime)
+                    else datetime.fromisoformat(str(created_raw))
+                )
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                stale_pending = (now - created_at).total_seconds() > 72 * 3600
+            except Exception:
+                stale_pending = False
+            if stale_pending:
+                _terminalize_verified(
+                    local_order_id,
+                    reason_code="RECOVERY_STALE_PENDING_TRIGGER",
+                    terminal_status="EXPIRED",
+                    diagnostics={"recovery_classification": "stale_over_72h"},
+                )
+                continue
+
+            if lifecycle in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                _terminalize_verified(
+                    local_order_id,
+                    reason_code=str(meta.get("reason_code") or meta.get("final_reason") or "RECOVERY_TERMINAL_STATE"),
+                    terminal_status=lifecycle,
+                    diagnostics={"recovery_classification": "terminal_meta_pending_row"},
+                )
+                continue
+
+            plan = self._build_recovery_plan_from_order(order)
+            if plan is None:
+                continue
+
+            # ── Plan-level identity proof ────────────────────────────
+            # After building the plan, verify the plan carries the exact
+            # client_id and execution_mode we expect. The plan builder no
+            # longer infers execution_mode from the runner (Amendment 1),
+            # so a persisted row with a blank mode surfaces here as an
+            # empty plan.execution_mode string and is skipped.
+            plan_client_id = str(getattr(plan, "client_id", "") or "").strip().lower()
+            if plan_client_id and plan_client_id != self.client_id:
+                log.error(
+                    "[%s] RECOVERY_SKIP plan_client_id_mismatch local_order_id=%s plan=%r",
+                    self.client_id, local_order_id, plan_client_id,
+                )
+                continue
+            plan_mode_raw = str(getattr(plan, "execution_mode", "") or "").strip().upper()
+            if plan_mode_raw != recovery_mode:
+                log.error(
+                    "[%s] RECOVERY_SKIP plan_execution_mode_mismatch local_order_id=%s "
+                    "plan_mode=%r recovery_mode=%s",
+                    self.client_id, local_order_id, plan_mode_raw, recovery_mode,
+                )
+                continue
+
+            # ── AMENDMENT §6: broker-ambiguity crash window ────────────────
+            # If a durable submit intent was persisted (submit_intent_at) but
+            # no broker_order_id landed on the row, the process may have
+            # crashed AFTER the broker accepted the order but BEFORE the id
+            # was committed. A live order may exist at the broker under the
+            # durable tag. Such a row MUST NOT be resumed toward resubmission
+            # (the §2 path) — that risks a double-submit on a live account.
+            # Route it to the fail-closed reconciler, which never resubmits
+            # and never terminalizes until the broker-query adoption gate is
+            # wired. On RECONCILE_PENDING we retain durable ownership so the
+            # row is never lost while it waits for reconciliation.
+            if meta.get("submit_intent_at") and not str(order.get("broker_order_id") or "").strip():
+                reconcile_fn = None
+                if self.execution_core is not None:
+                    reconcile_fn = getattr(
+                        self.execution_core, "reconcile_deferred_broker_intent", None
+                    )
+                if not callable(reconcile_fn):
+                    # No reconciler available — retain ownership WITHOUT
+                    # resubmitting or terminalizing (a live order may exist).
+                    log.critical(
+                        "[%s] RECOVERY_CRASH_WINDOW reconciler_unavailable "
+                        "local_order_id=%s — row retained, NOT resumed "
+                        "(possible live broker order)",
+                        self.client_id, local_order_id,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="crash_window_reconciler_unavailable",
+                    )
+                    continue
+                try:
+                    rec = reconcile_fn(local_order_id=local_order_id) or {}
+                except Exception as exc:
+                    log.error(
+                        "[%s] reconcile_deferred_broker_intent raised "
+                        "local_order_id=%s exc=%s",
+                        self.client_id, local_order_id, exc,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="crash_window_reconcile_raised",
+                    )
+                    continue
+                rec_disposition = str(rec.get("disposition") or "").strip().upper()
+                if rec_disposition == "ALREADY_RECONCILED":
+                    # A broker order id is already present — the order monitor
+                    # owns it. Nothing to resume; leave the row untouched.
+                    continue
+                if rec_disposition == "RECONCILE_PENDING":
+                    # Crash window unresolved. NEVER resubmit / terminalize.
+                    _retain_recovery_ownership(
+                        local_order_id,
+                        reason=str(rec.get("reason_code") or "crash_window_reconcile_pending"),
+                    )
+                    continue
+                if rec_disposition == "NOT_IN_CRASH_WINDOW":
+                    # Reconciler proved the row never reached the broker
+                    # boundary — fall through to the normal resume path below.
+                    pass
+                else:
+                    # KEEP_WATCHER / unknown → retain ownership, do not resume.
+                    _retain_recovery_ownership(
+                        local_order_id,
+                        reason=str(rec.get("reason_code") or "crash_window_keep"),
+                    )
+                    continue
+
+            if lifecycle in {"BROKER_READY", "SUBMITTING"} and meta.get("broker_ready") is True:
+                # ── AMENDMENT §2: NEVER fall through to submit_existing_entry ──
+                # The direct submit path bypasses kill switch, exposure
+                # revalidation, fresh quote, spread, drift, entry confirmation
+                # and account-size cap.  All BROKER_READY / SUBMITTING recovery
+                # submits MUST route through the dedicated execution-core
+                # scaffold.  While the scaffold's canonical gates are still
+                # being wired in, it never calls the broker — it returns a
+                # RETRY_WAIT disposition that keeps the row durably owned by
+                # the recovery scheduler until either the gates land or a
+                # truthful boundary is reached (trigger age, retry exhaustion,
+                # identity mismatch, invalid status).
+                resume_fn = None
+                if self.execution_core is not None:
+                    resume_fn = getattr(
+                        self.execution_core, "resume_deferred_broker_ready_order", None
+                    )
+                if not callable(resume_fn):
+                    # No dedicated recovery path available — retain the row
+                    # WITHOUT terminalizing (engineering incomplete is not a
+                    # truthful boundary) and WITHOUT calling the direct
+                    # submit path (that's exactly what §2 forbids).  The
+                    # next recovery pass will re-attempt.
+                    log.critical(
+                        "[%s] RECOVERY_BLOCKED "
+                        "resume_deferred_broker_ready_order_unavailable "
+                        "local_order_id=%s — row retained without action "
+                        "(never falling back to submit_existing_entry per §2)",
+                        self.client_id, local_order_id,
+                    )
+                    continue
+
+                try:
+                    outcome = resume_fn(local_order_id=local_order_id, plan=plan) or {}
+                except Exception as exc:
+                    log.error(
+                        "[%s] resume_deferred_broker_ready_order raised "
+                        "local_order_id=%s exc=%s",
+                        self.client_id, local_order_id, exc,
+                    )
+                    continue
+
+                disposition = str(outcome.get("disposition") or "").strip().upper()
+                reason_code = str(outcome.get("reason_code") or "RECOVERY_UNKNOWN")
+
+                if disposition == "TERMINAL_DURABLE":
+                    # §7: verified — a failed terminalize is surfaced, not
+                    # swallowed. On failure the row remains PENDING_TRIGGER
+                    # and is retained with durable ownership (§5) so it is
+                    # never left ownerless by a silent terminalize miss.
+                    _term_ok = _terminalize_verified(
+                        local_order_id,
+                        reason_code=reason_code,
+                        terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
+                        diagnostics={
+                            "recovery_classification": "broker_ready_boundary",
+                            "recovery_attempt": outcome.get("attempt"),
+                            "recovery_max_attempts": outcome.get("max_attempts"),
+                            "recovery_owner": outcome.get("owner"),
+                        },
+                    )
+                    if not _term_ok:
+                        _retain_recovery_ownership(
+                            local_order_id, reason="broker_ready_terminalize_failed",
+                        )
+                elif disposition == "RETRY_WAIT":
+                    # Persist attempt tracking WITHOUT clearing broker_ready
+                    # or any selector/contract/quantity/limit field.  The row
+                    # remains resumable — the durable BROKER_READY state is
+                    # preserved.  See ap_execution_core.resume_deferred_broker_ready_order
+                    # for the full field-preservation rationale.
+                    # §7: verify the durable write; §5: on failure the row is
+                    # still owned (broker_ready meta intact) but we record the
+                    # write failure so a silently-lost attempt is diagnosable.
+                    update_meta = getattr(self.osm, "update_order_meta", None)
+                    _meta_ok = False
+                    if callable(update_meta):
+                        try:
+                            _meta_ok = bool(update_meta(local_order_id, {
+                                "recovery_last_attempt_at": now.isoformat(),
+                                "recovery_attempt_count": outcome.get("attempt"),
+                                "recovery_next_retry_at": outcome.get("next_retry_at"),
+                                "recovery_reason_code": reason_code,
+                                "recovery_owner": outcome.get("owner"),
+                                "recovery_generation": outcome.get("generation"),
+                                "recovery_max_attempts": outcome.get("max_attempts"),
+                            }))
+                        except Exception as exc:
+                            log.critical(
+                                "[%s] RECOVERY_RETRY_META_RAISED local_order_id=%s exc=%s",
+                                self.client_id, local_order_id, exc,
+                            )
+                            result.setdefault("errors", []).append("recovery_retry_meta_raised")
+                    if not _meta_ok:
+                        log.critical(
+                            "[%s] RECOVERY_RETRY_META_WRITE_FAILED local_order_id=%s "
+                            "— retry-tracking marker not persisted; row still "
+                            "durably BROKER_READY and owned",
+                            self.client_id, local_order_id,
+                        )
+                        result.setdefault("errors", []).append("recovery_retry_meta_write_failed")
+                # KEEP_WATCHER (e.g. RECOVERY_OSM_UNAVAILABLE, row read
+                # error, already-submitted) → row untouched.
+                continue
+
+            # PRE_SUBMIT_PROOF_RETRY has an explicit scheduler consumer. Both
+            # startup recovery and the runtime 20-second pass enter this branch;
+            # no in-memory watcher is required for completion.
+            if lifecycle == "PRE_SUBMIT_PROOF_RETRY":
+                outcome = resume_pre_submit_proof_retry(order, self.osm, self.execution_core)
+                disposition = str(outcome.get("disposition") or "").upper()
+                reason_code = str(outcome.get("reason_code") or "PROOF_RETRY_UNKNOWN")
+                if disposition == "SUBMITTED":
+                    recovered += 1
+                elif disposition == "TERMINAL_DURABLE":
+                    _terminalize_verified(
+                        local_order_id,
+                        reason_code=reason_code,
+                        terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
+                        diagnostics={
+                            "recovery_classification": "pre_submit_proof_retry_terminal",
+                            "proof_retry_attempt": outcome.get("proof_retry_attempt"),
+                            "selected_contract": str(order.get("contract") or ""),
+                        },
+                    )
+                elif disposition not in {"NOT_DUE", "CLAIM_LOST", "RETRY_WAIT", "RECONCILE_PENDING"}:
+                    result.setdefault("errors", []).append(
+                        f"proof_retry_unknown_disposition:{disposition or 'blank'}"
+                    )
+                continue
+
+            should_resume = False
+            materialization_resume = False
+            if lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING":
+                # Rearm immediately; the watcher consumes next_retry_at and
+                # remains dormant until due.  Startup recovery is not the only
+                # scheduler tick, so a future-due row still has a real owner.
+                should_resume = True
+                materialization_resume = True
+            elif lifecycle == "MATERIALIZING" or materialization_status == "RUNNING":
+                lease_raw = meta.get("materialization_lease_until")
+                try:
+                    lease = datetime.fromisoformat(str(lease_raw))
+                    if lease.tzinfo is None:
+                        lease = lease.replace(tzinfo=timezone.utc)
+                    should_resume = lease <= now
+                except Exception:
+                    should_resume = True
+                materialization_resume = should_resume
+            elif lifecycle == "" and materialization_status == "QUEUED":
+                should_resume = True
+                materialization_resume = True
+            elif lifecycle == "" and materialization_status in {"", "WAITING_FOR_TRIGGER"}:
+                # Ordinary orphan: the watch() recovery classifier either
+                # rearms it, or terminalizes if the live quote proves the move
+                # already happened/staleness makes rearm unsafe.
+                should_resume = True
+
+            if should_resume:
+                # ── AMENDMENT §5: a resumable row must never be ownerless ──
+                if self.entry_watcher is None:
+                    # No watcher wired — cannot rearm this pass. Record
+                    # durable ownership so the row is diagnosably owned by
+                    # the recovery scheduler and a future pass resumes it.
+                    _retain_recovery_ownership(
+                        local_order_id, reason="entry_watcher_unavailable",
+                    )
+                    continue
+                if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
+                    # Already owned by a live watcher — nothing to do.
+                    continue
+                plan.metadata["materialization_generation"] = int(
+                    meta.get("materialization_generation") or 1
+                )
+                plan.metadata["contract_deferred"] = True
+                armed = bool(self.entry_watcher.watch(
+                    plan,
+                    local_order_id,
+                    recovery_rearm=True,
+                    no_cancel_on_reject=True,
+                    materialization_resume=materialization_resume,
+                ))
+                if armed:
+                    recovered += 1
+                else:
+                    # Rearm returned False — the watcher did NOT take
+                    # ownership. Do not silently drop the row; record durable
+                    # recovery ownership so it is resumed on a later pass.
+                    _retain_recovery_ownership(
+                        local_order_id, reason="watcher_rearm_returned_false",
+                    )
+
+        result["deferred_lifecycles_recovered"] = recovered
 
     def _reseed_watchers(self, result: dict):
         """

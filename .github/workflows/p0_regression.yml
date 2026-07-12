@@ -36,6 +36,13 @@ jobs:
             tests/test_p0_regression_suite.py \
             tests/test_p0_entry_metadata_guard.py \
             tests/test_p0_trade_flow_contracts.py \
+            tests/test_p0_deferred_breach_lifecycle_completion.py \
+            tests/test_p0_amendment10_recovery_full_wiring.py \
+            tests/test_p0_amendment11_ownership_through_cleanup.py \
+            tests/test_p0_seam1_pre_submit_proof_retry.py \
+            tests/test_p0_seam2_timing_boundary.py \
+            tests/test_p0_selector_retry_taxonomy.py \
+            tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             -v --tb=short --color=yes
 
       - name: Summary

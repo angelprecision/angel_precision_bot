@@ -195,6 +195,7 @@ def test_trigger_ready_deferred_quote_refresh_failure_expires_order_with_last_er
     core.store = MagicMock()
     core.order_state_machine = MagicMock()
     core.order_state_machine.expire_pending_entry.return_value = True
+    core.order_state_machine.terminalize_deferred_breach.return_value = True
     core.contract_selector = MagicMock()
     core.contract_selector.select.return_value = selected
     core._breach_risk_check = MagicMock(return_value=True)
@@ -242,9 +243,10 @@ def test_trigger_ready_deferred_quote_refresh_failure_expires_order_with_last_er
 
     core.contract_selector.select.assert_called_once_with(plan)
     core.order_state_machine.submit_existing_entry.assert_not_called()
-    core.order_state_machine.expire_pending_entry.assert_called_once_with(
-        "local-avgo-1",
-        reason="breach_quote_refresh_failed:no_quote",
+    core.order_state_machine.terminalize_deferred_breach.assert_called_once()
+    assert (
+        core.order_state_machine.terminalize_deferred_breach.call_args.kwargs["reason_code"]
+        == "breach_quote_refresh_failed:no_quote"
     )
     core.store.update_signal_fields.assert_any_call(
         "sig-avgo-1",

@@ -246,6 +246,8 @@ _TO_QUEUE_REASON: dict[str, str] = {
     "DELTA_OUT_OF_RANGE":             "DELTA_OUT_OF_RANGE",
     "MONEYNESS_OUT_OF_RANGE":         "MONEYNESS_OUT_OF_RANGE",
     "DTE_OUT_OF_RANGE":               "DTE_OUT_OF_RANGE",
+    "CHEAP_CONTRACT_NO_UPGRADE":      "NO_AFFORDABLE_CONTRACT",
+    "CHEAP_CONTRACT_ONLY_CHOICE":     "CHEAP_CONTRACT_ONLY_CHOICE",
     "NO_AFFORDABLE_CONTRACT":         "NO_AFFORDABLE_CONTRACT",
     "UNTRADEABLE_FOR_ACCOUNT_SIZE":   "NO_AFFORDABLE_CONTRACT",
     "PREMIUM_CAP_EXCEEDED":           "PREMIUM_CAP_EXCEEDED",
@@ -1629,9 +1631,15 @@ class APContractSelectionEngine:
         _bind_selector_request_diagnostics(plan, request_context)
 
         _selector_mode = _normalized_selector_mode(self.mode)
-        _plan_mode = _normalized_selector_mode(_safe_plan_attr(plan, "execution_mode", ""))
+        _plan_mode = _normalized_selector_mode(
+            _safe_plan_attr(plan, "execution_mode", "")
+            or _safe_plan_attr(plan, "mode", "")
+        )
         _original_client_id = _safe_plan_attr(plan, "client_id", None)
-        _original_execution_mode = _safe_plan_attr(plan, "execution_mode", None)
+        _original_execution_mode = (
+            _safe_plan_attr(plan, "execution_mode", None)
+            or _safe_plan_attr(plan, "mode", None)
+        )
         _original_signal_id = _safe_plan_attr(plan, "signal_id", None)
 
         # PR P1 — selector failure metadata tracking (observability only).

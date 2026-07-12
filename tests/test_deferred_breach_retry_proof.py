@@ -123,6 +123,6 @@ def test_source_wires_central_classifier_and_stale_abort_meta():
     assert "_decision_a = _classify_deferred_breach_retry_decision(" in src
     assert "_build_deferred_retry_stale_abort_meta(" in src
     assert "breach_retry_cutoff:" in src
-    assert "breach_retry_exhausted:" in src
+    assert "BREACH_RETRY_EXHAUSTED:" in src
     assert "breach_retry_disabled:" in src
     assert "breach_retry_unavailable:" in src
