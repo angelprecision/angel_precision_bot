@@ -215,6 +215,7 @@ def _fetch_15m_bars_network(key: str, broker: Any, *, now: Optional[datetime] = 
                     "high": float(it["high"]),
                     "low": float(it["low"]),
                     "close": float(it["close"]),
+                    "volume": float(it.get("volume") or 0),
                 })
             except (KeyError, TypeError, ValueError):
                 continue
@@ -267,12 +268,14 @@ def aggregate_bars(bars_15m: list[dict[str, Any]], *, bucket_minutes: int) -> li
                 "high": bar["high"],
                 "low": bar["low"],
                 "close": bar["close"],
+                "volume": float(bar.get("volume") or 0),
             }
             current_key = key
         else:
             agg["high"] = max(agg["high"], bar["high"])
             agg["low"] = min(agg["low"], bar["low"])
             agg["close"] = bar["close"]
+            agg["volume"] = float(agg.get("volume") or 0) + float(bar.get("volume") or 0)
     if agg is not None:
         out.append(agg)
     return out

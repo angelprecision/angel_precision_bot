@@ -1133,7 +1133,7 @@ def _dispatch(
     _canonical_signal_id = payload.get("canonical_signal_id") or signal_id
     try:
         from ap_canonical_signal import build_canonical_signal_id as _build_cid
-        _canonical_signal_id = _build_cid(payload) or _canonical_signal_id
+        _canonical_signal_id = _build_cid(str(signal_id or ""), payload) or _canonical_signal_id
     except Exception:
         pass  # canonical module optional — fallback to signal_id
 
@@ -1143,6 +1143,33 @@ def _dispatch(
     # legacy-fallback guard; it does not affect _dispatch fail-closed logic.
     _execution_mode = runtime_mode_for_dispatch
     live_mode: bool = _execution_mode == "LIVE"
+
+    # Intelligence context PRETRIGGER enqueue: durable, observe-only, and
+    # non-blocking. This is intentionally before synchronous Master Control
+    # intelligence so slow evidence can materialize ahead of any trigger breach.
+    try:
+        from ap.intelligence_context_handoff import enqueue_pretrigger_context_best_effort
+
+        _intel_enqueue = enqueue_pretrigger_context_best_effort(
+            payload,
+            client_id=client_id,
+            execution_mode=_execution_mode,
+            canonical_signal_id=_canonical_signal_id,
+        )
+        if not _intel_enqueue.get("ok"):
+            log.warning(
+                "[%s] PRETRIGGER intelligence enqueue failed signal_id=%s reason=%s",
+                ticker,
+                signal_id,
+                _intel_enqueue.get("error"),
+            )
+    except Exception as _intel_exc:
+        log.warning(
+            "[%s] PRETRIGGER intelligence enqueue error signal_id=%s: %s",
+            ticker,
+            signal_id,
+            _intel_exc,
+        )
 
     if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=_execution_mode):
         log.warning(

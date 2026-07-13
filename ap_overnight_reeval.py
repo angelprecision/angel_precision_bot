@@ -1411,6 +1411,21 @@ def run_overnight_reeval(
             try:
                 armed = entry_watcher.watch(decision.plan, local_order_id)
                 if armed:
+                    try:
+                        from ap.intelligence_context_handoff import enqueue_preopen_context_best_effort
+
+                        enqueue_preopen_context_best_effort(
+                            signal,
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                            canonical_signal_id=_resolve_canonical_signal_id(signal_id, signal),
+                            local_order_id=str(local_order_id),
+                        )
+                    except Exception as _preopen_intel_exc:
+                        log.warning(
+                            "[%s] PREOPEN intelligence handoff error signal_id=%s local_order_id=%s: %s",
+                            ticker, signal_id, local_order_id, _preopen_intel_exc,
+                        )
                     # Overnight reeval creates a LOCAL entry order before broker
                     # submission. That order waits for APEntryWatcher to see the
                     # breach. It MUST NOT remain in CREATED status, because
