@@ -11,6 +11,20 @@ on:
 jobs:
   p0-tests:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +41,7 @@ jobs:
       - name: Run P0 plus cohesion tests
         env:
           DATABASE_URL: "postgresql://test:test@localhost/test"
+          INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
         run: |
           python -m pytest \
             tests/test_osm_retry_idempotency.py \
@@ -43,6 +58,7 @@ jobs:
             tests/test_p0_seam2_timing_boundary.py \
             tests/test_p0_selector_retry_taxonomy.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
+            tests/test_p0_intelligence_postgres.py \
             -v --tb=short --color=yes
 
       - name: Summary

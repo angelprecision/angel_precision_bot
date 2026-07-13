@@ -7,7 +7,10 @@ import time
 import uuid
 from typing import Any, Optional
 
-from ap.intelligence_context_materializer import build_snapshot_kwargs
+from ap.intelligence_context_materializer import (
+    build_snapshot_kwargs,
+    recover_missing_intelligence_jobs,
+)
 from ap.intelligence_snapshot_store import (
     claim_due_intelligence_jobs,
     complete_job_with_snapshot,
@@ -27,6 +30,7 @@ def process_due_intelligence_jobs_once(
     claim_owner: Optional[str] = None,
     limit: int = 5,
     lease_seconds: int = 120,
+    broker: Any = None,
 ) -> dict[str, Any]:
     owner = claim_owner or f"intelligence-context-worker:{uuid.uuid4().hex[:8]}"
     claimed = claim_due_intelligence_jobs(
@@ -45,7 +49,7 @@ def process_due_intelligence_jobs_once(
     transition_failures = 0
     for job in claimed.get("jobs") or []:
         try:
-            snapshot_kwargs = build_snapshot_kwargs(job)
+            snapshot_kwargs = build_snapshot_kwargs(job, broker=broker)
             result = complete_job_with_snapshot(job, claim_owner=owner, snapshot_kwargs=snapshot_kwargs)
             if result.get("ok") and result.get("completed"):
                 completed += 1
@@ -134,6 +138,7 @@ def start_intelligence_context_worker(
     execution_mode: str,
     stop_event: threading.Event,
     interval_seconds: Optional[float] = None,
+    broker: Any = None,
 ) -> Optional[threading.Thread]:
     if os.getenv("INTELLIGENCE_CONTEXT_WORKER_ENABLED", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
@@ -146,11 +151,22 @@ def start_intelligence_context_worker(
 
     def _loop() -> None:
         owner = f"{name}:{uuid.uuid4().hex[:8]}"
+        recovery_interval = float(os.getenv("INTELLIGENCE_CONTEXT_RECOVERY_INTERVAL_SEC", "60"))
+        last_recovery = 0.0
         while not stop_event.is_set():
+            now = time.monotonic()
+            if now - last_recovery >= recovery_interval:
+                recovery = recover_missing_intelligence_jobs(
+                    client_id=client_id, execution_mode=execution_mode,
+                )
+                last_recovery = now
+                if not recovery.get("ok"):
+                    log.warning("[%s] intelligence recovery scan failed: %s", client_id, recovery)
             result = process_due_intelligence_jobs_once(
                 claim_owner=owner,
                 client_id=client_id,
                 execution_mode=execution_mode,
+                broker=broker,
             )
             if result.get("errors"):
                 log.warning("[%s] intelligence context worker errors: %s", client_id, result)

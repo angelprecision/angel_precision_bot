@@ -1,16 +1,22 @@
 import os
+import sys
 import threading
 import time
+import types
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ["INTELLIGENCE_CONTEXT_STORE_BACKEND"] = "memory"
 
 from ap.intelligence_context_materializer import (  # noqa: E402
     build_intelligence_context_payload,
+    _canonical_signal_id,
     enqueue_preopen_context,
     enqueue_pretrigger_context,
+    recover_missing_intelligence_jobs,
 )
+from ap.intelligence_market_data import extract_underlying_price  # noqa: E402
 from ap.intelligence_context_worker import process_due_intelligence_jobs_once  # noqa: E402
 from ap.intelligence_context_handoff import submit_intelligence_enqueue  # noqa: E402
 from ap.intelligence_context_handoff import (  # noqa: E402
@@ -487,3 +493,169 @@ def test_snapshot_completion_uses_one_transaction_shaped_connection(monkeypatch)
     assert failed["ok"] is False
     assert failed["error_code"] == "JOB_CLAIM_OWNERSHIP_LOST"
     assert events[-1] == "rollback"
+
+
+def test_underlying_observation_never_falls_back_to_plan_prices():
+    assert extract_underlying_price({"entry_price": 2.5, "trigger_price": 500.0}) is None
+    assert extract_underlying_price({"underlying_price": 501.25, "trigger_price": 500.0}) == 501.25
+
+
+def test_reeval_identity_strips_client_suffix_and_queue_uses_correct_signature():
+    signal_id = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72:abc123"
+    assert _canonical_signal_id({"signal_id": signal_id}) == (
+        "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
+    )
+    queue_source = (REPO_ROOT / "ap/queue.py").read_text()
+    assert "_build_cid(str(signal_id or \"\"), payload)" in queue_source
+
+
+def test_snapshot_row_and_payload_share_authoritative_input_hash():
+    enqueue_pretrigger_context(
+        _signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+    )
+    _process()
+    snapshot = get_latest_snapshot(
+        client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", phase="PRETRIGGER",
+    )["snapshot"]
+    assert snapshot["input_hash"] == snapshot["payload"]["input_hash"]
+
+
+def test_claim_finalizes_exhausted_job_instead_of_reclaiming():
+    enqueue_pretrigger_context(
+        _signal(), client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+    )
+    job = next(iter(_MEMORY_JOBS.values()))
+    job["status"] = "RUNNING"
+    job["attempt_count"] = job["max_attempts"]
+    job["_claim_expires_epoch"] = time.time() - 1
+    claimed = claim_due_intelligence_jobs(
+        claim_owner="new-owner", client_id="client@example.com",
+        execution_mode="PAPER", limit=1,
+    )
+    assert claimed["jobs"] == []
+    assert job["status"] == "FAILED_TERMINAL"
+    assert job["last_error_code"] == "ATTEMPTS_EXHAUSTED_AT_CLAIM"
+
+
+def test_real_intelligence_modules_receive_fetched_point_in_time_context(monkeypatch):
+    now = datetime.now(timezone.utc)
+    daily = []
+    for index in range(260):
+        day = now - timedelta(days=260 - index)
+        price = 400 + index * 0.25
+        daily.append({
+            "date": day.date().isoformat(), "open": price, "high": price + 2,
+            "low": price - 2, "close": price + 1, "volume": 1_000_000 + index,
+        })
+    bars = []
+    for day_offset in (1, 0):
+        base_day = (now - timedelta(days=day_offset)).replace(hour=14, minute=30, second=0, microsecond=0)
+        for index in range(26):
+            ts = base_day + timedelta(minutes=15 * index)
+            price = 500 + index * 0.1 + (1 - day_offset)
+            bars.append({
+                "time": ts.isoformat(), "open": price, "high": price + 0.8,
+                "low": price - 0.4, "close": price + 0.5,
+                "volume": 10_000 + index * (2 if day_offset == 0 else 1),
+            })
+
+    class Broker:
+        def get_quote(self, symbol):
+            return {
+                "last": 505.0 if symbol == "SPY" else 200.0,
+                "change_percentage": 1.0,
+                "trade_date": now.timestamp(),
+            }
+
+        def _get(self, _path, params=None):
+            assert params["interval"] == "daily"
+            return {"history": {"day": daily}}
+
+    monkeypatch.setattr("ap.fvg_telemetry.fetch_15m_bars", lambda *_args, **_kwargs: bars)
+    signal = {
+        **_signal(), "sector_etf": "XLK", "trigger_price": 501.0,
+        "stop_price": 495.0, "target_price": 515.0,
+    }
+    payload = build_intelligence_context_payload(
+        signal, phase="PREOPEN", client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123", broker=Broker(),
+        input_hash="authoritative-hash",
+    )
+    assert payload["input_hash"] == "authoritative-hash"
+    assert payload["underlying_observation"]["source"] == "tradier_quote"
+    assert payload["strat_context"]["diagnostics"]["states"]["monthly"]["available"] is True
+    assert payload["fvg_context"]["diagnostics"]["timeframes"]["1h"]["available"] is True
+    assert payload["component_statuses"]["market"] == "AVAILABLE"
+    assert payload["component_statuses"]["sector"] == "AVAILABLE"
+    assert payload["component_statuses"]["volume"] == "AVAILABLE"
+    assert payload["component_statuses"]["vwap"] == "AVAILABLE"
+
+
+def test_recovery_scan_backfills_missing_phase_jobs_from_durable_truth(monkeypatch):
+    signal_id = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72:abc123"
+    payload = {**_signal(), "signal_id": signal_id, "canonical_signal_id": ""}
+
+    class Cursor:
+        query = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params):
+            self.query += 1
+
+        def fetchall(self):
+            if self.query == 1:
+                return [{"signal_id": signal_id, "payload": payload}]
+            return [{"signal_id": signal_id, "local_order_id": "loid-1", "payload": payload}]
+
+    cursor = Cursor()
+    monkeypatch.setitem(
+        sys.modules, "ap.db",
+        types.SimpleNamespace(conn=lambda: cursor, run_with_retry=lambda fn: fn()),
+    )
+    result = recover_missing_intelligence_jobs(
+        client_id="client@example.com", execution_mode="PAPER"
+    )
+    assert result == {"ok": True, "pretrigger": 1, "preopen": 1}
+    jobs = list(_MEMORY_JOBS.values())
+    assert {job["phase"] for job in jobs} == {"PRETRIGGER", "PREOPEN"}
+    assert {job["canonical_signal_id"] for job in jobs} == {
+        "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
+    }
+
+
+def test_preopen_refreshes_time_sensitive_quote_instead_of_relabeling_pretrigger(monkeypatch):
+    prices = iter((500.0, 500.0, 200.0, 505.0, 505.0, 201.0))
+
+    class Broker:
+        def get_quote(self, _symbol):
+            return {
+                "last": next(prices), "change_percentage": 0.5,
+                "trade_date": datetime.now(timezone.utc).timestamp(),
+            }
+
+        def _get(self, _path, params=None):
+            return {"history": {"day": []}}
+
+    monkeypatch.setattr("ap.fvg_telemetry.fetch_15m_bars", lambda *_args, **_kwargs: [])
+    broker = Broker()
+    signal = {**_signal(), "sector_etf": "XLK"}
+    pretrigger = build_intelligence_context_payload(
+        signal, phase="PRETRIGGER", client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123", broker=broker,
+    )
+    preopen = build_intelligence_context_payload(
+        signal, phase="PREOPEN", client_id="client@example.com",
+        execution_mode="PAPER", canonical_signal_id="canon-123", broker=broker,
+        parent_snapshot_id="parent-1",
+    )
+    assert pretrigger["underlying_observation"]["price"] == 500.0
+    assert preopen["underlying_observation"]["price"] == 505.0
+    assert preopen["parent_snapshot_id"] == "parent-1"

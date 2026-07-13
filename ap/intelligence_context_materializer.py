@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 from ap.intelligence_market_data import (
     build_data_quality_warnings,
+    collect_point_in_time_context,
     extract_trade_geometry,
     summarize_timeframe,
 )
@@ -30,21 +31,12 @@ def _now_iso() -> str:
 def _canonical_signal_id(signal: dict[str, Any], fallback: str = "") -> str:
     try:
         from ap_canonical_signal import build_canonical_signal_id
-
         return (
-            build_canonical_signal_id(signal)
+            build_canonical_signal_id(str(signal.get("signal_id") or fallback or ""), signal)
             or str(signal.get("canonical_signal_id") or signal.get("signal_id") or fallback or "")
         )
     except Exception:
-        try:
-            from ap_canonical_signal import build_canonical_signal_id
-
-            return (
-                build_canonical_signal_id(str(signal.get("signal_id") or fallback or ""), signal)
-                or str(signal.get("canonical_signal_id") or signal.get("signal_id") or fallback or "")
-            )
-        except Exception:
-            return str(signal.get("canonical_signal_id") or signal.get("signal_id") or fallback or "")
+        return str(signal.get("canonical_signal_id") or signal.get("signal_id") or fallback or "")
 
 
 def _stable_hash(value: Any) -> str:
@@ -81,32 +73,90 @@ def build_intelligence_context_payload(
     parent_snapshot_id: Optional[str] = None,
     context_revision: int = CONTEXT_REVISION,
     profile_version: str = DEFAULT_PROFILE_VERSION,
+    input_hash: str = "",
+    broker: Any = None,
 ) -> dict[str, Any]:
     phase = str(phase or "").upper()
     sig = dict(signal or {})
     canonical_signal_id = canonical_signal_id or _canonical_signal_id(sig)
-    geometry = extract_trade_geometry(sig)
+    point_in_time = collect_point_in_time_context(sig, broker=broker, phase=phase)
+    observation = point_in_time.get("underlying_observation") or {}
+    observed_price = observation.get("price")
+    evaluation_signal = dict(sig)
+    if observed_price is not None:
+        evaluation_signal["underlying_price"] = observed_price
+        evaluation_signal["current_price"] = observed_price
+    else:
+        evaluation_signal.pop("underlying_price", None)
+        evaluation_signal.pop("current_price", None)
+    data_sources = point_in_time.get("data_sources") or {}
+    from ap.market_context_builder import build_market_context_for_signal
+    market_context = build_market_context_for_signal(evaluation_signal, data_sources=data_sources)
+    market_context["market"] = dict(data_sources.get("market") or {})
+    market_context["sector"] = dict(data_sources.get("sector") or {})
+    market_context.setdefault("candles", {})["1h"] = list(
+        ((data_sources.get("candles") or {}).get("1h") or [])
+    )
+    from ap.the_strat_confluence import evaluate_higher_timeframe_confluence
+    from ap.fair_value_gap import evaluate_fvg_context
+    from ap.sector_context import score_sector_context
+    from ap.volume_confirmation import score_volume_confirmation
+    from ap.vwap_context import score_vwap_context
+    strat_context = evaluate_higher_timeframe_confluence(evaluation_signal, market_context)
+    fvg_context = evaluate_fvg_context(evaluation_signal, market_context)
+    sector_context = score_sector_context(evaluation_signal, market_context)
+    volume_context = score_volume_confirmation(evaluation_signal, market_context)
+    vwap_context = score_vwap_context(evaluation_signal, market_context)
+    geometry = extract_trade_geometry(evaluation_signal)
     timeframe_context = {
-        "monthly": summarize_timeframe(sig, "1mo"),
-        "weekly": summarize_timeframe(sig, "1w"),
-        "daily": summarize_timeframe(sig, "1d"),
-        "4h": summarize_timeframe(sig, "4h"),
-        "1h": summarize_timeframe(sig, "1h"),
+        "monthly": summarize_timeframe({"1mo": market_context["candles"].get("monthly")}, "1mo"),
+        "weekly": summarize_timeframe({"1w": market_context["candles"].get("weekly")}, "1w"),
+        "daily": summarize_timeframe({"1d": market_context["candles"].get("daily")}, "1d"),
+        "4h": summarize_timeframe({"4h": market_context["candles"].get("4h")}, "4h"),
+        "1h": summarize_timeframe({"1h": market_context["candles"].get("1h")}, "1h"),
     }
-    fvg_candles = {
-        "1h": timeframe_context["1h"],
-        "4h": timeframe_context["4h"],
-    }
-    warnings = build_data_quality_warnings(sig)
+    warnings = build_data_quality_warnings(evaluation_signal)
+    warnings.extend(point_in_time.get("errors") or [])
     hard_blocks: list[str] = []
     if not geometry["available"]:
         warnings.extend([f"geometry_{name}_missing" for name in geometry.get("missing_data", [])])
 
-    status = "COMPLETE"
-    if warnings:
-        status = "PARTIAL"
-    if not geometry["available"] and len(warnings) >= 3:
+    def _component(available: bool, *, error_prefix: str = "", stale: bool = False) -> str:
+        if error_prefix and any(str(item).startswith(error_prefix) for item in point_in_time.get("errors") or []):
+            return "ERROR"
+        if available and stale:
+            return "STALE"
+        return "AVAILABLE" if available else "MISSING"
+
+    fvg_tf = ((fvg_context.get("diagnostics") or {}).get("timeframes") or {})
+    component_statuses = {
+        "geometry": _component(bool(geometry.get("available"))),
+        "underlying_quote": _component(
+            observed_price is not None, error_prefix="underlying_quote",
+            stale=bool(observation.get("age_seconds") is not None and observation.get("age_seconds") > 120),
+        ),
+        "monthly": _component(bool(timeframe_context["monthly"].get("available")), error_prefix="daily_history"),
+        "weekly": _component(bool(timeframe_context["weekly"].get("available")), error_prefix="daily_history"),
+        "daily": _component(bool(timeframe_context["daily"].get("available")), error_prefix="daily_history"),
+        "four_hour": _component(bool(timeframe_context["4h"].get("available")), error_prefix="intraday_history"),
+        "one_hour_fvg": _component(bool((fvg_tf.get("1h") or {}).get("available")), error_prefix="intraday_history"),
+        "four_hour_fvg": _component(bool((fvg_tf.get("4h") or {}).get("available")), error_prefix="intraday_history"),
+        "market": _component((sector_context.get("diagnostics") or {}).get("market_direction") is not None, error_prefix="market_quote"),
+        "sector": _component((sector_context.get("diagnostics") or {}).get("sector_direction") is not None, error_prefix="sector_quote"),
+        "volume": _component((volume_context.get("diagnostics") or {}).get("relative_volume") is not None),
+        "vwap": _component((vwap_context.get("diagnostics") or {}).get("vwap") is not None),
+    }
+    required_values = list(component_statuses.values())
+    status = "COMPLETE" if required_values and all(value == "AVAILABLE" for value in required_values) else "PARTIAL"
+    if all(value in {"MISSING", "ERROR"} for value in required_values):
         status = "UNAVAILABLE"
+    advisories = sorted(set(
+        list(strat_context.get("block_recommendations") or [])
+        + list(fvg_context.get("block_recommendations") or [])
+        + list(sector_context.get("block_recommendations") or [])
+        + list(volume_context.get("block_recommendations") or [])
+        + list(vwap_context.get("block_recommendations") or [])
+    ))
 
     payload = {
         "profile_version": str(profile_version or DEFAULT_PROFILE_VERSION),
@@ -121,31 +171,30 @@ def build_intelligence_context_payload(
         "side": str(sig.get("side") or sig.get("direction") or "").upper(),
         "pattern": str(sig.get("pattern") or sig.get("pattern_id") or ""),
         "timeframe": str(sig.get("timeframe") or ""),
-        "data_as_of": sig.get("data_as_of") or sig.get("queued_at") or _now_iso(),
+        "data_as_of": point_in_time.get("collected_at") or _now_iso(),
+        "signal_data_as_of": sig.get("data_as_of") or sig.get("queued_at"),
         "computed_at": _now_iso(),
         "status": status,
+        "component_statuses": component_statuses,
         "hard_safety_blocks": hard_blocks,
-        "strategy_advisories": [],
+        "strategy_advisories": advisories,
         "data_quality_warnings": sorted(set(warnings)),
         "observe_only": True,
         "affected_eligibility": False,
         "trade_geometry": geometry,
         "timeframe_context": timeframe_context,
-        "fvg_context": {
-            "available": bool(fvg_candles["1h"]["available"] or fvg_candles["4h"]["available"]),
-            "source": "signal_candles_only",
-            "candles": fvg_candles,
-        },
-        "market_context": {
-            "sector": sig.get("sector"),
-            "sector_etf": sig.get("sector_etf"),
-            "volume_context": sig.get("volume_context"),
-            "vwap_context": sig.get("vwap_context"),
-        },
+        "strat_context": strat_context,
+        "fvg_context": fvg_context,
+        "market_context": market_context,
+        "sector_context": sector_context,
+        "volume_context": volume_context,
+        "vwap_context": vwap_context,
+        "underlying_observation": observation,
+        "data_provenance": point_in_time.get("provenance") or {},
         "parent_snapshot_id": parent_snapshot_id,
         "compatibility_key": "intelligence_evaluation",
     }
-    payload["input_hash"] = _stable_hash(
+    payload["input_hash"] = str(input_hash or _stable_hash(
         {
             "phase": phase,
             "client_id": client_id,
@@ -154,13 +203,13 @@ def build_intelligence_context_payload(
             "local_order_id": local_order_id,
             "signal": sig,
         }
-    )
+    ))
     payload["config_hash"] = _config_hash()
     payload["git_commit"] = _git_commit()
     return payload
 
 
-def build_snapshot_kwargs(job: dict[str, Any]) -> dict[str, Any]:
+def build_snapshot_kwargs(job: dict[str, Any], *, broker: Any = None) -> dict[str, Any]:
     payload = job.get("payload") or {}
     signal = payload.get("signal") if isinstance(payload.get("signal"), dict) else payload
     phase = str(job.get("phase") or payload.get("phase") or "").upper()
@@ -192,6 +241,8 @@ def build_snapshot_kwargs(job: dict[str, Any]) -> dict[str, Any]:
         parent_snapshot_id=parent_snapshot_id,
         context_revision=int(job.get("context_revision") or CONTEXT_REVISION),
         profile_version=str(job.get("profile_version") or DEFAULT_PROFILE_VERSION),
+        input_hash=str(job.get("input_hash") or ""),
+        broker=broker,
     )
     if phase == "PREOPEN":
         context_payload["parent_link_status"] = parent_link_status or "PRETRIGGER_NOT_AVAILABLE"
@@ -296,3 +347,100 @@ def enqueue_preopen_context(
         input_hash=input_hash,
         payload=payload,
     )
+
+
+def recover_missing_intelligence_jobs(
+    *, client_id: str, execution_mode: str, limit: int = 100
+) -> dict[str, Any]:
+    """Backfill durable jobs from canonical queue/order truth after process loss."""
+    from ap.db import conn, run_with_retry
+
+    mode = normalize_execution_mode(execution_mode)
+
+    def _load() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        with conn() as c:
+            c.execute(
+                """
+                SELECT signal_id, payload
+                FROM trade_queue q
+                WHERE q.client_id=%s
+                  AND upper(COALESCE(q.payload->>'execution_mode', q.payload->>'mode', %s))=%s
+                  AND q.status NOT IN ('REJECTED','ERROR','CANCELED','CANCELLED','EXPIRED')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ap_intelligence_jobs j
+                    WHERE j.client_id=q.client_id
+                      AND lower(j.execution_mode)=lower(%s)
+                      AND j.signal_id=q.signal_id
+                      AND j.phase='PRETRIGGER'
+                  )
+                ORDER BY q.created_ts DESC
+                LIMIT %s
+                """,
+                (client_id, mode, mode, mode, int(limit or 100)),
+            )
+            queue_rows = list(c.fetchall() or [])
+            c.execute(
+                """
+                SELECT o.signal_id, o.local_order_id, q.payload
+                FROM orders o
+                JOIN trade_queue q
+                  ON q.client_id=o.client_id AND q.signal_id=o.signal_id
+                WHERE o.client_id=%s
+                  AND o.kind='ENTRY'
+                  AND o.status IN ('PENDING_TRIGGER','WATCHING')
+                  AND o.broker_order_id IS NULL
+                  AND upper(COALESCE(q.payload->>'execution_mode', q.payload->>'mode', %s))=%s
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ap_intelligence_jobs j
+                    WHERE j.client_id=o.client_id
+                      AND lower(j.execution_mode)=lower(%s)
+                      AND j.signal_id=o.signal_id
+                      AND COALESCE(NULLIF(BTRIM(j.local_order_id), ''), '__none__')=
+                          COALESCE(NULLIF(BTRIM(o.local_order_id), ''), '__none__')
+                      AND j.phase='PREOPEN'
+                  )
+                ORDER BY o.created_ts DESC
+                LIMIT %s
+                """,
+                (client_id, mode, mode, mode, int(limit or 100)),
+            )
+            preopen_rows = list(c.fetchall() or [])
+            return queue_rows, preopen_rows
+
+    try:
+        queue_rows, preopen_rows = run_with_retry(_load)
+    except Exception as exc:
+        return {"ok": False, "pretrigger": 0, "preopen": 0, "error": str(exc)[:500]}
+
+    counts = {"pretrigger": 0, "preopen": 0}
+    for row in queue_rows:
+        payload = row.get("payload") if isinstance(row, dict) else row[1]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        signal = dict(payload or {})
+        signal.setdefault("signal_id", row.get("signal_id") if isinstance(row, dict) else row[0])
+        result = enqueue_pretrigger_context(
+            signal, client_id=client_id, execution_mode=mode,
+            canonical_signal_id=_canonical_signal_id(signal),
+        )
+        counts["pretrigger"] += int(bool(result.get("inserted")))
+    for row in preopen_rows:
+        payload = row.get("payload") if isinstance(row, dict) else row[2]
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        signal = dict(payload or {})
+        signal.setdefault("signal_id", row.get("signal_id") if isinstance(row, dict) else row[0])
+        local_order_id = row.get("local_order_id") if isinstance(row, dict) else row[1]
+        result = enqueue_preopen_context(
+            signal, client_id=client_id, execution_mode=mode,
+            canonical_signal_id=_canonical_signal_id(signal),
+            local_order_id=str(local_order_id or ""),
+        )
+        counts["preopen"] += int(bool(result.get("inserted")))
+    return {"ok": True, **counts}

@@ -246,6 +246,14 @@ def claim_due_intelligence_jobs(
                     expired = float(job.get("_claim_expires_epoch") or 0) <= now
                     if job.get("client_id") != client_id or job.get("execution_mode") != execution_mode:
                         continue
+                    due_or_expired = (
+                        job.get("status") in {"PENDING", "RETRY_PENDING"}
+                        or (job.get("status") == "RUNNING" and expired)
+                    )
+                    if due_or_expired and int(job.get("attempt_count") or 0) >= int(job.get("max_attempts") or 3):
+                        job["status"] = "FAILED_TERMINAL"
+                        job["last_error_code"] = "ATTEMPTS_EXHAUSTED_AT_CLAIM"
+                        continue
                     if job.get("status") in {"PENDING", "RETRY_PENDING"} or (
                         job.get("status") == "RUNNING" and expired
                     ):
@@ -260,10 +268,27 @@ def claim_due_intelligence_jobs(
             with _db_conn()() as c:
                 c.execute(
                     """
-                    WITH due AS (
+                    WITH exhausted AS (
+                      UPDATE ap_intelligence_jobs
+                      SET status='FAILED_TERMINAL',
+                          last_error_code='ATTEMPTS_EXHAUSTED_AT_CLAIM',
+                          last_error_detail='claim_attempt_budget_exhausted',
+                          claim_expires_at=NULL,
+                          updated_at=now()
+                      WHERE client_id=%s AND lower(execution_mode)=lower(%s)
+                        AND attempt_count >= max_attempts
+                        AND (
+                          (status IN ('PENDING', 'RETRY_PENDING') AND next_attempt_at <= now())
+                          OR
+                          (status='RUNNING' AND claim_expires_at IS NOT NULL
+                           AND claim_expires_at <= now())
+                        )
+                      RETURNING id
+                    ), due AS (
                       SELECT id
                       FROM ap_intelligence_jobs
                       WHERE client_id=%s AND lower(execution_mode)=lower(%s)
+                        AND attempt_count < max_attempts
                         AND (
                           (status IN ('PENDING', 'RETRY_PENDING') AND next_attempt_at <= now())
                           OR
@@ -285,7 +310,8 @@ def claim_due_intelligence_jobs(
                     WHERE j.id=due.id
                     RETURNING j.*
                     """,
-                    (client_id, normalize_execution_mode(execution_mode), int(limit or 5),
+                    (client_id, normalize_execution_mode(execution_mode),
+                     client_id, normalize_execution_mode(execution_mode), int(limit or 5),
                      claim_owner, int(lease_seconds or 120)),
                 )
                 return _result(True, jobs=c.fetchall())

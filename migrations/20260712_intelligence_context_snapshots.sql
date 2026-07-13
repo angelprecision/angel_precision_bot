@@ -102,6 +102,12 @@ ON ap_intelligence_jobs (
   client_id, lower(execution_mode), status, next_attempt_at, claim_expires_at
 );
 
+CREATE INDEX IF NOT EXISTS idx_ap_intel_jobs_active_due_claim
+ON ap_intelligence_jobs (
+  client_id, lower(execution_mode), next_attempt_at, claim_expires_at
+)
+WHERE status IN ('PENDING', 'RETRY_PENDING', 'RUNNING');
+
 CREATE INDEX IF NOT EXISTS idx_ap_intel_jobs_identity_lookup
 ON ap_intelligence_jobs (
   client_id,
@@ -110,3 +116,25 @@ ON ap_intelligence_jobs (
   phase,
   context_revision
 );
+
+CREATE INDEX IF NOT EXISTS idx_ap_intel_jobs_recovery_lookup
+ON ap_intelligence_jobs (
+  client_id,
+  lower(execution_mode),
+  signal_id,
+  phase,
+  COALESCE(NULLIF(BTRIM(local_order_id), ''), '__none__')
+);
+
+ALTER TABLE ap_intelligence_snapshots ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ap_intelligence_jobs ENABLE ROW LEVEL SECURITY;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+    EXECUTE 'REVOKE ALL ON ap_intelligence_snapshots, ap_intelligence_jobs FROM anon';
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+    EXECUTE 'REVOKE ALL ON ap_intelligence_snapshots, ap_intelligence_jobs FROM authenticated';
+  END IF;
+END $$;

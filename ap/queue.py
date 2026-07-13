@@ -1133,7 +1133,7 @@ def _dispatch(
     _canonical_signal_id = payload.get("canonical_signal_id") or signal_id
     try:
         from ap_canonical_signal import build_canonical_signal_id as _build_cid
-        _canonical_signal_id = _build_cid(payload) or _canonical_signal_id
+        _canonical_signal_id = _build_cid(str(signal_id or ""), payload) or _canonical_signal_id
     except Exception:
         pass  # canonical module optional — fallback to signal_id
 

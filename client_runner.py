@@ -3439,6 +3439,7 @@ class ClientRunner(threading.Thread):
                 client_id=self.email,
                 execution_mode=self.mode,
                 stop_event=self.stopped,
+                broker=broker,
             )
         except Exception as _intel_worker_exc:
             logger.warning(
