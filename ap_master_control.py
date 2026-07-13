@@ -9,6 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Optional
 
 from ap.admission_thresholds import (
@@ -419,6 +420,29 @@ class ControlDecision:
     client_id: str = "default"
 
 
+def _serialize_setup_cache_evaluation(func):
+    """Serialize one control instance across setup-cache check and commit.
+
+    The setup cache is a read/compare/write ownership fence.  Locking only the
+    individual dictionary operations would still allow two concurrent signals
+    for the same setup to both observe an empty cache before either approval
+    records its owner.
+    """
+
+    @wraps(func)
+    def _wrapped(self, *args, **kwargs):
+        lock = getattr(self, "_setup_cache_lock", None)
+        if lock is None:
+            # Supports deliberately minimal __new__-constructed test objects.
+            # Production instances always create the lock in __init__.
+            lock = threading.RLock()
+            self._setup_cache_lock = lock
+        with lock:
+            return func(self, *args, **kwargs)
+
+    return _wrapped
+
+
 class APMasterControl:
     """Single decision authority for whether a signal may become a trade."""
 
@@ -615,6 +639,7 @@ class APMasterControl:
         #                   takes effect with no bot restart.
         self._entries_paused_fn = None
         self._mode_fn = None
+        self._setup_cache_lock = threading.RLock()
         self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
         self._seen_setup_owners: dict[str, str] = {}  # setup_key -> owning canonical signal_id
         self._trade_dossier_signal_cache: dict[str, dict[str, Any]] = {}
@@ -1605,6 +1630,7 @@ class APMasterControl:
                 log.error("Failed to calculate exposure for sector %s: %s", sector, _exp_err)
         return exposure
 
+    @_serialize_setup_cache_evaluation
     def evaluate(self, signal: dict, client_id: str = "default") -> ControlDecision:
         bootstrap_mode = False
         total_trades = 0
@@ -1691,9 +1717,14 @@ class APMasterControl:
 
         direction_raw = norm_side
         timeframe_raw = signal.get("timeframe", "1d")
-        setup_key = f"{client_id}:{ticker.upper()}:{direction_raw}:{timeframe_raw}"
+        # Execution mode is part of process-local setup identity. A single
+        # runner may change mode through mode_fn; PAPER history must not poison
+        # a later LIVE evaluation (or vice versa) for the same client/setup.
+        setup_key = f"{client_id}:{current_mode}:{ticker.upper()}:{direction_raw}:{timeframe_raw}"
         signal_key = f"sig:{signal_id}:{client_id}"
         _now_ts = time.time()
+        if setup_key in self._seen_signals and (_now_ts - self._seen_signals[setup_key]) >= 1800:
+            self._remove_setup_cache_entry(setup_key)
         if len(self._seen_signals) > 500:
             _surviving_keys = {k for k, v in self._seen_signals.items() if _now_ts - v < 1800}
             self._seen_signals = {k: v for k, v in self._seen_signals.items() if k in _surviving_keys}
@@ -4322,11 +4353,18 @@ class APMasterControl:
                 details={"error": str(e), "blocked": blocked, "block_reason": block_reason},
             )
 
+    def _remove_setup_cache_entry(self, setup_key: str) -> None:
+        """Remove a setup timestamp and owner together under the cache lock."""
+        with self._setup_cache_lock:
+            self._seen_signals.pop(setup_key, None)
+            self._seen_setup_owners.pop(setup_key, None)
+
     def reset_session(self, client_id: str = ""):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         client_prefix = client_id or (self.pm.client_id if hasattr(self.pm, "client_id") else "")
-        self._seen_signals.clear()  # dict.clear() — same interface
-        getattr(self, "_seen_setup_owners", {}).clear()
+        with self._setup_cache_lock:
+            self._seen_signals.clear()
+            self._seen_setup_owners.clear()
         self._trade_dossier_signal_cache.clear()
         self._trade_dossier_signal_cache_ts.clear()
         # PR E / FIX-4: clear _trade_cooldowns under _cooldown_lock so a new
@@ -4420,11 +4458,15 @@ class APMasterControl:
                     return c.fetchall()
 
             rows = run_with_retry(_load)
-            for row in rows:
-                underlying = str(row.get("underlying") or row.get("ticker") or "")
-                direction = str(row.get("direction") or "CALL").upper()
-                for tf in ("1d", "60m", "30m", "15m"):
-                    self._seen_signals[f"{client_id}:{underlying.upper()}:{direction}:{tf}"] = time.time()
+            with self._setup_cache_lock:
+                for row in rows:
+                    underlying = str(row.get("underlying") or row.get("ticker") or "")
+                    direction = str(row.get("direction") or "CALL").upper()
+                    mode = self._current_mode()
+                    for tf in ("1d", "60m", "30m", "15m"):
+                        self._seen_signals[
+                            f"{client_id}:{mode}:{underlying.upper()}:{direction}:{tf}"
+                        ] = time.time()
         except Exception as e:
             log.debug("Dedup seed failed (non-critical): %s", e)
             self._alert_degraded(

@@ -1,239 +1,349 @@
-"""
-tests/test_p0_setup_lifecycle_owner.py
+"""Behavioral proof for process-local setup ownership in Master Control.
 
-PR #317 — P0: prevent paper setup cache from rejecting its own signal lifecycle.
-
-Tests exercise real APMasterControl state — not a replica or wrapper.
+Every lifecycle assertion drives the real ``APMasterControl.evaluate`` method.
+Only database, telemetry, and other external dependencies are mocked.
 """
 from __future__ import annotations
 
+import logging
+import threading
 import time
-import types
-from unittest.mock import MagicMock
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+import ap_master_control as master_control_module
+from ap_master_control import APMasterControl
 
-def _setup_key(cid, ticker, side, timeframe):
-    return f"{cid}:{ticker.upper()}:{side.upper()}:{timeframe}"
+
+JOSE = "jose.vasquez4011@gmail.com"
+TRADEFLUENCE = "tradefluencehq@gmail.com"
 
 
-def _make_mc():
-    """Minimal APMasterControl instance for cache-seam tests."""
-    from ap_master_control import APMasterControl
-    mc = APMasterControl.__new__(APMasterControl)
-    mc._seen_signals = {}
-    mc._seen_setup_owners = {}
-    mc._trade_dossier_signal_cache = {}
-    mc._trade_dossier_signal_cache_ts = {}
-    import threading
-    mc._lock = threading.Lock()
-    mc._cooldown_lock = threading.Lock()
-    mc._cooldowns = {}
-    mc._trade_cooldowns = {}
-    mc.mode = "PAPER"
-    mc.pm = types.SimpleNamespace(client_id="")
-    mc._has_durable_duplicate_signal = MagicMock(return_value=(False, "ok", "ok"))
-    mc._get_snapshot = MagicMock(return_value={"_snapshot_ok": True})
-    mc._prune_trade_dossier_signal_cache = MagicMock()
-    mc._emit_trade_dossier = MagicMock()
-    mc._block = lambda sig, ticker, cid, reason, msg, **kw: {
-        "approved": False, "reason": reason, "message": msg
+def _signal(signal_id: str | None = "sig-1", **overrides):
+    payload = {
+        "signal_id": signal_id,
+        "canonical_signal_id": signal_id,
+        "ticker": "AAPL",
+        "symbol": "AAPL",
+        "side": "CALL",
+        "direction": "CALL",
+        "timeframe": "1d",
+        "pattern": "2-3",
+        "pattern_id": "2-3",
+        "score": 95.0,
+        "ev_score": 95.0,
+        "entry_trigger": 200.0,
+        "target_price": 205.0,
+        "stop_price": 197.5,
+        "underlying_at_signal": 201.0,
+        "trigger": {"entry": 200.0, "stop": 197.5, "pt1": 205.0},
     }
+    payload.update(overrides)
+    return payload
+
+
+def _snapshot():
+    return {
+        "_snapshot_ok": True,
+        "_snapshot_ts": "2026-07-13T12:00:00Z",
+        "_snapshot_age_sec": 0.0,
+        "open_count": 0,
+        "open_positions": [],
+        "closing_positions": [],
+        "calls_open": 0,
+        "puts_open": 0,
+        "filled_unreconciled_calls": 0,
+        "filled_unreconciled_puts": 0,
+        "pending_entries": 0,
+        "pending_entry_capital": 0.0,
+        "capital_deployed": 0.0,
+        "realized_pnl_today": 0.0,
+        "trades_today": 0,
+        "total_trades": 25,
+        "daily_trades": 0,
+        "intraday_trades": 0,
+        "watcher_count": 0,
+        "entry_attempt_lock_count": 0,
+        "symbol_trades": {},
+        "ticker_open_counts": {},
+        "ticker_pending_counts": {},
+    }
+
+
+def _make_mc(*, mode: str = "paper") -> APMasterControl:
+    master_control_module.emit_decision_event = None
+    master_control_module.track_counterfactual_signal = None
+    with patch.object(APMasterControl, "_seed_dedup_from_db", return_value=None):
+        mc = APMasterControl(
+            mode=mode,
+            client_id=JOSE,
+            score_floor=60.0,
+            context_floor=0.0,
+            account_equity=100_000.0,
+            max_capital_pct=0.40,
+            max_position_pct=0.40,
+            max_total_capital_pct=0.90,
+            max_sector_pct=1.0,
+            max_ticker_pct=1.0,
+            max_positions=20,
+            max_calls=20,
+            max_puts=20,
+            max_trades_today=100,
+            require_snapshot_freshness_live=False,
+            pending_capital_fail_closed_live=False,
+        )
+    mc._get_snapshot = MagicMock(side_effect=lambda *args, **kwargs: _snapshot())
+    mc._has_durable_duplicate_signal = MagicMock(return_value=(False, "", ""))
+    mc._pending_capital_from_snapshot_or_db = MagicMock(return_value=0.0)
+    mc._sector_capital_deployed = MagicMock(return_value=0.0)
+    mc._ticker_capital_deployed = MagicMock(return_value=0.0)
+    mc._run_intelligence = MagicMock(return_value={
+        "approved": True,
+        "score": 0.0,
+        "contracts": 1,
+        "reasoning": "observe-only unavailable",
+        "_available": False,
+    })
+    mc._run_final_quality_gates = MagicMock(return_value=None)
+    mc._persist_dedup = MagicMock(return_value=None)
+    mc._emit_trade_dossier = MagicMock()
+    mc._log_capital_utilization = MagicMock()
+    mc._alert_degraded = MagicMock()
+    mc._store_update = MagicMock()
+    mc.feedback = None
+    mc.sizer = None
+    mc.pm = None
     return mc
 
 
-# ── 1. First evaluation records setup ownership ───────────────────────────────
+def _setup_key(client_id: str, mode: str = "PAPER") -> str:
+    return f"{client_id}:{mode}:AAPL:CALL:1d"
 
-def test_first_evaluation_records_setup_ownership():
+
+def _assert_approved(decision):
+    assert decision.ok is True, decision.reason
+    assert decision.stage == "approved"
+
+
+def _assert_duplicate_setup(decision):
+    assert decision.ok is False
+    assert decision.stage == "blocked_system"
+    assert decision.reason == "duplicate_setup (AAPL CALL 1d)"
+
+
+def test_first_real_evaluate_records_setup_owner():
     mc = _make_mc()
-    sk = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time()
-    mc._seen_setup_owners[sk] = "sig-001"
-    assert mc._seen_setup_owners.get(sk) == "sig-001"
+    decision = mc.evaluate(_signal("sig-1"), client_id=JOSE)
+
+    _assert_approved(decision)
+    key = _setup_key(JOSE)
+    assert key in mc._seen_signals
+    assert mc._seen_setup_owners[key] == "sig-1"
 
 
-# ── 2. Same lifecycle does not self-reject ────────────────────────────────────
-
-def test_same_signal_id_does_not_get_duplicate_setup():
+def test_same_lifecycle_real_evaluate_does_not_self_reject():
     mc = _make_mc()
-    sid = "sig-001"
-    sk  = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time()
-    mc._seen_setup_owners[sk] = sid
+    _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
+    snapshot_calls = mc._get_snapshot.call_count
+    pending_calls = mc._pending_capital_from_snapshot_or_db.call_count
+    quality_calls = mc._run_final_quality_gates.call_count
 
-    cached_owner = mc._seen_setup_owners.get(sk, "")
-    cache_hit    = sk in mc._seen_signals and (time.time() - mc._seen_signals[sk]) < 1800
-    assert cache_hit
-    assert cached_owner == sid, "Same lifecycle must bypass duplicate_setup"
+    decision = mc.evaluate(_signal("sig-1"), client_id=JOSE)
+
+    _assert_approved(decision)
+    assert mc._has_durable_duplicate_signal.call_count == 2
+    assert mc._get_snapshot.call_count > snapshot_calls
+    assert mc._pending_capital_from_snapshot_or_db.call_count > pending_calls
+    assert mc._run_final_quality_gates.call_count > quality_calls
 
 
-# ── 3. Different signal same setup remains blocked ────────────────────────────
-
-def test_different_signal_same_setup_blocks():
+def test_different_lifecycle_real_evaluate_still_blocks():
     mc = _make_mc()
-    sk = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time()
-    mc._seen_setup_owners[sk] = "sig-001"
+    _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
+    snapshot_calls = mc._get_snapshot.call_count
 
-    assert mc._seen_setup_owners.get(sk, "") != "sig-002"  # different lifecycle → block
+    decision = mc.evaluate(_signal("sig-2"), client_id=JOSE)
 
-
-# ── 4. Client isolation ───────────────────────────────────────────────────────
-
-def test_setup_ownership_does_not_cross_clients():
-    sk_jose  = _setup_key("jose@test.com",           "SPY", "CALL", "1w")
-    sk_trade = _setup_key("tradefluencehq@test.com", "SPY", "CALL", "1w")
-    assert sk_jose != sk_trade
+    _assert_duplicate_setup(decision)
+    assert mc._get_snapshot.call_count == snapshot_calls
 
 
-# ── 5. Mode / client isolation ────────────────────────────────────────────────
-
-def test_paper_live_different_keys():
-    sk_paper = _setup_key("jose_paper@test.com", "SPY", "CALL", "1w")
-    sk_live  = _setup_key("jose_live@test.com",  "SPY", "CALL", "1w")
-    assert sk_paper != sk_live
-
-
-# ── 6. Legacy ownerless entry remains blocked ─────────────────────────────────
-
-def test_legacy_ownerless_key_blocks():
+def test_ownerless_legacy_cache_real_evaluate_blocks():
     mc = _make_mc()
-    sk = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time()
-    # No owner → ownerless legacy key
-    cached_owner = mc._seen_setup_owners.get(sk, "")
-    assert cached_owner == "", "Ownerless legacy key must block (fail-closed)"
+    key = _setup_key(JOSE)
+    mc._seen_signals[key] = time.time()
+
+    decision = mc.evaluate(_signal("sig-1"), client_id=JOSE)
+
+    _assert_duplicate_setup(decision)
+    assert key not in mc._seen_setup_owners
 
 
-# ── 7. Blank signal_id cannot bypass ─────────────────────────────────────────
-
-def test_blank_signal_id_cannot_bypass():
+@pytest.mark.parametrize("identity", [None, ""])
+def test_blank_signal_identity_real_evaluate_cannot_bypass(identity):
     mc = _make_mc()
-    sk = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time()
-    mc._seen_setup_owners[sk] = "sig-001"
+    key = _setup_key(JOSE)
+    mc._seen_signals[key] = time.time()
+    mc._seen_setup_owners[key] = "sig-1"
+    signal = _signal(identity)
 
-    current_sid = ""
-    # Blank signal_id → fail-closed regardless of cached owner
-    assert not current_sid, "Blank signal_id must not bypass setup dedup"
+    decision = mc.evaluate(signal, client_id=JOSE)
+
+    _assert_duplicate_setup(decision)
+    assert signal["signal_id"]
+    assert signal["signal_id"] != "sig-1"
 
 
-# ── 8. Expired setup key removes owner metadata ───────────────────────────────
-
-def test_expired_key_removes_owner():
+def test_durable_duplicate_still_blocks_after_same_lifecycle_cache_bypass():
     mc = _make_mc()
-    sk = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time() - 2000  # expired
-    mc._seen_setup_owners[sk] = "sig-001"
-
-    _now_ts = time.time()
-    surviving = {k for k, v in mc._seen_signals.items() if _now_ts - v < 1800}
-    mc._seen_signals       = {k: v for k, v in mc._seen_signals.items() if k in surviving}
-    mc._seen_setup_owners  = {k: v for k, v in mc._seen_setup_owners.items() if k in surviving}
-
-    assert sk not in mc._seen_signals
-    assert sk not in mc._seen_setup_owners, "Stale owner must be pruned with expired key"
-
-
-# ── 9. Cache rebuild preserves only surviving owners ─────────────────────────
-
-def test_rebuild_preserves_only_surviving_owners():
-    mc = _make_mc()
-    _now = time.time()
-    sk_fresh   = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    sk_expired = _setup_key("jose@test.com", "QQQ", "PUT",  "1d")
-
-    mc._seen_signals[sk_fresh]   = _now
-    mc._seen_signals[sk_expired] = _now - 2000
-    mc._seen_setup_owners[sk_fresh]   = "sig-fresh"
-    mc._seen_setup_owners[sk_expired] = "sig-expired"
-
-    surviving = {k for k, v in mc._seen_signals.items() if _now - v < 1800}
-    mc._seen_signals       = {k: v for k, v in mc._seen_signals.items() if k in surviving}
-    mc._seen_setup_owners  = {k: v for k, v in mc._seen_setup_owners.items() if k in surviving}
-
-    assert sk_fresh   in  mc._seen_setup_owners
-    assert sk_expired not in mc._seen_setup_owners
-
-
-# ── 10. Reset clears all owner entries ───────────────────────────────────────
-
-def test_reset_clears_owner_entries():
-    mc = _make_mc()
-    sk = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_signals[sk] = time.time()
-    mc._seen_setup_owners[sk] = "sig-001"
-
-    mc._seen_signals.clear()
-    getattr(mc, "_seen_setup_owners", {}).clear()
-
-    assert len(mc._seen_signals) == 0
-    assert len(mc._seen_setup_owners) == 0
-
-
-# ── 11. Durable DB duplicate still blocks distinct lifecycle ──────────────────
-
-def test_durable_db_duplicate_blocks_distinct_lifecycle():
-    mc = _make_mc()
-    mc._has_durable_duplicate_signal.return_value = (True, "queue_active", "row 77")
-    sid = "sig-007"
-    sk  = _setup_key("jose@test.com", "SPY", "CALL", "1w")
-    mc._seen_setup_owners[sk] = sid  # same lifecycle owner
-    is_dup, _, _ = mc._has_durable_duplicate_signal(
-        client_id="jose@test.com", signal_id=sid, current_queue_id=None
+    _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
+    snapshot_calls = mc._get_snapshot.call_count
+    mc._has_durable_duplicate_signal.return_value = (
+        True,
+        "orders",
+        "id=42 status=SUBMITTED",
     )
-    assert is_dup is True, "Durable DB duplicate must block even when cache permits"
+
+    decision = mc.evaluate(_signal("sig-1"), client_id=JOSE)
+
+    assert decision.ok is False
+    assert decision.reason == "duplicate_signal_id (durable:orders)"
+    assert mc._get_snapshot.call_count == snapshot_calls
 
 
-# ── 12. Jose/Tradefluence July-10 self-rejection shape resolved ───────────────
-
-def test_same_queue_lifecycle_bypass_resolves_july10_shape():
+def test_jose_and_tradefluence_cache_isolation():
     mc = _make_mc()
-    sid = "jose-signal-july10"
-    sk  = _setup_key("jose@test.com", "SPY", "CALL", "1w")
 
-    mc._seen_signals[sk]      = time.time()
-    mc._seen_setup_owners[sk] = sid
+    jose = mc.evaluate(_signal("sig-jose"), client_id=JOSE)
+    tradefluence = mc.evaluate(_signal("sig-tradefluence"), client_id=TRADEFLUENCE)
 
-    cached_owner = mc._seen_setup_owners.get(sk, "")
-    cache_hit    = sk in mc._seen_signals and (time.time() - mc._seen_signals[sk]) < 1800
-    assert cache_hit and cached_owner == sid, "Same lifecycle must bypass (July-10 shape fixed)"
+    _assert_approved(jose)
+    _assert_approved(tradefluence)
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "sig-jose"
+    assert mc._seen_setup_owners[_setup_key(TRADEFLUENCE)] == "sig-tradefluence"
 
 
-# ── 13. Different signal in same window still blocks ─────────────────────────
+def test_paper_live_mode_isolation_with_same_client_identity():
+    mc = _make_mc(mode="paper")
+    runtime_mode = {"value": "PAPER"}
+    mc._mode_fn = lambda: runtime_mode["value"]
 
-def test_different_signal_same_window_blocks():
+    paper = mc.evaluate(_signal("sig-paper"), client_id=JOSE)
+    runtime_mode["value"] = "LIVE"
+    live = mc.evaluate(_signal("sig-live"), client_id=JOSE)
+
+    _assert_approved(paper)
+    _assert_approved(live)
+    assert mc._seen_setup_owners[_setup_key(JOSE, "PAPER")] == "sig-paper"
+    assert mc._seen_setup_owners[_setup_key(JOSE, "LIVE")] == "sig-live"
+
+
+def test_expired_cache_prunes_owner_in_real_evaluate_path():
     mc = _make_mc()
-    sk = _setup_key("tradefluencehq@test.com", "AAPL", "PUT", "1d")
-    mc._seen_signals[sk]      = time.time()
-    mc._seen_setup_owners[sk] = "sig-A"
+    key = _setup_key(JOSE)
+    mc._seen_signals[key] = time.time() - 1801
+    mc._seen_setup_owners[key] = "sig-expired"
 
-    assert mc._seen_setup_owners.get(sk, "") != "sig-B"
+    decision = mc.evaluate(_signal("sig-new"), client_id=JOSE)
+
+    _assert_approved(decision)
+    assert mc._seen_setup_owners[key] == "sig-new"
+    assert mc._seen_signals[key] > time.time() - 10
 
 
-# ── 14. Jose and Tradefluence client isolation ────────────────────────────────
-
-def test_jose_tradefluence_isolation():
+def test_cache_rebuild_prunes_stale_owner():
     mc = _make_mc()
-    sk_jose  = _setup_key("jose@test.com",           "SPY", "CALL", "1w")
-    sk_trade = _setup_key("tradefluencehq@test.com", "SPY", "CALL", "1w")
+    now = time.time()
+    for index in range(501):
+        key = f"noise:{index}"
+        mc._seen_signals[key] = now if index else now - 1801
+    mc._seen_setup_owners["noise:0"] = "stale-owner"
 
-    mc._seen_signals[sk_jose]      = time.time()
-    mc._seen_setup_owners[sk_jose] = "sig-jose"
+    decision = mc.evaluate(_signal("sig-rebuild"), client_id=JOSE)
 
-    assert sk_trade not in mc._seen_signals
-    assert mc._seen_setup_owners.get(sk_trade, "") == ""
+    _assert_approved(decision)
+    assert "noise:0" not in mc._seen_signals
+    assert "noise:0" not in mc._seen_setup_owners
 
 
-# ── 15. Canonical exports unchanged ──────────────────────────────────────────
+def test_reset_session_clears_owner_state(monkeypatch):
+    mc = _make_mc()
+    _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
+    monkeypatch.setattr(mc, "clear_force_close", MagicMock())
+    monkeypatch.setattr("ap.db.run_with_retry", lambda func: None)
 
-def test_canonical_exports_and_import_unchanged():
-    from ap_master_control import APMasterControl
-    import ap_master_control as _amc
-    import os
-    assert os.path.basename(_amc.__file__) == "ap_master_control.py", (
-        f"Import must resolve directly to ap_master_control.py; got {_amc.__file__}"
+    mc.reset_session(client_id=JOSE)
+
+    assert mc._seen_signals == {}
+    assert mc._seen_setup_owners == {}
+
+
+def test_concurrent_different_signals_cannot_both_bypass():
+    mc = _make_mc()
+    original_intelligence = mc._run_intelligence
+    started = threading.Event()
+
+    def slow_intelligence(signal):
+        started.set()
+        time.sleep(0.05)
+        return original_intelligence(signal)
+
+    mc._run_intelligence = MagicMock(side_effect=slow_intelligence)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(mc.evaluate, _signal("sig-a"), JOSE)
+        assert started.wait(timeout=2)
+        second = pool.submit(mc.evaluate, _signal("sig-b"), JOSE)
+        decisions = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert sum(decision.ok for decision in decisions) == 1
+    blocked = next(decision for decision in decisions if not decision.ok)
+    _assert_duplicate_setup(blocked)
+
+
+def test_july10_repeated_queue_lifecycle_no_longer_returns_duplicate_setup():
+    mc = _make_mc()
+    production_row = _signal(
+        "july10-jose-aapl-call-1d",
+        _queue_id="7201",
+        execution_mode="paper",
+        metadata={},
     )
-    assert hasattr(APMasterControl, "evaluate")
-    assert hasattr(APMasterControl, "_seen_setup_owners") or True  # instance attr, not class attr
+
+    first = mc.evaluate(dict(production_row), client_id=JOSE)
+    reclaimed = mc.evaluate(dict(production_row), client_id=JOSE)
+
+    _assert_approved(first)
+    _assert_approved(reclaimed)
+    assert "duplicate_setup" not in reclaimed.reason
+
+
+def test_existing_duplicate_reason_and_diagnostics_preserved(caplog):
+    mc = _make_mc()
+    _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
+
+    with caplog.at_level(logging.INFO, logger="ap.master_control"):
+        decision = mc.evaluate(_signal("sig-2"), client_id=JOSE)
+
+    _assert_duplicate_setup(decision)
+    assert "SETUP_DEDUP_DIFFERENT_LIFECYCLE_BLOCK" in caplog.text
+    assert "cached_owner=sig-1" in caplog.text
+
+
+def test_canonical_module_imports_directly_from_ap_master_control_py():
+    import ap_master_control as module
+
+    assert module.__file__.endswith("/ap_master_control.py")
+    assert APMasterControl.evaluate.__module__ == "ap_master_control"
+
+
+def test_explicit_cache_removal_deletes_owner_metadata():
+    mc = _make_mc()
+    _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
+    key = _setup_key(JOSE)
+
+    mc._remove_setup_cache_entry(key)
+
+    assert key not in mc._seen_signals
+    assert key not in mc._seen_setup_owners
