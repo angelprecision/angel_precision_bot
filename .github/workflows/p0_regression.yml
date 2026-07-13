@@ -63,6 +63,8 @@ jobs:
             tests/test_entry_watcher_audit.py \
             tests/test_p0_watcher_invalidation_ownership.py \
             tests/test_p0_broker_open_protective_monitoring.py \
+            tests/test_p0_final_duplicate_honesty.py \
+            tests/test_p0_setup_lifecycle_owner.py \
             -v --tb=short --color=yes
 
       - name: Summary

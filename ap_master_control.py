@@ -9,6 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Optional
 
 from ap.admission_thresholds import (
@@ -419,6 +420,59 @@ class ControlDecision:
     client_id: str = "default"
 
 
+def _serialize_setup_cache_evaluation(func):
+    """Serialize one control instance across setup-cache check and commit.
+
+    The setup cache is a read/compare/write ownership fence.  Locking only the
+    individual dictionary operations would still allow two concurrent signals
+    for the same setup to both observe an empty cache before either approval
+    records its owner.
+    """
+
+    @wraps(func)
+    def _wrapped(self, *args, **kwargs):
+        lock = getattr(self, "_setup_cache_lock", None)
+        if lock is None:
+            # Supports deliberately minimal __new__-constructed test objects.
+            # Production instances always create the lock in __init__.
+            lock = threading.RLock()
+            self._setup_cache_lock = lock
+        with lock:
+            return func(self, *args, **kwargs)
+
+    return _wrapped
+
+
+def _setup_lifecycle_owner_key(signal: dict, *, raw_signal_id: str = "") -> str:
+    """Return the most stable process-local owner for one queue lifecycle.
+
+    This identity is intentionally separate from ``signal_id``.  Durable
+    duplicate checks, decision events, plans, and orders continue to use the
+    raw signal identity supplied to ``evaluate()`` (or its existing generated
+    fallback).  The setup cache instead prefers durable queue identity, then
+    canonical signal identity, so recovery may reconstruct the same lifecycle
+    with a different raw reevaluation suffix without rejecting itself.
+    """
+    queue_id = signal.get("_queue_id")
+    queue_id_int = None
+    if isinstance(queue_id, int) and not isinstance(queue_id, bool):
+        queue_id_int = queue_id
+    elif isinstance(queue_id, str) and queue_id.strip().isdigit():
+        queue_id_int = int(queue_id.strip())
+    if queue_id_int is not None and queue_id_int > 0:
+        return f"queue:{queue_id_int}"
+
+    canonical_signal_id = str(signal.get("canonical_signal_id") or "").strip()
+    if canonical_signal_id:
+        return f"canonical:{canonical_signal_id}"
+
+    raw_signal_id = str(raw_signal_id or "").strip()
+    if raw_signal_id:
+        return f"signal:{raw_signal_id}"
+
+    return ""
+
+
 class APMasterControl:
     """Single decision authority for whether a signal may become a trade."""
 
@@ -615,7 +669,9 @@ class APMasterControl:
         #                   takes effect with no bot restart.
         self._entries_paused_fn = None
         self._mode_fn = None
+        self._setup_cache_lock = threading.RLock()
         self._seen_signals: dict[str, float] = {}  # key -> inserted_ts, expires after 1800s
+        self._seen_setup_owners: dict[str, str] = {}  # setup_key -> owning canonical signal_id
         self._trade_dossier_signal_cache: dict[str, dict[str, Any]] = {}
         self._trade_dossier_signal_cache_ts: dict[str, float] = {}
         self._trade_dossier_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=TRADE_DOSSIER_QUEUE_MAX)
@@ -1604,6 +1660,7 @@ class APMasterControl:
                 log.error("Failed to calculate exposure for sector %s: %s", sector, _exp_err)
         return exposure
 
+    @_serialize_setup_cache_evaluation
     def evaluate(self, signal: dict, client_id: str = "default") -> ControlDecision:
         bootstrap_mode = False
         total_trades = 0
@@ -1619,7 +1676,12 @@ class APMasterControl:
             signal["_original_index_ticker"] = orig
 
         score = float(signal.get("score", 0) or 0)
-        signal_id = str(signal.get("signal_id") or uuid.uuid4())
+        _raw_signal_id = str(signal.get("signal_id") or "").strip()
+        _setup_lifecycle_owner = _setup_lifecycle_owner_key(
+            signal,
+            raw_signal_id=_raw_signal_id,
+        )
+        signal_id = _raw_signal_id or str(uuid.uuid4())
         signal["signal_id"] = signal_id
         self._cache_trade_dossier_signal(signal_id, signal)
         try:
@@ -1690,11 +1752,20 @@ class APMasterControl:
 
         direction_raw = norm_side
         timeframe_raw = signal.get("timeframe", "1d")
-        setup_key = f"{client_id}:{ticker.upper()}:{direction_raw}:{timeframe_raw}"
+        # Execution mode is part of process-local setup identity. A single
+        # runner may change mode through mode_fn; PAPER history must not poison
+        # a later LIVE evaluation (or vice versa) for the same client/setup.
+        setup_key = f"{client_id}:{current_mode}:{ticker.upper()}:{direction_raw}:{timeframe_raw}"
         signal_key = f"sig:{signal_id}:{client_id}"
         _now_ts = time.time()
+        if setup_key in self._seen_signals and (_now_ts - self._seen_signals[setup_key]) >= 1800:
+            self._remove_setup_cache_entry(setup_key)
         if len(self._seen_signals) > 500:
-            self._seen_signals = {k: v for k, v in self._seen_signals.items() if _now_ts - v < 1800}
+            _surviving_keys = {k for k, v in self._seen_signals.items() if _now_ts - v < 1800}
+            self._seen_signals = {k: v for k, v in self._seen_signals.items() if k in _surviving_keys}
+            # Prune ownership map in the same pass — no stale owners survive after key expires.
+            _owners = getattr(self, "_seen_setup_owners", {})
+            self._seen_setup_owners = {k: v for k, v in _owners.items() if k in _surviving_keys}
         self._prune_trade_dossier_signal_cache(_now_ts)
 
         # Durable per-client duplicate check.
@@ -1751,11 +1822,51 @@ class APMasterControl:
                 client_id, signal_id,
             )
 
-        # Setup-level dedup unchanged — same-ticker/direction within 30 min
-        # is intentionally per-process. Durable per-client setup dedup is a
-        # separate concern from per-signal_id and is out of scope.
+        # Setup-level dedup — same-ticker/direction within 30 min.
+        # PR #317: same proven lifecycle bypasses the process-local cache so that
+        # a signal reevaluated during reclaim/recovery does not self-reject.
         if setup_key in self._seen_signals and (_now_ts - self._seen_signals[setup_key]) < 1800:
-            return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")
+            _owners = getattr(self, "_seen_setup_owners", {})
+            _cached_owner = _owners.get(setup_key, "")
+            _cache_age_s  = round(_now_ts - self._seen_signals[setup_key], 1)
+
+            if not _setup_lifecycle_owner:
+                # No queue/canonical/raw identity — fail closed; a generated
+                # signal_id is not proof that this is the cached lifecycle.
+                log.info(
+                    "SETUP_DEDUP_OWNER_UNAVAILABLE client_id=%s signal_id=%s "
+                    "setup_key=%s cache_age_s=%s",
+                    client_id, signal_id, setup_key, _cache_age_s,
+                )
+                return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")  # SETUP_DEDUP_BLANK_SID
+
+            if not _cached_owner:
+                # Legacy ownerless entry — fail-closed; cannot prove same lifecycle.
+                log.info(
+                    "SETUP_DEDUP_LEGACY_OWNERLESS_BLOCK client_id=%s "
+                    "setup_key=%s signal_id=%s lifecycle_owner=%s cache_age_s=%s",
+                    client_id, setup_key, signal_id, _setup_lifecycle_owner, _cache_age_s,
+                )
+                return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")  # SETUP_DEDUP_OWNERLESS
+
+            if _cached_owner == _setup_lifecycle_owner:
+                # Same proven lifecycle — allow through; all durable checks still run.
+                log.info(
+                    "SETUP_DEDUP_SAME_LIFECYCLE_BYPASS client_id=%s "
+                    "signal_id=%s lifecycle_owner=%s setup_key=%s cache_age_s=%s",
+                    client_id, signal_id, _setup_lifecycle_owner, setup_key, _cache_age_s,
+                )
+                # Fall through — do not return here.
+            else:
+                # Different lifecycle — preserve block, include both owners in diagnostic.
+                log.info(
+                    "SETUP_DEDUP_DIFFERENT_LIFECYCLE_BLOCK client_id=%s "
+                    "signal_id=%s lifecycle_owner=%s cached_owner=%s "
+                    "setup_key=%s cache_age_s=%s",
+                    client_id, signal_id, _setup_lifecycle_owner, _cached_owner,
+                    setup_key, _cache_age_s,
+                )
+                return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")  # SETUP_DEDUP_DIFFERENT_LIFECYCLE
 
         snap = self._get_snapshot(client_id, ticker=ticker, signal_id=signal_id)
         if current_mode == "LIVE" and not snap.get("_snapshot_ok", True):
@@ -2856,6 +2967,12 @@ class APMasterControl:
             log.warning("[%s] Dedup persist failed in paper — proceeding: %s", ticker, _dedup_err)
         self._seen_signals[signal_key] = time.time()
         self._seen_signals[setup_key] = time.time()
+        # PR #317: record the stable queue-lifecycle owner separately from the
+        # raw signal_id used by durable duplicate checks and downstream rows.
+        if _setup_lifecycle_owner:
+            _owners = getattr(self, "_seen_setup_owners", {})
+            _owners[setup_key] = _setup_lifecycle_owner
+            self._seen_setup_owners = _owners
         self._emit_trade_dossier(
             signal,
             client_id=client_id,
@@ -4274,10 +4391,18 @@ class APMasterControl:
                 details={"error": str(e), "blocked": blocked, "block_reason": block_reason},
             )
 
+    def _remove_setup_cache_entry(self, setup_key: str) -> None:
+        """Remove a setup timestamp and owner together under the cache lock."""
+        with self._setup_cache_lock:
+            self._seen_signals.pop(setup_key, None)
+            self._seen_setup_owners.pop(setup_key, None)
+
     def reset_session(self, client_id: str = ""):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         client_prefix = client_id or (self.pm.client_id if hasattr(self.pm, "client_id") else "")
-        self._seen_signals.clear()  # dict.clear() — same interface
+        with self._setup_cache_lock:
+            self._seen_signals.clear()
+            self._seen_setup_owners.clear()
         self._trade_dossier_signal_cache.clear()
         self._trade_dossier_signal_cache_ts.clear()
         # PR E / FIX-4: clear _trade_cooldowns under _cooldown_lock so a new
@@ -4371,11 +4496,15 @@ class APMasterControl:
                     return c.fetchall()
 
             rows = run_with_retry(_load)
-            for row in rows:
-                underlying = str(row.get("underlying") or row.get("ticker") or "")
-                direction = str(row.get("direction") or "CALL").upper()
-                for tf in ("1d", "60m", "30m", "15m"):
-                    self._seen_signals[f"{client_id}:{underlying.upper()}:{direction}:{tf}"] = time.time()
+            with self._setup_cache_lock:
+                for row in rows:
+                    underlying = str(row.get("underlying") or row.get("ticker") or "")
+                    direction = str(row.get("direction") or "CALL").upper()
+                    mode = self._current_mode()
+                    for tf in ("1d", "60m", "30m", "15m"):
+                        self._seen_signals[
+                            f"{client_id}:{mode}:{underlying.upper()}:{direction}:{tf}"
+                        ] = time.time()
         except Exception as e:
             log.debug("Dedup seed failed (non-critical): %s", e)
             self._alert_degraded(
