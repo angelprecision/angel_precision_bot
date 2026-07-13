@@ -6,9 +6,25 @@ from unittest.mock import MagicMock
 
 os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
 
+import ap.db as ap_db
 import ap.exit_safety as exit_safety
+import ap.position_quote_monitor as qpm_mod
 import ap_exit_engine as exit_engine_mod
-from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition, evaluate_exit
+from ap.position_quote_monitor import APPositionQuoteMonitor
+from ap_exit_engine import (
+    APExitEngine,
+    BrokerFlatCloseResult,
+    DegradedMonitoringPersistResult,
+    ExitDecision,
+    ManagedPosition,
+    PROTECTIVE_STATE_BROKER_FLAT_PENDING,
+    PROTECTIVE_STATE_DEGRADED,
+    PROTECTIVE_STATE_RETRY_EXHAUSTED,
+    PROTECTIVE_STATE_UNPERSISTED,
+    STALE_EXIT_RETRY_DELAY_SEC,
+    STALE_EXIT_RETRY_MAX_ATTEMPTS,
+    evaluate_exit,
+)
 
 
 def _pos(**overrides) -> ManagedPosition:
@@ -37,20 +53,22 @@ def _pos(**overrides) -> ManagedPosition:
     return ManagedPosition(**data)
 
 
+def _decision(code="IMMEDIATE_TP", reason="IMMEDIATE TP -- +20%", qty=1) -> ExitDecision:
+    return ExitDecision("CLOSE_ALL", qty, reason, "HIGH", 0.20, suggested_limit=1.18, reason_code=code)
+
+
 def _engine(monkeypatch, *, broker_qty=1):
     broker = MagicMock()
     engine = APExitEngine(broker=broker, email="jason@example.com")
     engine.master_control = type("MC", (), {"mode": "live"})()
     engine._emit_exit_event = lambda *args, **kwargs: None
-    engine._persist_degraded_monitoring_state = lambda *args, **kwargs: None
-    engine._mark_broker_flat_stale_position = APExitEngine._mark_broker_flat_stale_position.__get__(engine, APExitEngine)
     monkeypatch.setattr(
         exit_safety,
         "resolve_exit_broker_truth",
         lambda **kwargs: {
             "is_fresh_exact": True,
             "broker_truth_open_qty": broker_qty,
-            "audit": {"source": "test"},
+            "audit": {"source": "test", "contract": kwargs.get("contract")},
         },
     )
     monkeypatch.setattr(
@@ -61,137 +79,208 @@ def _engine(monkeypatch, *, broker_qty=1):
     return engine
 
 
-def test_stale_quote_creates_owned_retry_and_requests_quote_retry(monkeypatch):
+class _DbConn:
+    def __init__(self, *, rowcount=1, row=None, raises=None):
+        self.rowcount = rowcount
+        self.row = row if row is not None else {"status": "CLOSED", "quantity_remaining": 0}
+        self.raises = raises
+        self.queries = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=None):
+        if self.raises:
+            raise self.raises
+        self.queries.append((sql, params))
+
+    def fetchone(self):
+        return self.row
+
+
+def _patch_db(monkeypatch, *, rowcount=1, row=None, raises=None):
+    fake = _DbConn(rowcount=rowcount, row=row, raises=raises)
+    monkeypatch.setattr(ap_db, "conn", lambda: fake)
+    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *a, **k: fn())
+    return fake
+
+
+def test_retry_throttling_no_increment_or_refresh_before_next_at(monkeypatch):
     engine = _engine(monkeypatch, broker_qty=2)
     pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
-    decision = ExitDecision("CLOSE_ALL", 1, "IMMEDIATE TP -- +20%", "HIGH", 0.20, reason_code="IMMEDIATE_TP")
-    retry_requests = []
+    refreshes = []
     engine.quote_monitor = type(
         "QM",
         (),
-        {"request_immediate_refresh": lambda self, *symbols: retry_requests.append(symbols)},
+        {"request_immediate_refresh": lambda self, *symbols: refreshes.append(symbols) or True},
     )()
+    _patch_db(monkeypatch)
 
-    broker_flat = engine._own_stale_exit_retry(
-        pos,
-        decision,
-        option_quote_state="stale_option_quote",
-        option_quote_age_sec=90.0,
-        stage="exit_decision",
+    assert engine._own_stale_exit_retry(pos, _decision(), option_quote_state="stale", option_quote_age_sec=90, stage="exit_decision") is False
+    assert pos.exit_retry_attempt == 1
+    assert refreshes == [("SPY260717C00500000", "SPY")]
+
+    before_broker_probe = exit_safety.resolve_exit_broker_truth
+    calls = {"broker": 0}
+    monkeypatch.setattr(
+        exit_safety,
+        "resolve_exit_broker_truth",
+        lambda **kwargs: calls.__setitem__("broker", calls["broker"] + 1) or before_broker_probe(**kwargs),
+    )
+    assert engine._own_stale_exit_retry(pos, _decision(), option_quote_state="stale", option_quote_age_sec=91, stage="exit_decision") is False
+    assert pos.exit_retry_attempt == 1
+    assert len(refreshes) == 1
+    assert calls["broker"] == 0
+
+    pos.exit_retry_next_at = datetime.now(timezone.utc) - timedelta(milliseconds=1)
+    assert engine._own_stale_exit_retry(pos, _decision(), option_quote_state="stale", option_quote_age_sec=92, stage="exit_decision") is False
+    assert pos.exit_retry_attempt == 2
+    assert len(refreshes) == 2
+
+
+def test_retry_exhaustion_does_not_hot_loop_or_wake(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    pos.exit_retry_attempt = STALE_EXIT_RETRY_MAX_ATTEMPTS
+    pos.exit_retry_first_requested_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+    pos.exit_retry_deadline = datetime.now(timezone.utc) + timedelta(seconds=60)
+    pos.exit_retry_next_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    refreshes = []
+    engine.quote_monitor = type(
+        "QM",
+        (),
+        {"request_immediate_refresh": lambda self, *symbols: refreshes.append(symbols) or True},
+    )()
+    _patch_db(monkeypatch)
+
+    assert engine._own_stale_exit_retry(pos, _decision(), option_quote_state="blind", option_quote_age_sec=None, stage="exit_decision") is False
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_RETRY_EXHAUSTED
+    assert pos.exit_retry_attempt == STALE_EXIT_RETRY_MAX_ATTEMPTS
+    assert refreshes == []
+
+
+def test_retry_deadline_exhaustion_without_attempt_increment(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    pos.exit_retry_attempt = 2
+    pos.exit_retry_first_requested_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    pos.exit_retry_deadline = datetime.now(timezone.utc) - timedelta(seconds=1)
+    pos.exit_retry_next_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    _patch_db(monkeypatch)
+
+    engine._own_stale_exit_retry(pos, _decision(), option_quote_state="missing", option_quote_age_sec=None, stage="exit_decision")
+
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_RETRY_EXHAUSTED
+    assert pos.exit_retry_attempt == 2
+
+
+def test_degraded_ownership_persist_result_rowcount_one(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    fake = _patch_db(monkeypatch, rowcount=1)
+    intent = engine._build_retry_intent(
+        pos, _decision(), status=PROTECTIVE_STATE_DEGRADED, attempt=1,
+        now=datetime.now(timezone.utc),
+        first_requested=datetime.now(timezone.utc),
+        next_at=datetime.now(timezone.utc) + timedelta(seconds=1),
+        deadline=datetime.now(timezone.utc) + timedelta(seconds=30),
+        option_quote_state="stale", option_quote_age_sec=90,
     )
 
-    assert broker_flat is False
-    assert pos.protective_monitoring_state == "PROTECTIVE_MONITORING_DEGRADED"
-    assert pos.behavior_quieted is False
-    assert pos.exit_retry_owner == "ap_exit_engine"
-    assert pos.exit_retry_decision_code == "IMMEDIATE_TP"
-    assert retry_requests == [("SPY260717C00500000", "SPY")]
+    result = engine._persist_degraded_monitoring_state(
+        pos, state=PROTECTIVE_STATE_DEGRADED, intent=intent, persist_reason="test"
+    )
+
+    assert result == DegradedMonitoringPersistResult(True, 1, "persisted", None)
+    sql, params = fake.queries[0]
+    assert "client_id = %s" in sql
+    assert "COALESCE(contract, '') = %s" in sql
+    assert params[-1] == "SPY260717C00500000"
 
 
-def test_quieted_logging_does_not_suppress_valid_quote_exit_submission(monkeypatch):
+def test_degraded_ownership_persist_zero_rowcount_is_critical_state(monkeypatch):
     engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    _patch_db(monkeypatch, rowcount=0)
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append((code, message, extra))
+
+    engine._own_stale_exit_retry(pos, _decision(), option_quote_state="stale", option_quote_age_sec=90, stage="exit_decision")
+
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_UNPERSISTED
+    assert pos.exit_retry_persisted is False
+    assert pos.exit_retry_persist_error
+    assert alerts and alerts[0][0] == "PROTECTIVE_MONITORING_UNPERSISTED"
+
+
+def test_degraded_ownership_persist_exception_is_critical_state(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    _patch_db(monkeypatch, raises=RuntimeError("db down"))
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append((code, message, extra))
+
+    engine._own_stale_exit_retry(pos, _decision(), option_quote_state="stale", option_quote_age_sec=90, stage="exit_decision")
+
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_UNPERSISTED
+    assert "db down" in pos.exit_retry_persist_error
+    assert alerts and alerts[0][0] == "PROTECTIVE_MONITORING_UNPERSISTED"
+
+
+def test_broker_flat_close_removes_memory_only_after_verified_durable_close(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
     pos = _pos()
     engine._positions = [pos]
     engine._positions_by_id = {pos.position_id: pos}
-    pos.log_quieted = True
-    pos.behavior_quieted = False
-    decision = ExitDecision("CLOSE_ALL", 1, "IMMEDIATE TP -- +20%", "HIGH", 0.20, suggested_limit=1.18)
-    submitted = []
-    engine.on_exit = lambda p, d: submitted.append((p.position_id, d.quantity)) or {
-        "accepted": True,
-        "local_order_id": "L-1",
-        "broker_order_id": "B-1",
-    }
+    _patch_db(monkeypatch, rowcount=1, row={"status": "CLOSED", "quantity_remaining": 0})
 
-    monkeypatch.setattr(exit_engine_mod, "_is_option_quote_stale", lambda pos, now_utc: (False, 0.0, "fresh"))
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
 
-    assert engine._submit_exit_decision(pos, decision) is True
-    assert submitted == [("pos-protective-1", 1)]
-
-
-def test_stale_quote_submission_failure_remains_retry_owned(monkeypatch):
-    engine = _engine(monkeypatch, broker_qty=1)
-    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
-    decision = ExitDecision("CLOSE_ALL", 1, "IMMEDIATE TP -- +20%", "HIGH", 0.20, suggested_limit=1.18)
-    engine.on_exit = lambda p, d: (_ for _ in ()).throw(AssertionError("stale retry must not submit"))
-    monkeypatch.setattr(
-        exit_engine_mod,
-        "_is_option_quote_stale",
-        lambda pos, now_utc: (True, 90.0, "stale_option_quote"),
-    )
-
-    assert engine._submit_exit_decision(pos, decision) is False
-    assert pos.exit_retry_owner == "ap_exit_engine"
-    assert pos.protective_monitoring_state == "PROTECTIVE_MONITORING_DEGRADED"
-
-
-def test_emergency_exit_bypasses_stale_quote_retry(monkeypatch):
-    engine = _engine(monkeypatch, broker_qty=1)
-    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
-    engine._positions = [pos]
-    engine._positions_by_id = {pos.position_id: pos}
-    decision = ExitDecision("CLOSE_ALL", 1, "HARD STOP -- down 33%", "IMMEDIATE", -0.33, suggested_limit=1.18)
-    submitted = []
-    engine.on_exit = lambda p, d: submitted.append(d.reason_code) or {
-        "accepted": True,
-        "local_order_id": "L-2",
-        "broker_order_id": "B-2",
-    }
-    monkeypatch.setattr(
-        exit_engine_mod,
-        "_is_option_quote_stale",
-        lambda pos, now_utc: (True, 90.0, "stale_option_quote"),
-    )
-
-    assert engine._submit_exit_decision(pos, decision) is True
-    assert submitted == ["HARD_STOP"]
-    assert getattr(pos, "exit_retry_owner", "") == ""
-
-
-def test_normal_stop_evaluates_before_hard_emergency_threshold_with_valid_quote():
-    now = datetime.now(exit_engine_mod.ET)
-    pos = _pos(
-        entry_price=1.00,
-        current_option_price=0.79,
-        current_bid=0.79,
-        current_ask=0.81,
-        opened_at=datetime.now(timezone.utc) - timedelta(minutes=20),
-    )
-    pos._stop_breach_ts = datetime.now(timezone.utc) - timedelta(seconds=45)
-
-    decision = evaluate_exit(pos, now)
-    decision.reason_code = exit_engine_mod._classify_exit_decision(decision)
-
-    assert decision.should_act is True
-    assert decision.reason_code != "HARD_STOP"
-    assert "DEEP_LOSS_STOP" in decision.reason
-
-
-def test_broker_flat_position_is_safely_removed_from_monitoring(monkeypatch):
-    engine = _engine(monkeypatch, broker_qty=0)
-    monkeypatch.setattr(engine, "_persist_degraded_monitoring_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(engine, "_mark_broker_flat_stale_position", APExitEngine._mark_broker_flat_stale_position.__get__(engine, APExitEngine))
-    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
-    engine._positions = [pos]
-    engine._positions_by_id = {pos.position_id: pos}
-    decision = ExitDecision("CLOSE_ALL", 1, "IMMEDIATE TP -- +20%", "HIGH", 0.20, reason_code="IMMEDIATE_TP")
-
-    broker_flat = engine._own_stale_exit_retry(
-        pos,
-        decision,
-        option_quote_state="stale_option_quote",
-        option_quote_age_sec=90.0,
-        stage="exit_decision",
-    )
-
-    assert broker_flat is True
+    assert result == BrokerFlatCloseResult(True, 1, True, "closed", None)
     assert pos.closed is True
     assert pos.quantity_remaining == 0
     assert engine.active_positions() == []
 
 
-def test_restart_seed_restores_broker_open_quieted_position_monitoring(monkeypatch):
+def test_broker_flat_zero_rowcount_keeps_position_monitored(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, rowcount=0)
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result.closed is False
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_BROKER_FLAT_PENDING
+    assert engine.active_positions() == [pos]
+
+
+def test_broker_flat_db_exception_keeps_position_monitored(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, raises=RuntimeError("db fail"))
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result.closed is False
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_BROKER_FLAT_PENDING
+
+
+def test_restart_seed_restores_degraded_retry_owner_and_deadline(monkeypatch):
     engine = _engine(monkeypatch, broker_qty=1)
+    first = datetime.now(timezone.utc) - timedelta(seconds=10)
+    next_at = datetime.now(timezone.utc) + timedelta(seconds=20)
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=40)
     pm = type(
         "PM",
         (),
@@ -211,7 +300,18 @@ def test_restart_seed_restores_broker_open_quieted_position_monitoring(monkeypat
                     "target_underlying": 510.0,
                     "stop_underlying": 495.0,
                     "execution_mode": "live",
-                    "meta": {"protective_monitoring_state": "PROTECTIVE_MONITORING_DEGRADED"},
+                    "meta": {
+                        "protective_monitoring_state": PROTECTIVE_STATE_DEGRADED,
+                        "exit_retry_owner": "ap_exit_engine",
+                        "exit_retry_status": PROTECTIVE_STATE_DEGRADED,
+                        "exit_retry_action": "CLOSE_ALL",
+                        "exit_retry_quantity": 1,
+                        "exit_retry_decision_code": "IMMEDIATE_TP",
+                        "exit_retry_attempt": 2,
+                        "exit_retry_first_requested_at": first.isoformat(),
+                        "exit_retry_next_at": next_at.isoformat(),
+                        "exit_retry_deadline": deadline.isoformat(),
+                    },
                 }
             ]
         },
@@ -223,4 +323,138 @@ def test_restart_seed_restores_broker_open_quieted_position_monitoring(monkeypat
     active = engine.active_positions()
     assert len(active) == 1
     assert active[0].position_id == "pos-restart-quieted"
-    assert active[0].quantity_remaining == 1
+    assert active[0].exit_retry_owner == "ap_exit_engine"
+    assert active[0].exit_retry_attempt == 2
+    assert active[0].exit_retry_next_at == next_at
+    assert active[0].exit_retry_deadline == deadline
+
+
+def test_restart_restored_retry_not_due_does_not_duplicate_refresh(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    pos.protective_monitoring_state = PROTECTIVE_STATE_DEGRADED
+    pos.exit_retry_status = PROTECTIVE_STATE_DEGRADED
+    pos.exit_retry_attempt = 2
+    pos.exit_retry_next_at = datetime.now(timezone.utc) + timedelta(seconds=30)
+    refreshes = []
+    engine.quote_monitor = type(
+        "QM",
+        (),
+        {"request_immediate_refresh": lambda self, *symbols: refreshes.append(symbols) or True},
+    )()
+
+    engine._own_stale_exit_retry(pos, _decision(), option_quote_state="stale", option_quote_age_sec=90, stage="exit_decision")
+
+    assert pos.exit_retry_attempt == 2
+    assert refreshes == []
+
+
+def test_forced_risk_submit_path_bypasses_stale_quote(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    submitted = []
+    engine.on_exit = lambda p, d: submitted.append(d.reason_code) or {
+        "accepted": True,
+        "local_order_id": "L-2",
+        "broker_order_id": "B-2",
+    }
+    monkeypatch.setattr(exit_engine_mod, "_is_option_quote_stale", lambda pos, now_utc: (True, 90.0, "stale_option_quote"))
+
+    assert engine._submit_exit_decision(pos, _decision("STOP_HIT", "STOP HIT -- thesis failed")) is True
+    assert submitted == ["STOP_HIT"]
+    assert getattr(pos, "exit_retry_owner", "") == ""
+
+
+def test_eod_forced_risk_submit_path_bypasses_stale_quote(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    submitted = []
+    engine.on_exit = lambda p, d: submitted.append(d.reason_code) or {
+        "accepted": True,
+        "local_order_id": "L-3",
+        "broker_order_id": "B-3",
+    }
+    monkeypatch.setattr(exit_engine_mod, "_is_option_quote_stale", lambda pos, now_utc: (True, 90.0, "stale_option_quote"))
+
+    assert engine._submit_exit_decision(pos, _decision("EOD_FORCE_CLOSE", "EOD FORCE CLOSE")) is True
+    assert submitted == ["EOD_FORCE_CLOSE"]
+
+
+def test_take_profit_stale_quote_uses_bounded_retry_not_forced_path(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    engine.on_exit = lambda p, d: (_ for _ in ()).throw(AssertionError("TP must not submit on stale quote"))
+    _patch_db(monkeypatch)
+    monkeypatch.setattr(exit_engine_mod, "_is_option_quote_stale", lambda pos, now_utc: (True, 90.0, "stale_option_quote"))
+
+    assert engine._submit_exit_decision(pos, _decision("IMMEDIATE_TP", "IMMEDIATE TP -- +20%")) is False
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_DEGRADED
+    assert pos.exit_retry_attempt == 1
+
+
+def test_fresh_recovery_clears_degraded_state_and_reevaluates_current_decision(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    pos.protective_monitoring_state = PROTECTIVE_STATE_DEGRADED
+    pos.exit_retry_owner = "ap_exit_engine"
+    pos.exit_retry_attempt = 1
+    _patch_db(monkeypatch)
+
+    engine._clear_degraded_monitoring_state(pos)
+    current = evaluate_exit(pos, datetime.now(exit_engine_mod.ET))
+
+    assert pos.protective_monitoring_state == "RESOLVED"
+    assert pos.exit_retry_owner == ""
+    assert current.action in {"HOLD", "CLOSE_ALL", "SCALE_OUT"}
+
+
+def test_quote_monitor_coalesces_duplicate_immediate_refresh(monkeypatch):
+    qpm_mod._SHARED_CACHE.clear()
+    qpm_mod._SHARED_BACKOFF_UNTIL = 0.0
+    qpm_mod._SHARED_CACHE["SPY260717C00500000"] = {"quote": {"symbol": "SPY260717C00500000"}, "ts": 1.0}
+    monitor = APPositionQuoteMonitor(MagicMock(), "jason@example.com", MagicMock())
+
+    assert monitor.request_immediate_refresh("SPY260717C00500000") is True
+    assert monitor.request_immediate_refresh("SPY260717C00500000") is False
+    metrics = monitor.metrics_snapshot()
+    assert metrics["immediate_retry_requests"] == 2
+    assert metrics["immediate_retry_evictions"] == 1
+    assert metrics["immediate_retry_coalesced"] == 1
+
+
+def test_quote_monitor_backoff_suppresses_immediate_refresh(monkeypatch):
+    qpm_mod._SHARED_BACKOFF_UNTIL = qpm_mod.time.time() + 30
+    monitor = APPositionQuoteMonitor(MagicMock(), "jason@example.com", MagicMock())
+
+    assert monitor.request_immediate_refresh("SPY260717C00500000") is False
+    assert monitor.metrics_snapshot()["immediate_retry_backoff_suppressed"] == 1
+    qpm_mod._SHARED_BACKOFF_UNTIL = 0.0
+
+
+def test_retry_config_is_clamped_at_import_time():
+    assert 1 <= STALE_EXIT_RETRY_MAX_ATTEMPTS <= 20
+    assert 0.5 <= STALE_EXIT_RETRY_DELAY_SEC <= 60
+
+
+def test_normal_stop_evaluates_before_hard_emergency_threshold_with_valid_quote():
+    pos = _pos(
+        entry_price=1.00,
+        current_option_price=0.79,
+        current_bid=0.79,
+        current_ask=0.81,
+        opened_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+    )
+    pos._stop_breach_ts = datetime.now(timezone.utc) - timedelta(seconds=45)
+
+    decision = evaluate_exit(pos, datetime.now(exit_engine_mod.ET))
+    decision.reason_code = exit_engine_mod._classify_exit_decision(decision)
+
+    assert decision.should_act is True
+    assert decision.reason_code != "HARD_STOP"
+    assert "DEEP_LOSS_STOP" in decision.reason
