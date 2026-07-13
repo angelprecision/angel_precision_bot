@@ -457,14 +457,21 @@ class TestModuleConstants:
 
     def test_max_intraday_drift_pct_default_value(self):
         """Default must remain 0.015 (1.5%) for back-compat."""
+        global ap_entry_watcher
         # Clear env to confirm default
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MAX_INTRADAY_DRIFT_PCT", None)
-            importlib.reload(ap_entry_watcher)
+            ap_entry_watcher = importlib.reload(
+                sys.modules.get("ap_entry_watcher")
+                or importlib.import_module("ap_entry_watcher")
+            )
             try:
                 assert ap_entry_watcher.MAX_INTRADAY_DRIFT_PCT == 0.015
             finally:
-                importlib.reload(ap_entry_watcher)
+                ap_entry_watcher = importlib.reload(
+                    sys.modules.get("ap_entry_watcher")
+                    or importlib.import_module("ap_entry_watcher")
+                )
 
     def test_max_option_premium_drift_pct_is_module_level(self):
         """MAX_OPTION_PREMIUM_DRIFT_PCT must be a module-level constant."""
