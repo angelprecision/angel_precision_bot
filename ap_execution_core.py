@@ -2226,47 +2226,23 @@ class APExecutionCore:
     ) -> dict:
         """Canonical consumer for a due deferred-materialization retry.
 
-        P0 AMENDMENT (fix/deferred-retry-due-execution-p0)
-        --------------------------------------------------
-        This is the single canonical entry point for executing attempt N+1 of
-        a durably-scheduled deferred materialization retry. Both the runtime
-        recovery pass and the in-memory watcher must route through this method
-        so selector, copyback, submit-intent, and broker submit logic live in
-        one place. Recovery MUST NOT reproduce selector or broker-submit calls;
-        it orchestrates ownership and calls this method.
+        P0 AMENDMENT (fix/deferred-retry-due-execution-p0) — HARDENED
+        ---------------------------------------------------------------
+        Blocker §1: Fail closed on every required identity field.
+          - direction must be CALL or PUT in the durable row; never default to CALL.
+          - trigger_crossed_at must be present and parseable; never substitute _now.
+          - signal_id, plan_id, client_id must be non-empty from the durable row.
+        Blocker §2: Exact identity proof on every field.
+          - A missing row field when the expected field is provided FAILS, not passes.
+        Blocker §5: Atomic attempt advancement.
+          - claim_deferred_materialization receives retry_attempt so the durable
+            row always shows the in-flight attempt, even on mid-execution crash.
+          - Every RETRY_WAIT return calls schedule_deferred_materialization_retry
+            before returning so the durable row is in a verifiable RETRY_WAIT state,
+            not MATERIALIZING until lease expires.
 
-        Contract:
-
-          1. Re-reads the durable row through the OSM and re-verifies:
-             * status is still PENDING_TRIGGER
-             * no broker_order_id exists
-             * submitted_ts is null
-             * exact client_id / execution_mode match
-             * durable retry_attempt has not already advanced past
-               ``expected_retry_attempt - 1``
-             * retry is due (materialization_next_retry_at <= now)
-          2. Fenced CAS via ``claim_deferred_materialization`` — this
-             atomically advances materialization_generation from
-             ``expected_generation`` to ``expected_generation + 1``. Only one
-             worker wins; the loser returns CLAIM_LOST with no side effects.
-          3. Executes a fresh selector request with reset per-request budget
-             counters (a fresh ``SimpleNamespace`` metadata patch is applied
-             so the selector never sees exhausted direct_quote_calls,
-             chain_calls, or expiration_calls from attempt N). Previous
-             attempt diagnostics are preserved in
-             ``meta.materialization_attempt_history``.
-          4. Routes SUCCESS into the canonical breach path
-             (``_on_entry_trigger``) which already handles atomic copyback
-             and canonical safe submit — no duplicate broker code path.
-          5. Routes retryable failure back into
-             ``schedule_deferred_materialization_retry`` with the same
-             taxonomy (SELECTOR_REQUEST_BUDGET_EXHAUSTED remains
-             OPERATIONAL_REQUEST_BUDGET, not a quality reject).
-          6. Routes terminal failure into ``terminalize_deferred_breach``.
-
-        Returns a structured lifecycle dict with disposition, reason_code,
-        attempt, max_attempts, owner, generation, and (for RETRY_WAIT)
-        next_retry_at. Never raises, never calls the broker directly.
+        Never defaults direction, client_id, plan_id, or trigger_crossed_at.
+        Never calls the broker directly. Never duplicates selector logic.
         """
         _now = datetime.now(timezone.utc)
         _base: dict = {
@@ -2282,12 +2258,8 @@ class APExecutionCore:
             return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
 
         def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
-            return {
-                **_base, **extra,
-                "disposition": "TERMINAL_DURABLE",
-                "reason_code": reason,
-                "terminal_status": status,
-            }
+            return {**_base, **extra, "disposition": "TERMINAL_DURABLE",
+                    "reason_code": reason, "terminal_status": status}
 
         def _claim_lost(reason: str) -> dict:
             return {**_base, "disposition": "CLAIM_LOST", "reason_code": reason}
@@ -2304,19 +2276,17 @@ class APExecutionCore:
         if not owner or _expected_generation < 1 or _expected_attempt < 1:
             return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
 
-        # ── Row read + status / identity re-verification ────────────────
+        # ── Row read ─────────────────────────────────────────────────
         try:
             row = osm.get_order(local_order_id)
         except Exception as exc:
-            log.error(
-                "[%s] resume_deferred_materialization_retry row_read_failed "
-                "local_order_id=%s exc=%s",
-                self.client_id, local_order_id, exc,
-            )
+            log.error("[%s] resume_deferred_materialization_retry row_read_failed "
+                      "local_order_id=%s exc=%s", self.client_id, local_order_id, exc)
             return _keep(f"RETRY_ROW_READ_ERROR:{type(exc).__name__}")
         if not isinstance(row, dict):
             return _keep("RETRY_ROW_MISSING")
 
+        # ── Status gates ────────────────────────────────────────────
         status = str(row.get("status") or "").upper()
         if status != "PENDING_TRIGGER":
             return _keep(f"RETRY_STATUS_NOT_ELIGIBLE:{status}")
@@ -2325,16 +2295,25 @@ class APExecutionCore:
         if row.get("submitted_ts"):
             return _keep("RETRY_ALREADY_SUBMITTED")
 
+        # ── BLOCKER §1 + §2: fail-closed identity proof ─────────────
+        # client_id: both must be present and must match.
         row_client = str(row.get("client_id") or "").strip().lower()
         expected_client = str(self.client_id or self.email or "").strip().lower()
-        if row_client and expected_client and row_client != expected_client:
+        if not row_client:
+            return _term("RETRY_MISSING_CLIENT_ID", status="ERROR")
+        if not expected_client:
+            return _term("RETRY_RUNNER_CLIENT_ID_MISSING", status="ERROR")
+        if row_client != expected_client:
             return _term("RETRY_CLIENT_ID_MISMATCH", status="ERROR")
 
+        # execution_mode: row must contain a valid mode and must match runner.
         row_mode = str(row.get("execution_mode") or "").strip().lower()
         expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
         if row_mode not in {"live", "paper"}:
             return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
-        if expected_mode and row_mode != expected_mode:
+        if expected_mode not in {"live", "paper"}:
+            return _term("RETRY_RUNNER_EXECUTION_MODE_INVALID", status="ERROR")
+        if row_mode != expected_mode:
             return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
 
         meta = row.get("meta") or {}
@@ -2345,7 +2324,52 @@ class APExecutionCore:
                 meta = {}
         meta = meta or {}
 
-        # ── Retry due & attempt integrity ─────────────────────────────
+        # signal_id: required — the CAS predicate needs it.
+        signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()
+        if not signal_id:
+            return _term("RETRY_MISSING_SIGNAL_ID", status="ERROR")
+
+        # plan_id: required for plan reconstruction.
+        plan_id = str(row.get("plan_id") or meta.get("plan_id") or "").strip()
+        if not plan_id:
+            return _term("RETRY_MISSING_PLAN_ID", status="ERROR")
+
+        # direction: must be CALL or PUT — never default.
+        raw_direction = str(row.get("direction") or meta.get("side") or meta.get("direction") or "").strip().upper()
+        if raw_direction not in {"CALL", "PUT"}:
+            return _term(f"RETRY_MISSING_OR_INVALID_DIRECTION:got={raw_direction!r}", status="ERROR")
+        direction = raw_direction
+
+        # ticker: required.
+        ticker = str(row.get("symbol") or meta.get("ticker") or meta.get("symbol") or "").strip().upper()
+        if not ticker:
+            return _term("RETRY_MISSING_TICKER", status="ERROR")
+
+        # trigger_crossed_at: must be present and parseable — never substitute now.
+        trigger_crossed_at_raw = (
+            meta.get("trigger_crossed_at") or meta.get("triggered_at")
+        )
+        if not trigger_crossed_at_raw:
+            return _term("RETRY_MISSING_TRIGGER_CROSSED_AT", status="ERROR")
+        try:
+            trigger_crossed_dt = datetime.fromisoformat(str(trigger_crossed_at_raw))
+            if trigger_crossed_dt.tzinfo is None:
+                trigger_crossed_dt = trigger_crossed_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return _term("RETRY_INVALID_TRIGGER_CROSSED_AT", status="ERROR")
+
+        # trigger_price: must be positive.
+        _trigger_price_raw = row.get("trigger_price") or meta.get("trigger_price")
+        if _trigger_price_raw is None:
+            return _term("RETRY_MISSING_TRIGGER_PRICE", status="ERROR")
+        try:
+            trigger_price = float(_trigger_price_raw)
+        except (TypeError, ValueError):
+            return _term("RETRY_INVALID_TRIGGER_PRICE", status="ERROR")
+        if trigger_price <= 0:
+            return _term("RETRY_ZERO_TRIGGER_PRICE", status="ERROR")
+
+        # ── Fencing counters ─────────────────────────────────────────
         try:
             durable_generation = int(meta.get("materialization_generation") or 0)
         except (TypeError, ValueError):
@@ -2358,7 +2382,6 @@ class APExecutionCore:
             durable_prior_attempt = int(meta.get("retry_attempt") or 0)
         except (TypeError, ValueError):
             durable_prior_attempt = 0
-        # Attempt N+1 is only valid when the durable row is on attempt N.
         if durable_prior_attempt != _expected_attempt - 1:
             return _claim_lost(
                 f"RETRY_ATTEMPT_ADVANCED:durable={durable_prior_attempt}:expected_prior={_expected_attempt - 1}"
@@ -2373,19 +2396,15 @@ class APExecutionCore:
                 _durable_max = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
             except (TypeError, ValueError):
                 _durable_max = 3
-        # The durable max is the CAP. Never widen it just because the caller
-        # asked for an attempt beyond it — that would defeat retry exhaustion.
         max_attempts = _durable_max
         if _expected_attempt > max_attempts:
-            return _term(
-                "RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
-                attempt=_expected_attempt, max_attempts=max_attempts,
-            )
+            return _term("RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
+                         attempt=_expected_attempt, max_attempts=max_attempts)
 
         durable_due_at_raw = (
             meta.get("materialization_next_retry_at")
-            or meta.get("next_retry_at")
             or meta.get("deferred_retry_next_attempt_at")
+            or meta.get("next_retry_at")
         )
         if not durable_due_at_raw:
             return _keep("RETRY_NO_DURABLE_SCHEDULE")
@@ -2398,13 +2417,10 @@ class APExecutionCore:
         if durable_due_at > _now:
             return {**_base, "disposition": "NOT_DUE", "reason_code": "RETRY_NOT_DUE"}
 
-        # ── Fenced CAS ─────────────────────────────────────────────────
+        # ── Fenced CAS (blocker §5: also stamps retry_attempt atomically) ─
         _new_generation = _expected_generation + 1
-        signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()
         try:
-            _retry_lock_ttl = int(os.getenv(
-                "DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", "120"
-            ))
+            _retry_lock_ttl = int(os.getenv("DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", "120"))
         except (TypeError, ValueError):
             _retry_lock_ttl = 120
         _lease_until = (_now + timedelta(seconds=_retry_lock_ttl)).isoformat()
@@ -2418,40 +2434,71 @@ class APExecutionCore:
                 owner=owner,
                 new_generation=_new_generation,
                 lease_until=_lease_until,
-                trigger_crossed_at=str(
-                    meta.get("trigger_crossed_at") or meta.get("triggered_at") or _now.isoformat()
-                ),
-                trigger_price=float(
-                    row.get("trigger_price") or meta.get("trigger_price") or 0
-                ),
+                trigger_crossed_at=trigger_crossed_at_raw,
+                trigger_price=trigger_price,
                 observed_underlying_price=float(
                     meta.get("observed_underlying_price")
                     or meta.get("triggered_underlying_price") or 0
                 ),
                 signal_id=signal_id,
                 execution_mode=row_mode,
+                retry_attempt=_expected_attempt,
             ))
         except Exception as exc:
-            log.error(
-                "[%s] resume_deferred_materialization_retry claim_failed "
-                "local_order_id=%s exc=%s",
-                self.client_id, local_order_id, exc,
-            )
+            log.error("[%s] resume_deferred_materialization_retry claim_failed "
+                      "local_order_id=%s exc=%s", self.client_id, local_order_id, exc)
             return _keep(f"RETRY_CLAIM_EXCEPTION:{type(exc).__name__}")
         if not claimed:
             return _claim_lost("RETRY_CLAIM_NOT_ACQUIRED")
 
-        _base.update(
-            attempt=_expected_attempt,
-            max_attempts=max_attempts,
-            generation=_new_generation,
-        )
+        _base.update(attempt=_expected_attempt, max_attempts=max_attempts, generation=_new_generation)
 
-        # ── Preserve prior attempt diagnostics in a durable history list ──
-        # We stamp the history BEFORE the selector runs so a crash mid-attempt
-        # still leaves a forensic trail. Fresh per-request counters are
-        # implied by taking a fresh selector call path (a new selector call
-        # constructs its own request context per attempt).
+        # ── Helper: durable RETRY_WAIT schedule (blocker §5) ────────
+        # Every RETRY_WAIT return MUST call this so the durable row
+        # transitions out of MATERIALIZING before we return — never
+        # leave the row stranded at MATERIALIZING until lease expiry.
+        try:
+            _retry_delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+        except (TypeError, ValueError):
+            _retry_delay = 20
+
+        def _schedule_retry_wait(reason_code: str, selector_failure: dict | None = None) -> dict:
+            """Write a durable RETRY_WAIT row; return the RETRY_WAIT disposition."""
+            _next_attempt = _expected_attempt + 1
+            _next_retry_at = (_now + timedelta(seconds=_retry_delay)).isoformat()
+            _schedule = getattr(osm, "schedule_deferred_materialization_retry", None)
+            _ok = False
+            if callable(_schedule):
+                try:
+                    _ok = bool(_schedule(
+                        local_order_id,
+                        owner=owner,
+                        generation=_new_generation,
+                        reason_code=reason_code,
+                        attempt=_expected_attempt,
+                        max_attempts=max_attempts,
+                        next_retry_at=_next_retry_at,
+                        selector_failure=selector_failure or {"reason_code": reason_code},
+                    ))
+                except Exception as _sch_exc:
+                    log.critical("[%s] resume_deferred_materialization_retry "
+                                 "schedule_retry_wait FAILED local_order_id=%s exc=%s "
+                                 "— row may be stranded at MATERIALIZING",
+                                 self.client_id, local_order_id, _sch_exc)
+            if not _ok:
+                log.critical("[%s] resume_deferred_materialization_retry "
+                             "schedule_retry_wait returned False local_order_id=%s "
+                             "— row may be stranded at MATERIALIZING",
+                             self.client_id, local_order_id)
+            return {
+                **_base,
+                "disposition": "RETRY_WAIT",
+                "reason_code": reason_code,
+                "next_retry_at": _next_retry_at,
+                "durable_retry_schedule_ok": _ok,
+            }
+
+        # ── Preserve prior attempt diagnostics ───────────────────────
         try:
             prior_history = meta.get("materialization_attempt_history") or []
             if not isinstance(prior_history, list):
@@ -2462,103 +2509,79 @@ class APExecutionCore:
                 "started_at": meta.get("materialization_started_at"),
                 "completed_at": meta.get("selector_completed_at"),
                 "reason_code": (
-                    meta.get("retry_reason")
-                    or meta.get("materialization_reason")
+                    meta.get("retry_reason") or meta.get("materialization_reason")
                     or meta.get("deferred_retry_reason_code")
                 ),
-                "selector_request_diagnostics": (
-                    meta.get("materialization_selector_failure") or {}
-                ),
+                "selector_request_diagnostics": meta.get("materialization_selector_failure") or {},
             }
             new_history = prior_history + [prior_diagnostics]
             update_meta = getattr(osm, "update_order_meta", None)
             if callable(update_meta):
                 update_meta(local_order_id, {
                     "materialization_attempt_history": new_history,
-                    # Fresh per-attempt counters. The selector constructs its
-                    # own request context per call, but we stamp the reset
-                    # explicitly so operator inspection of the durable row
-                    # shows attempt N+1 starting from zero.
                     "selector_request_counters_reset_at": _now.isoformat(),
                     "materialization_current_attempt": _expected_attempt,
                     "materialization_current_generation": _new_generation,
                 })
         except Exception as _hist_exc:
-            log.warning(
-                "[%s] resume_deferred_materialization_retry history_write_failed "
-                "local_order_id=%s exc=%s (non-fatal)",
-                self.client_id, local_order_id, _hist_exc,
-            )
+            log.warning("[%s] resume_deferred_materialization_retry history_write_failed "
+                        "local_order_id=%s exc=%s (non-fatal)",
+                        self.client_id, local_order_id, _hist_exc)
 
-        # ── Build the plan snapshot and route into the canonical breach path ──
-        try:
-            direction = str(row.get("direction") or meta.get("side") or "CALL").upper()
-            recovered_plan = SimpleNamespace(
-                plan_id=str(row.get("plan_id") or local_order_id),
-                signal_id=signal_id,
-                client_id=row_client or expected_client,
-                execution_mode=row_mode,
-                ticker=str(row.get("symbol") or "").upper(),
-                side=direction,
-                direction=direction,
-                score=float(row.get("score") or meta.get("score") or 65.0),
-                tier=str(row.get("tier") or meta.get("tier") or "B"),
-                trigger_price=float(
-                    row.get("trigger_price") or meta.get("trigger_price") or 0
-                ),
-                stop_underlying=(
-                    row.get("stop_underlying")
-                    if row.get("stop_underlying") is not None
-                    else meta.get("stop_underlying")
-                ),
-                target_underlying=(
-                    row.get("target_underlying")
-                    if row.get("target_underlying") is not None
-                    else meta.get("target_underlying")
-                ),
-                contract_symbol=str(row.get("contract") or ""),
-                pattern=str(row.get("pattern") or meta.get("pattern") or ""),
-                timeframe=str(row.get("timeframe") or meta.get("timeframe") or "1d"),
-                strategy_type=str(meta.get("strategy_type") or ""),
-                prior_day_high=meta.get("prior_day_high"),
-                prior_day_low=meta.get("prior_day_low"),
-                contracts=int(row.get("qty") or 0),
-                limit_price=float(row.get("limit_price") or 0),
-                max_position_usd=float(row.get("reserved_cost") or 0),
-                metadata={
-                    **dict(meta),
-                    "contract_deferred": True,
-                    "materialization_generation": _new_generation,
-                    "materialization_owner": owner,
-                    "materialization_retry_owner": owner,
-                    "materialization_retry_attempt": _expected_attempt,
-                    "materialization_retry_max_attempts": max_attempts,
-                    "breach_attempt_count": _expected_attempt - 1,
-                    "deferred_breach_selection": True,
-                    "selection_context": "deferred_breach_retry",
-                    # Ensure the selector sees FRESH per-request counters.
-                    "selector_request_counters_reset_at": _now.isoformat(),
-                    "selector_request_direct_quote_calls_reset": True,
-                    "selector_request_chain_calls_reset": True,
-                    "selector_request_expiration_calls_reset": True,
-                },
-            )
-        except Exception as exc:
-            log.error(
-                "[%s] resume_deferred_materialization_retry plan_build_failed "
-                "local_order_id=%s exc=%s",
-                self.client_id, local_order_id, exc,
-            )
-            return _keep(f"RETRY_PLAN_BUILD_ERROR:{type(exc).__name__}")
-
+        # ── Build plan — all fields from durable row, no defaults ───
+        recovered_plan = SimpleNamespace(
+            plan_id=plan_id,
+            signal_id=signal_id,
+            client_id=row_client,
+            execution_mode=row_mode,
+            ticker=ticker,
+            side=direction,
+            direction=direction,
+            score=float(row.get("score") or meta.get("score") or 65.0),
+            tier=str(row.get("tier") or meta.get("tier") or "B"),
+            trigger_price=trigger_price,
+            stop_underlying=(
+                row.get("stop_underlying") if row.get("stop_underlying") is not None
+                else meta.get("stop_underlying")
+            ),
+            target_underlying=(
+                row.get("target_underlying") if row.get("target_underlying") is not None
+                else meta.get("target_underlying")
+            ),
+            contract_symbol=str(row.get("contract") or ""),
+            pattern=str(row.get("pattern") or meta.get("pattern") or ""),
+            timeframe=str(row.get("timeframe") or meta.get("timeframe") or "1d"),
+            strategy_type=str(meta.get("strategy_type") or ""),
+            prior_day_high=meta.get("prior_day_high"),
+            prior_day_low=meta.get("prior_day_low"),
+            contracts=int(row.get("qty") or 0),
+            limit_price=float(row.get("limit_price") or 0),
+            max_position_usd=float(row.get("reserved_cost") or 0),
+            metadata={
+                **dict(meta),
+                "contract_deferred": True,
+                "materialization_generation": _new_generation,
+                "materialization_owner": owner,
+                "materialization_retry_owner": owner,
+                "materialization_retry_attempt": _expected_attempt,
+                "materialization_retry_max_attempts": max_attempts,
+                "breach_attempt_count": _expected_attempt - 1,
+                "deferred_breach_selection": True,
+                "selection_context": "deferred_breach_retry",
+                "selector_request_counters_reset_at": _now.isoformat(),
+                "selector_request_direct_quote_calls_reset": True,
+                "selector_request_chain_calls_reset": True,
+                "selector_request_expiration_calls_reset": True,
+            },
+        )
         signal = {
-            "signal_id": recovered_plan.signal_id,
+            "signal_id": signal_id,
             "local_order_id": local_order_id,
-            "client_id": recovered_plan.client_id,
+            "client_id": row_client,
             "execution_mode": row_mode,
-            "ticker": recovered_plan.ticker,
+            "ticker": ticker,
             "side": direction,
-            "entry_price": recovered_plan.trigger_price,
+            "entry_price": trigger_price,
             "stop_price": recovered_plan.stop_underlying,
             "target_price": recovered_plan.target_underlying,
             "contract_symbol": recovered_plan.contract_symbol,
@@ -2567,52 +2590,32 @@ class APExecutionCore:
             "materialization_retry_owner": owner,
             "materialization_retry_attempt": _expected_attempt,
         }
-        _crossed_raw = (
-            meta.get("trigger_crossed_at") or meta.get("triggered_at") or _now.isoformat()
-        )
-        try:
-            crossed = datetime.fromisoformat(str(_crossed_raw))
-            if crossed.tzinfo is None:
-                crossed = crossed.replace(tzinfo=timezone.utc)
-        except Exception:
-            crossed = _now
         watched = SimpleNamespace(
-            signal=signal, ticker=recovered_plan.ticker, side=direction,
-            trigger_price=recovered_plan.trigger_price,
-            entry_trigger=recovered_plan.trigger_price,
+            signal=signal, ticker=ticker, side=direction,
+            trigger_price=trigger_price,
+            entry_trigger=trigger_price,
             stop_level=recovered_plan.stop_underlying,
             target_price=recovered_plan.target_underlying,
-            trigger_crossed_at=crossed, triggered_at=crossed,
+            trigger_crossed_at=trigger_crossed_dt,
+            triggered_at=trigger_crossed_dt,
             breach_price=float(
-                meta.get("observed_underlying_price")
-                or recovered_plan.trigger_price or 0
+                meta.get("observed_underlying_price") or trigger_price or 0
             ),
         )
 
         try:
             self._on_entry_trigger(watched)
         except Exception as exc:
-            log.exception(
-                "[%s] resume_deferred_materialization_retry canonical_callback_failed "
-                "local_order_id=%s",
-                recovered_plan.ticker or local_order_id, exc,
+            log.exception("[%s] resume_deferred_materialization_retry canonical_callback_failed "
+                          "local_order_id=%s", ticker or local_order_id, exc)
+            # Blocker §5: schedule a durable RETRY_WAIT before returning
+            # so the row does not remain MATERIALIZING until lease expiry.
+            return _schedule_retry_wait(
+                f"RETRY_CANONICAL_CALLBACK_EXCEPTION:{type(exc).__name__}",
+                {"callback_exception": str(exc)[:200]},
             )
-            # Do not terminalize on a callback exception — the row is now
-            # MATERIALIZING with a valid lease. The next scheduler tick will
-            # either see it advance (broker_ready / retry scheduled) or the
-            # lease will expire and be reclaimed. Return RETRY_WAIT so the
-            # caller stops waiting synchronously.
-            try:
-                _delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
-            except (TypeError, ValueError):
-                _delay = 20
-            return {
-                **_base, "disposition": "RETRY_WAIT",
-                "reason_code": f"RETRY_CANONICAL_CALLBACK_EXCEPTION:{type(exc).__name__}",
-                "next_retry_at": (_now + timedelta(seconds=_delay)).isoformat(),
-            }
 
-        # ── Re-read the durable row to determine the actual outcome ─────
+        # ── Re-read to determine outcome ─────────────────────────────
         try:
             after = osm.get_order(local_order_id) or {}
         except Exception as exc:
@@ -2628,53 +2631,30 @@ class APExecutionCore:
         if after.get("broker_order_id") and after_status in {
             "SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"
         }:
-            return {
-                **_base, "disposition": "SUBMITTED",
-                "reason_code": "RETRY_CANONICAL_SUBMIT_ACCEPTED",
-                "broker_order_id": after.get("broker_order_id"),
-            }
+            return {**_base, "disposition": "SUBMITTED",
+                    "reason_code": "RETRY_CANONICAL_SUBMIT_ACCEPTED",
+                    "broker_order_id": after.get("broker_order_id")}
         if after_meta.get("broker_ready") is True and after_status == "PENDING_TRIGGER":
-            return {
-                **_base, "disposition": "BROKER_READY",
-                "reason_code": "RETRY_CANONICAL_BROKER_READY",
-            }
-        # Retry was rescheduled by the callback -> respect its next_retry_at.
+            return {**_base, "disposition": "BROKER_READY",
+                    "reason_code": "RETRY_CANONICAL_BROKER_READY"}
+        after_lifecycle = str(after_meta.get("lifecycle_state") or "").upper()
         after_next_retry = (
             after_meta.get("materialization_next_retry_at")
             or after_meta.get("next_retry_at")
         )
-        after_lifecycle = str(after_meta.get("lifecycle_state") or "").upper()
         if after_lifecycle == "RETRY_WAIT" and after_next_retry:
-            return {
-                **_base, "disposition": "RETRY_WAIT",
-                "reason_code": str(
-                    after_meta.get("retry_reason")
-                    or after_meta.get("materialization_reason")
-                    or "RETRY_RESCHEDULED"
-                ),
-                "next_retry_at": str(after_next_retry),
-            }
+            return {**_base, "disposition": "RETRY_WAIT",
+                    "reason_code": str(after_meta.get("retry_reason")
+                                       or after_meta.get("materialization_reason")
+                                       or "RETRY_RESCHEDULED"),
+                    "next_retry_at": str(after_next_retry)}
         if after_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
-            return {
-                **_base, "disposition": "TERMINAL_DURABLE",
-                "reason_code": str(
-                    after.get("last_error")
-                    or after_meta.get("final_reason")
-                    or "RETRY_CANONICAL_TERMINALIZED"
-                ),
-                "terminal_status": after_status,
-            }
-        # No durable outcome recorded -> keep ownership for the next pass.
-        try:
-            _delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
-        except (TypeError, ValueError):
-            _delay = 20
-        return {
-            **_base, "disposition": "RETRY_WAIT",
-            "reason_code": "RETRY_CANONICAL_NO_DURABLE_OUTCOME",
-            "next_retry_at": (_now + timedelta(seconds=_delay)).isoformat(),
-        }
-
+            return {**_base, "disposition": "TERMINAL_DURABLE",
+                    "reason_code": str(after.get("last_error") or after_meta.get("final_reason")
+                                       or "RETRY_CANONICAL_TERMINALIZED"),
+                    "terminal_status": after_status}
+        # No durable outcome — schedule retry before returning (blocker §5).
+        return _schedule_retry_wait("RETRY_CANONICAL_NO_DURABLE_OUTCOME")
     def reconcile_deferred_broker_intent(
         self,
         *,

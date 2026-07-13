@@ -755,3 +755,257 @@ def test_spec_acceptance_due_row_advances_generation_and_attempt():
     assert out["attempt"] == 2
     assert out["generation"] == 2
     assert out["disposition"] in {"BROKER_READY", "SUBMITTED"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AMENDMENT §1 tests — fail-closed on missing required fields
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_amend1_missing_direction_fails_closed():
+    """Missing direction must TERMINAL_DURABLE — never silently default to CALL."""
+    core = _core()
+    bad = _row()
+    bad["direction"] = None
+    bad["meta"].pop("side", None)
+    bad["meta"].pop("direction", None)
+    core.order_state_machine.get_order.return_value = bad
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-nodirection",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "DIRECTION" in result["reason_code"]
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+
+
+def test_amend1_invalid_direction_fails_closed():
+    """direction='BUY' is not CALL/PUT — must TERMINAL_DURABLE."""
+    core = _core()
+    bad = _row()
+    bad["direction"] = "BUY"
+    bad["meta"]["side"] = "BUY"
+    core.order_state_machine.get_order.return_value = bad
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-baddirection",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "DIRECTION" in result["reason_code"]
+
+
+def test_amend1_missing_trigger_crossed_at_fails_closed():
+    """Missing trigger_crossed_at must TERMINAL_DURABLE — never substitute now."""
+    core = _core()
+    bad = _row()
+    bad["meta"].pop("trigger_crossed_at", None)
+    bad["meta"].pop("triggered_at", None)
+    core.order_state_machine.get_order.return_value = bad
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-notriggerts",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "TRIGGER_CROSSED_AT" in result["reason_code"]
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+
+
+def test_amend1_missing_signal_id_fails_closed():
+    """signal_id is required for the CAS predicate — must TERMINAL_DURABLE."""
+    core = _core()
+    bad = _row()
+    bad["signal_id"] = None
+    bad["meta"]["signal_id"] = None
+    core.order_state_machine.get_order.return_value = bad
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-nosignal",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "SIGNAL_ID" in result["reason_code"]
+
+
+def test_amend1_missing_client_id_row_fails_closed():
+    """Missing client_id in the row must TERMINAL_DURABLE."""
+    core = _core()
+    bad = _row()
+    bad["client_id"] = None
+    core.order_state_machine.get_order.return_value = bad
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-noclient",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "CLIENT_ID" in result["reason_code"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AMENDMENT §2 tests — proof fails when watcher field absent but expected present
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_amend2_absent_watcher_token_fails_when_expected_provided():
+    """Watcher signal has no stored watcher_token (empty string). With an
+    expected token provided, proof must FAIL — not silently pass.
+    """
+    from ap_entry_watcher import APEntryWatcher
+
+    watcher = APEntryWatcher.__new__(APEntryWatcher)
+    watcher._pending = []
+    watcher._lock = threading.RLock()
+
+    now = datetime.now(timezone.utc)
+    watcher._pending.append(SimpleNamespace(
+        signal={
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "watcher_token": "",        # absent
+            "trigger_generation": 1,
+        },
+        is_active=True,
+        rearm_mode=False,
+        _ownership_quarantine=False,
+        state=SimpleNamespace(name="PENDING"),
+        expire_at=now + timedelta(hours=48),
+        deferred_retry_not_before=now - timedelta(seconds=30),
+    ))
+
+    proof = watcher.prove_materialization_retry_owner(
+        LOCAL_ORDER_ID,
+        expected_watcher_token="watcher:CURRENT",  # expected but absent in watcher
+    )
+    assert proof["proven"] is False
+    assert proof["reason_code"] == "PROOF_WATCHER_TOKEN_MISMATCH"
+
+
+def test_amend2_absent_generation_fails_when_expected_provided():
+    """Watcher signal has generation=0. With expected_generation=1, must FAIL."""
+    from ap_entry_watcher import APEntryWatcher
+
+    watcher = APEntryWatcher.__new__(APEntryWatcher)
+    watcher._pending = []
+    watcher._lock = threading.RLock()
+
+    now = datetime.now(timezone.utc)
+    watcher._pending.append(SimpleNamespace(
+        signal={
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "watcher_token": "watcher:x",
+            "trigger_generation": 0,   # absent / zero
+        },
+        is_active=True,
+        rearm_mode=False,
+        _ownership_quarantine=False,
+        state=SimpleNamespace(name="PENDING"),
+        expire_at=now + timedelta(hours=48),
+        deferred_retry_not_before=now - timedelta(seconds=30),
+    ))
+
+    proof = watcher.prove_materialization_retry_owner(
+        LOCAL_ORDER_ID,
+        expected_generation=1,
+    )
+    assert proof["proven"] is False
+    assert proof["reason_code"] == "PROOF_GENERATION_MISMATCH"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AMENDMENT §3 — malformed timestamp quarantine, not has_order fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_amend3_malformed_durable_timestamp_quarantines():
+    """A non-parseable next_retry_at must produce a quarantine outcome.
+    Recovery must not fall through to has_order() / watcher rearm.
+    """
+    from ap_entry_watcher import APEntryWatcher
+    from unittest.mock import patch
+    from ap import db as db_mod
+
+    core = _core()
+    core.order_state_machine.client_id = CLIENT_ID   # required by recovery osm check
+
+    row_bad_ts = _row()
+    row_bad_ts["meta"]["lifecycle_state"] = "RETRY_WAIT"
+    row_bad_ts["meta"]["materialization_status"] = "RETRY_PENDING"
+    row_bad_ts["meta"]["materialization_next_retry_at"] = "NOT-A-TIMESTAMP"
+    row_bad_ts["meta"]["next_retry_at"] = "NOT-A-TIMESTAMP"
+    row_bad_ts["meta"]["deferred_retry_next_attempt_at"] = "NOT-A-TIMESTAMP"
+
+    watcher = APEntryWatcher.__new__(APEntryWatcher)
+    watcher._pending = []
+    watcher._lock = threading.RLock()
+    watcher.watch = MagicMock(return_value=True)
+
+    rec = _recovery(core, watcher)
+
+    class _C:
+        def execute(self, *a, **k):
+            return self
+        def fetchall(self):
+            return [row_bad_ts]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self):
+            return _C()
+        def __exit__(self, *a):
+            return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    # watcher.watch must NOT have been called — row was quarantined
+    watcher.watch.assert_not_called()
+    # OSM retention (update_order_meta) must have been called for the quarantine
+    core.order_state_machine.update_order_meta.assert_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AMENDMENT §5 — callback exception triggers durable retry schedule
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_amend5_callback_exception_schedules_durable_retry():
+    """When _on_entry_trigger raises, resume must call
+    schedule_deferred_materialization_retry (not just return RETRY_WAIT with
+    the row still stranded at MATERIALIZING).
+    """
+    core = _core()
+    row = _row()
+    core.order_state_machine.get_order.return_value = row
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    core._on_entry_trigger.side_effect = RuntimeError("network error")
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-exc",
+    )
+    # Must return RETRY_WAIT — not KEEP_WATCHER or anything else
+    assert result["disposition"] == "RETRY_WAIT"
+    assert "EXCEPTION" in result["reason_code"] or "CALLBACK" in result["reason_code"]
+    # CRITICAL: schedule must have been called to make the RETRY_WAIT durable
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()

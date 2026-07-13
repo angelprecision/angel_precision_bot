@@ -1558,104 +1558,95 @@ class APStartupRecovery:
                 should_resume = True
 
             if should_resume:
-                # ── AMENDMENT §5: a resumable row must never be ownerless ──
-                if self.entry_watcher is None:
-                    # No watcher wired — cannot rearm this pass. Record
-                    # durable ownership so the row is diagnosably owned by
-                    # the recovery scheduler and a future pass resumes it.
-                    _retain_recovery_ownership(
-                        local_order_id, reason="entry_watcher_unavailable",
-                    )
-                    continue
-                # ── P0 (fix/deferred-retry-due-execution-p0) ────────────
-                # For a RETRY_WAIT / RETRY_PENDING row that is DUE
-                # (next_retry_at <= now), physical watcher registry
-                # presence is NOT proof of executable ownership. Prove it
-                # by inspecting the actual registered WatchedSignal via
-                # entry_watcher.prove_materialization_retry_owner(); on
-                # proof failure, fenced-CAS reclaim and execute the next
-                # attempt through the canonical execution-core method.
+                # ── P0 AMENDMENT (fix/deferred-retry-due-execution-p0) ───────
+                #
+                # BLOCKER §3: Apply executable ownership proof to ALL RETRY_WAIT
+                # / RETRY_PENDING rows — not just due ones. For future-due rows,
+                # the proof verifies that deferred_retry_not_before exists and is
+                # plausibly aligned with the durable schedule. A malformed durable
+                # timestamp gets a quarantine outcome, never a fall-through to
+                # has_order().
+                #
+                # BLOCKER §4: Due-retry execution does not require a live
+                # entry_watcher. An already-due durable retry routes to
+                # resume_deferred_materialization_retry through execution_core
+                # regardless of watcher availability. The watcher is only needed
+                # for future-due rearm scheduling.
+
+                _is_retry_row = (
+                    lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING"
+                )
+
+                # ── Parse + validate the durable retry schedule ───────────────
                 _durable_next_retry_at = (
                     meta.get("materialization_next_retry_at")
-                    or meta.get("next_retry_at")
                     or meta.get("deferred_retry_next_attempt_at")
+                    or meta.get("next_retry_at")
                 )
-                _due_now = False
                 _due_at = None
-                if _durable_next_retry_at and (
-                    lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING"
-                ):
+                _ts_parse_error = False
+                if _durable_next_retry_at and _is_retry_row:
                     try:
                         _due_at = datetime.fromisoformat(str(_durable_next_retry_at))
                         if _due_at.tzinfo is None:
                             _due_at = _due_at.replace(tzinfo=timezone.utc)
-                        _due_now = _due_at <= now
                     except Exception:
-                        _due_now = False
+                        _ts_parse_error = True
                         _due_at = None
 
-                if _due_now:
-                    _prove = getattr(
-                        self.entry_watcher, "prove_materialization_retry_owner", None,
+                if _is_retry_row and _ts_parse_error:
+                    # Blocker §3: malformed durable timestamp — quarantine.
+                    log.critical(
+                        "[%s] RECOVERY_RETRY_TS_MALFORMED local_order_id=%s "
+                        "raw=%r — quarantining via retention",
+                        self.client_id, local_order_id, _durable_next_retry_at,
                     )
-                    _proof_result: dict = {"proven": False, "reason_code": "PROOF_UNAVAILABLE"}
-                    if callable(_prove):
-                        try:
-                            _proof_result = _prove(
-                                local_order_id,
-                                expected_client_id=self.client_id,
-                                expected_execution_mode=recovery_mode,
-                                expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
-                                expected_generation=int(meta.get("materialization_generation") or 1),
-                                durable_next_retry_at=str(_durable_next_retry_at),
-                                durable_retry_deadline=(
-                                    str(meta.get("absolute_entry_deadline"))
-                                    if meta.get("absolute_entry_deadline") else None
-                                ),
-                            ) or {"proven": False, "reason_code": "PROOF_RETURNED_NONE"}
-                        except Exception as _proof_exc:
-                            log.error(
-                                "[%s] prove_materialization_retry_owner raised "
-                                "local_order_id=%s exc=%s",
-                                self.client_id, local_order_id, _proof_exc,
-                            )
-                            _proof_result = {
-                                "proven": False,
-                                "reason_code": f"PROOF_EXCEPTION:{type(_proof_exc).__name__}",
-                            }
+                    _retain_recovery_ownership(
+                        local_order_id, reason="retry_ts_malformed",
+                    )
+                    continue
 
+                _is_due = _due_at is not None and _due_at <= now
+
+                # ── Due-retry path (blocker §4: watcher not required) ─────────
+                if _is_retry_row and _is_due:
+                    # Prove executable ownership regardless of watcher state.
+                    _proof_result = {"proven": False, "reason_code": "PROOF_UNAVAILABLE"}
+                    if self.entry_watcher is not None:
+                        _prove = getattr(
+                            self.entry_watcher, "prove_materialization_retry_owner", None,
+                        )
+                        if callable(_prove):
+                            try:
+                                _proof_result = _prove(
+                                    local_order_id,
+                                    expected_client_id=self.client_id,
+                                    expected_execution_mode=recovery_mode,
+                                    expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
+                                    expected_generation=int(meta.get("materialization_generation") or 1),
+                                    durable_next_retry_at=str(_durable_next_retry_at),
+                                    durable_retry_deadline=(
+                                        str(meta.get("absolute_entry_deadline"))
+                                        if meta.get("absolute_entry_deadline") else None
+                                    ),
+                                ) or {"proven": False, "reason_code": "PROOF_RETURNED_NONE"}
+                            except Exception as _pexc:
+                                _proof_result = {
+                                    "proven": False,
+                                    "reason_code": f"PROOF_EXCEPTION:{type(_pexc).__name__}",
+                                }
                     _proven = bool(_proof_result.get("proven"))
                     _proof_reason = str(_proof_result.get("reason_code") or "PROOF_UNKNOWN")
-
-                    # Overdue grace: avoid racing a currently executing
-                    # watcher. Only skip if the watcher can prove ownership
-                    # AND the grace window has not elapsed. A stale-past-
-                    # grace watcher is NOT a valid active owner even if
-                    # proof passes.
                     try:
-                        _grace_seconds = int(
-                            os.getenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "5")
-                        )
+                        _grace_seconds = int(os.getenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "5"))
                     except (TypeError, ValueError):
                         _grace_seconds = 5
-                    _grace_expired = False
-                    if _due_at is not None:
-                        try:
-                            _grace_expired = (
-                                (now - _due_at).total_seconds() > _grace_seconds
-                            )
-                        except Exception:
-                            _grace_expired = True
-
+                    _grace_expired = (now - _due_at).total_seconds() > _grace_seconds
                     if _proven and not _grace_expired:
-                        # Watcher will consume the due retry within grace.
-                        continue
+                        continue  # watcher will fire within grace
 
-                    # If canonical takeover is not wired (no execution_core
-                    # or missing method), fall THROUGH to the legacy rearm
-                    # path so the row still gets an owner — the next runtime
-                    # health-loop pass will re-enter the due-retry branch
-                    # with a proper watcher registration.
+                    # Blocker §4: attempt takeover through execution_core
+                    # whether or not a watcher is available.
                     _resume_fn = None
                     if self.execution_core is not None:
                         _resume_fn = getattr(
@@ -1665,10 +1656,10 @@ class APStartupRecovery:
                         log.warning(
                             "[%s] RECOVERY_DUE_RETRY_TAKEOVER_UNAVAILABLE "
                             "local_order_id=%s proof_reason=%s — falling through "
-                            "to legacy rearm; next pass will retry",
+                            "to legacy rearm",
                             self.client_id, local_order_id, _proof_reason,
                         )
-                        # Fall through to the legacy rearm block below.
+                        # Fall through to the future-due / legacy rearm block.
                     else:
                         _expected_generation = int(meta.get("materialization_generation") or 1)
                         _expected_attempt = int(meta.get("retry_attempt") or 0) + 1
@@ -1694,13 +1685,12 @@ class APStartupRecovery:
                                 reason=f"due_retry_resume_raised:{type(_resume_exc).__name__}",
                             )
                             continue
-
                         _disp = str(_outcome.get("disposition") or "").strip().upper()
                         _reason = str(_outcome.get("reason_code") or "RETRY_UNKNOWN")
                         log.info(
                             "[%s] RECOVERY_DUE_RETRY_TAKEOVER local_order_id=%s "
-                            "proof_reason=%s grace_expired=%s disposition=%s reason=%s "
-                            "attempt=%s generation=%s",
+                            "proof_reason=%s grace_expired=%s disposition=%s "
+                            "reason=%s attempt=%s generation=%s",
                             self.client_id, local_order_id, _proof_reason,
                             _grace_expired, _disp, _reason,
                             _outcome.get("attempt"), _outcome.get("generation"),
@@ -1708,9 +1698,6 @@ class APStartupRecovery:
                         if _disp in {"SUBMITTED", "BROKER_READY"}:
                             recovered += 1
                         elif _disp == "TERMINAL_DURABLE":
-                            # resume_deferred_materialization_retry does not
-                            # write terminalization itself; verified-terminalize
-                            # here so a failed write is surfaced (§7 pattern).
                             _term_ok = _terminalize_verified(
                                 local_order_id,
                                 reason_code=_reason,
@@ -1727,19 +1714,56 @@ class APStartupRecovery:
                                 _retain_recovery_ownership(
                                     local_order_id, reason="due_retry_terminalize_failed",
                                 )
-                        # RETRY_WAIT / CLAIM_LOST / NOT_DUE / KEEP_WATCHER —
-                        # row remains durably owned by execution core; no
-                        # further action required from recovery this pass.
+                        # All other dispositions: row is now durably owned or
+                        # rescheduled by execution_core; skip rearm.
                         continue
 
-                # ── Not due (or lifecycle didn't require due-retry check) ──
-                # Preserve the original behaviour: if a watcher is present,
-                # trust registry membership for future-due rearms. Future-due
-                # rows are safe because the poll loop will honour
-                # deferred_retry_not_before.
-                if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
-                    # Already owned by a live watcher — nothing to do.
+                # ── Future-due / orphan rearm path ────────────────────────────
+                # Blocker §3: for future-due RETRY_WAIT rows, prove the watcher
+                # has an executable schedule before trusting has_order(). An
+                # absent or non-matching in-memory schedule means the poll loop
+                # will not fire the retry on time.
+                if _is_retry_row and _due_at is not None:
+                    _future_proof = {"proven": False, "reason_code": "NO_WATCHER"}
+                    if self.entry_watcher is not None:
+                        _pf = getattr(self.entry_watcher, "prove_materialization_retry_owner", None)
+                        if callable(_pf):
+                            try:
+                                _future_proof = _pf(
+                                    local_order_id,
+                                    expected_client_id=self.client_id,
+                                    expected_execution_mode=recovery_mode,
+                                    expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
+                                    expected_generation=int(meta.get("materialization_generation") or 1),
+                                    durable_next_retry_at=str(_durable_next_retry_at),
+                                    durable_retry_deadline=(
+                                        str(meta.get("absolute_entry_deadline"))
+                                        if meta.get("absolute_entry_deadline") else None
+                                    ),
+                                ) or {"proven": False, "reason_code": "PROOF_RETURNED_NONE"}
+                            except Exception as _fpexc:
+                                _future_proof = {
+                                    "proven": False,
+                                    "reason_code": f"PROOF_EXCEPTION:{type(_fpexc).__name__}",
+                                }
+                    if _future_proof.get("proven"):
+                        continue  # watcher owns this future-due row
+
+                # ── §5: a resumable row must never be ownerless ───────────────
+                if self.entry_watcher is None:
+                    _retain_recovery_ownership(
+                        local_order_id, reason="entry_watcher_unavailable",
+                    )
                     continue
+                if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
+                    # For non-RETRY_WAIT orphans (MATERIALIZING, QUEUED,
+                    # WAITING_FOR_TRIGGER), registry presence is sufficient.
+                    if not _is_retry_row:
+                        continue
+                    # RETRY_WAIT with no durable timestamp: no recoverable
+                    # schedule to violate — trust registry.
+                    if _due_at is None:
+                        continue
                 plan.metadata["materialization_generation"] = int(
                     meta.get("materialization_generation") or 1
                 )
@@ -1754,13 +1778,9 @@ class APStartupRecovery:
                 if armed:
                     recovered += 1
                 else:
-                    # Rearm returned False — the watcher did NOT take
-                    # ownership. Do not silently drop the row; record durable
-                    # recovery ownership so it is resumed on a later pass.
                     _retain_recovery_ownership(
                         local_order_id, reason="watcher_rearm_returned_false",
                     )
-
         result["deferred_lifecycles_recovered"] = recovered
 
     def _reseed_watchers(self, result: dict):

@@ -1923,6 +1923,11 @@ class APOrderStateMachine:
         observed_underlying_price: float,
         signal_id: str,
         execution_mode: str,
+        # P0 AMENDMENT (fix/deferred-retry-due-execution-p0 blocker §5):
+        # Advance retry_attempt atomically with generation so the durable row
+        # always shows the correct attempt count for the in-flight claim, even
+        # if the process crashes between claim and schedule_deferred_materialization_retry.
+        retry_attempt: int | None = None,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -1997,6 +2002,15 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "broker_ready": False,
         }
+        # Atomically advance the in-flight attempt counter when provided.
+        # This ensures the durable row always reflects which attempt is
+        # currently executing, even if the process crashes between claim
+        # and schedule_deferred_materialization_retry.
+        if retry_attempt is not None:
+            try:
+                _patch["retry_attempt_in_flight"] = int(retry_attempt)
+            except (TypeError, ValueError):
+                pass
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
         except Exception:

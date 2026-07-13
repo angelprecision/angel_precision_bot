@@ -1167,22 +1167,28 @@ class APEntryWatcher:
             elif _retry_dt is not None:
                 base["retry_due_at"] = str(_retry_dt)
 
-            if expected_client_id_norm and row_client and expected_client_id_norm != row_client:
-                base["reason_code"] = "PROOF_CLIENT_ID_MISMATCH"
-                return base
-            if expected_mode_norm and row_mode and expected_mode_norm != row_mode:
-                base["reason_code"] = "PROOF_EXECUTION_MODE_MISMATCH"
-                return base
-            if expected_token_norm and row_token and expected_token_norm != row_token:
-                base["reason_code"] = "PROOF_WATCHER_TOKEN_MISMATCH"
-                return base
-            if (
-                expected_generation_int is not None
-                and row_generation
-                and expected_generation_int != row_generation
-            ):
-                base["reason_code"] = "PROOF_GENERATION_MISMATCH"
-                return base
+            # ── BLOCKER §2: exact identity — absence fails like a mismatch ──
+            # When an expected identity field is supplied, an absent watcher
+            # field must fail proof exactly as a mismatch would. This closes
+            # the fail-open window where a watcher with no stored client_id,
+            # watcher_token, or generation could still pass because one side
+            # of the comparison was empty.
+            if expected_client_id_norm:
+                if expected_client_id_norm != row_client:
+                    base["reason_code"] = "PROOF_CLIENT_ID_MISMATCH"
+                    return base
+            if expected_mode_norm:
+                if expected_mode_norm != row_mode:
+                    base["reason_code"] = "PROOF_EXECUTION_MODE_MISMATCH"
+                    return base
+            if expected_token_norm:
+                if expected_token_norm != row_token:
+                    base["reason_code"] = "PROOF_WATCHER_TOKEN_MISMATCH"
+                    return base
+            if expected_generation_int is not None:
+                if expected_generation_int != row_generation:
+                    base["reason_code"] = "PROOF_GENERATION_MISMATCH"
+                    return base
 
             # Must be in a state that can actually execute the poll callback.
             # Quarantined, rearm-only, or expired watchers cannot.
