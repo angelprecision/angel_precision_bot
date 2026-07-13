@@ -2858,17 +2858,16 @@ class APExecutionCore:
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
-        # ── Intelligence PR 1 + PR 2: dispatch immediately after plan is confirmed ──────
-        # Fires before any post-plan terminal return (rejections, expiry, submit).
-        # BREACH is assembled from already-present watcher facts plus durable
-        # PRETRIGGER/PREOPEN snapshots only. It does not fetch history/chains,
-        # wait on futures, or run selector/intelligence modules.
+        # ── Intelligence PR 1 + PR 2 + PR #330: Non-blocking BREACH handoff ────
+        # PR #330 §1: execution thread only freezes evidence and submits to the
+        # bounded background executor.  No snapshot reads, no writes, no joins.
+        # Required sequence: freeze → bounded handoff → immediately continue.
         try:
             from ap.intelligence_context_materializer import _canonical_signal_id as _intel_canon
-            from ap.intelligence_evaluation import (
-                _ensure_intelligence_dispatched as _eid,
-                dispatch_breach_intelligence_snapshot as _dispatch_breach_intel,
-            )
+            from ap.intelligence_evaluation import _freeze_breach_input as _fbi
+            from ap.intelligence_context_handoff import submit_breach_intelligence_handoff as _sbih
+            from ap.intelligence_evaluation import _ensure_intelligence_dispatched as _eid
+
             _breach_canonical_signal_id = str(
                 sig.get("canonical_signal_id")
                 or getattr(approved_plan, "canonical_signal_id", "")
@@ -2882,8 +2881,9 @@ class APExecutionCore:
                 or getattr(self, "mode", None)
                 or ""
             )
-            _breach_dispatch_started = time.monotonic()
-            _breach_result = _dispatch_breach_intel(
+
+            # Step 1: freeze — extract all evidence from mutable objects NOW
+            _frozen = _fbi(
                 sig,
                 plan=approved_plan,
                 watched=watched,
@@ -2891,42 +2891,63 @@ class APExecutionCore:
                 execution_mode=_breach_execution_mode,
                 canonical_signal_id=_breach_canonical_signal_id,
                 local_order_id=str(queue_local_order_id or ""),
-                order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
             )
+
+            # Step 2: nonblocking handoff — submit to bounded executor, return immediately
+            _handoff_started = time.monotonic()
+            _handoff_result = _sbih(_frozen)
+            _handoff_ms = round((time.monotonic() - _handoff_started) * 1000.0, 3)
+            # _handoff_ms measures ONLY the local queue submission, never DB work.
+
+            # Step 3: record handoff telemetry (no DB wait)
             try:
+                _saturated = not _handoff_result.get("accepted", True)
                 _latency_patch = {
-                    "breach_intelligence_dispatch_ms": round(
-                        (time.monotonic() - _breach_dispatch_started) * 1000.0, 3
-                    ),
-                    "breach_to_selector_start_ms": None,
-                    "context_snapshot_missing_count": len(
-                        ((_breach_result.get("payload") or {}).get("missing_parent_snapshots") or [])
-                    ),
-                    "context_snapshot_stale_count": (
-                        ((_breach_result.get("payload") or {}).get("latency") or {}).get(
-                            "context_snapshot_stale_count", 0
-                        )
-                    ),
-                    "intelligence_queue_saturated_count": 0,
+                    "breach_intelligence_handoff_ms":       _handoff_ms,
+                    "breach_intelligence_handoff_accepted": _handoff_result.get("accepted", False),
+                    "breach_intelligence_handoff_saturated": _saturated,
+                    "breach_to_selector_start_ms":          None,  # filled after selector
+                    "intelligence_queue_saturated_count":   1 if _saturated else 0,
                 }
                 _ap_meta = getattr(approved_plan, "metadata", None)
                 if isinstance(_ap_meta, dict):
                     _ap_meta["breach_intelligence_latency"] = _latency_patch
+                if _saturated:
+                    log.warning(
+                        "[%s] BREACH_HANDOFF_SATURATED signal_id=%s — "
+                        "intelligence snapshot deferred; execution continues",
+                        ticker, signal_id,
+                    )
             except Exception:
                 pass
+
+            # Step 4: legacy breach evaluator — only via bounded executor, only if enabled
             if os.getenv("INTELLIGENCE_LEGACY_BREACH_EVALUATION_ENABLED", "0").strip() in {"1", "true", "TRUE", "yes"}:
-                _eid(
-                    sig,
-                    execution_mode="",
-                    client_id=_breach_client_id,
-                    local_order_id=str(queue_local_order_id or ""),
-                    plan=approved_plan,
-                    order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
-                    ticker=ticker,
-                )
-        except Exception as _eid_exc:
-            log.debug("[%s] breach intelligence dispatch non-critical: %s", ticker, _eid_exc)
+                try:
+                    # Legacy evaluation must also be dispatched asynchronously.
+                    from ap.intelligence_context_handoff import submit_intelligence_enqueue as _sie
+                    def _legacy_eid_task(_s=dict(sig), _pb=_breach_client_id, _lo=str(queue_local_order_id or ""), _t=ticker):
+                        _eid(
+                            _s,
+                            execution_mode="",
+                            client_id=_pb,
+                            local_order_id=_lo,
+                            plan=None,   # legacy path only; no mutable plan
+                            order_meta_writer=None,
+                            ticker=_t,
+                        )
+                    _sie(
+                        _legacy_eid_task,
+                        phase="BREACH_LEGACY",
+                        signal_id=str(sig.get("signal_id") or ""),
+                    )
+                except Exception:
+                    pass
+
+        except Exception as _breach_handoff_exc:
+            log.debug("[%s] breach intelligence handoff non-critical: %s", ticker, _breach_handoff_exc)
         # ── End intelligence wiring ─────────────────────────────────────────────
+        # PR #330 bounded dispatcher used: submit_breach_intelligence_handoff (via _sbih)
 
         _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
             approved_plan=approved_plan,

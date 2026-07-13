@@ -83,3 +83,29 @@ def enqueue_preopen_context_best_effort(signal: dict[str, Any], **kwargs: Any) -
         signal_id=str((signal or {}).get("signal_id") or ""),
         **kwargs,
     )
+
+
+def submit_breach_intelligence_handoff(
+    frozen_breach_input: "dict[str, Any]",
+) -> "dict[str, Any]":
+    """
+    Non-blocking BREACH intelligence handoff.  PR #330 §1, §2.
+
+    Called from _on_entry_trigger() AFTER the frozen breach input is assembled.
+    Returns immediately — never waits for database I/O, never blocks the
+    execution thread.
+
+    Saturation → rejected immediately, telemetry incremented, execution continues.
+    Task failure → logged by _log_result callback, no lifecycle mutation.
+    """
+    if not intelligence_context_enabled():
+        return {"ok": True, "accepted": False, "disabled": True}
+    from ap.intelligence_evaluation import _materialize_breach_background
+
+    _sig_id = str((frozen_breach_input or {}).get("signal_id") or "")
+    return submit_intelligence_enqueue(
+        _materialize_breach_background,
+        dict(frozen_breach_input),   # extra defensive copy
+        phase="BREACH",
+        signal_id=_sig_id,
+    )

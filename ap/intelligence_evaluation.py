@@ -1033,6 +1033,454 @@ def build_breach_intelligence_payload(
     return payload
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #330 §3: Freeze breach input — immutable dict extracted at confirmed-breach
+#             seam before any background work.  No mutable objects cross this
+#             boundary.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _freeze_breach_input(
+    signal: dict,
+    *,
+    plan: Any,
+    watched: Any,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    profile_version: str = "",
+) -> dict:
+    """
+    Extract every piece of evidence needed for BREACH intelligence from the live
+    watcher and plan objects, return a plain frozen dict.
+
+    Nothing mutable — no watched object, no approved_plan, no self, no OSM,
+    no broker — crosses into the background task.
+
+    PR #330 §4: underlying price comes ONLY from watcher breach quote facts.
+    """
+    from ap.intelligence_snapshot_store import DEFAULT_PROFILE_VERSION, normalize_execution_mode
+
+    sig = dict(signal or {})
+    mode = normalize_execution_mode(execution_mode)
+    pv = str(profile_version or DEFAULT_PROFILE_VERSION)
+
+    # ── Watcher breach facts ─────────────────────────────────────────────────
+    def _wa(attr: str) -> Any:
+        return getattr(watched, attr, None)
+
+    _bid  = _as_float(_wa("last_quote_bid") or _wa("first_breach_bid"))
+    _ask  = _as_float(_wa("last_quote_ask") or _wa("first_breach_ask"))
+    _side = str(sig.get("side") or sig.get("direction") or _plan_attr(plan, "side", "direction") or "").upper()
+
+    # PR #330 §4: use bid/ask midpoint or side-authoritative quote ONLY.
+    if _bid and _ask and _bid > 0 and _ask > 0:
+        _underlying_price = (_bid + _ask) / 2.0
+        _breach_quote_status = "AVAILABLE"
+    elif _side == "CALL" and _ask and _ask > 0:
+        _underlying_price = _ask
+        _breach_quote_status = "PARTIAL"
+    elif _side == "PUT" and _bid and _bid > 0:
+        _underlying_price = _bid
+        _breach_quote_status = "PARTIAL"
+    else:
+        _underlying_price = None
+        _breach_quote_status = "MISSING"
+
+    # ── Plan geometry ────────────────────────────────────────────────────────
+    _stop   = _as_float(_plan_attr(plan, "stop_price", "stop") or sig.get("stop_price") or sig.get("stop"))
+    _target = _as_float(_plan_attr(plan, "target_underlying", "target_price", "pt1", "target")
+                        or sig.get("target_price") or sig.get("target") or sig.get("pt1"))
+
+    frozen = {
+        # Identity
+        "client_id":              str(client_id or ""),
+        "execution_mode":         mode,
+        "canonical_signal_id":    str(canonical_signal_id or ""),
+        "signal_id":              str(sig.get("signal_id") or ""),
+        "local_order_id":         str(local_order_id or ""),
+        "plan_id":                str(_plan_attr(plan, "plan_id") or sig.get("plan_id") or ""),
+        "ticker":                 str(sig.get("ticker") or sig.get("symbol")
+                                      or _plan_attr(plan, "ticker", "symbol") or "").upper(),
+        "side":                   _side,
+        "timeframe":              str(sig.get("timeframe") or _plan_attr(plan, "timeframe") or ""),
+        "profile_version":        pv,
+        "context_revision":       None,   # computed in background from parent hashes
+
+        # Watcher breach facts
+        "trigger_crossed_at":     str(_wa("trigger_crossed_at") or ""),
+        "trigger_confirmed_at":   str(_wa("trigger_confirmed_at") or ""),
+        "trigger_price":          _as_float(_wa("trigger_price")
+                                            or _plan_attr(plan, "trigger_price", "trigger")
+                                            or sig.get("trigger_price") or sig.get("entry_price")),
+        "first_breach_bid":       _as_float(_wa("first_breach_bid")),
+        "first_breach_ask":       _as_float(_wa("first_breach_ask")),
+        "last_quote_bid":         _bid,
+        "last_quote_ask":         _ask,
+        "last_quote_at":          str(_wa("last_quote_at") or _wa("last_quote_ts") or ""),
+        "quote_source":           str(_wa("quote_source") or ""),
+        "quote_age_ms":           _as_float(_wa("quote_age_ms")),
+        "watcher_id":             str(_wa("watcher_id") or id(watched)),
+        "watcher_generation":     _as_float(_wa("watcher_generation") or _wa("generation") or 0),
+
+        # Geometry
+        "stop":                   _stop,
+        "target":                 _target,
+        "underlying_price":       _underlying_price,
+        "breach_quote_status":    _breach_quote_status,
+
+        # Plan evidence for attribution
+        "setup_score":            _as_float(_plan_attr(plan, "score") or sig.get("score")),
+        "setup_grade":            str(_plan_attr(plan, "grade", "tier") or sig.get("grade") or sig.get("tier") or ""),
+        "strategy_metadata":      dict(
+            (getattr(plan, "metadata", None) if not isinstance(plan, dict) else plan.get("metadata")) or {}
+        ),
+    }
+    return frozen
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #330 §5: Background BREACH materialization task.
+#             Called by the bounded executor; never touches execution lifecycle.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _materialize_breach_background(frozen_breach_input: dict) -> dict:
+    """
+    Run all BREACH intelligence database operations from the frozen breach input.
+
+    Permitted: load PRETRIGGER/PREOPEN snapshots, verify identity,
+               assemble BREACH profile, persist snapshot, write compact pointer.
+
+    Forbidden: change eligibility, change watcher state, cancel/expire any order,
+               select a contract, create submit intent, call broker submit,
+               create a position, mutate any execution object.
+
+    Every resulting payload retains observe_only=true, affected_eligibility=false.
+    """
+    import time as _t
+    started = _t.monotonic()
+    _sig_id = str((frozen_breach_input or {}).get("signal_id") or "")
+
+    try:
+        from ap.intelligence_snapshot_store import (
+            DEFAULT_PROFILE_VERSION,
+            get_latest_snapshot,
+            normalize_execution_mode,
+            write_snapshot,
+        )
+
+        fi     = frozen_breach_input or {}
+        cid    = str(fi.get("client_id") or "")
+        mode   = normalize_execution_mode(str(fi.get("execution_mode") or ""))
+        canon  = str(fi.get("canonical_signal_id") or "")
+        pv     = str(fi.get("profile_version") or DEFAULT_PROFILE_VERSION)
+        loc_id = str(fi.get("local_order_id") or "")
+
+        # ── Load parents ───────────────────────────────────────────────────
+        _load_start = _t.monotonic()
+        pretrigger = get_latest_snapshot(client_id=cid, execution_mode=mode,
+                                         canonical_signal_id=canon, phase="PRETRIGGER")
+        preopen    = get_latest_snapshot(client_id=cid, execution_mode=mode,
+                                         canonical_signal_id=canon, phase="PREOPEN")
+        _load_ms = (_t.monotonic() - _load_start) * 1000.0
+
+        pt_snap = pretrigger.get("snapshot") if (pretrigger or {}).get("ok") else None
+        po_snap = preopen.get("snapshot")    if (preopen or {}).get("ok")    else None
+
+        # ── PR #330 §7: compute truthful revision from parent IDs + breach input ──
+        _pretrigger_id  = str((pt_snap or {}).get("snapshot_id") or "")
+        _preopen_id     = str((po_snap or {}).get("snapshot_id") or "")
+        _pretrigger_rev = str((pt_snap or {}).get("context_revision") or "")
+        _preopen_rev    = str((po_snap or {}).get("context_revision") or "")
+        _revision = _compute_breach_context_revision(
+            fi, _pretrigger_id, _pretrigger_rev, _preopen_id, _preopen_rev
+        )
+
+        # ── Assemble BREACH profile (no live objects — signal rebuilt from frozen) ─
+        _asm_start = _t.monotonic()
+        # Reconstruct a minimal signal dict from the frozen input.
+        _sig_dict = {
+            "signal_id":           fi.get("signal_id") or "",
+            "canonical_signal_id": canon,
+            "client_id":           cid,
+            "execution_mode":      mode,
+            "ticker":              fi.get("ticker") or "",
+            "side":                fi.get("side") or "",
+            "timeframe":           fi.get("timeframe") or "",
+            "trigger_price":       fi.get("trigger_price"),
+            "stop_price":          fi.get("stop"),
+            "target_price":        fi.get("target"),
+        }
+        payload = _build_breach_payload_from_frozen(
+            frozen=fi,
+            signal=_sig_dict,
+            pretrigger_snapshot=pt_snap,
+            preopen_snapshot=po_snap,
+            context_revision=_revision,
+        )
+        payload["latency"]["parent_snapshot_read_ms"] = round(_load_ms, 3)
+        payload["latency"]["breach_profile_assembly_ms"] = round(
+            (_t.monotonic() - _asm_start) * 1000.0, 3
+        )
+
+        # ── Persist BREACH snapshot ────────────────────────────────────────
+        _write_start = _t.monotonic()
+        _input_hash = str(payload.get("input_hash") or "")
+        persisted = write_snapshot(
+            client_id=cid,
+            execution_mode=mode,
+            canonical_signal_id=canon,
+            signal_id=str(fi.get("signal_id") or ""),
+            local_order_id=loc_id,
+            phase="BREACH",
+            context_revision=_revision,
+            profile_version=pv,
+            parent_snapshot_id=_preopen_id or _pretrigger_id,
+            input_hash=_input_hash,
+            config_hash=str(payload.get("config_hash") or ""),
+            git_commit=str(payload.get("git_commit") or ""),
+            data_as_of=(payload.get("data_as_of") or {}).get("BREACH"),
+            status=str(payload.get("profile_status") or "PARTIAL"),
+            payload=payload,
+        )
+        _write_ms = (_t.monotonic() - _write_start) * 1000.0
+        payload["latency"]["breach_snapshot_write_ms"] = round(_write_ms, 3)
+
+        snapshot_id = str((persisted or {}).get("snapshot_id") or "")
+
+        # ── PR #330 §8: compact pointer — best-effort, order meta only ────
+        _ptr_ok = True
+        _ptr_start = _t.monotonic()
+        if snapshot_id and loc_id:
+            try:
+                _pointer = _compact_breach_pointer(payload, snapshot_id)
+                # Write only to order meta — no mutable plan object available.
+                from ap.db import conn
+                with conn() as _c:
+                    _c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = COALESCE(meta, '{}'::jsonb)
+                                   || jsonb_build_object('intelligence_evaluation', %s::jsonb)
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                        """,
+                        (_pointer if isinstance(_pointer, str) else str(_pointer),
+                         loc_id, cid),
+                    )
+            except Exception as _ptr_exc:
+                _ptr_ok = False
+                payload.setdefault("errors", []).append(
+                    f"BREACH_POINTER_WRITE_FAILED:{str(_ptr_exc)[:200]}"
+                )
+        payload["latency"]["pointer_write_ms"] = round((_t.monotonic() - _ptr_start) * 1000.0, 3)
+
+        payload["latency"]["breach_intelligence_materialization_ms"] = round(
+            (_t.monotonic() - started) * 1000.0, 3
+        )
+        return {
+            "ok":          bool((persisted or {}).get("ok")),
+            "snapshot_id": snapshot_id,
+            "duplicate":   bool((persisted or {}).get("duplicate")),
+            "pointer_ok":  _ptr_ok,
+            "payload":     payload,
+        }
+
+    except Exception as _bg_exc:
+        _err_cat = _categorize_breach_bg_error(_bg_exc)
+        try:
+            import logging as _lg
+            _lg.getLogger("ap.intelligence_evaluation").warning(
+                "BREACH_INTELLIGENCE_BACKGROUND_FAILED signal_id=%s category=%s: %s",
+                _sig_id, _err_cat, _bg_exc,
+            )
+        except Exception:
+            pass
+        return {"ok": False, "error": str(_bg_exc)[:500], "error_category": _err_cat}
+
+
+def _compute_breach_context_revision(
+    frozen: dict,
+    pretrigger_id: str,
+    pretrigger_rev: str,
+    preopen_id: str,
+    preopen_rev: str,
+) -> int:
+    """
+    PR #330 §7: derive revision from parent IDs + immutable breach input.
+    Same breach input + same parents → same revision (idempotent).
+    Changed breach facts or new parent → next revision.
+    """
+    import hashlib
+    _fields = [
+        str(frozen.get("client_id") or ""),
+        str(frozen.get("execution_mode") or ""),
+        str(frozen.get("canonical_signal_id") or ""),
+        str(frozen.get("local_order_id") or ""),
+        "BREACH",
+        str(frozen.get("profile_version") or ""),
+        pretrigger_id, pretrigger_rev,
+        preopen_id, preopen_rev,
+        str(frozen.get("trigger_confirmed_at") or ""),
+        str(frozen.get("first_breach_bid") or ""),
+        str(frozen.get("first_breach_ask") or ""),
+        str(frozen.get("trigger_price") or ""),
+        str(frozen.get("stop") or ""),
+        str(frozen.get("target") or ""),
+        str(frozen.get("watcher_generation") or ""),
+    ]
+    h = hashlib.sha256("|".join(_fields).encode()).hexdigest()[:8]
+    # Map to a small integer for the snapshot store revision field.
+    # Collision probability over typical session cardinality is negligible.
+    return (int(h, 16) % 65536) or 1
+
+
+def _build_breach_payload_from_frozen(
+    *,
+    frozen: dict,
+    signal: dict,
+    pretrigger_snapshot: "Optional[dict]",
+    preopen_snapshot: "Optional[dict]",
+    context_revision: int = 1,
+) -> dict:
+    """
+    Build the BREACH payload dict from a frozen breach input + loaded parents.
+    Equivalent to build_breach_intelligence_payload but accepts frozen evidence
+    rather than live watched/plan objects.
+    """
+    from ap.intelligence_snapshot_store import DEFAULT_PROFILE_VERSION, normalize_execution_mode
+
+    sig = dict(signal or {})
+    fi  = dict(frozen or {})
+    cid   = str(fi.get("client_id") or "")
+    mode  = normalize_execution_mode(str(fi.get("execution_mode") or ""))
+    canon = str(fi.get("canonical_signal_id") or "")
+    pv    = str(fi.get("profile_version") or DEFAULT_PROFILE_VERSION)
+    ticker = str(fi.get("ticker") or "").upper()
+    side   = str(fi.get("side") or "").upper()
+
+    pretrigger_snapshot, pt_warnings = _verify_parent_snapshot_identity(
+        pretrigger_snapshot, phase="PRETRIGGER", client_id=cid,
+        execution_mode=mode, canonical_signal_id=canon,
+        ticker=ticker, side=side, profile_version=pv,
+    )
+    preopen_snapshot, po_warnings = _verify_parent_snapshot_identity(
+        preopen_snapshot, phase="PREOPEN", client_id=cid,
+        execution_mode=mode, canonical_signal_id=canon,
+        ticker=ticker, side=side, profile_version=pv,
+    )
+    warnings = [i for i in pt_warnings + po_warnings if i.endswith("_mismatch")]
+    if warnings:
+        warnings = ["intelligence_snapshot_identity_mismatch"] + warnings
+    warnings += [i for i in pt_warnings + po_warnings if i.endswith("_missing")]
+
+    pt_payload  = _snapshot_payload(pretrigger_snapshot)
+    po_payload  = _snapshot_payload(preopen_snapshot)
+    parent_payload = po_payload or pt_payload
+
+    component_statuses = {
+        "geometry":       _snapshot_component_status(parent_payload, "geometry"),
+        "multi_timeframe":_snapshot_component_status(parent_payload, "multi_timeframe"),
+    }
+
+    # PR #330 §4: underlying price from frozen watcher quote facts only.
+    _breach_qs = str(fi.get("breach_quote_status") or "MISSING")
+    current_price = fi.get("underlying_price")   # already filtered in _freeze_breach_input
+    if _breach_qs == "MISSING":
+        component_statuses["breach_quote"] = "MISSING"
+
+    trigger_price = fi.get("trigger_price")
+    stop          = fi.get("stop")
+    target        = fi.get("target")
+
+    advisories: list = []
+    if not pretrigger_snapshot:
+        advisories.append("intelligence_pretrigger_snapshot_missing")
+    if not preopen_snapshot:
+        advisories.append("intelligence_preopen_snapshot_missing")
+
+    profile_status = "COMPLETE"
+    if warnings or not pretrigger_snapshot or not preopen_snapshot:
+        profile_status = "PARTIAL"
+    if _breach_qs == "MISSING":
+        profile_status = "PARTIAL"
+
+    parent_snapshot_ids = {}
+    if pretrigger_snapshot:
+        parent_snapshot_ids["PRETRIGGER"] = str(pretrigger_snapshot.get("snapshot_id") or "")
+    if preopen_snapshot:
+        parent_snapshot_ids["PREOPEN"] = str(preopen_snapshot.get("snapshot_id") or "")
+
+    from ap.intelligence_context_materializer import _canonical_signal_id as _icm_canon
+    _input_hash = _compute_breach_context_revision.__module__  # re-use module for brevity
+    # Recompute input hash here for the payload.
+    import hashlib as _hs
+    _ih_src = "|".join([
+        str(fi.get("client_id") or ""), mode, canon, str(fi.get("local_order_id") or ""),
+        "BREACH", pv, str(trigger_price or ""), str(fi.get("first_breach_bid") or ""),
+        str(fi.get("first_breach_ask") or ""), str(fi.get("watcher_generation") or ""),
+    ])
+    _input_hash = _hs.sha256(_ih_src.encode()).hexdigest()
+
+    return {
+        "phase":                "BREACH",
+        "profile_version":      pv,
+        "profile_status":       profile_status,
+        "observe_only":         True,
+        "affected_eligibility": False,
+        "context_revision":     int(context_revision or 1),
+        "input_hash":           _input_hash,
+        "config_hash":          "",
+        "git_commit":           "",
+        "client_id":            cid,
+        "execution_mode":       mode,
+        "canonical_signal_id":  canon,
+        "signal_id":            str(fi.get("signal_id") or ""),
+        "local_order_id":       str(fi.get("local_order_id") or ""),
+        "ticker":               ticker,
+        "side":                 side,
+        "trigger_price":        trigger_price,
+        "stop":                 stop,
+        "target":               target,
+        "current_underlying_price": current_price,
+        "breach_quote_status":  _breach_qs,
+        "trigger_crossed_at":   fi.get("trigger_crossed_at") or "",
+        "trigger_confirmed_at": fi.get("trigger_confirmed_at") or "",
+        "first_breach_bid":     fi.get("first_breach_bid"),
+        "first_breach_ask":     fi.get("first_breach_ask"),
+        "watcher_id":           fi.get("watcher_id") or "",
+        "watcher_generation":   fi.get("watcher_generation"),
+        "setup_score":          fi.get("setup_score"),
+        "setup_grade":          fi.get("setup_grade") or "",
+        "parent_snapshot_ids":  parent_snapshot_ids,
+        "component_statuses":   component_statuses,
+        "warnings":             warnings,
+        "advisories":           advisories,
+        "missing_parent_snapshots": [
+            ph for ph, snap in [("PRETRIGGER", pretrigger_snapshot), ("PREOPEN", preopen_snapshot)]
+            if not snap
+        ],
+        "data_as_of":           {
+            "BREACH": fi.get("trigger_confirmed_at") or fi.get("trigger_crossed_at") or "",
+        },
+        "latency":              {},
+    }
+
+
+def _categorize_breach_bg_error(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "read" in msg or "get_latest" in msg or "load" in msg:
+        return "BREACH_PARENT_READ_FAILED"
+    if "mismatch" in msg or "identity" in msg:
+        return "BREACH_PARENT_IDENTITY_MISMATCH"
+    if "write" in msg or "persist" in msg:
+        return "BREACH_SNAPSHOT_WRITE_FAILED"
+    if "pointer" in msg:
+        return "BREACH_POINTER_WRITE_FAILED"
+    return "BREACH_MATERIALIZATION_ERROR"
+
+
 def dispatch_breach_intelligence_snapshot(
     signal: dict[str, Any],
     *,

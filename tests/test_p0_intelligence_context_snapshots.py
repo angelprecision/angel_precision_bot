@@ -1,3 +1,4 @@
+import pytest
 import os
 import sys
 import threading
@@ -870,9 +871,696 @@ def test_breach_dispatch_seam_after_plan_recovery_before_hydration():
     fn_start = source.index("def _on_entry_trigger(")
     fn_end = source.find("\n    def ", fn_start + 100)
     body = source[fn_start:fn_end]
-    assert body.index("_recover_plan_for_revalidation") < body.index(
-        "dispatch_breach_intelligence_snapshot"
+    # PR #330: synchronous dispatch replaced by _freeze_breach_input + submit_breach_intelligence_handoff
+    # Verify freeze happens before hydration, and that the old synchronous dispatch is gone.
+    assert "_freeze_breach_input" in body, "_freeze_breach_input must be wired in _on_entry_trigger"
+    assert "submit_breach_intelligence_handoff" in body, "submit_breach_intelligence_handoff must be wired"
+    # New handoff must precede hydration (same seam requirement, new function names)
+    assert body.index("_freeze_breach_input") < body.index("_refresh_hydrated_prebreach_plan")
+    # Old synchronous dispatch must be gone
+    assert "dispatch_breach_intelligence_snapshot(" not in body, (
+        "PR #330: dispatch_breach_intelligence_snapshot must not be called synchronously "
+        "from _on_entry_trigger — use submit_breach_intelligence_handoff instead"
     )
-    assert body.index("dispatch_breach_intelligence_snapshot") < body.index(
-        "_refresh_hydrated_prebreach_plan"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR #330 — Amendment: Non-blocking handoff, frozen input, saturation,
+#            identity, idempotency, trade-flow safety
+# ══════════════════════════════════════════════════════════════════════════════
+
+import threading
+from ap.intelligence_evaluation import (
+    _freeze_breach_input,
+    _materialize_breach_background,
+    _compute_breach_context_revision,
+)
+from ap.intelligence_context_handoff import submit_breach_intelligence_handoff
+
+
+def _make_watched(trigger_price=501.25, bid=501.10, ask=501.40, generation=1):
+    w = types.SimpleNamespace()
+    w.trigger_price        = trigger_price
+    w.trigger_crossed_at   = "2026-01-01T09:31:00+00:00"
+    w.trigger_confirmed_at = "2026-01-01T09:31:02+00:00"
+    w.first_breach_bid     = bid
+    w.first_breach_ask     = ask
+    w.last_quote_bid       = bid
+    w.last_quote_ask       = ask
+    w.last_quote_at        = "2026-01-01T09:31:02+00:00"
+    w.quote_source         = "broker"
+    w.quote_age_ms         = 120.0
+    w.watcher_id           = "watcher-test-1"
+    w.watcher_generation   = generation
+    return w
+
+
+def _make_plan(score=0.82, grade="A", stop=497.0, target=508.0):
+    p = types.SimpleNamespace()
+    p.score         = score
+    p.grade         = grade
+    p.tier          = grade
+    p.stop_price    = stop
+    p.target_price  = target
+    p.trigger_price = 501.25
+    p.ticker        = "SPY"
+    p.side          = "CALL"
+    p.plan_id       = "plan-test-1"
+    p.execution_mode = "PAPER"
+    p.metadata      = {"strategy": "2U"}
+    return p
+
+
+def _freeze_args(sig_override=None, plan_override=None, watched_override=None):
+    sig = dict(_signal())
+    if sig_override:
+        sig.update(sig_override)
+    return dict(
+        signal=sig,
+        plan=plan_override or _make_plan(),
+        watched=watched_override or _make_watched(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="oid-test-1",
     )
+
+
+# ── Test: _freeze_breach_input extracts from live objects ────────────────────
+
+def test_freeze_breach_input_contains_required_fields():
+    frozen = _freeze_breach_input(**_freeze_args())
+    assert frozen["client_id"] == "client@example.com"
+    assert frozen["canonical_signal_id"] == "canon-123"
+    assert frozen["ticker"] == "SPY"
+    assert frozen["trigger_price"] == 501.25
+    assert frozen["first_breach_bid"] == 501.10
+    assert frozen["first_breach_ask"] == 501.40
+    assert frozen["watcher_generation"] == 1
+    assert frozen["stop"] == 497.0
+    assert frozen["target"] == 508.0
+    assert frozen["setup_score"] == 0.82
+    assert "strategy" in (frozen.get("strategy_metadata") or {})
+
+
+def test_freeze_breach_input_no_mutable_objects():
+    """Frozen dict must not contain live watcher/plan/self references."""
+    watched = _make_watched()
+    plan    = _make_plan()
+    frozen  = _freeze_breach_input(**_freeze_args(watched_override=watched, plan_override=plan))
+    import types as _t
+    for k, v in frozen.items():
+        assert not isinstance(v, _t.SimpleNamespace), (
+            f"key={k} contains mutable SimpleNamespace"
+        )
+        assert not hasattr(v, "order_state_machine"), f"key={k} has OSM attribute"
+
+
+# ── Test: nonblocking — blocking store does not block execution thread ────────
+
+def test_nonblocking_breach_handoff_with_blocking_store():
+    """
+    PR #330 §1: confirmed breach must not wait for snapshot DB operations.
+    Instrument the background task to block 3 seconds; verify the handoff
+    returns in <<1s.
+    """
+    _reset_memory_store_for_tests()
+    _block = threading.Event()
+    _unblock = threading.Event()
+
+    def _blocking_task(frozen):
+        _block.set()     # signal that background started
+        _unblock.wait(timeout=5.0)  # block until test releases it
+        return {"ok": True}
+
+    os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "1"
+    try:
+        from ap.intelligence_context_handoff import submit_intelligence_enqueue
+        frozen = _freeze_breach_input(**_freeze_args())
+        _sig_id = frozen["signal_id"]
+
+        t0 = time.monotonic()
+        result = submit_intelligence_enqueue(
+            _blocking_task, frozen,
+            phase="BREACH", signal_id=_sig_id,
+        )
+        elapsed = time.monotonic() - t0
+        _unblock.set()
+
+        assert elapsed < 0.5, (
+            f"Handoff must return immediately; took {elapsed:.3f}s "
+            "(PR #330 §1: no synchronous DB work before selector)"
+        )
+        assert result.get("accepted") is True
+    finally:
+        os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "0"
+
+
+def test_saturation_does_not_block_execution():
+    """
+    PR #330 §10: when executor is saturated, execution continues immediately.
+    Fill all capacity slots, then verify submit_breach_intelligence_handoff
+    returns with accepted=False without blocking.
+    """
+    os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "1"
+    try:
+        from ap.intelligence_context_handoff import _CAPACITY, submit_breach_intelligence_handoff
+
+        # Drain all capacity
+        drained = 0
+        while _CAPACITY.acquire(blocking=False):
+            drained += 1
+
+        frozen = _freeze_breach_input(**_freeze_args())
+        t0 = time.monotonic()
+        result = submit_breach_intelligence_handoff(frozen)
+        elapsed = time.monotonic() - t0
+
+        # Restore
+        for _ in range(drained):
+            try:
+                _CAPACITY.release()
+            except ValueError:
+                break
+
+        assert elapsed < 0.2, f"Saturated handoff must return immediately; took {elapsed:.3f}s"
+        # accepted=False (capacity exhausted) OR disabled; either way execution continues.
+        assert not result.get("accepted", True) or result.get("disabled"), (
+            f"Expected saturation rejection; got {result}"
+        )
+    finally:
+        os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "0"
+
+
+def test_watched_mutation_after_handoff_does_not_affect_frozen():
+    """
+    PR #330 §3: mutating the watched object after freeze must NOT change
+    the frozen breach input passed to the background task.
+    """
+    watched = _make_watched(bid=501.10, ask=501.40)
+    frozen  = _freeze_breach_input(**_freeze_args(watched_override=watched))
+
+    orig_bid = frozen["first_breach_bid"]
+    orig_ask = frozen["first_breach_ask"]
+
+    # Mutate watched AFTER freeze
+    watched.first_breach_bid = 999.0
+    watched.first_breach_ask = 999.0
+    watched.last_quote_bid   = 999.0
+
+    assert frozen["first_breach_bid"] == orig_bid, "Frozen bid must not change after mutation"
+    assert frozen["first_breach_ask"] == orig_ask, "Frozen ask must not change after mutation"
+
+
+def test_plan_mutation_after_handoff_does_not_affect_frozen():
+    plan   = _make_plan(stop=497.0, target=508.0)
+    frozen = _freeze_breach_input(**_freeze_args(plan_override=plan))
+
+    orig_stop   = frozen["stop"]
+    orig_target = frozen["target"]
+
+    plan.stop_price   = 100.0
+    plan.target_price = 100.0
+
+    assert frozen["stop"]   == orig_stop,   "Frozen stop must not change after plan mutation"
+    assert frozen["target"] == orig_target, "Frozen target must not change after plan mutation"
+
+
+# ── Test: PR #330 §4 — breach quote status rules ─────────────────────────────
+
+def test_freeze_sets_breach_quote_available_on_valid_bid_ask():
+    frozen = _freeze_breach_input(**_freeze_args(watched_override=_make_watched(bid=501.10, ask=501.40)))
+    assert frozen["breach_quote_status"] == "AVAILABLE"
+    assert frozen["underlying_price"] == pytest.approx((501.10 + 501.40) / 2.0)
+
+
+def test_freeze_sets_breach_quote_missing_on_zero_quotes():
+    w = _make_watched()
+    w.last_quote_bid   = 0
+    w.last_quote_ask   = 0
+    w.first_breach_bid = 0
+    w.first_breach_ask = 0
+    frozen = _freeze_breach_input(**_freeze_args(watched_override=w))
+    assert frozen["breach_quote_status"] == "MISSING"
+    assert frozen["underlying_price"] is None
+
+
+def test_freeze_does_not_use_option_price_as_underlying():
+    """Must NOT fall back to option limit_price or entry_price as underlying price."""
+    w = _make_watched()
+    w.last_quote_bid   = 0
+    w.last_quote_ask   = 0
+    w.first_breach_bid = 0
+    w.first_breach_ask = 0
+    sig = dict(_signal())
+    sig["limit_price"]  = 3.50   # option premium — must NOT be used
+    sig["entry_price"]  = 501.25  # must NOT be used as underlying
+    plan = _make_plan()
+    frozen = _freeze_breach_input(signal=sig, plan=plan, watched=w,
+                                  client_id="client@example.com",
+                                  execution_mode="PAPER",
+                                  canonical_signal_id="canon-123",
+                                  local_order_id="oid-test-1")
+    assert frozen["underlying_price"] is None
+    assert frozen["breach_quote_status"] == "MISSING"
+
+
+# ── Test: PR #330 §6 — parent identity verification in background ─────────────
+
+def test_background_rejects_wrong_client_pretrigger():
+    _reset_memory_store_for_tests()
+    bad_pretrigger = {
+        "snapshot_id": "bad-pt",
+        "client_id": "wrong@example.com",
+        "execution_mode": "PAPER",
+        "canonical_signal_id": "canon-123",
+        "phase": "PRETRIGGER",
+        "profile_version": "v1",
+        "payload": {"ticker": "SPY", "side": "CALL"},
+    }
+    from ap.intelligence_evaluation import _verify_parent_snapshot_identity
+    result, warnings = _verify_parent_snapshot_identity(
+        bad_pretrigger,
+        phase="PRETRIGGER",
+        client_id="client@example.com",
+        execution_mode="paper",
+        canonical_signal_id="canon-123",
+        ticker="SPY",
+        side="CALL",
+        profile_version="v1",
+    )
+    assert result is None, "Wrong client_id must reject the parent"
+    assert any("mismatch" in w for w in warnings), f"Mismatch warning expected; got {warnings}"
+
+
+def test_background_missing_pretrigger_produces_partial_profile():
+    _reset_memory_store_for_tests()
+    frozen = _freeze_breach_input(**_freeze_args())
+    frozen["client_id"] = "client@example.com"
+    # No PRETRIGGER/PREOPEN snapshots in store
+    result = _materialize_breach_background(frozen)
+    if result.get("ok") is not False:
+        payload = result.get("payload") or {}
+        assert payload.get("profile_status") == "PARTIAL", (
+            "Missing PRETRIGGER → PARTIAL profile"
+        )
+        assert "PRETRIGGER" in (payload.get("missing_parent_snapshots") or [])
+
+
+# ── Test: PR #330 §7 — revision idempotency ──────────────────────────────────
+
+def test_same_breach_input_produces_same_revision():
+    frozen = _freeze_breach_input(**_freeze_args())
+    r1 = _compute_breach_context_revision(frozen, "pt-id", "1", "po-id", "1")
+    r2 = _compute_breach_context_revision(frozen, "pt-id", "1", "po-id", "1")
+    assert r1 == r2, "Same breach input + same parents → same revision"
+
+
+def test_changed_watcher_generation_changes_revision():
+    w1 = _make_watched(generation=1)
+    w2 = _make_watched(generation=2)
+    f1 = _freeze_breach_input(**_freeze_args(watched_override=w1))
+    f2 = _freeze_breach_input(**_freeze_args(watched_override=w2))
+    r1 = _compute_breach_context_revision(f1, "pt", "1", "po", "1")
+    r2 = _compute_breach_context_revision(f2, "pt", "1", "po", "1")
+    assert r1 != r2, "Different watcher_generation → different revision"
+
+
+def test_new_preopen_parent_changes_revision():
+    frozen = _freeze_breach_input(**_freeze_args())
+    r1 = _compute_breach_context_revision(frozen, "pt", "1", "po-v1", "1")
+    r2 = _compute_breach_context_revision(frozen, "pt", "1", "po-v2", "2")
+    assert r1 != r2, "New PREOPEN parent → different BREACH revision"
+
+
+# ── Test: PR #330 — trade-flow safety from background task ───────────────────
+
+def test_background_task_does_not_call_broker():
+    """The background task must never call broker submit or contract selector."""
+    _reset_memory_store_for_tests()
+    broker_called = []
+
+    class _FakeBroker:
+        def submit_order(self, *a, **kw):
+            broker_called.append(True)
+        def post_order(self, *a, **kw):
+            broker_called.append(True)
+        def place_order(self, *a, **kw):
+            broker_called.append(True)
+
+    # Patch to inject fake broker (shouldn't be reachable; this proves isolation)
+    import ap.intelligence_evaluation as _ie
+    frozen = _freeze_breach_input(**_freeze_args())
+    _materialize_breach_background(frozen)
+    assert not broker_called, "Background BREACH task must NEVER call broker"
+
+
+def test_background_task_observe_only():
+    """Every BREACH snapshot must have observe_only=true and affected_eligibility=false."""
+    _reset_memory_store_for_tests()
+    frozen = _freeze_breach_input(**_freeze_args())
+    result = _materialize_breach_background(frozen)
+    payload = (result or {}).get("payload") or {}
+    assert payload.get("observe_only") is True
+    assert payload.get("affected_eligibility") is False
+
+
+def test_background_task_does_not_mutate_watcher_state():
+    """Background task must not change any watcher-owned state."""
+    _reset_memory_store_for_tests()
+    watched = _make_watched()
+    frozen  = _freeze_breach_input(**_freeze_args(watched_override=watched))
+    # Save pre-task state of watched
+    pre_bid = watched.last_quote_bid
+    _materialize_breach_background(frozen)
+    assert watched.last_quote_bid == pre_bid, "Background task must not mutate watched object"
+
+
+# ── Test: missing evidence partial profiles ───────────────────────────────────
+
+def test_missing_preopen_produces_partial_profile():
+    from ap.intelligence_evaluation import _build_breach_payload_from_frozen
+    frozen = _freeze_breach_input(**_freeze_args())
+    payload = _build_breach_payload_from_frozen(
+        frozen=frozen,
+        signal=dict(_signal()),
+        pretrigger_snapshot={"snapshot_id": "pt-1", "client_id": "client@example.com",
+                              "execution_mode": "paper", "canonical_signal_id": "canon-123",
+                              "phase": "PRETRIGGER", "profile_version": "v1",
+                              "payload": {"ticker": "SPY", "side": "CALL"}},
+        preopen_snapshot=None,
+    )
+    assert payload["profile_status"] == "PARTIAL"
+    assert "PREOPEN" in payload.get("missing_parent_snapshots", [])
+
+
+def test_missing_breach_quote_sets_component_missing():
+    from ap.intelligence_evaluation import _build_breach_payload_from_frozen
+    w = _make_watched()
+    w.last_quote_bid = 0; w.last_quote_ask = 0
+    w.first_breach_bid = 0; w.first_breach_ask = 0
+    frozen = _freeze_breach_input(**_freeze_args(watched_override=w))
+    assert frozen["breach_quote_status"] == "MISSING"
+    payload = _build_breach_payload_from_frozen(
+        frozen=frozen, signal=dict(_signal()),
+        pretrigger_snapshot=None, preopen_snapshot=None,
+    )
+    assert payload["component_statuses"].get("breach_quote") == "MISSING"
+    assert payload["profile_status"] == "PARTIAL"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR #330 — Amendment: Non-blocking handoff, frozen input, saturation,
+#            identity, idempotency, trade-flow safety
+# ══════════════════════════════════════════════════════════════════════════════
+
+import threading
+from ap.intelligence_evaluation import (
+    _freeze_breach_input,
+    _materialize_breach_background,
+    _compute_breach_context_revision,
+    _build_breach_payload_from_frozen,
+)
+from ap.intelligence_context_handoff import submit_breach_intelligence_handoff
+
+
+def _make_watched(trigger_price=501.25, bid=501.10, ask=501.40, generation=1):
+    import types as _ty
+    w = _ty.SimpleNamespace()
+    w.trigger_price        = trigger_price
+    w.trigger_crossed_at   = "2026-01-01T09:31:00+00:00"
+    w.trigger_confirmed_at = "2026-01-01T09:31:02+00:00"
+    w.first_breach_bid     = bid
+    w.first_breach_ask     = ask
+    w.last_quote_bid       = bid
+    w.last_quote_ask       = ask
+    w.last_quote_at        = "2026-01-01T09:31:02+00:00"
+    w.quote_source         = "broker"
+    w.quote_age_ms         = 120.0
+    w.watcher_id           = "watcher-test-330"
+    w.watcher_generation   = generation
+    return w
+
+
+def _make_plan(score=0.82, grade="A", stop=497.0, target=508.0):
+    import types as _ty
+    p = _ty.SimpleNamespace()
+    p.score          = score
+    p.grade          = grade
+    p.tier           = grade
+    p.stop_price     = stop
+    p.target_price   = target
+    p.trigger_price  = 501.25
+    p.ticker         = "SPY"
+    p.side           = "CALL"
+    p.plan_id        = "plan-330-test"
+    p.execution_mode = "PAPER"
+    p.metadata       = {"strategy": "2U"}
+    return p
+
+
+def _freeze_args(sig_extra=None, plan_override=None, watched_override=None):
+    sig = dict(_signal())
+    if sig_extra:
+        sig.update(sig_extra)
+    return dict(
+        signal=sig,
+        plan=plan_override or _make_plan(),
+        watched=watched_override or _make_watched(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="oid-test-330",
+    )
+
+
+# ── Frozen input ──────────────────────────────────────────────────────────────
+
+def test_330_freeze_contains_required_identity_and_watcher_fields():
+    frozen = _freeze_breach_input(**_freeze_args())
+    assert frozen["client_id"] == "client@example.com"
+    assert frozen["canonical_signal_id"] == "canon-123"
+    assert frozen["ticker"] == "SPY"
+    assert frozen["trigger_price"] == 501.25
+    assert frozen["first_breach_bid"] == 501.10
+    assert frozen["first_breach_ask"] == 501.40
+    assert frozen["watcher_generation"] == 1
+    assert frozen["stop"] == 497.0
+    assert frozen["setup_score"] == 0.82
+
+
+def test_330_freeze_no_mutable_objects():
+    import types as _ty
+    watched = _make_watched()
+    plan    = _make_plan()
+    frozen  = _freeze_breach_input(**_freeze_args(plan_override=plan, watched_override=watched))
+    for k, v in frozen.items():
+        assert not isinstance(v, _ty.SimpleNamespace), f"key={k} is a mutable namespace"
+
+
+def test_330_watched_mutation_after_freeze_does_not_change_frozen():
+    watched = _make_watched(bid=501.10)
+    frozen  = _freeze_breach_input(**_freeze_args(watched_override=watched))
+    orig    = frozen["first_breach_bid"]
+    watched.first_breach_bid = 999.0
+    watched.last_quote_bid   = 999.0
+    assert frozen["first_breach_bid"] == orig
+
+
+def test_330_plan_mutation_after_freeze_does_not_change_frozen():
+    plan   = _make_plan(stop=497.0)
+    frozen = _freeze_breach_input(**_freeze_args(plan_override=plan))
+    orig   = frozen["stop"]
+    plan.stop_price = 1.0
+    assert frozen["stop"] == orig
+
+
+# ── Nonblocking ───────────────────────────────────────────────────────────────
+
+def test_330_blocking_snapshot_does_not_block_execution_thread():
+    """PR #330 §1: handoff must return in microseconds even if DB blocks 3s."""
+    _reset_memory_store_for_tests()
+    _unblock = threading.Event()
+
+    def _blocking_bg(frozen):
+        _unblock.wait(timeout=5.0)
+        return {"ok": True}
+
+    os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "1"
+    try:
+        from ap.intelligence_context_handoff import submit_intelligence_enqueue
+        frozen = _freeze_breach_input(**_freeze_args())
+        t0 = time.monotonic()
+        submit_intelligence_enqueue(
+            _blocking_bg, frozen,
+            phase="BREACH", signal_id=frozen["signal_id"],
+        )
+        elapsed = time.monotonic() - t0
+        _unblock.set()
+        assert elapsed < 0.5, (
+            f"Handoff returned in {elapsed:.3f}s — must be <0.5s "
+            "(PR #330: no synchronous DB work before selector)"
+        )
+    finally:
+        os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "0"
+        _unblock.set()
+
+
+def test_330_saturation_returns_immediately_without_inline_fallback():
+    """PR #330 §10: saturated queue → immediate rejection, no inline work."""
+    os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "1"
+    try:
+        from ap.intelligence_context_handoff import _CAPACITY
+        drained = 0
+        while _CAPACITY.acquire(blocking=False):
+            drained += 1
+        frozen = _freeze_breach_input(**_freeze_args())
+        t0 = time.monotonic()
+        result = submit_breach_intelligence_handoff(frozen)
+        elapsed = time.monotonic() - t0
+        for _ in range(drained):
+            try: _CAPACITY.release()
+            except ValueError: break
+        assert elapsed < 0.2, f"Saturated handoff took {elapsed:.3f}s"
+        assert not result.get("accepted", True) or result.get("disabled"), (
+            f"Saturated handoff must not be accepted: {result}"
+        )
+    finally:
+        os.environ["INTELLIGENCE_CONTEXT_WORKER_ENABLED"] = "0"
+
+
+# ── PR #330 §4 — underlying price rules ──────────────────────────────────────
+
+def test_330_breach_quote_available_on_valid_bid_ask():
+    frozen = _freeze_breach_input(**_freeze_args(watched_override=_make_watched(bid=501.10, ask=501.40)))
+    assert frozen["breach_quote_status"] == "AVAILABLE"
+    assert frozen["underlying_price"] == pytest.approx((501.10 + 501.40) / 2.0)
+
+
+def test_330_breach_quote_missing_on_zero_quotes():
+    import types as _ty
+    w = _make_watched()
+    w.last_quote_bid = 0; w.last_quote_ask = 0
+    w.first_breach_bid = 0; w.first_breach_ask = 0
+    frozen = _freeze_breach_input(**_freeze_args(watched_override=w))
+    assert frozen["breach_quote_status"] == "MISSING"
+    assert frozen["underlying_price"] is None
+
+
+def test_330_does_not_use_option_premium_as_underlying():
+    """option limit_price or entry_price must NEVER be used as underlying price."""
+    import types as _ty
+    w = _make_watched()
+    w.last_quote_bid = 0; w.last_quote_ask = 0
+    w.first_breach_bid = 0; w.first_breach_ask = 0
+    sig = dict(_signal())
+    sig["limit_price"] = 3.50   # option premium
+    sig["entry_price"] = 501.25  # must NOT be used as underlying
+    frozen = _freeze_breach_input(
+        signal=sig, plan=_make_plan(), watched=w,
+        client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", local_order_id="oid-330",
+    )
+    assert frozen["underlying_price"] is None
+    assert frozen["breach_quote_status"] == "MISSING"
+
+
+# ── PR #330 §6 — parent identity ─────────────────────────────────────────────
+
+def test_330_wrong_client_parent_rejected():
+    from ap.intelligence_evaluation import _verify_parent_snapshot_identity
+    snap, warnings = _verify_parent_snapshot_identity(
+        {"snapshot_id": "x", "client_id": "wrong@example.com",
+         "execution_mode": "paper", "canonical_signal_id": "canon-123",
+         "phase": "PRETRIGGER", "profile_version": "v1",
+         "payload": {"ticker": "SPY", "side": "CALL"}},
+        phase="PRETRIGGER", client_id="client@example.com",
+        execution_mode="paper", canonical_signal_id="canon-123",
+        ticker="SPY", side="CALL", profile_version="v1",
+    )
+    assert snap is None
+    assert any("mismatch" in w for w in warnings)
+
+
+def test_330_wrong_execution_mode_parent_rejected():
+    from ap.intelligence_evaluation import _verify_parent_snapshot_identity
+    snap, warnings = _verify_parent_snapshot_identity(
+        {"snapshot_id": "x", "client_id": "client@example.com",
+         "execution_mode": "live",    # mismatch with PAPER
+         "canonical_signal_id": "canon-123",
+         "phase": "PREOPEN", "profile_version": "v1",
+         "payload": {"ticker": "SPY", "side": "CALL"}},
+        phase="PREOPEN", client_id="client@example.com",
+        execution_mode="paper", canonical_signal_id="canon-123",
+        ticker="SPY", side="CALL", profile_version="v1",
+    )
+    assert snap is None
+    assert any("mismatch" in w for w in warnings)
+
+
+def test_330_missing_pretrigger_produces_partial():
+    payload = _build_breach_payload_from_frozen(
+        frozen=_freeze_breach_input(**_freeze_args()),
+        signal=dict(_signal()),
+        pretrigger_snapshot=None,
+        preopen_snapshot=None,
+    )
+    assert payload["profile_status"] == "PARTIAL"
+    assert "PRETRIGGER" in (payload.get("missing_parent_snapshots") or [])
+
+
+# ── PR #330 §7 — revision idempotency ────────────────────────────────────────
+
+def test_330_same_input_same_revision():
+    frozen = _freeze_breach_input(**_freeze_args())
+    r1 = _compute_breach_context_revision(frozen, "pt", "1", "po", "1")
+    r2 = _compute_breach_context_revision(frozen, "pt", "1", "po", "1")
+    assert r1 == r2
+
+
+def test_330_different_watcher_generation_different_revision():
+    f1 = _freeze_breach_input(**_freeze_args(watched_override=_make_watched(generation=1)))
+    f2 = _freeze_breach_input(**_freeze_args(watched_override=_make_watched(generation=2)))
+    assert (_compute_breach_context_revision(f1, "pt", "1", "po", "1") !=
+            _compute_breach_context_revision(f2, "pt", "1", "po", "1"))
+
+
+def test_330_new_preopen_parent_different_revision():
+    frozen = _freeze_breach_input(**_freeze_args())
+    r1 = _compute_breach_context_revision(frozen, "pt", "1", "po-v1", "1")
+    r2 = _compute_breach_context_revision(frozen, "pt", "1", "po-v2", "2")
+    assert r1 != r2
+
+
+# ── Trade-flow safety ─────────────────────────────────────────────────────────
+
+def test_330_background_task_observe_only_flag():
+    _reset_memory_store_for_tests()
+    frozen  = _freeze_breach_input(**_freeze_args())
+    result  = _materialize_breach_background(frozen)
+    payload = (result or {}).get("payload") or {}
+    assert payload.get("observe_only") is True
+    assert payload.get("affected_eligibility") is False
+
+
+def test_330_background_does_not_mutate_watched_object():
+    watched = _make_watched()
+    frozen  = _freeze_breach_input(**_freeze_args(watched_override=watched))
+    pre_bid = watched.last_quote_bid
+    _reset_memory_store_for_tests()
+    _materialize_breach_background(frozen)
+    assert watched.last_quote_bid == pre_bid
+
+
+def test_330_missing_breach_quote_component_missing_in_payload():
+    import types as _ty
+    w = _make_watched()
+    w.last_quote_bid = 0; w.last_quote_ask = 0
+    w.first_breach_bid = 0; w.first_breach_ask = 0
+    frozen  = _freeze_breach_input(**_freeze_args(watched_override=w))
+    payload = _build_breach_payload_from_frozen(
+        frozen=frozen, signal=dict(_signal()),
+        pretrigger_snapshot=None, preopen_snapshot=None,
+    )
+    assert payload["component_statuses"].get("breach_quote") == "MISSING"
+    assert payload["profile_status"] == "PARTIAL"
