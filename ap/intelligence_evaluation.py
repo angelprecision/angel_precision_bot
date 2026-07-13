@@ -57,6 +57,7 @@ import threading
 import time as _time_module
 from collections import OrderedDict
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Optional
 
 log = logging.getLogger("ap.intelligence_evaluation")
@@ -693,6 +694,435 @@ def make_phase_intelligence_key(
         )
     )
     return hashlib.sha1(raw.encode()).hexdigest()[:24]
+
+
+def _stable_payload_hash(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_iso(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return ""
+    return str(value or "")
+
+
+def _breach_price_from_watcher(watched: Any) -> Optional[float]:
+    bid = _as_float(getattr(watched, "last_quote_bid", None))
+    ask = _as_float(getattr(watched, "last_quote_ask", None))
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    for attr in ("breach_price", "first_breach_ask", "first_breach_bid", "trigger_price"):
+        value = _as_float(getattr(watched, attr, None))
+        if value and value > 0:
+            return value
+    return None
+
+
+def _snapshot_payload(snapshot: Optional[dict[str, Any]]) -> dict[str, Any]:
+    payload = (snapshot or {}).get("payload") or {}
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _snapshot_component_status(payload: dict[str, Any], name: str) -> str:
+    statuses = payload.get("component_statuses") or {}
+    if not isinstance(statuses, dict):
+        return "MISSING"
+    value = statuses.get(name)
+    if value is None and name == "FVG":
+        value = statuses.get("one_hour_fvg") or statuses.get("four_hour_fvg")
+    if value is None and name == "multi_timeframe":
+        vals = [
+            statuses.get("monthly"), statuses.get("weekly"),
+            statuses.get("daily"), statuses.get("four_hour"),
+        ]
+        if any(v == "ERROR" for v in vals):
+            return "ERROR"
+        if any(v == "STALE" for v in vals):
+            return "STALE"
+        if vals and all(v == "AVAILABLE" for v in vals if v is not None):
+            return "AVAILABLE"
+        return "MISSING"
+    raw = str(value or "MISSING").upper()
+    if raw == "UNAVAILABLE":
+        return "MISSING"
+    return raw if raw in {"AVAILABLE", "MISSING", "STALE", "ERROR", "NOT_APPLICABLE"} else "MISSING"
+
+
+def _verify_parent_snapshot_identity(
+    snapshot: Optional[dict[str, Any]],
+    *,
+    phase: str,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    ticker: str,
+    side: str,
+    profile_version: str,
+) -> tuple[Optional[dict[str, Any]], list[str]]:
+    if not snapshot:
+        return None, [f"{phase}_missing"]
+    payload = _snapshot_payload(snapshot)
+    mismatches: list[str] = []
+    checks = {
+        "client_id": (snapshot.get("client_id") or payload.get("client_id"), client_id),
+        "execution_mode": (snapshot.get("execution_mode") or payload.get("execution_mode"), execution_mode),
+        "canonical_signal_id": (
+            snapshot.get("canonical_signal_id") or payload.get("canonical_signal_id"),
+            canonical_signal_id,
+        ),
+        "ticker": (payload.get("ticker") or payload.get("symbol"), ticker),
+        "side": (payload.get("side") or payload.get("direction"), side),
+        "profile_version": (
+            snapshot.get("profile_version") or payload.get("profile_version"),
+            profile_version,
+        ),
+    }
+    for field, (actual, expected) in checks.items():
+        if str(actual or "").strip().upper() != str(expected or "").strip().upper():
+            mismatches.append(f"{phase}_{field}_mismatch")
+    if mismatches:
+        return None, mismatches
+    return snapshot, []
+
+
+def _grade_from_score(score: Optional[float]) -> Optional[str]:
+    if score is None:
+        return None
+    if score >= 85:
+        return "A"
+    if score >= 70:
+        return "B"
+    if score >= 55:
+        return "C"
+    return "D"
+
+
+def _compact_breach_pointer(payload: dict[str, Any], snapshot_id: str) -> dict[str, Any]:
+    return {
+        "phase": "BREACH",
+        "profile_version": payload.get("profile_version"),
+        "snapshot_id": snapshot_id,
+        "parent_snapshot_ids": payload.get("parent_snapshot_ids") or {},
+        "profile_status": payload.get("profile_status"),
+        "setup_score": payload.get("setup_score"),
+        "setup_grade": payload.get("setup_grade"),
+        "advisory_count": len(payload.get("strategy_advisories") or []),
+        "warning_count": len(payload.get("data_quality_warnings") or []),
+        "observe_only": True,
+    }
+
+
+def _write_compact_intelligence_pointer(
+    *,
+    plan: Any,
+    local_order_id: str,
+    payload: dict[str, Any],
+    snapshot_id: str,
+    order_meta_writer: Any = None,
+) -> None:
+    pointer = _compact_breach_pointer(payload, snapshot_id)
+    try:
+        meta = getattr(plan, "metadata", None)
+        if isinstance(meta, dict):
+            meta["intelligence_evaluation"] = pointer
+            score_audit = meta.setdefault("score_audit", {})
+            if isinstance(score_audit, dict):
+                score_audit["intelligence_evaluation"] = pointer
+    except Exception:
+        pass
+    try:
+        if callable(order_meta_writer) and local_order_id:
+            order_meta_writer(str(local_order_id), {"intelligence_evaluation": pointer})
+    except Exception:
+        pass
+
+
+def build_breach_intelligence_payload(
+    *,
+    signal: dict[str, Any],
+    plan: Any,
+    watched: Any,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    pretrigger_snapshot: Optional[dict[str, Any]],
+    preopen_snapshot: Optional[dict[str, Any]],
+    context_revision: int = 1,
+    profile_version: str = "",
+) -> dict[str, Any]:
+    from ap.intelligence_snapshot_store import DEFAULT_PROFILE_VERSION, normalize_execution_mode
+
+    sig = dict(signal or {})
+    profile_version = str(profile_version or DEFAULT_PROFILE_VERSION)
+    execution_mode = normalize_execution_mode(execution_mode)
+    ticker = str(sig.get("ticker") or sig.get("symbol") or _plan_attr(plan, "ticker", "symbol") or "").upper()
+    side = str(sig.get("side") or sig.get("direction") or _plan_attr(plan, "side", "direction") or "").upper()
+    trigger_price = _as_float(getattr(watched, "trigger_price", None) or _plan_attr(plan, "trigger_price", "trigger") or sig.get("trigger_price") or sig.get("entry_price"))
+    current_price = _breach_price_from_watcher(watched)
+    stop = _as_float(_plan_attr(plan, "stop_price", "stop") or sig.get("stop_price") or sig.get("stop"))
+    target = _as_float(_plan_attr(plan, "target_underlying", "target_price", "pt1", "target") or sig.get("target_price") or sig.get("target") or sig.get("pt1"))
+    warnings: list[str] = []
+    pretrigger_snapshot, pretrigger_warnings = _verify_parent_snapshot_identity(
+        pretrigger_snapshot, phase="PRETRIGGER", client_id=client_id,
+        execution_mode=execution_mode, canonical_signal_id=canonical_signal_id,
+        ticker=ticker, side=side, profile_version=profile_version,
+    )
+    preopen_snapshot, preopen_warnings = _verify_parent_snapshot_identity(
+        preopen_snapshot, phase="PREOPEN", client_id=client_id,
+        execution_mode=execution_mode, canonical_signal_id=canonical_signal_id,
+        ticker=ticker, side=side, profile_version=profile_version,
+    )
+    mismatch = [
+        item for item in pretrigger_warnings + preopen_warnings
+        if item.endswith("_mismatch")
+    ]
+    if mismatch:
+        warnings.append("intelligence_snapshot_identity_mismatch")
+    warnings.extend(item for item in pretrigger_warnings + preopen_warnings if item.endswith("_missing"))
+
+    pretrigger_payload = _snapshot_payload(pretrigger_snapshot)
+    preopen_payload = _snapshot_payload(preopen_snapshot)
+    parent_payload = preopen_payload or pretrigger_payload
+
+    component_statuses = {
+        "geometry": _snapshot_component_status(parent_payload, "geometry"),
+        "multi_timeframe": _snapshot_component_status(parent_payload, "multi_timeframe"),
+        "FVG": _snapshot_component_status(parent_payload, "FVG"),
+        "market": _snapshot_component_status(parent_payload, "market"),
+        "sector": _snapshot_component_status(parent_payload, "sector"),
+        "volume": _snapshot_component_status(parent_payload, "volume"),
+        "VWAP": _snapshot_component_status(parent_payload, "vwap"),
+        "breach_quote": "AVAILABLE" if current_price is not None else "MISSING",
+        "contract_execution_quality": "NOT_AVAILABLE_UNTIL_CONTRACT_SELECTED",
+        "expected_move_contract_evidence": "NOT_AVAILABLE_UNTIL_CONTRACT_SELECTED",
+    }
+    stale_count = sum(1 for status in component_statuses.values() if status == "STALE")
+    missing_count = sum(1 for status in component_statuses.values() if status == "MISSING")
+    if current_price is None:
+        warnings.append("breach_quote_missing")
+
+    hard_blocks: list[str] = []
+    remaining_target_distance = None
+    remaining_r = None
+    breach_distance = None
+    breach_distance_percent = None
+    if current_price is not None and trigger_price:
+        if side == "PUT":
+            breach_distance = trigger_price - current_price
+        else:
+            breach_distance = current_price - trigger_price
+        breach_distance_percent = (breach_distance / trigger_price) * 100.0 if trigger_price else None
+    if current_price is not None and target is not None:
+        remaining_target_distance = (current_price - target) if side == "PUT" else (target - current_price)
+        if remaining_target_distance <= 0:
+            hard_blocks.append("target_already_reached")
+    if current_price is not None and stop is not None and target is not None:
+        risk = abs(current_price - stop)
+        remaining_r = (remaining_target_distance / risk) if risk and remaining_target_distance is not None else None
+        if remaining_r is not None and remaining_r <= 0:
+            hard_blocks.append("remaining_r_nonpositive")
+    if component_statuses["geometry"] in {"MISSING", "ERROR"}:
+        hard_blocks.append("invalid_geometry")
+    if mismatch:
+        hard_blocks.append("identity_conflict")
+
+    advisories = sorted(set(
+        list(pretrigger_payload.get("strategy_advisories") or [])
+        + list(preopen_payload.get("strategy_advisories") or [])
+    ))
+    warnings = sorted(set(warnings + list(pretrigger_payload.get("data_quality_warnings") or []) + list(preopen_payload.get("data_quality_warnings") or [])))
+    setup_score = _as_float(parent_payload.get("setup_score") or parent_payload.get("overall_score") or sig.get("score") or _plan_attr(plan, "score"))
+    setup_grade = str(parent_payload.get("setup_grade") or parent_payload.get("grade") or _plan_attr(plan, "grade") or "") or _grade_from_score(setup_score)
+    required = {k: v for k, v in component_statuses.items() if k in {
+        "geometry", "multi_timeframe", "FVG", "market", "sector", "volume", "VWAP", "breach_quote",
+    }}
+    complete = bool(required) and all(v == "AVAILABLE" for v in required.values())
+    profile_status = "COMPLETE" if complete and not mismatch else "PARTIAL"
+    now = _now_iso()
+    payload = {
+        "profile_version": profile_version,
+        "phase": "BREACH",
+        "context_revision": int(context_revision or 1),
+        "client_id": str(client_id or ""),
+        "execution_mode": execution_mode,
+        "canonical_signal_id": str(canonical_signal_id or ""),
+        "signal_id": str(sig.get("signal_id") or _plan_attr(plan, "signal_id") or ""),
+        "local_order_id": str(local_order_id or ""),
+        "ticker": ticker,
+        "side": side,
+        "profile_status": profile_status,
+        "profile_completeness": {
+            "complete": complete,
+            "missing_components": sorted(k for k, v in required.items() if v == "MISSING"),
+            "stale_components": sorted(k for k, v in required.items() if v == "STALE"),
+            "error_components": sorted(k for k, v in required.items() if v == "ERROR"),
+        },
+        "setup_score": setup_score,
+        "setup_grade": setup_grade,
+        "hard_safety_blocks": sorted(set(hard_blocks)),
+        "strategy_advisories": advisories,
+        "data_quality_warnings": warnings,
+        "component_statuses": component_statuses,
+        "parent_snapshot_ids": {
+            "PRETRIGGER": (pretrigger_snapshot or {}).get("id"),
+            "PREOPEN": (preopen_snapshot or {}).get("id"),
+        },
+        "missing_parent_snapshots": sorted(item for item in ("PRETRIGGER" if pretrigger_snapshot is None else "", "PREOPEN" if preopen_snapshot is None else "") if item),
+        "data_as_of": {
+            "PRETRIGGER": pretrigger_payload.get("data_as_of"),
+            "PREOPEN": preopen_payload.get("data_as_of"),
+            "BREACH": _as_iso(getattr(watched, "trigger_crossed_at", None)) or now,
+        },
+        "computed_at": now,
+        "breach_inputs": {
+            "breached_at": _as_iso(getattr(watched, "trigger_crossed_at", None)) or now,
+            "watcher_quote_timestamp": sig.get("watcher_quote_timestamp") or sig.get("quote_timestamp") or _as_iso(getattr(watched, "last_quote_at", None)),
+            "watcher_quote_source": sig.get("watcher_quote_source") or sig.get("quote_source") or "",
+            "current_underlying_price": current_price,
+            "trigger_price": trigger_price,
+            "breach_distance_dollars": breach_distance,
+            "breach_distance_percent": breach_distance_percent,
+            "stop": stop,
+            "target": target,
+            "remaining_target_distance": remaining_target_distance,
+            "remaining_r": remaining_r,
+            "watcher_id": sig.get("watcher_id") or getattr(watched, "watcher_id", "") or "",
+            "watcher_generation": sig.get("watcher_generation") or sig.get("materialization_generation"),
+            "watcher_owner": sig.get("watcher_owner") or sig.get("materialization_owner") or "",
+            "local_order_id": str(local_order_id or ""),
+            "canonical_signal_id": str(canonical_signal_id or ""),
+            "client_id": str(client_id or ""),
+            "execution_mode": execution_mode,
+        },
+        "observe_only": True,
+        "affected_eligibility": False,
+        "compatibility_key": "intelligence_evaluation",
+        "contract_evidence_status": "NOT_AVAILABLE_UNTIL_CONTRACT_SELECTED",
+    }
+    payload["input_hash"] = _stable_payload_hash({
+        "phase": "BREACH",
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "canonical_signal_id": canonical_signal_id,
+        "local_order_id": local_order_id,
+        "context_revision": int(context_revision or 1),
+        "breach_inputs": payload["breach_inputs"],
+        "parent_snapshot_ids": payload["parent_snapshot_ids"],
+    })
+    payload["config_hash"] = _config_hash({"profile_version": profile_version, "phase": "BREACH"})
+    payload["git_commit"] = _CACHED_GIT_COMMIT
+    payload["latency"] = {
+        "context_snapshot_missing_count": len(payload["missing_parent_snapshots"]),
+        "context_snapshot_stale_count": stale_count,
+        "intelligence_queue_saturated_count": 0,
+    }
+    return payload
+
+
+def dispatch_breach_intelligence_snapshot(
+    signal: dict[str, Any],
+    *,
+    plan: Any,
+    watched: Any,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    order_meta_writer: Any = None,
+) -> dict[str, Any]:
+    """Assemble and persist the BREACH profile from already-present facts only."""
+    from ap.intelligence_snapshot_store import (
+        DEFAULT_PROFILE_VERSION,
+        get_latest_snapshot,
+        normalize_execution_mode,
+        write_snapshot,
+    )
+
+    started = _time_module.monotonic()
+    load_started = _time_module.monotonic()
+    mode = normalize_execution_mode(execution_mode)
+    pretrigger = get_latest_snapshot(
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        phase="PRETRIGGER",
+    )
+    preopen = get_latest_snapshot(
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        phase="PREOPEN",
+    )
+    load_ms = (_time_module.monotonic() - load_started) * 1000.0
+    assembly_started = _time_module.monotonic()
+    payload = build_breach_intelligence_payload(
+        signal=dict(signal or {}),
+        plan=plan,
+        watched=watched,
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        local_order_id=local_order_id,
+        pretrigger_snapshot=pretrigger.get("snapshot") if pretrigger.get("ok") else None,
+        preopen_snapshot=preopen.get("snapshot") if preopen.get("ok") else None,
+        context_revision=1,
+        profile_version=DEFAULT_PROFILE_VERSION,
+    )
+    payload["latency"]["breach_snapshot_load_ms"] = round(load_ms, 3)
+    payload["latency"]["breach_profile_assembly_ms"] = round(
+        (_time_module.monotonic() - assembly_started) * 1000.0, 3
+    )
+    persisted = write_snapshot(
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        signal_id=str((signal or {}).get("signal_id") or _plan_attr(plan, "signal_id") or ""),
+        local_order_id=local_order_id,
+        phase="BREACH",
+        context_revision=1,
+        profile_version=DEFAULT_PROFILE_VERSION,
+        parent_snapshot_id=(payload.get("parent_snapshot_ids") or {}).get("PREOPEN")
+        or (payload.get("parent_snapshot_ids") or {}).get("PRETRIGGER"),
+        input_hash=str(payload.get("input_hash") or ""),
+        config_hash=str(payload.get("config_hash") or ""),
+        git_commit=str(payload.get("git_commit") or ""),
+        data_as_of=(payload.get("data_as_of") or {}).get("BREACH"),
+        status=str(payload.get("profile_status") or "PARTIAL"),
+        payload=payload,
+    )
+    snapshot_id = str(persisted.get("snapshot_id") or "")
+    payload["latency"]["breach_intelligence_dispatch_ms"] = round(
+        (_time_module.monotonic() - started) * 1000.0, 3
+    )
+    if snapshot_id:
+        _write_compact_intelligence_pointer(
+            plan=plan,
+            local_order_id=local_order_id,
+            payload=payload,
+            snapshot_id=snapshot_id,
+            order_meta_writer=order_meta_writer,
+        )
+    return {
+        "ok": bool(persisted.get("ok")),
+        "snapshot_id": snapshot_id,
+        "duplicate": bool(persisted.get("duplicate")),
+        "payload": MappingProxyType(copy.deepcopy(payload)),
+        "error": persisted.get("error"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

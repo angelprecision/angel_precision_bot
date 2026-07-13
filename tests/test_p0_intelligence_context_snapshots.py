@@ -16,6 +16,10 @@ from ap.intelligence_context_materializer import (  # noqa: E402
     enqueue_pretrigger_context,
     recover_missing_intelligence_jobs,
 )
+from ap.intelligence_evaluation import (  # noqa: E402
+    build_breach_intelligence_payload,
+    dispatch_breach_intelligence_snapshot,
+)
 from ap.intelligence_market_data import extract_underlying_price  # noqa: E402
 from ap.intelligence_context_worker import process_due_intelligence_jobs_once  # noqa: E402
 from ap.intelligence_context_handoff import submit_intelligence_enqueue  # noqa: E402
@@ -659,3 +663,216 @@ def test_preopen_refreshes_time_sensitive_quote_instead_of_relabeling_pretrigger
     assert pretrigger["underlying_observation"]["price"] == 500.0
     assert preopen["underlying_observation"]["price"] == 505.0
     assert preopen["parent_snapshot_id"] == "parent-1"
+
+
+def _write_parent_phase(phase: str, *, client="client@example.com", mode="PAPER",
+                        canonical="canon-123", local_order_id="loid-1",
+                        ticker="SPY", side="CALL", component_overrides=None):
+    statuses = {
+        "geometry": "AVAILABLE",
+        "monthly": "AVAILABLE",
+        "weekly": "AVAILABLE",
+        "daily": "AVAILABLE",
+        "four_hour": "AVAILABLE",
+        "one_hour_fvg": "AVAILABLE",
+        "market": "AVAILABLE",
+        "sector": "AVAILABLE",
+        "volume": "AVAILABLE",
+        "vwap": "AVAILABLE",
+    }
+    statuses.update(component_overrides or {})
+    return write_snapshot(
+        client_id=client,
+        execution_mode=mode,
+        canonical_signal_id=canonical,
+        signal_id="sig-123",
+        local_order_id=local_order_id if phase == "PREOPEN" else "",
+        phase=phase,
+        context_revision=1,
+        input_hash=f"{phase}-hash",
+        config_hash="cfg",
+        git_commit="git",
+        data_as_of="2026-07-10T14:00:00+00:00",
+        status="COMPLETE",
+        payload={
+            "phase": phase,
+            "profile_version": "intelligence_context_v1_observe_only",
+            "client_id": client,
+            "execution_mode": mode,
+            "canonical_signal_id": canonical,
+            "ticker": ticker,
+            "side": side,
+            "component_statuses": statuses,
+            "strategy_advisories": ["market_opposes"] if phase == "PREOPEN" else [],
+            "data_quality_warnings": [],
+            "setup_score": 78.0,
+            "setup_grade": "B",
+            "data_as_of": "2026-07-10T14:00:00+00:00",
+        },
+    )
+
+
+def _watched_for_breach():
+    return types.SimpleNamespace(
+        trigger_price=501.25,
+        trigger_crossed_at=datetime(2026, 7, 10, 14, 35, tzinfo=timezone.utc),
+        last_quote_bid=502.4,
+        last_quote_ask=502.6,
+        watcher_id="watcher-1",
+    )
+
+
+def _plan_for_breach():
+    return types.SimpleNamespace(
+        metadata={"score_audit": {}},
+        execution_mode="PAPER",
+        client_id="client@example.com",
+        ticker="SPY",
+        side="CALL",
+        signal_id="sig-123",
+        trigger_price=501.25,
+        stop_price=497.0,
+        target_price=508.0,
+        score=78.0,
+    )
+
+
+def test_breach_profile_loads_exact_parent_identity_and_preserves_current_price():
+    pretrigger = _write_parent_phase("PRETRIGGER")
+    preopen = _write_parent_phase("PREOPEN")
+    payload = build_breach_intelligence_payload(
+        signal=_signal(),
+        plan=_plan_for_breach(),
+        watched=_watched_for_breach(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        pretrigger_snapshot=get_latest_snapshot(
+            client_id="client@example.com", execution_mode="PAPER",
+            canonical_signal_id="canon-123", phase="PRETRIGGER",
+        )["snapshot"],
+        preopen_snapshot=get_latest_snapshot(
+            client_id="client@example.com", execution_mode="PAPER",
+            canonical_signal_id="canon-123", phase="PREOPEN",
+        )["snapshot"],
+    )
+    assert payload["phase"] == "BREACH"
+    assert payload["profile_status"] == "COMPLETE"
+    assert payload["parent_snapshot_ids"] == {
+        "PRETRIGGER": pretrigger["snapshot_id"],
+        "PREOPEN": preopen["snapshot_id"],
+    }
+    assert payload["breach_inputs"]["current_underlying_price"] == 502.5
+    assert payload["component_statuses"]["contract_execution_quality"] == (
+        "NOT_AVAILABLE_UNTIL_CONTRACT_SELECTED"
+    )
+
+
+def test_breach_profile_rejects_cross_client_mode_signal_parent_context():
+    wrong = _write_parent_phase("PRETRIGGER", client="other@example.com")
+    payload = build_breach_intelligence_payload(
+        signal=_signal(),
+        plan=_plan_for_breach(),
+        watched=_watched_for_breach(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        pretrigger_snapshot={
+            **get_latest_snapshot(
+                client_id="other@example.com", execution_mode="PAPER",
+                canonical_signal_id="canon-123", phase="PRETRIGGER",
+            )["snapshot"],
+            "id": wrong["snapshot_id"],
+        },
+        preopen_snapshot=None,
+    )
+    assert payload["profile_status"] == "PARTIAL"
+    assert "intelligence_snapshot_identity_mismatch" in payload["data_quality_warnings"]
+    assert payload["parent_snapshot_ids"]["PRETRIGGER"] is None
+    assert "identity_conflict" in payload["hard_safety_blocks"]
+
+
+def test_missing_pretrigger_or_preopen_creates_partial_not_rejection():
+    payload = build_breach_intelligence_payload(
+        signal=_signal(),
+        plan=_plan_for_breach(),
+        watched=_watched_for_breach(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        pretrigger_snapshot=None,
+        preopen_snapshot=None,
+    )
+    assert payload["profile_status"] == "PARTIAL"
+    assert payload["missing_parent_snapshots"] == ["PREOPEN", "PRETRIGGER"]
+    assert payload["observe_only"] is True
+    assert payload["affected_eligibility"] is False
+
+
+def test_breach_dispatch_is_idempotent_and_writes_compact_metadata():
+    _write_parent_phase("PRETRIGGER")
+    _write_parent_phase("PREOPEN")
+    plan = _plan_for_breach()
+    order_meta = {}
+
+    def writer(_loid, patch):
+        order_meta.update(patch)
+
+    first = dispatch_breach_intelligence_snapshot(
+        _signal(),
+        plan=plan,
+        watched=_watched_for_breach(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        order_meta_writer=writer,
+    )
+    second = dispatch_breach_intelligence_snapshot(
+        _signal(),
+        plan=plan,
+        watched=_watched_for_breach(),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        order_meta_writer=writer,
+    )
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["duplicate"] is True
+    assert second["snapshot_id"] == first["snapshot_id"]
+    pointer = plan.metadata["intelligence_evaluation"]
+    assert pointer["phase"] == "BREACH"
+    assert pointer["snapshot_id"] == first["snapshot_id"]
+    assert "breach_inputs" not in pointer
+    assert order_meta["intelligence_evaluation"] == pointer
+
+
+def test_breach_source_has_no_network_or_wait_calls():
+    source = (REPO_ROOT / "ap" / "intelligence_evaluation.py").read_text()
+    start = source.index("def dispatch_breach_intelligence_snapshot")
+    end = source.index("\n# ─", start)
+    breach_src = source[start:end]
+    forbidden = [
+        "get_quote(", "_get(", "Future.result", ".result(", "sleep(",
+        "option_chain", "yfinance", "tradier history",
+    ]
+    for token in forbidden:
+        assert token not in breach_src
+
+
+def test_breach_dispatch_seam_after_plan_recovery_before_hydration():
+    source = (REPO_ROOT / "ap_execution_core.py").read_text()
+    fn_start = source.index("def _on_entry_trigger(")
+    fn_end = source.find("\n    def ", fn_start + 100)
+    body = source[fn_start:fn_end]
+    assert body.index("_recover_plan_for_revalidation") < body.index(
+        "dispatch_breach_intelligence_snapshot"
+    )
+    assert body.index("dispatch_breach_intelligence_snapshot") < body.index(
+        "_refresh_hydrated_prebreach_plan"
+    )

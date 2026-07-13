@@ -2858,27 +2858,75 @@ class APExecutionCore:
             _terminalize_breach_failure("approved_plan_missing_after_revalidation")
             return
 
-        # ── Intelligence PR 1: dispatch immediately after plan is confirmed ──────
+        # ── Intelligence PR 1 + PR 2: dispatch immediately after plan is confirmed ──────
         # Fires before any post-plan terminal return (rejections, expiry, submit).
-        # _ensure_intelligence_dispatched is idempotent — retries do not re-dispatch.
-        # Disabled by default (INTELLIGENCE_EVIDENCE_ENABLED=0). Never raises.
+        # BREACH is assembled from already-present watcher facts plus durable
+        # PRETRIGGER/PREOPEN snapshots only. It does not fetch history/chains,
+        # wait on futures, or run selector/intelligence modules.
         try:
-            from ap.intelligence_evaluation import _ensure_intelligence_dispatched as _eid
-            _eid(
-                sig,
-                # Req 2: mode resolved inside _ensure_intelligence_dispatched
-                # from both sig and approved_plan with mismatch detection.
-                # Do NOT pass execution_mode from getattr(approved_plan, ...) alone.
-                execution_mode="",   # resolver reads plan directly
-                client_id=_breach_client_id,
-                local_order_id=str(queue_local_order_id or ""),
-                plan=approved_plan,  # Req 1: plan passed for canonical snapshot build
-                order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
-                ticker=ticker,
+            from ap.intelligence_context_materializer import _canonical_signal_id as _intel_canon
+            from ap.intelligence_evaluation import (
+                _ensure_intelligence_dispatched as _eid,
+                dispatch_breach_intelligence_snapshot as _dispatch_breach_intel,
             )
+            _breach_canonical_signal_id = str(
+                sig.get("canonical_signal_id")
+                or getattr(approved_plan, "canonical_signal_id", "")
+                or _intel_canon(sig, signal_id)
+                or signal_id
+            )
+            _breach_execution_mode = str(
+                getattr(approved_plan, "execution_mode", None)
+                or sig.get("execution_mode")
+                or getattr(self, "execution_mode", None)
+                or getattr(self, "mode", None)
+                or ""
+            )
+            _breach_dispatch_started = time.monotonic()
+            _breach_result = _dispatch_breach_intel(
+                sig,
+                plan=approved_plan,
+                watched=watched,
+                client_id=_breach_client_id,
+                execution_mode=_breach_execution_mode,
+                canonical_signal_id=_breach_canonical_signal_id,
+                local_order_id=str(queue_local_order_id or ""),
+                order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
+            )
+            try:
+                _latency_patch = {
+                    "breach_intelligence_dispatch_ms": round(
+                        (time.monotonic() - _breach_dispatch_started) * 1000.0, 3
+                    ),
+                    "breach_to_selector_start_ms": None,
+                    "context_snapshot_missing_count": len(
+                        ((_breach_result.get("payload") or {}).get("missing_parent_snapshots") or [])
+                    ),
+                    "context_snapshot_stale_count": (
+                        ((_breach_result.get("payload") or {}).get("latency") or {}).get(
+                            "context_snapshot_stale_count", 0
+                        )
+                    ),
+                    "intelligence_queue_saturated_count": 0,
+                }
+                _ap_meta = getattr(approved_plan, "metadata", None)
+                if isinstance(_ap_meta, dict):
+                    _ap_meta["breach_intelligence_latency"] = _latency_patch
+            except Exception:
+                pass
+            if os.getenv("INTELLIGENCE_LEGACY_BREACH_EVALUATION_ENABLED", "0").strip() in {"1", "true", "TRUE", "yes"}:
+                _eid(
+                    sig,
+                    execution_mode="",
+                    client_id=_breach_client_id,
+                    local_order_id=str(queue_local_order_id or ""),
+                    plan=approved_plan,
+                    order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
+                    ticker=ticker,
+                )
         except Exception as _eid_exc:
-            log.debug("[%s] intelligence early dispatch non-critical: %s", ticker, _eid_exc)
-        # ── End early intelligence dispatch ─────────────────────────────────────
+            log.debug("[%s] breach intelligence dispatch non-critical: %s", ticker, _eid_exc)
+        # ── End intelligence wiring ─────────────────────────────────────────────
 
         _hydration_bridge_applied = self._refresh_hydrated_prebreach_plan(
             approved_plan=approved_plan,
