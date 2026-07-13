@@ -1874,6 +1874,93 @@ class APStartupRecovery:
                         plan.metadata["contract_deferred"] = True
                     except Exception:
                         pass
+
+                # PR #328 — canonical classifier gate before watch().
+                # Wires PendingTriggerRestartRecovery as the single decision
+                # authority; removes the prior unconditional watch() call that
+                # bypassed classification for invalidated/terminal/stale rows.
+                try:
+                    from ap.pending_trigger_restart_recovery import (
+                        PendingTriggerRestartRecovery as _PTR,
+                    )
+                    _row_dict = dict(order)
+                    if "local_order_id" not in _row_dict and local_order_id:
+                        _row_dict["local_order_id"] = local_order_id
+                    if "client_id" not in _row_dict:
+                        _row_dict["client_id"] = self.client_id
+                    if "execution_mode" not in _row_dict:
+                        _row_dict["execution_mode"] = self._execution_mode() or ""
+
+                    # Build a plan_builder that uses the already-constructed plan.
+                    _plan_obj = plan
+                    def _plan_builder(_r, _p=_plan_obj):
+                        # Convert plan object to dict for the recovery engine.
+                        return {
+                            "signal_id":      getattr(_p, "signal_id", "") or "",
+                            "plan_id":        getattr(_p, "plan_id", "") or "",
+                            "local_order_id": getattr(_p, "local_order_id", local_order_id) or local_order_id,
+                            "client_id":      getattr(_p, "client_id", self.client_id) or self.client_id,
+                            "client_email":   getattr(_p, "client_id", self.client_id) or self.client_id,
+                            "execution_mode": self._execution_mode() or "",
+                            "ticker":         getattr(_p, "ticker", "") or "",
+                            "side":           getattr(_p, "side", "") or "",
+                            "entry_price":    float(getattr(_p, "trigger_price", 0) or 0),
+                            "stop_price":     float(getattr(_p, "stop_price", 0) or 0),
+                            "target_price":   float(getattr(_p, "target_price", 0) or 0),
+                            "score":          float(getattr(_p, "score", 0) or 0),
+                            "tier":           getattr(_p, "tier", "") or "",
+                            "timeframe":      getattr(_p, "timeframe", "") or "",
+                            "contracts":      int(getattr(_p, "quantity", 0) or 0),
+                            "contract":       getattr(_p, "contract_symbol", "") or "",
+                        }
+
+                    _ptr = _PTR(
+                        client_id=self.client_id,
+                        execution_mode=self._execution_mode() or "",
+                        osm=self.osm,
+                        entry_watcher=self.entry_watcher,
+                        broker=self.broker,
+                    )
+                    _outcome = _ptr.recover_one_row(
+                        _row_dict, plan_builder_fn=_plan_builder
+                    )
+                    from ap.pending_trigger_restart_recovery import _RowOutcome
+                    if _outcome == _RowOutcome.WATCHER_OWNED:
+                        rearmed += 1
+                        log.info(
+                            "[%s] RECOVERY: watcher re-armed+verified | local_order_id=%s cls=%s",
+                            self.client_id, local_order_id, _outcome,
+                        )
+                    elif _outcome == _RowOutcome.RETRY_OWNED:
+                        log.info(
+                            "[%s] RECOVERY: retry_owned | local_order_id=%s",
+                            self.client_id, local_order_id,
+                        )
+                    elif _outcome == _RowOutcome.TERMINALIZED:
+                        log.info(
+                            "[%s] RECOVERY: terminalized | local_order_id=%s",
+                            self.client_id, local_order_id,
+                        )
+                    elif _outcome == _RowOutcome.SKIPPED:
+                        log.info(
+                            "[%s] RECOVERY: skipped (not PENDING_TRIGGER) | local_order_id=%s",
+                            self.client_id, local_order_id,
+                        )
+                    else:
+                        log.critical(
+                            "[%s] RECOVERY: UNRESOLVED | local_order_id=%s — operator review required",
+                            self.client_id, local_order_id,
+                        )
+                    continue
+                except Exception as _ptr_exc:
+                    log.error(
+                        "[%s] RECOVERY: PendingTriggerRestartRecovery error local_order_id=%s: %s "
+                        "— falling back to direct watch()",
+                        self.client_id, local_order_id, _ptr_exc,
+                    )
+                    # Fallback: original unconditional watch() for safety during rollout.
+                    pass
+
                 try:
                     armed = bool(self.entry_watcher.watch(plan, local_order_id))
                 except Exception as exc:

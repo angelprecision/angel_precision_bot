@@ -1242,11 +1242,10 @@ class APOrderMonitor:
 
             if not _after_cutoff:
                 # Valid watcher-held row, market session still open — PRESERVE.
-                # Attempt a re-arm in case the watcher lost its in-memory state
-                # after a restart. If re-arm fails, still preserve the row;
-                # the next cycle will retry.
+                # PR #328: route through canonical recovery engine before raw rearm.
                 _rearm_attempted, _rearm_succeeded, _rearm_reason = (
-                    self._attempt_lost_handoff_rearm(order, local_id, contract)
+                    self._canonical_pending_trigger_rearm(order, local_id, contract,
+                                                          is_past_eod=False)
                 )
                 log.info(
                     "[%s] PENDING_TRIGGER_WATCHER_EVIDENCE_PRESERVED "
@@ -1286,11 +1285,11 @@ class APOrderMonitor:
                 )
                 if _is_overnight:
                     # Overnight/deferred row: PRESERVE even after cutoff.
-                    # overnight_reeval or the morning handoff audit will handle it
-                    # at the next session open. Do NOT write EOD_EXPIRED or
-                    # ORPHAN_EXPIRED — this row is working as designed.
+                    # PR #328: use canonical recovery engine with is_past_eod=False for
+                    # overnight rows (they should not be EOD-expired).
                     _rearm_attempted, _rearm_succeeded, _rearm_reason = (
-                        self._attempt_lost_handoff_rearm(order, local_id, contract)
+                        self._canonical_pending_trigger_rearm(order, local_id, contract,
+                                                              is_past_eod=False)
                     )
                     log.info(
                         "[%s] PENDING_TRIGGER_OVERNIGHT_PRESERVED "
@@ -1517,6 +1516,68 @@ class APOrderMonitor:
             return bool(has_order(local_order_id)), True, None
         except Exception as exc:
             return None, True, f"{type(exc).__name__}: {exc}"
+
+    def _canonical_pending_trigger_rearm(
+        self,
+        order: dict,
+        local_order_id: str,
+        contract: str,
+        *,
+        is_past_eod: bool = False,
+    ) -> tuple[bool, bool, Optional[str]]:
+        """
+        PR #328 — canonical recovery engine wrapper for the order monitor.
+
+        Routes every PENDING_TRIGGER rearm decision through
+        PendingTriggerRestartRecovery so classify_pending_trigger_row() is
+        the sole decision authority.  The legacy _attempt_lost_handoff_rearm
+        is preserved as a fallback if the recovery engine is unavailable.
+
+        Returns (attempted, succeeded, reason) in the same shape as the
+        legacy helper for backward-compat with log call-sites.
+        """
+        try:
+            from ap.pending_trigger_restart_recovery import (
+                PendingTriggerRestartRecovery as _PTR,
+                _RowOutcome,
+            )
+            _row = dict(order)
+            if "local_order_id" not in _row:
+                _row["local_order_id"] = local_order_id
+            if "client_id" not in _row:
+                _row["client_id"] = self.client_id
+            _mode = getattr(self, "mode", None) or "paper"
+            if "execution_mode" not in _row:
+                _row["execution_mode"] = _mode.lower()
+
+            _ptr = _PTR(
+                client_id=self.client_id,
+                execution_mode=_mode.lower(),
+                osm=getattr(self, "order_state_machine", None),
+                entry_watcher=getattr(self, "entry_watcher", None),
+                broker=getattr(self, "broker", None),
+                is_past_eod=is_past_eod,
+            )
+            _outcome = _ptr.recover_one_row(_row)
+
+            if _outcome == _RowOutcome.WATCHER_OWNED:
+                return (True, True, "canonical_recovery_watcher_owned")
+            elif _outcome == _RowOutcome.RETRY_OWNED:
+                return (True, True, "canonical_recovery_retry_owned")
+            elif _outcome == _RowOutcome.TERMINALIZED:
+                return (True, False, "canonical_recovery_terminalized")
+            elif _outcome == _RowOutcome.SKIPPED:
+                return (False, False, "canonical_recovery_not_pending_trigger")
+            else:
+                return (True, False, f"canonical_recovery_unresolved:{_outcome}")
+
+        except Exception as _ptr_exc:
+            log.warning(
+                "[%s] _canonical_pending_trigger_rearm error local=%s: %s — "
+                "falling back to _attempt_lost_handoff_rearm",
+                self.client_id, local_order_id, _ptr_exc,
+            )
+            return self._attempt_lost_handoff_rearm(order, local_order_id, contract)
 
     def _attempt_lost_handoff_rearm(
         self,
