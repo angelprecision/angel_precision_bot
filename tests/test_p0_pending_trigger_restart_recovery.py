@@ -32,6 +32,15 @@ from ap.pending_trigger_restart_recovery import (
     _MAT_ATTEMPT_COUNT,
     _MAT_OWNER_FIELD,
     _MAT_RETRY_REASON,
+    _RR_STATUS_FIELD,
+    _RR_OWNER_FIELD,
+    _RR_REASON_FIELD,
+    _RR_ATTEMPT_FIELD,
+    _RR_NEXT_AT_FIELD,
+    _RR_DEADLINE_FIELD,
+    _RR_CLIENT_FIELD,
+    _RR_MODE_FIELD,
+    _RR_CLOSE_REASON,
 )
 from ap.pending_trigger_classifier import PendingTriggerClassification as PTC
 
@@ -168,6 +177,22 @@ def _retry_meta(*, next_at=None, deadline=None, owner="restart_recovery:test-oid
     }
 
 
+def _restart_rearm_meta(*, next_at=None, deadline=None, attempts=1,
+                        owner="restart_rearm:client@test.com:paper:test-oid",
+                        reason="quote_unavailable"):
+    _now = datetime.now(timezone.utc)
+    return {
+        _RR_STATUS_FIELD: "RETRY_PENDING",
+        _RR_OWNER_FIELD: owner,
+        _RR_REASON_FIELD: reason,
+        _RR_ATTEMPT_FIELD: attempts,
+        _RR_NEXT_AT_FIELD: next_at or (_now + timedelta(seconds=30)).isoformat(),
+        _RR_DEADLINE_FIELD: deadline or (_now + timedelta(minutes=3)).isoformat(),
+        _RR_CLIENT_FIELD: "client@test.com",
+        _RR_MODE_FIELD: "paper",
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test 1 — Valid waiting orphan rearmed + registry verified (Blockers 4, 5)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -267,23 +292,26 @@ class TestRetryableCanonicalFields:
         assert summary["retry_rows_owned"] == 0
         assert summary["ownerless_rows_remaining"] == 1
 
-    def test_quote_unavailable_enters_canonical_retry_with_323_fields(self):
-        """Quote unavailable (None) before rearm → _enter_canonical_retry writes
-        the exact #323 canonical fields so the deployed consumer sees the row."""
+    def test_quote_unavailable_enters_restart_rearm_retry_not_materialization(self):
+        """Pre-breach quote unavailable writes restart_rearm retry, not #323 materialization."""
         r = _row()  # clean row, no retry metadata
         rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
         summary = rec.recover_all([r])
 
-        # Should write canonical fields via _enter_canonical_retry
         all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
-        assert all_meta.get(_MAT_STATUS_FIELD) == "RETRY_PENDING", (
-            "Canonical materialization_status must be written for #323 consumer"
-        )
-        assert _MAT_NEXT_RETRY_AT in all_meta
-        assert _MAT_RETRY_DEADLINE in all_meta
-        assert isinstance(all_meta.get(_MAT_ATTEMPT_COUNT), int)
-        assert all_meta.get(_MAT_OWNER_FIELD, "").startswith("restart_recovery:")
+        assert all_meta.get(_RR_STATUS_FIELD) == "RETRY_PENDING"
+        assert all_meta.get(_RR_OWNER_FIELD, "").startswith("restart_rearm:")
+        assert all_meta.get(_RR_REASON_FIELD)
+        assert isinstance(all_meta.get(_RR_ATTEMPT_FIELD), int)
+        assert _RR_NEXT_AT_FIELD in all_meta
+        assert _RR_DEADLINE_FIELD in all_meta
+        assert all_meta.get(_RR_CLIENT_FIELD) == "client@test.com"
+        assert all_meta.get(_RR_MODE_FIELD) == "paper"
+        assert _MAT_STATUS_FIELD not in all_meta
+        assert _MAT_NEXT_RETRY_AT not in all_meta
+        assert _MAT_OWNER_FIELD not in all_meta
         assert summary["retry_rows_owned"] == 1
+        assert summary["restart_rearm_retry_owned_count"] == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -321,6 +349,9 @@ class TestAlreadyThroughTrigger:
 
         assert summary["terminalized"] == 0
         assert summary["retry_rows_owned"] == 1
+        all_meta = {k: v for oid, patch in rec.osm.meta_writes for k, v in patch.items()}
+        assert all_meta.get(_RR_STATUS_FIELD) == "RETRY_PENDING"
+        assert _MAT_STATUS_FIELD not in all_meta
 
     def test_call_quote_without_positive_ask_is_unavailable(self):
         r = _row(meta={"trigger_price": 450.0})
@@ -339,6 +370,9 @@ class TestAlreadyThroughTrigger:
         assert summary["watchers_rearmed"] == 0
         assert summary["retry_rows_owned"] == 1
         assert summary["terminalized"] == 0
+        all_meta = {k: v for oid, patch in rec.osm.meta_writes for k, v in patch.items()}
+        assert all_meta.get(_RR_STATUS_FIELD) == "RETRY_PENDING"
+        assert _MAT_STATUS_FIELD not in all_meta
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -691,7 +725,7 @@ class TestBlocker6WatchFailure:
     def test_watch_false_then_terminalize_success_counts_as_terminalized(self):
         """watch() false → terminalize → TERMINALIZED only (not also unresolved)."""
         osm = _MockOSM(cancel_returns=True, get_order_status="CANCELED")
-        r = _row()
+        r = _row(meta={"trigger_price": 450.0})
         osm.seed(r)
         rec, _ = _make_recovery(r, watcher=_MockWatcher(watch_returns=False), osm=osm)
         summary = rec.recover_all([r])
@@ -713,6 +747,166 @@ class TestBlocker6WatchFailure:
 
         assert summary["terminalized"] == 0
         assert summary["ownerless_rows_remaining"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Final amendment — durable identity + restart-rearm retry separation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFinalIdentityAndRestartRearmRetry:
+    def test_missing_client_id_is_unresolved_without_mutation(self):
+        r = _row(meta={"trigger_price": 450.0})
+        r["client_id"] = ""
+        r["client_email"] = "client@test.com"
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r])
+
+        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["identity_failure_count"] == 1
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_missing_execution_mode_is_unresolved_and_never_defaults_to_paper(self):
+        r = _row(meta={"trigger_price": 450.0})
+        r["execution_mode"] = ""
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r])
+
+        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["identity_failure_count"] == 1
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_wrong_client_and_mode_are_unresolved_without_mutation(self):
+        r_client = _row(client_id="other@test.com", meta={"trigger_price": 450.0})
+        r_mode = _row(execution_mode="live", meta={"trigger_price": 450.0})
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery([r_client, r_mode], watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r_client, r_mode])
+
+        assert summary["ownerless_rows_remaining"] == 2
+        assert summary["identity_failure_count"] == 2
+        assert watcher._pending == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_restart_rearm_retry_not_materialization_consumer(self):
+        r = _row(meta={"trigger_price": 450.0})
+        rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
+        summary = rec.recover_all([r])
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+
+        assert summary["retry_rows_owned"] == 1
+        assert summary["restart_rearm_retry_owned_count"] == 1
+        assert all_meta[_RR_STATUS_FIELD] == "RETRY_PENDING"
+        assert _MAT_STATUS_FIELD not in all_meta
+        assert _MAT_NEXT_RETRY_AT not in all_meta
+        assert _MAT_OWNER_FIELD not in all_meta
+
+    def test_restart_rearm_retry_before_next_at_does_not_fetch_or_increment(self):
+        future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        deadline = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        r = _row(meta={**_restart_rearm_meta(next_at=future, deadline=deadline),
+                       "trigger_price": 450.0})
+        broker = MagicMock()
+        rec = PendingTriggerRestartRecovery(
+            client_id="client@test.com",
+            execution_mode="paper",
+            osm=_MockOSM(),
+            entry_watcher=_MockWatcher(),
+            broker=broker,
+        )
+        rec.osm.seed(r)
+        summary = rec.recover_all([r])
+
+        assert summary["retry_rows_owned"] == 1
+        assert summary["restart_rearm_retry_owned_count"] == 1
+        broker.get_quote.assert_not_called()
+        assert rec.osm.meta_writes == []
+
+    def test_due_restart_rearm_retry_quote_clear_rearms_once(self):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=deadline),
+                       "trigger_price": 450.0})
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        summary = rec.recover_all([r])
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+
+        assert summary["watchers_rearmed"] == 1
+        assert all_meta[_RR_STATUS_FIELD] == "CLOSED"
+        assert all_meta[_RR_CLOSE_REASON] == "watcher_owned"
+
+    def test_due_restart_rearm_retry_quote_unavailable_increments_attempt(self):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=deadline, attempts=2),
+                       "trigger_price": 450.0})
+        rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
+        summary = rec.recover_all([r])
+        all_meta = {k: v for oid, patch in osm.meta_writes for k, v in patch.items()}
+
+        assert summary["retry_rows_owned"] == 1
+        assert summary["restart_rearm_retry_owned_count"] == 1
+        assert all_meta[_RR_ATTEMPT_FIELD] == 3
+        assert _MAT_STATUS_FIELD not in all_meta
+
+    def test_due_restart_rearm_retry_already_through_terminalizes_no_watch(self):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=deadline),
+                       "trigger_price": 450.0})
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=True)
+        broker = MagicMock()
+        broker.submit_order = MagicMock()
+        broker.post_order = MagicMock()
+        broker.materialize_contract = MagicMock()
+        broker.proof_trade = MagicMock()
+        rec.broker = broker
+        summary = rec.recover_all([r])
+
+        assert summary["terminalized"] == 1
+        assert watcher._pending == []
+        broker.submit_order.assert_not_called()
+        broker.post_order.assert_not_called()
+        broker.materialize_contract.assert_not_called()
+        broker.proof_trade.assert_not_called()
+        assert osm.cancel_calls[0][1] == "restart_recovery_already_through_trigger"
+
+    def test_restart_rearm_retry_deadline_exhausted_terminalizes_exact_reason(self):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        r = _row(meta={**_restart_rearm_meta(next_at=past, deadline=past),
+                       "trigger_price": 450.0})
+        rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
+        summary = rec.recover_all([r])
+
+        assert summary["terminalized"] == 1
+        assert osm.cancel_calls[0][1] == "restart_rearm_quote_retry_exhausted"
+
+    def test_trigger_confirmed_cannot_enter_restart_rearm_retry(self):
+        r = _row(meta={"trigger_price": 450.0, "trigger_confirmed": True})
+        rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
+        summary = rec.recover_all([r])
+
+        assert summary["ownerless_rows_remaining"] == 1
+        assert summary["retry_rows_owned"] == 0
+        assert osm.meta_writes == []
+
+    def test_broker_order_id_cannot_enter_restart_rearm_retry(self):
+        r = _row(meta={"trigger_price": 450.0})
+        r["broker_order_id"] = "B-1"
+        rec, osm = _make_recovery(r, watcher=_MockWatcher(), quote_result=None)
+        summary = rec.recover_all([r])
+
+        assert summary["skipped_not_pending_trigger"] == 1
+        assert summary["retry_rows_owned"] == 0
+        assert osm.meta_writes == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -809,6 +1003,58 @@ class TestIntegrationOrderMonitor:
         assert result_reason == "canonical_recovery_terminalized"
         assert osm.cancel_calls == [(r["local_order_id"], reason)]
 
+    def test_order_monitor_missing_client_id_does_not_inject_runtime_identity(self):
+        from ap.order_monitor import APOrderMonitor
+
+        r = _row(meta={"trigger_price": 450.0})
+        r["client_id"] = ""
+        osm = _MockOSM()
+        osm.seed(r)
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = "client@test.com"
+        monitor.client_mode = "PAPER"
+        monitor.osm = osm
+        monitor.entry_watcher = _MockWatcher(watch_returns=True)
+        monitor.broker = MagicMock()
+
+        attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+            r, r["local_order_id"], "SPY240101C00450000",
+            is_past_eod=False,
+        )
+
+        assert attempted is True
+        assert succeeded is False
+        assert reason == "canonical_recovery_unresolved:UNRESOLVED"
+        assert monitor.entry_watcher._pending == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
+    def test_order_monitor_missing_execution_mode_does_not_default_to_paper(self):
+        from ap.order_monitor import APOrderMonitor
+
+        r = _row(meta={"trigger_price": 450.0})
+        r["execution_mode"] = ""
+        osm = _MockOSM()
+        osm.seed(r)
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = "client@test.com"
+        monitor.client_mode = "PAPER"
+        monitor.osm = osm
+        monitor.entry_watcher = _MockWatcher(watch_returns=True)
+        monitor.broker = MagicMock()
+
+        attempted, succeeded, reason = monitor._canonical_pending_trigger_rearm(
+            r, r["local_order_id"], "SPY240101C00450000",
+            is_past_eod=False,
+        )
+
+        assert attempted is True
+        assert succeeded is False
+        assert reason == "canonical_recovery_unresolved:UNRESOLVED"
+        assert monitor.entry_watcher._pending == []
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+
     def test_startup_recovery_has_no_direct_watch_fallback(self):
         import inspect
         import ap_recovery
@@ -816,3 +1062,5 @@ class TestIntegrationOrderMonitor:
         src = inspect.getsource(ap_recovery.APStartupRecovery._reseed_watchers)
         assert "falling back to direct watch" not in src
         assert "self.entry_watcher.watch(plan, local_order_id)" not in src
+        assert '_row_dict["client_id"]' not in src
+        assert '_row_dict["execution_mode"]' not in src

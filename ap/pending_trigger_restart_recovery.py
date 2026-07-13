@@ -57,6 +57,25 @@ _MAT_ATTEMPT_COUNT   = "materialization_attempt_count"
 _MAT_OWNER_FIELD     = "materialization_owner"
 _MAT_RETRY_REASON    = "materialization_retry_reason"
 
+# Dedicated pre-breach restart rearm retry fields. These are intentionally
+# separate from #323 post-breach materialization retry metadata.
+_RR_STATUS_FIELD     = "restart_rearm_status"
+_RR_OWNER_FIELD      = "restart_rearm_owner"
+_RR_REASON_FIELD     = "restart_rearm_reason"
+_RR_ATTEMPT_FIELD    = "restart_rearm_attempt"
+_RR_NEXT_AT_FIELD    = "restart_rearm_next_at"
+_RR_DEADLINE_FIELD   = "restart_rearm_deadline"
+_RR_FIRST_FAILED_AT  = "restart_rearm_first_failed_at"
+_RR_LAST_FAILED_AT   = "restart_rearm_last_failed_at"
+_RR_CLIENT_FIELD     = "restart_rearm_client_id"
+_RR_MODE_FIELD       = "restart_rearm_execution_mode"
+_RR_CLOSED_AT        = "restart_rearm_closed_at"
+_RR_CLOSE_REASON     = "restart_rearm_close_reason"
+
+_RETRY_MATERIALIZATION = "MATERIALIZATION_RETRY"
+_RETRY_RESTART_REARM  = "RESTART_REARM_RETRY"
+_RETRY_WATCHER        = "WATCHER_RETRY"
+
 
 # ── Environment-tunable limits ────────────────────────────────────────────────
 
@@ -109,6 +128,7 @@ class PendingTriggerRestartRecovery:
         quote_check_fn=None,
         is_past_eod: bool = False,
         dry_run: bool = False,
+        caller_source: str = "unknown",
     ) -> None:
         self.client_id      = str(client_id or "").strip()
         self.execution_mode = str(execution_mode or "").strip().lower()
@@ -118,6 +138,9 @@ class PendingTriggerRestartRecovery:
         self.quote_check_fn = quote_check_fn or _default_quote_check
         self.is_past_eod    = is_past_eod
         self.dry_run        = dry_run
+        self.caller_source  = str(caller_source or "unknown").strip() or "unknown"
+        self._row_retry_subtypes: dict[str, str] = {}
+        self._row_failure_reasons: dict[str, str] = {}
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -128,13 +151,21 @@ class PendingTriggerRestartRecovery:
         """
         # Blocker 2: per-row outcome tracking; no arithmetic shortcuts.
         _outcomes: dict[str, str] = {}   # local_order_id → _RowOutcome constant
+        self._row_retry_subtypes = {}
+        self._row_failure_reasons = {}
 
         for row in rows:
             local_oid = str(row.get("local_order_id") or "").strip()
             outcome = self._recover_one(row, plan_builder_fn=plan_builder_fn)
             _outcomes[local_oid or id(row)] = outcome
 
-        summary = _build_summary(self.client_id, self.execution_mode, _outcomes)
+        summary = _build_summary(
+            self.client_id,
+            self.execution_mode,
+            _outcomes,
+            retry_subtypes=self._row_retry_subtypes,
+            failure_reasons=self._row_failure_reasons,
+        )
         _emit_summary(summary)
         return summary
 
@@ -147,29 +178,64 @@ class PendingTriggerRestartRecovery:
 
     def _recover_one(self, row: dict, *, plan_builder_fn=None) -> str:
         local_oid  = str(row.get("local_order_id") or "").strip()
-        row_client = str(row.get("client_id") or row.get("client_email") or "").strip().lower()
+        signal_id  = str(row.get("signal_id") or "").strip()
+        row_client = str(row.get("client_id") or "").strip().lower()
         row_mode   = str(row.get("execution_mode") or "").strip().lower()
 
-        # Identity fence: never mutate the wrong tenant / mode.
-        if row_client and row_client != self.client_id.lower():
-            log.critical(
-                "RESTART_RECOVERY_CLIENT_ISOLATION_VIOLATION local=%s row=%s expected=%s",
-                local_oid, row_client, self.client_id,
+        # Identity fence: raw durable row identity is required. Callers must
+        # never repair missing client/mode from active runner context.
+        if not local_oid:
+            self._mark_failure("", "missing_local_order_id")
+            self._log_identity_failure(
+                "RESTART_RECOVERY_MISSING_LOCAL_ORDER_ID",
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
             )
             return _RowOutcome.UNRESOLVED
 
-        if row_mode and row_mode != self.execution_mode:
-            log.critical(
-                "RESTART_RECOVERY_MODE_ISOLATION_VIOLATION local=%s row_mode=%s expected=%s",
-                local_oid, row_mode, self.execution_mode,
+        if not row_client:
+            self._mark_failure(local_oid, "identity:missing_client_id")
+            self._log_identity_failure(
+                "RESTART_RECOVERY_MISSING_DURABLE_CLIENT_ID",
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
             )
             return _RowOutcome.UNRESOLVED
 
-        # Missing authoritative identity → fail closed.
-        if not local_oid or not row_client or not row_mode:
-            log.critical(
-                "RESTART_RECOVERY_MISSING_IDENTITY local=%r client=%r mode=%r — fail closed",
-                local_oid, row_client, row_mode,
+        if not row_mode:
+            self._mark_failure(local_oid, "identity:missing_execution_mode")
+            self._log_identity_failure(
+                "RESTART_RECOVERY_MISSING_DURABLE_EXECUTION_MODE",
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        if row_client != self.client_id.lower():
+            self._mark_failure(local_oid, "identity:client_id_mismatch")
+            self._log_identity_failure(
+                "RESTART_RECOVERY_CLIENT_ID_MISMATCH",
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        if row_mode != self.execution_mode:
+            self._mark_failure(local_oid, "identity:execution_mode_mismatch")
+            self._log_identity_failure(
+                "RESTART_RECOVERY_EXECUTION_MODE_MISMATCH",
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
             )
             return _RowOutcome.UNRESOLVED
 
@@ -178,7 +244,7 @@ class PendingTriggerRestartRecovery:
         _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
         _symbol  = str(row.get("ticker") or row.get("underlying") or row.get("symbol") or "").strip()
         _trigger = _canonical_underlying_trigger(row)
-        if _symbol and _side and _trigger is not None:
+        if not _retry_subtype(row) and _symbol and _side and _trigger is not None:
             try:
                 live_quote_abt = self.quote_check_fn(self.broker, _symbol, _side, _trigger)
             except Exception as _qe:
@@ -222,30 +288,12 @@ class PendingTriggerRestartRecovery:
                     meta_patch={"restart_recovery_cls": cls},
                 )
             if live_quote_abt is None:
-                return self._enter_canonical_retry(local_oid, row,
+                return self._enter_restart_rearm_retry(local_oid, row,
                     reason="restart_recovery_quote_unavailable_before_rearm")
             return self._rearm_and_verify(row, local_oid, plan_builder_fn=plan_builder_fn)
 
         elif cls == PTC.WAITING_RETRYABLE:
-            # Hand to #323 deployed consumer.  Do not normal-rearm.
-            # Blocker 3: prove the row is eligible for the canonical consumer
-            # before counting it as owned. A timestamp alone is not ownership.
-            proof = self._verify_retry_ownership(local_oid, row)
-            if proof is not None:
-                log.info(
-                    "RESTART_RECOVERY_RETRY_OWNED local=%s proof=%s",
-                    local_oid, proof,
-                )
-                self._safe_meta_update(local_oid, {
-                    "restart_recovery_cls": cls,
-                    "restart_recovery_at":  _now_iso(),
-                })
-                return _RowOutcome.RETRY_OWNED
-            log.critical(
-                "RESTART_RECOVERY_RETRY_OWNERSHIP_UNPROVEN local=%s — UNRESOLVED",
-                local_oid,
-            )
-            return _RowOutcome.UNRESOLVED
+            return self._handle_retryable(row, local_oid, live_quote_abt, plan_builder_fn)
 
         elif cls == PTC.STUCK_TRIGGER_READY:
             _meta = row.get("meta") or {}
@@ -329,6 +377,9 @@ class PendingTriggerRestartRecovery:
         _mat_status = str(_meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
         _mat_next   = _meta.get(_MAT_NEXT_RETRY_AT)
         _has_canonical_retry = (_mat_status == "RETRY_PENDING" and _mat_next)
+        _rr_status = str(_meta.get(_RR_STATUS_FIELD) or "").strip().upper()
+        _rr_next = _meta.get(_RR_NEXT_AT_FIELD)
+        _has_restart_rearm_retry = (_rr_status == "RETRY_PENDING" and _rr_next)
 
         if _has_terminal:
             return self._terminalize_with_reason(
@@ -337,8 +388,9 @@ class PendingTriggerRestartRecovery:
                 meta_patch={"restart_recovery_cls": PTC.ORPHAN_NO_WATCHER},
             )
         if _has_canonical_retry:
-            proof = self._verify_retry_ownership(local_oid, row)
+            proof = self._verify_materialization_retry_ownership(local_oid, row)
             if proof is not None:
+                self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
                 self._safe_meta_update(local_oid, {
                     "restart_recovery_cls": PTC.ORPHAN_NO_WATCHER,
                     "restart_recovery_at":  _now_iso(),
@@ -349,6 +401,8 @@ class PendingTriggerRestartRecovery:
                 local_oid,
             )
             return _RowOutcome.UNRESOLVED
+        if _has_restart_rearm_retry:
+            return self._handle_restart_rearm_retry(row, local_oid, live_quote_abt, plan_builder_fn)
         if live_quote_abt is True:
             return self._terminalize_with_reason(
                 local_oid, row,
@@ -356,10 +410,98 @@ class PendingTriggerRestartRecovery:
                 meta_patch={"restart_recovery_cls": PTC.ORPHAN_NO_WATCHER},
             )
         if live_quote_abt is None:
-            return self._enter_canonical_retry(local_oid, row,
+            return self._enter_restart_rearm_retry(local_oid, row,
                 reason="restart_orphan_quote_unavailable")
         # Quote clear, no terminal evidence → safe recovery rearm.
         return self._rearm_and_verify(row, local_oid, plan_builder_fn=plan_builder_fn)
+
+    def _handle_retryable(self, row, local_oid, live_quote_abt, plan_builder_fn) -> str:
+        subtype = _retry_subtype(row)
+        if subtype == _RETRY_MATERIALIZATION:
+            proof = self._verify_materialization_retry_ownership(local_oid, row)
+            if proof is not None:
+                self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
+                log.info("RESTART_RECOVERY_MATERIALIZATION_RETRY_OWNED local=%s proof=%s", local_oid, proof)
+                self._safe_meta_update(local_oid, {
+                    "restart_recovery_cls": PTC.WAITING_RETRYABLE,
+                    "restart_recovery_retry_subtype": _RETRY_MATERIALIZATION,
+                    "restart_recovery_at": _now_iso(),
+                })
+                return _RowOutcome.RETRY_OWNED
+            self._mark_failure(local_oid, "retry_verification:materialization")
+            log.critical("RESTART_RECOVERY_MATERIALIZATION_RETRY_UNPROVEN local=%s", local_oid)
+            return _RowOutcome.UNRESOLVED
+
+        if subtype == _RETRY_RESTART_REARM:
+            return self._handle_restart_rearm_retry(row, local_oid, live_quote_abt, plan_builder_fn)
+
+        if subtype == _RETRY_WATCHER:
+            proof = self._verify_registry_ownership(local_oid, row)
+            if proof is not None:
+                self._mark_retry_subtype(local_oid, _RETRY_WATCHER)
+                return _RowOutcome.RETRY_OWNED
+            self._mark_failure(local_oid, "retry_verification:watcher")
+            log.critical("RESTART_RECOVERY_WATCHER_RETRY_UNPROVEN local=%s", local_oid)
+            return _RowOutcome.UNRESOLVED
+
+        self._mark_failure(local_oid, "retry_verification:unknown_subtype")
+        log.critical("RESTART_RECOVERY_UNKNOWN_RETRY_SUBTYPE local=%s", local_oid)
+        return _RowOutcome.UNRESOLVED
+
+    def _handle_restart_rearm_retry(self, row, local_oid, live_quote_abt, plan_builder_fn) -> str:
+        proof = self._verify_restart_rearm_retry_ownership(local_oid, row, allow_expired=True)
+        if proof is None:
+            self._mark_failure(local_oid, "retry_verification:restart_rearm")
+            log.critical("RESTART_RECOVERY_RESTART_REARM_RETRY_UNPROVEN local=%s", local_oid)
+            return _RowOutcome.UNRESOLVED
+
+        now = datetime.now(timezone.utc)
+        next_at = proof["restart_rearm_next_at_dt"]
+        deadline = proof["restart_rearm_deadline_dt"]
+        attempt = int(proof["restart_rearm_attempt"])
+        max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
+
+        if now < next_at:
+            self._mark_retry_subtype(local_oid, _RETRY_RESTART_REARM)
+            return _RowOutcome.RETRY_OWNED
+
+        if now > deadline or attempt >= max_attempts:
+            return self._terminalize_with_reason(
+                local_oid,
+                row,
+                "restart_rearm_quote_retry_exhausted",
+                meta_patch={
+                    "restart_recovery_retry_subtype": _RETRY_RESTART_REARM,
+                    "restart_rearm_exhausted_attempt": attempt,
+                },
+            )
+
+        quote_state = self._quote_state_for_row(row)
+        if quote_state is True:
+            return self._terminalize_with_reason(
+                local_oid,
+                row,
+                "restart_recovery_already_through_trigger",
+                meta_patch={"restart_recovery_retry_subtype": _RETRY_RESTART_REARM},
+            )
+        if quote_state is False:
+            outcome = self._rearm_and_verify(row, local_oid, plan_builder_fn=plan_builder_fn)
+            if outcome == _RowOutcome.WATCHER_OWNED:
+                self._safe_meta_update(local_oid, {
+                    _RR_STATUS_FIELD: "CLOSED",
+                    _RR_CLOSED_AT: _now_iso(),
+                    _RR_CLOSE_REASON: "watcher_owned",
+                    "restart_recovery_retry_subtype": _RETRY_RESTART_REARM,
+                })
+            return outcome
+
+        return self._enter_restart_rearm_retry(
+            local_oid,
+            row,
+            reason=proof["restart_rearm_reason"],
+            prior_attempt=attempt,
+            first_failed_at=proof["restart_rearm_first_failed_at"],
+        )
 
     # ── Rearm + post-registration verification ────────────────────────────────
 
@@ -373,7 +515,7 @@ class PendingTriggerRestartRecovery:
         watcher = self.entry_watcher
         if watcher is None or not callable(getattr(watcher, "watch", None)):
             log.critical("RESTART_RECOVERY_WATCHER_UNAVAILABLE local=%s", local_oid)
-            return self._enter_canonical_retry(local_oid, row,
+            return self._enter_restart_rearm_retry(local_oid, row,
                 reason="restart_recovery_watcher_unavailable")
 
         plan = _build_plan(row, plan_builder_fn)
@@ -425,6 +567,84 @@ class PendingTriggerRestartRecovery:
         )
         return _RowOutcome.WATCHER_OWNED
 
+    def _enter_restart_rearm_retry(
+        self,
+        local_oid: str,
+        row: dict,
+        *,
+        reason: str,
+        prior_attempt: Optional[int] = None,
+        first_failed_at: Optional[str] = None,
+    ) -> str:
+        if _has_trigger_or_submit_evidence(row):
+            self._mark_failure(local_oid, "restart_rearm_blocked:trigger_or_submit_evidence")
+            log.critical("RESTART_RECOVERY_RESTART_REARM_BLOCKED local=%s trigger_or_submit_evidence=true", local_oid)
+            return _RowOutcome.UNRESOLVED
+
+        _delay = _env_int("RESTART_REARM_RETRY_DELAY_SECONDS", 30)
+        _deadline_secs = _env_int("RESTART_REARM_RETRY_DEADLINE_SECONDS", 180)
+        _max = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
+        _now = datetime.now(timezone.utc)
+        _attempts = int(prior_attempt if prior_attempt is not None else (_extract_meta(row).get(_RR_ATTEMPT_FIELD) or 0)) + 1
+        if _attempts > _max:
+            return self._terminalize_with_reason(
+                local_oid,
+                row,
+                "restart_rearm_quote_retry_exhausted",
+                meta_patch={"restart_rearm_exhausted_attempt": _attempts},
+            )
+
+        _deadline_dt = (
+            _parse_iso(first_failed_at) + timedelta(seconds=_deadline_secs)
+            if first_failed_at and _parse_iso(first_failed_at) is not None
+            else _now + timedelta(seconds=_deadline_secs)
+        )
+        if _deadline_dt <= _now:
+            return self._terminalize_with_reason(
+                local_oid,
+                row,
+                "restart_rearm_quote_retry_exhausted",
+                meta_patch={"restart_rearm_exhausted_attempt": _attempts},
+            )
+        _next_dt = min(_now + timedelta(seconds=_delay), _deadline_dt)
+        _next = _next_dt.isoformat()
+        _deadline = _deadline_dt.isoformat()
+        _first_failed = first_failed_at or _now.isoformat()
+        _owner = f"restart_rearm:{self.client_id}:{self.execution_mode}:{local_oid}"
+        _patch = {
+            _RR_STATUS_FIELD: "RETRY_PENDING",
+            _RR_OWNER_FIELD: _owner,
+            _RR_REASON_FIELD: str(reason or "restart_rearm_quote_unavailable"),
+            _RR_ATTEMPT_FIELD: _attempts,
+            _RR_NEXT_AT_FIELD: _next,
+            _RR_DEADLINE_FIELD: _deadline,
+            _RR_FIRST_FAILED_AT: _first_failed,
+            _RR_LAST_FAILED_AT: _now.isoformat(),
+            _RR_CLIENT_FIELD: self.client_id,
+            _RR_MODE_FIELD: self.execution_mode,
+            "restart_recovery_retry_subtype": _RETRY_RESTART_REARM,
+            "restart_recovery_at": _now.isoformat(),
+        }
+        if not self._safe_meta_update(local_oid, _patch):
+            self._mark_failure(local_oid, "restart_rearm_retry_write_failed")
+            return _RowOutcome.UNRESOLVED
+
+        proof = self._verify_restart_rearm_retry_ownership(
+            local_oid,
+            row,
+            expected_owner=_owner,
+            expected_next_at=_next,
+            expected_deadline=_deadline,
+        )
+        if proof is None:
+            self._mark_failure(local_oid, "retry_verification:restart_rearm_after_write")
+            log.critical("RESTART_RECOVERY_RESTART_REARM_RETRY_NOT_PROVEN local=%s", local_oid)
+            return _RowOutcome.UNRESOLVED
+
+        self._mark_retry_subtype(local_oid, _RETRY_RESTART_REARM)
+        log.info("RESTART_RECOVERY_RESTART_REARM_RETRY_OWNED local=%s proof=%s", local_oid, proof)
+        return _RowOutcome.RETRY_OWNED
+
     # ── Canonical retry ownership (#323 fields) ────────────────────────────────
 
     def _enter_canonical_retry(self, local_oid: str, row: dict, *, reason: str) -> str:
@@ -474,7 +694,7 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
-        proof = self._verify_retry_ownership(
+        proof = self._verify_materialization_retry_ownership(
             local_oid,
             row,
             expected_owner=_owner,
@@ -492,6 +712,7 @@ class PendingTriggerRestartRecovery:
             "RESTART_RECOVERY_RETRY_OWNED local=%s proof=%s reason=%s",
             local_oid, proof, reason,
         )
+        self._mark_retry_subtype(local_oid, _RETRY_MATERIALIZATION)
         return _RowOutcome.RETRY_OWNED
 
     # ── Terminalize with reread verification (Blocker 5) ─────────────────────
@@ -573,10 +794,10 @@ class PendingTriggerRestartRecovery:
         if _rr_oid and _rr_oid != local_oid:
             log.critical("RESTART_RECOVERY_REREAD_OID_MISMATCH local=%s got=%s", local_oid, _rr_oid)
             return _RowOutcome.UNRESOLVED
-        if _rr_client and _rr_client != self.client_id.lower():
+        if not _rr_client or _rr_client != self.client_id.lower():
             log.critical("RESTART_RECOVERY_REREAD_CLIENT_MISMATCH local=%s got=%s", local_oid, _rr_client)
             return _RowOutcome.UNRESOLVED
-        if _rr_mode and _rr_mode != self.execution_mode:
+        if not _rr_mode or _rr_mode != self.execution_mode:
             log.critical("RESTART_RECOVERY_REREAD_MODE_MISMATCH local=%s got=%s", local_oid, _rr_mode)
             return _RowOutcome.UNRESOLVED
         if _rr_status not in _TERMINAL_STATUSES:
@@ -607,7 +828,7 @@ class PendingTriggerRestartRecovery:
         log.info("RESTART_RECOVERY_TERMINALIZED local=%s status=%s reason=%s", local_oid, _rr_status, reason)
         return _RowOutcome.TERMINALIZED
 
-    def _verify_retry_ownership(
+    def _verify_materialization_retry_ownership(
         self,
         local_oid: str,
         row: dict,
@@ -643,6 +864,8 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
+        if meta.get("materialization_outcome"):
+            return None
         mat_status = str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
         next_at = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
         deadline = str(meta.get(_MAT_RETRY_DEADLINE) or "").strip()
@@ -676,6 +899,89 @@ class PendingTriggerRestartRecovery:
             "materialization_attempt_count": attempts,
             "materialization_next_retry_at": next_at,
             "materialization_retry_deadline": deadline,
+        }
+
+    def _verify_restart_rearm_retry_ownership(
+        self,
+        local_oid: str,
+        row: dict,
+        *,
+        expected_owner: Optional[str] = None,
+        expected_next_at: Optional[str] = None,
+        expected_deadline: Optional[str] = None,
+        allow_expired: bool = False,
+    ) -> Optional[dict]:
+        """Prove bounded pre-breach restart-rearm retry ownership."""
+        get_fn = getattr(self.osm, "get_order", None)
+        if not callable(get_fn):
+            return None
+        try:
+            reread = get_fn(local_oid)
+        except Exception:
+            return None
+        if not isinstance(reread, dict):
+            return None
+
+        status = str(reread.get("status") or "").strip().upper()
+        rr_oid = str(reread.get("local_order_id") or "").strip()
+        rr_client = str(reread.get("client_id") or "").strip().lower()
+        rr_mode = str(reread.get("execution_mode") or "").strip().lower()
+        if status != "PENDING_TRIGGER":
+            return None
+        if rr_oid != local_oid:
+            return None
+        if rr_client != self.client_id.lower():
+            return None
+        if rr_mode != self.execution_mode:
+            return None
+        if _has_trigger_or_submit_evidence(reread):
+            return None
+
+        meta = _extract_meta(reread)
+        restart_status = str(meta.get(_RR_STATUS_FIELD) or "").strip().upper()
+        owner = str(meta.get(_RR_OWNER_FIELD) or "").strip()
+        reason = str(meta.get(_RR_REASON_FIELD) or "").strip()
+        next_at = str(meta.get(_RR_NEXT_AT_FIELD) or "").strip()
+        deadline = str(meta.get(_RR_DEADLINE_FIELD) or "").strip()
+        first_failed_at = str(meta.get(_RR_FIRST_FAILED_AT) or "").strip()
+        rr_client_meta = str(meta.get(_RR_CLIENT_FIELD) or "").strip().lower()
+        rr_mode_meta = str(meta.get(_RR_MODE_FIELD) or "").strip().lower()
+        try:
+            attempt = int(meta.get(_RR_ATTEMPT_FIELD))
+        except (TypeError, ValueError):
+            return None
+        max_attempts = _env_int("RESTART_REARM_RETRY_MAX_ATTEMPTS", 6)
+        next_dt = _parse_iso(next_at)
+        deadline_dt = _parse_iso(deadline)
+        if restart_status != "RETRY_PENDING":
+            return None
+        if not owner or not reason:
+            return None
+        if attempt < 1 or attempt > max_attempts:
+            return None
+        if next_dt is None or deadline_dt is None or next_dt > deadline_dt:
+            return None
+        if not allow_expired and datetime.now(timezone.utc) > deadline_dt:
+            return None
+        if rr_client_meta != self.client_id.lower() or rr_mode_meta != self.execution_mode:
+            return None
+        if expected_owner is not None and owner != expected_owner:
+            return None
+        if expected_next_at is not None and next_at != expected_next_at:
+            return None
+        if expected_deadline is not None and deadline != expected_deadline:
+            return None
+        return {
+            "local_order_id": local_oid,
+            "restart_rearm_status": restart_status,
+            "restart_rearm_owner": owner,
+            "restart_rearm_reason": reason,
+            "restart_rearm_attempt": attempt,
+            "restart_rearm_next_at": next_at,
+            "restart_rearm_next_at_dt": next_dt,
+            "restart_rearm_deadline": deadline,
+            "restart_rearm_deadline_dt": deadline_dt,
+            "restart_rearm_first_failed_at": first_failed_at,
         }
 
     # ── Registry verification — 6-way proof (Blocker 4) ──────────────────────
@@ -783,6 +1089,47 @@ class PendingTriggerRestartRecovery:
         except Exception:
             return None
 
+    def _quote_state_for_row(self, row: dict) -> Optional[bool]:
+        side = str(row.get("direction") or row.get("side") or "").strip().upper()
+        symbol = str(row.get("ticker") or row.get("underlying") or row.get("symbol") or "").strip()
+        trigger = _canonical_underlying_trigger(row)
+        if not side or not symbol or trigger is None:
+            return None
+        try:
+            return self.quote_check_fn(self.broker, symbol, side, trigger)
+        except Exception:
+            return None
+
+    def _mark_retry_subtype(self, local_oid: str, subtype: str) -> None:
+        if local_oid:
+            self._row_retry_subtypes[str(local_oid)] = str(subtype)
+
+    def _mark_failure(self, local_oid: str, reason: str) -> None:
+        if local_oid:
+            self._row_failure_reasons[str(local_oid)] = str(reason)
+
+    def _log_identity_failure(
+        self,
+        marker: str,
+        *,
+        local_oid: str,
+        signal_id: str,
+        durable_client: str,
+        durable_mode: str,
+    ) -> None:
+        log.critical(
+            "%s local_order_id=%s signal_id=%s expected_client=%s durable_client=%s "
+            "expected_mode=%s durable_mode=%s caller_source=%s",
+            marker,
+            local_oid,
+            signal_id,
+            self.client_id,
+            durable_client,
+            self.execution_mode,
+            durable_mode,
+            self.caller_source,
+        )
+
     # ── Meta update helper ────────────────────────────────────────────────────
 
     def _safe_meta_update(self, local_oid: str, patch: dict) -> bool:
@@ -798,8 +1145,17 @@ class PendingTriggerRestartRecovery:
 
 # ── Summary (Blocker 2: per-row outcomes) ─────────────────────────────────────
 
-def _build_summary(client_id: str, execution_mode: str, outcomes: dict[str, str]) -> dict:
+def _build_summary(
+    client_id: str,
+    execution_mode: str,
+    outcomes: dict[str, str],
+    *,
+    retry_subtypes: Optional[dict[str, str]] = None,
+    failure_reasons: Optional[dict[str, str]] = None,
+) -> dict:
     _all = list(outcomes.values())
+    retry_subtypes = retry_subtypes or {}
+    failure_reasons = failure_reasons or {}
     unresolved_row_ids = {
         str(row_id): outcome
         for row_id, outcome in outcomes.items()
@@ -821,15 +1177,35 @@ def _build_summary(client_id: str, execution_mode: str, outcomes: dict[str, str]
         "execution_mode":                   execution_mode,
         "rows_examined":                    len(_all),
         "watchers_rearmed":                 _all.count(_RowOutcome.WATCHER_OWNED),
+        "watcher_owned_count":              _all.count(_RowOutcome.WATCHER_OWNED),
         "retry_rows_owned":                 _all.count(_RowOutcome.RETRY_OWNED),
+        "materialization_retry_owned_count": sum(
+            1 for v in retry_subtypes.values() if v == _RETRY_MATERIALIZATION
+        ),
+        "restart_rearm_retry_owned_count":  sum(
+            1 for v in retry_subtypes.values() if v == _RETRY_RESTART_REARM
+        ),
+        "watcher_retry_owned_count":         sum(
+            1 for v in retry_subtypes.values() if v == _RETRY_WATCHER
+        ),
         "rearm_rows_owned":                 _all.count(_RowOutcome.REARM_OWNED),
         "terminalized":                     _all.count(_RowOutcome.TERMINALIZED),
+        "terminalized_count":               _all.count(_RowOutcome.TERMINALIZED),
         "skipped_not_pending_trigger":      _all.count(_RowOutcome.SKIPPED),
+        "skipped_count":                    _all.count(_RowOutcome.SKIPPED),
         "unresolved_cleanup_failures":      _all.count(_RowOutcome.UNRESOLVED),
+        "identity_failure_count":           sum(
+            1 for v in failure_reasons.values() if str(v).startswith("identity:")
+        ),
+        "retry_verification_failure_count": sum(
+            1 for v in failure_reasons.values() if str(v).startswith("retry_verification:")
+        ),
         # Blocker 2: ownerless = count(UNRESOLVED) — not arithmetic
         "ownerless_rows_remaining":         len(unresolved_row_ids),
         "resolved_row_ids":                 resolved_row_ids,
         "unresolved_row_ids":               unresolved_row_ids,
+        "retry_subtypes":                   dict(retry_subtypes),
+        "failure_reasons":                  dict(failure_reasons),
         "row_outcomes":                     dict(outcomes),
     }
 
@@ -922,6 +1298,42 @@ def _canonical_underlying_trigger(row: dict) -> Optional[float]:
         if value > 0:
             return value
     return None
+
+
+def _retry_subtype(row: dict) -> str:
+    meta = _extract_meta(row)
+    mat_status = str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
+    rr_status = str(meta.get(_RR_STATUS_FIELD) or "").strip().upper()
+    if mat_status == "RETRY_PENDING" or meta.get(_MAT_NEXT_RETRY_AT):
+        return _RETRY_MATERIALIZATION
+    if rr_status == "RETRY_PENDING" or meta.get(_RR_NEXT_AT_FIELD):
+        return _RETRY_RESTART_REARM
+    if meta.get("watcher_retry_owner") or meta.get("watcher_retry_next_at"):
+        return _RETRY_WATCHER
+    return ""
+
+
+def _has_trigger_or_submit_evidence(row: dict) -> bool:
+    meta = _extract_meta(row)
+    if (row or {}).get("broker_order_id") or (row or {}).get("submitted_ts"):
+        return True
+    evidence_keys = (
+        "submit_intent_at",
+        "broker_submit_key",
+        "trigger_confirmed",
+        "trigger_crossed_at",
+        "materialization_status",
+        "materialization_next_retry_at",
+        "materialization_owner",
+        "materialization_outcome",
+    )
+    for key in evidence_keys:
+        if meta.get(key):
+            return True
+    watcher_audit = meta.get("watcher_audit")
+    if isinstance(watcher_audit, dict) and str(watcher_audit.get("reason_code") or "") == "trigger_ready":
+        return True
+    return False
 
 
 def _parse_iso(raw) -> Optional[datetime]:

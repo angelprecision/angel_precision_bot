@@ -1863,12 +1863,6 @@ class APStartupRecovery:
                         PendingTriggerRestartRecovery as _PTR,
                     )
                     _row_dict = dict(order)
-                    if "local_order_id" not in _row_dict and local_order_id:
-                        _row_dict["local_order_id"] = local_order_id
-                    if "client_id" not in _row_dict:
-                        _row_dict["client_id"] = self.client_id
-                    if "execution_mode" not in _row_dict:
-                        _row_dict["execution_mode"] = self._execution_mode() or ""
 
                     def _plan_builder(_r):
                         _p = self._build_recovery_plan_from_order(order)
@@ -1918,6 +1912,7 @@ class APStartupRecovery:
                         osm=self.osm,
                         entry_watcher=self.entry_watcher,
                         broker=self.broker,
+                        caller_source="ap_recovery._reseed_watchers",
                     )
                     _outcome = _ptr.recover_one_row(
                         _row_dict, plan_builder_fn=_plan_builder

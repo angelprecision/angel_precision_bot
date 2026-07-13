@@ -1530,8 +1530,8 @@ class APOrderMonitor:
 
         Routes every PENDING_TRIGGER rearm decision through
         PendingTriggerRestartRecovery so classify_pending_trigger_row() is
-        the sole decision authority.  The legacy _attempt_lost_handoff_rearm
-        is preserved as a fallback if the recovery engine is unavailable.
+        the sole decision authority.  Recovery engine failures fail closed; this
+        path must not fall back to direct watcher rearm.
 
         Returns (attempted, succeeded, reason) in the same shape as the
         legacy helper for backward-compat with log call-sites.
@@ -1542,13 +1542,11 @@ class APOrderMonitor:
                 _RowOutcome,
             )
             _row = dict(order)
-            if "local_order_id" not in _row:
-                _row["local_order_id"] = local_order_id
-            if "client_id" not in _row:
-                _row["client_id"] = self.client_id
-            _mode = getattr(self, "mode", None) or "paper"
-            if "execution_mode" not in _row:
-                _row["execution_mode"] = _mode.lower()
+            _mode = (
+                getattr(self, "client_mode", None)
+                or getattr(self, "mode", None)
+                or ""
+            )
 
             _ptr = _PTR(
                 client_id=self.client_id,
@@ -1557,6 +1555,7 @@ class APOrderMonitor:
                 entry_watcher=getattr(self, "entry_watcher", None),
                 broker=getattr(self, "broker", None),
                 is_past_eod=is_past_eod,
+                caller_source="ap.order_monitor._canonical_pending_trigger_rearm",
             )
             _outcome = _ptr.recover_one_row(_row)
 
