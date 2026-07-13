@@ -28,6 +28,7 @@ RATE_LIMIT_BACKOFF_MAX_SEC  = float(os.getenv("QUOTE_429_BACKOFF_MAX_SEC", "8.0"
 MAX_SPREAD_PCT              = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.18"))
 MAX_SPREAD_ABS              = float(os.getenv("MAX_OPTION_SPREAD_ABS", "0.15"))
 HEARTBEAT_DEGRADED_SEC      = float(os.getenv("QUOTE_HEARTBEAT_DEGRADED_SEC", "10.0"))
+IMMEDIATE_REFRESH_MIN_INTERVAL_SECONDS = float(os.getenv("IMMEDIATE_REFRESH_MIN_INTERVAL_SECONDS", "1.0"))
 
 # Feature flag: migrate to snapshots-only ownership later by setting this to "0".
 DIRECT_POSITION_WRITES      = os.getenv("QUOTE_MONITOR_DIRECT_WRITES", "1") == "1"
@@ -103,6 +104,7 @@ class APPositionQuoteMonitor:
         self._last_push_price: dict[str, float] = {}
         self._last_wake_price: dict[str, float] = {}
         self._last_wake_ts:    dict[str, float] = {}
+        self._last_immediate_refresh_ts: dict[str, float] = {}
 
         # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
         # Throttle state for DB persistence of live quote/PnL fields.
@@ -133,6 +135,10 @@ class APPositionQuoteMonitor:
             "blind_alerts": 0,
             "wakes_sent": 0,
             "wakes_suppressed": 0,
+            "immediate_retry_requests": 0,
+            "immediate_retry_coalesced": 0,
+            "immediate_retry_evictions": 0,
+            "immediate_retry_backoff_suppressed": 0,
             "exits_gated_blind": 0,    # bumped by exit engine when it gates
             "exits_gated_stale": 0,    # bumped by exit engine when it gates
         }
@@ -183,6 +189,42 @@ class APPositionQuoteMonitor:
 
     def note_exit_gated_stale(self) -> None:
         self._metrics["exits_gated_stale"] += 1
+
+    def request_immediate_refresh(self, *symbols: str) -> bool:
+        """
+        Ask the quote monitor to retry the next cycle immediately.
+
+        Rate-limit backoff remains authoritative in _fetch_batch_cached(), but
+        requested symbols are evicted from the shared cache so a degraded
+        protective decision cannot wait behind a stale cache entry.
+        """
+        cleaned = {str(s or "").upper().strip() for s in symbols if str(s or "").strip()}
+        self._metrics["immediate_retry_requests"] += 1
+        if not cleaned:
+            self._metrics["immediate_retry_coalesced"] += 1
+            return False
+        now = time.time()
+        global _SHARED_BACKOFF_UNTIL
+        if now < _SHARED_BACKOFF_UNTIL:
+            self._metrics["immediate_retry_backoff_suppressed"] += 1
+            return False
+        due = set()
+        for sym in cleaned:
+            last = self._last_immediate_refresh_ts.get(sym, 0.0)
+            if now - last < IMMEDIATE_REFRESH_MIN_INTERVAL_SECONDS:
+                self._metrics["immediate_retry_coalesced"] += 1
+                continue
+            due.add(sym)
+        if not due:
+            return False
+        if cleaned:
+            with _SHARED_CACHE_LOCK:
+                for sym in due:
+                    if _SHARED_CACHE.pop(sym, None) is not None:
+                        self._metrics["immediate_retry_evictions"] += 1
+                    self._last_immediate_refresh_ts[sym] = now
+        self._kick.set()
+        return True
 
     # ── Health snapshot ──────────────────────────────────────────────────────
     def health_snapshot(self) -> list[dict]:
@@ -935,6 +977,7 @@ class APPositionQuoteMonitor:
             self._last_push_price.pop(k, None)
             self._last_wake_price.pop(k, None)
             self._last_wake_ts.pop(k, None)
+            self._last_immediate_refresh_ts.pop(k, None)
 
     # ── Quote fetch (shared cache + 429 backoff) ─────────────────────────────
     def _fetch_batch_cached(self, symbols: list[str]) -> dict[str, dict]:
