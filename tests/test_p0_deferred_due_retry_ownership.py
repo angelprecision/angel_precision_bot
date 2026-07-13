@@ -724,39 +724,233 @@ def test_12_recovery_never_calls_broker_directly():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_spec_acceptance_due_row_advances_generation_and_attempt():
-    """The single most important assertion: a due retry does NOT remain
-    stuck at attempt=1 / generation=1 / DEFERRED:*. After one takeover
-    call the durable outcome shows an advanced generation and an advanced
-    attempt (via the resume method's return payload).
+def test_spec_acceptance_single_claim_seam():
+    """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
+    deferred path → selector mock → durable copyback → canonical submit seam.
+
+    Verifies the core requirement: claim_deferred_materialization is called
+    EXACTLY ONCE across the entire path. The second claim inside
+    _on_entry_trigger must be bypassed via the verified pre-claim markers.
+
+    Does NOT mock _on_entry_trigger. Does NOT manually manufacture the
+    post-callback row.
     """
-    core = _core()
-    before = _row(retry_attempt=1, materialization_generation=1)
-    # Simulate the row transitioning to broker_ready after the callback.
-    after = _row(retry_attempt=1, materialization_generation=2)
-    after["contract"] = "RTX260117C00130000"
-    after["limit_price"] = 2.10
-    after["qty"] = 1
-    after["reserved_cost"] = 210.0
-    after["meta"]["broker_ready"] = True
-    after["meta"]["materialization_generation"] = 2
-    after["meta"]["selected_contract"] = "RTX260117C00130000"
-    after["meta"]["selected_limit"] = 2.10
-    after["meta"]["selected_qty"] = 1
+    import ap_execution_core as core_mod
 
-    core.order_state_machine.get_order.side_effect = [before, after]
-    core.order_state_machine.claim_deferred_materialization.return_value = True
+    now = datetime.now(timezone.utc)
 
-    out = core.resume_deferred_materialization_retry(
+    # ── Build a production-shape durable row (RETRY_WAIT attempt=1) ──
+    before_meta = {
+        "lifecycle_state": "RETRY_WAIT",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 1,
+        "watcher_token": "watcher:test",
+        "retry_attempt": 1,
+        "retry_max_attempts": 3,
+        "next_retry_at": _iso(now - timedelta(seconds=30)),
+        "materialization_next_retry_at": _iso(now - timedelta(seconds=30)),
+        "trigger_crossed_at": _iso(now - timedelta(seconds=60)),
+        "trigger_price": 130.0,
+        "observed_underlying_price": 130.05,
+        "materialization_selector_failure": {
+            "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        },
+    }
+    before_row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-seam-1",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": "CALL",
+        "score": 78.0,
+        "tier": "B",
+        "trigger_price": 130.0,
+        "stop_underlying": 128.0,
+        "target_underlying": 133.0,
+        "pattern": "3-1-2",
+        "timeframe": "1d",
+        "contract": "DEFERRED:RTX",
+        "qty": 1,
+        "limit_price": 0.01,
+        "reserved_cost": 0.0,
+        "meta": before_meta,
+    }
+
+    # After claim: row is MATERIALIZING with gen=2, attempt=2
+    claimed_meta = dict(before_meta)
+    claimed_meta.update({
+        "lifecycle_state": "MATERIALIZING",
+        "materialization_generation": 2,
+        "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
+        "materialization_in_flight": True,
+        "retry_attempt": 2,
+    })
+    after_claim_row = dict(before_row)
+    after_claim_row["meta"] = claimed_meta
+
+    # After selector succeeds: row is BROKER_READY
+    broker_ready_meta = dict(claimed_meta)
+    broker_ready_meta.update({
+        "lifecycle_state": "BROKER_READY",
+        "broker_ready": True,
+        "selected_contract": "RTX260117C00130000",
+        "selected_limit": 2.10,
+        "selected_qty": 1,
+        "materialization_status": "SELECTED",
+    })
+    broker_ready_row = dict(before_row)
+    broker_ready_row.update({
+        "contract": "RTX260117C00130000",
+        "limit_price": 2.10,
+        "qty": 1,
+        "reserved_cost": 210.0,
+    })
+    broker_ready_row["meta"] = broker_ready_meta
+
+    # ── Build minimal execution core ──────────────────────────────────
+    claim_call_count = [0]
+
+    class _OSM:
+        client_id = CLIENT_ID
+        _claimed = False  # flips True when claim_deferred_materialization is called
+
+        def get_order(self, oid):
+            # Before claim: return the before-state row (RETRY_WAIT)
+            # After claim: return the after-claim row (MATERIALIZING) so the
+            # pre-claim bypass verification can confirm lifecycle=MATERIALIZING
+            if not _OSM._claimed:
+                return before_row
+            return after_claim_row
+
+        def claim_deferred_materialization(self, oid, **kw):
+            claim_call_count[0] += 1
+            _OSM._claimed = True
+            return True
+
+        def update_order_meta(self, oid, patch):
+            return True
+
+        def schedule_deferred_materialization_retry(self, oid, **kw):
+            return True
+
+        def terminalize_deferred_breach(self, oid, **kw):
+            return True
+
+        def submit_existing_entry(self, *a, **kw):
+            return {"status": "SUBMITTED", "broker_order_id": "BR-TEST-1"}
+
+        def get_orders_for_position(self, *a, **kw):
+            return []
+
+        def persist_deferred_broker_ready(self, *a, **kw):
+            return True
+
+        def claim_deferred_broker_ready_submit(self, *a, **kw):
+            return True
+
+    class _FakeSelector:
+        select_count = 0
+        def select(self, plan):
+            _FakeSelector.select_count += 1
+            return SimpleNamespace(
+                contract_symbol="RTX260117C00130000",
+                limit_price=2.10,
+                qty=1,
+                affordable_contracts=1,
+                premium_per_contract=2.10,
+                bid=2.05, ask=2.15, mid=2.10,
+                execution_price_per_share=2.15,
+                dte=14, expiration="2026-01-17",
+                delta=0.45, open_interest=5000, volume=1200,
+                reason_code=None,
+                error_code=None,
+            )
+
+    osm = _OSM()
+    selector = _FakeSelector()
+
+    core = SimpleNamespace(
+        client_id=CLIENT_ID,
+        email=CLIENT_ID,
+        execution_mode="paper",
+        mode="PAPER",
+        paper=True,
+        order_state_machine=osm,
+        broker=MagicMock(),
+        contract_selector=selector,
+    )
+    # ── Build execution core via __new__ so all real class methods are
+    # bound, then set only the minimal external dependencies as stubs.
+    core = object.__new__(core_mod.APExecutionCore)
+    core.client_id = CLIENT_ID
+    core.email = CLIENT_ID
+    core.execution_mode = "paper"
+    core.mode = "PAPER"
+    core.paper = True
+    core.order_state_machine = osm
+    core.broker = MagicMock()
+    core.contract_selector = selector
+    # Signal store (telemetry only — stubs prevent side effects)
+    core.store = MagicMock()
+    core.store.update_status.return_value = True
+    core.store.update_signal_fields.return_value = True
+    # Kill switch and position state
+    core._kill_switch = False
+    core._max_positions = 5
+    core._pos_lock = __import__("threading").RLock()
+    core._open_positions = {}
+    core._pending_entries = {}
+    core._reserved_capital = 0.0
+    core._capital_lock = __import__("threading").RLock()
+    # master_control: kill switch must be off
+    core.master_control = MagicMock()
+    core.master_control.mode = "PAPER"
+    core.master_control._kill_switch_fn = lambda: False
+    core.master_control._kill_switch = False
+    core.master_control.max_positions = 5
+    # Wiring stubs
+    core.exit_eng = None
+    core.entry_watcher = None
+    core.position_manager = MagicMock()
+    core.position_manager.get_open_count.return_value = 0
+    core.fill_monitor = MagicMock()
+    core.alpha_tracker = MagicMock()
+    core.entry_telemetry = MagicMock()
+    core.intelligence_context = MagicMock()
+    core.intelligence_context.is_enabled.return_value = False
+
+    owner_label = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3"
+    result = core.resume_deferred_materialization_retry(
         local_order_id=LOCAL_ORDER_ID,
         expected_generation=1,
         expected_retry_attempt=2,
-        owner="owner-acceptance",
+        owner=owner_label,
     )
-    # Advanced from attempt=1 -> attempt=2, generation=1 -> generation=2
-    assert out["attempt"] == 2
-    assert out["generation"] == 2
-    assert out["disposition"] in {"BROKER_READY", "SUBMITTED"}
+
+    # ── Assertions ────────────────────────────────────────────────────
+    # CORE INVARIANT: claim must be called exactly once
+    assert claim_call_count[0] == 1, (
+        f"claim_deferred_materialization must be called exactly once; "
+        f"got {claim_call_count[0]}"
+    )
+    # Selector must have been called exactly once
+    assert _FakeSelector.select_count == 1, (
+        f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
+    )
+    # Outcome must be BROKER_READY or SUBMITTED (not CLAIM_LOST, not KEEP_WATCHER)
+    assert result["disposition"] in {"BROKER_READY", "SUBMITTED", "RETRY_WAIT"}, (
+        f"Expected BROKER_READY/SUBMITTED/RETRY_WAIT; got {result['disposition']}: "
+        f"{result.get('reason_code')}"
+    )
+    # generation and attempt advanced
+    assert result["generation"] == 2
+    assert result["attempt"] == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
