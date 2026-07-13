@@ -5817,71 +5817,55 @@ class APExitEngine:
                 contract=str(option_symbol or ""),
             )
             _broker_truth_qty = _broker_truth.get("broker_truth_open_qty")
+            _broker_truth_state, _broker_truth_parsed_qty = _classify_exact_broker_open_qty(_broker_truth_qty)
+            _broker_truth_fresh_exact = _broker_truth.get("is_fresh_exact") is True
+            _broker_truth["broker_truth_state"] = _broker_truth_state.value
+            _broker_truth["broker_truth_parsed_open_qty"] = _broker_truth_parsed_qty
             _broker_truth_audit = dict((_broker_truth.get("audit") or {}))
             _broker_truth_audit["requested_qty"] = int(decision.quantity or 0)
-            if _broker_truth.get("is_fresh_exact") and int(_broker_truth_qty or 0) == 0:
-                # Final amendment: durably close the stale local position so the
-                # next tick does not re-evaluate and re-fire this exit.
-                # Clearing exit_in_flight alone is NOT enough — the position row
-                # must be marked CLOSED (or equivalent terminal state) so
-                # _can_submit_exit() treats it as done on the next poll cycle.
+            _broker_truth_audit["broker_truth_state"] = _broker_truth_state.value
+            _broker_truth_audit["broker_truth_parsed_open_qty"] = _broker_truth_parsed_qty
+            if _broker_truth_fresh_exact and _broker_truth_state == BrokerPositionTruth.UNKNOWN:
+                self._emit_degraded_critical(
+                    pos,
+                    "BROKER_TRUTH_QUANTITY_UNKNOWN",
+                    "fresh exact broker truth had an unknown or malformed open quantity at submit seam; broker-flat close is forbidden",
+                    extra={"broker_truth": _broker_truth_audit},
+                )
+            if _broker_truth_fresh_exact and _broker_truth_state == BrokerPositionTruth.FLAT:
                 with self._lock:
                     pos.exit_in_flight   = False
                     pos.pending_exit_reason = ""
+                close_result = self._mark_broker_flat_stale_position(pos, _broker_truth)
                 self._emit_exit_event(
                     pos,
-                    decision="REJECT",
+                    decision="REJECT" if close_result.closed else "ALERT",
                     reason_code="SYNTHETIC_POSITION_STALE_BROKER_FLAT",
-                    explanation="Blocked exit submit: fresh exact broker snapshot shows no open long position.",
+                    explanation=(
+                        "Blocked exit submit: fresh exact broker snapshot shows no open long position."
+                        if close_result.closed
+                        else "Blocked exit submit: broker snapshot is flat but durable local close remains pending."
+                    ),
                     stage="exit_submission",
-                    extra_inputs={"broker_truth": _broker_truth_audit},
+                    extra_inputs={
+                        "broker_truth": _broker_truth_audit,
+                        "broker_flat_close": close_result.__dict__,
+                    },
                 )
                 log.warning(
                     "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT | position_id=%s contract=%s "
-                    "requested_qty=%s snapshot_status=%s — marking local position stale/closed",
+                    "requested_qty=%s snapshot_status=%s close_verified=%s",
                     ticker, position_id or "?", option_symbol,
                     int(decision.quantity or 0),
                     _broker_truth_audit.get("snapshot_status", "unknown"),
+                    close_result.verified,
                 )
-                # Durable stale-close: update positions row and exit order row so
-                # the next tick sees a terminal state and does not re-evaluate.
-                try:
-                    _stale_meta = {
-                        "synthetic_position_stale_broker_flat": True,
-                        "stale_marked_at": now_utc_iso(),
-                        "broker_truth_open_qty": 0,
-                        "exit_circuit_breaker_broker_truth": _broker_truth_audit,
-                        "reconciler_manual_close_needed": True,
-                        "stale_source": "exit_engine_submit_seam",
-                    }
-                    with conn() as _stale_c:
-                        _stale_c.execute(
-                            """
-                            UPDATE positions
-                            SET status = 'CLOSED',
-                                meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
-                            WHERE id = %s
-                              AND client_id = %s
-                              AND status NOT IN ('CLOSED', 'EXPIRED')
-                            """,
-                            (
-                                __import__("json").dumps(_stale_meta),
-                                position_id,
-                                str(getattr(pos, "client_id", "") or self.client_id),
-                            ),
-                        )
-                except Exception as _stale_exc:
-                    log.warning(
-                        "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT local-close failed "
-                        "position_id=%s error=%s — position may re-fire on next tick",
-                        ticker, position_id or "?", _stale_exc,
-                    )
                 return False
             if (
-                _broker_truth.get("is_fresh_exact")
-                and _broker_truth_qty is not None
-                and int(_broker_truth_qty) > 0
-                and int(decision.quantity or 0) > int(_broker_truth_qty)
+                _broker_truth_fresh_exact
+                and _broker_truth_state == BrokerPositionTruth.OPEN
+                and _broker_truth_parsed_qty is not None
+                and int(decision.quantity or 0) > int(_broker_truth_parsed_qty)
             ):
                 with self._lock:
                     pos.exit_in_flight = False
@@ -5892,7 +5876,7 @@ class APExitEngine:
                     reason_code="EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT",
                     explanation=(
                         f"Blocked exit submit because requested_qty={int(decision.quantity or 0)} "
-                        f"exceeds exact broker long qty={int(_broker_truth_qty)}"
+                        f"exceeds exact broker long qty={int(_broker_truth_parsed_qty)}"
                     ),
                     stage="exit_submission",
                     extra_inputs={"broker_truth": _broker_truth_audit},
@@ -5903,7 +5887,7 @@ class APExitEngine:
                     position_id or "?",
                     option_symbol,
                     int(decision.quantity or 0),
-                    int(_broker_truth_qty),
+                    int(_broker_truth_parsed_qty),
                 )
                 return False
 
