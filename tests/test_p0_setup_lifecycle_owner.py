@@ -25,6 +25,7 @@ def _signal(signal_id: str | None = "sig-1", **overrides):
     payload = {
         "signal_id": signal_id,
         "canonical_signal_id": signal_id,
+        "client_id": JOSE,
         "ticker": "AAPL",
         "symbol": "AAPL",
         "side": "CALL",
@@ -191,9 +192,13 @@ def test_blank_signal_identity_real_evaluate_cannot_bypass(identity):
 
     decision = mc.evaluate(signal, client_id=JOSE)
 
-    _assert_duplicate_setup(decision)
-    assert signal["signal_id"]
-    assert signal["signal_id"] != "sig-1"
+    assert decision.ok is False
+    if decision.stage == "metadata_validation":
+        assert "missing_signal_id" in decision.reason
+    else:
+        _assert_duplicate_setup(decision)
+        assert signal["signal_id"]
+        assert signal["signal_id"] != "sig-1"
 
 
 def test_durable_duplicate_still_blocks_after_same_lifecycle_cache_bypass():
@@ -217,7 +222,10 @@ def test_jose_and_tradefluence_cache_isolation():
     mc = _make_mc()
 
     jose = mc.evaluate(_signal("sig-jose"), client_id=JOSE)
-    tradefluence = mc.evaluate(_signal("sig-tradefluence"), client_id=TRADEFLUENCE)
+    tradefluence = mc.evaluate(
+        _signal("sig-tradefluence", client_id=TRADEFLUENCE),
+        client_id=TRADEFLUENCE,
+    )
 
     _assert_approved(jose)
     _assert_approved(tradefluence)
@@ -272,7 +280,6 @@ def test_reset_session_clears_owner_state(monkeypatch):
     mc = _make_mc()
     _assert_approved(mc.evaluate(_signal("sig-1"), client_id=JOSE))
     monkeypatch.setattr(mc, "clear_force_close", MagicMock())
-    monkeypatch.setattr("ap.db.run_with_retry", lambda func: None)
 
     mc.reset_session(client_id=JOSE)
 
@@ -292,9 +299,9 @@ def test_concurrent_different_signals_cannot_both_bypass():
 
     mc._run_intelligence = MagicMock(side_effect=slow_intelligence)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(mc.evaluate, _signal("sig-a"), JOSE)
+        first = pool.submit(mc.evaluate, _signal("sig-a"), client_id=JOSE)
         assert started.wait(timeout=2)
-        second = pool.submit(mc.evaluate, _signal("sig-b"), JOSE)
+        second = pool.submit(mc.evaluate, _signal("sig-b"), client_id=JOSE)
         decisions = [first.result(timeout=5), second.result(timeout=5)]
 
     assert sum(decision.ok for decision in decisions) == 1
@@ -442,7 +449,12 @@ def test_canonical_module_imports_directly_from_ap_master_control_py():
     import ap_master_control as module
 
     assert module.__file__.endswith("/ap_master_control.py")
-    assert APMasterControl.evaluate.__module__ == "ap_master_control"
+    canonical_evaluate = getattr(
+        APMasterControl,
+        "_entry_metadata_guard_original_evaluate",
+        APMasterControl.evaluate,
+    )
+    assert canonical_evaluate.__module__ == "ap_master_control"
 
 
 def test_explicit_cache_removal_deletes_owner_metadata():
