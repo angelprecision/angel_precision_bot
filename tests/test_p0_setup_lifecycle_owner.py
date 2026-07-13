@@ -140,7 +140,7 @@ def test_first_real_evaluate_records_setup_owner():
     _assert_approved(decision)
     key = _setup_key(JOSE)
     assert key in mc._seen_signals
-    assert mc._seen_setup_owners[key] == "sig-1"
+    assert mc._seen_setup_owners[key] == "canonical:sig-1"
 
 
 def test_same_lifecycle_real_evaluate_does_not_self_reject():
@@ -186,7 +186,7 @@ def test_blank_signal_identity_real_evaluate_cannot_bypass(identity):
     mc = _make_mc()
     key = _setup_key(JOSE)
     mc._seen_signals[key] = time.time()
-    mc._seen_setup_owners[key] = "sig-1"
+    mc._seen_setup_owners[key] = "signal:sig-1"
     signal = _signal(identity)
 
     decision = mc.evaluate(signal, client_id=JOSE)
@@ -221,8 +221,8 @@ def test_jose_and_tradefluence_cache_isolation():
 
     _assert_approved(jose)
     _assert_approved(tradefluence)
-    assert mc._seen_setup_owners[_setup_key(JOSE)] == "sig-jose"
-    assert mc._seen_setup_owners[_setup_key(TRADEFLUENCE)] == "sig-tradefluence"
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "canonical:sig-jose"
+    assert mc._seen_setup_owners[_setup_key(TRADEFLUENCE)] == "canonical:sig-tradefluence"
 
 
 def test_paper_live_mode_isolation_with_same_client_identity():
@@ -236,8 +236,8 @@ def test_paper_live_mode_isolation_with_same_client_identity():
 
     _assert_approved(paper)
     _assert_approved(live)
-    assert mc._seen_setup_owners[_setup_key(JOSE, "PAPER")] == "sig-paper"
-    assert mc._seen_setup_owners[_setup_key(JOSE, "LIVE")] == "sig-live"
+    assert mc._seen_setup_owners[_setup_key(JOSE, "PAPER")] == "canonical:sig-paper"
+    assert mc._seen_setup_owners[_setup_key(JOSE, "LIVE")] == "canonical:sig-live"
 
 
 def test_expired_cache_prunes_owner_in_real_evaluate_path():
@@ -249,7 +249,7 @@ def test_expired_cache_prunes_owner_in_real_evaluate_path():
     decision = mc.evaluate(_signal("sig-new"), client_id=JOSE)
 
     _assert_approved(decision)
-    assert mc._seen_setup_owners[key] == "sig-new"
+    assert mc._seen_setup_owners[key] == "canonical:sig-new"
     assert mc._seen_signals[key] > time.time() - 10
 
 
@@ -304,19 +304,126 @@ def test_concurrent_different_signals_cannot_both_bypass():
 
 def test_july10_repeated_queue_lifecycle_no_longer_returns_duplicate_setup():
     mc = _make_mc()
-    production_row = _signal(
-        "july10-jose-aapl-call-1d",
+    first_row = _signal(
+        "july10-jose-aapl-call-1d:attempt-1",
         _queue_id="7201",
+        canonical_signal_id="july10-jose-aapl-call-1d",
         execution_mode="paper",
         metadata={},
     )
+    reclaimed_row = {
+        **first_row,
+        "signal_id": "july10-jose-aapl-call-1d:recovery-2",
+    }
 
-    first = mc.evaluate(dict(production_row), client_id=JOSE)
-    reclaimed = mc.evaluate(dict(production_row), client_id=JOSE)
+    first = mc.evaluate(dict(first_row), client_id=JOSE)
+    reclaimed = mc.evaluate(dict(reclaimed_row), client_id=JOSE)
 
     _assert_approved(first)
     _assert_approved(reclaimed)
     assert "duplicate_setup" not in reclaimed.reason
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "queue:7201"
+
+
+def test_same_queue_lifecycle_changed_raw_suffix_does_not_self_reject():
+    mc = _make_mc()
+    first = _signal(
+        "sig-stable:attempt-1",
+        canonical_signal_id="sig-stable",
+        _queue_id=7201,
+    )
+    reclaimed = _signal(
+        "sig-stable:recovery-2",
+        canonical_signal_id="sig-stable",
+        _queue_id="7201",
+    )
+
+    _assert_approved(mc.evaluate(first, client_id=JOSE))
+    decision = mc.evaluate(reclaimed, client_id=JOSE)
+
+    _assert_approved(decision)
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "queue:7201"
+
+
+def test_different_queue_lifecycle_same_setup_still_blocks():
+    mc = _make_mc()
+    _assert_approved(mc.evaluate(
+        _signal("sig-1", canonical_signal_id="same-market-id", _queue_id=7201),
+        client_id=JOSE,
+    ))
+
+    decision = mc.evaluate(
+        _signal("sig-2", canonical_signal_id="same-market-id", _queue_id=7202),
+        client_id=JOSE,
+    )
+
+    _assert_duplicate_setup(decision)
+
+
+def test_same_canonical_identity_without_queue_id_bypasses_only_without_durable_duplicate():
+    mc = _make_mc()
+    _assert_approved(mc.evaluate(
+        _signal("canonical-setup:attempt-1", canonical_signal_id="canonical-setup"),
+        client_id=JOSE,
+    ))
+
+    decision = mc.evaluate(
+        _signal("canonical-setup:recovery-2", canonical_signal_id="canonical-setup"),
+        client_id=JOSE,
+    )
+
+    _assert_approved(decision)
+    assert mc._has_durable_duplicate_signal.call_count == 2
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "canonical:canonical-setup"
+
+
+def test_raw_signal_identity_is_final_owner_fallback():
+    mc = _make_mc()
+    signal = _signal("raw-only", canonical_signal_id="")
+
+    _assert_approved(mc.evaluate(signal, client_id=JOSE))
+
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "signal:raw-only"
+
+
+def test_invalid_queue_identity_falls_back_to_canonical_identity():
+    mc = _make_mc()
+    first = _signal(
+        "stable:attempt-1",
+        canonical_signal_id="stable",
+        _queue_id="not-an-integer",
+    )
+    reclaimed = _signal(
+        "stable:recovery-2",
+        canonical_signal_id="stable",
+        _queue_id="not-an-integer",
+    )
+
+    _assert_approved(mc.evaluate(first, client_id=JOSE))
+    _assert_approved(mc.evaluate(reclaimed, client_id=JOSE))
+
+    assert mc._seen_setup_owners[_setup_key(JOSE)] == "canonical:stable"
+
+
+def test_durable_separate_active_order_blocks_same_canonical_identity():
+    mc = _make_mc()
+    _assert_approved(mc.evaluate(
+        _signal("canonical-setup:attempt-1", canonical_signal_id="canonical-setup"),
+        client_id=JOSE,
+    ))
+    mc._has_durable_duplicate_signal.return_value = (
+        True,
+        "orders",
+        "id=42 status=SUBMITTED",
+    )
+
+    decision = mc.evaluate(
+        _signal("canonical-setup:recovery-2", canonical_signal_id="canonical-setup"),
+        client_id=JOSE,
+    )
+
+    assert decision.ok is False
+    assert decision.reason == "duplicate_signal_id (durable:orders)"
 
 
 def test_existing_duplicate_reason_and_diagnostics_preserved(caplog):
@@ -328,7 +435,7 @@ def test_existing_duplicate_reason_and_diagnostics_preserved(caplog):
 
     _assert_duplicate_setup(decision)
     assert "SETUP_DEDUP_DIFFERENT_LIFECYCLE_BLOCK" in caplog.text
-    assert "cached_owner=sig-1" in caplog.text
+    assert "cached_owner=canonical:sig-1" in caplog.text
 
 
 def test_canonical_module_imports_directly_from_ap_master_control_py():

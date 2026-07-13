@@ -443,6 +443,36 @@ def _serialize_setup_cache_evaluation(func):
     return _wrapped
 
 
+def _setup_lifecycle_owner_key(signal: dict, *, raw_signal_id: str = "") -> str:
+    """Return the most stable process-local owner for one queue lifecycle.
+
+    This identity is intentionally separate from ``signal_id``.  Durable
+    duplicate checks, decision events, plans, and orders continue to use the
+    raw signal identity supplied to ``evaluate()`` (or its existing generated
+    fallback).  The setup cache instead prefers durable queue identity, then
+    canonical signal identity, so recovery may reconstruct the same lifecycle
+    with a different raw reevaluation suffix without rejecting itself.
+    """
+    queue_id = signal.get("_queue_id")
+    queue_id_int = None
+    if isinstance(queue_id, int) and not isinstance(queue_id, bool):
+        queue_id_int = queue_id
+    elif isinstance(queue_id, str) and queue_id.strip().isdigit():
+        queue_id_int = int(queue_id.strip())
+    if queue_id_int is not None and queue_id_int > 0:
+        return f"queue:{queue_id_int}"
+
+    canonical_signal_id = str(signal.get("canonical_signal_id") or "").strip()
+    if canonical_signal_id:
+        return f"canonical:{canonical_signal_id}"
+
+    raw_signal_id = str(raw_signal_id or "").strip()
+    if raw_signal_id:
+        return f"signal:{raw_signal_id}"
+
+    return ""
+
+
 class APMasterControl:
     """Single decision authority for whether a signal may become a trade."""
 
@@ -1646,7 +1676,12 @@ class APMasterControl:
             signal["_original_index_ticker"] = orig
 
         score = float(signal.get("score", 0) or 0)
-        signal_id = str(signal.get("signal_id") or uuid.uuid4())
+        _raw_signal_id = str(signal.get("signal_id") or "").strip()
+        _setup_lifecycle_owner = _setup_lifecycle_owner_key(
+            signal,
+            raw_signal_id=_raw_signal_id,
+        )
+        signal_id = _raw_signal_id or str(uuid.uuid4())
         signal["signal_id"] = signal_id
         self._cache_trade_dossier_signal(signal_id, signal)
         try:
@@ -1795,12 +1830,13 @@ class APMasterControl:
             _cached_owner = _owners.get(setup_key, "")
             _cache_age_s  = round(_now_ts - self._seen_signals[setup_key], 1)
 
-            if not signal_id:
-                # Blank current signal ID — fail-closed; cannot prove same lifecycle.
+            if not _setup_lifecycle_owner:
+                # No queue/canonical/raw identity — fail closed; a generated
+                # signal_id is not proof that this is the cached lifecycle.
                 log.info(
-                    "SETUP_DEDUP_OWNER_UNAVAILABLE_BLANK_SIGNAL client_id=%s "
+                    "SETUP_DEDUP_OWNER_UNAVAILABLE client_id=%s signal_id=%s "
                     "setup_key=%s cache_age_s=%s",
-                    client_id, setup_key, _cache_age_s,
+                    client_id, signal_id, setup_key, _cache_age_s,
                 )
                 return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")  # SETUP_DEDUP_BLANK_SID
 
@@ -1808,25 +1844,27 @@ class APMasterControl:
                 # Legacy ownerless entry — fail-closed; cannot prove same lifecycle.
                 log.info(
                     "SETUP_DEDUP_LEGACY_OWNERLESS_BLOCK client_id=%s "
-                    "setup_key=%s signal_id=%s cache_age_s=%s",
-                    client_id, setup_key, signal_id, _cache_age_s,
+                    "setup_key=%s signal_id=%s lifecycle_owner=%s cache_age_s=%s",
+                    client_id, setup_key, signal_id, _setup_lifecycle_owner, _cache_age_s,
                 )
                 return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")  # SETUP_DEDUP_OWNERLESS
 
-            if _cached_owner == signal_id:
+            if _cached_owner == _setup_lifecycle_owner:
                 # Same proven lifecycle — allow through; all durable checks still run.
                 log.info(
                     "SETUP_DEDUP_SAME_LIFECYCLE_BYPASS client_id=%s "
-                    "signal_id=%s setup_key=%s cache_age_s=%s",
-                    client_id, signal_id, setup_key, _cache_age_s,
+                    "signal_id=%s lifecycle_owner=%s setup_key=%s cache_age_s=%s",
+                    client_id, signal_id, _setup_lifecycle_owner, setup_key, _cache_age_s,
                 )
                 # Fall through — do not return here.
             else:
                 # Different lifecycle — preserve block, include both owners in diagnostic.
                 log.info(
                     "SETUP_DEDUP_DIFFERENT_LIFECYCLE_BLOCK client_id=%s "
-                    "signal_id=%s cached_owner=%s setup_key=%s cache_age_s=%s",
-                    client_id, signal_id, _cached_owner, setup_key, _cache_age_s,
+                    "signal_id=%s lifecycle_owner=%s cached_owner=%s "
+                    "setup_key=%s cache_age_s=%s",
+                    client_id, signal_id, _setup_lifecycle_owner, _cached_owner,
+                    setup_key, _cache_age_s,
                 )
                 return self._block(signal_id, ticker, client_id, "blocked_system", f"duplicate_setup ({ticker} {direction_raw} {timeframe_raw})")  # SETUP_DEDUP_DIFFERENT_LIFECYCLE
 
@@ -2929,11 +2967,11 @@ class APMasterControl:
             log.warning("[%s] Dedup persist failed in paper — proceeding: %s", ticker, _dedup_err)
         self._seen_signals[signal_key] = time.time()
         self._seen_signals[setup_key] = time.time()
-        # PR #317: record the owning signal_id so same-lifecycle reevaluation
-        # is not blocked as duplicate_setup. Only recorded when canonical ID is known.
-        if signal_id:
+        # PR #317: record the stable queue-lifecycle owner separately from the
+        # raw signal_id used by durable duplicate checks and downstream rows.
+        if _setup_lifecycle_owner:
             _owners = getattr(self, "_seen_setup_owners", {})
-            _owners[setup_key] = signal_id
+            _owners[setup_key] = _setup_lifecycle_owner
             self._seen_setup_owners = _owners
         self._emit_trade_dossier(
             signal,
