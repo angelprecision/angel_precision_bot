@@ -864,6 +864,7 @@ class PendingTriggerRestartRecovery:
         rr_oid    = str(reread.get("local_order_id") or "").strip()
         rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
         rr_mode   = str(reread.get("execution_mode") or "").strip().lower()
+        contract  = str(reread.get("contract") or "").strip()
         if status != "PENDING_TRIGGER":
             return None
         if not rr_oid or rr_oid != local_oid:
@@ -871,6 +872,8 @@ class PendingTriggerRestartRecovery:
         if not rr_client or rr_client != self.client_id.lower():
             return None
         if not rr_mode or rr_mode != self.execution_mode:
+            return None
+        if not contract or not contract.upper().startswith("DEFERRED:"):
             return None
         if reread.get("broker_order_id") or reread.get("submitted_ts"):
             return None
@@ -1017,10 +1020,11 @@ class PendingTriggerRestartRecovery:
         _exp_client = self.client_id.lower()
         _exp_mode   = self.execution_mode
 
-        if not local_oid or not _exp_client or not _exp_mode:
+        if not local_oid or not _exp_sid or not _exp_client or not _exp_mode:
             log.warning(
                 "RESTART_RECOVERY registry proof aborted — incomplete expected identity "
-                "local=%s client=%s mode=%s", local_oid, _exp_client, _exp_mode,
+                "local=%s signal_id=%s client=%s mode=%s",
+                local_oid, _exp_sid, _exp_client, _exp_mode,
             )
             return None
 
@@ -1053,20 +1057,19 @@ class PendingTriggerRestartRecovery:
                         "expected=%s got=%r", local_oid, _exp_mode, _w_mode,
                     )
                     return None
-                if _exp_sid:
-                    if not _w_sid or _w_sid != _exp_sid:
-                        log.warning(
-                            "RESTART_RECOVERY registry signal_id mismatch local=%s "
-                            "expected=%s got=%r", local_oid, _exp_sid, _w_sid,
-                        )
-                        return None
+                if not _w_sid or _w_sid != _exp_sid:
+                    log.warning(
+                        "RESTART_RECOVERY registry signal_id mismatch local=%s "
+                        "expected=%s got=%r", local_oid, _exp_sid, _w_sid,
+                    )
+                    return None
                 if _quarant:
                     log.warning(
                         "RESTART_RECOVERY registry watcher is quarantined local=%s", local_oid,
                     )
                     return None
                 _valid_states = {"PENDING", "REARM", "RETRY"}
-                if _w_state.upper() not in _valid_states and _w_state:
+                if _w_state.upper() not in _valid_states:
                     log.warning(
                         "RESTART_RECOVERY registry watcher state invalid local=%s state=%s",
                         local_oid, _w_state,

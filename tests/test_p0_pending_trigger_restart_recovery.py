@@ -268,6 +268,7 @@ class TestRetryableCanonicalFields:
         _now = datetime.now(timezone.utc)
         _next = (_now + timedelta(minutes=1)).isoformat()
         r = _row(meta=_retry_meta(next_at=_next))
+        r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r, watcher=_MockWatcher())
         summary = rec.recover_all([r])
 
@@ -287,6 +288,7 @@ class TestRetryableCanonicalFields:
             _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
             _MAT_BROKER_READY:       True,   # contradicts RETRY_PENDING
         })
+        r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r, watcher=_MockWatcher())
         summary = rec.recover_all([r])
 
@@ -641,6 +643,7 @@ class TestBlocker3CanonicalRetryFields:
     def test_enter_canonical_retry_writes_323_fields(self):
         """_enter_canonical_retry must write the exact fields the #323 consumer reads."""
         r = _row(meta={"trigger_price": 450.0})
+        r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r)
         outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="test")
 
@@ -692,6 +695,49 @@ class TestBlocker4RegistryProof:
         watcher._dedup_set.clear()
         proof = rec._verify_registry_ownership(r["local_order_id"], r)
         assert proof is None, "Dedup not held must fail registry proof"
+
+    def test_missing_durable_signal_id_rejected(self):
+        r = _row(signal_id="")
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher)
+        watcher.watch({"signal_id": "rogue-signal", "client_id": "client@test.com",
+                       "execution_mode": "paper"}, r["local_order_id"])
+        watcher._dedup_set.add("rogue-signal")
+
+        proof = rec._verify_registry_ownership(r["local_order_id"], r)
+        assert proof is None, "Blank durable signal_id must fail registry proof"
+
+    def test_wrong_signal_id_rejected(self):
+        r = _row()
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher)
+        watcher.watch({"signal_id": "rogue-signal", "client_id": "client@test.com",
+                       "execution_mode": "paper"}, r["local_order_id"])
+        watcher._dedup_set.add("rogue-signal")
+
+        proof = rec._verify_registry_ownership(r["local_order_id"], r)
+        assert proof is None, "Wrong signal_id must fail registry proof"
+
+    def test_missing_watcher_mode_rejected(self):
+        r = _row()
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher)
+        watcher.watch({"signal_id": r["signal_id"], "client_id": "client@test.com",
+                       "execution_mode": ""}, r["local_order_id"])
+
+        proof = rec._verify_registry_ownership(r["local_order_id"], r)
+        assert proof is None, "Blank watcher execution_mode must fail registry proof"
+
+    def test_empty_watcher_state_rejected(self):
+        r = _row()
+        watcher = _MockWatcher(watch_returns=True)
+        rec, osm = _make_recovery(r, watcher=watcher)
+        watcher.watch({"signal_id": r["signal_id"], "client_id": "client@test.com",
+                       "execution_mode": "paper"}, r["local_order_id"])
+        watcher._pending[0].state = ""
+
+        proof = rec._verify_registry_ownership(r["local_order_id"], r)
+        assert proof is None, "Empty watcher state must fail registry proof"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1086,6 +1132,7 @@ class TestAmendment10Required:
         Must NOT write: materialization_owner, materialization_retry_deadline,
         materialization_attempt_count, materialization_retry_reason."""
         r = _row(meta={"trigger_price": 450.0})
+        r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r)
         outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="chain_warmup")
 
@@ -1147,6 +1194,23 @@ class TestAmendment10Required:
         rec, _ = _make_recovery(r, osm=osm)
         proof = rec._verify_materialization_retry_ownership(r["local_order_id"], r)
         assert proof is None, "Missing materialization_attempts must fail proof"
+
+    def test_verify_materialization_retry_rejects_non_deferred_contract(self):
+        _now = datetime.now(timezone.utc)
+        osm = _MockOSM()
+        r = _row(meta={
+            _MAT_STATUS_FIELD:       "RETRY_PENDING",
+            _MAT_NEXT_RETRY_AT:      (_now + timedelta(minutes=1)).isoformat(),
+            _MAT_ATTEMPTS_FIELD:     1,
+            _MAT_REASON_FIELD:       "test",
+            _MAT_LAST_FAILURE_FIELD: _now.isoformat(),
+            _MAT_BROKER_READY:       False,
+        })
+        r["contract"] = "SPY260717C00600000"
+        osm.seed(r)
+        rec, _ = _make_recovery(r, osm=osm)
+        proof = rec._verify_materialization_retry_ownership(r["local_order_id"], r)
+        assert proof is None, "Non-DEFERRED contract must fail materialization retry proof"
 
     # 4. DEFERRED_MATERIALIZATION_MAX_ATTEMPTS env var respected ──────────────
 
@@ -1257,6 +1321,7 @@ class TestAmendment10Required:
         """Proof from _verify_materialization_retry_ownership must agree with
         the exact values written by _enter_canonical_retry."""
         r = _row(meta={"trigger_price": 450.0})
+        r["contract"] = "DEFERRED:SPY"
         rec, osm = _make_recovery(r)
         outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="zero_quotes")
 
