@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+
+import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
 
@@ -13,6 +16,7 @@ import ap_exit_engine as exit_engine_mod
 from ap.position_quote_monitor import APPositionQuoteMonitor
 from ap_exit_engine import (
     APExitEngine,
+    BrokerPositionTruth,
     BrokerFlatCloseResult,
     DegradedMonitoringPersistResult,
     ExitDecision,
@@ -23,6 +27,7 @@ from ap_exit_engine import (
     PROTECTIVE_STATE_UNPERSISTED,
     STALE_EXIT_RETRY_DELAY_SEC,
     STALE_EXIT_RETRY_MAX_ATTEMPTS,
+    _classify_exact_broker_open_qty,
     evaluate_exit,
 )
 
@@ -82,7 +87,14 @@ def _engine(monkeypatch, *, broker_qty=1):
 class _DbConn:
     def __init__(self, *, rowcount=1, row=None, raises=None):
         self.rowcount = rowcount
-        self.row = row if row is not None else {"status": "CLOSED", "quantity_remaining": 0}
+        self.row = row if row is not None else {
+            "id": "pos-protective-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "contract": "SPY260717C00500000",
+            "status": "CLOSED",
+            "quantity_remaining": 0,
+        }
         self.raises = raises
         self.queries = []
 
@@ -106,6 +118,293 @@ def _patch_db(monkeypatch, *, rowcount=1, row=None, raises=None):
     monkeypatch.setattr(ap_db, "conn", lambda: fake)
     monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *a, **k: fn())
     return fake
+
+
+@pytest.mark.parametrize("value", [None, "", "unknown", "N/A", "null", float("nan"), float("inf"), float("-inf"), -1, -0.5, 0.5, True, False, {}, [], object()])
+def test_strict_broker_quantity_parser_unknown_values(value):
+    assert _classify_exact_broker_open_qty(value) == (BrokerPositionTruth.UNKNOWN, None)
+
+
+@pytest.mark.parametrize("value", [0, 0.0, "0", "0.0", Decimal("0")])
+def test_strict_broker_quantity_parser_flat_values(value):
+    assert _classify_exact_broker_open_qty(value) == (BrokerPositionTruth.FLAT, 0)
+
+
+@pytest.mark.parametrize("value, qty", [(1, 1), (2, 2), ("1", 1), ("2.0", 2), (Decimal("3"), 3)])
+def test_strict_broker_quantity_parser_open_values(value, qty):
+    assert _classify_exact_broker_open_qty(value) == (BrokerPositionTruth.OPEN, qty)
+
+
+def _assert_unknown_qty_does_not_flat_close(monkeypatch, broker_qty):
+    engine = _engine(monkeypatch, broker_qty=broker_qty)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, rowcount=1)
+    close_calls = []
+    engine._mark_broker_flat_stale_position = lambda *a, **k: close_calls.append((a, k)) or BrokerFlatCloseResult(True, 1, True, "closed", None)
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append((code, extra))
+
+    result = engine._own_stale_exit_retry(
+        pos,
+        _decision(),
+        option_quote_state="stale",
+        option_quote_age_sec=90,
+        stage="exit_decision",
+    )
+
+    assert result is False
+    assert close_calls == []
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert engine.active_positions() == [pos]
+    assert pos.broker_truth_state == BrokerPositionTruth.UNKNOWN.value
+    assert any(code == "BROKER_TRUTH_QUANTITY_UNKNOWN" for code, _extra in alerts)
+
+
+def test_none_broker_quantity_is_not_flat(monkeypatch):
+    _assert_unknown_qty_does_not_flat_close(monkeypatch, None)
+
+
+@pytest.mark.parametrize("broker_qty", ["unknown", "N/A", "", "null", "abc"])
+def test_malformed_string_broker_quantity_is_not_flat(monkeypatch, broker_qty):
+    _assert_unknown_qty_does_not_flat_close(monkeypatch, broker_qty)
+
+
+@pytest.mark.parametrize("broker_qty", [float("nan"), float("inf"), float("-inf")])
+def test_nan_and_infinity_broker_quantity_are_not_flat(monkeypatch, broker_qty):
+    _assert_unknown_qty_does_not_flat_close(monkeypatch, broker_qty)
+
+
+@pytest.mark.parametrize("broker_qty", [-1, -0.5, 0.5, "1.5"])
+def test_negative_and_fractional_broker_quantity_are_unknown(monkeypatch, broker_qty):
+    _assert_unknown_qty_does_not_flat_close(monkeypatch, broker_qty)
+
+
+def test_missing_execution_mode_blocks_degraded_persistence(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos(execution_mode="")
+    fake = _patch_db(monkeypatch)
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append(code)
+
+    result = engine._persist_degraded_monitoring_state(
+        pos,
+        state=PROTECTIVE_STATE_DEGRADED,
+        intent={},
+        persist_reason="test",
+    )
+
+    assert result.persisted is False
+    assert result.reason == "identity_unproven"
+    assert fake.queries == []
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_UNPERSISTED
+    assert pos in [pos]
+    assert alerts == ["PROTECTIVE_MONITORING_IDENTITY_UNPROVEN"]
+
+
+def test_missing_execution_mode_blocks_broker_flat_close(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos(execution_mode="")
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    fake = _patch_db(monkeypatch)
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append(code)
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result.closed is False
+    assert result.verified is False
+    assert fake.queries == []
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_BROKER_FLAT_PENDING
+    assert engine.active_positions() == [pos]
+    assert alerts == ["BROKER_FLAT_CLOSE_IDENTITY_UNPROVEN"]
+
+
+def test_missing_contract_blocks_all_protective_mutation(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos(option_symbol="")
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    fake = _patch_db(monkeypatch)
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append(code)
+
+    persist = engine._persist_degraded_monitoring_state(
+        pos,
+        state=PROTECTIVE_STATE_DEGRADED,
+        intent={},
+        persist_reason="test",
+    )
+    close = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert persist.persisted is False
+    assert close.closed is False
+    assert close.verified is False
+    assert fake.queries == []
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_BROKER_FLAT_PENDING
+    assert alerts == ["PROTECTIVE_MONITORING_IDENTITY_UNPROVEN", "BROKER_FLAT_CLOSE_IDENTITY_UNPROVEN"]
+
+
+def test_cross_mode_isolation_uses_strict_execution_mode_equality(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    live_pos = _pos(execution_mode="live")
+    paper_pos = _pos(execution_mode="paper")
+    live_fake = _patch_db(monkeypatch, rowcount=1)
+    engine._persist_degraded_monitoring_state(live_pos, state=PROTECTIVE_STATE_DEGRADED, intent={}, persist_reason="live")
+    live_sql, live_params = live_fake.queries[0]
+
+    paper_fake = _patch_db(monkeypatch, rowcount=1)
+    engine._persist_degraded_monitoring_state(paper_pos, state=PROTECTIVE_STATE_DEGRADED, intent={}, persist_reason="paper")
+    paper_sql, paper_params = paper_fake.queries[0]
+
+    assert "LOWER(COALESCE(execution_mode, '')) = %s" in live_sql
+    assert "(%s = '' OR" not in live_sql
+    assert live_params[-2:] == ("live", "SPY260717C00500000")
+    assert paper_params[-2:] == ("paper", "SPY260717C00500000")
+    assert "LOWER(COALESCE(execution_mode, '')) = %s" in paper_sql
+
+
+def test_exact_numeric_zero_closes_only_after_durable_identity_verification(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    events = []
+
+    class OrderedCloseConn(_DbConn):
+        def fetchone(self):
+            events.append(("reread", pos.closed, pos.quantity_remaining, pos.position_id in engine._positions_by_id))
+            return self.row
+
+    fake = OrderedCloseConn(rowcount=1)
+    monkeypatch.setattr(ap_db, "conn", lambda: fake)
+    monkeypatch.setattr(ap_db, "run_with_retry", lambda fn, *a, **k: fn())
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result == BrokerFlatCloseResult(True, 1, True, "closed", None)
+    assert events == [("reread", False, 1, True)]
+    assert pos.closed is True
+    assert pos.quantity_remaining == 0
+    assert engine.active_positions() == []
+
+
+def test_broker_flat_reread_wrong_mode_fails_verification(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, rowcount=1, row={
+        "id": pos.position_id,
+        "client_id": pos.client_id,
+        "execution_mode": "paper",
+        "contract": pos.option_symbol,
+        "status": "CLOSED",
+        "quantity_remaining": 0,
+    })
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result.closed is False
+    assert result.verified is False
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert engine.active_positions() == [pos]
+
+
+def test_broker_flat_reread_wrong_contract_fails_verification(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, rowcount=1, row={
+        "id": pos.position_id,
+        "client_id": pos.client_id,
+        "execution_mode": pos.execution_mode,
+        "contract": "SPY260717P00500000",
+        "status": "CLOSED",
+        "quantity_remaining": 0,
+    })
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result.closed is False
+    assert result.verified is False
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert engine.active_positions() == [pos]
+
+
+def test_broker_flat_reread_malformed_remaining_quantity_fails_verification(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=0)
+    pos = _pos()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, rowcount=1, row={
+        "id": pos.position_id,
+        "client_id": pos.client_id,
+        "execution_mode": pos.execution_mode,
+        "contract": pos.option_symbol,
+        "status": "CLOSED",
+        "quantity_remaining": "unknown",
+    })
+
+    result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
+
+    assert result.closed is False
+    assert result.verified is False
+    assert pos.closed is False
+    assert pos.quantity_remaining == 1
+    assert engine.active_positions() == [pos]
+
+
+def test_recovered_state_clear_is_mode_and_contract_scoped(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos()
+    pos.protective_monitoring_state = PROTECTIVE_STATE_DEGRADED
+    fake = _patch_db(monkeypatch, rowcount=1)
+
+    engine._clear_degraded_monitoring_state(pos)
+
+    sql, params = fake.queries[0]
+    assert "id = %s" in sql
+    assert "client_id = %s" in sql
+    assert "LOWER(COALESCE(execution_mode, '')) = %s" in sql
+    assert "COALESCE(contract, '') = %s" in sql
+    assert params[-4:] == (pos.position_id, pos.client_id, pos.execution_mode, pos.option_symbol)
+
+
+def test_retry_exhaustion_with_unknown_broker_truth_remains_monitored(monkeypatch):
+    engine = _engine(monkeypatch, broker_qty=None)
+    pos = _pos()
+    pos.exit_retry_attempt = STALE_EXIT_RETRY_MAX_ATTEMPTS
+    pos.exit_retry_first_requested_at = datetime.now(timezone.utc) - timedelta(seconds=60)
+    pos.exit_retry_deadline = datetime.now(timezone.utc) + timedelta(seconds=60)
+    pos.exit_retry_next_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    _patch_db(monkeypatch, rowcount=1)
+    close_calls = []
+    engine._mark_broker_flat_stale_position = lambda *a, **k: close_calls.append((a, k)) or BrokerFlatCloseResult(True, 1, True, "closed", None)
+    alerts = []
+    engine._emit_degraded_critical = lambda pos, code, message, extra=None: alerts.append((code, extra))
+
+    result = engine._own_stale_exit_retry(pos, _decision(), option_quote_state="blind", option_quote_age_sec=None, stage="exit_decision")
+
+    assert result is False
+    assert pos.exit_retry_attempt == STALE_EXIT_RETRY_MAX_ATTEMPTS
+    assert pos.protective_monitoring_state == PROTECTIVE_STATE_RETRY_EXHAUSTED
+    assert pos.behavior_quieted is False
+    assert engine.active_positions() == [pos]
+    assert close_calls == []
+    assert any(code == "PROTECTIVE_RETRY_EXHAUSTED_BROKER_QTY_UNKNOWN" for code, _extra in alerts)
 
 
 def test_retry_throttling_no_increment_or_refresh_before_next_at(monkeypatch):
@@ -235,7 +534,14 @@ def test_broker_flat_close_removes_memory_only_after_verified_durable_close(monk
     pos = _pos()
     engine._positions = [pos]
     engine._positions_by_id = {pos.position_id: pos}
-    _patch_db(monkeypatch, rowcount=1, row={"status": "CLOSED", "quantity_remaining": 0})
+    _patch_db(monkeypatch, rowcount=1, row={
+        "id": pos.position_id,
+        "client_id": pos.client_id,
+        "execution_mode": pos.execution_mode,
+        "contract": pos.option_symbol,
+        "status": "CLOSED",
+        "quantity_remaining": 0,
+    })
 
     result = engine._mark_broker_flat_stale_position(pos, {"is_fresh_exact": True, "broker_truth_open_qty": 0})
 

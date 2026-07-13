@@ -61,6 +61,8 @@ import threading
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation
+from enum import Enum
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
 
@@ -1175,6 +1177,20 @@ class BrokerFlatCloseResult:
     error: Optional[str] = None
 
 
+class BrokerPositionTruth(str, Enum):
+    OPEN = "OPEN"
+    FLAT = "FLAT"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ProtectivePositionIdentity:
+    position_id: str
+    client_id: str
+    execution_mode: str
+    contract: str
+
+
 def _active_exit_blocks_resubmit(order: dict | None) -> bool:
     """
     Return True if an in-flight exit order exists that must block resubmission.
@@ -1253,11 +1269,31 @@ def _is_forced_risk_exit_code(code: str) -> bool:
     return (code or "").upper() in FORCED_RISK_EXIT_CODES
 
 
-def _safe_positive_int(value) -> int:
+def _classify_exact_broker_open_qty(value) -> tuple[BrokerPositionTruth, Optional[int]]:
+    """
+    Classify exact broker open quantity without coercing malformed values to flat.
+    Only finite numeric zero is FLAT; positive finite whole numbers are OPEN.
+    Missing, malformed, negative, fractional, NaN, or infinite values are UNKNOWN.
+    """
+    if value is None or isinstance(value, bool):
+        return BrokerPositionTruth.UNKNOWN, None
     try:
-        return max(int(value or 0), 0)
-    except Exception:
-        return 0
+        text = str(value).strip()
+        if not text:
+            return BrokerPositionTruth.UNKNOWN, None
+        qty_decimal = Decimal(text)
+    except (InvalidOperation, ValueError, TypeError):
+        return BrokerPositionTruth.UNKNOWN, None
+    if not qty_decimal.is_finite():
+        return BrokerPositionTruth.UNKNOWN, None
+    if qty_decimal < 0:
+        return BrokerPositionTruth.UNKNOWN, None
+    if qty_decimal != qty_decimal.to_integral_value():
+        return BrokerPositionTruth.UNKNOWN, None
+    qty = int(qty_decimal)
+    if qty == 0:
+        return BrokerPositionTruth.FLAT, 0
+    return BrokerPositionTruth.OPEN, qty
 
 
 def _is_protective_exit(reason: str) -> bool:
@@ -1896,6 +1932,22 @@ class APExitEngine:
                 return None
         return None
 
+    def _protective_position_identity(self, pos: ManagedPosition) -> Optional[ProtectivePositionIdentity]:
+        position_id = str(getattr(pos, "position_id", "") or "").strip()
+        client_id = str(getattr(pos, "client_id", "") or "").strip()
+        execution_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+        contract = str(getattr(pos, "option_symbol", "") or "").strip()
+        if not position_id or not client_id or not execution_mode or not contract:
+            return None
+        if execution_mode not in {"live", "paper"}:
+            return None
+        return ProtectivePositionIdentity(
+            position_id=position_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            contract=contract,
+        )
+
     def _persist_degraded_monitoring_state(
         self,
         pos: ManagedPosition,
@@ -1905,11 +1957,22 @@ class APExitEngine:
         persist_reason: str,
         broker_truth: Optional[dict] = None,
     ) -> DegradedMonitoringPersistResult:
-        pid = str(getattr(pos, "position_id", "") or "")
-        client_id = str(getattr(pos, "client_id", "") or self._email or "")
-        execution_mode = str(getattr(pos, "execution_mode", "") or "").lower().strip()
-        if not pid or not client_id:
-            return DegradedMonitoringPersistResult(False, 0, "missing_identity", "missing position_id/client_id")
+        identity = self._protective_position_identity(pos)
+        if identity is None:
+            pos.protective_monitoring_state = PROTECTIVE_STATE_UNPERSISTED
+            pos.behavior_quieted = False
+            self._emit_degraded_critical(
+                pos,
+                "PROTECTIVE_MONITORING_IDENTITY_UNPROVEN",
+                "degraded retry ownership was not persisted because position identity is incomplete",
+                extra={
+                    "position_id": str(getattr(pos, "position_id", "") or ""),
+                    "client_id_present": bool(str(getattr(pos, "client_id", "") or "").strip()),
+                    "execution_mode": str(getattr(pos, "execution_mode", "") or ""),
+                    "contract": str(getattr(pos, "option_symbol", "") or ""),
+                },
+            )
+            return DegradedMonitoringPersistResult(False, 0, "identity_unproven", "missing position_id/client_id/execution_mode/contract")
         try:
             import json
             from ap.db import conn, run_with_retry
@@ -1933,18 +1996,17 @@ class APExitEngine:
                             updated_at = NOW()
                         WHERE id = %s
                           AND client_id = %s
-                          AND (%s = '' OR COALESCE(execution_mode, '') = %s)
+                          AND LOWER(COALESCE(execution_mode, '')) = %s
                           AND COALESCE(contract, '') = %s
                           AND status IN ('OPEN', 'CLOSING')
                           AND COALESCE(quantity_remaining, qty, 0) > 0
                         """,
                         (
                             json.dumps(patch, default=str),
-                            pid,
-                            client_id,
-                            execution_mode,
-                            execution_mode,
-                            str(getattr(pos, "option_symbol", "") or ""),
+                            identity.position_id,
+                            identity.client_id,
+                            identity.execution_mode,
+                            identity.contract,
                         ),
                     )
                     return c.rowcount
@@ -1955,24 +2017,49 @@ class APExitEngine:
             msg = f"degraded ownership rowcount={rowcount}"
             log.critical(
                 "[%s] PROTECTIVE_MONITORING_OWNERSHIP_PERSIST_FAILED | pos_id=%s client_id=%s mode=%s contract=%s rowcount=%s",
-                pos.ticker, pid, client_id, execution_mode, getattr(pos, "option_symbol", "") or "", rowcount,
+                pos.ticker, identity.position_id, identity.client_id, identity.execution_mode, identity.contract, rowcount,
             )
             return DegradedMonitoringPersistResult(False, rowcount, "rowcount_not_one", msg)
         except Exception as exc:
             log.critical(
                 "[%s] PROTECTIVE_MONITORING_OWNERSHIP_PERSIST_ERROR | pos_id=%s client_id=%s error=%s",
-                pos.ticker, pid, client_id, exc,
+                pos.ticker, identity.position_id, identity.client_id, exc,
                 exc_info=True,
             )
             return DegradedMonitoringPersistResult(False, 0, "exception", str(exc))
 
     def _mark_broker_flat_stale_position(self, pos: ManagedPosition, broker_truth: dict) -> BrokerFlatCloseResult:
-        pid = str(getattr(pos, "position_id", "") or "")
-        client_id = str(getattr(pos, "client_id", "") or self._email or "")
-        execution_mode = str(getattr(pos, "execution_mode", "") or "").lower().strip()
-        contract = str(getattr(pos, "option_symbol", "") or "")
-        if not pid or not client_id:
-            return BrokerFlatCloseResult(False, 0, False, "missing_identity", "missing position_id/client_id")
+        identity = self._protective_position_identity(pos)
+        if identity is None:
+            pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
+            pos.behavior_quieted = False
+            self._emit_degraded_critical(
+                pos,
+                "BROKER_FLAT_CLOSE_IDENTITY_UNPROVEN",
+                "broker-flat durable close was not attempted because position identity is incomplete",
+                extra={
+                    "position_id": str(getattr(pos, "position_id", "") or ""),
+                    "client_id_present": bool(str(getattr(pos, "client_id", "") or "").strip()),
+                    "execution_mode": str(getattr(pos, "execution_mode", "") or ""),
+                    "contract": str(getattr(pos, "option_symbol", "") or ""),
+                    "broker_truth": broker_truth,
+                },
+            )
+            return BrokerFlatCloseResult(False, 0, False, "identity_unproven", "missing position_id/client_id/execution_mode/contract")
+        truth_state, parsed_qty = _classify_exact_broker_open_qty((broker_truth or {}).get("broker_truth_open_qty"))
+        if (broker_truth or {}).get("is_fresh_exact") is not True or truth_state != BrokerPositionTruth.FLAT:
+            pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
+            self._emit_degraded_critical(
+                pos,
+                "BROKER_FLAT_CLOSE_TRUTH_UNPROVEN",
+                "broker-flat durable close was not attempted because broker truth is not exact numeric flat",
+                extra={
+                    "broker_truth": broker_truth,
+                    "broker_truth_state": truth_state.value,
+                    "broker_truth_parsed_open_qty": parsed_qty,
+                },
+            )
+            return BrokerFlatCloseResult(False, 0, False, "broker_flat_truth_unproven", None)
         try:
             import json
             from ap.db import conn, run_with_retry
@@ -1997,54 +2084,77 @@ class APExitEngine:
                             updated_at = NOW()
                         WHERE id = %s
                           AND client_id = %s
-                          AND (%s = '' OR COALESCE(execution_mode, '') = %s)
+                          AND LOWER(COALESCE(execution_mode, '')) = %s
                           AND COALESCE(contract, '') = %s
                           AND status IN ('OPEN', 'CLOSING')
                           AND COALESCE(quantity_remaining, qty, 0) > 0
                         """,
-                        (json.dumps(patch, default=str), pid, client_id, execution_mode, execution_mode, contract),
+                        (
+                            json.dumps(patch, default=str),
+                            identity.position_id,
+                            identity.client_id,
+                            identity.execution_mode,
+                            identity.contract,
+                        ),
                     )
                     rowcount = int(c.rowcount or 0)
                     if rowcount != 1:
                         return rowcount, None
                     c.execute(
                         """
-                        SELECT status, COALESCE(quantity_remaining, 0) AS quantity_remaining
+                        SELECT
+                            id,
+                            client_id,
+                            execution_mode,
+                            contract,
+                            status,
+                            quantity_remaining
                         FROM positions
                         WHERE id = %s
                           AND client_id = %s
-                          AND (%s = '' OR COALESCE(execution_mode, '') = %s)
+                          AND LOWER(COALESCE(execution_mode, '')) = %s
                           AND COALESCE(contract, '') = %s
                         LIMIT 1
                         """,
-                        (pid, client_id, execution_mode, execution_mode, contract),
+                        (
+                            identity.position_id,
+                            identity.client_id,
+                            identity.execution_mode,
+                            identity.contract,
+                        ),
                     )
                     return rowcount, c.fetchone()
 
             rowcount, row = run_with_retry(_update) or (0, None)
             row = dict(row or {})
+            remaining_state, parsed_remaining = _classify_exact_broker_open_qty(row.get("quantity_remaining"))
             verified = (
                 int(rowcount or 0) == 1
+                and str(row.get("id") or "") == identity.position_id
+                and str(row.get("client_id") or "") == identity.client_id
+                and str(row.get("execution_mode") or "").lower() == identity.execution_mode
+                and str(row.get("contract") or "") == identity.contract
                 and str(row.get("status") or "").upper() in {"CLOSED", "EXPIRED"}
-                and _safe_positive_int(row.get("quantity_remaining")) == 0
+                and remaining_state == BrokerPositionTruth.FLAT
+                and parsed_remaining == 0
             )
             if not verified:
                 pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
                 log.critical(
                     "[%s] BROKER_FLAT_DURABLE_CLOSE_UNVERIFIED | pos_id=%s client_id=%s mode=%s contract=%s rowcount=%s row=%s",
-                    pos.ticker, pid, client_id, execution_mode, contract, rowcount, row,
+                    pos.ticker, identity.position_id, identity.client_id, identity.execution_mode, identity.contract, rowcount, row,
                 )
                 return BrokerFlatCloseResult(False, int(rowcount or 0), False, "durable_close_unverified", None)
 
             pos.closed = True
             pos.quantity_remaining = 0
-            self._positions_by_id.pop(pid, None)
+            self._positions_by_id.pop(identity.position_id, None)
             return BrokerFlatCloseResult(True, int(rowcount or 0), True, "closed", None)
         except Exception as exc:
             pos.protective_monitoring_state = PROTECTIVE_STATE_BROKER_FLAT_PENDING
             log.critical(
                 "[%s] BROKER_FLAT_DURABLE_CLOSE_ERROR | pos_id=%s client_id=%s mode=%s contract=%s error=%s",
-                pos.ticker, pid, client_id, execution_mode, contract, exc,
+                pos.ticker, identity.position_id, identity.client_id, identity.execution_mode, identity.contract, exc,
                 exc_info=True,
             )
             return BrokerFlatCloseResult(False, 0, False, "exception", str(exc))
@@ -2076,9 +2186,19 @@ class APExitEngine:
             import json
             from ap.db import conn, run_with_retry
 
-            pid = str(getattr(pos, "position_id", "") or "")
-            client_id = str(getattr(pos, "client_id", "") or self._email or "")
-            if not pid or not client_id:
+            identity = self._protective_position_identity(pos)
+            if identity is None:
+                self._emit_degraded_critical(
+                    pos,
+                    "PROTECTIVE_MONITORING_RESOLVE_PERSIST_IDENTITY_UNPROVEN",
+                    "degraded monitoring was cleared in memory but durable clear was not attempted because identity is incomplete",
+                    extra={
+                        "position_id": str(getattr(pos, "position_id", "") or ""),
+                        "client_id_present": bool(str(getattr(pos, "client_id", "") or "").strip()),
+                        "execution_mode": str(getattr(pos, "execution_mode", "") or ""),
+                        "contract": str(getattr(pos, "option_symbol", "") or ""),
+                    },
+                )
                 return
             patch = {
                 "protective_monitoring_state": PROTECTIVE_STATE_RESOLVED,
@@ -2099,15 +2219,26 @@ class APExitEngine:
                             updated_at = NOW()
                         WHERE id = %s
                           AND client_id = %s
+                          AND LOWER(COALESCE(execution_mode, '')) = %s
+                          AND COALESCE(contract, '') = %s
                           AND status IN ('OPEN', 'CLOSING')
                         """,
-                        (json.dumps(patch), pid, client_id),
+                        (
+                            json.dumps(patch),
+                            identity.position_id,
+                            identity.client_id,
+                            identity.execution_mode,
+                            identity.contract,
+                        ),
                     )
                     return c.rowcount
 
             rowcount = int(run_with_retry(_update) or 0)
             if rowcount != 1:
-                log.warning("[%s] degraded monitoring clear metadata rowcount=%s pos=%s", pos.ticker, rowcount, pid)
+                log.warning(
+                    "[%s] degraded monitoring clear metadata rowcount=%s pos=%s mode=%s contract=%s",
+                    pos.ticker, rowcount, identity.position_id, identity.execution_mode, identity.contract,
+                )
         except Exception as exc:
             log.warning("[%s] degraded monitoring clear metadata failed pos=%s: %s", pos.ticker, getattr(pos, "position_id", "?"), exc)
 
@@ -2243,15 +2374,29 @@ class APExitEngine:
         next_attempt = current_attempt if retry_exhausted else current_attempt + 1
         next_at = now + timedelta(seconds=float(STALE_EXIT_RETRY_DELAY_SEC))
 
-        broker_truth = self._resolve_broker_open_qty_for_degraded_monitoring(pos)
+        broker_truth = dict(self._resolve_broker_open_qty_for_degraded_monitoring(pos) or {})
         broker_truth_qty = broker_truth.get("broker_truth_open_qty")
-        broker_open = bool(broker_truth.get("is_fresh_exact") and _safe_positive_int(broker_truth_qty) > 0)
-        broker_flat = bool(broker_truth.get("is_fresh_exact") and _safe_positive_int(broker_truth_qty) == 0)
+        truth_state, parsed_broker_qty = _classify_exact_broker_open_qty(broker_truth_qty)
+        fresh_exact = broker_truth.get("is_fresh_exact") is True
+        broker_open = fresh_exact and truth_state == BrokerPositionTruth.OPEN
+        broker_flat = fresh_exact and truth_state == BrokerPositionTruth.FLAT
+        broker_unknown = not fresh_exact or truth_state == BrokerPositionTruth.UNKNOWN
+        broker_truth["broker_truth_state"] = truth_state.value
+        broker_truth["broker_truth_parsed_open_qty"] = parsed_broker_qty
+
+        pos.broker_truth_state = truth_state.value
+        pos.broker_truth_parsed_open_qty = parsed_broker_qty
+
+        exhausted_reason_code = "PROTECTIVE_RETRY_EXHAUSTED_BROKER_OPEN"
+        if broker_unknown and not fresh_exact:
+            exhausted_reason_code = "PROTECTIVE_RETRY_EXHAUSTED_BROKER_TRUTH_UNAVAILABLE"
+        elif broker_unknown:
+            exhausted_reason_code = "PROTECTIVE_RETRY_EXHAUSTED_BROKER_QTY_UNKNOWN"
 
         reason_code = (
             "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
             if broker_flat
-            else "PROTECTIVE_RETRY_EXHAUSTED"
+            else exhausted_reason_code
             if retry_exhausted
             else "PROTECTIVE_MONITORING_DEGRADED_RETRY_OWNED"
         )
@@ -2277,6 +2422,19 @@ class APExitEngine:
         )
         self._apply_retry_intent_to_position(pos, intent, state=state)
         pos.broker_truth_open_qty = broker_truth_qty
+
+        if fresh_exact and truth_state == BrokerPositionTruth.UNKNOWN:
+            self._emit_degraded_critical(
+                pos,
+                "BROKER_TRUTH_QUANTITY_UNKNOWN",
+                "fresh exact broker truth had an unknown or malformed open quantity; broker-flat close is forbidden",
+                extra={
+                    **intent,
+                    "broker_truth": broker_truth,
+                    "broker_truth_state": truth_state.value,
+                    "broker_truth_parsed_open_qty": parsed_broker_qty,
+                },
+            )
 
         persist = self._persist_degraded_monitoring_state(
             pos,
@@ -2320,6 +2478,8 @@ class APExitEngine:
                     "option_quote_state": option_quote_state,
                     "option_quote_age_sec": option_quote_age_sec,
                     "broker_truth": broker_truth,
+                    "broker_truth_state": truth_state.value,
+                    "broker_truth_parsed_open_qty": parsed_broker_qty,
                     "broker_flat_close": close_result.__dict__,
                 },
             )
@@ -2328,7 +2488,7 @@ class APExitEngine:
         if retry_exhausted:
             self._emit_degraded_critical(
                 pos,
-                "PROTECTIVE_RETRY_EXHAUSTED",
+                reason_code,
                 (
                     "stale quote retry exhausted while broker truth still indicates open or is unavailable; "
                     "position remains monitored and reconciliation/emergency paths remain active"
@@ -2336,7 +2496,10 @@ class APExitEngine:
                 extra={
                     **intent,
                     "broker_truth_open_qty": broker_truth_qty,
+                    "broker_truth_state": truth_state.value,
+                    "broker_truth_parsed_open_qty": parsed_broker_qty,
                     "broker_open_override": broker_open,
+                    "broker_truth_unknown": broker_unknown,
                 },
             )
             return False
@@ -2369,7 +2532,10 @@ class APExitEngine:
                 "retry_exhausted": retry_exhausted,
                 "refresh_requested": refresh_requested,
                 "broker_truth_open_qty": broker_truth_qty,
+                "broker_truth_state": truth_state.value,
+                "broker_truth_parsed_open_qty": parsed_broker_qty,
                 "broker_open_override": broker_open,
+                "broker_truth_unknown": broker_unknown,
             },
         )
         log.warning(
