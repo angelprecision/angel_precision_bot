@@ -133,6 +133,7 @@ class APPositionQuoteMonitor:
             "blind_alerts": 0,
             "wakes_sent": 0,
             "wakes_suppressed": 0,
+            "immediate_retry_requests": 0,
             "exits_gated_blind": 0,    # bumped by exit engine when it gates
             "exits_gated_stale": 0,    # bumped by exit engine when it gates
         }
@@ -183,6 +184,22 @@ class APPositionQuoteMonitor:
 
     def note_exit_gated_stale(self) -> None:
         self._metrics["exits_gated_stale"] += 1
+
+    def request_immediate_refresh(self, *symbols: str) -> None:
+        """
+        Ask the quote monitor to retry the next cycle immediately.
+
+        Rate-limit backoff remains authoritative in _fetch_batch_cached(), but
+        requested symbols are evicted from the shared cache so a degraded
+        protective decision cannot wait behind a stale cache entry.
+        """
+        cleaned = {str(s or "").upper().strip() for s in symbols if str(s or "").strip()}
+        if cleaned:
+            with _SHARED_CACHE_LOCK:
+                for sym in cleaned:
+                    _SHARED_CACHE.pop(sym, None)
+        self._metrics["immediate_retry_requests"] += 1
+        self._kick.set()
 
     # ── Health snapshot ──────────────────────────────────────────────────────
     def health_snapshot(self) -> list[dict]:

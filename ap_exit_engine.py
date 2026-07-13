@@ -1104,6 +1104,9 @@ EXIT_RULE_PRIORITY = {code: idx for idx, code in enumerate(EXIT_RULE_PRECEDENCE)
 LOWEST_EXIT_PRIORITY = len(EXIT_RULE_PRIORITY) + 100
 
 STALE_OPTION_QUOTE_MAX_AGE_SEC = int(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
+STALE_EXIT_RETRY_MAX_ATTEMPTS = int(os.getenv("EXIT_STALE_DECISION_RETRY_MAX_ATTEMPTS", "5"))
+STALE_EXIT_RETRY_MAX_AGE_SEC = float(os.getenv("EXIT_STALE_DECISION_RETRY_MAX_AGE_SEC", "30"))
+STALE_EXIT_RETRY_DELAY_SEC = float(os.getenv("EXIT_STALE_DECISION_RETRY_DELAY_SEC", "1"))
 FORCED_RISK_EXIT_CODES = {
     "EOD_FORCE_CLOSE",
     "STOP_HIT",
@@ -1202,6 +1205,13 @@ def _is_option_quote_stale(
 
 def _is_forced_risk_exit_code(code: str) -> bool:
     return (code or "").upper() in FORCED_RISK_EXIT_CODES
+
+
+def _safe_positive_int(value) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except Exception:
+        return 0
 
 
 def _is_protective_exit(reason: str) -> bool:
@@ -1796,6 +1806,285 @@ class APExitEngine:
     def attach_quote_monitor(self, monitor) -> None:
         """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
         self.quote_monitor = monitor
+
+    def _request_immediate_quote_retry(self, pos: ManagedPosition) -> None:
+        qm = getattr(self, "quote_monitor", None)
+        try:
+            if qm is not None and hasattr(qm, "request_immediate_refresh"):
+                qm.request_immediate_refresh(
+                    getattr(pos, "option_symbol", "") or "",
+                    getattr(pos, "ticker", "") or "",
+                )
+                return
+            if qm is not None and hasattr(qm, "kick"):
+                qm.kick()
+                return
+            self._quote_arrived_event.set()
+        except Exception as exc:
+            log.debug("[%s] quote retry request failed: %s", getattr(pos, "ticker", "?"), exc)
+
+    def _persist_degraded_monitoring_state(
+        self,
+        pos: ManagedPosition,
+        *,
+        decision: Optional[ExitDecision],
+        reason_code: str,
+        option_quote_state: str,
+        option_quote_age_sec,
+        retry_count: int,
+        retry_exhausted: bool = False,
+        broker_truth: Optional[dict] = None,
+    ) -> None:
+        pid = str(getattr(pos, "position_id", "") or "")
+        client_id = str(getattr(pos, "client_id", "") or self._email or "")
+        if not pid or not client_id:
+            return
+        try:
+            import json
+            from ap.db import conn, run_with_retry
+
+            patch = {
+                "protective_monitoring_state": "PROTECTIVE_MONITORING_DEGRADED",
+                "protective_monitoring_reason": reason_code,
+                "protective_monitoring_degraded_at": datetime.now(timezone.utc).isoformat(),
+                "log_quieted_only": True,
+                "behavior_quieted": False,
+                "exit_retry_owner": "ap_exit_engine",
+                "exit_retry_reason": reason_code,
+                "exit_retry_decision_code": _classify_exit_decision(decision) if decision is not None else "",
+                "exit_retry_count": int(retry_count),
+                "exit_retry_max_attempts": int(STALE_EXIT_RETRY_MAX_ATTEMPTS),
+                "exit_retry_last_quote_state": option_quote_state,
+                "exit_retry_last_quote_age_sec": option_quote_age_sec,
+                "exit_retry_exhausted": bool(retry_exhausted),
+                "broker_truth": broker_truth or {},
+            }
+
+            def _update():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status IN ('OPEN', 'CLOSING')
+                          AND COALESCE(quantity_remaining, qty, 0) > 0
+                        """,
+                        (json.dumps(patch, default=str), pid, client_id),
+                    )
+                    return c.rowcount
+
+            run_with_retry(_update)
+        except Exception as exc:
+            log.debug("[%s] degraded monitoring state persist failed for pos=%s: %s", pos.ticker, pid, exc)
+
+    def _mark_broker_flat_stale_position(self, pos: ManagedPosition, broker_truth: dict) -> None:
+        pid = str(getattr(pos, "position_id", "") or "")
+        client_id = str(getattr(pos, "client_id", "") or self._email or "")
+        try:
+            pos.closed = True
+            pos.quantity_remaining = 0
+            if pid:
+                self._positions_by_id.pop(pid, None)
+        except Exception:
+            pass
+        if not pid or not client_id:
+            return
+        try:
+            import json
+            from ap.db import conn, run_with_retry
+
+            patch = {
+                "synthetic_position_stale_broker_flat": True,
+                "stale_marked_at": datetime.now(timezone.utc).isoformat(),
+                "broker_truth_open_qty": 0,
+                "exit_circuit_breaker_broker_truth": broker_truth,
+                "stale_source": "protective_monitoring_degraded",
+                "protective_monitoring_state": "BROKER_FLAT_REMOVED",
+            }
+
+            def _update():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET status = 'CLOSED',
+                            quantity_remaining = 0,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status NOT IN ('CLOSED', 'EXPIRED')
+                        """,
+                        (json.dumps(patch, default=str), pid, client_id),
+                    )
+                    return c.rowcount
+
+            run_with_retry(_update)
+        except Exception as exc:
+            log.warning("[%s] broker-flat stale close failed for pos=%s: %s", pos.ticker, pid, exc)
+
+    def _clear_degraded_monitoring_state(self, pos: ManagedPosition) -> None:
+        if getattr(pos, "protective_monitoring_state", "") != "PROTECTIVE_MONITORING_DEGRADED":
+            return
+        try:
+            pos.protective_monitoring_state = ""
+            pos.exit_retry_owner = ""
+            pos.exit_retry_reason = ""
+            pos.exit_retry_decision_code = ""
+            pos.exit_retry_count = 0
+            pos.exit_retry_requested_at = None
+            pos.exit_retry_first_requested_at = None
+            pos.exit_retry_at = None
+            pos.exit_retry_last_error = ""
+        except Exception:
+            pass
+
+    def _resolve_broker_open_qty_for_degraded_monitoring(self, pos: ManagedPosition) -> dict:
+        try:
+            from ap.exit_safety import resolve_exit_broker_truth
+            result = resolve_exit_broker_truth(
+                broker=getattr(self, "broker", None),
+                client_id=str(getattr(pos, "client_id", "") or self._email or ""),
+                contract=str(getattr(pos, "option_symbol", "") or ""),
+            )
+            return dict(result or {})
+        except Exception as exc:
+            return {
+                "is_fresh_exact": False,
+                "broker_truth_open_qty": None,
+                "audit": {"error": str(exc), "source": "degraded_monitoring_probe"},
+            }
+
+    def _own_stale_exit_retry(
+        self,
+        pos: ManagedPosition,
+        decision: ExitDecision,
+        *,
+        option_quote_state: str,
+        option_quote_age_sec,
+        stage: str,
+    ) -> bool:
+        """
+        Convert stale quote behavioral suppression into explicit retry ownership.
+
+        Returns True when broker truth confirms the position is flat and normal
+        local stale-position handling should take over. Otherwise the position
+        remains monitored and the next quote/reconciler cycle owns recovery.
+        """
+        now = datetime.now(timezone.utc)
+        first_requested = getattr(pos, "exit_retry_first_requested_at", None)
+        if not isinstance(first_requested, datetime):
+            first_requested = now
+            pos.exit_retry_first_requested_at = first_requested
+        try:
+            retry_age = max(0.0, (now - first_requested).total_seconds())
+        except Exception:
+            retry_age = 0.0
+
+        retry_count = int(getattr(pos, "exit_retry_count", 0) or 0) + 1
+        retry_exhausted = (
+            retry_count > STALE_EXIT_RETRY_MAX_ATTEMPTS
+            or retry_age > STALE_EXIT_RETRY_MAX_AGE_SEC
+        )
+        broker_truth = self._resolve_broker_open_qty_for_degraded_monitoring(pos)
+        broker_truth_qty = broker_truth.get("broker_truth_open_qty")
+        broker_open = bool(broker_truth.get("is_fresh_exact") and _safe_positive_int(broker_truth_qty) > 0)
+        broker_flat = bool(broker_truth.get("is_fresh_exact") and _safe_positive_int(broker_truth_qty) == 0)
+
+        pos.protective_monitoring_state = "PROTECTIVE_MONITORING_DEGRADED"
+        pos.behavior_quieted = False
+        pos.log_quieted = True
+        pos.exit_retry_owner = "ap_exit_engine"
+        pos.exit_retry_reason = "stale_option_quote"
+        pos.exit_retry_decision_code = _classify_exit_decision(decision)
+        pos.exit_retry_requested_at = now
+        pos.exit_retry_at = now.timestamp() + STALE_EXIT_RETRY_DELAY_SEC
+        pos.exit_retry_count = retry_count
+        pos.exit_retry_max_attempts = STALE_EXIT_RETRY_MAX_ATTEMPTS
+        pos.exit_retry_last_quote_state = option_quote_state
+        pos.exit_retry_last_quote_age_sec = option_quote_age_sec
+        pos.exit_retry_last_error = "" if not retry_exhausted else "stale_exit_retry_exhausted"
+        pos.broker_truth_open_qty = broker_truth_qty
+
+        reason_code = (
+            "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+            if broker_flat
+            else "PROTECTIVE_MONITORING_DEGRADED_RETRY_EXHAUSTED"
+            if retry_exhausted
+            else "PROTECTIVE_MONITORING_DEGRADED_RETRY_OWNED"
+        )
+        self._persist_degraded_monitoring_state(
+            pos,
+            decision=decision,
+            reason_code=reason_code,
+            option_quote_state=option_quote_state,
+            option_quote_age_sec=option_quote_age_sec,
+            retry_count=retry_count,
+            retry_exhausted=retry_exhausted,
+            broker_truth=broker_truth,
+        )
+        self._request_immediate_quote_retry(pos)
+
+        if broker_flat:
+            self._mark_broker_flat_stale_position(pos, broker_truth)
+            self._emit_exit_event(
+                pos,
+                decision="REJECT",
+                reason_code=reason_code,
+                explanation="Fresh exact broker truth is flat; local stale position may be removed by normal stale-close handling.",
+                stage=stage,
+                extra_inputs={
+                    "decision_action": decision.action,
+                    "decision_qty": decision.quantity,
+                    "decision_reason_code": _classify_exit_decision(decision),
+                    "option_quote_state": option_quote_state,
+                    "option_quote_age_sec": option_quote_age_sec,
+                    "broker_truth": broker_truth,
+                },
+            )
+            return True
+
+        self._emit_exit_event(
+            pos,
+            decision="HOLD",
+            reason_code=reason_code,
+            explanation=(
+                "Stale option quote moved to PROTECTIVE_MONITORING_DEGRADED with owned retry; "
+                "quote polling, broker reconciliation, stop evaluation, and emergency exits remain active."
+            ),
+            stage=stage,
+            extra_inputs={
+                "decision_action": decision.action,
+                "decision_qty": decision.quantity,
+                "decision_pnl_pct": decision.pnl_pct,
+                "decision_reason_code": _classify_exit_decision(decision),
+                "option_quote_state": option_quote_state,
+                "option_quote_age_sec": option_quote_age_sec,
+                "exit_retry_owner": "ap_exit_engine",
+                "exit_retry_count": retry_count,
+                "exit_retry_max_attempts": STALE_EXIT_RETRY_MAX_ATTEMPTS,
+                "retry_exhausted": retry_exhausted,
+                "broker_truth_open_qty": broker_truth_qty,
+                "broker_open_override": broker_open,
+            },
+        )
+        log.warning(
+            "[%s] PROTECTIVE_MONITORING_DEGRADED | pos_id=%s code=%s quote_state=%s age=%s "
+            "retry=%d/%d broker_truth_open_qty=%s exhausted=%s",
+            pos.ticker,
+            getattr(pos, "position_id", "") or "?",
+            _classify_exit_decision(decision),
+            option_quote_state,
+            option_quote_age_sec,
+            retry_count,
+            STALE_EXIT_RETRY_MAX_ATTEMPTS,
+            broker_truth_qty,
+            retry_exhausted,
+        )
+        return False
 
     def apply_quote_snapshots(self, snapshots: list[dict]) -> None:
         """
@@ -4446,32 +4735,6 @@ class APExitEngine:
                     if decision.should_act:
                         option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
                         if option_quote_stale and not _is_forced_risk_exit_code(decision.reason_code):
-                            self._emit_exit_event(
-                                pos, decision="HOLD",
-                                reason_code="OPTION_QUOTE_STALE_DECISION_SUPPRESSED",
-                                explanation=(
-                                    f"Suppressed {decision.reason_code} before submit queue because option quote is not fresh: "
-                                    f"{option_quote_state} age={option_quote_age_sec}"
-                                ),
-                                stage="exit_decision",
-                                extra_inputs={
-                                    "decision_action": decision.action,
-                                    "decision_qty": decision.quantity,
-                                    "decision_pnl_pct": decision.pnl_pct,
-                                    "decision_reason_code": decision.reason_code,
-                                    "option_quote_state": option_quote_state,
-                                    "option_quote_age_sec": option_quote_age_sec,
-                                    "last_option_quote_update_ts": (
-                                        pos.last_option_quote_update_ts.isoformat()
-                                        if getattr(pos, "last_option_quote_update_ts", None) else ""
-                                    ),
-                                },
-                            )
-                            log.error(
-                                "[%s] EXIT DECISION SUPPRESSED: stale option quote | code=%s age=%s state=%s pos_id=%s",
-                                pos.ticker, decision.reason_code, option_quote_age_sec,
-                                option_quote_state, pos.position_id or "?",
-                            )
                             qm = getattr(self, "quote_monitor", None)
                             if qm is not None:
                                 qpm_state = getattr(pos, "quote_state", "")
@@ -4479,10 +4742,19 @@ class APExitEngine:
                                     qm.note_exit_gated_blind()
                                 elif hasattr(qm, "note_exit_gated_stale"):
                                     qm.note_exit_gated_stale()
+                            self._own_stale_exit_retry(
+                                pos,
+                                decision,
+                                option_quote_state=option_quote_state,
+                                option_quote_age_sec=option_quote_age_sec,
+                                stage="exit_decision",
+                            )
                             continue
 
                         if option_quote_stale and _is_forced_risk_exit_code(decision.reason_code):
                             decision.reason = f"{decision.reason} | DEGRADED_QUOTE_MODE:{option_quote_state}"
+                        else:
+                            self._clear_degraded_monitoring_state(pos)
 
                         # ── PR #176: LIVE_DEGRADED_SOFT_EXIT_GUARD ────────────────────────────
                         # Last line of defence before any live broker exit submission.
@@ -4864,30 +5136,12 @@ class APExitEngine:
 
             option_quote_stale, option_quote_age_sec, option_quote_state = _is_option_quote_stale(pos, now_utc)
             if option_quote_stale and not _is_forced_risk_exit_code(decision.reason_code):
-                self._emit_exit_event(
-                    pos, decision="REJECT",
-                    reason_code="OPTION_QUOTE_STALE_BLOCK",
-                    explanation=(
-                        f"Blocked {decision.reason_code} because option quote is not fresh: "
-                        f"{option_quote_state} age={option_quote_age_sec}"
-                    ),
+                self._own_stale_exit_retry(
+                    pos,
+                    decision,
+                    option_quote_state=option_quote_state,
+                    option_quote_age_sec=option_quote_age_sec,
                     stage="exit_submission",
-                    extra_inputs={
-                        "decision_action": decision.action,
-                        "decision_qty": decision.quantity,
-                        "decision_reason_code": decision.reason_code,
-                        "option_quote_state": option_quote_state,
-                        "option_quote_age_sec": option_quote_age_sec,
-                        "last_option_quote_update_ts": (
-                            pos.last_option_quote_update_ts.isoformat()
-                            if getattr(pos, "last_option_quote_update_ts", None) else ""
-                        ),
-                    },
-                )
-                log.error(
-                    "[%s] EXIT BLOCKED: stale option quote | code=%s age=%s state=%s pos_id=%s",
-                    ticker, decision.reason_code, option_quote_age_sec,
-                    option_quote_state, pos.position_id or "?",
                 )
                 return False
 
@@ -4913,6 +5167,8 @@ class APExitEngine:
                     ticker, decision.reason_code, option_quote_age_sec,
                     option_quote_state, pos.position_id or "?",
                 )
+            else:
+                self._clear_degraded_monitoring_state(pos)
 
             if kill_active and KILL_BLOCKS_NON_PROTECTIVE_EXITS and not _is_protective_exit(decision.reason or ""):
                 self._emit_exit_event(
