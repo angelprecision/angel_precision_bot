@@ -18,6 +18,8 @@ from ap.intelligence_context_materializer import (  # noqa: E402
 )
 from ap.intelligence_evaluation import (  # noqa: E402
     build_breach_intelligence_payload,
+    build_contract_selected_intelligence_payload,
+    dispatch_contract_selected_intelligence_snapshot,
     dispatch_breach_intelligence_snapshot,
 )
 from ap.intelligence_market_data import extract_underlying_price  # noqa: E402
@@ -875,4 +877,215 @@ def test_breach_dispatch_seam_after_plan_recovery_before_hydration():
     )
     assert body.index("dispatch_breach_intelligence_snapshot") < body.index(
         "_refresh_hydrated_prebreach_plan"
+    )
+
+
+def _write_breach_parent():
+    return write_snapshot(
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        signal_id="sig-123",
+        local_order_id="loid-1",
+        phase="BREACH",
+        context_revision=1,
+        input_hash="breach-hash",
+        config_hash="cfg",
+        git_commit="git",
+        data_as_of="2026-07-10T14:35:00+00:00",
+        status="COMPLETE",
+        payload={
+            "phase": "BREACH",
+            "profile_version": "intelligence_context_v1_observe_only",
+            "profile_status": "COMPLETE",
+            "setup_score": 78.0,
+            "setup_grade": "B",
+            "component_statuses": {"geometry": "AVAILABLE", "breach_quote": "AVAILABLE"},
+            "hard_safety_blocks": [],
+            "strategy_advisories": [],
+            "data_quality_warnings": [],
+        },
+    )
+
+
+def _contract_order_row(**overrides):
+    row = {
+        "local_order_id": "loid-1",
+        "client_id": "client@example.com",
+        "execution_mode": "PAPER",
+        "canonical_signal_id": "canon-123",
+        "signal_id": "sig-123",
+        "symbol": "SPY",
+        "direction": "CALL",
+        "contract": "SPY260717C00600000",
+        "limit_price": 2.15,
+        "qty": 1,
+        "reserved_cost": 215.0,
+        "meta": {
+            "broker_ready": True,
+            "selected_contract": "SPY260717C00600000",
+            "selected_limit": 2.15,
+            "selected_qty": 1,
+            "selected_bid": 2.10,
+            "selected_ask": 2.15,
+            "selected_mid": 2.125,
+            "selected_expiration": "2026-07-17",
+            "selected_dte": 7,
+            "selected_strike": 600.0,
+            "selected_delta": 0.42,
+            "selected_open_interest": 1200,
+            "selected_volume": 300,
+            "selected_iv": 0.25,
+            "underlying_price": 602.5,
+            "quote_source": "tradier_live",
+            "quote_timestamp": "2026-07-10T14:35:01+00:00",
+            "selector_effective_budget": 500.0,
+            "materialization_generation": 3,
+            "selector_diagnostics": {
+                "candidates_considered": 12,
+                "rejected_candidate_reasons": {"SPREAD_TOO_WIDE": 2},
+            },
+        },
+    }
+    row.update(overrides)
+    return row
+
+
+def test_contract_selected_payload_uses_durable_order_contract_price_and_qty():
+    breach = _write_breach_parent()
+    payload = build_contract_selected_intelligence_payload(
+        signal=_signal(),
+        plan=types.SimpleNamespace(
+            metadata={"score_audit": {}},
+            execution_mode="PAPER",
+            client_id="client@example.com",
+            ticker="SPY",
+            side="CALL",
+            signal_id="sig-123",
+            contract_symbol="SPY260717C00600000",
+            limit_price=2.15,
+            contracts=1,
+        ),
+        order_row=_contract_order_row(),
+        breach_snapshot=get_latest_snapshot(
+            client_id="client@example.com", execution_mode="PAPER",
+            canonical_signal_id="canon-123", phase="BREACH",
+        )["snapshot"],
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+    )
+    assert payload["phase"] == "CONTRACT_SELECTED"
+    assert payload["profile_status"] == "COMPLETE"
+    assert payload["parent_snapshot_ids"]["BREACH"] == breach["snapshot_id"]
+    assert payload["contract_evidence"]["OCC symbol"] == "SPY260717C00600000"
+    assert payload["contract_evidence"]["selected execution price"] == 2.15
+    assert payload["contract_evidence"]["quantity"] == 1
+    assert payload["contract_evidence"]["candidate audit"]["candidates_considered"] == 12
+    assert payload["contract_evidence"]["expected move"]["status"] == "AVAILABLE"
+
+
+def test_contract_selected_mismatch_or_placeholder_creates_no_successful_snapshot():
+    _write_breach_parent()
+    plan = types.SimpleNamespace(
+        metadata={"score_audit": {}},
+        execution_mode="PAPER",
+        client_id="client@example.com",
+        ticker="SPY",
+        side="CALL",
+        signal_id="sig-123",
+        contract_symbol="SPY260717C00600000",
+        limit_price=2.15,
+        contracts=1,
+    )
+    result = dispatch_contract_selected_intelligence_snapshot(
+        _signal(),
+        plan=plan,
+        order_row=_contract_order_row(contract="DEFERRED:SPY", limit_price=0.01),
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+    )
+    assert result["ok"] is False
+    assert result["snapshot_id"] == ""
+    assert "invalid_occ_symbol" in result["payload"]["hard_safety_blocks"]
+    assert "invalid_selected_price" in result["payload"]["hard_safety_blocks"]
+    assert get_latest_snapshot(
+        client_id="client@example.com", execution_mode="PAPER",
+        canonical_signal_id="canon-123", phase="CONTRACT_SELECTED",
+    )["snapshot"] is None
+
+
+def test_contract_selected_missing_iv_keeps_expected_move_unavailable_and_idempotent():
+    _write_breach_parent()
+    plan = types.SimpleNamespace(
+        metadata={"score_audit": {}},
+        execution_mode="PAPER",
+        client_id="client@example.com",
+        ticker="SPY",
+        side="CALL",
+        signal_id="sig-123",
+        contract_symbol="SPY260717C00600000",
+        limit_price=2.15,
+        contracts=1,
+    )
+    row = _contract_order_row()
+    row["meta"].pop("selected_iv")
+    order_meta = {}
+    first = dispatch_contract_selected_intelligence_snapshot(
+        _signal(),
+        plan=plan,
+        order_row=row,
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        order_meta_writer=lambda _loid, patch: order_meta.update(patch),
+    )
+    second = dispatch_contract_selected_intelligence_snapshot(
+        _signal(),
+        plan=plan,
+        order_row=row,
+        client_id="client@example.com",
+        execution_mode="PAPER",
+        canonical_signal_id="canon-123",
+        local_order_id="loid-1",
+        order_meta_writer=lambda _loid, patch: order_meta.update(patch),
+    )
+    assert first["ok"] is True
+    assert second["duplicate"] is True
+    assert second["snapshot_id"] == first["snapshot_id"]
+    assert first["payload"]["contract_evidence"]["expected move"] == {
+        "status": "UNAVAILABLE",
+        "reason": "real_iv_missing",
+    }
+    assert plan.metadata["intelligence_evaluation"]["contract_snapshot_id"] == first["snapshot_id"]
+    assert order_meta["intelligence_evaluation"]["contract_snapshot_id"] == first["snapshot_id"]
+
+
+def test_contract_selected_source_has_no_selector_chain_or_wait_calls():
+    source = (REPO_ROOT / "ap" / "intelligence_evaluation.py").read_text()
+    start = source.index("def dispatch_contract_selected_intelligence_snapshot")
+    end = source.index("\n# ─", start)
+    contract_src = source[start:end]
+    forbidden = [
+        "select_contract", "option_chain", "get_option", "Future.result",
+        ".result(", "sleep(", "place_order", "submit_existing_entry(",
+    ]
+    for token in forbidden:
+        assert token not in contract_src
+
+
+def test_contract_selected_seam_after_copyback_before_submit_existing_entry():
+    source = (REPO_ROOT / "ap_execution_core.py").read_text()
+    fn_start = source.index("def _on_entry_trigger(")
+    fn_end = source.find("\n    def ", fn_start + 100)
+    body = source[fn_start:fn_end]
+    assert body.index("persist_deferred_broker_ready") < body.index(
+        "dispatch_contract_selected_intelligence_snapshot"
+    )
+    assert body.index("dispatch_contract_selected_intelligence_snapshot") < body.index(
+        "submit_res = self.order_state_machine.submit_existing_entry("
     )

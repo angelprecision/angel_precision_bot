@@ -1125,6 +1125,322 @@ def dispatch_breach_intelligence_snapshot(
     }
 
 
+def _order_meta_from_row(order_row: dict[str, Any]) -> dict[str, Any]:
+    meta = (order_row or {}).get("meta") or (order_row or {}).get("metadata") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _looks_like_real_occ(symbol: str) -> bool:
+    raw = str(symbol or "").strip().upper()
+    if not raw or raw.startswith("DEFERRED:"):
+        return False
+    return any(ch.isdigit() for ch in raw) and ("C" in raw or "P" in raw)
+
+
+def _compact_contract_pointer(payload: dict[str, Any], snapshot_id: str) -> dict[str, Any]:
+    return {
+        "latest_snapshot_id": snapshot_id,
+        "breach_snapshot_id": (payload.get("parent_snapshot_ids") or {}).get("BREACH"),
+        "contract_snapshot_id": snapshot_id,
+        "setup_score": payload.get("setup_score"),
+        "execution_score": payload.get("execution_score"),
+        "phase_statuses": payload.get("phase_statuses") or {},
+        "observe_only": True,
+    }
+
+
+def _write_compact_contract_pointer(
+    *,
+    plan: Any,
+    local_order_id: str,
+    payload: dict[str, Any],
+    snapshot_id: str,
+    order_meta_writer: Any = None,
+) -> None:
+    pointer = _compact_contract_pointer(payload, snapshot_id)
+    try:
+        meta = getattr(plan, "metadata", None)
+        if isinstance(meta, dict):
+            meta["intelligence_evaluation"] = pointer
+            score_audit = meta.setdefault("score_audit", {})
+            if isinstance(score_audit, dict):
+                score_audit["intelligence_evaluation"] = pointer
+    except Exception:
+        pass
+    try:
+        if callable(order_meta_writer) and local_order_id:
+            order_meta_writer(str(local_order_id), {"intelligence_evaluation": pointer})
+    except Exception:
+        pass
+
+
+def build_contract_selected_intelligence_payload(
+    *,
+    signal: dict[str, Any],
+    plan: Any,
+    order_row: dict[str, Any],
+    breach_snapshot: Optional[dict[str, Any]],
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    context_revision: int = 1,
+    profile_version: str = "",
+) -> dict[str, Any]:
+    from ap.intelligence_snapshot_store import DEFAULT_PROFILE_VERSION, normalize_execution_mode
+
+    sig = dict(signal or {})
+    meta = _order_meta_from_row(order_row)
+    profile_version = str(profile_version or DEFAULT_PROFILE_VERSION)
+    mode = normalize_execution_mode(execution_mode)
+    row_contract = str(order_row.get("contract") or meta.get("selected_contract") or "").strip()
+    row_price = _as_float(order_row.get("limit_price") or meta.get("selected_limit") or meta.get("selected_limit_price"))
+    try:
+        row_qty = int(order_row.get("qty") or meta.get("selected_qty") or 0)
+    except (TypeError, ValueError):
+        row_qty = 0
+    ticker = str(order_row.get("symbol") or sig.get("ticker") or sig.get("symbol") or _plan_attr(plan, "ticker", "symbol") or "").upper()
+    side = str(order_row.get("direction") or sig.get("side") or sig.get("direction") or _plan_attr(plan, "side", "direction") or "").upper()
+    warnings: list[str] = []
+    errors: list[str] = []
+    plan_contract = str(_plan_attr(plan, "contract_symbol", "contract") or "").strip()
+    plan_price = _as_float(_plan_attr(plan, "limit_price"))
+    try:
+        plan_qty = int(_plan_attr(plan, "contracts", "qty") or 0)
+    except (TypeError, ValueError):
+        plan_qty = 0
+    identity_checks = {
+        "client_id": (order_row.get("client_id") or meta.get("client_id"), client_id),
+        "execution_mode": (order_row.get("execution_mode") or meta.get("execution_mode"), mode),
+        "canonical_signal_id": (
+            order_row.get("canonical_signal_id") or meta.get("canonical_signal_id"),
+            canonical_signal_id,
+        ),
+        "local_order_id": (order_row.get("local_order_id"), local_order_id),
+        "ticker": (ticker, str(sig.get("ticker") or sig.get("symbol") or _plan_attr(plan, "ticker", "symbol") or "").upper()),
+        "side": (side, str(sig.get("side") or sig.get("direction") or _plan_attr(plan, "side", "direction") or "").upper()),
+        "contract": (row_contract, plan_contract or row_contract),
+        "price": (row_price, plan_price if plan_price is not None else row_price),
+        "quantity": (row_qty, plan_qty or row_qty),
+    }
+    for field, (actual, expected) in identity_checks.items():
+        if str(actual or "").strip().upper() != str(expected or "").strip().upper():
+            if field == "price":
+                try:
+                    if abs(float(actual) - float(expected)) <= 0.0001:
+                        continue
+                except Exception:
+                    pass
+            errors.append(f"{field}_mismatch")
+    if not _looks_like_real_occ(row_contract):
+        errors.append("invalid_occ_symbol")
+    if row_price is None or row_price <= 0.01:
+        errors.append("invalid_selected_price")
+    if row_qty <= 0:
+        errors.append("invalid_selected_quantity")
+    broker_ready = meta.get("broker_ready")
+    if broker_ready is not True and str(meta.get("materialization_entry_path") or ""):
+        errors.append("broker_ready_not_true")
+
+    breach_payload = _snapshot_payload(breach_snapshot)
+    if not breach_snapshot:
+        warnings.append("BREACH missing")
+    component_statuses = dict(breach_payload.get("component_statuses") or {})
+    component_statuses["selected_contract"] = "AVAILABLE" if not errors else "ERROR"
+    component_statuses["expected_move"] = "AVAILABLE" if meta.get("selected_iv") or meta.get("atm_iv") else "MISSING"
+
+    iv = _as_float(meta.get("selected_iv") or meta.get("iv") or meta.get("atm_iv"))
+    dte = _as_float(meta.get("selected_dte") or meta.get("dte"))
+    underlying_price = _as_float(meta.get("underlying_price") or meta.get("current_underlying_price"))
+    expected_move = {
+        "status": "UNAVAILABLE",
+        "reason": "real_iv_missing",
+    }
+    if iv is not None and dte is not None and underlying_price is not None and dte > 0:
+        expected_move = {
+            "status": "AVAILABLE",
+            "underlying_price": underlying_price,
+            "IV": iv,
+            "DTE": dte,
+            "source": meta.get("quote_source") or meta.get("selector_quote_source") or "",
+            "quote_timestamp": meta.get("quote_timestamp") or meta.get("selected_quote_at"),
+            "one_sigma_move": underlying_price * iv * ((dte / 365.0) ** 0.5),
+        }
+
+    bid = _as_float(meta.get("selected_bid") or meta.get("bid"))
+    ask = _as_float(meta.get("selected_ask") or meta.get("ask"))
+    mid = _as_float(meta.get("selected_mid") or meta.get("mid"))
+    spread_dollars = (ask - bid) if ask is not None and bid is not None else None
+    spread_percent = (spread_dollars / mid) if spread_dollars is not None and mid else None
+    execution_score = None
+    if not errors and spread_percent is not None:
+        execution_score = max(0.0, min(100.0, 100.0 - (spread_percent * 100.0)))
+    payload = {
+        "profile_version": profile_version,
+        "phase": "CONTRACT_SELECTED",
+        "context_revision": int(context_revision or 1),
+        "client_id": str(client_id or ""),
+        "execution_mode": mode,
+        "canonical_signal_id": str(canonical_signal_id or ""),
+        "signal_id": str(sig.get("signal_id") or order_row.get("signal_id") or _plan_attr(plan, "signal_id") or ""),
+        "local_order_id": str(local_order_id or ""),
+        "ticker": ticker,
+        "side": side,
+        "profile_status": "ERROR" if errors else "COMPLETE",
+        "phase_statuses": {
+            "BREACH": breach_payload.get("profile_status") or ("MISSING" if not breach_snapshot else "UNKNOWN"),
+            "CONTRACT_SELECTED": "ERROR" if errors else "COMPLETE",
+        },
+        "setup_score": breach_payload.get("setup_score"),
+        "setup_grade": breach_payload.get("setup_grade"),
+        "execution_score": execution_score,
+        "execution_grade": _grade_from_score(execution_score),
+        "component_statuses": component_statuses,
+        "hard_safety_blocks": list(breach_payload.get("hard_safety_blocks") or []) + errors,
+        "strategy_advisories": list(breach_payload.get("strategy_advisories") or []),
+        "data_quality_warnings": sorted(set(list(breach_payload.get("data_quality_warnings") or []) + warnings)),
+        "parent_snapshot_ids": {"BREACH": (breach_snapshot or {}).get("id")},
+        "contract_evidence": {
+            "OCC symbol": row_contract,
+            "underlying ticker": ticker,
+            "CALL/PUT": side,
+            "expiration": meta.get("selected_expiration") or meta.get("expiration"),
+            "DTE": meta.get("selected_dte") or meta.get("dte"),
+            "strike": meta.get("selected_strike") or meta.get("strike"),
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "selected execution price": row_price,
+            "quote timestamp": meta.get("quote_timestamp") or meta.get("selected_quote_at"),
+            "quote source": meta.get("quote_source") or meta.get("selector_quote_source"),
+            "quote age": meta.get("quote_age_ms") or meta.get("quote_age_seconds"),
+            "spread dollars": spread_dollars,
+            "spread percent": spread_percent,
+            "delta": meta.get("selected_delta") or meta.get("delta"),
+            "gamma": meta.get("selected_gamma") or meta.get("gamma"),
+            "theta": meta.get("selected_theta") or meta.get("theta"),
+            "IV": iv,
+            "open interest": meta.get("selected_open_interest") or meta.get("open_interest"),
+            "option volume": meta.get("selected_volume") or meta.get("volume"),
+            "underlying price": underlying_price,
+            "ATM IV": meta.get("atm_iv"),
+            "expected move": expected_move,
+            "premium per contract": row_price * 100.0 if row_price is not None else None,
+            "quantity": row_qty,
+            "estimated total debit": row_price * row_qty * 100.0 if row_price is not None else None,
+            "reserved cost": order_row.get("reserved_cost") or meta.get("selected_reserved_cost"),
+            "selector budget": meta.get("selector_effective_budget") or meta.get("selector_budget"),
+            "remaining client capacity": meta.get("remaining_client_capacity"),
+            "candidate count": (meta.get("selector_diagnostics") or {}).get("candidates_considered"),
+            "candidate rejection counts": (meta.get("selector_diagnostics") or {}).get("rejected_candidate_reasons"),
+            "candidate audit": meta.get("selector_diagnostics") or meta.get("selector_candidate_audit"),
+            "expiration-policy match": meta.get("expiration_policy_match"),
+            "strike-policy match": meta.get("strike_policy_match"),
+            "distance to target strike": meta.get("distance_to_target_strike"),
+            "broker_ready": broker_ready,
+            "durable order revision/version": meta.get("materialization_generation") or meta.get("revision"),
+        },
+        "observe_only": True,
+        "affected_eligibility": False,
+        "compatibility_key": "intelligence_evaluation",
+        "computed_at": _now_iso(),
+    }
+    payload["input_hash"] = _stable_payload_hash({
+        "phase": "CONTRACT_SELECTED",
+        "client_id": client_id,
+        "execution_mode": mode,
+        "canonical_signal_id": canonical_signal_id,
+        "local_order_id": local_order_id,
+        "context_revision": int(context_revision or 1),
+        "contract": row_contract,
+        "price": row_price,
+        "quantity": row_qty,
+        "order_revision": payload["contract_evidence"]["durable order revision/version"],
+    })
+    payload["config_hash"] = _config_hash({"profile_version": profile_version, "phase": "CONTRACT_SELECTED"})
+    payload["git_commit"] = _CACHED_GIT_COMMIT
+    return payload
+
+
+def dispatch_contract_selected_intelligence_snapshot(
+    signal: dict[str, Any],
+    *,
+    plan: Any,
+    order_row: dict[str, Any],
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    local_order_id: str,
+    order_meta_writer: Any = None,
+) -> dict[str, Any]:
+    from ap.intelligence_snapshot_store import (
+        DEFAULT_PROFILE_VERSION,
+        get_latest_snapshot,
+        normalize_execution_mode,
+        write_snapshot,
+    )
+
+    mode = normalize_execution_mode(execution_mode)
+    breach = get_latest_snapshot(
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        phase="BREACH",
+    )
+    payload = build_contract_selected_intelligence_payload(
+        signal=dict(signal or {}),
+        plan=plan,
+        order_row=dict(order_row or {}),
+        breach_snapshot=breach.get("snapshot") if breach.get("ok") else None,
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        local_order_id=local_order_id,
+        context_revision=1,
+        profile_version=DEFAULT_PROFILE_VERSION,
+    )
+    if payload["profile_status"] == "ERROR":
+        return {"ok": False, "snapshot_id": "", "payload": MappingProxyType(copy.deepcopy(payload)), "error": "contract_selected_identity_or_value_error"}
+    persisted = write_snapshot(
+        client_id=client_id,
+        execution_mode=mode,
+        canonical_signal_id=canonical_signal_id,
+        signal_id=str(payload.get("signal_id") or ""),
+        local_order_id=local_order_id,
+        phase="CONTRACT_SELECTED",
+        context_revision=1,
+        profile_version=DEFAULT_PROFILE_VERSION,
+        parent_snapshot_id=(payload.get("parent_snapshot_ids") or {}).get("BREACH"),
+        input_hash=str(payload.get("input_hash") or ""),
+        config_hash=str(payload.get("config_hash") or ""),
+        git_commit=str(payload.get("git_commit") or ""),
+        data_as_of=payload.get("computed_at"),
+        status=str(payload.get("profile_status") or "COMPLETE"),
+        payload=payload,
+    )
+    snapshot_id = str(persisted.get("snapshot_id") or "")
+    if snapshot_id:
+        _write_compact_contract_pointer(
+            plan=plan,
+            local_order_id=local_order_id,
+            payload=payload,
+            snapshot_id=snapshot_id,
+            order_meta_writer=order_meta_writer,
+        )
+    return {
+        "ok": bool(persisted.get("ok")),
+        "snapshot_id": snapshot_id,
+        "duplicate": bool(persisted.get("duplicate")),
+        "payload": MappingProxyType(copy.deepcopy(payload)),
+        "error": persisted.get("error"),
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Req 2: Safe plan accessor — handles both object and dict approved plans
 # ─────────────────────────────────────────────────────────────────────────────
