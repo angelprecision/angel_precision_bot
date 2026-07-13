@@ -5414,6 +5414,37 @@ class APExecutionCore:
                 _terminalize_breach_failure(_inv_err)
                 return
 
+            # ── Intelligence PR 3: CONTRACT_SELECTED durable evidence ───────
+            # Only after selector success was copied into the durable row and
+            # the order-row proof read succeeded. Evidence is read from
+            # `_order_row_raw`, not from the in-memory selector object, and is
+            # observe-only: failure here must never block submit or cleanup.
+            try:
+                from ap.intelligence_evaluation import (
+                    dispatch_contract_selected_intelligence_snapshot as _dispatch_contract_intel,
+                )
+                if isinstance(_order_row_raw, dict):
+                    _dispatch_contract_intel(
+                        sig,
+                        plan=approved_plan,
+                        order_row=_order_row_raw,
+                        client_id=str(_proof_client_id or _breach_client_id or ""),
+                        execution_mode=str(_proof_execution_mode or ""),
+                        canonical_signal_id=str(
+                            sig.get("canonical_signal_id")
+                            or getattr(approved_plan, "canonical_signal_id", "")
+                            or signal_id
+                            or ""
+                        ),
+                        local_order_id=str(queue_local_order_id or ""),
+                        order_meta_writer=getattr(self.order_state_machine, "update_order_meta", None),
+                    )
+            except Exception as _contract_intel_exc:
+                log.debug(
+                    "[%s] contract-selected intelligence dispatch non-critical: %s",
+                    ticker, _contract_intel_exc,
+                )
+
             if (not _pre_contract) or _pre_contract.upper().startswith("DEFERRED:"):
                 _inv_err = "DEFERRED_CONTRACT_NOT_MATERIALIZED"
                 log.critical(
