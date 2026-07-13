@@ -258,8 +258,6 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 if new_state == WatchState.TRIGGERED:
                     if open_protect_active and w.ticker in self._open_trigger_tickers:
                         w.state = WatchState.EXPIRED
-                        w._release_dedup_key()
-                        terminal_done.append(w)
                         audit = self._build_watcher_audit_payload(
                             w,
                             trigger_type="open_protection",
@@ -271,6 +269,8 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                             raw_reason="ticker_already_triggered_inside_open_protect_window",
                             extra={"open_protect_active": True},
                         )
+                        w._pending_audit = audit
+                        terminal_done.append(w)
                         open_protection_audits.append((w, audit))
                         _base.log.info(
                             "[%s] OPEN_PROTECTION_BLOCK — ticker already triggered at open",
@@ -283,9 +283,6 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                         triggered.append(w)
                 elif new_state in (WatchState.EXPIRED, WatchState.INVALIDATED):
                     terminal_done.append(w)
-
-            terminal_ids = {id(w) for w in terminal_done}
-            self._pending = [w for w in self._pending if id(w) not in terminal_ids]
 
         for w, audit in quote_missing_audits:
             self._persist_watcher_audit((getattr(w, "signal", {}) or {}).get("local_order_id"), audit)
@@ -311,22 +308,20 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     "signal_expired_in_poll_loop",
                     minutes_watching=str(getattr(w, "minutes_watching", "?")),
                 )
-            if self.on_expire:
-                try:
-                    self.on_expire(w)
-                except Exception as exc:
-                    _base.log.error("[%s] on_expire callback failed: %s", w.ticker, exc, exc_info=True)
+            self._dispatch_completion(
+                w, self.on_expire or (lambda _w: None),
+                pre_computed_audit=getattr(w, "_pending_audit", None),
+            )
         elif w.state == WatchState.INVALIDATED:
             pending_audit = getattr(w, "_pending_audit", None)
             if pending_audit:
                 self._persist_watcher_audit((getattr(w, "signal", {}) or {}).get("local_order_id"), pending_audit)
             if sig_id and ticker:
                 _base._ew_record(sig_id, ticker, "INVALIDATED", "signal_invalidated_in_poll_loop")
-            if self.on_invalidate:
-                try:
-                    self.on_invalidate(w)
-                except Exception as exc:
-                    _base.log.error("[%s] on_invalidate callback failed: %s", w.ticker, exc, exc_info=True)
+            self._dispatch_completion(
+                w, self.on_invalidate or (lambda _w: None),
+                pre_computed_audit=pending_audit,
+            )
 
     def _process_triggered_poll_result(self, w) -> None:
         sig = getattr(w, "signal", {}) or {}
@@ -365,14 +360,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         if not self.on_trigger:
             _base.log.error("[%s] TRIGGERED but no on_trigger callback is wired", w.ticker)
             w.state = WatchState.EXPIRED
-            w._release_dedup_key()
-            with self._lock:
-                self._pending = [x for x in self._pending if id(x) != id(w)]
-            if self.on_expire:
-                try:
-                    self.on_expire(w)
-                except Exception as exc:
-                    _base.log.error("[%s] on_expire callback failed after missing on_trigger: %s", w.ticker, exc, exc_info=True)
+            self._dispatch_completion(w, self.on_expire or (lambda _w: None))
             return
 
         attempts = int(getattr(w, "_trigger_attempts", 0) or 0)
@@ -454,16 +442,12 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 },
             )
             self._persist_watcher_audit(local_order_id, exhausted_audit)
-            w._release_dedup_key()
             if sig_id and ticker:
                 _base._ew_record(sig_id, ticker, "EXPIRED", "on_trigger_exhausted_3_attempts")
-            with self._lock:
-                self._pending = [x for x in self._pending if id(x) != id(w)]
-            if self.on_expire:
-                try:
-                    self.on_expire(w)
-                except Exception as expire_exc:
-                    _base.log.error("[%s] on_expire callback failed after trigger exhaustion: %s", w.ticker, expire_exc, exc_info=True)
+            self._dispatch_completion(
+                w, self.on_expire or (lambda _w: None),
+                pre_computed_audit=exhausted_audit,
+            )
 
 
 # Ensure legacy methods whose globals resolve ``WatchedSignal`` pick up the

@@ -163,51 +163,61 @@ class TestBugEw5ModeWiring:
         w = APEntryWatcher(broker, order_state_machine=_make_osm(), mode="live")
         assert w.mode == "LIVE"
 
-    def test_live_overnight_quote_outage_invalidates(self):
-        """LIVE + zero-bid+zero-ask on overnight revalidation -> INVALIDATED."""
+    def test_live_overnight_quote_outage_retry_owned(self):
+        """PR #324 Failure A fix: LIVE + zero quote on overnight revalidation ->
+        bounded RETRY_OWNED, NOT inert INVALIDATED.
+
+        Uses timeframe="1w" (non-daily) so _safe_is_daily_signal returns False
+        naturally and the generic overnight path is exercised without patching.
+
+        The old behavior (state=INVALIDATED, dedup released, watcher inert in
+        _pending) is replaced by bounded retry ownership.  The watcher remains
+        in PENDING, dedup is held, retry metadata is written.
+        """
         broker = MagicMock()
-        # Quote returns zero bid + zero ask (simulated outage)
-        broker.session.get.return_value.json.return_value = {
-            "quotes": {"quote": {"bid": 0, "ask": 0, "last": 0}}
-        }
-        broker.session.get.return_value.status_code = 200
-        w = APEntryWatcher(broker, order_state_machine=_make_osm(), mode="LIVE")
-        # Add an overnight signal
-        sig = _make_signal(signal_id="sig-live-overnight", timeframe="1d")
+        osm = _make_osm()
+        w = APEntryWatcher(broker, order_state_machine=osm, mode="LIVE")
+        # Non-daily timeframe → generic overnight path (no daily validator)
+        sig = _make_signal(signal_id="sig-live-overnight", timeframe="1w")
         watched = WatchedSignal(sig, overnight=True)
         watched._watcher_ref = w
         w._pending.append(watched)
         w._dedup_set.add(sig["signal_id"])
 
-        # Force the generic (non-daily) revalidation path by stubbing
-        # _safe_is_daily_signal to False, and _get_quote to return zeros.
         with patch.object(w, "_get_quote", return_value={"bid": 0, "ask": 0, "last": 0}):
-            with patch("ap_entry_watcher._safe_is_daily_signal", return_value=False):
-                w._revalidate_overnight_at_open()
+            w._revalidate_overnight_at_open()
 
-        assert watched.state == WatchState.INVALIDATED, (
-            f"LIVE + quote outage must INVALIDATE; got {watched.state}. "
-            f"The BUG-EW-5 fix: getattr(self, 'mode', 'PAPER') used to "
-            f"silently return PAPER and arm fail-open in LIVE."
+        # PR #324: watcher must stay PENDING (not INVALIDATED) — retry owned.
+        assert watched.state == WatchState.PENDING, (
+            f"LIVE + quote outage must be RETRY_OWNED (PENDING); got {watched.state}. "
+            f"PR #324 Failure A fix: inert INVALIDATED is eliminated."
         )
+        # Watcher must remain registered.
+        assert watched in w._pending, "Watcher must remain in _pending (dedup held)"
+        # Dedup must remain held.
+        assert sig["signal_id"] in w._dedup_set, "Dedup key must remain held"
+        # Retry tracking must be initialised.
+        assert watched._overnight_quote_retry_attempt >= 1
+        assert watched._overnight_quote_retry_first_failed_at is not None
+        assert watched._overnight_quote_retry_deadline is not None
 
     def test_paper_overnight_quote_outage_preserves_fail_open(self):
         """PAPER + zero-bid+zero-ask -> overnight=False (arm fail-open).
 
         Per direction: do NOT change paper semantics. This documents
-        the preserved behavior.
+        the preserved behavior.  Uses timeframe="1w" so the generic overnight
+        path is exercised without needing to patch _safe_is_daily_signal.
         """
         broker = MagicMock()
         w = APEntryWatcher(broker, order_state_machine=_make_osm(), mode="PAPER")
-        sig = _make_signal(signal_id="sig-paper-overnight", timeframe="1d")
+        sig = _make_signal(signal_id="sig-paper-overnight", timeframe="1w")
         watched = WatchedSignal(sig, overnight=True)
         watched._watcher_ref = w
         w._pending.append(watched)
         w._dedup_set.add(sig["signal_id"])
 
         with patch.object(w, "_get_quote", return_value={"bid": 0, "ask": 0, "last": 0}):
-            with patch("ap_entry_watcher._safe_is_daily_signal", return_value=False):
-                w._revalidate_overnight_at_open()
+            w._revalidate_overnight_at_open()
 
         # Per direction: PAPER fail-open keeps the signal armed
         # (overnight=False = generic intraday watcher takes over).
@@ -447,14 +457,21 @@ class TestModuleConstants:
 
     def test_max_intraday_drift_pct_default_value(self):
         """Default must remain 0.015 (1.5%) for back-compat."""
+        global ap_entry_watcher
         # Clear env to confirm default
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("MAX_INTRADAY_DRIFT_PCT", None)
-            importlib.reload(ap_entry_watcher)
+            ap_entry_watcher = importlib.reload(
+                sys.modules.get("ap_entry_watcher")
+                or importlib.import_module("ap_entry_watcher")
+            )
             try:
                 assert ap_entry_watcher.MAX_INTRADAY_DRIFT_PCT == 0.015
             finally:
-                importlib.reload(ap_entry_watcher)
+                ap_entry_watcher = importlib.reload(
+                    sys.modules.get("ap_entry_watcher")
+                    or importlib.import_module("ap_entry_watcher")
+                )
 
     def test_max_option_premium_drift_pct_is_module_level(self):
         """MAX_OPTION_PREMIUM_DRIFT_PCT must be a module-level constant."""

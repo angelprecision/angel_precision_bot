@@ -45,11 +45,118 @@ USAGE
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Optional
 
 from ap.logger import get_logger
 
 log = get_logger("ap.pending_trigger_classifier")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watcher completion acknowledgment — PR #324
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WatcherCompletionOutcome:
+    """Authoritative result outcomes for watcher lifecycle callbacks."""
+    TERMINALIZED = "TERMINALIZED"  # order durably left PENDING_TRIGGER
+    RETRY_OWNED  = "RETRY_OWNED"   # watcher remains registered with retry state
+    REARMED      = "REARMED"       # watcher remains in explicit rearm state
+    FAILED       = "FAILED"        # no durable outcome; watcher retained + quarantine
+
+
+@dataclass(frozen=True)
+class WatcherCompletionResult:
+    """Typed, immutable result returned by watcher lifecycle callbacks.
+
+    None / arbitrary dict / implicit return must never be interpreted as
+    success.  Legacy callbacks that return None are normalized to FAILED
+    unless the caller can independently prove a durable outcome.
+    """
+    outcome:        str
+    reason_code:    str
+    local_order_id: Optional[str] = None
+    retry_next_at:  Optional[str] = None
+    retry_deadline: Optional[str] = None
+    detail:         Optional[str] = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watcher invalidation 5-class taxonomy — PR #324
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WatcherInvalidationClass:
+    """Lifecycle classifications for watcher invalidation decisions."""
+    TERMINAL           = "INVALIDATED_TERMINAL"
+    RETRYABLE          = "INVALIDATED_RETRYABLE"
+    REARMABLE          = "INVALIDATED_REARMABLE"
+    ALREADY_BREACHED   = "INVALIDATED_ALREADY_BREACHED"
+    NO_WATCHER_OWNER   = "INVALIDATED_NO_WATCHER_OWNER"
+
+
+# Canonical reason → class mapping.
+# The live watcher and restart classifier share this single source of truth.
+WATCHER_INVALIDATION_TAXONOMY: dict[str, str] = {
+    # ── INVALIDATED_TERMINAL ─────────────────────────────────────────────────
+    "stop_bid_below_call_stop":                  WatcherInvalidationClass.TERMINAL,
+    "stop_ask_above_put_stop":                   WatcherInvalidationClass.TERMINAL,
+    "overnight_daily_invalidated":               WatcherInvalidationClass.TERMINAL,
+    "overnight_too_far_from_trigger":            WatcherInvalidationClass.TERMINAL,
+    "arm_drift":                                 WatcherInvalidationClass.TERMINAL,
+    "invalid_side":                              WatcherInvalidationClass.TERMINAL,
+    "prior_high_breached":                       WatcherInvalidationClass.TERMINAL,
+    "prior_low_breached":                        WatcherInvalidationClass.TERMINAL,
+    "both_sides_breached":                       WatcherInvalidationClass.TERMINAL,
+    "rearm_window_exhausted":                    WatcherInvalidationClass.TERMINAL,
+    "rearm_window_expired":                      WatcherInvalidationClass.TERMINAL,
+    "rearm_max_attempts_expired":                WatcherInvalidationClass.TERMINAL,
+    "overnight_live_quote_unavailable_timeout":  WatcherInvalidationClass.TERMINAL,
+    "overnight_open_recheck_data_timeout":       WatcherInvalidationClass.TERMINAL,
+    "on_trigger_exhausted_3_attempts":           WatcherInvalidationClass.TERMINAL,
+    # ── INVALIDATED_RETRYABLE ────────────────────────────────────────────────
+    "overnight_live_quote_unavailable":          WatcherInvalidationClass.RETRYABLE,
+    "overnight_open_data_unavailable_retry_later": WatcherInvalidationClass.RETRYABLE,
+    "overnight_daily_validator_error":           WatcherInvalidationClass.RETRYABLE,
+    "snapshot_unavailable":                      WatcherInvalidationClass.RETRYABLE,
+    "missing_prior_levels":                      WatcherInvalidationClass.RETRYABLE,
+    "quote_fetch_failed":                        WatcherInvalidationClass.RETRYABLE,
+    "validator_provider_timeout":                WatcherInvalidationClass.RETRYABLE,
+    "temporary_database_failure":                WatcherInvalidationClass.RETRYABLE,
+    # ── INVALIDATED_REARMABLE ────────────────────────────────────────────────
+    "temporary_wrong_side_of_stop":              WatcherInvalidationClass.REARMABLE,
+    "arm_below_stop_reclaim_wait":               WatcherInvalidationClass.REARMABLE,
+    # Note: arm_below_stop itself maps to REARMABLE only after rearm eligibility
+    # succeeds; otherwise it is TERMINAL.  The watcher resolves this at runtime.
+    "arm_below_stop":                            WatcherInvalidationClass.REARMABLE,
+    # ── INVALIDATED_ALREADY_BREACHED ─────────────────────────────────────────
+    "arm_already_through_trigger":               WatcherInvalidationClass.ALREADY_BREACHED,
+    "overnight_daily_already_through_trigger":   WatcherInvalidationClass.ALREADY_BREACHED,
+    "overnight_premarket_breached":              WatcherInvalidationClass.ALREADY_BREACHED,
+    "trigger_stop_same_poll_collision":          WatcherInvalidationClass.ALREADY_BREACHED,
+    # ── INVALIDATED_NO_WATCHER_OWNER (invariant violations) ─────────────────
+    # watcher_invalidated alone is never authoritative; underlying reason must survive
+    "watcher_invalidated":                       WatcherInvalidationClass.NO_WATCHER_OWNER,
+}
+
+
+def classify_watcher_reason(reason_code: str) -> str:
+    """Return the WatcherInvalidationClass for a given reason code.
+
+    Unknown reasons return NO_WATCHER_OWNER.  Callers must handle that class
+    as an invariant violation (FAILED, retain watcher, retain dedup).
+
+    stop_* prefix reasons are always TERMINAL regardless of the taxonomy dict
+    (matches existing _reason_is_invalidation logic).
+    """
+    rc = str(reason_code or "").strip().lower()
+    if not rc:
+        return WatcherInvalidationClass.NO_WATCHER_OWNER
+    if rc.startswith("stop_"):
+        return WatcherInvalidationClass.TERMINAL
+    cls = WATCHER_INVALIDATION_TAXONOMY.get(rc)
+    if cls is not None:
+        return cls
+    return WatcherInvalidationClass.NO_WATCHER_OWNER
 
 
 class PendingTriggerClassification:
@@ -71,24 +178,26 @@ class PendingTriggerClassification:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Terminal reason sets — must stay in sync with
-# ap_execution_core._REAL_UNDERLYING_INVALIDATION_REASONS (Bug A classifier)
+# Terminal reason sets — derived from WATCHER_INVALIDATION_TAXONOMY (PR #324 §4).
+# These must NOT be maintained separately; use classify_watcher_reason() instead.
+# Kept for backward-compat with existing callers of _reason_is_invalidation().
 # ─────────────────────────────────────────────────────────────────────────────
 
-_INVALIDATION_REASON_CODES: frozenset[str] = frozenset({
-    "overnight_daily_invalidated",
-    "overnight_premarket_breached",
-    "overnight_too_far_from_trigger",
-    "overnight_open_recheck_data_timeout",
-    "overnight_daily_validator_error",
-    "overnight_live_quote_unavailable",
-    "overnight_daily_already_through_trigger",
-    "arm_drift",
-    "arm_below_stop",
-    "arm_already_through_trigger",
-    "watcher_invalidated",
-    "on_trigger_exhausted_3_attempts",
-})
+# Derived at module-load time from the canonical taxonomy.
+# INVALIDATED_TERMINAL reasons → treated as "real invalidation" by legacy classifier.
+# INVALIDATED_ALREADY_BREACHED reasons are also treated as real (setup is over).
+# INVALIDATED_NO_WATCHER_OWNER ("watcher_invalidated" alone) is NOT terminal by itself
+# but is kept here for backward compat with existing callers.
+def _build_invalidation_reason_codes() -> frozenset:
+    _codes = set()
+    for reason, cls in WATCHER_INVALIDATION_TAXONOMY.items():
+        if cls in (WatcherInvalidationClass.TERMINAL, WatcherInvalidationClass.ALREADY_BREACHED):
+            _codes.add(reason)
+    # Keep backward-compat entries that callers depend on
+    _codes.update({"watcher_invalidated", "on_trigger_exhausted_3_attempts"})
+    return frozenset(_codes)
+
+_INVALIDATION_REASON_CODES: frozenset = _build_invalidation_reason_codes()
 
 _TERMINAL_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
     "TERMINAL_NO_TRADEABLE_CONTRACT",
@@ -99,13 +208,16 @@ _TERMINAL_MATERIALIZATION_OUTCOMES: frozenset[str] = frozenset({
 
 
 def _reason_is_invalidation(reason_code: str) -> bool:
-    """Match the classifier in ap_execution_core: stop_* prefix + known set."""
-    rc = str(reason_code or "").strip().lower()
-    if not rc:
-        return False
-    if rc.startswith("stop_"):
-        return True
-    return rc in _INVALIDATION_REASON_CODES
+    """PR #324 §4: delegate to classify_watcher_reason for canonical classification.
+
+    stop_* prefix and TERMINAL/ALREADY_BREACHED classes are treated as
+    "real invalidation" by the pending-trigger classifier.
+    """
+    cls = classify_watcher_reason(reason_code)
+    return cls in (
+        WatcherInvalidationClass.TERMINAL,
+        WatcherInvalidationClass.ALREADY_BREACHED,
+    )
 
 
 def _extract(row: dict, path: str, default=None):
@@ -207,8 +319,13 @@ def classify_pending_trigger_row(
         if watcher_owned is False:
             return PendingTriggerClassification.ORPHAN_NO_WATCHER
 
-        # ── Priority 7: active retry state → retryable ──
+        # ── Priority 7: INVALIDATED_RETRYABLE or INVALIDATED_REARMABLE with active retry → retryable ──
+        # PR #324 §4: a retryable reason must never be STUCK_INVALIDATED.
         if retry_status in ("RETRY_PENDING", "RUNNING") or retry_next_at:
+            return PendingTriggerClassification.WAITING_RETRYABLE
+        # If watcher_invalidation_class says RETRYABLE/REARMABLE, row is still waiting.
+        _inv_class = str(meta.get("watcher_invalidation_class") or "").strip()
+        if _inv_class in ("INVALIDATED_RETRYABLE", "INVALIDATED_REARMABLE"):
             return PendingTriggerClassification.WAITING_RETRYABLE
 
         # Default: watcher owns it, no terminal evidence — safe waiting state

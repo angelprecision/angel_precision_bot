@@ -6919,11 +6919,63 @@ class APExecutionCore:
 
     def _on_signal_expire(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
+        _local_oid_exp = str(
+            (getattr(watched, "signal", {}) or {}).get("local_order_id") or ""
+        ).strip()
+
+        # Preserve exact expire reason from audit if available.
+        _expire_reason = "watcher_expired"
+        try:
+            _audit_for_exp = getattr(watched, "_pending_audit", None)
+            if isinstance(_audit_for_exp, dict):
+                _raw_exp = str(_audit_for_exp.get("reason_code") or "").strip()
+                if _raw_exp:
+                    _expire_reason = _raw_exp
+        except Exception:
+            pass
+
+        # Persist watcher_invalidation_class for expire outcomes.
+        _osm_exp = getattr(self, "order_state_machine", None)
+        if _osm_exp is not None and _local_oid_exp:
+            _upd_exp = getattr(_osm_exp, "update_order_meta", None)
+            if callable(_upd_exp):
+                try:
+                    from ap.pending_trigger_classifier import classify_watcher_reason
+                    _exp_class = classify_watcher_reason(_expire_reason)
+                    _upd_exp(_local_oid_exp, {
+                        "watcher_invalidation_class":  _exp_class,
+                        "watcher_invalidation_reason": _expire_reason,
+                        "watcher_invalidation_source": "poll_loop_expire",
+                    })
+                except Exception:
+                    pass
+
         if signal_id:
             self.store.update_status(signal_id, "expired", timestamp_flag="expired_at")
-        self._cleanup_pending_entry_order(watched, action="expire", reason="watcher_expired")
+        _cleanup_ok = self._cleanup_pending_entry_order(
+            watched, action="expire", reason=_expire_reason
+        )
         funnel.inc("watcher_expired")
-        log.info(f"[{watched.ticker}] Signal expired -- no breach")
+        log.info("[%s] Signal expired -- no breach", watched.ticker)
+
+        try:
+            from ap.pending_trigger_classifier import (
+                WatcherCompletionResult as _WCR,
+                WatcherCompletionOutcome as _WCO,
+            )
+            if _cleanup_ok:
+                return _WCR(
+                    outcome=_WCO.TERMINALIZED,
+                    reason_code=_expire_reason,
+                    local_order_id=_local_oid_exp or None,
+                )
+            return _WCR(
+                outcome=_WCO.FAILED,
+                reason_code=f"cleanup_returned_false:{_expire_reason}",
+                local_order_id=_local_oid_exp or None,
+            )
+        except Exception:
+            return None
 
     # ── P0 (PR #304): Real underlying invalidation classifier ────────────────
     # Reason codes that mean "the underlying thesis is broken" and must NOT be
@@ -6956,22 +7008,25 @@ class APExecutionCore:
     })
 
     def _is_real_underlying_invalidation(self, reason_code: str) -> bool:
-        """
-        True when the watcher's invalidation reason indicates a genuine
-        underlying/structure/arm-time break of the setup thesis.
+        """PR #324 §4: delegate to canonical classify_watcher_reason().
 
-        Called from _on_signal_invalidate to decide whether a DEFERRED:*
-        contract may keep the watcher alive (benign reason) or must be
-        terminalized (real invalidation). Any prefix like 'stop_' is
-        treated as real underlying — future stop reason codes automatically
-        classify correctly.
+        True for TERMINAL or ALREADY_BREACHED classifications — these mean
+        the underlying thesis is broken and a DEFERRED contract cannot be
+        kept alive.  RETRYABLE/REARMABLE are NOT real underlying invalidation.
         """
-        rc = str(reason_code or "").strip().lower()
-        if not rc:
-            return False
-        if rc.startswith("stop_"):
-            return True
-        return rc in self._REAL_UNDERLYING_INVALIDATION_REASONS
+        try:
+            from ap.pending_trigger_classifier import (
+                classify_watcher_reason, WatcherInvalidationClass,
+            )
+            cls = classify_watcher_reason(reason_code)
+            return cls in (
+                WatcherInvalidationClass.TERMINAL,
+                WatcherInvalidationClass.ALREADY_BREACHED,
+            )
+        except Exception:
+            # Fallback: stop_* prefix is always terminal
+            rc = str(reason_code or "").strip().lower()
+            return rc.startswith("stop_") or rc in self._REAL_UNDERLYING_INVALIDATION_REASONS
 
     def _on_signal_invalidate(self, watched: WatchedSignal):
         signal_id = str(watched.signal.get("signal_id", ""))
@@ -7027,9 +7082,54 @@ class APExecutionCore:
             _watcher_is_live = _watcher_mode == "live" or (
                 not _watcher_mode and getattr(self, "paper", None) is False
             )
-            # LIVE fails closed: an unclassified reason on a LIVE deferred watcher
-            # is treated as a real invalidation (terminalize) rather than kept alive.
-            _unclassified_live = _watcher_is_live and not _inv_reason_code
+            # PR #324 §5 — LIVE unknown reason check uses classify_watcher_reason, not empty-string.
+            # NO_WATCHER_OWNER from classifier means the reason is unknown or invariant-violating.
+            _inv_class = ""
+            try:
+                from ap.pending_trigger_classifier import (
+                    classify_watcher_reason as _cwrfn,
+                    WatcherInvalidationClass as _WIC,
+                )
+                _inv_class = _cwrfn(_inv_reason_code) if _inv_reason_code else _WIC.NO_WATCHER_OWNER
+            except Exception:
+                _inv_class = "INVALIDATED_NO_WATCHER_OWNER"
+
+            # Unknown LIVE reason (NO_WATCHER_OWNER) → FAILED quarantine, no terminalize.
+            _is_unknown_live_reason = (
+                _watcher_is_live
+                and _inv_class == "INVALIDATED_NO_WATCHER_OWNER"
+                and not _is_real_underlying_invalidation
+            )
+            # PR #324 final amendment §1: blank/whitespace/malformed/unrecognized LIVE
+            # reason must ALSO enter FAILED quarantine. Do NOT require _inv_reason_code
+            # to be truthy — an empty reason on a LIVE watcher is precisely the case
+            # where falling into the benign RETRY_OWNED path violates the ownership contract.
+            if _is_unknown_live_reason:
+                _unknown_reason = _inv_reason_code or "blank_live_invalidation_reason"
+                log.critical(
+                    "[%s] DEFERRED_CONTRACT_UNKNOWN_LIVE_REASON — signal_id=%s "
+                    "reason_code=%r class=%s — FAILED quarantine (watcher retained, "
+                    "dedup held, exact reason preserved, no cancel).",
+                    watched.ticker, signal_id or "?",
+                    _unknown_reason, _inv_class,
+                )
+                funnel.inc("deferred_contract_unknown_live_reason_quarantine")
+                try:
+                    from ap.pending_trigger_classifier import (
+                        WatcherCompletionResult as _UWCR, WatcherCompletionOutcome as _UWCO,
+                    )
+                    return _UWCR(
+                        outcome=_UWCO.FAILED,
+                        reason_code=f"unknown_live_reason:{_unknown_reason}",
+                        local_order_id=str(
+                            (getattr(watched, "signal", {}) or {}).get("local_order_id") or ""
+                        ),
+                        detail=f"class={_inv_class}",
+                    )
+                except Exception:
+                    return None
+
+            _unclassified_live = False  # handled above
 
             if _is_real_underlying_invalidation or _unclassified_live:
                 # Terminalize — the underlying thesis is invalid; deferral of
@@ -7045,29 +7145,113 @@ class APExecutionCore:
                 funnel.inc("deferred_contract_real_invalidation_terminalized")
                 # do NOT return — continue to the full invalidation/cancel path
             else:
-                # Benign, non-underlying invalidation on a (paper or reason-known-benign)
-                # deferred watcher: keep it alive so breach-time selection can run.
+                # PR #324 Failure B fix: remove detached PENDING restoration.
+                #
+                # Previously: watched.state = WatchState.PENDING; return
+                # That changed the state of a Python object that was ALREADY REMOVED
+                # from APEntryWatcher._pending (the poll loop removed it before calling
+                # this callback).  Setting state on a detached object is not registry
+                # ownership — the watcher cannot poll, trigger, or retry.
+                #
+                # Correct behavior for benign/transient deferred invalidation:
+                # The PR #324 callback-first ordering (Failure C fix) ensures the watcher
+                # is STILL in _pending when we arrive here.  We return RETRY_OWNED so
+                # the poll loop keeps the watcher registered with its dedup key held.
+                # The watcher remains in WatchState.PENDING (is_active=True on the next
+                # poll cycle) so breach-time contract selection can still run.
+                #
+                # If we are somehow called after removal (legacy path), the result is
+                # still RETRY_OWNED — the caller is responsible for verifying registry
+                # membership before accepting the result.
                 try:
                     from ap_entry_watcher import WatchState
                     _prior_state = getattr(watched, "state", None)
-                    watched.state = WatchState.PENDING
+                    # Restore to PENDING only if the watcher is still owned (state was
+                    # INVALIDATED from a benign reason, not yet terminalized).
+                    if _prior_state == WatchState.INVALIDATED:
+                        watched.state = WatchState.PENDING
                     if hasattr(watched, "breach_count"):
                         watched.breach_count = 0
                     log.info(
-                        "[%s] DEFERRED_CONTRACT_INVALIDATED ignored (benign) | signal_id=%s "
-                        "contract=%s reason_code=%s — state restored %s -> PENDING; "
-                        "awaiting breach-time contract selection",
+                        "[%s] DEFERRED_CONTRACT_INVALIDATED_RETRY_OWNED | signal_id=%s "
+                        "contract=%s reason_code=%s prior_state=%s — "
+                        "watcher retained in registry for breach-time selection",
                         watched.ticker, signal_id or "?", contract,
                         _inv_reason_code or "(none)", _prior_state,
                     )
                 except Exception as _e:
                     log.error(
-                        "[%s] DEFERRED_CONTRACT_INVALIDATED state-restore failed: %s — "
-                        "order NOT canceled, but watcher may be stuck in INVALIDATED",
+                        "[%s] DEFERRED_CONTRACT_INVALIDATED state-restore failed: %s",
                         watched.ticker, _e,
                     )
                 funnel.inc("deferred_contract_invalidated")
-                return  # Do NOT cancel the order or write 'invalidated' to signal store.
+                # PR #324 §6 — RETRY_OWNED must persist durable bounded retry metadata.
+                _def_oid = str((getattr(watched, "signal", {}) or {}).get("local_order_id") or "")
+                _def_now = datetime.now(timezone.utc)
+                try:
+                    _def_retry_delay = max(5, int(os.getenv(
+                        "WATCHER_DEFERRED_RETRY_DELAY_SECONDS", "30"
+                    )))
+                except (TypeError, ValueError):
+                    _def_retry_delay = 30
+                try:
+                    _def_retry_deadline_secs = max(60, int(os.getenv(
+                        "WATCHER_DEFERRED_RETRY_DEADLINE_SECONDS", "300"
+                    )))
+                except (TypeError, ValueError):
+                    _def_retry_deadline_secs = 300
+
+                _def_next_at = (_def_now + timedelta(seconds=_def_retry_delay)).isoformat()
+                _def_deadline = (_def_now + timedelta(seconds=_def_retry_deadline_secs)).isoformat()
+                _def_owner = f"deferred_retry:{_def_oid}"
+
+                # Persist metadata — failure → FAILED quarantine.
+                _def_meta_ok = False
+                _def_meta_exc = None
+                _def_osm = getattr(self, "order_state_machine", None)
+                if _def_osm is not None and _def_oid:
+                    _def_upd = getattr(_def_osm, "update_order_meta", None)
+                    if callable(_def_upd):
+                        try:
+                            _def_meta_ok = bool(_def_upd(_def_oid, {
+                                "watcher_invalidation_class":  "INVALIDATED_RETRYABLE",
+                                "watcher_invalidation_reason": _inv_reason_code or "deferred_contract_benign_invalidation",
+                                "watcher_retry_owner":         _def_owner,
+                                "watcher_retry_attempt":       1,
+                                "watcher_retry_next_at":       _def_next_at,
+                                "watcher_retry_deadline":      _def_deadline,
+                            }))
+                        except Exception as _dme:
+                            _def_meta_exc = _dme
+                            _def_meta_ok = False
+
+                try:
+                    from ap.pending_trigger_classifier import (
+                        WatcherCompletionResult as _WCR,
+                        WatcherCompletionOutcome as _WCO,
+                    )
+                    if not _def_meta_ok:
+                        log.critical(
+                            "[%s] deferred RETRY_OWNED metadata write failed (exc=%s) — "
+                            "cannot claim RETRY_OWNED without durable metadata; "
+                            "returning FAILED for quarantine.",
+                            watched.ticker, _def_meta_exc,
+                        )
+                        return _WCR(
+                            outcome=_WCO.FAILED,
+                            reason_code="deferred_retry_metadata_persistence_failed",
+                            local_order_id=_def_oid or None,
+                            detail=str(_def_meta_exc)[:200] if _def_meta_exc else "write_returned_false",
+                        )
+                    return _WCR(
+                        outcome=_WCO.RETRY_OWNED,
+                        reason_code=_inv_reason_code or "deferred_contract_benign_invalidation",
+                        local_order_id=_def_oid or None,
+                        retry_next_at=_def_next_at,
+                        retry_deadline=_def_deadline,
+                    )
+                except Exception:
+                    return None  # fallback — poll loop normalizes None → FAILED
 
         # ── Full forensic context for legitimate invalidations ─────────────────
         # P1 FIX (2026-05-21): every watcher_invalidated must log:
@@ -7136,10 +7320,62 @@ class APExecutionCore:
         except Exception as e:
             log.debug("watcher_invalidated forensic log failed: %s", e)
 
+        # PR #324: extract and preserve exact invalidation reason before cleanup.
+        _exact_inv_reason = "watcher_invalidated"
+        try:
+            _pending_audit_for_reason = getattr(watched, "_pending_audit", None)
+            if isinstance(_pending_audit_for_reason, dict):
+                _raw_rc = str(_pending_audit_for_reason.get("reason_code") or "").strip()
+                if _raw_rc and _raw_rc != "watcher_invalidated":
+                    _exact_inv_reason = _raw_rc
+        except Exception:
+            pass
+
+        # Persist invalidation taxonomy alongside the exact reason.
+        _local_oid_inv = str(
+            (getattr(watched, "signal", {}) or {}).get("local_order_id") or ""
+        ).strip()
+        _osm_inv = getattr(self, "order_state_machine", None)
+        if _osm_inv is not None and _local_oid_inv:
+            _upd_inv = getattr(_osm_inv, "update_order_meta", None)
+            if callable(_upd_inv):
+                try:
+                    from ap.pending_trigger_classifier import classify_watcher_reason
+                    _inv_class = classify_watcher_reason(_exact_inv_reason)
+                    _upd_inv(_local_oid_inv, {
+                        "watcher_invalidation_class":  _inv_class,
+                        "watcher_invalidation_reason": _exact_inv_reason,
+                        "watcher_invalidation_source": "poll_loop",
+                    })
+                except Exception:
+                    pass
+
         if signal_id:
             self.store.update_status(signal_id, "invalidated", timestamp_flag="invalidated_at")
-        self._cleanup_pending_entry_order(watched, action="cancel", reason="watcher_invalidated")
+        _cleanup_ok = self._cleanup_pending_entry_order(
+            watched, action="cancel", reason=_exact_inv_reason
+        )
         funnel.inc("watcher_invalidated")
+
+        # Return explicit WatcherCompletionResult so poll loop can verify.
+        try:
+            from ap.pending_trigger_classifier import (
+                WatcherCompletionResult as _WCR,
+                WatcherCompletionOutcome as _WCO,
+            )
+            if _cleanup_ok:
+                return _WCR(
+                    outcome=_WCO.TERMINALIZED,
+                    reason_code=_exact_inv_reason,
+                    local_order_id=_local_oid_inv or None,
+                )
+            return _WCR(
+                outcome=_WCO.FAILED,
+                reason_code=f"cleanup_returned_false:{_exact_inv_reason}",
+                local_order_id=_local_oid_inv or None,
+            )
+        except Exception:
+            return None
 
     def _finalize_proof(self, pos: "ManagedPosition", actual_fill_price: float = 0.0) -> None:
         """Write proof/P&L/feedback using the ACTUAL broker fill price.
