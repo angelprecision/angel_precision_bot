@@ -14,11 +14,14 @@ Tests verify:
 from __future__ import annotations
 
 import uuid
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 from ap.pending_trigger_restart_recovery import (
     PendingTriggerRestartRecovery,
@@ -82,6 +85,7 @@ class _MockOSM:
             raise self._cancel_raises
         if self._cancel_returns:
             self._rows.setdefault(oid, {})["status"] = self._get_order_status
+            self._rows.setdefault(oid, {})["last_error"] = reason
         return self._cancel_returns
 
     def get_order(self, oid: str):
@@ -95,7 +99,12 @@ class _MockOSM:
 
     def update_order_meta(self, oid: str, patch: dict) -> bool:
         self.meta_writes.append((oid, dict(patch)))
-        self._rows.setdefault(oid, {}).update(patch)
+        row = self._rows.setdefault(oid, {})
+        meta = row.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        meta.update(dict(patch))
+        row["meta"] = meta
         return True
 
 
@@ -146,13 +155,26 @@ def _make_recovery(row_or_rows=None, *, osm=None, watcher=None, mode="paper",
     return rec, _osm
 
 
+def _retry_meta(*, next_at=None, deadline=None, owner="restart_recovery:test-oid",
+                attempts=1, reason="test_retry"):
+    _now = datetime.now(timezone.utc)
+    return {
+        _MAT_STATUS_FIELD: "RETRY_PENDING",
+        _MAT_NEXT_RETRY_AT: next_at or (_now + timedelta(minutes=1)).isoformat(),
+        _MAT_RETRY_DEADLINE: deadline or (_now + timedelta(minutes=5)).isoformat(),
+        _MAT_ATTEMPT_COUNT: attempts,
+        _MAT_OWNER_FIELD: owner,
+        _MAT_RETRY_REASON: reason,
+    }
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test 1 — Valid waiting orphan rearmed + registry verified (Blockers 4, 5)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestValidWaitingOrphanRearmed:
     def test_rearmed_with_6way_registry_proof(self):
-        r = _row()
+        r = _row(meta={"trigger_price": 450.0})
         watcher = _MockWatcher(watch_returns=True)
         rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
         summary = rec.recover_all([r])
@@ -173,7 +195,7 @@ class TestValidWaitingOrphanRearmed:
 
 class TestWatchTrueRegistryEmpty:
     def test_watch_true_no_registry_counts_as_unresolved(self):
-        r = _row()
+        r = _row(meta={"trigger_price": 450.0})
 
         class _NonRegistering(_MockWatcher):
             def watch(self, plan, local_order_id, *, recovery_rearm=False):
@@ -220,10 +242,7 @@ class TestRetryableCanonicalFields:
         RETRY_OWNED; #323 consumer can pick it up; no normal rearm."""
         _now = datetime.now(timezone.utc)
         _next = (_now + timedelta(minutes=1)).isoformat()
-        r = _row(meta={
-            _MAT_STATUS_FIELD:  "RETRY_PENDING",
-            _MAT_NEXT_RETRY_AT: _next,
-        })
+        r = _row(meta=_retry_meta(next_at=_next))
         rec, osm = _make_recovery(r, watcher=_MockWatcher())
         summary = rec.recover_all([r])
 
@@ -231,6 +250,22 @@ class TestRetryableCanonicalFields:
         assert summary["watchers_rearmed"] == 0
         assert summary["ownerless_rows_remaining"] == 0
         assert len(osm.cancel_calls) == 0
+
+    def test_retryable_missing_deadline_is_unresolved_not_owned(self):
+        """A RETRY_PENDING timestamp alone is not consumer ownership proof."""
+        _now = datetime.now(timezone.utc)
+        r = _row(meta={
+            _MAT_STATUS_FIELD: "RETRY_PENDING",
+            _MAT_NEXT_RETRY_AT: (_now + timedelta(minutes=1)).isoformat(),
+            _MAT_ATTEMPT_COUNT: 1,
+            _MAT_OWNER_FIELD: "restart_recovery:test",
+            _MAT_RETRY_REASON: "missing_deadline",
+        })
+        rec, osm = _make_recovery(r, watcher=_MockWatcher())
+        summary = rec.recover_all([r])
+
+        assert summary["retry_rows_owned"] == 0
+        assert summary["ownerless_rows_remaining"] == 1
 
     def test_quote_unavailable_enters_canonical_retry_with_323_fields(self):
         """Quote unavailable (None) before rearm → _enter_canonical_retry writes
@@ -258,7 +293,7 @@ class TestRetryableCanonicalFields:
 class TestAlreadyThroughTrigger:
     @pytest.mark.parametrize("direction", ["CALL", "PUT"])
     def test_abt_terminalized_no_broker_submit(self, direction):
-        r = _row(direction=direction)
+        r = _row(direction=direction, meta={"trigger_price": 450.0})
         watcher = _MockWatcher(watch_returns=True)
         rec, osm = _make_recovery(r, watcher=watcher, quote_result=True)
         summary = rec.recover_all([r])
@@ -268,6 +303,42 @@ class TestAlreadyThroughTrigger:
         assert summary["ownerless_rows_remaining"] == 0
         reason = osm.cancel_calls[0][1]
         assert "already_through_trigger" in reason
+
+    def test_generic_entry_price_is_not_used_as_underlying_trigger(self):
+        """Option premium entry_price must not create false underlying breach."""
+        r = _row(entry_price=1.25)
+        broker = MagicMock()
+        broker.get_quote.return_value = {"bid": 448.9, "ask": 449.0}
+        rec = PendingTriggerRestartRecovery(
+            client_id="client@test.com",
+            execution_mode="paper",
+            osm=_MockOSM(),
+            entry_watcher=_MockWatcher(),
+            broker=broker,
+        )
+        rec.osm.seed(r)
+        summary = rec.recover_all([r])
+
+        assert summary["terminalized"] == 0
+        assert summary["retry_rows_owned"] == 1
+
+    def test_call_quote_without_positive_ask_is_unavailable(self):
+        r = _row(meta={"trigger_price": 450.0})
+        broker = MagicMock()
+        broker.get_quote.return_value = {"bid": 449.5, "ask": 0}
+        rec = PendingTriggerRestartRecovery(
+            client_id="client@test.com",
+            execution_mode="paper",
+            osm=_MockOSM(),
+            entry_watcher=_MockWatcher(),
+            broker=broker,
+        )
+        rec.osm.seed(r)
+        summary = rec.recover_all([r])
+
+        assert summary["watchers_rearmed"] == 0
+        assert summary["retry_rows_owned"] == 1
+        assert summary["terminalized"] == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -452,7 +523,7 @@ class TestSummaryPerRowOutcomes:
 
     def test_row_outcomes_map_populated(self):
         """summary["row_outcomes"] must contain per-row outcome constants."""
-        r1 = _row()
+        r1 = _row(meta={"trigger_price": 450.0})
         r2 = _row(meta={"watcher_audit": {"reason_code": "stop_bid_below_call_stop"}})
         watcher = _MockWatcher(watch_returns=True)
         rec, osm = _make_recovery([r1, r2], watcher=watcher, quote_result=False)
@@ -469,7 +540,7 @@ class TestSummaryPerRowOutcomes:
 
 class TestIdempotentSecondRun:
     def test_second_run_no_duplicate_rearm_or_cancel(self):
-        r = _row()
+        r = _row(meta={"trigger_price": 450.0})
         watcher = _MockWatcher(watch_returns=True)
         osm = _MockOSM()
         osm.seed(r)
@@ -531,7 +602,7 @@ class TestBlocker2UnresolvedAddsToOwnerless:
 class TestBlocker3CanonicalRetryFields:
     def test_enter_canonical_retry_writes_323_fields(self):
         """_enter_canonical_retry must write the exact fields the #323 consumer reads."""
-        r = _row()
+        r = _row(meta={"trigger_price": 450.0})
         rec, osm = _make_recovery(r)
         outcome = rec._enter_canonical_retry(r["local_order_id"], r, reason="test")
 
@@ -635,7 +706,7 @@ class TestBlocker6WatchFailure:
     def test_watch_false_then_terminalize_fails_counts_as_unresolved_only(self):
         """watch() false → terminalize fails → UNRESOLVED only (not also terminalized)."""
         osm = _MockOSM(cancel_returns=False)
-        r = _row()
+        r = _row(meta={"trigger_price": 450.0})
         osm.seed(r)
         rec, _ = _make_recovery(r, watcher=_MockWatcher(watch_returns=False), osm=osm)
         summary = rec.recover_all([r])
@@ -711,3 +782,37 @@ class TestIntegrationOrderMonitor:
         assert isinstance(attempted, bool)
         assert isinstance(succeeded, bool)
         assert isinstance(reason, (str, type(None)))
+
+    def test_canonical_rearm_uses_production_osm_attribute(self):
+        """Production APOrderMonitor stores the OSM on self.osm, not self.order_state_machine."""
+        from ap.order_monitor import APOrderMonitor
+
+        reason = "overnight_daily_invalidated"
+        r = _row(meta={"watcher_audit": {"reason_code": reason}})
+        osm = _MockOSM(cancel_returns=True, get_order_status="CANCELED")
+        osm.seed(r)
+
+        monitor = APOrderMonitor.__new__(APOrderMonitor)
+        monitor.client_id = "client@test.com"
+        monitor.mode = "PAPER"
+        monitor.osm = osm
+        monitor.entry_watcher = _MockWatcher()
+        monitor.broker = MagicMock()
+
+        attempted, succeeded, result_reason = monitor._canonical_pending_trigger_rearm(
+            r, r["local_order_id"], "SPY240101C00450000",
+            is_past_eod=False,
+        )
+
+        assert attempted is True
+        assert succeeded is False
+        assert result_reason == "canonical_recovery_terminalized"
+        assert osm.cancel_calls == [(r["local_order_id"], reason)]
+
+    def test_startup_recovery_has_no_direct_watch_fallback(self):
+        import inspect
+        import ap_recovery
+
+        src = inspect.getsource(ap_recovery.APStartupRecovery._reseed_watchers)
+        assert "falling back to direct watch" not in src
+        assert "self.entry_watcher.watch(plan, local_order_id)" not in src

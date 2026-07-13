@@ -23,7 +23,6 @@ BLOCKER FIXES (PR #328 amendment):
 
 from __future__ import annotations
 
-import logging
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -74,13 +73,17 @@ def _default_quote_check(broker, symbol: str, side: str, trigger: float) -> Opti
     """True=already through trigger; False=not; None=unavailable."""
     try:
         raw = broker.get_quote(symbol) or {}
+        if not _quote_is_fresh(raw):
+            return None
         bid = float(raw.get("bid") or 0)
         ask = float(raw.get("ask") or 0)
-        if not bid and not ask:
-            return None
         if str(side or "").strip().upper() == "CALL":
+            if ask <= 0:
+                return None
             return ask >= trigger
         elif str(side or "").strip().upper() == "PUT":
+            if bid <= 0:
+                return None
             return bid <= trigger
         return None
     except Exception:
@@ -172,14 +175,14 @@ class PendingTriggerRestartRecovery:
 
         # Live quote check.
         live_quote_abt: Optional[bool] = None
-        try:
-            _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
-            _symbol  = str(row.get("ticker") or row.get("underlying") or row.get("symbol") or "").strip()
-            _trigger = float(row.get("entry_price") or row.get("trigger_price") or row.get("trigger") or 0)
-            if _symbol and _side and _trigger:
+        _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
+        _symbol  = str(row.get("ticker") or row.get("underlying") or row.get("symbol") or "").strip()
+        _trigger = _canonical_underlying_trigger(row)
+        if _symbol and _side and _trigger is not None:
+            try:
                 live_quote_abt = self.quote_check_fn(self.broker, _symbol, _side, _trigger)
-        except Exception as _qe:
-            log.debug("RESTART_RECOVERY quote check failed local=%s: %s", local_oid, _qe)
+            except Exception as _qe:
+                log.debug("RESTART_RECOVERY quote check failed local=%s: %s", local_oid, _qe)
 
         # Registry ownership check.
         watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid)
@@ -225,24 +228,24 @@ class PendingTriggerRestartRecovery:
 
         elif cls == PTC.WAITING_RETRYABLE:
             # Hand to #323 deployed consumer.  Do not normal-rearm.
-            # Blocker 3: verify existing canonical retry fields are present.
-            _meta = row.get("meta") or {}
-            _have_status   = str(_meta.get(_MAT_STATUS_FIELD) or "").strip().upper() == "RETRY_PENDING"
-            _have_next_at  = bool(_meta.get(_MAT_NEXT_RETRY_AT))
-            if _have_status and _have_next_at:
+            # Blocker 3: prove the row is eligible for the canonical consumer
+            # before counting it as owned. A timestamp alone is not ownership.
+            proof = self._verify_retry_ownership(local_oid, row)
+            if proof is not None:
                 log.info(
-                    "RESTART_RECOVERY_RETRY_OWNED local=%s — #323 consumer will pick up",
-                    local_oid,
+                    "RESTART_RECOVERY_RETRY_OWNED local=%s proof=%s",
+                    local_oid, proof,
                 )
                 self._safe_meta_update(local_oid, {
                     "restart_recovery_cls": cls,
                     "restart_recovery_at":  _now_iso(),
                 })
                 return _RowOutcome.RETRY_OWNED
-            else:
-                # Canonical fields missing — need to set them.
-                return self._enter_canonical_retry(local_oid, row,
-                    reason="restart_recovery_retryable_missing_canonical_fields")
+            log.critical(
+                "RESTART_RECOVERY_RETRY_OWNERSHIP_UNPROVEN local=%s — UNRESOLVED",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
 
         elif cls == PTC.STUCK_TRIGGER_READY:
             _meta = row.get("meta") or {}
@@ -334,11 +337,18 @@ class PendingTriggerRestartRecovery:
                 meta_patch={"restart_recovery_cls": PTC.ORPHAN_NO_WATCHER},
             )
         if _has_canonical_retry:
-            self._safe_meta_update(local_oid, {
-                "restart_recovery_cls": PTC.ORPHAN_NO_WATCHER,
-                "restart_recovery_at":  _now_iso(),
-            })
-            return _RowOutcome.RETRY_OWNED
+            proof = self._verify_retry_ownership(local_oid, row)
+            if proof is not None:
+                self._safe_meta_update(local_oid, {
+                    "restart_recovery_cls": PTC.ORPHAN_NO_WATCHER,
+                    "restart_recovery_at":  _now_iso(),
+                })
+                return _RowOutcome.RETRY_OWNED
+            log.critical(
+                "RESTART_RECOVERY_ORPHAN_RETRY_OWNERSHIP_UNPROVEN local=%s — UNRESOLVED",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
         if live_quote_abt is True:
             return self._terminalize_with_reason(
                 local_oid, row,
@@ -464,9 +474,23 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
+        proof = self._verify_retry_ownership(
+            local_oid,
+            row,
+            expected_owner=_owner,
+            expected_next_at=_next,
+            expected_deadline=_deadline,
+        )
+        if proof is None:
+            log.critical(
+                "RESTART_RECOVERY_CANONICAL_RETRY_NOT_PROVEN local=%s — UNRESOLVED",
+                local_oid,
+            )
+            return _RowOutcome.UNRESOLVED
+
         log.info(
-            "RESTART_RECOVERY_RETRY_OWNED local=%s next_at=%s deadline=%s reason=%s",
-            local_oid, _next, _deadline, reason,
+            "RESTART_RECOVERY_RETRY_OWNED local=%s proof=%s reason=%s",
+            local_oid, proof, reason,
         )
         return _RowOutcome.RETRY_OWNED
 
@@ -544,6 +568,7 @@ class PendingTriggerRestartRecovery:
         _rr_oid    = str(reread.get("local_order_id") or "").strip()
         _rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
         _rr_mode   = str(reread.get("execution_mode") or "").strip().lower()
+        _rr_meta   = _extract_meta(reread)
 
         if _rr_oid and _rr_oid != local_oid:
             log.critical("RESTART_RECOVERY_REREAD_OID_MISMATCH local=%s got=%s", local_oid, _rr_oid)
@@ -560,9 +585,98 @@ class PendingTriggerRestartRecovery:
                 local_oid, _rr_status,
             )
             return _RowOutcome.UNRESOLVED
+        durable_reasons = {
+            str(reread.get("last_error") or "").strip(),
+            str(_rr_meta.get("restart_recovery_terminal_reason") or "").strip(),
+            str(_rr_meta.get("terminal_reason") or "").strip(),
+            str(_rr_meta.get("reason_code") or "").strip(),
+            str(_rr_meta.get("final_reason") or "").strip(),
+            str(_rr_meta.get("watcher_invalidation_reason") or "").strip(),
+        }
+        watcher_audit = _rr_meta.get("watcher_audit")
+        if isinstance(watcher_audit, dict):
+            durable_reasons.add(str(watcher_audit.get("reason_code") or "").strip())
+        durable_reasons.discard("")
+        if reason and str(reason).strip() not in durable_reasons:
+            log.critical(
+                "RESTART_RECOVERY_REREAD_REASON_MISMATCH local=%s reason=%s durable=%s — UNRESOLVED",
+                local_oid, reason, sorted(durable_reasons),
+            )
+            return _RowOutcome.UNRESOLVED
 
         log.info("RESTART_RECOVERY_TERMINALIZED local=%s status=%s reason=%s", local_oid, _rr_status, reason)
         return _RowOutcome.TERMINALIZED
+
+    def _verify_retry_ownership(
+        self,
+        local_oid: str,
+        row: dict,
+        *,
+        expected_owner: Optional[str] = None,
+        expected_next_at: Optional[str] = None,
+        expected_deadline: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Prove canonical #323 retry ownership by rereading durable state."""
+        get_fn = getattr(self.osm, "get_order", None)
+        if not callable(get_fn):
+            return None
+        try:
+            reread = get_fn(local_oid)
+        except Exception:
+            return None
+        if not isinstance(reread, dict):
+            return None
+
+        status = str(reread.get("status") or "").strip().upper()
+        rr_oid = str(reread.get("local_order_id") or "").strip()
+        rr_client = str(reread.get("client_id") or reread.get("client_email") or "").strip().lower()
+        rr_mode = str(reread.get("execution_mode") or "").strip().lower()
+        if status != "PENDING_TRIGGER":
+            return None
+        if rr_oid and rr_oid != local_oid:
+            return None
+        if not rr_client or rr_client != self.client_id.lower():
+            return None
+        if not rr_mode or rr_mode != self.execution_mode:
+            return None
+        if reread.get("broker_order_id") or reread.get("submitted_ts"):
+            return None
+
+        meta = _extract_meta(reread)
+        mat_status = str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
+        next_at = str(meta.get(_MAT_NEXT_RETRY_AT) or "").strip()
+        deadline = str(meta.get(_MAT_RETRY_DEADLINE) or "").strip()
+        owner = str(meta.get(_MAT_OWNER_FIELD) or "").strip()
+        reason = str(meta.get(_MAT_RETRY_REASON) or "").strip()
+        try:
+            attempts = int(meta.get(_MAT_ATTEMPT_COUNT))
+        except (TypeError, ValueError):
+            return None
+        max_attempts = _env_int("RESTART_RECOVERY_RETRY_MAX_ATTEMPTS", 3)
+        if mat_status != "RETRY_PENDING" or not next_at or not deadline:
+            return None
+        if attempts < 1 or attempts > max_attempts:
+            return None
+        if not owner or not reason:
+            return None
+        if expected_owner is not None and owner != expected_owner:
+            return None
+        if expected_next_at is not None and next_at != expected_next_at:
+            return None
+        if expected_deadline is not None and deadline != expected_deadline:
+            return None
+        next_dt = _parse_iso(next_at)
+        deadline_dt = _parse_iso(deadline)
+        if next_dt is None or deadline_dt is None or deadline_dt < next_dt:
+            return None
+        return {
+            "local_order_id": local_oid,
+            "materialization_status": mat_status,
+            "materialization_owner": owner,
+            "materialization_attempt_count": attempts,
+            "materialization_next_retry_at": next_at,
+            "materialization_retry_deadline": deadline,
+        }
 
     # ── Registry verification — 6-way proof (Blocker 4) ──────────────────────
 
@@ -686,6 +800,22 @@ class PendingTriggerRestartRecovery:
 
 def _build_summary(client_id: str, execution_mode: str, outcomes: dict[str, str]) -> dict:
     _all = list(outcomes.values())
+    unresolved_row_ids = {
+        str(row_id): outcome
+        for row_id, outcome in outcomes.items()
+        if outcome == _RowOutcome.UNRESOLVED
+    }
+    resolved_row_ids = {
+        str(row_id): outcome
+        for row_id, outcome in outcomes.items()
+        if outcome in {
+            _RowOutcome.WATCHER_OWNED,
+            _RowOutcome.RETRY_OWNED,
+            _RowOutcome.REARM_OWNED,
+            _RowOutcome.TERMINALIZED,
+            _RowOutcome.SKIPPED,
+        }
+    }
     return {
         "client_id":                        client_id,
         "execution_mode":                   execution_mode,
@@ -697,7 +827,9 @@ def _build_summary(client_id: str, execution_mode: str, outcomes: dict[str, str]
         "skipped_not_pending_trigger":      _all.count(_RowOutcome.SKIPPED),
         "unresolved_cleanup_failures":      _all.count(_RowOutcome.UNRESOLVED),
         # Blocker 2: ownerless = count(UNRESOLVED) — not arithmetic
-        "ownerless_rows_remaining":         _all.count(_RowOutcome.UNRESOLVED),
+        "ownerless_rows_remaining":         len(unresolved_row_ids),
+        "resolved_row_ids":                 resolved_row_ids,
+        "unresolved_row_ids":               unresolved_row_ids,
         "row_outcomes":                     dict(outcomes),
     }
 
@@ -743,6 +875,7 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[dict]:
             "ticker":         row.get("ticker") or row.get("symbol") or "",
             "side":           row.get("direction") or row.get("side") or "",
             "entry_price":    float(row.get("entry_price") or row.get("trigger_price") or 0),
+            "trigger_price":  float(_canonical_underlying_trigger(row) or row.get("trigger_price") or 0),
             "stop_price":     float(row.get("stop_price") or row.get("stop_underlying") or 0),
             "target_price":   float(row.get("target_price") or row.get("target_underlying") or 0),
             "score":          float(row.get("score") or 0),
@@ -758,3 +891,66 @@ def _build_plan(row: dict, plan_builder_fn=None) -> Optional[dict]:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _extract_meta(row: dict) -> dict:
+    meta = (row or {}).get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _canonical_underlying_trigger(row: dict) -> Optional[float]:
+    """Resolve only authoritative underlying trigger fields."""
+    meta = _extract_meta(row)
+    candidates = (
+        meta.get("trigger_price"),
+        meta.get("entry_trigger"),
+        (row or {}).get("trigger_price"),
+        (row or {}).get("entry_trigger"),
+        (row or {}).get("plan_trigger_price"),
+    )
+    for raw in candidates:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _parse_iso(raw) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _quote_is_fresh(raw: dict) -> bool:
+    ts = (
+        raw.get("timestamp")
+        or raw.get("quote_ts")
+        or raw.get("updated_at")
+        or raw.get("as_of")
+    )
+    if not ts:
+        return True
+    dt = _parse_iso(ts)
+    if dt is None:
+        return False
+    max_age = _env_int("RESTART_RECOVERY_QUOTE_MAX_AGE_SECONDS", 120)
+    age = datetime.now(timezone.utc) - dt
+    return timedelta(seconds=0) <= age <= timedelta(seconds=max_age)

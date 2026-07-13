@@ -1553,7 +1553,7 @@ class APOrderMonitor:
             _ptr = _PTR(
                 client_id=self.client_id,
                 execution_mode=_mode.lower(),
-                osm=getattr(self, "order_state_machine", None),
+                osm=getattr(self, "osm", None),
                 entry_watcher=getattr(self, "entry_watcher", None),
                 broker=getattr(self, "broker", None),
                 is_past_eod=is_past_eod,
@@ -1572,12 +1572,12 @@ class APOrderMonitor:
                 return (True, False, f"canonical_recovery_unresolved:{_outcome}")
 
         except Exception as _ptr_exc:
-            log.warning(
+            log.error(
                 "[%s] _canonical_pending_trigger_rearm error local=%s: %s — "
-                "falling back to _attempt_lost_handoff_rearm",
+                "canonical recovery failed closed",
                 self.client_id, local_order_id, _ptr_exc,
             )
-            return self._attempt_lost_handoff_rearm(order, local_order_id, contract)
+            return (True, False, f"canonical_recovery_error:{type(_ptr_exc).__name__}")
 
     def _attempt_lost_handoff_rearm(
         self,
