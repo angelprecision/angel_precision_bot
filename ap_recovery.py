@@ -1854,52 +1854,104 @@ class APStartupRecovery:
                         self.client_id, local_order_id, exc,
                     )
 
-                plan = self._build_recovery_plan_from_order(order)
-                if plan is None:
-                    log.warning(
-                        "[%s] RECOVERY: cannot reseed local_order_id=%s — invalid_or_missing_side",
-                        self.client_id, local_order_id,
-                    )
-                    continue
-                if not getattr(plan, "ticker", "") or getattr(plan, "trigger_price", None) in (None, 0, 0.0):
-                    log.warning(
-                        "[%s] RECOVERY: cannot reseed local_order_id=%s — missing ticker or trigger_price",
-                        self.client_id, local_order_id,
-                    )
-                    continue
-                if str(getattr(plan, "contract_symbol", "") or "").upper().startswith("DEFERRED:"):
-                    try:
-                        if not hasattr(plan, "metadata") or plan.metadata is None:
-                            plan.metadata = {}
-                        plan.metadata["contract_deferred"] = True
-                    except Exception:
-                        pass
+                # PR #328 — canonical classifier gate before watch().
+                # Wires PendingTriggerRestartRecovery as the single decision
+                # authority; removes the prior unconditional watch() call that
+                # bypassed classification for invalidated/terminal/stale rows.
                 try:
-                    armed = bool(self.entry_watcher.watch(plan, local_order_id))
-                except Exception as exc:
+                    from ap.pending_trigger_restart_recovery import (
+                        PendingTriggerRestartRecovery as _PTR,
+                    )
+                    _row_dict = dict(order)
+
+                    def _plan_builder(_r):
+                        _p = self._build_recovery_plan_from_order(order)
+                        if _p is None:
+                            log.warning(
+                                "[%s] RECOVERY: cannot rearm local_order_id=%s — invalid_or_missing_side",
+                                self.client_id, local_order_id,
+                            )
+                            return None
+                        if not getattr(_p, "ticker", "") or getattr(_p, "trigger_price", None) in (None, 0, 0.0):
+                            log.warning(
+                                "[%s] RECOVERY: cannot rearm local_order_id=%s — missing ticker or trigger_price",
+                                self.client_id, local_order_id,
+                            )
+                            return None
+                        if str(getattr(_p, "contract_symbol", "") or "").upper().startswith("DEFERRED:"):
+                            try:
+                                if not hasattr(_p, "metadata") or _p.metadata is None:
+                                    _p.metadata = {}
+                                _p.metadata["contract_deferred"] = True
+                            except Exception:
+                                pass
+                        # Convert plan object to dict for the recovery engine.
+                        return {
+                            "signal_id":      getattr(_p, "signal_id", "") or "",
+                            "plan_id":        getattr(_p, "plan_id", "") or "",
+                            "local_order_id": getattr(_p, "local_order_id", local_order_id) or local_order_id,
+                            "client_id":      getattr(_p, "client_id", self.client_id) or self.client_id,
+                            "client_email":   getattr(_p, "client_id", self.client_id) or self.client_id,
+                            "execution_mode": self._execution_mode() or "",
+                            "ticker":         getattr(_p, "ticker", "") or "",
+                            "side":           getattr(_p, "side", "") or "",
+                            "entry_price":    float(getattr(_p, "trigger_price", 0) or 0),
+                            "trigger_price":  float(getattr(_p, "trigger_price", 0) or 0),
+                            "stop_price":     float(getattr(_p, "stop_price", 0) or 0),
+                            "target_price":   float(getattr(_p, "target_price", 0) or 0),
+                            "score":          float(getattr(_p, "score", 0) or 0),
+                            "tier":           getattr(_p, "tier", "") or "",
+                            "timeframe":      getattr(_p, "timeframe", "") or "",
+                            "contracts":      int(getattr(_p, "quantity", 0) or 0),
+                            "contract":       getattr(_p, "contract_symbol", "") or "",
+                        }
+
+                    _ptr = _PTR(
+                        client_id=self.client_id,
+                        execution_mode=self._execution_mode() or "",
+                        osm=self.osm,
+                        entry_watcher=self.entry_watcher,
+                        broker=self.broker,
+                        caller_source="ap_recovery._reseed_watchers",
+                    )
+                    _outcome = _ptr.recover_one_row(
+                        _row_dict, plan_builder_fn=_plan_builder
+                    )
+                    from ap.pending_trigger_restart_recovery import _RowOutcome
+                    if _outcome == _RowOutcome.WATCHER_OWNED:
+                        rearmed += 1
+                        log.info(
+                            "[%s] RECOVERY: watcher re-armed+verified | local_order_id=%s cls=%s",
+                            self.client_id, local_order_id, _outcome,
+                        )
+                    elif _outcome == _RowOutcome.RETRY_OWNED:
+                        log.info(
+                            "[%s] RECOVERY: retry_owned | local_order_id=%s",
+                            self.client_id, local_order_id,
+                        )
+                    elif _outcome == _RowOutcome.TERMINALIZED:
+                        log.info(
+                            "[%s] RECOVERY: terminalized | local_order_id=%s",
+                            self.client_id, local_order_id,
+                        )
+                    elif _outcome == _RowOutcome.SKIPPED:
+                        log.info(
+                            "[%s] RECOVERY: skipped (not PENDING_TRIGGER) | local_order_id=%s",
+                            self.client_id, local_order_id,
+                        )
+                    else:
+                        log.critical(
+                            "[%s] RECOVERY: UNRESOLVED | local_order_id=%s — operator review required",
+                            self.client_id, local_order_id,
+                        )
+                    continue
+                except Exception as _ptr_exc:
                     log.error(
-                        "[%s] RECOVERY: watcher reseed exception | local_order_id=%s signal_id=%s error=%s",
-                        self.client_id, local_order_id, order.get("signal_id"), exc,
+                        "[%s] RECOVERY: PendingTriggerRestartRecovery error local_order_id=%s: %s "
+                        "— canonical recovery failed closed",
+                        self.client_id, local_order_id, _ptr_exc,
                     )
                     continue
-                if armed:
-                    rearmed += 1
-                    log.info(
-                        "[%s] RECOVERY: watcher re-armed | local_order_id=%s signal_id=%s contract=%s trigger=%s",
-                        self.client_id,
-                        local_order_id,
-                        order.get("signal_id"),
-                        getattr(plan, "contract_symbol", ""),
-                        getattr(plan, "trigger_price", None),
-                    )
-                else:
-                    log.warning(
-                        "[%s] RECOVERY: watcher reseed failed | local_order_id=%s signal_id=%s reason=%s",
-                        self.client_id,
-                        local_order_id,
-                        order.get("signal_id"),
-                        getattr(self.entry_watcher, "_last_reject_reason", None),
-                    )
 
         result["watchers_requeued"] = count + rearmed
         log.info(

@@ -289,6 +289,8 @@ def classify_pending_trigger_row(
             meta.get("materialization_next_retry_at")
             or _extract(meta, "materialization.next_retry_at")
         )
+        restart_rearm_status = str(meta.get("restart_rearm_status") or "").strip().upper()
+        restart_rearm_next_at = meta.get("restart_rearm_next_at")
 
         # ── Priority 1: trigger_ready without broker_order_id is the zombie ──
         # A watcher decided the row should submit, but broker never accepted.
@@ -312,17 +314,26 @@ def classify_pending_trigger_row(
             return PendingTriggerClassification.UNSAFE_ALREADY_THROUGH_TRIGGER
 
         # ── Priority 5: past EOD without an active retry ──
-        if is_past_eod and retry_status not in ("RETRY_PENDING", "RUNNING", "QUEUED"):
+        if (
+            is_past_eod
+            and retry_status not in ("RETRY_PENDING", "RUNNING", "QUEUED")
+            and restart_rearm_status != "RETRY_PENDING"
+        ):
             return PendingTriggerClassification.STALE_AFTER_EOD
 
-        # ── Priority 6: watcher ownership check (when caller provided it) ──
+        # ── Priority 6: INVALIDATED_RETRYABLE or INVALIDATED_REARMABLE with active retry → retryable ──
+        # PR #324 §4: a retryable reason must never be STUCK_INVALIDATED.
+        if (
+            retry_status in ("RETRY_PENDING", "RUNNING")
+            or retry_next_at
+            or restart_rearm_status == "RETRY_PENDING"
+            or restart_rearm_next_at
+        ):
+            return PendingTriggerClassification.WAITING_RETRYABLE
+
+        # ── Priority 7: watcher ownership check (when caller provided it) ──
         if watcher_owned is False:
             return PendingTriggerClassification.ORPHAN_NO_WATCHER
-
-        # ── Priority 7: INVALIDATED_RETRYABLE or INVALIDATED_REARMABLE with active retry → retryable ──
-        # PR #324 §4: a retryable reason must never be STUCK_INVALIDATED.
-        if retry_status in ("RETRY_PENDING", "RUNNING") or retry_next_at:
-            return PendingTriggerClassification.WAITING_RETRYABLE
         # If watcher_invalidation_class says RETRYABLE/REARMABLE, row is still waiting.
         _inv_class = str(meta.get("watcher_invalidation_class") or "").strip()
         if _inv_class in ("INVALIDATED_RETRYABLE", "INVALIDATED_REARMABLE"):
