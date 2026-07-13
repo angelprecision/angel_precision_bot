@@ -2002,13 +2002,20 @@ class APOrderStateMachine:
             "execution_mode": _mode,
             "broker_ready": False,
         }
-        # Atomically advance the in-flight attempt counter when provided.
-        # This ensures the durable row always reflects which attempt is
-        # currently executing, even if the process crashes between claim
-        # and schedule_deferred_materialization_retry.
+        # P0 AMENDMENT blocker §4 (second round): atomically advance the
+        # CANONICAL retry_attempt field in the same JSONB merge as the
+        # generation advance. retry_attempt_in_flight is also written as
+        # a diagnostic alias for operators. The SQL predicate verifies the
+        # previous canonical attempt to prevent re-use of an already-claimed
+        # attempt slot (belt-and-suspenders against concurrent claimants
+        # after a lease expiry).
+        _prev_attempt: int | None = None
         if retry_attempt is not None:
             try:
-                _patch["retry_attempt_in_flight"] = int(retry_attempt)
+                _ra = int(retry_attempt)
+                _patch["retry_attempt"] = _ra
+                _patch["retry_attempt_in_flight"] = _ra
+                _prev_attempt = max(0, _ra - 1)
             except (TypeError, ValueError):
                 pass
         try:
@@ -2018,6 +2025,15 @@ class APOrderStateMachine:
 
         def _claim():
             with conn() as c:
+                _attempt_predicate = ""
+                _attempt_params: list = []
+                if _prev_attempt is not None:
+                    # Verify the canonical retry_attempt is at the expected
+                    # prior value — prevents double-claiming an attempt slot.
+                    _attempt_predicate = (
+                        " AND COALESCE((meta->>'retry_attempt')::int, 0) = %s"
+                    )
+                    _attempt_params = [_prev_attempt]
                 cur = c.execute(
                     """
                     UPDATE orders
@@ -2037,10 +2053,11 @@ class APOrderStateMachine:
                          OR COALESCE(meta->>'materialization_lease_until','') < %s
                       )
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
-                    """,
+                    """ + _attempt_predicate,
                     (
                         _patch_json, local_order_id, self.client_id,
                         _signal_id, _mode, _now, _expected_previous_generation,
+                        *_attempt_params,
                     ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)

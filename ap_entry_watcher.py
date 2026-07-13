@@ -1215,12 +1215,25 @@ class APEntryWatcher:
                     base["reason_code"] = "PROOF_WATCHER_EXPIRED"
                     return base
 
-            # The critical inertness check: if the durable row says "retry due
-            # NOW" but the in-memory watcher's deferred_retry_not_before is
-            # in the future (or a garbage value), then the poll loop will
-            # sleep past the due time and NEVER execute attempt N+1. This is
-            # the exact production failure this PR exists to eliminate.
-            if durable_due_at_dt is not None and durable_due_at_dt <= now:
+            # ── Schedule alignment proof (applies to ALL retries) ───────────
+            # P0 blocker §1 (second round): previously only validated
+            # deferred_retry_not_before when the durable timestamp was already
+            # due. For future retries, a watcher with deferred_retry_not_before
+            # = None proceeds immediately to quote evaluation on every poll
+            # cycle — it never waits for the durable retry time. A watcher
+            # whose in-memory schedule is malformed is also cleared and proceeds
+            # immediately. Both must FAIL proof for any durable timestamp,
+            # whether past or future.
+            #
+            # Tolerance: 1 second. The clock delta between the durable write
+            # and the recovery pass creates a small natural drift; a 1-second
+            # tolerance is tight enough to catch None/malformed/wildly mismatched
+            # schedules and wide enough to avoid false negatives from sub-second
+            # timing differences.
+            _SCHEDULE_TOLERANCE_SECONDS = 1
+
+            if durable_due_at_dt is not None:
+                # Parse the in-memory schedule.
                 _mem_due_dt: Optional[datetime] = None
                 if isinstance(_retry_dt, datetime):
                     _mem_due_dt = _retry_dt
@@ -1229,14 +1242,28 @@ class APEntryWatcher:
                         _mem_due_dt = datetime.fromisoformat(_retry_dt)
                     except Exception:
                         _mem_due_dt = None
-                if _mem_due_dt is not None:
-                    if _mem_due_dt.tzinfo is None:
-                        _mem_due_dt = _mem_due_dt.replace(tzinfo=timezone.utc)
-                    # In-memory schedule is materially past the durable due
-                    # time — poll loop will keep sleeping. Not executable.
-                    if _mem_due_dt > now + timedelta(seconds=1):
-                        base["reason_code"] = "PROOF_INERT_WATCHER_MEMORY_SLEEP_PAST_DURABLE_DUE"
-                        return base
+
+                if _mem_due_dt is None:
+                    # No in-memory schedule — watcher is inert regardless of
+                    # whether the durable retry is due or future.
+                    base["reason_code"] = "PROOF_NO_MEMORY_RETRY_SCHEDULE"
+                    return base
+
+                if _mem_due_dt.tzinfo is None:
+                    _mem_due_dt = _mem_due_dt.replace(tzinfo=timezone.utc)
+
+                _delta = abs((_mem_due_dt - durable_due_at_dt).total_seconds())
+                if _delta > _SCHEDULE_TOLERANCE_SECONDS:
+                    # In-memory schedule diverges materially from the durable
+                    # schedule — the poll loop will fire at the wrong time (or
+                    # not at all). Fail proof with the exact delta so forensics
+                    # can see how far out of alignment the watcher is.
+                    base["reason_code"] = (
+                        f"PROOF_SCHEDULE_MISMATCH:delta={_delta:.1f}s:"
+                        f"mem={_mem_due_dt.isoformat()}:"
+                        f"durable={durable_due_at_dt.isoformat()}"
+                    )
+                    return base
 
             base["proven"] = True
             base["reason_code"] = "PROOF_OK"

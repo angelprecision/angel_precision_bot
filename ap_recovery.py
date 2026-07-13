@@ -1606,6 +1606,24 @@ class APStartupRecovery:
                     )
                     continue
 
+                # P0 blocker §2 (new): RETRY_WAIT with no durable retry
+                # timestamp is an inconsistent lifecycle state. There is no
+                # safe interpretation of:
+                #   lifecycle_state = RETRY_WAIT / materialization_status = RETRY_PENDING
+                #   next_retry_at   = null
+                # It must be quarantined via retention — never trusted through
+                # has_order(). A future health pass can repair or terminalize it.
+                if _is_retry_row and _durable_next_retry_at is None:
+                    log.critical(
+                        "[%s] RECOVERY_RETRY_NO_DURABLE_SCHEDULE local_order_id=%s "
+                        "lifecycle=%s mstatus=%s — quarantining; no schedule to trust",
+                        self.client_id, local_order_id, lifecycle, materialization_status,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="retry_wait_no_durable_schedule",
+                    )
+                    continue
+
                 _is_due = _due_at is not None and _due_at <= now
 
                 # ── Due-retry path (blocker §4: watcher not required) ─────────
@@ -1714,8 +1732,24 @@ class APStartupRecovery:
                                 _retain_recovery_ownership(
                                     local_order_id, reason="due_retry_terminalize_failed",
                                 )
-                        # All other dispositions: row is now durably owned or
-                        # rescheduled by execution_core; skip rearm.
+                        elif _disp == "RETRY_SCHEDULE_FAILED":
+                            # P0 blocker §3: schedule write failed — row may be
+                            # stranded at MATERIALIZING. Retain durable ownership
+                            # so the next health-loop pass does not lose the row.
+                            log.critical(
+                                "[%s] RECOVERY_DUE_RETRY_SCHEDULE_FAILED "
+                                "local_order_id=%s reason=%s — retaining ownership",
+                                self.client_id, local_order_id, _reason,
+                            )
+                            _retain_recovery_ownership(
+                                local_order_id, reason=f"due_retry_schedule_failed:{_reason}",
+                            )
+                            result.setdefault("errors", []).append(
+                                f"retry_schedule_failed:{local_order_id}"
+                            )
+                        # All other dispositions (RETRY_WAIT / CLAIM_LOST /
+                        # NOT_DUE / KEEP_WATCHER): row is owned by execution
+                        # core; skip rearm.
                         continue
 
                 # ── Future-due / orphan rearm path ────────────────────────────
@@ -1760,10 +1794,8 @@ class APStartupRecovery:
                     # WAITING_FOR_TRIGGER), registry presence is sufficient.
                     if not _is_retry_row:
                         continue
-                    # RETRY_WAIT with no durable timestamp: no recoverable
-                    # schedule to violate — trust registry.
-                    if _due_at is None:
-                        continue
+                    # RETRY_WAIT rows with no durable timestamp are quarantined
+                    # above, so _due_at is always set here. Fall through to rearm.
                 plan.metadata["materialization_generation"] = int(
                     meta.get("materialization_generation") or 1
                 )

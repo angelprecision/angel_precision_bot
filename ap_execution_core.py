@@ -2417,6 +2417,59 @@ class APExecutionCore:
         if durable_due_at > _now:
             return {**_base, "disposition": "NOT_DUE", "reason_code": "RETRY_NOT_DUE"}
 
+        # ── Blocker §5: enforce absolute_entry_deadline before ANY claim ──
+        # An expired deadline must terminalize the row here — before the CAS,
+        # before selector work, before _on_entry_trigger. Downstream LIVE
+        # gates may provide partial defense, but the lifecycle consumer must
+        # honor its own durable deadline. PAPER retries of stale setups must
+        # also be blocked.
+        _deadline_raw = (
+            meta.get("absolute_entry_deadline")
+            or meta.get("retry_deadline")
+            or meta.get("deferred_retry_deadline")
+        )
+        if _deadline_raw:
+            try:
+                _deadline_dt = datetime.fromisoformat(str(_deadline_raw))
+                if _deadline_dt.tzinfo is None:
+                    _deadline_dt = _deadline_dt.replace(tzinfo=timezone.utc)
+                if _now >= _deadline_dt:
+                    return _term(
+                        "RETRY_DEADLINE_EXHAUSTED",
+                        status="EXPIRED",
+                        attempt=_expected_attempt,
+                        max_attempts=max_attempts,
+                    )
+            except Exception:
+                # Unparseable deadline — fail closed: treat as expired
+                # rather than silently allowing a potentially stale retry.
+                return _term(
+                    "RETRY_INVALID_DEADLINE",
+                    status="EXPIRED",
+                    attempt=_expected_attempt,
+                    max_attempts=max_attempts,
+                )
+
+        # ── Policy fields: required from the durable row — no silent defaults ─
+        # score, tier, and timeframe affect expiration/playbook selection,
+        # sizing gate thresholds, and contract scoring. Manufacturing them
+        # inside a broker-capable recovery path is unsafe.
+        _score_raw = row.get("score") if row.get("score") is not None else meta.get("score")
+        if _score_raw is None:
+            return _term("RETRY_MISSING_SCORE", status="ERROR")
+        try:
+            score = float(_score_raw)
+        except (TypeError, ValueError):
+            return _term("RETRY_INVALID_SCORE", status="ERROR")
+
+        _tier = str(row.get("tier") or meta.get("tier") or "").strip()
+        if not _tier:
+            return _term("RETRY_MISSING_TIER", status="ERROR")
+
+        _timeframe = str(row.get("timeframe") or meta.get("timeframe") or "").strip()
+        if not _timeframe:
+            return _term("RETRY_MISSING_TIMEFRAME", status="ERROR")
+
         # ── Fenced CAS (blocker §5: also stamps retry_attempt atomically) ─
         _new_generation = _expected_generation + 1
         try:
@@ -2463,8 +2516,13 @@ class APExecutionCore:
             _retry_delay = 20
 
         def _schedule_retry_wait(reason_code: str, selector_failure: dict | None = None) -> dict:
-            """Write a durable RETRY_WAIT row; return the RETRY_WAIT disposition."""
-            _next_attempt = _expected_attempt + 1
+            """Write a durable RETRY_WAIT row; return truthful disposition.
+
+            P0 blocker §3: RETRY_WAIT is only returned when the durable write
+            is confirmed. On write failure, RETRY_SCHEDULE_FAILED is returned
+            so recovery can retain ownership and re-attempt on the next pass.
+            Recovery must never treat a failed schedule as durably owned.
+            """
             _next_retry_at = (_now + timedelta(seconds=_retry_delay)).isoformat()
             _schedule = getattr(osm, "schedule_deferred_materialization_retry", None)
             _ok = False
@@ -2481,21 +2539,34 @@ class APExecutionCore:
                         selector_failure=selector_failure or {"reason_code": reason_code},
                     ))
                 except Exception as _sch_exc:
-                    log.critical("[%s] resume_deferred_materialization_retry "
-                                 "schedule_retry_wait FAILED local_order_id=%s exc=%s "
-                                 "— row may be stranded at MATERIALIZING",
-                                 self.client_id, local_order_id, _sch_exc)
+                    log.critical(
+                        "[%s] resume_deferred_materialization_retry "
+                        "schedule_retry_wait RAISED local_order_id=%s exc=%s "
+                        "— row stranded at MATERIALIZING",
+                        self.client_id, local_order_id, _sch_exc,
+                    )
             if not _ok:
-                log.critical("[%s] resume_deferred_materialization_retry "
-                             "schedule_retry_wait returned False local_order_id=%s "
-                             "— row may be stranded at MATERIALIZING",
-                             self.client_id, local_order_id)
+                log.critical(
+                    "[%s] resume_deferred_materialization_retry "
+                    "schedule_retry_wait FAILED local_order_id=%s "
+                    "— row stranded at MATERIALIZING; recovery must retain ownership",
+                    self.client_id, local_order_id,
+                )
+                # Return RETRY_SCHEDULE_FAILED so recovery calls
+                # _retain_recovery_ownership and does NOT claim the row is
+                # durably rescheduled. The next health-loop pass will see the
+                # row still at MATERIALIZING (or after lease expiry, RETRY_WAIT
+                # will be re-attempted).
+                return {
+                    **_base,
+                    "disposition": "RETRY_SCHEDULE_FAILED",
+                    "reason_code": f"RETRY_SCHEDULE_WRITE_FAILED:{reason_code}",
+                }
             return {
                 **_base,
                 "disposition": "RETRY_WAIT",
                 "reason_code": reason_code,
                 "next_retry_at": _next_retry_at,
-                "durable_retry_schedule_ok": _ok,
             }
 
         # ── Preserve prior attempt diagnostics ───────────────────────
@@ -2537,8 +2608,8 @@ class APExecutionCore:
             ticker=ticker,
             side=direction,
             direction=direction,
-            score=float(row.get("score") or meta.get("score") or 65.0),
-            tier=str(row.get("tier") or meta.get("tier") or "B"),
+            score=score,
+            tier=_tier,
             trigger_price=trigger_price,
             stop_underlying=(
                 row.get("stop_underlying") if row.get("stop_underlying") is not None
@@ -2550,7 +2621,7 @@ class APExecutionCore:
             ),
             contract_symbol=str(row.get("contract") or ""),
             pattern=str(row.get("pattern") or meta.get("pattern") or ""),
-            timeframe=str(row.get("timeframe") or meta.get("timeframe") or "1d"),
+            timeframe=_timeframe,
             strategy_type=str(meta.get("strategy_type") or ""),
             prior_day_high=meta.get("prior_day_high"),
             prior_day_low=meta.get("prior_day_low"),

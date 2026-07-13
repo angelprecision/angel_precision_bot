@@ -200,7 +200,9 @@ def test_1_registered_but_inert_watcher_does_not_prove_ownership():
         durable_retry_deadline=_iso(now + timedelta(hours=2)),
     )
     assert proof["proven"] is False
-    assert "INERT_WATCHER" in proof["reason_code"] or "SLEEP_PAST_DURABLE_DUE" in proof["reason_code"]
+    # Schedule mismatch: in-memory is 30 minutes in the future but
+    # durable was due 60s ago — delta is ~1860s, well over 1s tolerance.
+    assert "SCHEDULE_MISMATCH" in proof["reason_code"] or "MEMORY_RETRY_SCHEDULE" in proof["reason_code"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1009,3 +1011,267 @@ def test_amend5_callback_exception_schedules_durable_retry():
     assert "EXCEPTION" in result["reason_code"] or "CALLBACK" in result["reason_code"]
     # CRITICAL: schedule must have been called to make the RETRY_WAIT durable
     core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Second-round blocker tests from reviewer
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_blocker1_future_watcher_null_memory_schedule_fails_proof():
+    """Future-due durable timestamp + watcher deferred_retry_not_before=None
+    must FAIL proof. The watcher would immediately proceed to quote evaluation
+    without waiting for the durable retry time.
+    """
+    from ap_entry_watcher import APEntryWatcher
+
+    watcher = APEntryWatcher.__new__(APEntryWatcher)
+    watcher._pending = []
+    watcher._lock = threading.RLock()
+
+    now = datetime.now(timezone.utc)
+    future_due = now + timedelta(minutes=5)
+    watcher._pending.append(SimpleNamespace(
+        signal={
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "watcher_token": "watcher:x",
+            "trigger_generation": 1,
+        },
+        is_active=True,
+        rearm_mode=False,
+        _ownership_quarantine=False,
+        state=SimpleNamespace(name="PENDING"),
+        expire_at=now + timedelta(hours=48),
+        deferred_retry_not_before=None,  # inert — would fire immediately
+    ))
+
+    proof = watcher.prove_materialization_retry_owner(
+        LOCAL_ORDER_ID,
+        durable_next_retry_at=_iso(future_due),
+    )
+    assert proof["proven"] is False
+    assert "MEMORY_RETRY_SCHEDULE" in proof["reason_code"] or "SCHEDULE_MISMATCH" in proof["reason_code"]
+
+
+def test_blocker1_future_watcher_mismatched_schedule_fails_proof():
+    """Future-due durable at +5min, watcher at +20min. Delta > 1s → proof fails."""
+    from ap_entry_watcher import APEntryWatcher
+
+    watcher = APEntryWatcher.__new__(APEntryWatcher)
+    watcher._pending = []
+    watcher._lock = threading.RLock()
+
+    now = datetime.now(timezone.utc)
+    durable_due = now + timedelta(minutes=5)
+    memory_due = now + timedelta(minutes=20)  # 15-minute mismatch
+    watcher._pending.append(SimpleNamespace(
+        signal={
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "watcher_token": "watcher:x",
+            "trigger_generation": 1,
+        },
+        is_active=True,
+        rearm_mode=False,
+        _ownership_quarantine=False,
+        state=SimpleNamespace(name="PENDING"),
+        expire_at=now + timedelta(hours=48),
+        deferred_retry_not_before=memory_due,
+    ))
+
+    proof = watcher.prove_materialization_retry_owner(
+        LOCAL_ORDER_ID,
+        durable_next_retry_at=_iso(durable_due),
+    )
+    assert proof["proven"] is False
+    assert "SCHEDULE_MISMATCH" in proof["reason_code"]
+    assert "delta=" in proof["reason_code"]
+
+
+def test_blocker2_retry_wait_no_timestamp_quarantines():
+    """RETRY_WAIT with no durable next_retry_at must quarantine via
+    retention. must NOT fall through to has_order() trust.
+    """
+    from ap_entry_watcher import APEntryWatcher
+    from unittest.mock import patch
+    from ap import db as db_mod
+
+    core = _core()
+    core.order_state_machine.client_id = CLIENT_ID
+
+    row_no_ts = _row()
+    row_no_ts["meta"]["lifecycle_state"] = "RETRY_WAIT"
+    row_no_ts["meta"]["materialization_status"] = "RETRY_PENDING"
+    # Remove ALL retry timestamps
+    for k in ("materialization_next_retry_at", "next_retry_at",
+               "deferred_retry_next_attempt_at"):
+        row_no_ts["meta"].pop(k, None)
+
+    watcher = APEntryWatcher.__new__(APEntryWatcher)
+    watcher._pending = []
+    watcher._lock = threading.RLock()
+    watcher.watch = MagicMock(return_value=True)
+
+    rec = _recovery(core, watcher)
+
+    class _C:
+        def execute(self, *a, **k):
+            return self
+        def fetchall(self):
+            return [row_no_ts]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self):
+            return _C()
+        def __exit__(self, *a):
+            return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    # Watcher.watch must NOT have been called
+    watcher.watch.assert_not_called()
+    # OSM retention must have been called
+    core.order_state_machine.update_order_meta.assert_called()
+
+
+def test_blocker3_schedule_write_false_returns_retry_schedule_failed():
+    """When schedule_deferred_materialization_retry returns False,
+    resume must return RETRY_SCHEDULE_FAILED — NOT RETRY_WAIT.
+    """
+    core = _core()
+    row = _row()
+    core.order_state_machine.get_order.side_effect = [row, row]
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+    core._on_entry_trigger.side_effect = RuntimeError("cb error")
+    # Schedule write fails
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = False
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-sched-fail",
+    )
+    assert result["disposition"] == "RETRY_SCHEDULE_FAILED"
+    assert "SCHEDULE_WRITE_FAILED" in result["reason_code"]
+
+
+def test_blocker4_claim_writes_canonical_retry_attempt():
+    """claim_deferred_materialization must write retry_attempt (canonical)
+    in the same patch as generation, not just retry_attempt_in_flight.
+    """
+    import json
+    from unittest.mock import patch, MagicMock
+    from ap.order_state_machine import APOrderStateMachine
+
+    patches_seen: list = []
+
+    class _FakeCursor:
+        rowcount = 1
+        def execute(self, sql, params=()):
+            if params and isinstance(params[0], str):
+                try:
+                    patches_seen.append(json.loads(params[0]))
+                except Exception:
+                    pass
+            return self
+
+    class _FakeConn:
+        def __enter__(self):
+            return _FakeCursor()
+        def __exit__(self, *a):
+            return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    # Patch conn AND run_with_retry so the SQL path actually executes
+    with patch("ap.order_state_machine.conn", return_value=_FakeConn()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        osm.claim_deferred_materialization(
+            LOCAL_ORDER_ID,
+            owner="owner-x",
+            new_generation=2,
+            lease_until="2026-12-31T00:00:00+00:00",
+            trigger_crossed_at="2026-07-13T10:00:00+00:00",
+            trigger_price=130.0,
+            observed_underlying_price=130.05,
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
+            retry_attempt=2,
+        )
+
+    assert patches_seen, "no patch was written to the DB"
+    patch_written = patches_seen[0]
+    assert "retry_attempt" in patch_written, "canonical retry_attempt must be in patch"
+    assert patch_written["retry_attempt"] == 2
+    assert patch_written.get("retry_attempt_in_flight") == 2
+
+
+def test_blocker5_expired_deadline_terminalizes_before_claim():
+    """A row whose absolute_entry_deadline is in the past must be
+    terminalized BEFORE the CAS — no selector call, no broker path.
+    """
+    core = _core()
+    row = _row()
+    now = datetime.now(timezone.utc)
+    row["meta"]["absolute_entry_deadline"] = _iso(now - timedelta(hours=1))
+
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-expired",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == "RETRY_DEADLINE_EXHAUSTED"
+    assert result["terminal_status"] == "EXPIRED"
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+    core._on_entry_trigger.assert_not_called()
+
+
+def test_blocker5_missing_score_fails_before_claim():
+    """Missing score in the row must fail closed before the CAS."""
+    core = _core()
+    row = _row()
+    row["score"] = None
+    row["meta"].pop("score", None)
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-noscore",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "SCORE" in result["reason_code"]
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
+
+
+def test_blocker5_missing_timeframe_fails_before_claim():
+    """Missing timeframe in the row must fail closed before the CAS."""
+    core = _core()
+    row = _row()
+    row["timeframe"] = None
+    row["meta"].pop("timeframe", None)
+    core.order_state_machine.get_order.return_value = row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-notf",
+    )
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert "TIMEFRAME" in result["reason_code"]
+    core.order_state_machine.claim_deferred_materialization.assert_not_called()
