@@ -2438,6 +2438,139 @@ class APOrderStateMachine:
             )
             return False
 
+    def terminalize_deferred_retry_if_unchanged(
+        self,
+        local_order_id: str,
+        *,
+        reason_code: str,
+        terminal_status: str = "EXPIRED",
+        expected_client_id: str,
+        expected_execution_mode: str,
+        expected_generation: int,
+        expected_prior_retry_attempt: int,
+        diagnostics: dict | None = None,
+    ) -> bool:
+        """Fenced terminal CAS for due-retry boundary failures.
+
+        P0 AMENDMENT (fix/deferred-retry-due-execution-p0 — final)
+        -----------------------------------------------------------
+        This method ONLY succeeds when the durable row is provably still in the
+        exact pre-claim RETRY_WAIT state the consumer observed. It refuses to
+        write when ANY of these are present in the durable row:
+
+          * generation advanced past expected (concurrent claim winner)
+          * retry_attempt advanced past expected_prior (concurrent attempt)
+          * lifecycle_state ≠ RETRY_WAIT (concurrent lifecycle advance)
+          * materialization_status ≠ RETRY_PENDING
+          * broker_ready IS NOT 'false' (concurrent broker-ready advance)
+          * materialization_in_flight IS NOT 'false' (concurrent claim)
+          * submit_intent_at IS NOT NULL/blank (concurrent submit intent)
+          * broker_order_id IS NOT NULL/blank (concurrent broker submission)
+          * submitted_ts IS NOT NULL (concurrent submit completion)
+          * execution_mode ≠ expected (mode isolation guard)
+          * client_id ≠ expected (client isolation guard)
+
+        Boolean fields use text equality ('false') rather than ::boolean casts
+        so malformed metadata values (non-'true'/'false' strings) fail closed
+        rather than raising a Postgres transaction error and accidentally
+        allowing a broad terminalize to proceed.
+
+        Returns True only when rowcount == 1 (exactly one row was updated).
+        Returns False on any CAS miss, identity mismatch, or write error.
+        """
+        import json as _json_local
+
+        _reason = str(reason_code or "").strip()
+        _status = str(terminal_status or "EXPIRED").strip().upper()
+        _exp_client = str(expected_client_id or "").strip().lower()
+        _exp_mode = str(expected_execution_mode or "").strip().lower()
+        if (
+            not _reason
+            or _status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
+            or not _exp_client
+            or not _exp_mode
+        ):
+            return False
+        try:
+            _exp_gen = int(expected_generation)
+            _exp_attempt = int(expected_prior_retry_attempt)
+        except (TypeError, ValueError):
+            return False
+        if _exp_gen < 1 or _exp_attempt < 0:
+            return False
+
+        _now = now_utc_iso()
+        _patch = {}
+        for _k, _v in (diagnostics or {}).items():
+            _patch[_k] = _v
+        _patch.update({
+            "lifecycle_state": _status,
+            "materialization_status": "FAILED_TERMINAL",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "current_owner": "",
+            "materialization_lease_until": "",
+            "broker_ready": False,
+            "reason_code": _reason,
+            "materialization_reason": _reason,
+            "final_reason": _reason,
+            "materialization_finished_at": _now,
+            "selector_completed_at": _now,
+            "retry_terminal_fenced": True,
+            "retry_terminal_expected_generation": _exp_gen,
+            "retry_terminal_expected_prior_attempt": _exp_attempt,
+        })
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _fenced_terminal():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET status                 = %s,
+                        last_error             = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts             = NOW()
+                    WHERE local_order_id       = %s
+                      AND client_id            = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND kind                 = 'ENTRY'
+                      AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      -- No submit intent in flight
+                      AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
+                      -- Exact lifecycle state proof
+                      AND COALESCE(meta->>'lifecycle_state', '') = 'RETRY_WAIT'
+                      AND COALESCE(meta->>'materialization_status', '') = 'RETRY_PENDING'
+                      -- Exact fencing counters
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE((meta->>'retry_attempt')::int, 0) = %s
+                      -- Boolean fields: fail closed on anything other than literal 'false'
+                      -- A malformed value like 'truee' is NOT 'false' and blocks the update
+                      AND COALESCE(meta->>'broker_ready', 'false') = 'false'
+                      AND COALESCE(meta->>'materialization_in_flight', 'false') = 'false'
+                    """,
+                    (
+                        _status, _reason, _patch_json,
+                        local_order_id, _exp_client, _exp_mode,
+                        _exp_gen, _exp_attempt,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_fenced_terminal) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] terminalize_deferred_retry_if_unchanged failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def claim_pre_submit_proof_retry(
         self,
         local_order_id: str,

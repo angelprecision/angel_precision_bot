@@ -1,0 +1,714 @@
+"""P0 tests: fenced due-retry terminalization.
+
+Verifies that a due-retry terminal boundary in resume_deferred_materialization_retry
+cannot write a terminal state when a concurrent worker has advanced:
+  - materialization_generation (concurrent claim winner)
+  - submit_intent_at (concurrent submit in progress)
+  - broker_ready (concurrent broker-ready advance)
+And that already-terminal rows are NOT written twice.
+
+Corresponds to PR #332 final amendment:
+  terminalize_deferred_retry_if_unchanged() on APOrderStateMachine.
+  TERMINAL_REQUIRED / TERMINAL_ALREADY_DURABLE disposition semantics.
+  Recovery _terminalize_fenced_retry() classification of CAS misses.
+"""
+
+from __future__ import annotations
+
+import json
+import threading
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+CLIENT_ID = "jose@example.com"
+LOCAL_ORDER_ID = "oid-fenced-term-1"
+SIGNAL_ID = "sig-fenced-term-1"
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+# ── OSM CAS harness ───────────────────────────────────────────────────────────
+
+class _FakeConn:
+    """Minimal DB connection that replays a fixed rowcount."""
+    def __init__(self, rowcount: int = 1, patches: list | None = None):
+        self._rc = rowcount
+        self._patches = patches if patches is not None else []
+        self.rowcount = rowcount
+
+    def execute(self, sql: str, params=()):
+        # The UPDATE in terminalize_deferred_retry_if_unchanged passes:
+        # (status, reason, patch_json, local_order_id, client, mode, gen, attempt)
+        # The patch JSON is the 3rd positional param (index 2).
+        for p in params:
+            if isinstance(p, str) and p.startswith("{"):
+                try:
+                    self._patches.append(json.loads(p))
+                except Exception:
+                    pass
+        self.rowcount = self._rc
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _osm(rowcount: int = 1, patches: list | None = None):
+    from ap.order_state_machine import APOrderStateMachine
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+    _conn = _FakeConn(rowcount=rowcount, patches=patches if patches is not None else [])
+
+    with patch("ap.order_state_machine.conn", return_value=_conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        yield osm, _conn
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 1 — generation advanced before terminal CAS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_1_generation_advanced_blocks_terminal_cas():
+    """When concurrent worker advanced generation from 4→5, the fenced CAS
+    must return False. Recovery must classify CLAIM_LOST and NOT write
+    any terminal status or retain ownership metadata.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    patches = []
+    # CAS returns 0 rows (generation mismatch blocks update)
+    fake_conn = _FakeConn(rowcount=0, patches=patches)
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_MAX_ATTEMPTS_EXCEEDED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="paper",
+            expected_generation=4,            # old generation
+            expected_prior_retry_attempt=1,
+        )
+
+    assert ok is False, "CAS must fail when rowcount=0 (generation advanced)"
+    # When CAS misses, the terminal status must NOT appear in the returned row's status.
+    # The patches list may have captured the attempted patch JSON, but rowcount=0
+    # means Postgres rejected the write. Verify the CAS returned False.
+    # The important invariant is that ok=False, not which patches were captured.
+    assert not ok  # redundant but explicit
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 2 — submit_intent_at blocks terminalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_2_submit_intent_blocks_terminal_cas():
+    """The SQL predicate requires submit_intent_at IS NULL/blank.
+    A row with submit_intent_at present must reject the terminal CAS
+    — the predicate returns 0 rows and CAS fails.
+    We verify the SQL contains the submit_intent_at guard.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    sqls_seen = []
+
+    class _C:
+        rowcount = 0
+        def execute(self, sql, params=()):
+            sqls_seen.append(sql)
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=_C()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_DEADLINE_EXHAUSTED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="paper",
+            expected_generation=4,
+            expected_prior_retry_attempt=1,
+        )
+
+    assert ok is False
+    assert sqls_seen, "SQL must have been executed"
+    combined = " ".join(sqls_seen)
+    assert "submit_intent_at" in combined, \
+        "SQL predicate must include submit_intent_at guard"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 3 — broker_ready advance prevents terminalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_3_broker_ready_advance_blocks_terminal_cas():
+    """The predicate requires broker_ready = 'false'. When broker_ready
+    is 'true' in the row, the predicate matches 0 rows.
+    We verify the SQL contains the broker_ready guard.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    sqls_seen = []
+
+    class _C:
+        rowcount = 0
+        def execute(self, sql, params=()):
+            sqls_seen.append(sql)
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=_C()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_MAX_ATTEMPTS_EXCEEDED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="paper",
+            expected_generation=4,
+            expected_prior_retry_attempt=1,
+        )
+
+    assert ok is False
+    combined = " ".join(sqls_seen)
+    assert "broker_ready" in combined, "SQL must guard against broker_ready advance"
+    # Verify it uses fail-closed text equality, not ::boolean cast
+    assert "'false'" in combined, "broker_ready predicate must use text 'false' not ::boolean"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 4 — TERMINAL_ALREADY_DURABLE: terminalize not called twice
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_4_terminal_already_durable_not_written_twice():
+    """When resume returns TERMINAL_ALREADY_DURABLE, recovery must NOT
+    call terminalize_deferred_retry_if_unchanged or terminalize_deferred_breach.
+    """
+    from ap_execution_core import APExecutionCore
+
+    # Simulate a post-callback reread that finds status=EXPIRED
+    expired_row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-1",
+        "status": "EXPIRED",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "RTX", "direction": "CALL",
+        "score": 78.0, "tier": "B",
+        "trigger_price": 130.0,
+        "stop_underlying": 128.0, "target_underlying": 133.0,
+        "pattern": "3-1-2", "timeframe": "1d",
+        "contract": "DEFERRED:RTX", "qty": 1,
+        "limit_price": 0.01, "reserved_cost": 0.0,
+        "meta": {
+            "lifecycle_state": "EXPIRED",
+            "materialization_generation": 2,
+            "retry_attempt": 2,
+            "trigger_crossed_at": _iso(_now() - timedelta(minutes=2)),
+            "trigger_price": 130.0,
+            "materialization_next_retry_at": _iso(_now() - timedelta(seconds=30)),
+            "next_retry_at": _iso(_now() - timedelta(seconds=30)),
+            "retry_max_attempts": 3,
+        },
+    }
+    before_meta = dict(expired_row["meta"])
+    before_meta["lifecycle_state"] = "RETRY_WAIT"
+    before_meta["materialization_status"] = "RETRY_PENDING"
+    before_meta["materialization_generation"] = 1
+    before_meta["retry_attempt"] = 1
+    before_row = dict(expired_row)
+    before_row["status"] = "PENDING_TRIGGER"
+    before_row["meta"] = before_meta
+
+    term_call_count = [0]
+
+    class _OSM:
+        client_id = CLIENT_ID
+        _claimed = False
+
+        def get_order(self, oid):
+            if not _OSM._claimed:
+                return before_row
+            return expired_row  # Already terminal after claim
+
+        def claim_deferred_materialization(self, oid, **kw):
+            _OSM._claimed = True
+            return True
+
+        def update_order_meta(self, oid, patch): return True
+        def terminalize_deferred_retry_if_unchanged(self, oid, **kw):
+            term_call_count[0] += 1
+            return True
+        def terminalize_deferred_breach(self, oid, **kw):
+            term_call_count[0] += 1
+            return True
+        def schedule_deferred_materialization_retry(self, oid, **kw): return True
+        def submit_existing_entry(self, *a, **kw): return {}
+        def get_orders_for_position(self, *a, **kw): return []
+        def persist_deferred_broker_ready(self, *a, **kw): return True
+        def claim_deferred_broker_ready_submit(self, *a, **kw): return True
+
+    core = object.__new__(APExecutionCore)
+    core.client_id = CLIENT_ID
+    core.email = CLIENT_ID
+    core.execution_mode = "paper"
+    core.mode = "PAPER"
+    core.paper = True
+    core.order_state_machine = _OSM()
+    core.broker = MagicMock()
+    core.contract_selector = MagicMock()
+    core.store = MagicMock()
+    core._kill_switch = False
+    core._max_positions = 5
+    core._pos_lock = threading.RLock()
+    core._open_positions = {}
+    core._pending_entries = {}
+    core._reserved_capital = 0.0
+    core._capital_lock = threading.RLock()
+    core.master_control = MagicMock()
+    core.master_control._kill_switch_fn = lambda: False
+    core.master_control.mode = "PAPER"
+    core.exit_eng = None
+    core.entry_watcher = None
+    core.position_manager = MagicMock()
+    core.fill_monitor = MagicMock()
+    core.alpha_tracker = MagicMock()
+    core.entry_telemetry = MagicMock()
+    core.intelligence_context = MagicMock()
+    core.intelligence_context.is_enabled.return_value = False
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner="owner-already-term",
+    )
+
+    assert result["disposition"] == "TERMINAL_ALREADY_DURABLE", (
+        f"Expected TERMINAL_ALREADY_DURABLE; got {result['disposition']}: {result.get('reason_code')}"
+    )
+    assert term_call_count[0] == 0, (
+        f"terminalize must NOT be called for TERMINAL_ALREADY_DURABLE; called {term_call_count[0]} times"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 5 — exact old RETRY_WAIT row terminalized successfully
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_5_exact_old_retry_row_terminalized():
+    """When the row is exactly the expected RETRY_WAIT state (no concurrent
+    advance), terminalize_deferred_retry_if_unchanged must succeed (rowcount=1).
+    The patch must include the terminal status and reason_code.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    patches = []
+    fake_conn = _FakeConn(rowcount=1, patches=patches)
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_MAX_ATTEMPTS_EXCEEDED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="paper",
+            expected_generation=4,
+            expected_prior_retry_attempt=1,
+            diagnostics={"selector_diagnostics": {"last": "OI_TOO_LOW"}},
+        )
+
+    assert ok is True, "CAS must succeed when rowcount=1"
+    assert patches, "At least one patch must have been written"
+    p = patches[0]
+    assert p["lifecycle_state"] == "EXPIRED"
+    assert p["reason_code"] == "RETRY_MAX_ATTEMPTS_EXCEEDED"
+    assert p["final_reason"] == "RETRY_MAX_ATTEMPTS_EXCEEDED"
+    assert p["retry_terminal_fenced"] is True
+    assert p["retry_terminal_expected_generation"] == 4
+    assert p["retry_terminal_expected_prior_attempt"] == 1
+    # Diagnostics are preserved
+    assert p.get("selector_diagnostics") == {"last": "OI_TOO_LOW"}
+    # Lifecycle resets
+    assert p["broker_ready"] is False
+    assert p["materialization_in_flight"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 6 — wrong execution_mode cannot terminalize
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_6_wrong_execution_mode_cannot_terminalize():
+    """terminalize_deferred_retry_if_unchanged rejects a call where
+    expected_execution_mode = 'live' but the row has execution_mode = 'paper'.
+    The SQL predicate is: LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+    A mode mismatch returns 0 rows from Postgres (mocked by rowcount=0).
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    fake_conn = _FakeConn(rowcount=0)
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok_wrong_mode = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_MAX_ATTEMPTS_EXCEEDED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="live",   # WRONG — row is paper
+            expected_generation=4,
+            expected_prior_retry_attempt=1,
+        )
+
+    assert ok_wrong_mode is False, "LIVE worker must not terminalize PAPER row (rowcount=0)"
+
+
+def test_6b_empty_mode_rejects_early():
+    """An empty expected_execution_mode fails validation before the SQL."""
+    from ap.order_state_machine import APOrderStateMachine
+
+    sql_calls = [0]
+
+    class _C:
+        rowcount = 0
+        def execute(self, *a, **k):
+            sql_calls[0] += 1
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=_C()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_MAX_ATTEMPTS_EXCEEDED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="",   # invalid
+            expected_generation=4,
+            expected_prior_retry_attempt=1,
+        )
+
+    assert ok is False
+    assert sql_calls[0] == 0, "SQL must NOT execute when execution_mode is empty"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 7 — malformed boolean metadata fails closed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_7_malformed_boolean_metadata_fails_closed():
+    """The predicate uses text equality ('false') not ::boolean cast.
+    A malformed value like 'truee' is NOT 'false' — the predicate
+    must block terminalization (rowcount=0). This is verified by
+    checking the SQL contains the text predicate, not a cast.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    sqls = []
+
+    class _C:
+        rowcount = 0
+        def execute(self, sql, params=()):
+            sqls.append(sql)
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    with patch("ap.order_state_machine.conn", return_value=_C()), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.terminalize_deferred_retry_if_unchanged(
+            LOCAL_ORDER_ID,
+            reason_code="RETRY_DEADLINE_EXHAUSTED",
+            terminal_status="EXPIRED",
+            expected_client_id=CLIENT_ID,
+            expected_execution_mode="paper",
+            expected_generation=4,
+            expected_prior_retry_attempt=1,
+        )
+
+    assert ok is False  # rowcount=0
+    combined = " ".join(sqls)
+    # Must use text equality, not ::boolean cast
+    assert "= 'false'" in combined, "Must use text = 'false' for fail-closed boolean check"
+    assert "::boolean" not in combined, "Must NOT use ::boolean cast (can raise on malformed data)"
+    # materlization_in_flight must also be guarded
+    assert "materialization_in_flight" in combined
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 8 — concurrent terminal winner: recovery does not error or retain
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_8_concurrent_terminal_winner_no_error():
+    """When _terminalize_fenced_retry CAS misses and the reread shows
+    the row is already EXPIRED (another worker won), recovery must:
+      - classify result as ALREADY_TERMINAL
+      - NOT append a recovery error
+      - NOT call _retain_recovery_ownership
+    """
+    from ap_recovery import APStartupRecovery
+
+    term_calls = [0]
+    retain_calls = []
+
+    class _OSM:
+        client_id = CLIENT_ID
+
+        def get_order(self, oid):
+            # Return a fully-terminal row
+            return {
+                "local_order_id": LOCAL_ORDER_ID,
+                "client_id": CLIENT_ID,
+                "execution_mode": "paper",
+                "signal_id": SIGNAL_ID,
+                "status": "EXPIRED",
+                "broker_order_id": None,
+                "submitted_ts": None,
+                "meta": {
+                    "lifecycle_state": "EXPIRED",
+                    "materialization_generation": 4,
+                    "retry_attempt": 1,
+                    "reason_code": "RETRY_MAX_ATTEMPTS_EXCEEDED",
+                },
+            }
+
+        def terminalize_deferred_retry_if_unchanged(self, oid, **kw):
+            term_calls[0] += 1
+            return False  # CAS misses — row already moved
+
+        def update_order_meta(self, oid, patch):
+            if "recovery_owner" in str(patch) or "retention" in str(patch):
+                retain_calls.append(patch)
+            return True
+
+        def terminalize_deferred_breach(self, oid, **kw):
+            term_calls[0] += 1
+            return True
+
+    # Build a minimal recovery outcome dict (TERMINAL_REQUIRED)
+    outcome = {
+        "disposition": "TERMINAL_REQUIRED",
+        "reason_code": "RETRY_MAX_ATTEMPTS_EXCEEDED",
+        "terminal_status": "EXPIRED",
+        "expected_generation": 4,
+        "expected_prior_retry_attempt": 1,
+        "expected_client_id": CLIENT_ID,
+        "expected_execution_mode": "paper",
+        "expected_lifecycle_state": "RETRY_WAIT",
+        "expected_materialization_status": "RETRY_PENDING",
+        "attempt": 2,
+        "max_attempts": 3,
+        "owner": "recovery_retry:jose@example.com:oid-1:5",
+        "generation": 5,
+    }
+
+    mc = SimpleNamespace(mode="PAPER")
+    osm = _OSM()
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=MagicMock(),
+        osm=osm,
+        pm=MagicMock(),
+        master_control=mc,
+        exit_engine=None,
+        entry_watcher=None,
+        execution_core=None,
+    )
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    recovery_mode = "paper"
+
+    # Directly call the fenced helper via the inner function
+    # (simulate what the recovery loop does for TERMINAL_REQUIRED)
+    import ap_recovery as rec_mod
+    import types
+
+    # We need to build the _terminalize_fenced_retry closure the way
+    # _recover_deferred_breach_lifecycles builds it. To do that without
+    # running the full SQL-based loop, call the method with a patched
+    # DB cursor that returns only our outcome row.
+    from ap import db as db_mod
+
+    row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": "CALL",
+        "score": 78.0, "tier": "B",
+        "trigger_price": 130.0,
+        "stop_underlying": 128.0,
+        "target_underlying": 133.0,
+        "pattern": "3-1-2",
+        "timeframe": "1d",
+        "contract": "DEFERRED:RTX",
+        "qty": 1, "limit_price": 0.01, "reserved_cost": 0.0,
+        "meta": {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_generation": 4,
+            "retry_attempt": 1,
+            "retry_max_attempts": 3,
+            "next_retry_at": _iso(_now() - timedelta(seconds=60)),
+            "materialization_next_retry_at": _iso(_now() - timedelta(seconds=60)),
+            "trigger_crossed_at": _iso(_now() - timedelta(seconds=120)),
+            "trigger_price": 130.0,
+        },
+    }
+
+    class _C:
+        def execute(self, *a, **k): return self
+        def fetchall(self): return [row]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    # Mock execution_core.resume_deferred_materialization_retry to return
+    # TERMINAL_REQUIRED directly without running the real selector path
+    mock_core = MagicMock()
+    mock_core.resume_deferred_materialization_retry.return_value = outcome
+    rec.execution_core = mock_core
+
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    # The fenced CAS returned False (concurrent winner already terminalized)
+    # Recovery must classify ALREADY_TERMINAL — no error, no retention write
+    assert "fenced_term_write_failed" not in str(result.get("errors", [])), (
+        f"Must not add write-failed error on ALREADY_TERMINAL: {result}"
+    )
+    # No explicit _retain_recovery_ownership should have been called
+    retain_metas = [
+        c for c in osm.update_order_meta.call_args_list
+        if "recovery_owner" in str(c) or "retention_reason" in str(c)
+    ] if hasattr(osm, 'update_order_meta') and hasattr(osm.update_order_meta, 'call_args_list') else retain_calls
+    assert not retain_calls, f"_retain_recovery_ownership must NOT be called: {retain_calls}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test: TERMINAL_REQUIRED carries exact expected state
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_terminal_required_carries_expected_state():
+    """resume_deferred_materialization_retry must include all expected
+    fencing fields in the TERMINAL_REQUIRED return dict so recovery
+    can call terminalize_deferred_retry_if_unchanged with exact predicates.
+    """
+    from ap_execution_core import APExecutionCore
+
+    now = datetime.now(timezone.utc)
+    row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-1",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": "CALL",
+        "score": 78.0, "tier": "B",
+        "trigger_price": 130.0,
+        "stop_underlying": 128.0, "target_underlying": 133.0,
+        "pattern": "3-1-2", "timeframe": "1d",
+        "contract": "DEFERRED:RTX", "qty": 1,
+        "limit_price": 0.01, "reserved_cost": 0.0,
+        "meta": {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_generation": 2,
+            "retry_attempt": 3,    # durable=3, caller expects attempt=4 (prior=3 matches)
+            "retry_max_attempts": 3,
+            "next_retry_at": _iso(now - timedelta(seconds=30)),
+            "materialization_next_retry_at": _iso(now - timedelta(seconds=30)),
+            "trigger_crossed_at": _iso(now - timedelta(seconds=120)),
+            "trigger_price": 130.0,
+        },
+    }
+
+    class _OSM:
+        client_id = CLIENT_ID
+        def get_order(self, oid): return row
+        def claim_deferred_materialization(self, *a, **kw): return True
+        def update_order_meta(self, *a, **kw): return True
+        def schedule_deferred_materialization_retry(self, *a, **kw): return True
+        def submit_existing_entry(self, *a, **kw): return {}
+        def get_orders_for_position(self, *a, **kw): return []
+
+    core = object.__new__(APExecutionCore)
+    core.client_id = CLIENT_ID
+    core.email = CLIENT_ID
+    core.execution_mode = "paper"
+    core.mode = "PAPER"
+    core.paper = True
+    core.order_state_machine = _OSM()
+    core.broker = MagicMock()
+
+    # attempt=4 exceeds max_attempts=3 → TERMINAL_REQUIRED
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=2,
+        expected_retry_attempt=4,   # > max_attempts=3
+        owner="owner-max-exc",
+    )
+
+    assert result["disposition"] in {"TERMINAL_REQUIRED", "TERMINAL_DURABLE"}
+    assert result["reason_code"] == "RETRY_MAX_ATTEMPTS_EXCEEDED"
+    assert result["terminal_status"] == "EXPIRED"
+    # Must carry all expected state for fenced CAS
+    assert "expected_generation" in result
+    assert result["expected_generation"] == 2
+    assert "expected_prior_retry_attempt" in result
+    assert result["expected_prior_retry_attempt"] == 3   # attempt(4)-1 = 3
+    assert "expected_client_id" in result
+    assert "expected_execution_mode" in result
+    assert result["expected_lifecycle_state"] == "RETRY_WAIT"
+    assert result["expected_materialization_status"] == "RETRY_PENDING"

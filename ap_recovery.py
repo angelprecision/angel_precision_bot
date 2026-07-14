@@ -1188,6 +1188,142 @@ class APStartupRecovery:
                 result.setdefault("errors", []).append("recovery_terminalize_failed")
             return ok
 
+        def _terminalize_fenced_retry(loid, *, outcome: dict, extra_diagnostics: dict | None = None):
+            """Fenced terminal CAS via terminalize_deferred_retry_if_unchanged.
+
+            P0 FINAL AMENDMENT: called when resume_deferred_materialization_retry()
+            returns TERMINAL_REQUIRED. The outcome dict carries the expected
+            generation, prior attempt, client, and mode so the terminal CAS
+            predicate fences against concurrent lifecycle advances.
+
+            Returns a classification dict:
+              {"result": "TERMINALIZED"}           — fenced CAS succeeded
+              {"result": "ALREADY_TERMINAL"}       — row already terminal
+              {"result": "CLAIM_LOST"}             — concurrent winner advanced
+              {"result": "OWNERSHIP_ADVANCED"}     — submit intent / broker-ready
+              {"result": "WRITE_FAILED"}           — true write failure, retain ownership
+            """
+            _fn = getattr(self.osm, "terminalize_deferred_retry_if_unchanged", None)
+            if not callable(_fn):
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_UNAVAILABLE local_order_id=%s "
+                    "— falling back to broad terminalize; upgrade OSM",
+                    self.client_id, loid,
+                )
+                # Fallback: use broad terminalize (existing behaviour, still better than nothing)
+                _broad_ok = _terminalize_verified(
+                    loid,
+                    reason_code=str(outcome.get("reason_code") or "RETRY_TERMINAL"),
+                    terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
+                    diagnostics=extra_diagnostics or {},
+                )
+                return {"result": "TERMINALIZED" if _broad_ok else "WRITE_FAILED"}
+
+            _ok = False
+            try:
+                _ok = bool(_fn(
+                    loid,
+                    reason_code=str(outcome.get("reason_code") or "RETRY_TERMINAL"),
+                    terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
+                    expected_client_id=str(outcome.get("expected_client_id") or self.client_id or ""),
+                    expected_execution_mode=str(outcome.get("expected_execution_mode") or recovery_mode or ""),
+                    expected_generation=int(outcome.get("expected_generation") or 0),
+                    expected_prior_retry_attempt=int(outcome.get("expected_prior_retry_attempt") or 0),
+                    diagnostics={
+                        **(extra_diagnostics or {}),
+                        "recovery_classification": "fenced_retry_terminal",
+                        "recovery_owner": outcome.get("owner"),
+                    },
+                ))
+            except Exception as exc:
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_RAISED local_order_id=%s exc=%s",
+                    self.client_id, loid, exc,
+                )
+                return {"result": "WRITE_FAILED"}
+
+            if _ok:
+                log.info(
+                    "[%s] RECOVERY_FENCED_TERM_OK local_order_id=%s reason=%s",
+                    self.client_id, loid, outcome.get("reason_code"),
+                )
+                return {"result": "TERMINALIZED"}
+
+            # CAS missed — reread to classify why
+            _reread = None
+            try:
+                _reread = self.osm.get_order(loid)
+            except Exception:
+                pass
+            if not isinstance(_reread, dict):
+                return {"result": "WRITE_FAILED"}
+
+            _rr_status = str(_reread.get("status") or "").upper()
+            _rr_meta = _reread.get("meta") or {}
+            if isinstance(_rr_meta, str):
+                try:
+                    import json as _j; _rr_meta = _j.loads(_rr_meta)
+                except Exception:
+                    _rr_meta = {}
+
+            # A: Already terminal
+            if _rr_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                log.info(
+                    "[%s] RECOVERY_FENCED_TERM_ALREADY_TERMINAL local_order_id=%s "
+                    "status=%s — concurrent worker completed terminal write",
+                    self.client_id, loid, _rr_status,
+                )
+                return {"result": "ALREADY_TERMINAL"}
+
+            _rr_gen = int((_rr_meta or {}).get("materialization_generation") or 0)
+            _rr_attempt = int((_rr_meta or {}).get("retry_attempt") or 0)
+            _exp_gen = int(outcome.get("expected_generation") or 0)
+            _exp_attempt_prior = int(outcome.get("expected_prior_retry_attempt") or 0)
+
+            # B: Concurrent generation or attempt advance
+            if _rr_gen > _exp_gen or _rr_attempt > _exp_attempt_prior:
+                log.info(
+                    "[%s] RECOVERY_FENCED_TERM_CLAIM_LOST local_order_id=%s "
+                    "rr_gen=%d exp_gen=%d rr_attempt=%d exp_prior=%d",
+                    self.client_id, loid, _rr_gen, _exp_gen, _rr_attempt, _exp_attempt_prior,
+                )
+                return {"result": "CLAIM_LOST"}
+
+            # C: Submit intent, broker-ready, or active lifecycle
+            _rr_lifecycle = str((_rr_meta or {}).get("lifecycle_state") or "").upper()
+            _rr_submit_intent = str((_rr_meta or {}).get("submit_intent_at") or "").strip()
+            _rr_broker_id = str(_reread.get("broker_order_id") or "").strip()
+            _rr_broker_ready = str((_rr_meta or {}).get("broker_ready") or "false").lower()
+            _rr_inflight = str((_rr_meta or {}).get("materialization_in_flight") or "false").lower()
+            if (
+                _rr_submit_intent
+                or _rr_broker_id
+                or _reread.get("submitted_ts")
+                or _rr_broker_ready not in {"false", ""}
+                or _rr_inflight not in {"false", ""}
+                or _rr_lifecycle in {
+                    "MATERIALIZING", "BROKER_READY", "SUBMITTING",
+                    "PRE_SUBMIT_PROOF_RETRY", "SUBMITTED", "ACKNOWLEDGED",
+                }
+            ):
+                log.warning(
+                    "[%s] RECOVERY_FENCED_TERM_OWNERSHIP_ADVANCED local_order_id=%s "
+                    "lifecycle=%s submit_intent=%r broker_id=%r broker_ready=%r inflight=%r",
+                    self.client_id, loid, _rr_lifecycle,
+                    bool(_rr_submit_intent), bool(_rr_broker_id),
+                    _rr_broker_ready, _rr_inflight,
+                )
+                return {"result": "OWNERSHIP_ADVANCED"}
+
+            # D: Row still in old RETRY_WAIT state — true write failure
+            log.critical(
+                "[%s] RECOVERY_FENCED_TERM_WRITE_FAILED local_order_id=%s "
+                "— row still RETRY_WAIT; retaining ownership for next pass",
+                self.client_id, loid,
+            )
+            result.setdefault("errors", []).append(f"fenced_term_write_failed:{loid}")
+            return {"result": "WRITE_FAILED"}
+
         # ── AMENDMENT §5: durable ownership on failed/impossible rearm ──
         # A resumable row must never be left ownerless. When a rearm cannot
         # happen (no entry_watcher wired) or the rearm returns False, we do
@@ -1715,23 +1851,52 @@ class APStartupRecovery:
                         )
                         if _disp in {"SUBMITTED", "BROKER_READY"}:
                             recovered += 1
-                        elif _disp == "TERMINAL_DURABLE":
-                            _term_ok = _terminalize_verified(
+                        elif _disp == "TERMINAL_REQUIRED":
+                            # P0 FINAL AMENDMENT: fenced terminal CAS using the
+                            # exact expected state carried in the outcome dict.
+                            # Never uses the broad terminalize_deferred_breach.
+                            _fenced = _terminalize_fenced_retry(
                                 local_order_id,
-                                reason_code=_reason,
-                                terminal_status=str(_outcome.get("terminal_status") or "EXPIRED"),
-                                diagnostics={
-                                    "recovery_classification": "due_retry_terminal",
+                                outcome=_outcome,
+                                extra_diagnostics={
+                                    "recovery_classification": "due_retry_terminal_required",
                                     "recovery_attempt": _outcome.get("attempt"),
                                     "recovery_max_attempts": _outcome.get("max_attempts"),
                                     "recovery_owner": _outcome.get("owner"),
                                     "recovery_generation": _outcome.get("generation"),
                                 },
                             )
-                            if not _term_ok:
+                            _fenced_result = _fenced.get("result")
+                            if _fenced_result == "WRITE_FAILED":
                                 _retain_recovery_ownership(
-                                    local_order_id, reason="due_retry_terminalize_failed",
+                                    local_order_id, reason=f"fenced_term_write_failed:{_reason}",
                                 )
+                            # ALREADY_TERMINAL / CLAIM_LOST / OWNERSHIP_ADVANCED:
+                            # row is owned by another worker — no retention, no error
+                        elif _disp in {"TERMINAL_DURABLE", "TERMINAL_ALREADY_DURABLE"}:
+                            # TERMINAL_ALREADY_DURABLE: canonical downstream already wrote
+                            # the terminal state; do NOT issue another terminal write.
+                            # TERMINAL_DURABLE: backward-compat path — also no write needed
+                            # (the consumer verified the row is already terminal).
+                            log.info(
+                                "[%s] RECOVERY_DUE_RETRY_ALREADY_TERMINAL local_order_id=%s "
+                                "disp=%s reason=%s terminal_status=%s",
+                                self.client_id, local_order_id, _disp, _reason,
+                                _outcome.get("terminal_status"),
+                            )
+                            # Verify terminal status in durable row (belt-and-suspenders)
+                            try:
+                                _at_row = self.osm.get_order(local_order_id)
+                                _at_status = str((_at_row or {}).get("status") or "").upper()
+                                if _at_status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR",
+                                                      "SUBMITTED", "ACKNOWLEDGED", "FILLED"}:
+                                    log.warning(
+                                        "[%s] RECOVERY_ALREADY_TERMINAL_VERIFY_MISMATCH "
+                                        "local_order_id=%s expected_terminal actual_status=%s",
+                                        self.client_id, local_order_id, _at_status,
+                                    )
+                            except Exception:
+                                pass
                         elif _disp == "RETRY_SCHEDULE_FAILED":
                             # P0 blocker §3: schedule write failed — row may be
                             # stranded at MATERIALIZING. Retain durable ownership

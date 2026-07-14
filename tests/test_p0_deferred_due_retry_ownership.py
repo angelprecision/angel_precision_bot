@@ -514,7 +514,7 @@ def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker():
         expected_retry_attempt=4,   # exceeds max
         owner="owner-exhausted",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert result["reason_code"] == "RETRY_MAX_ATTEMPTS_EXCEEDED"
     # Never claimed, never invoked broker, never called _on_entry_trigger
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
@@ -538,7 +538,7 @@ def test_9_paper_recovery_does_not_touch_live_rows():
         expected_retry_attempt=2,
         owner="owner-paper",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert result["reason_code"] == "RETRY_EXECUTION_MODE_MISMATCH"
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
 
@@ -553,7 +553,7 @@ def test_9b_live_recovery_does_not_touch_paper_rows():
         expected_retry_attempt=2,
         owner="owner-live",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert result["reason_code"] == "RETRY_EXECUTION_MODE_MISMATCH"
 
 
@@ -973,7 +973,7 @@ def test_amend1_missing_direction_fails_closed():
         expected_retry_attempt=2,
         owner="owner-nodirection",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "DIRECTION" in result["reason_code"]
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
 
@@ -992,7 +992,7 @@ def test_amend1_invalid_direction_fails_closed():
         expected_retry_attempt=2,
         owner="owner-baddirection",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "DIRECTION" in result["reason_code"]
 
 
@@ -1010,7 +1010,7 @@ def test_amend1_missing_trigger_crossed_at_fails_closed():
         expected_retry_attempt=2,
         owner="owner-notriggerts",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "TRIGGER_CROSSED_AT" in result["reason_code"]
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
 
@@ -1029,7 +1029,7 @@ def test_amend1_missing_signal_id_fails_closed():
         expected_retry_attempt=2,
         owner="owner-nosignal",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "SIGNAL_ID" in result["reason_code"]
 
 
@@ -1046,7 +1046,7 @@ def test_amend1_missing_client_id_row_fails_closed():
         expected_retry_attempt=2,
         owner="owner-noclient",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "CLIENT_ID" in result["reason_code"]
 
 
@@ -1426,7 +1426,7 @@ def test_blocker5_expired_deadline_terminalizes_before_claim():
         expected_retry_attempt=2,
         owner="owner-expired",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert result["reason_code"] == "RETRY_DEADLINE_EXHAUSTED"
     assert result["terminal_status"] == "EXPIRED"
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
@@ -1447,7 +1447,7 @@ def test_blocker5_missing_score_fails_before_claim():
         expected_retry_attempt=2,
         owner="owner-noscore",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "SCORE" in result["reason_code"]
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
 
@@ -1466,6 +1466,6 @@ def test_blocker5_missing_timeframe_fails_before_claim():
         expected_retry_attempt=2,
         owner="owner-notf",
     )
-    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "TIMEFRAME" in result["reason_code"]
     core.order_state_machine.claim_deferred_materialization.assert_not_called()

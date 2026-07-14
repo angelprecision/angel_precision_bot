@@ -2258,8 +2258,32 @@ class APExecutionCore:
             return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
 
         def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
-            return {**_base, **extra, "disposition": "TERMINAL_DURABLE",
-                    "reason_code": reason, "terminal_status": status}
+            # P0 FINAL AMENDMENT: return TERMINAL_REQUIRED (not TERMINAL_DURABLE)
+            # so recovery uses the fenced terminalize_deferred_retry_if_unchanged()
+            # CAS rather than the broad terminalize_deferred_breach(). The expected
+            # state fields enable the fenced predicate to refuse writes when a
+            # concurrent worker has already advanced generation, attempt, lifecycle,
+            # broker_ready, or submit_intent.
+            return {
+                **_base, **extra,
+                "disposition": "TERMINAL_REQUIRED",
+                "reason_code": reason,
+                "terminal_status": status,
+                # Fencing fields: exact state the row must still be in for the
+                # terminal CAS to succeed. Use the caller's expectation
+                # (_expected_generation, _expected_attempt) since these are
+                # locked in at call time and never change within the method.
+                "expected_generation": _expected_generation,
+                "expected_prior_retry_attempt": _expected_attempt - 1,
+                "expected_client_id": (
+                    str(getattr(self, "client_id", "") or getattr(self, "email", "") or "").strip().lower()
+                ),
+                "expected_execution_mode": (
+                    str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "").strip().lower()
+                ),
+                "expected_lifecycle_state": "RETRY_WAIT",
+                "expected_materialization_status": "RETRY_PENDING",
+            }
 
         def _claim_lost(reason: str) -> dict:
             return {**_base, "disposition": "CLAIM_LOST", "reason_code": reason}
@@ -2272,7 +2296,9 @@ class APExecutionCore:
             _expected_generation = int(expected_generation)
             _expected_attempt = int(expected_retry_attempt)
         except (TypeError, ValueError):
-            return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
+            _expected_generation = 0
+            _expected_attempt = 0
+            return _keep("RETRY_INVALID_EXPECTATIONS")
         if not owner or _expected_generation < 1 or _expected_attempt < 1:
             return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
 
@@ -2733,11 +2759,20 @@ class APExecutionCore:
                                        or after_meta.get("materialization_reason")
                                        or "RETRY_RESCHEDULED"),
                     "next_retry_at": str(after_next_retry)}
+        # P0 FINAL AMENDMENT: use TERMINAL_ALREADY_DURABLE (not TERMINAL_DURABLE)
+        # when the canonical downstream path already wrote a terminal status.
+        # Recovery must NOT call terminalize_deferred_retry_if_unchanged() again —
+        # the row is already terminal, a second write is unsafe.
         if after_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
-            return {**_base, "disposition": "TERMINAL_DURABLE",
-                    "reason_code": str(after.get("last_error") or after_meta.get("final_reason")
-                                       or "RETRY_CANONICAL_TERMINALIZED"),
-                    "terminal_status": after_status}
+            return {
+                **_base,
+                "disposition": "TERMINAL_ALREADY_DURABLE",
+                "reason_code": str(after.get("last_error") or after_meta.get("final_reason")
+                                   or "RETRY_CANONICAL_TERMINALIZED"),
+                "terminal_status": after_status,
+                "generation": _new_generation,
+                "attempt": _expected_attempt,
+            }
         # No durable outcome — schedule retry before returning (blocker §5).
         return _schedule_retry_wait("RETRY_CANONICAL_NO_DURABLE_OUTCOME")
     def reconcile_deferred_broker_intent(
