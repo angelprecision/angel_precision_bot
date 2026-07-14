@@ -570,6 +570,31 @@ def _build_deferred_retry_schedule_meta(
     now: Optional[datetime] = None,
 ) -> dict:
     _now = now or datetime.now(timezone.utc)
+    # P0 amendment (fix/deferred-retry-due-execution-p0 §5): preserve BOTH
+    # the operational reason (why THIS attempt stopped early) and the last
+    # candidate-quality reason the selector was scoring against. Neither is
+    # dropped in favour of the other.
+    try:
+        from ap.selector_retry_policy import classify_retry_reason_taxonomy
+        _last_quality = None
+        if isinstance(selector_audit, dict):
+            _last_quality = (
+                selector_audit.get("last_candidate_reject_reason")
+                or selector_audit.get("best_candidate_reject_reason")
+                or selector_audit.get("last_reject_reason")
+            )
+        _taxonomy = classify_retry_reason_taxonomy(
+            reason_code, last_candidate_quality_reason=_last_quality,
+        )
+    except Exception:
+        _taxonomy = {
+            "reason_code": str(reason_code or ""),
+            "classification": "UNKNOWN",
+            "retry_class": "UNKNOWN",
+            "selector_terminal_reason": None,
+            "operational_reason": None,
+            "may_retry_with_fresh_budget": False,
+        }
     return {
         "deferred_retry_scheduled": True,
         "deferred_retry_reason_code": str(reason_code or ""),
@@ -593,6 +618,12 @@ def _build_deferred_retry_schedule_meta(
         "entry_path": _MATERIALIZATION_ENTRY_PATH,
         "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
         "materialization_detail": str(reason_code or ""),
+        # P0 §5: honest taxonomy — both operational and candidate-quality
+        # dimensions preserved together on the durable row.
+        "retry_class": _taxonomy["retry_class"],
+        "selector_terminal_reason": _taxonomy["selector_terminal_reason"],
+        "operational_reason": _taxonomy["operational_reason"],
+        "may_retry_with_fresh_budget": _taxonomy["may_retry_with_fresh_budget"],
     }
 
 
@@ -2185,6 +2216,573 @@ class APExecutionCore:
             "next_retry_at": (_now + timedelta(seconds=_retry_delay_seconds)).isoformat(),
         }
 
+    def resume_deferred_materialization_retry(
+        self,
+        *,
+        local_order_id: str,
+        expected_generation: int,
+        expected_retry_attempt: int,
+        owner: str,
+    ) -> dict:
+        """Canonical consumer for a due deferred-materialization retry.
+
+        P0 AMENDMENT (fix/deferred-retry-due-execution-p0) — HARDENED
+        ---------------------------------------------------------------
+        Blocker §1: Fail closed on every required identity field.
+          - direction must be CALL or PUT in the durable row; never default to CALL.
+          - trigger_crossed_at must be present and parseable; never substitute _now.
+          - signal_id, plan_id, client_id must be non-empty from the durable row.
+        Blocker §2: Exact identity proof on every field.
+          - A missing row field when the expected field is provided FAILS, not passes.
+        Blocker §5: Atomic attempt advancement.
+          - claim_deferred_materialization receives retry_attempt so the durable
+            row always shows the in-flight attempt, even on mid-execution crash.
+          - Every RETRY_WAIT return calls schedule_deferred_materialization_retry
+            before returning so the durable row is in a verifiable RETRY_WAIT state,
+            not MATERIALIZING until lease expires.
+
+        Never defaults direction, client_id, plan_id, or trigger_crossed_at.
+        Never calls the broker directly. Never duplicates selector logic.
+        """
+        _now = datetime.now(timezone.utc)
+        _base: dict = {
+            "local_order_id": local_order_id,
+            "owner": str(owner or ""),
+            "attempt": None,
+            "max_attempts": None,
+            "generation": None,
+            "next_retry_at": None,
+        }
+
+        def _keep(reason: str) -> dict:
+            return {**_base, "disposition": "KEEP_WATCHER", "reason_code": reason}
+
+        def _term(reason: str, status: str = "EXPIRED", **extra) -> dict:
+            # P0 FINAL AMENDMENT: return TERMINAL_REQUIRED (not TERMINAL_DURABLE)
+            # so recovery uses the fenced terminalize_deferred_retry_if_unchanged()
+            # CAS rather than the broad terminalize_deferred_breach(). The expected
+            # state fields enable the fenced predicate to refuse writes when a
+            # concurrent worker has already advanced generation, attempt, lifecycle,
+            # broker_ready, or submit_intent.
+            return {
+                **_base, **extra,
+                "disposition": "TERMINAL_REQUIRED",
+                "reason_code": reason,
+                "terminal_status": status,
+                # Fencing fields: exact state the row must still be in for the
+                # terminal CAS to succeed. Use the caller's expectation
+                # (_expected_generation, _expected_attempt) since these are
+                # locked in at call time and never change within the method.
+                "expected_generation": _expected_generation,
+                "expected_prior_retry_attempt": _expected_attempt - 1,
+                "expected_client_id": (
+                    str(getattr(self, "client_id", "") or getattr(self, "email", "") or "").strip().lower()
+                ),
+                "expected_execution_mode": (
+                    str(getattr(self, "execution_mode", "") or getattr(self, "mode", "") or "").strip().lower()
+                ),
+                "expected_lifecycle_state": "RETRY_WAIT",
+                "expected_materialization_status": "RETRY_PENDING",
+            }
+
+        def _claim_lost(reason: str) -> dict:
+            return {**_base, "disposition": "CLAIM_LOST", "reason_code": reason}
+
+        osm = getattr(self, "order_state_machine", None) or getattr(self, "osm", None)
+        if osm is None:
+            return _keep("RETRY_OSM_UNAVAILABLE")
+
+        try:
+            _expected_generation = int(expected_generation)
+            _expected_attempt = int(expected_retry_attempt)
+        except (TypeError, ValueError):
+            _expected_generation = 0
+            _expected_attempt = 0
+            return _keep("RETRY_INVALID_EXPECTATIONS")
+        if not owner or _expected_generation < 1 or _expected_attempt < 1:
+            return _term("RETRY_INVALID_EXPECTATIONS", status="ERROR")
+
+        # ── Row read ─────────────────────────────────────────────────
+        try:
+            row = osm.get_order(local_order_id)
+        except Exception as exc:
+            log.error("[%s] resume_deferred_materialization_retry row_read_failed "
+                      "local_order_id=%s exc=%s", self.client_id, local_order_id, exc)
+            return _keep(f"RETRY_ROW_READ_ERROR:{type(exc).__name__}")
+        if not isinstance(row, dict):
+            return _keep("RETRY_ROW_MISSING")
+
+        # ── Status gates ────────────────────────────────────────────
+        status = str(row.get("status") or "").upper()
+        if status != "PENDING_TRIGGER":
+            return _keep(f"RETRY_STATUS_NOT_ELIGIBLE:{status}")
+        if str(row.get("broker_order_id") or "").strip():
+            return _keep("RETRY_ALREADY_SUBMITTED")
+        if row.get("submitted_ts"):
+            return _keep("RETRY_ALREADY_SUBMITTED")
+
+        # ── BLOCKER §1 + §2: fail-closed identity proof ─────────────
+        # client_id: both must be present and must match.
+        row_client = str(row.get("client_id") or "").strip().lower()
+        expected_client = str(self.client_id or self.email or "").strip().lower()
+        if not row_client:
+            return _term("RETRY_MISSING_CLIENT_ID", status="ERROR")
+        if not expected_client:
+            return _term("RETRY_RUNNER_CLIENT_ID_MISSING", status="ERROR")
+        if row_client != expected_client:
+            return _term("RETRY_CLIENT_ID_MISMATCH", status="ERROR")
+
+        # execution_mode: row must contain a valid mode and must match runner.
+        row_mode = str(row.get("execution_mode") or "").strip().lower()
+        expected_mode = str(self.execution_mode or self.mode or "").strip().lower()
+        if row_mode not in {"live", "paper"}:
+            return _term("RETRY_INVALID_EXECUTION_MODE", status="ERROR")
+        if expected_mode not in {"live", "paper"}:
+            return _term("RETRY_RUNNER_EXECUTION_MODE_INVALID", status="ERROR")
+        if row_mode != expected_mode:
+            return _term("RETRY_EXECUTION_MODE_MISMATCH", status="ERROR")
+
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        meta = meta or {}
+
+        # signal_id: required — the CAS predicate needs it.
+        signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()
+        if not signal_id:
+            return _term("RETRY_MISSING_SIGNAL_ID", status="ERROR")
+
+        # plan_id: required for plan reconstruction.
+        plan_id = str(row.get("plan_id") or meta.get("plan_id") or "").strip()
+        if not plan_id:
+            return _term("RETRY_MISSING_PLAN_ID", status="ERROR")
+
+        # direction: must be CALL or PUT — never default.
+        raw_direction = str(row.get("direction") or meta.get("side") or meta.get("direction") or "").strip().upper()
+        if raw_direction not in {"CALL", "PUT"}:
+            return _term(f"RETRY_MISSING_OR_INVALID_DIRECTION:got={raw_direction!r}", status="ERROR")
+        direction = raw_direction
+
+        # ticker: required.
+        ticker = str(row.get("symbol") or meta.get("ticker") or meta.get("symbol") or "").strip().upper()
+        if not ticker:
+            return _term("RETRY_MISSING_TICKER", status="ERROR")
+
+        # trigger_crossed_at: must be present and parseable — never substitute now.
+        trigger_crossed_at_raw = (
+            meta.get("trigger_crossed_at") or meta.get("triggered_at")
+        )
+        if not trigger_crossed_at_raw:
+            return _term("RETRY_MISSING_TRIGGER_CROSSED_AT", status="ERROR")
+        try:
+            trigger_crossed_dt = datetime.fromisoformat(str(trigger_crossed_at_raw))
+            if trigger_crossed_dt.tzinfo is None:
+                trigger_crossed_dt = trigger_crossed_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return _term("RETRY_INVALID_TRIGGER_CROSSED_AT", status="ERROR")
+
+        # trigger_price: must be positive.
+        _trigger_price_raw = row.get("trigger_price") or meta.get("trigger_price")
+        if _trigger_price_raw is None:
+            return _term("RETRY_MISSING_TRIGGER_PRICE", status="ERROR")
+        try:
+            trigger_price = float(_trigger_price_raw)
+        except (TypeError, ValueError):
+            return _term("RETRY_INVALID_TRIGGER_PRICE", status="ERROR")
+        if trigger_price <= 0:
+            return _term("RETRY_ZERO_TRIGGER_PRICE", status="ERROR")
+
+        # ── Fencing counters ─────────────────────────────────────────
+        try:
+            durable_generation = int(meta.get("materialization_generation") or 0)
+        except (TypeError, ValueError):
+            durable_generation = 0
+        if durable_generation != _expected_generation:
+            return _claim_lost(
+                f"RETRY_GENERATION_ADVANCED:durable={durable_generation}:expected={_expected_generation}"
+            )
+        try:
+            durable_prior_attempt = int(meta.get("retry_attempt") or 0)
+        except (TypeError, ValueError):
+            durable_prior_attempt = 0
+        if durable_prior_attempt != _expected_attempt - 1:
+            return _claim_lost(
+                f"RETRY_ATTEMPT_ADVANCED:durable={durable_prior_attempt}:expected_prior={_expected_attempt - 1}"
+            )
+
+        try:
+            _durable_max = int(meta.get("retry_max_attempts") or 0)
+        except (TypeError, ValueError):
+            _durable_max = 0
+        if _durable_max <= 0:
+            try:
+                _durable_max = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+            except (TypeError, ValueError):
+                _durable_max = 3
+        max_attempts = _durable_max
+        if _expected_attempt > max_attempts:
+            return _term("RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
+                         attempt=_expected_attempt, max_attempts=max_attempts)
+
+        durable_due_at_raw = (
+            meta.get("materialization_next_retry_at")
+            or meta.get("deferred_retry_next_attempt_at")
+            or meta.get("next_retry_at")
+        )
+        if not durable_due_at_raw:
+            return _keep("RETRY_NO_DURABLE_SCHEDULE")
+        try:
+            durable_due_at = datetime.fromisoformat(str(durable_due_at_raw))
+            if durable_due_at.tzinfo is None:
+                durable_due_at = durable_due_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            return _term("RETRY_INVALID_DURABLE_SCHEDULE", status="ERROR")
+        if durable_due_at > _now:
+            return {**_base, "disposition": "NOT_DUE", "reason_code": "RETRY_NOT_DUE"}
+
+        # ── Blocker §5: enforce absolute_entry_deadline before ANY claim ──
+        # An expired deadline must terminalize the row here — before the CAS,
+        # before selector work, before _on_entry_trigger. Downstream LIVE
+        # gates may provide partial defense, but the lifecycle consumer must
+        # honor its own durable deadline. PAPER retries of stale setups must
+        # also be blocked.
+        _deadline_raw = (
+            meta.get("absolute_entry_deadline")
+            or meta.get("retry_deadline")
+            or meta.get("deferred_retry_deadline")
+        )
+        if _deadline_raw:
+            try:
+                _deadline_dt = datetime.fromisoformat(str(_deadline_raw))
+                if _deadline_dt.tzinfo is None:
+                    _deadline_dt = _deadline_dt.replace(tzinfo=timezone.utc)
+                if _now >= _deadline_dt:
+                    return _term(
+                        "RETRY_DEADLINE_EXHAUSTED",
+                        status="EXPIRED",
+                        attempt=_expected_attempt,
+                        max_attempts=max_attempts,
+                    )
+            except Exception:
+                # Unparseable deadline — fail closed: treat as expired
+                # rather than silently allowing a potentially stale retry.
+                return _term(
+                    "RETRY_INVALID_DEADLINE",
+                    status="EXPIRED",
+                    attempt=_expected_attempt,
+                    max_attempts=max_attempts,
+                )
+
+        # ── Policy fields: required from the durable row — no silent defaults ─
+        # score, tier, and timeframe affect expiration/playbook selection,
+        # sizing gate thresholds, and contract scoring. Manufacturing them
+        # inside a broker-capable recovery path is unsafe.
+        _score_raw = row.get("score") if row.get("score") is not None else meta.get("score")
+        if _score_raw is None:
+            return _term("RETRY_MISSING_SCORE", status="ERROR")
+        try:
+            score = float(_score_raw)
+        except (TypeError, ValueError):
+            return _term("RETRY_INVALID_SCORE", status="ERROR")
+
+        _tier = str(row.get("tier") or meta.get("tier") or "").strip()
+        if not _tier:
+            return _term("RETRY_MISSING_TIER", status="ERROR")
+
+        _timeframe = str(row.get("timeframe") or meta.get("timeframe") or "").strip()
+        if not _timeframe:
+            return _term("RETRY_MISSING_TIMEFRAME", status="ERROR")
+
+        # ── Fenced CAS (blocker §5: also stamps retry_attempt atomically) ─
+        _new_generation = _expected_generation + 1
+        try:
+            _retry_lock_ttl = int(os.getenv("DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", "120"))
+        except (TypeError, ValueError):
+            _retry_lock_ttl = 120
+        _lease_until = (_now + timedelta(seconds=_retry_lock_ttl)).isoformat()
+
+        claim = getattr(osm, "claim_deferred_materialization", None)
+        if not callable(claim):
+            return _keep("RETRY_CLAIM_UNAVAILABLE")
+        try:
+            claimed = bool(claim(
+                local_order_id,
+                owner=owner,
+                new_generation=_new_generation,
+                lease_until=_lease_until,
+                trigger_crossed_at=trigger_crossed_at_raw,
+                trigger_price=trigger_price,
+                observed_underlying_price=float(
+                    meta.get("observed_underlying_price")
+                    or meta.get("triggered_underlying_price") or 0
+                ),
+                signal_id=signal_id,
+                execution_mode=row_mode,
+                retry_attempt=_expected_attempt,
+            ))
+        except Exception as exc:
+            log.error("[%s] resume_deferred_materialization_retry claim_failed "
+                      "local_order_id=%s exc=%s", self.client_id, local_order_id, exc)
+            return _keep(f"RETRY_CLAIM_EXCEPTION:{type(exc).__name__}")
+        if not claimed:
+            return _claim_lost("RETRY_CLAIM_NOT_ACQUIRED")
+
+        _base.update(attempt=_expected_attempt, max_attempts=max_attempts, generation=_new_generation)
+
+        # ── Helper: durable RETRY_WAIT schedule (blocker §5) ────────
+        # Every RETRY_WAIT return MUST call this so the durable row
+        # transitions out of MATERIALIZING before we return — never
+        # leave the row stranded at MATERIALIZING until lease expiry.
+        try:
+            _retry_delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+        except (TypeError, ValueError):
+            _retry_delay = 20
+
+        def _schedule_retry_wait(reason_code: str, selector_failure: dict | None = None) -> dict:
+            """Write a durable RETRY_WAIT row; return truthful disposition.
+
+            P0 blocker §3: RETRY_WAIT is only returned when the durable write
+            is confirmed. On write failure, RETRY_SCHEDULE_FAILED is returned
+            so recovery can retain ownership and re-attempt on the next pass.
+            Recovery must never treat a failed schedule as durably owned.
+            """
+            _next_retry_at = (_now + timedelta(seconds=_retry_delay)).isoformat()
+            _schedule = getattr(osm, "schedule_deferred_materialization_retry", None)
+            _ok = False
+            if callable(_schedule):
+                try:
+                    _ok = bool(_schedule(
+                        local_order_id,
+                        owner=owner,
+                        generation=_new_generation,
+                        reason_code=reason_code,
+                        attempt=_expected_attempt,
+                        max_attempts=max_attempts,
+                        next_retry_at=_next_retry_at,
+                        selector_failure=selector_failure or {"reason_code": reason_code},
+                    ))
+                except Exception as _sch_exc:
+                    log.critical(
+                        "[%s] resume_deferred_materialization_retry "
+                        "schedule_retry_wait RAISED local_order_id=%s exc=%s "
+                        "— row stranded at MATERIALIZING",
+                        self.client_id, local_order_id, _sch_exc,
+                    )
+            if not _ok:
+                log.critical(
+                    "[%s] resume_deferred_materialization_retry "
+                    "schedule_retry_wait FAILED local_order_id=%s "
+                    "— row stranded at MATERIALIZING; recovery must retain ownership",
+                    self.client_id, local_order_id,
+                )
+                # Return RETRY_SCHEDULE_FAILED so recovery calls
+                # _retain_recovery_ownership and does NOT claim the row is
+                # durably rescheduled. The next health-loop pass will see the
+                # row still at MATERIALIZING (or after lease expiry, RETRY_WAIT
+                # will be re-attempted).
+                return {
+                    **_base,
+                    "disposition": "RETRY_SCHEDULE_FAILED",
+                    "reason_code": f"RETRY_SCHEDULE_WRITE_FAILED:{reason_code}",
+                }
+            return {
+                **_base,
+                "disposition": "RETRY_WAIT",
+                "reason_code": reason_code,
+                "next_retry_at": _next_retry_at,
+            }
+
+        # ── Preserve prior attempt diagnostics ───────────────────────
+        try:
+            prior_history = meta.get("materialization_attempt_history") or []
+            if not isinstance(prior_history, list):
+                prior_history = []
+            prior_diagnostics = {
+                "attempt": durable_prior_attempt,
+                "generation": durable_generation,
+                "started_at": meta.get("materialization_started_at"),
+                "completed_at": meta.get("selector_completed_at"),
+                "reason_code": (
+                    meta.get("retry_reason") or meta.get("materialization_reason")
+                    or meta.get("deferred_retry_reason_code")
+                ),
+                "selector_request_diagnostics": meta.get("materialization_selector_failure") or {},
+            }
+            new_history = prior_history + [prior_diagnostics]
+            update_meta = getattr(osm, "update_order_meta", None)
+            if callable(update_meta):
+                update_meta(local_order_id, {
+                    "materialization_attempt_history": new_history,
+                    "selector_request_counters_reset_at": _now.isoformat(),
+                    "materialization_current_attempt": _expected_attempt,
+                    "materialization_current_generation": _new_generation,
+                })
+        except Exception as _hist_exc:
+            log.warning("[%s] resume_deferred_materialization_retry history_write_failed "
+                        "local_order_id=%s exc=%s (non-fatal)",
+                        self.client_id, local_order_id, _hist_exc)
+
+        # ── Build plan — all fields from durable row, no defaults ───
+        recovered_plan = SimpleNamespace(
+            plan_id=plan_id,
+            signal_id=signal_id,
+            client_id=row_client,
+            execution_mode=row_mode,
+            ticker=ticker,
+            side=direction,
+            direction=direction,
+            score=score,
+            tier=_tier,
+            trigger_price=trigger_price,
+            stop_underlying=(
+                row.get("stop_underlying") if row.get("stop_underlying") is not None
+                else meta.get("stop_underlying")
+            ),
+            target_underlying=(
+                row.get("target_underlying") if row.get("target_underlying") is not None
+                else meta.get("target_underlying")
+            ),
+            contract_symbol=str(row.get("contract") or ""),
+            pattern=str(row.get("pattern") or meta.get("pattern") or ""),
+            timeframe=_timeframe,
+            strategy_type=str(meta.get("strategy_type") or ""),
+            prior_day_high=meta.get("prior_day_high"),
+            prior_day_low=meta.get("prior_day_low"),
+            contracts=int(row.get("qty") or 0),
+            limit_price=float(row.get("limit_price") or 0),
+            max_position_usd=float(row.get("reserved_cost") or 0),
+            metadata={
+                **dict(meta),
+                "contract_deferred": True,
+                "materialization_generation": _new_generation,
+                "materialization_owner": owner,
+                "materialization_retry_owner": owner,
+                "materialization_retry_attempt": _expected_attempt,
+                "materialization_retry_max_attempts": max_attempts,
+                "breach_attempt_count": _expected_attempt - 1,
+                "deferred_breach_selection": True,
+                "selection_context": "deferred_breach_retry",
+                "selector_request_counters_reset_at": _now.isoformat(),
+                "selector_request_direct_quote_calls_reset": True,
+                "selector_request_chain_calls_reset": True,
+                "selector_request_expiration_calls_reset": True,
+            },
+        )
+        signal = {
+            "signal_id": signal_id,
+            "local_order_id": local_order_id,
+            "client_id": row_client,
+            "execution_mode": row_mode,
+            "ticker": ticker,
+            "side": direction,
+            "entry_price": trigger_price,
+            "stop_price": recovered_plan.stop_underlying,
+            "target_price": recovered_plan.target_underlying,
+            "contract_symbol": recovered_plan.contract_symbol,
+            "contract_deferred": True,
+            "_approved_plan": recovered_plan,
+            "materialization_retry_owner": owner,
+            "materialization_retry_attempt": _expected_attempt,
+            "ownership_kind": "materialization_retry",
+            "owner": owner,
+            "materialization_generation": _new_generation,
+            "retry_attempt": _expected_attempt,
+            "fenced": True,
+            "recovery_submit_fenced": True,
+            "recovery_submit_owner": owner,
+            "recovery_submit_generation": _new_generation,
+        }
+        watched = SimpleNamespace(
+            signal=signal, ticker=ticker, side=direction,
+            trigger_price=trigger_price,
+            entry_trigger=trigger_price,
+            stop_level=recovered_plan.stop_underlying,
+            target_price=recovered_plan.target_underlying,
+            trigger_crossed_at=trigger_crossed_dt,
+            triggered_at=trigger_crossed_dt,
+            breach_price=float(
+                meta.get("observed_underlying_price") or trigger_price or 0
+            ),
+        )
+
+        try:
+            # Set verified pre-claim markers so _on_entry_trigger's deferred
+            # claim block bypasses its second claim and proceeds directly to
+            # the selector + canonical submit continuation. The bypass is
+            # verified inside _on_entry_trigger against the durable row —
+            # the markers alone are not trusted; the durable row must confirm
+            # lifecycle=MATERIALIZING with matching owner/generation/attempt.
+            watched.signal.update({
+                "_recovery_pre_claimed":             True,
+                "_recovery_pre_claimed_owner":       owner,
+                "_recovery_pre_claimed_generation":  _new_generation,
+                "_recovery_pre_claimed_attempt":     _expected_attempt,
+                "_recovery_pre_claimed_client_id":   row_client,
+                "_recovery_pre_claimed_mode":        row_mode,
+            })
+            self._on_entry_trigger(watched)
+        except Exception as exc:
+            log.exception("[%s] resume_deferred_materialization_retry canonical_callback_failed "
+                          "local_order_id=%s", ticker or local_order_id, exc)
+            # Blocker §5: schedule a durable RETRY_WAIT before returning
+            # so the row does not remain MATERIALIZING until lease expiry.
+            return _schedule_retry_wait(
+                f"RETRY_CANONICAL_CALLBACK_EXCEPTION:{type(exc).__name__}",
+                {"callback_exception": str(exc)[:200]},
+            )
+
+        # ── Re-read to determine outcome ─────────────────────────────
+        try:
+            after = osm.get_order(local_order_id) or {}
+        except Exception as exc:
+            return _keep(f"RETRY_POST_CALLBACK_READ_ERROR:{type(exc).__name__}")
+        after_status = str(after.get("status") or "").upper()
+        after_meta = after.get("meta") or {}
+        if isinstance(after_meta, str):
+            try:
+                after_meta = json.loads(after_meta)
+            except Exception:
+                after_meta = {}
+
+        if after.get("broker_order_id") and after_status in {
+            "SUBMITTED", "ACK", "ACKNOWLEDGED", "PARTIAL", "PARTIAL_FILL", "FILLED"
+        }:
+            return {**_base, "disposition": "SUBMITTED",
+                    "reason_code": "RETRY_CANONICAL_SUBMIT_ACCEPTED",
+                    "broker_order_id": after.get("broker_order_id")}
+        if after_meta.get("broker_ready") is True and after_status == "PENDING_TRIGGER":
+            return {**_base, "disposition": "BROKER_READY",
+                    "reason_code": "RETRY_CANONICAL_BROKER_READY"}
+        after_lifecycle = str(after_meta.get("lifecycle_state") or "").upper()
+        after_next_retry = (
+            after_meta.get("materialization_next_retry_at")
+            or after_meta.get("next_retry_at")
+        )
+        if after_lifecycle == "RETRY_WAIT" and after_next_retry:
+            return {**_base, "disposition": "RETRY_WAIT",
+                    "reason_code": str(after_meta.get("retry_reason")
+                                       or after_meta.get("materialization_reason")
+                                       or "RETRY_RESCHEDULED"),
+                    "next_retry_at": str(after_next_retry)}
+        # P0 FINAL AMENDMENT: use TERMINAL_ALREADY_DURABLE (not TERMINAL_DURABLE)
+        # when the canonical downstream path already wrote a terminal status.
+        # Recovery must NOT call terminalize_deferred_retry_if_unchanged() again —
+        # the row is already terminal, a second write is unsafe.
+        if after_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+            return {
+                **_base,
+                "disposition": "TERMINAL_ALREADY_DURABLE",
+                "reason_code": str(after.get("last_error") or after_meta.get("final_reason")
+                                   or "RETRY_CANONICAL_TERMINALIZED"),
+                "terminal_status": after_status,
+                "generation": _new_generation,
+                "attempt": _expected_attempt,
+            }
+        # No durable outcome — schedule retry before returning (blocker §5).
+        return _schedule_retry_wait("RETRY_CANONICAL_NO_DURABLE_OUTCOME")
     def reconcile_deferred_broker_intent(
         self,
         *,
@@ -2381,54 +2979,168 @@ class APExecutionCore:
         _initial_meta = getattr(_initial_plan, "metadata", None) or {}
         if not isinstance(_initial_meta, dict):
             _initial_meta = {}
+        _ownership_kind = str(
+            sig.get("ownership_kind")
+            or _initial_meta.get("ownership_kind")
+            or "broker_ready_recovery"
+        ).strip()
         _is_recovered = bool(
             sig.get("recovery_submit_fenced")
             or _initial_meta.get("recovery_submit_fenced")
+            or sig.get("fenced")
+            or _initial_meta.get("fenced")
         )
         _recovery_owner = str(
             sig.get("recovery_submit_owner")
             or _initial_meta.get("recovery_submit_owner")
+            or sig.get("owner")
+            or _initial_meta.get("owner")
             or ""
         ).strip()
         _recovery_generation_raw = (
             sig.get("recovery_submit_generation")
             if sig.get("recovery_submit_generation") is not None
-            else _initial_meta.get("recovery_submit_generation")
+            else (
+                _initial_meta.get("recovery_submit_generation")
+                if _initial_meta.get("recovery_submit_generation") is not None
+                else (
+                    sig.get("materialization_generation")
+                    if sig.get("materialization_generation") is not None
+                    else _initial_meta.get("materialization_generation")
+                )
+            )
         )
         try:
             _recovery_generation = int(_recovery_generation_raw)
         except (TypeError, ValueError):
             _recovery_generation = None
+        _recovery_attempt_raw = (
+            sig.get("retry_attempt")
+            if sig.get("retry_attempt") is not None
+            else (
+                _initial_meta.get("retry_attempt")
+                if _initial_meta.get("retry_attempt") is not None
+                else (
+                    sig.get("materialization_retry_attempt")
+                    if sig.get("materialization_retry_attempt") is not None
+                    else _initial_meta.get("materialization_retry_attempt")
+                )
+            )
+        )
+        try:
+            _recovery_attempt = int(_recovery_attempt_raw)
+        except (TypeError, ValueError):
+            _recovery_attempt = None
         _callback_mode = str(
             sig.get("execution_mode")
             or getattr(_initial_plan, "execution_mode", None)
             or getattr(self, "execution_mode", None)
             or ""
         ).strip().lower()
+        _callback_client_id = str(
+            sig.get("client_id")
+            or getattr(_initial_plan, "client_id", None)
+            or getattr(self, "client_id", None)
+            or getattr(self, "email", None)
+            or ""
+        ).strip().lower()
         _callback_local_order_id = str(sig.get("local_order_id") or "").strip()
         _ownership_context = MappingProxyType({
             "is_recovered": _is_recovered,
+            "ownership_kind": _ownership_kind,
+            "local_order_id": _callback_local_order_id,
+            "client_id": _callback_client_id,
+            "fenced": bool(_is_recovered),
             "owner": _recovery_owner,
             "generation": _recovery_generation,
+            "retry_attempt": _recovery_attempt,
             "execution_mode": _callback_mode,
-            "local_order_id": _callback_local_order_id,
         })
         sig["_callback_ownership_context"] = _ownership_context
         if _is_recovered and (
             not _recovery_owner
             or _recovery_generation is None
             or _callback_mode not in {"live", "paper"}
+            or not _callback_client_id
             or not _callback_local_order_id
+            or _ownership_kind not in {"broker_ready_recovery", "materialization_retry"}
         ):
             log.critical(
-                "[%s] RECOVERY_CALLBACK_OWNERSHIP_INVALID order=%s owner=%r generation=%r mode=%r",
-                ticker, _callback_local_order_id, _recovery_owner,
-                _recovery_generation, _callback_mode,
+                "[%s] RECOVERY_CALLBACK_OWNERSHIP_INVALID order=%s kind=%r "
+                "owner=%r generation=%r attempt=%r client=%r mode=%r",
+                ticker, _callback_local_order_id, _ownership_kind,
+                _recovery_owner, _recovery_generation, _recovery_attempt,
+                _callback_client_id, _callback_mode,
             )
             return {
                 "disposition": "KEEP_WATCHER",
                 "reason_code": "RECOVERY_CALLBACK_OWNERSHIP_INVALID",
             }
+        if _is_recovered and _ownership_kind == "materialization_retry":
+            if _recovery_attempt is None or _recovery_attempt < 1:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_OWNERSHIP_INVALID_ATTEMPT",
+                }
+            if self.order_state_machine is None:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_OSM_UNAVAILABLE",
+                }
+            try:
+                _owned_row = self.order_state_machine.get_order(_callback_local_order_id)
+            except Exception as _own_exc:
+                log.critical(
+                    "[%s] MATERIALIZATION_CALLBACK_ROW_READ_FAILED order=%s exc=%s",
+                    ticker, _callback_local_order_id, _own_exc,
+                )
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_ROW_READ_FAILED",
+                }
+            _owned_meta = {}
+            if isinstance(_owned_row, dict):
+                _owned_meta = _owned_row.get("meta") or {}
+            if isinstance(_owned_meta, str):
+                try:
+                    _owned_meta = json.loads(_owned_meta)
+                except Exception:
+                    _owned_meta = {}
+            if not isinstance(_owned_meta, dict):
+                _owned_meta = {}
+            try:
+                _owned_generation = int(_owned_meta.get("materialization_generation") or 0)
+            except (TypeError, ValueError):
+                _owned_generation = 0
+            try:
+                _owned_attempt = int(_owned_meta.get("retry_attempt") or 0)
+            except (TypeError, ValueError):
+                _owned_attempt = 0
+            _owned_ok = (
+                isinstance(_owned_row, dict)
+                and str(_owned_row.get("status") or "").upper() == "PENDING_TRIGGER"
+                and not str(_owned_row.get("broker_order_id") or "").strip()
+                and not _owned_row.get("submitted_ts")
+                and str(_owned_row.get("client_id") or "").strip().lower() == _callback_client_id
+                and str(_owned_row.get("execution_mode") or "").strip().lower() == _callback_mode
+                and str(_owned_meta.get("lifecycle_state") or "").upper() == "MATERIALIZING"
+                and str(_owned_meta.get("materialization_status") or "").upper() == "RUNNING"
+                and _owned_meta.get("materialization_in_flight") is True
+                and str(_owned_meta.get("materialization_owner") or "").strip() == _recovery_owner
+                and _owned_generation == _recovery_generation
+                and _owned_attempt == _recovery_attempt
+            )
+            if not _owned_ok:
+                log.critical(
+                    "[%s] MATERIALIZATION_CALLBACK_OWNERSHIP_VERIFY_FAILED "
+                    "order=%s owner=%r generation=%r attempt=%r",
+                    ticker, _callback_local_order_id, _recovery_owner,
+                    _recovery_generation, _recovery_attempt,
+                )
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_OWNERSHIP_VERIFY_FAILED",
+                }
 
         # P0 hotfix — resolve client identity from the signal dict first, then
         # fall back to self.client_id (set in __init__), then self.email.
@@ -3049,108 +3761,174 @@ class APExecutionCore:
                 str(_contract_sym_raw or ""),
                 float(getattr(approved_plan, "limit_price", 0) or 0),
             )
-            # Atomically fence the breach worker before selector/network work.
-            # A failed claim never falls through to broker submission.  The
-            # watcher keeps ownership and retries the durable write later.
-            _mat_client_id    = str(_breach_client_id or "")
-            _mat_exec_mode    = str(getattr(approved_plan, "execution_mode", "") or "")
-            _mat_direction    = str(getattr(approved_plan, "side", "") or "")
+            # ── Pre-claim bypass for resume_deferred_materialization_retry ──
+            # resume_deferred_materialization_retry already claimed the row
+            # (generation N→N+1, lifecycle→MATERIALIZING) before calling
+            # _on_entry_trigger. A second claim here fails because the row is
+            # already MATERIALIZING with a live lease, blocking selector + submit.
+            #
+            # The bypass is ONLY safe when verified against the durable row:
+            # lifecycle=MATERIALIZING, materialization_in_flight=true, exact
+            # owner, generation, attempt, client_id, execution_mode must all
+            # match the pre-claim markers written into sig. Any mismatch fails
+            # closed — no selector, no broker path.
+            _recovery_pre_claimed = bool(sig.get("_recovery_pre_claimed"))
+            _mat_client_id     = str(_breach_client_id or "")
+            _mat_exec_mode     = str(getattr(approved_plan, "execution_mode", "") or "")
+            _mat_direction     = str(getattr(approved_plan, "side", "") or "")
             _mat_trigger_price = float(getattr(watched, "trigger_price", 0) or 0)
-            _mat_owner = str(
-                sig.get("watcher_token")
-                or sig.get("materialization_owner")
-                or f"execution-core:{getattr(self, 'client_id', '')}:{queue_local_order_id}"
-            )
-            _prior_mat_attempt = 0
-            try:
-                _meta_for_attempt = getattr(approved_plan, "metadata", None) or {}
-                _prior_mat_attempt = int(_meta_for_attempt.get("materialization_attempts", 0) or 0)
-            except Exception:
-                _prior_mat_attempt = 0
-            # ── AMENDMENT §3: strictly monotonic generation ──────────
-            # Read the *current* persisted generation directly from the
-            # durable row.  The plan's metadata carries a stale
-            # snapshot; using it would cause a reclaim after lease
-            # expiry to compute the wrong new_generation and the CAS
-            # would fail.  Fresh read is authoritative.
-            _persisted_generation = 0
-            try:
-                _durable_row = self.order_state_machine.get_order(queue_local_order_id)
-                if isinstance(_durable_row, dict):
-                    _dur_meta = _durable_row.get("meta") or {}
-                    if isinstance(_dur_meta, str):
-                        try:
-                            _dur_meta = json.loads(_dur_meta)
-                        except Exception:
-                            _dur_meta = {}
-                    _persisted_generation = int(
-                        (_dur_meta or {}).get("materialization_generation") or 0
-                    )
-            except Exception:
-                _persisted_generation = 0
-            _mat_generation = _persisted_generation + 1
-            _deferred_claim_context.update({
-                "owner": _mat_owner,
-                "generation": _mat_generation,
-            })
-            _mat_claim = getattr(
-                self.order_state_machine, "claim_deferred_materialization", None,
-            )
-            _mat_claimed = False
-            if callable(_mat_claim):
+
+            if _recovery_pre_claimed:
+                _pre_owner   = str(sig.get("_recovery_pre_claimed_owner") or "")
+                _pre_gen     = int(sig.get("_recovery_pre_claimed_generation") or 0)
+                _pre_attempt = int(sig.get("_recovery_pre_claimed_attempt") or 0)
+                _pre_client  = str(sig.get("_recovery_pre_claimed_client_id") or "").lower()
+                _pre_mode    = str(sig.get("_recovery_pre_claimed_mode") or "").lower()
+                _pv_row = None
                 try:
-                    _lease_until = (
-                        datetime.now(timezone.utc) + timedelta(seconds=120)
-                    ).isoformat()
-                    _crossed_at = getattr(watched, "trigger_crossed_at", None)
-                    _crossed_at = (
-                        _crossed_at.isoformat()
-                        if hasattr(_crossed_at, "isoformat")
-                        else str(_crossed_at or datetime.now(timezone.utc).isoformat())
-                    )
-                    _observed_underlying = float(
-                        getattr(watched, "last_quote_ask", 0)
-                        or getattr(watched, "last_quote_bid", 0)
-                        or _mat_trigger_price
-                        or 0
-                    )
-                    _mat_claimed = bool(_mat_claim(
-                        str(queue_local_order_id or ""),
-                        owner=_mat_owner,
-                        generation=_mat_generation,
-                        lease_until=_lease_until,
-                        trigger_crossed_at=_crossed_at,
-                        trigger_price=_mat_trigger_price,
-                        observed_underlying_price=_observed_underlying,
-                        signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                        execution_mode=_mat_exec_mode,
-                    ))
-                except Exception as _mat_claim_exc:
-                    log.critical(
-                        "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
-                        ticker, queue_local_order_id, _mat_claim_exc,
-                    )
-            if not _mat_claimed:
-                try:
-                    _claim_row = self.order_state_machine.get_order(queue_local_order_id)
+                    _pv_row = self.order_state_machine.get_order(queue_local_order_id)
                 except Exception:
-                    _claim_row = None
-                if isinstance(_claim_row, dict):
-                    _claim_status = str(_claim_row.get("status") or "").upper()
-                    if _claim_status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
-                        return {"disposition": "SUBMITTED"}
-                    if _claim_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
-                        return {"disposition": "TERMINAL_DURABLE"}
-                log.critical(
-                    "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s — "
-                    "selector and broker submission blocked; watcher retains ownership",
-                    ticker, queue_local_order_id,
+                    pass
+                _pre_verified = False
+                if isinstance(_pv_row, dict):
+                    _pvm = _pv_row.get("meta") or {}
+                    if isinstance(_pvm, str):
+                        try:
+                            _pvm = json.loads(_pvm)
+                        except Exception:
+                            _pvm = {}
+                    _pvc = str(_pv_row.get("client_id") or "").strip().lower()
+                    _pve = str(_pv_row.get("execution_mode") or "").strip().lower()
+                    _pvg = int((_pvm or {}).get("materialization_generation") or 0)
+                    _pvo = str((_pvm or {}).get("materialization_owner") or "").strip()
+                    _pvl = str((_pvm or {}).get("lifecycle_state") or "").upper()
+                    _pvif = bool((_pvm or {}).get("materialization_in_flight"))
+                    _pva = int((_pvm or {}).get("retry_attempt") or 0)
+                    _pre_verified = (
+                        _pvl == "MATERIALIZING"
+                        and _pvif
+                        and _pvg == _pre_gen
+                        and _pvo == _pre_owner
+                        and _pvc == _pre_client
+                        and _pve == _pre_mode
+                        and _pva == _pre_attempt
+                        and bool(_pre_owner)
+                        and _pre_gen > 0
+                        and _pre_attempt > 0
+                    )
+                if not _pre_verified:
+                    log.critical(
+                        "[%s] MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED order=%s "
+                        "pre_gen=%d pre_attempt=%d pre_owner=%r — "
+                        "failing closed; no selector or broker path entered",
+                        ticker, queue_local_order_id,
+                        _pre_gen, _pre_attempt, _pre_owner,
+                    )
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "MATERIALIZATION_PRE_CLAIM_VERIFY_FAILED",
+                        "retry_after_seconds": 5,
+                    }
+                # Verified — bypass the normal claim and proceed to selector.
+                _mat_owner = _pre_owner
+                _mat_generation = _pre_gen
+                _mat_claimed = True
+                _deferred_claim_context.update({
+                    "owner": _mat_owner,
+                    "generation": _mat_generation,
+                })
+            else:
+                # ── Normal watcher path: claim exactly once ───────────────
+                _mat_owner = str(
+                    sig.get("watcher_token")
+                    or sig.get("materialization_owner")
+                    or f"execution-core:{getattr(self, 'client_id', '')}:{queue_local_order_id}"
                 )
-                return {
-                    "disposition": "KEEP_WATCHER",
-                    "reason_code": "MATERIALIZATION_STATE_WRITE_FAILED",
-                    "retry_after_seconds": 5,
-                }
+                _prior_mat_attempt = 0
+                try:
+                    _meta_for_attempt = getattr(approved_plan, "metadata", None) or {}
+                    _prior_mat_attempt = int(_meta_for_attempt.get("materialization_attempts", 0) or 0)
+                except Exception:
+                    _prior_mat_attempt = 0
+                # ── AMENDMENT §3: strictly monotonic generation ──────────
+                _persisted_generation = 0
+                try:
+                    _durable_row = self.order_state_machine.get_order(queue_local_order_id)
+                    if isinstance(_durable_row, dict):
+                        _dur_meta = _durable_row.get("meta") or {}
+                        if isinstance(_dur_meta, str):
+                            try:
+                                _dur_meta = json.loads(_dur_meta)
+                            except Exception:
+                                _dur_meta = {}
+                        _persisted_generation = int(
+                            (_dur_meta or {}).get("materialization_generation") or 0
+                        )
+                except Exception:
+                    _persisted_generation = 0
+                _mat_generation = _persisted_generation + 1
+                _deferred_claim_context.update({
+                    "owner": _mat_owner,
+                    "generation": _mat_generation,
+                })
+                _mat_claim = getattr(
+                    self.order_state_machine, "claim_deferred_materialization", None,
+                )
+                _mat_claimed = False
+                if callable(_mat_claim):
+                    try:
+                        _lease_until = (
+                            datetime.now(timezone.utc) + timedelta(seconds=120)
+                        ).isoformat()
+                        _crossed_at = getattr(watched, "trigger_crossed_at", None)
+                        _crossed_at = (
+                            _crossed_at.isoformat()
+                            if hasattr(_crossed_at, "isoformat")
+                            else str(_crossed_at or datetime.now(timezone.utc).isoformat())
+                        )
+                        _observed_underlying = float(
+                            getattr(watched, "last_quote_ask", 0)
+                            or getattr(watched, "last_quote_bid", 0)
+                            or _mat_trigger_price
+                            or 0
+                        )
+                        _mat_claimed = bool(_mat_claim(
+                            str(queue_local_order_id or ""),
+                            owner=_mat_owner,
+                            generation=_mat_generation,
+                            lease_until=_lease_until,
+                            trigger_crossed_at=_crossed_at,
+                            trigger_price=_mat_trigger_price,
+                            observed_underlying_price=_observed_underlying,
+                            signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                            execution_mode=_mat_exec_mode,
+                        ))
+                    except Exception as _mat_claim_exc:
+                        log.critical(
+                            "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s error=%s",
+                            ticker, queue_local_order_id, _mat_claim_exc,
+                        )
+                if not _mat_claimed:
+                    try:
+                        _claim_row = self.order_state_machine.get_order(queue_local_order_id)
+                    except Exception:
+                        _claim_row = None
+                    if isinstance(_claim_row, dict):
+                        _claim_status = str(_claim_row.get("status") or "").upper()
+                        if _claim_status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
+                            return {"disposition": "SUBMITTED"}
+                        if _claim_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                            return {"disposition": "TERMINAL_DURABLE"}
+                    log.critical(
+                        "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s — "
+                        "selector and broker submission blocked; watcher retains ownership",
+                        ticker, queue_local_order_id,
+                    )
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": "MATERIALIZATION_STATE_WRITE_FAILED",
+                        "retry_after_seconds": 5,
+                    }
             try:
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
@@ -6830,6 +7608,34 @@ class APExecutionCore:
 
         ownership = sig.get("_callback_ownership_context") or {}
         if ownership.get("is_recovered"):
+            if ownership.get("ownership_kind") == "materialization_retry":
+                terminalize = getattr(
+                    self.order_state_machine, "terminalize_materialization_retry", None
+                )
+                if not callable(terminalize):
+                    sig["_recovery_cleanup_disposition"] = "KEEP_WATCHER"
+                    return False
+                terminal_status = "EXPIRED" if action == "expire" else "CANCELED"
+                try:
+                    ok = bool(terminalize(
+                        local_order_id,
+                        owner=str(ownership.get("owner") or ""),
+                        generation=ownership.get("generation"),
+                        retry_attempt=ownership.get("retry_attempt"),
+                        client_id=str(ownership.get("client_id") or ""),
+                        execution_mode=str(ownership.get("execution_mode") or ""),
+                        terminal_status=terminal_status,
+                        reason=reason,
+                    ))
+                except Exception as exc:
+                    log.error("[%s] materialization retry terminal CAS raised: %s", watched.ticker, exc)
+                    ok = False
+                if not ok:
+                    sig["_recovery_cleanup_disposition"] = self._classify_recovered_ownership_loss(
+                        local_order_id
+                    )
+                return ok
+
             terminalize = getattr(self.order_state_machine, "terminalize_recovered_entry", None)
             if not callable(terminalize):
                 sig["_recovery_cleanup_disposition"] = "KEEP_WATCHER"

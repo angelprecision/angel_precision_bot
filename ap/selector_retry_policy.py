@@ -557,3 +557,98 @@ def is_retryable_selector_reason(reason_code: "str | None") -> bool:
     addition of a new reason code in the table is the only required change.
     """
     return get_policy(reason_code).classification == RETRYABLE_DATA
+
+
+# ── Sub-classification: OPERATIONAL_REQUEST_BUDGET vs candidate-quality ───────
+#
+# P0 AMENDMENT (fix/deferred-retry-due-execution-p0 §5)
+# ------------------------------------------------------
+# SELECTOR_REQUEST_BUDGET_EXHAUSTED is classified RETRYABLE_DATA above (a
+# subsequent attempt with fresh per-request counters may find a candidate),
+# but operationally it is NOT the same as a chain-warmup miss — a per-request
+# budget exhaustion means the selector's HTTP quota for THIS attempt was
+# consumed before a decisive gate fired. Downstream diagnostics must preserve
+# BOTH:
+#
+#   * the LAST candidate-quality rejection reason the selector scored during
+#     the attempt (e.g. OI_TOO_LOW), so operators can see whether attempt N
+#     was operationally curtailed or was hitting real quality rejects; and
+#   * the operational reason (SELECTOR_REQUEST_BUDGET_EXHAUSTED), so the
+#     retry class is correctly attributed to a fresh-budget retry, not to
+#     a quality reject that would (by policy §5 in the spec) fail closed.
+#
+# A retry caused by operational request-budget exhaustion MAY run again on a
+# fresh per-request budget. A true terminal quality failure (OI_TOO_LOW,
+# SPREAD_TOO_WIDE, PREMIUM_CAP_EXCEEDED, DELTA_OUT_OF_RANGE, DTE_OUT_OF_RANGE,
+# NO_CONTRACT_AFTER_FILTERS, etc.) stays terminal and respects existing
+# max-attempt policy.
+
+OPERATIONAL_REQUEST_BUDGET_CODES: frozenset = frozenset({
+    "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+    "MARKET_DATA_THROTTLE_UNAVAILABLE",
+    "PROVIDER_RATE_LIMITED",
+    "PROVIDER_TIMEOUT",
+})
+
+
+def is_operational_request_budget_reason(reason_code: "str | None") -> bool:
+    """True iff the reason code represents per-request operational budget
+    exhaustion (as opposed to structural chain-data unavailability).
+
+    All operational budget codes are also RETRYABLE_DATA — a fresh attempt
+    with reset counters can find a candidate. This helper is used purely
+    for diagnostic labelling of the retry_class field in
+    orders.meta.materialization_selector_failure so post-mortem analysis
+    can distinguish operational curtailment from data unavailability.
+    """
+    return str(reason_code or "").strip() in OPERATIONAL_REQUEST_BUDGET_CODES
+
+
+def classify_retry_reason_taxonomy(
+    reason_code: "str | None",
+    *,
+    last_candidate_quality_reason: "str | None" = None,
+) -> dict:
+    """Return the honest, dual-label taxonomy for a retry outcome.
+
+    Preserves BOTH the operational reason (why THIS attempt stopped early)
+    and the last candidate-quality reason (what the selector was scoring
+    against when it stopped). Neither is dropped in favour of the other.
+
+    Return shape:
+
+        {
+            "reason_code":               <as-emitted>,
+            "classification":            RETRYABLE_DATA / TERMINAL_QUALITY / ...,
+            "retry_class":               "OPERATIONAL_REQUEST_BUDGET" |
+                                         "TRANSIENT_DATA" |
+                                         "TERMINAL_QUALITY" | ...,
+            "selector_terminal_reason":  <last candidate-quality reason if any>,
+            "operational_reason":        <same as reason_code when operational>,
+            "may_retry_with_fresh_budget": bool,
+        }
+
+    Consumers write the full dict into
+    ``orders.meta.materialization_selector_failure`` so both dimensions are
+    preserved in the durable row and in operator dashboards.
+    """
+    _code = str(reason_code or "").strip()
+    policy = get_policy(_code)
+    _operational = is_operational_request_budget_reason(_code)
+    if _operational:
+        _retry_class = "OPERATIONAL_REQUEST_BUDGET"
+    elif policy.classification == RETRYABLE_DATA:
+        _retry_class = "TRANSIENT_DATA"
+    else:
+        _retry_class = policy.classification
+    return {
+        "reason_code": _code,
+        "classification": policy.classification,
+        "retry_class": _retry_class,
+        "selector_terminal_reason": (
+            str(last_candidate_quality_reason).strip()
+            if last_candidate_quality_reason else None
+        ),
+        "operational_reason": _code if _operational else None,
+        "may_retry_with_fresh_budget": _operational,
+    }

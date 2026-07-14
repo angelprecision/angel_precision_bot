@@ -1146,6 +1146,42 @@ class APStartupRecovery:
         now = datetime.now(timezone.utc)
         recovered = 0
 
+        def _strict_durable_counter(
+            meta_dict: dict,
+            key: str,
+            local_order_id: str,
+            *,
+            minimum: int = 0,
+            missing_default: int | None = None,
+        ):
+            raw = (meta_dict or {}).get(key)
+            if raw is None or raw == "":
+                if missing_default is not None:
+                    return missing_default
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                log.critical(
+                    "[%s] RECOVERY_MALFORMED_DURABLE_COUNTER local_order_id=%s "
+                    "field=%s raw=%r",
+                    self.client_id, local_order_id, key, raw,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_malformed_counter:{local_order_id}:{key}"
+                )
+                return None
+            if value < minimum:
+                log.critical(
+                    "[%s] RECOVERY_INVALID_DURABLE_COUNTER local_order_id=%s "
+                    "field=%s value=%r minimum=%d",
+                    self.client_id, local_order_id, key, value, minimum,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_invalid_counter:{local_order_id}:{key}"
+                )
+                return None
+            return value
+
         # ── AMENDMENT §7: verified terminalization ─────────────────────
         # terminalize_deferred_breach returns True only when Postgres
         # confirmed rowcount > 0. A False return means the row was NOT
@@ -1187,6 +1223,198 @@ class APStartupRecovery:
                 )
                 result.setdefault("errors", []).append("recovery_terminalize_failed")
             return ok
+
+        def _terminalize_fenced_retry(loid, *, outcome: dict, extra_diagnostics: dict | None = None):
+            """Fenced terminal CAS via terminalize_deferred_retry_if_unchanged.
+
+            All fencing identity fields MUST come from the TERMINAL_REQUIRED outcome
+            dict. No fallback to self.client_id, recovery_mode, or zero values — any
+            missing or malformed field returns INVALID_FENCED_OUTCOME and retains
+            ownership. This prevents a stale runner with wrong identity from being
+            silently substituted into the SQL predicate.
+
+            Returns a classification dict:
+              {"result": "TERMINALIZED"}                — fenced CAS succeeded
+              {"result": "ALREADY_TERMINAL"}            — row already terminal
+              {"result": "CLAIM_LOST"}                  — concurrent winner advanced
+              {"result": "OWNERSHIP_ADVANCED"}          — submit intent / broker-ready
+              {"result": "WRITE_FAILED"}                — true write failure, retain ownership
+              {"result": "FENCED_TERMINAL_UNAVAILABLE"} — OSM method missing; retain
+              {"result": "INVALID_FENCED_OUTCOME"}      — outcome missing required fields; retain
+            """
+            _fn = getattr(self.osm, "terminalize_deferred_retry_if_unchanged", None)
+            if not callable(_fn):
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_UNAVAILABLE local_order_id=%s "
+                    "— terminalize_deferred_retry_if_unchanged missing from OSM; "
+                    "row retained; deploy OSM update to unblock",
+                    self.client_id, loid,
+                )
+                result.setdefault("errors", []).append("recovery_fenced_terminal_unavailable")
+                return {"result": "FENCED_TERMINAL_UNAVAILABLE"}
+
+            # ── Require all fencing identity fields from the outcome dict ────
+            # Never substitute self.client_id, recovery_mode, or zero values.
+            # An incomplete outcome means the consumer did not produce reliable
+            # expected-state fields; calling the CAS with inferred defaults can
+            # terminalize the wrong generation or a different client's row.
+            _exp_client = str(outcome.get("expected_client_id") or "").strip().lower()
+            _exp_mode = str(outcome.get("expected_execution_mode") or "").strip().lower()
+            _exp_lc = str(outcome.get("expected_lifecycle_state") or "").strip().upper()
+            _exp_ms = str(outcome.get("expected_materialization_status") or "").strip().upper()
+            _exp_reason = str(outcome.get("reason_code") or "").strip()
+            _exp_status = str(outcome.get("terminal_status") or "").strip().upper()
+            try:
+                _exp_gen = int(outcome["expected_generation"])
+            except (KeyError, TypeError, ValueError):
+                _exp_gen = None
+            try:
+                _exp_prior = int(outcome["expected_prior_retry_attempt"])
+            except (KeyError, TypeError, ValueError):
+                _exp_prior = None
+
+            _missing = []
+            if not _exp_client:
+                _missing.append("expected_client_id")
+            if _exp_mode not in {"live", "paper"}:
+                _missing.append("expected_execution_mode")
+            if _exp_lc != "RETRY_WAIT":
+                _missing.append("expected_lifecycle_state=RETRY_WAIT")
+            if _exp_ms != "RETRY_PENDING":
+                _missing.append("expected_materialization_status=RETRY_PENDING")
+            if _exp_gen is None or _exp_gen < 1:
+                _missing.append("expected_generation>=1")
+            if _exp_prior is None or _exp_prior < 0:
+                _missing.append("expected_prior_retry_attempt>=0")
+            if not _exp_reason:
+                _missing.append("reason_code")
+            if _exp_status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                _missing.append("terminal_status in {REJECTED,EXPIRED,CANCELED,ERROR}")
+
+            if _missing:
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_INVALID_OUTCOME local_order_id=%s "
+                    "missing_or_invalid=%s — row retained; outcome did not carry "
+                    "required fencing fields",
+                    self.client_id, loid, _missing,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_fenced_outcome_invalid:{','.join(_missing)}"
+                )
+                return {"result": "INVALID_FENCED_OUTCOME"}
+
+            _ok = False
+            try:
+                _ok = bool(_fn(
+                    loid,
+                    reason_code=_exp_reason,
+                    terminal_status=_exp_status,
+                    expected_client_id=_exp_client,
+                    expected_execution_mode=_exp_mode,
+                    expected_generation=_exp_gen,
+                    expected_prior_retry_attempt=_exp_prior,
+                    diagnostics={
+                        **(extra_diagnostics or {}),
+                        "recovery_classification": "fenced_retry_terminal",
+                        "recovery_owner": outcome.get("owner"),
+                    },
+                ))
+            except Exception as exc:
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_RAISED local_order_id=%s exc=%s",
+                    self.client_id, loid, exc,
+                )
+                return {"result": "WRITE_FAILED"}
+
+            if _ok:
+                log.info(
+                    "[%s] RECOVERY_FENCED_TERM_OK local_order_id=%s reason=%s",
+                    self.client_id, loid, outcome.get("reason_code"),
+                )
+                return {"result": "TERMINALIZED"}
+
+            # CAS missed — reread to classify why
+            _reread = None
+            try:
+                _reread = self.osm.get_order(loid)
+            except Exception:
+                pass
+            if not isinstance(_reread, dict):
+                return {"result": "WRITE_FAILED"}
+
+            _rr_status = str(_reread.get("status") or "").upper()
+            _rr_meta = _reread.get("meta") or {}
+            if isinstance(_rr_meta, str):
+                try:
+                    import json as _j; _rr_meta = _j.loads(_rr_meta)
+                except Exception:
+                    _rr_meta = {}
+
+            # A: Already terminal
+            if _rr_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                log.info(
+                    "[%s] RECOVERY_FENCED_TERM_ALREADY_TERMINAL local_order_id=%s "
+                    "status=%s — concurrent worker completed terminal write",
+                    self.client_id, loid, _rr_status,
+                )
+                return {"result": "ALREADY_TERMINAL"}
+
+            _rr_gen = _strict_durable_counter(
+                _rr_meta or {}, "materialization_generation", loid,
+                minimum=0, missing_default=0,
+            )
+            _rr_attempt = _strict_durable_counter(
+                _rr_meta or {}, "retry_attempt", loid,
+                minimum=0, missing_default=0,
+            )
+            if _rr_gen is None or _rr_attempt is None:
+                return {"result": "WRITE_FAILED"}
+            _exp_gen = int(outcome.get("expected_generation") or 0)
+            _exp_attempt_prior = int(outcome.get("expected_prior_retry_attempt") or 0)
+
+            # B: Concurrent generation or attempt advance
+            if _rr_gen > _exp_gen or _rr_attempt > _exp_attempt_prior:
+                log.info(
+                    "[%s] RECOVERY_FENCED_TERM_CLAIM_LOST local_order_id=%s "
+                    "rr_gen=%d exp_gen=%d rr_attempt=%d exp_prior=%d",
+                    self.client_id, loid, _rr_gen, _exp_gen, _rr_attempt, _exp_attempt_prior,
+                )
+                return {"result": "CLAIM_LOST"}
+
+            # C: Submit intent, broker-ready, or active lifecycle
+            _rr_lifecycle = str((_rr_meta or {}).get("lifecycle_state") or "").upper()
+            _rr_submit_intent = str((_rr_meta or {}).get("submit_intent_at") or "").strip()
+            _rr_broker_id = str(_reread.get("broker_order_id") or "").strip()
+            _rr_broker_ready = str((_rr_meta or {}).get("broker_ready") or "false").lower()
+            _rr_inflight = str((_rr_meta or {}).get("materialization_in_flight") or "false").lower()
+            if (
+                _rr_submit_intent
+                or _rr_broker_id
+                or _reread.get("submitted_ts")
+                or _rr_broker_ready not in {"false", ""}
+                or _rr_inflight not in {"false", ""}
+                or _rr_lifecycle in {
+                    "MATERIALIZING", "BROKER_READY", "SUBMITTING",
+                    "PRE_SUBMIT_PROOF_RETRY", "SUBMITTED", "ACKNOWLEDGED",
+                }
+            ):
+                log.warning(
+                    "[%s] RECOVERY_FENCED_TERM_OWNERSHIP_ADVANCED local_order_id=%s "
+                    "lifecycle=%s submit_intent=%r broker_id=%r broker_ready=%r inflight=%r",
+                    self.client_id, loid, _rr_lifecycle,
+                    bool(_rr_submit_intent), bool(_rr_broker_id),
+                    _rr_broker_ready, _rr_inflight,
+                )
+                return {"result": "OWNERSHIP_ADVANCED"}
+
+            # D: Row still in old RETRY_WAIT state — true write failure
+            log.critical(
+                "[%s] RECOVERY_FENCED_TERM_WRITE_FAILED local_order_id=%s "
+                "— row still RETRY_WAIT; retaining ownership for next pass",
+                self.client_id, loid,
+            )
+            result.setdefault("errors", []).append(f"fenced_term_write_failed:{loid}")
+            return {"result": "WRITE_FAILED"}
 
         # ── AMENDMENT §5: durable ownership on failed/impossible rearm ──
         # A resumable row must never be left ownerless. When a rearm cannot
@@ -1307,31 +1535,8 @@ class APStartupRecovery:
                 )
                 continue
 
-            plan = self._build_recovery_plan_from_order(order)
-            if plan is None:
-                continue
-
-            # ── Plan-level identity proof ────────────────────────────
-            # After building the plan, verify the plan carries the exact
-            # client_id and execution_mode we expect. The plan builder no
-            # longer infers execution_mode from the runner (Amendment 1),
-            # so a persisted row with a blank mode surfaces here as an
-            # empty plan.execution_mode string and is skipped.
-            plan_client_id = str(getattr(plan, "client_id", "") or "").strip().lower()
-            if plan_client_id and plan_client_id != self.client_id:
-                log.error(
-                    "[%s] RECOVERY_SKIP plan_client_id_mismatch local_order_id=%s plan=%r",
-                    self.client_id, local_order_id, plan_client_id,
-                )
-                continue
-            plan_mode_raw = str(getattr(plan, "execution_mode", "") or "").strip().upper()
-            if plan_mode_raw != recovery_mode:
-                log.error(
-                    "[%s] RECOVERY_SKIP plan_execution_mode_mismatch local_order_id=%s "
-                    "plan_mode=%r recovery_mode=%s",
-                    self.client_id, local_order_id, plan_mode_raw, recovery_mode,
-                )
-                continue
+            # Plan construction deferred: due-retry rows processed first (P0 final amendment)
+            # The plan is built only inside should_resume for future-due rearm paths.
 
             # ── AMENDMENT §6: broker-ambiguity crash window ────────────────
             # If a durable submit intent was persisted (submit_intent_at) but
@@ -1431,8 +1636,48 @@ class APStartupRecovery:
                     )
                     continue
 
+                # Build and validate the plan before passing to the scaffold.
+                # A None plan means the row has malformed or missing identity
+                # metadata — the scaffold must not be called with None.
+                _br_plan = self._build_recovery_plan_from_order(order)
+                if _br_plan is None:
+                    log.critical(
+                        "[%s] BROKER_READY_RECOVERY_PLAN_INVALID local_order_id=%s "
+                        "— plan construction failed; row retained without submit",
+                        self.client_id, local_order_id,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="broker_ready_recovery_plan_invalid",
+                    )
+                    result.setdefault("errors", []).append(
+                        "broker_ready_recovery_plan_invalid"
+                    )
+                    continue
+                _br_plan_client = str(getattr(_br_plan, "client_id", "") or "").strip().lower()
+                _br_plan_mode = str(getattr(_br_plan, "execution_mode", "") or "").strip().upper()
+                if _br_plan_client and _br_plan_client != self.client_id:
+                    log.error(
+                        "[%s] BROKER_READY_RECOVERY_PLAN_CLIENT_MISMATCH "
+                        "local_order_id=%s plan_client=%r",
+                        self.client_id, local_order_id, _br_plan_client,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="broker_ready_recovery_plan_client_mismatch",
+                    )
+                    continue
+                if _br_plan_mode != recovery_mode:
+                    log.error(
+                        "[%s] BROKER_READY_RECOVERY_PLAN_MODE_MISMATCH "
+                        "local_order_id=%s plan_mode=%r recovery_mode=%s",
+                        self.client_id, local_order_id, _br_plan_mode, recovery_mode,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="broker_ready_recovery_plan_mode_mismatch",
+                    )
+                    continue
+
                 try:
-                    outcome = resume_fn(local_order_id=local_order_id, plan=plan) or {}
+                    outcome = resume_fn(local_order_id=local_order_id, plan=_br_plan) or {}
                 except Exception as exc:
                     log.error(
                         "[%s] resume_deferred_broker_ready_order raised "
@@ -1558,21 +1803,354 @@ class APStartupRecovery:
                 should_resume = True
 
             if should_resume:
-                # ── AMENDMENT §5: a resumable row must never be ownerless ──
+                # ── P0 AMENDMENT (fix/deferred-retry-due-execution-p0) ───────
+                #
+                # BLOCKER §3: Apply executable ownership proof to ALL RETRY_WAIT
+                # / RETRY_PENDING rows — not just due ones. For future-due rows,
+                # the proof verifies that deferred_retry_not_before exists and is
+                # plausibly aligned with the durable schedule. A malformed durable
+                # timestamp gets a quarantine outcome, never a fall-through to
+                # has_order().
+                #
+                # BLOCKER §4: Due-retry execution does not require a live
+                # entry_watcher. An already-due durable retry routes to
+                # resume_deferred_materialization_retry through execution_core
+                # regardless of watcher availability. The watcher is only needed
+                # for future-due rearm scheduling.
+
+                _is_retry_row = (
+                    lifecycle == "RETRY_WAIT" or materialization_status == "RETRY_PENDING"
+                )
+
+                # ── Parse + validate the durable retry schedule ───────────────
+                _durable_next_retry_at = (
+                    meta.get("materialization_next_retry_at")
+                    or meta.get("deferred_retry_next_attempt_at")
+                    or meta.get("next_retry_at")
+                )
+                _due_at = None
+                _ts_parse_error = False
+                if _durable_next_retry_at and _is_retry_row:
+                    try:
+                        _due_at = datetime.fromisoformat(str(_durable_next_retry_at))
+                        if _due_at.tzinfo is None:
+                            _due_at = _due_at.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        _ts_parse_error = True
+                        _due_at = None
+
+                if _is_retry_row and _ts_parse_error:
+                    # Blocker §3: malformed durable timestamp — quarantine.
+                    log.critical(
+                        "[%s] RECOVERY_RETRY_TS_MALFORMED local_order_id=%s "
+                        "raw=%r — quarantining via retention",
+                        self.client_id, local_order_id, _durable_next_retry_at,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="retry_ts_malformed",
+                    )
+                    continue
+
+                # P0 blocker §2 (new): RETRY_WAIT with no durable retry
+                # timestamp is an inconsistent lifecycle state. There is no
+                # safe interpretation of:
+                #   lifecycle_state = RETRY_WAIT / materialization_status = RETRY_PENDING
+                #   next_retry_at   = null
+                # It must be quarantined via retention — never trusted through
+                # has_order(). A future health pass can repair or terminalize it.
+                if _is_retry_row and _durable_next_retry_at is None:
+                    log.critical(
+                        "[%s] RECOVERY_RETRY_NO_DURABLE_SCHEDULE local_order_id=%s "
+                        "lifecycle=%s mstatus=%s — quarantining; no schedule to trust",
+                        self.client_id, local_order_id, lifecycle, materialization_status,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="retry_wait_no_durable_schedule",
+                    )
+                    continue
+
+                _retry_generation = None
+                _retry_attempt = None
+                _retry_max_attempts = None
+                if _is_retry_row:
+                    _retry_generation = _strict_durable_counter(
+                        meta, "materialization_generation", local_order_id,
+                        minimum=1, missing_default=1,
+                    )
+                    _retry_attempt = _strict_durable_counter(
+                        meta, "retry_attempt", local_order_id,
+                        minimum=0, missing_default=0,
+                    )
+                    _retry_max_attempts = _strict_durable_counter(
+                        meta, "retry_max_attempts", local_order_id,
+                        minimum=0, missing_default=0,
+                    )
+                    if (
+                        _retry_generation is None
+                        or _retry_attempt is None
+                        or _retry_max_attempts is None
+                    ):
+                        _retain_recovery_ownership(
+                            local_order_id, reason="retry_wait_malformed_counter",
+                        )
+                        continue
+
+                _is_due = _due_at is not None and _due_at <= now
+
+                # ── Due-retry path (blocker §4: watcher not required) ─────────
+                if _is_retry_row and _is_due:
+                    # Prove executable ownership regardless of watcher state.
+                    _proof_result = {"proven": False, "reason_code": "PROOF_UNAVAILABLE"}
+                    if self.entry_watcher is not None:
+                        _prove = getattr(
+                            self.entry_watcher, "prove_materialization_retry_owner", None,
+                        )
+                        if callable(_prove):
+                            try:
+                                _proof_result = _prove(
+                                    local_order_id,
+                                    expected_client_id=self.client_id,
+                                    expected_execution_mode=recovery_mode,
+                                    expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
+                                    expected_generation=_retry_generation,
+                                    durable_next_retry_at=str(_durable_next_retry_at),
+                                    durable_retry_deadline=(
+                                        str(meta.get("absolute_entry_deadline"))
+                                        if meta.get("absolute_entry_deadline") else None
+                                    ),
+                                ) or {"proven": False, "reason_code": "PROOF_RETURNED_NONE"}
+                            except Exception as _pexc:
+                                _proof_result = {
+                                    "proven": False,
+                                    "reason_code": f"PROOF_EXCEPTION:{type(_pexc).__name__}",
+                                }
+                    _proven = bool(_proof_result.get("proven"))
+                    _proof_reason = str(_proof_result.get("reason_code") or "PROOF_UNKNOWN")
+                    try:
+                        _grace_seconds = int(os.getenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "5"))
+                    except (TypeError, ValueError):
+                        _grace_seconds = 5
+                    _grace_expired = (now - _due_at).total_seconds() > _grace_seconds
+                    if _proven and not _grace_expired:
+                        continue  # watcher will fire within grace
+
+                    # Blocker §4: attempt takeover through execution_core
+                    # whether or not a watcher is available.
+                    _resume_fn = None
+                    if self.execution_core is not None:
+                        _resume_fn = getattr(
+                            self.execution_core, "resume_deferred_materialization_retry", None,
+                        )
+                    if not callable(_resume_fn):
+                        log.warning(
+                            "[%s] RECOVERY_DUE_RETRY_TAKEOVER_UNAVAILABLE "
+                            "local_order_id=%s proof_reason=%s — falling through "
+                            "to legacy rearm",
+                            self.client_id, local_order_id, _proof_reason,
+                        )
+                        # Fall through to the future-due / legacy rearm block.
+                    else:
+                        _expected_generation = int(_retry_generation)
+                        _expected_attempt = int(_retry_attempt) + 1
+                        _takeover_owner = (
+                            f"recovery_retry:{self.client_id}:{local_order_id}:"
+                            f"{_expected_generation + 1}"
+                        )
+                        try:
+                            _outcome = _resume_fn(
+                                local_order_id=local_order_id,
+                                expected_generation=_expected_generation,
+                                expected_retry_attempt=_expected_attempt,
+                                owner=_takeover_owner,
+                            ) or {}
+                        except Exception as _resume_exc:
+                            log.error(
+                                "[%s] resume_deferred_materialization_retry raised "
+                                "local_order_id=%s exc=%s",
+                                self.client_id, local_order_id, _resume_exc,
+                            )
+                            _retain_recovery_ownership(
+                                local_order_id,
+                                reason=f"due_retry_resume_raised:{type(_resume_exc).__name__}",
+                            )
+                            continue
+                        _disp = str(_outcome.get("disposition") or "").strip().upper()
+                        _reason = str(_outcome.get("reason_code") or "RETRY_UNKNOWN")
+                        log.info(
+                            "[%s] RECOVERY_DUE_RETRY_TAKEOVER local_order_id=%s "
+                            "proof_reason=%s grace_expired=%s disposition=%s "
+                            "reason=%s attempt=%s generation=%s",
+                            self.client_id, local_order_id, _proof_reason,
+                            _grace_expired, _disp, _reason,
+                            _outcome.get("attempt"), _outcome.get("generation"),
+                        )
+                        if _disp in {"SUBMITTED", "BROKER_READY"}:
+                            recovered += 1
+                        elif _disp == "TERMINAL_REQUIRED":
+                            # P0 FINAL AMENDMENT: fenced terminal CAS using the
+                            # exact expected state carried in the outcome dict.
+                            # Never uses the broad terminalize_deferred_breach.
+                            _fenced = _terminalize_fenced_retry(
+                                local_order_id,
+                                outcome=_outcome,
+                                extra_diagnostics={
+                                    "recovery_classification": "due_retry_terminal_required",
+                                    "recovery_attempt": _outcome.get("attempt"),
+                                    "recovery_max_attempts": _outcome.get("max_attempts"),
+                                    "recovery_owner": _outcome.get("owner"),
+                                    "recovery_generation": _outcome.get("generation"),
+                                },
+                            )
+                            _fenced_result = _fenced.get("result")
+                            if _fenced_result == "WRITE_FAILED":
+                                _retain_recovery_ownership(
+                                    local_order_id, reason=f"fenced_term_write_failed:{_reason}",
+                                )
+                            elif _fenced_result in {"FENCED_TERMINAL_UNAVAILABLE", "INVALID_FENCED_OUTCOME"}:
+                                _retain_recovery_ownership(
+                                    local_order_id, reason=_fenced_result.lower(),
+                                )
+                            # ALREADY_TERMINAL / CLAIM_LOST / OWNERSHIP_ADVANCED:
+                            # row is owned by another worker — no retention, no error
+                        elif _disp in {"TERMINAL_DURABLE", "TERMINAL_ALREADY_DURABLE"}:
+                            # TERMINAL_ALREADY_DURABLE: canonical downstream already wrote
+                            # the terminal state; do NOT issue another terminal write.
+                            # TERMINAL_DURABLE: backward-compat path — also no write needed
+                            # (the consumer verified the row is already terminal).
+                            log.info(
+                                "[%s] RECOVERY_DUE_RETRY_ALREADY_TERMINAL local_order_id=%s "
+                                "disp=%s reason=%s terminal_status=%s",
+                                self.client_id, local_order_id, _disp, _reason,
+                                _outcome.get("terminal_status"),
+                            )
+                            # Verify terminal status in durable row (belt-and-suspenders)
+                            try:
+                                _at_row = self.osm.get_order(local_order_id)
+                                _at_status = str((_at_row or {}).get("status") or "").upper()
+                                if _at_status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR",
+                                                      "SUBMITTED", "ACKNOWLEDGED", "FILLED"}:
+                                    log.warning(
+                                        "[%s] RECOVERY_ALREADY_TERMINAL_VERIFY_MISMATCH "
+                                        "local_order_id=%s expected_terminal actual_status=%s",
+                                        self.client_id, local_order_id, _at_status,
+                                    )
+                            except Exception:
+                                pass
+                        elif _disp == "RETRY_SCHEDULE_FAILED":
+                            # P0 blocker §3: schedule write failed — row may be
+                            # stranded at MATERIALIZING. Retain durable ownership
+                            # so the next health-loop pass does not lose the row.
+                            log.critical(
+                                "[%s] RECOVERY_DUE_RETRY_SCHEDULE_FAILED "
+                                "local_order_id=%s reason=%s — retaining ownership",
+                                self.client_id, local_order_id, _reason,
+                            )
+                            _retain_recovery_ownership(
+                                local_order_id, reason=f"due_retry_schedule_failed:{_reason}",
+                            )
+                            result.setdefault("errors", []).append(
+                                f"retry_schedule_failed:{local_order_id}"
+                            )
+                        # All other dispositions (RETRY_WAIT / CLAIM_LOST /
+                        # NOT_DUE / KEEP_WATCHER): row is owned by execution
+                        # core; skip rearm.
+                        continue
+
+                # ── Future-due / orphan rearm path ────────────────────────────
+                # Blocker §3: for future-due RETRY_WAIT rows, prove the watcher
+                # has an executable schedule before trusting has_order(). An
+                # absent or non-matching in-memory schedule means the poll loop
+                # will not fire the retry on time.
+                if _is_retry_row and _due_at is not None:
+                    _future_proof = {"proven": False, "reason_code": "NO_WATCHER"}
+                    if self.entry_watcher is not None:
+                        _pf = getattr(self.entry_watcher, "prove_materialization_retry_owner", None)
+                        if callable(_pf):
+                            try:
+                                _future_proof = _pf(
+                                    local_order_id,
+                                    expected_client_id=self.client_id,
+                                    expected_execution_mode=recovery_mode,
+                                    expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
+                                    expected_generation=_retry_generation,
+                                    durable_next_retry_at=str(_durable_next_retry_at),
+                                    durable_retry_deadline=(
+                                        str(meta.get("absolute_entry_deadline"))
+                                        if meta.get("absolute_entry_deadline") else None
+                                    ),
+                                ) or {"proven": False, "reason_code": "PROOF_RETURNED_NONE"}
+                            except Exception as _fpexc:
+                                _future_proof = {
+                                    "proven": False,
+                                    "reason_code": f"PROOF_EXCEPTION:{type(_fpexc).__name__}",
+                                }
+                    if _future_proof.get("proven"):
+                        continue  # watcher owns this future-due row
+
+                # ── §5: a resumable row must never be ownerless ───────────────
                 if self.entry_watcher is None:
-                    # No watcher wired — cannot rearm this pass. Record
-                    # durable ownership so the row is diagnosably owned by
-                    # the recovery scheduler and a future pass resumes it.
                     _retain_recovery_ownership(
                         local_order_id, reason="entry_watcher_unavailable",
                     )
                     continue
                 if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
-                    # Already owned by a live watcher — nothing to do.
+                    # For non-RETRY_WAIT orphans (MATERIALIZING, QUEUED,
+                    # WAITING_FOR_TRIGGER), registry presence is sufficient.
+                    if not _is_retry_row:
+                        continue
+                    # RETRY_WAIT rows with no durable timestamp are quarantined
+                    # above, so _due_at is always set here. Fall through to rearm.
+
+                # ── Build recovery plan lazily (P0 final amendment) ─────────
+                # Plan construction was moved here so that due-retry rows can
+                # reach resume_deferred_materialization_retry() above without
+                # being blocked by a missing or malformed plan. Only rearm
+                # paths (future-due watcher rearm, orphan rearm) need the plan.
+                plan = self._build_recovery_plan_from_order(order)
+                if plan is None:
+                    if _is_retry_row:
+                        # A future-due RETRY_WAIT row with an invalid plan
+                        # cannot be rearmed — retain ownership so a future pass
+                        # can retry after the row is repaired.
+                        log.critical(
+                            "[%s] RECOVERY_RETRY_REARM_PLAN_INVALID local_order_id=%s "
+                            "lifecycle=%s — retaining ownership; row not rearmed",
+                            self.client_id, local_order_id, lifecycle,
+                        )
+                        result.setdefault("errors", []).append(
+                            "recovery_retry_rearm_plan_invalid"
+                        )
+                        _retain_recovery_ownership(
+                            local_order_id, reason="retry_rearm_plan_invalid",
+                        )
+                    # For non-retry orphans: silently skip (pre-existing behaviour
+                    # — the plan builder already logged the reason).
                     continue
-                plan.metadata["materialization_generation"] = int(
-                    meta.get("materialization_generation") or 1
+
+                # ── Plan-level identity proof ────────────────────────────
+                plan_client_id = str(getattr(plan, "client_id", "") or "").strip().lower()
+                if plan_client_id and plan_client_id != self.client_id:
+                    log.error(
+                        "[%s] RECOVERY_SKIP plan_client_id_mismatch local_order_id=%s plan=%r",
+                        self.client_id, local_order_id, plan_client_id,
+                    )
+                    continue
+                plan_mode_raw = str(getattr(plan, "execution_mode", "") or "").strip().upper()
+                if plan_mode_raw != recovery_mode:
+                    log.error(
+                        "[%s] RECOVERY_SKIP plan_execution_mode_mismatch local_order_id=%s "
+                        "plan_mode=%r recovery_mode=%s",
+                        self.client_id, local_order_id, plan_mode_raw, recovery_mode,
+                    )
+                    continue
+
+                plan.metadata["materialization_generation"] = (
+                    int(_retry_generation) if _retry_generation is not None else int(
+                        meta.get("materialization_generation") or 1
+                    )
                 )
+                if _retry_attempt is not None:
+                    plan.metadata["retry_attempt"] = int(_retry_attempt)
                 plan.metadata["contract_deferred"] = True
                 armed = bool(self.entry_watcher.watch(
                     plan,
@@ -1584,13 +2162,9 @@ class APStartupRecovery:
                 if armed:
                     recovered += 1
                 else:
-                    # Rearm returned False — the watcher did NOT take
-                    # ownership. Do not silently drop the row; record durable
-                    # recovery ownership so it is resumed on a later pass.
                     _retain_recovery_ownership(
                         local_order_id, reason="watcher_rearm_returned_false",
                     )
-
         result["deferred_lifecycles_recovered"] = recovered
 
     def _reseed_watchers(self, result: dict):

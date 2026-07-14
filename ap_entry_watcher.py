@@ -1041,6 +1041,234 @@ class APEntryWatcher:
                     return True
         return False
 
+    def prove_materialization_retry_owner(
+        self,
+        local_order_id: Optional[str],
+        *,
+        expected_client_id: Optional[str] = None,
+        expected_execution_mode: Optional[str] = None,
+        expected_watcher_token: Optional[str] = None,
+        expected_generation: Optional[int] = None,
+        durable_next_retry_at: Optional[str] = None,
+        durable_retry_deadline: Optional[str] = None,
+    ) -> dict:
+        """Return a structured proof of executable retry ownership.
+
+        P0 AMENDMENT (fix/deferred-retry-due-execution-p0):
+        Registry presence alone is NOT proof that a watcher will execute a
+        due materialization retry. This method inspects the actual registered
+        ``WatchedSignal`` and verifies every condition required for it to
+        execute the next attempt:
+
+          * exact local_order_id, client_id, execution_mode match
+          * watcher_token matches durable row (fenced ownership)
+          * trigger_generation matches durable materialization_generation
+          * watcher is not terminal, quarantined, expired, or inactive
+          * the durable next_retry_at is either absent (already due & waiting
+            for poll) or matches the in-memory ``deferred_retry_not_before``
+            within a small tolerance — proving the poll loop will actually
+            consume the due retry rather than continuing to sleep past it
+          * retry deadline (absolute_entry_deadline) has not expired
+
+        Returns a structured result:
+
+            {
+                "proven": bool,
+                "reason_code": str,
+                "watcher_token": str | None,
+                "generation": int | None,
+                "retry_due_at": str | None,   # in-memory deferred_retry_not_before
+                "retry_deadline": str | None, # from durable row echoed back
+            }
+
+        A bare ``has_order()`` cannot express this; it returns True for a
+        registered-but-inert watcher whose deferred_retry_not_before has been
+        cleared or is None but that has no executable path back into the
+        selector callback. Recovery MUST use this method for due retries and
+        MUST fenced-CAS reclaim when ``proven=False`` — never fall through
+        to "registered means owned."
+        """
+        local_order_id = str(local_order_id or "").strip()
+        base: dict = {
+            "proven": False,
+            "reason_code": "",
+            "watcher_token": None,
+            "generation": None,
+            "retry_due_at": None,
+            "retry_deadline": durable_retry_deadline,
+        }
+        if not local_order_id:
+            base["reason_code"] = "PROOF_MISSING_LOCAL_ORDER_ID"
+            return base
+
+        expected_client_id_norm = str(expected_client_id or "").strip().lower() or None
+        expected_mode_norm = str(expected_execution_mode or "").strip().lower() or None
+        expected_token_norm = str(expected_watcher_token or "").strip() or None
+        try:
+            expected_generation_int = (
+                int(expected_generation) if expected_generation is not None else None
+            )
+        except (TypeError, ValueError):
+            base["reason_code"] = "PROOF_INVALID_EXPECTED_GENERATION"
+            return base
+
+        durable_due_at_dt: Optional[datetime] = None
+        if durable_next_retry_at:
+            try:
+                durable_due_at_dt = datetime.fromisoformat(str(durable_next_retry_at))
+                if durable_due_at_dt.tzinfo is None:
+                    durable_due_at_dt = durable_due_at_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                base["reason_code"] = "PROOF_INVALID_DURABLE_NEXT_RETRY_AT"
+                return base
+
+        durable_deadline_dt: Optional[datetime] = None
+        if durable_retry_deadline:
+            try:
+                durable_deadline_dt = datetime.fromisoformat(str(durable_retry_deadline))
+                if durable_deadline_dt.tzinfo is None:
+                    durable_deadline_dt = durable_deadline_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                base["reason_code"] = "PROOF_INVALID_DURABLE_RETRY_DEADLINE"
+                return base
+
+        now = datetime.now(timezone.utc)
+        if durable_deadline_dt is not None and now >= durable_deadline_dt:
+            base["reason_code"] = "PROOF_RETRY_DEADLINE_EXPIRED"
+            return base
+
+        with self._lock:
+            candidate = None
+            for watched in self._pending:
+                _sig = getattr(watched, "signal", {}) or {}
+                if str(_sig.get("local_order_id") or "").strip() != local_order_id:
+                    continue
+                candidate = watched
+                break
+
+            if candidate is None:
+                base["reason_code"] = "PROOF_WATCHER_NOT_REGISTERED"
+                return base
+
+            _sig = getattr(candidate, "signal", {}) or {}
+            row_client = str(_sig.get("client_id") or "").strip().lower()
+            row_mode = str(_sig.get("execution_mode") or "").strip().lower()
+            row_token = str(_sig.get("watcher_token") or "").strip()
+            try:
+                row_generation = int(_sig.get("trigger_generation") or 0)
+            except (TypeError, ValueError):
+                row_generation = 0
+
+            base["watcher_token"] = row_token or None
+            base["generation"] = row_generation or None
+            _retry_dt = getattr(candidate, "deferred_retry_not_before", None)
+            if isinstance(_retry_dt, datetime):
+                base["retry_due_at"] = _retry_dt.isoformat()
+            elif _retry_dt is not None:
+                base["retry_due_at"] = str(_retry_dt)
+
+            # ── BLOCKER §2: exact identity — absence fails like a mismatch ──
+            # When an expected identity field is supplied, an absent watcher
+            # field must fail proof exactly as a mismatch would. This closes
+            # the fail-open window where a watcher with no stored client_id,
+            # watcher_token, or generation could still pass because one side
+            # of the comparison was empty.
+            if expected_client_id_norm:
+                if expected_client_id_norm != row_client:
+                    base["reason_code"] = "PROOF_CLIENT_ID_MISMATCH"
+                    return base
+            if expected_mode_norm:
+                if expected_mode_norm != row_mode:
+                    base["reason_code"] = "PROOF_EXECUTION_MODE_MISMATCH"
+                    return base
+            if expected_token_norm:
+                if expected_token_norm != row_token:
+                    base["reason_code"] = "PROOF_WATCHER_TOKEN_MISMATCH"
+                    return base
+            if expected_generation_int is not None:
+                if expected_generation_int != row_generation:
+                    base["reason_code"] = "PROOF_GENERATION_MISMATCH"
+                    return base
+
+            # Must be in a state that can actually execute the poll callback.
+            # Quarantined, rearm-only, or expired watchers cannot.
+            _state = getattr(candidate, "state", None)
+            _state_name = getattr(_state, "name", str(_state)) if _state is not None else ""
+            if str(_state_name).upper() not in {"PENDING", ""}:
+                base["reason_code"] = f"PROOF_WATCHER_STATE_NOT_PENDING:{_state_name}"
+                return base
+            if getattr(candidate, "_ownership_quarantine", False):
+                base["reason_code"] = "PROOF_WATCHER_QUARANTINED"
+                return base
+            if getattr(candidate, "rearm_mode", False):
+                base["reason_code"] = "PROOF_WATCHER_REARM_ONLY"
+                return base
+            if not getattr(candidate, "is_active", False):
+                base["reason_code"] = "PROOF_WATCHER_NOT_ACTIVE"
+                return base
+
+            _expire_at = getattr(candidate, "expire_at", None)
+            if isinstance(_expire_at, datetime):
+                if _expire_at.tzinfo is None:
+                    _expire_at = _expire_at.replace(tzinfo=timezone.utc)
+                if now >= _expire_at:
+                    base["reason_code"] = "PROOF_WATCHER_EXPIRED"
+                    return base
+
+            # ── Schedule alignment proof (applies to ALL retries) ───────────
+            # P0 blocker §1 (second round): previously only validated
+            # deferred_retry_not_before when the durable timestamp was already
+            # due. For future retries, a watcher with deferred_retry_not_before
+            # = None proceeds immediately to quote evaluation on every poll
+            # cycle — it never waits for the durable retry time. A watcher
+            # whose in-memory schedule is malformed is also cleared and proceeds
+            # immediately. Both must FAIL proof for any durable timestamp,
+            # whether past or future.
+            #
+            # Tolerance: 1 second. The clock delta between the durable write
+            # and the recovery pass creates a small natural drift; a 1-second
+            # tolerance is tight enough to catch None/malformed/wildly mismatched
+            # schedules and wide enough to avoid false negatives from sub-second
+            # timing differences.
+            _SCHEDULE_TOLERANCE_SECONDS = 1
+
+            if durable_due_at_dt is not None:
+                # Parse the in-memory schedule.
+                _mem_due_dt: Optional[datetime] = None
+                if isinstance(_retry_dt, datetime):
+                    _mem_due_dt = _retry_dt
+                elif isinstance(_retry_dt, str) and _retry_dt.strip():
+                    try:
+                        _mem_due_dt = datetime.fromisoformat(_retry_dt)
+                    except Exception:
+                        _mem_due_dt = None
+
+                if _mem_due_dt is None:
+                    # No in-memory schedule — watcher is inert regardless of
+                    # whether the durable retry is due or future.
+                    base["reason_code"] = "PROOF_NO_MEMORY_RETRY_SCHEDULE"
+                    return base
+
+                if _mem_due_dt.tzinfo is None:
+                    _mem_due_dt = _mem_due_dt.replace(tzinfo=timezone.utc)
+
+                _delta = abs((_mem_due_dt - durable_due_at_dt).total_seconds())
+                if _delta > _SCHEDULE_TOLERANCE_SECONDS:
+                    # In-memory schedule diverges materially from the durable
+                    # schedule — the poll loop will fire at the wrong time (or
+                    # not at all). Fail proof with the exact delta so forensics
+                    # can see how far out of alignment the watcher is.
+                    base["reason_code"] = (
+                        f"PROOF_SCHEDULE_MISMATCH:delta={_delta:.1f}s:"
+                        f"mem={_mem_due_dt.isoformat()}:"
+                        f"durable={durable_due_at_dt.isoformat()}"
+                    )
+                    return base
+
+            base["proven"] = True
+            base["reason_code"] = "PROOF_OK"
+            return base
+
     def _validate_local_order_id(self, local_order_id: Optional[str]) -> bool:
         """Best-effort OSM pre-arm validation.
 
@@ -2601,6 +2829,47 @@ class APEntryWatcher:
             signal_dict["__recovery_rearm"] = True
         if _materialization_resume:
             signal_dict["__materialization_resume"] = True
+        if _recovery_rearm and _materialization_resume:
+            _plan_meta_for_adopt = getattr(plan, "metadata", None) or {}
+            _adopt_fn = getattr(
+                getattr(self, "order_state_machine", None),
+                "adopt_deferred_retry_watcher",
+                None,
+            )
+            _durable_next_retry = (
+                _plan_meta_for_adopt.get("materialization_next_retry_at")
+                or _plan_meta_for_adopt.get("next_retry_at")
+            )
+            if not callable(_adopt_fn):
+                log.critical(
+                    "[%s] RECOVERY_REARM_WATCHER_ADOPT_UNAVAILABLE local_order_id=%s",
+                    ticker, local_order_id,
+                )
+                return False
+            try:
+                _adopt_ok = bool(_adopt_fn(
+                    local_order_id,
+                    watcher_token=self.owner_token,
+                    generation=int(_plan_meta_for_adopt.get("materialization_generation") or 1),
+                    retry_attempt=int(_plan_meta_for_adopt.get("retry_attempt") or 0),
+                    next_retry_at=str(_durable_next_retry or ""),
+                    execution_mode=str(signal_dict.get("execution_mode") or ""),
+                ))
+            except Exception as _adopt_exc:
+                log.critical(
+                    "[%s] RECOVERY_REARM_WATCHER_ADOPT_RAISED local_order_id=%s error=%s",
+                    ticker, local_order_id, _adopt_exc,
+                )
+                return False
+            if not _adopt_ok:
+                log.critical(
+                    "[%s] RECOVERY_REARM_WATCHER_ADOPT_CAS_MISS local_order_id=%s "
+                    "generation=%s attempt=%s",
+                    ticker, local_order_id,
+                    _plan_meta_for_adopt.get("materialization_generation"),
+                    _plan_meta_for_adopt.get("retry_attempt"),
+                )
+                return False
 
         if _recovery_rearm and not _materialization_resume:
             try:

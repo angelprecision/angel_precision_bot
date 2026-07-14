@@ -106,7 +106,13 @@ def _order_row(row: Any) -> dict:
     display_contract = contract
     display_limit = raw_limit
     if str(contract or "").upper().startswith("DEFERRED:"):
-        display_contract = "pending pre-breach hydration / breach-time selection"
+        # P0 amendment (fix/deferred-retry-due-execution-p0 §9):
+        # Operators reported that raw "DEFERRED:<ticker>" / "$0.01" values on
+        # the dashboard were being misread as real contracts + real prices.
+        # Show a plain-English pending state instead; the raw values remain
+        # exposed in the drill-down diagnostics (raw `contract` / `limit_price`
+        # fields on this same row) for forensic use.
+        display_contract = "pending breach-time selection"
         if raw_limit is None or float(raw_limit or 0) <= 0.01:
             display_limit = "not priced yet"
     return {
