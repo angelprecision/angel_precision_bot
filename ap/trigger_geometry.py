@@ -15,9 +15,10 @@ def _f(value: Any) -> float | None:
 
 def _levels(signal: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
     trigger = signal.get("trigger") if isinstance(signal.get("trigger"), dict) else {}
-    entry = _f(signal.get("entry_price") or signal.get("trigger_price") or trigger.get("entry"))
-    stop = _f(signal.get("stop_price") or signal.get("stop_underlying") or trigger.get("stop"))
-    target = _f(signal.get("target_price") or signal.get("target_underlying") or trigger.get("pt1") or trigger.get("pt2"))
+    scalar_trigger = signal.get("trigger") if not isinstance(signal.get("trigger"), dict) else None
+    entry = _f(signal.get("entry_price") or signal.get("trigger_price") or scalar_trigger or trigger.get("entry"))
+    stop = _f(signal.get("stop_price") or signal.get("stop_underlying") or signal.get("stop") or trigger.get("stop"))
+    target = _f(signal.get("target_price") or signal.get("target_underlying") or signal.get("target") or trigger.get("pt1") or trigger.get("pt2"))
     return entry, stop, target
 
 

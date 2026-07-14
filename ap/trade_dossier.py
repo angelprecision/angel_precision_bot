@@ -452,6 +452,109 @@ def _minimal(signal: Mapping[str, Any], client_id: str, execution_mode: str, err
     }
 
 
+def _intelligence_score_for_dossier(
+    signal: Mapping[str, Any],
+    ctx: Mapping[str, Any],
+    identity: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Attach a matching persisted score, or build a fail-closed fallback."""
+
+    from ap.intelligence_score import build_intelligence_score, score_matches_identity
+
+    canonical = str(identity.get("canonical_signal_id") or "")
+    client_id = str(identity.get("client_id") or "")
+    execution_mode = str(identity.get("execution_mode") or "")
+    candidates = [
+        ctx.get("intelligence_score"),
+        (ctx.get("intelligence_evaluation") or {}).get("intelligence_score")
+        if isinstance(ctx.get("intelligence_evaluation"), Mapping) else None,
+        (ctx.get("intelligence_context") or {}).get("intelligence_score")
+        if isinstance(ctx.get("intelligence_context"), Mapping) else None,
+    ]
+    for candidate in candidates:
+        if score_matches_identity(
+            candidate,
+            canonical_signal_id=canonical,
+            client_id=client_id,
+            execution_mode=execution_mode,
+        ):
+            return dict(candidate)
+
+    scoring_signal = dict(signal or {})
+    scoring_signal["canonical_signal_id"] = canonical
+    try:
+        from ap.market_context_builder import build_market_context_for_signal
+        from ap.position_score_profile import build_position_score_profile
+
+        market_context = build_market_context_for_signal(
+            scoring_signal, data_sources=dict(ctx or {})
+        )
+        profile = build_position_score_profile(scoring_signal, market_context)
+    except Exception as exc:
+        log.warning("trade_dossier_intelligence_profile_failed: %s", exc)
+        profile = {}
+    return build_intelligence_score(
+        profile,
+        signal=scoring_signal,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        scored_at=identity.get("created_at"),
+        data_as_of=ctx.get("data_as_of") or signal.get("data_as_of") or identity.get("created_at"),
+        source="trade_dossier_fallback",
+        git_commit=str(identity.get("git_commit") or ""),
+    )
+
+
+def _latest_pretrigger_intelligence_score(
+    conn: Any,
+    *,
+    canonical_signal_id: str,
+    client_id: str,
+    execution_mode: str,
+) -> dict[str, Any] | None:
+    """Best-effort read of the already-durable score; never blocks dossier writes."""
+
+    savepoint = "ap_trade_dossier_score_lookup"
+    try:
+        conn.execute(f"SAVEPOINT {savepoint}")
+        conn.execute(
+            """
+            SELECT payload
+            FROM ap_intelligence_snapshots
+            WHERE client_id=%s
+              AND lower(execution_mode)=lower(%s)
+              AND canonical_signal_id=%s
+              AND phase='PRETRIGGER'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (client_id, execution_mode, canonical_signal_id),
+        )
+        row = conn.fetchone()
+        payload = row.get("payload") if isinstance(row, Mapping) else row[0] if row else None
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        score = payload.get("intelligence_score") if isinstance(payload, Mapping) else None
+        from ap.intelligence_score import score_matches_identity
+        if score_matches_identity(
+            score,
+            canonical_signal_id=canonical_signal_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+        ):
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            return dict(score)
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception as exc:
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception:
+            pass
+        log.debug("trade_dossier_intelligence_lookup_unavailable: %s", exc)
+    return None
+
+
 def build_trade_dossier(signal: dict, *, client_id: str, execution_mode: str, decision_context: dict | None = None) -> dict:
     try:
         sig = signal if isinstance(signal, dict) else {}
@@ -481,6 +584,7 @@ def build_trade_dossier(signal: dict, *, client_id: str, execution_mode: str, de
         failure, strength, unavailable = _failure_strength(levels, daily, trend, market, sector, options, hist)
         case = _case_score(levels, daily, trend, market, sector, options, hist, failure, unavailable)
         review = _summary(identity, levels, daily, failure, strength, case)
+        intelligence_score = _intelligence_score_for_dossier(sig, ctx, identity)
         decision_snapshot = {
             "master_control_decision": ctx.get("master_control_decision"),
             "decision_reason": ctx.get("decision_reason"),
@@ -501,6 +605,7 @@ def build_trade_dossier(signal: dict, *, client_id: str, execution_mode: str, de
             "failure_profile": failure,
             "strength_profile": strength,
             "case_score": case,
+            "intelligence_score": intelligence_score,
             "review_summary": review,
             "decision_snapshot": decision_snapshot,
             "raw_signal": _compact_signal(sig),
@@ -624,7 +729,23 @@ def build_and_persist_trade_dossier(conn, signal: dict, *, client_id: str, execu
     if not ENABLE_TRADE_DOSSIER:
         return None
     try:
-        dossier = build_trade_dossier(signal, client_id=client_id, execution_mode=execution_mode, decision_context=decision_context)
+        ctx = dict(decision_context or {})
+        signal_id = safe_str((signal or {}).get("signal_id"), "")
+        canonical = _canonical_signal_id(signal or {}, signal_id)
+        persisted_score = _latest_pretrigger_intelligence_score(
+            conn,
+            canonical_signal_id=canonical,
+            client_id=client_id,
+            execution_mode=execution_mode,
+        )
+        if persisted_score is not None:
+            ctx["intelligence_score"] = persisted_score
+        dossier = build_trade_dossier(
+            signal,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            decision_context=ctx,
+        )
         persist_trade_dossier(conn, dossier)
     except Exception as exc:
         log.warning("trade_dossier_write_failed client_id=%s execution_mode=%s err=%s", client_id, execution_mode, exc)

@@ -60,6 +60,29 @@ def _policy_rows(*, sessions: int, per_day: int, wins: int, win_return: float, l
     return rows
 
 
+def _ranked_policy_rows(*, sessions: int = 40) -> list[dict]:
+    """Ten daily candidates: top seven hit targets; bottom three are controls."""
+
+    rows: list[dict] = []
+    selected_index = 0
+    for day in range(1, sessions + 1):
+        for index in range(10):
+            if index < 7:
+                realized = 0.22 if selected_index < 252 else -0.08
+                selected_index += 1
+            else:
+                realized = -0.08
+            rows.append(
+                _row(
+                    index,
+                    day=day,
+                    score=100 - index,
+                    return_pct=realized,
+                )
+            )
+    return rows
+
+
 def test_rejects_nested_post_entry_feature_leakage():
     row = _row(1, features={"market": {"mfe_pct": 0.42}})
 
@@ -191,6 +214,31 @@ def test_observed_eighty_percent_is_held_when_confidence_does_not_prove_it():
 
 
 def test_large_strong_holdout_can_only_become_paper_promotion_candidate():
+    rows = _ranked_policy_rows()
+
+    report = evaluate_frozen_policy(
+        rows,
+        policy_version="policy-v1",
+        policy_frozen_at=FROZEN_AT,
+    )
+
+    assert report.win_rate == pytest.approx(0.90)
+    assert report.win_rate_ci_low > 0.80
+    assert report.avg_win_ci_low == pytest.approx(0.22)
+    assert report.avg_loss_ci_high == pytest.approx(0.08)
+    assert report.expectancy_ci_low > 0
+    assert report.resolved_unselected_opportunities == 120
+    assert report.unselected_win_rate == 0
+    assert report.selected_win_rate_lift == pytest.approx(0.90)
+    assert report.selected_win_rate_lift_ci_low > 0
+    assert report.selected_expectancy_lift_pct > 0
+    assert report.selected_expectancy_lift_ci_low > 0
+    assert report.score_return_correlation > 0
+    assert report.verdict == "PAPER_PROMOTION_CANDIDATE"
+    assert report.verdict_reasons == ("all_target_confidence_and_ranking_checks_met",)
+
+
+def test_target_results_without_unselected_controls_cannot_validate_ranking():
     rows = _policy_rows(
         sessions=40,
         per_day=7,
@@ -205,13 +253,43 @@ def test_large_strong_holdout_can_only_become_paper_promotion_candidate():
         policy_frozen_at=FROZEN_AT,
     )
 
-    assert report.win_rate == pytest.approx(0.90)
-    assert report.win_rate_ci_low > 0.80
-    assert report.avg_win_ci_low == pytest.approx(0.22)
-    assert report.avg_loss_ci_high == pytest.approx(0.08)
-    assert report.expectancy_ci_low > 0
-    assert report.verdict == "PAPER_PROMOTION_CANDIDATE"
-    assert report.verdict_reasons == ("all_point_and_confidence_targets_met",)
+    assert report.verdict == "HOLD_UNPROVEN"
+    assert report.target_checks["unselected_sample_size"] is False
+    assert "unselected_sample_size" in report.verdict_reasons
+
+
+def test_missing_unselected_outcomes_cannot_hide_ranking_quality():
+    rows = _ranked_policy_rows()
+    for row in rows:
+        if row["policy_score"] < 94:
+            row["outcome"] = None
+
+    report = evaluate_frozen_policy(
+        rows,
+        policy_version="policy-v1",
+        policy_frozen_at=FROZEN_AT,
+    )
+
+    assert report.eligible_outcome_coverage == pytest.approx(0.70)
+    assert report.verdict == "HOLD_DATA_QUALITY"
+    assert report.target_checks["eligible_outcome_coverage"] is False
+
+
+def test_invalid_scores_cannot_be_hidden_outside_selected_set():
+    rows = _ranked_policy_rows()
+    for row in rows[-21:]:
+        row["eligible"] = False
+        row["features"]["score_valid"] = False
+
+    report = evaluate_frozen_policy(
+        rows,
+        policy_version="policy-v1",
+        policy_frozen_at=FROZEN_AT,
+    )
+
+    assert report.score_validity_coverage == pytest.approx(379 / 400)
+    assert report.verdict == "HOLD_DATA_QUALITY"
+    assert report.target_checks["score_validity_coverage"] is False
 
 
 def test_sufficient_sample_that_misses_loss_target_is_held():

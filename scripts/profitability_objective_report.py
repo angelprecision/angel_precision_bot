@@ -16,10 +16,12 @@ from ap.profitability_objective import (  # noqa: E402
     ProfitabilityDataError,
     ProfitabilityTargets,
     evaluate_frozen_policy,
+    opportunity_mapping_from_intelligence_snapshot,
+    opportunity_mapping_from_trade_dossier,
 )
 
 
-def _read_jsonl(path: Path) -> list[dict]:
+def _read_jsonl(path: Path, source_format: str = "auto") -> list[dict]:
     if not path.is_file():
         raise ProfitabilityDataError(f"source JSONL not found: {path}")
     rows: list[dict] = []
@@ -36,6 +38,25 @@ def _read_jsonl(path: Path) -> list[dict]:
                 ) from exc
             if not isinstance(row, dict):
                 raise ProfitabilityDataError(f"line {line_number} must contain a JSON object")
+            detected = source_format
+            if detected == "auto":
+                if {"opportunity_id", "policy_score", "features"}.issubset(row):
+                    detected = "opportunity"
+                elif isinstance(row.get("dossier"), dict) and "intelligence_score" in row["dossier"]:
+                    detected = "trade-dossier"
+                elif "intelligence_score" in row or (
+                    isinstance(row.get("payload"), dict)
+                    and "intelligence_score" in row["payload"]
+                ):
+                    detected = "intelligence-snapshot"
+                else:
+                    raise ProfitabilityDataError(
+                        f"line {line_number} source format could not be detected"
+                    )
+            if detected == "intelligence-snapshot":
+                row = opportunity_mapping_from_intelligence_snapshot(row)
+            elif detected == "trade-dossier":
+                row = opportunity_mapping_from_trade_dossier(row)
             rows.append(row)
     if not rows:
         raise ProfitabilityDataError("source JSONL contains no opportunity rows")
@@ -47,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         description="Evaluate frozen top-5-to-7 policy evidence without changing trading behavior"
     )
     parser.add_argument("--source", required=True, type=Path, help="Strict opportunity JSONL")
+    parser.add_argument(
+        "--source-format",
+        choices=("auto", "opportunity", "intelligence-snapshot", "trade-dossier"),
+        default="auto",
+        help="Input row shape; auto accepts canonical snapshot and dossier exports",
+    )
     parser.add_argument("--policy-version", required=True)
     parser.add_argument(
         "--policy-frozen-at",
@@ -60,6 +87,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-sessions", type=int, default=20)
     parser.add_argument("--min-resolved", type=int, default=100)
     parser.add_argument("--min-outcome-coverage", type=float, default=0.95)
+    parser.add_argument("--min-score-coverage", type=float, default=0.95)
+    parser.add_argument("--min-resolved-unselected", type=int, default=100)
     args = parser.parse_args(argv)
 
     try:
@@ -70,9 +99,11 @@ def main(argv: list[str] | None = None) -> int:
             min_holdout_sessions=args.min_sessions,
             min_resolved_trades=args.min_resolved,
             min_outcome_coverage=args.min_outcome_coverage,
+            min_score_coverage=args.min_score_coverage,
+            min_resolved_unselected=args.min_resolved_unselected,
         )
         report = evaluate_frozen_policy(
-            _read_jsonl(args.source),
+            _read_jsonl(args.source, args.source_format),
             policy_version=args.policy_version,
             policy_frozen_at=args.policy_frozen_at,
             targets=targets,

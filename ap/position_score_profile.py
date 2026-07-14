@@ -14,6 +14,15 @@ from ap.vwap_context import score_vwap_context
 
 PROFILE_VERSION = "position_score_profile_v1_observe_only"
 
+_UPSTREAM_MAX_SCORES = {
+    "sector_context": 5.0,
+    "volume_confirmation": 10.0,
+    "vwap_context": 10.0,
+    "fair_value_gap": 15.0,
+    "the_strat_confluence": 18.0,
+    "trigger_geometry": 10.0,
+}
+
 
 def _f(v: Any) -> float | None:
     try:
@@ -32,6 +41,30 @@ def _fold(components: dict[str, ScoreComponent], missing: list[str], blocks: lis
     missing.extend(result.get("missing_data", []))
     blocks.extend(result.get("block_recommendations", []))
     return component
+
+
+def _upstream_or_run(ctx: dict[str, Any], name: str, fallback) -> dict[str, Any]:
+    """Use the already-evaluated module result instead of scoring it twice."""
+
+    upstream = ctx.get("_intelligence_upstream")
+    entry = upstream.get(name) if isinstance(upstream, dict) else None
+    if not isinstance(entry, dict) or not entry.get("provided"):
+        return fallback()
+    raw = entry.get("raw")
+    if isinstance(raw, dict):
+        return dict(raw)
+    available = bool(entry.get("available"))
+    score = _f(entry.get("score")) if available else None
+    reason = entry.get("error") or entry.get("missing_reason") or "upstream_result_unavailable"
+    return {
+        "score": score or 0.0,
+        "max_score": _UPSTREAM_MAX_SCORES[name],
+        "status": "ok" if score is not None else "missing_data",
+        "missing_data": [] if score is not None else [f"{name}:{reason}"],
+        "block_recommendations": [],
+        "warnings": [str(reason)] if reason else [],
+        "diagnostics": {"source": "intelligence_upstream", "available": available},
+    }
 
 
 def build_position_score_profile(signal: dict[str, Any], market_context: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -68,21 +101,40 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
     diagnostics = {"observe_only": True, "live_behavior_changed": False, "score_source": "diagnostic_position_profile"}
 
     components["scanner_quality"] = _score_scanner_quality(sig)
-    _fold(components, missing, blocks, "trigger_geometry", score_trigger_geometry(sig, side), "trigger geometry")
+    _fold(
+        components, missing, blocks, "trigger_geometry",
+        _upstream_or_run(ctx, "trigger_geometry", lambda: score_trigger_geometry(sig, side)),
+        "trigger geometry",
+    )
     opportunity = _fold(components, missing, blocks, "remaining_opportunity", score_remaining_opportunity(sig, side), "remaining opportunity")
 
-    htf = evaluate_higher_timeframe_confluence(sig, ctx)
+    htf = _upstream_or_run(
+        ctx, "the_strat_confluence",
+        lambda: evaluate_higher_timeframe_confluence(sig, ctx),
+    )
     _fold(components, missing, blocks, "higher_timeframe_confluence", htf, "monthly/weekly/daily/4h confluence")
-    fvg = evaluate_fvg_context(sig, ctx)
+    fvg = _upstream_or_run(ctx, "fair_value_gap", lambda: evaluate_fvg_context(sig, ctx))
     _fold(components, missing, blocks, "fair_value_gap", fvg, "4h/daily FVG context")
 
     stacking = _score_price_stacking(sig, ctx, htf, fvg)
     components["price_stacking"] = stacking
     missing.extend(stacking.details.get("missing_data", []))
 
-    volume = _fold(components, missing, blocks, "volume_confirmation", score_volume_confirmation(sig, ctx), "relative/breakout volume confirmation")
-    _fold(components, missing, blocks, "vwap_context", score_vwap_context(sig, ctx), "VWAP alignment and chop-zone diagnostics")
-    _fold(components, missing, blocks, "sector_context", score_sector_context(sig, ctx), "sector and broad-market direction diagnostics")
+    volume = _fold(
+        components, missing, blocks, "volume_confirmation",
+        _upstream_or_run(ctx, "volume_confirmation", lambda: score_volume_confirmation(sig, ctx)),
+        "relative/breakout volume confirmation",
+    )
+    _fold(
+        components, missing, blocks, "vwap_context",
+        _upstream_or_run(ctx, "vwap_context", lambda: score_vwap_context(sig, ctx)),
+        "VWAP alignment and chop-zone diagnostics",
+    )
+    _fold(
+        components, missing, blocks, "sector_context",
+        _upstream_or_run(ctx, "sector_context", lambda: score_sector_context(sig, ctx)),
+        "sector and broad-market direction diagnostics",
+    )
 
     contract = _score_contract_execution_quality(sig)
     components["contract_execution_quality"] = contract
@@ -182,7 +234,7 @@ def _bonus_points(htf, fvg, opportunity, volume):
     points, reasons = 0.0, []
     if {"monthly", "weekly", "daily"}.issubset(set(htf.get("aligned_timeframes") or [])): points += 5; reasons.append("monthly_weekly_daily_aligned")
     if (fvg.get("diagnostics") or {}).get("aligned_support_or_resistance") and not (fvg.get("diagnostics") or {}).get("entry_inside_opposing_fvg"): points += 5; reasons.append("clean_aligned_fvg")
-    if (volume.details.get("diagnostics") or {}).get("relative_volume", 0) >= CONFIG.relative_volume_strong: points += 5; reasons.append("volume_thrust")
+    if (_f((volume.details.get("diagnostics") or {}).get("relative_volume")) or 0.0) >= CONFIG.relative_volume_strong: points += 5; reasons.append("volume_thrust")
     if opportunity.details.get("remaining_r") is not None and opportunity.details["remaining_r"] >= 2: points += 5; reasons.append("two_r_or_better_remaining")
     return min(20, points), reasons
 

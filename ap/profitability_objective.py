@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from statistics import mean, stdev
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 
 class ProfitabilityDataError(ValueError):
@@ -42,6 +43,8 @@ _LEAKAGE_TOKENS = {
     "win_flag",
 }
 
+_MARKET_TZ = ZoneInfo("America/New_York")
+
 
 @dataclass(frozen=True)
 class ProfitabilityTargets:
@@ -61,6 +64,8 @@ class ProfitabilityTargets:
     min_holdout_sessions: int = 20
     min_resolved_trades: int = 100
     min_outcome_coverage: float = 0.95
+    min_score_coverage: float = 0.95
+    min_resolved_unselected: int = 100
     confidence_z: float = 1.959963984540054
 
     def __post_init__(self) -> None:
@@ -76,6 +81,10 @@ class ProfitabilityTargets:
             raise ProfitabilityDataError("minimum evidence sizes must be positive")
         if not 0 < self.min_outcome_coverage <= 1:
             raise ProfitabilityDataError("min_outcome_coverage must be in (0, 1]")
+        if not 0 < self.min_score_coverage <= 1:
+            raise ProfitabilityDataError("min_score_coverage must be in (0, 1]")
+        if self.min_resolved_unselected < 1:
+            raise ProfitabilityDataError("min_resolved_unselected must be positive")
         if self.confidence_z <= 0:
             raise ProfitabilityDataError("confidence_z must be positive")
 
@@ -104,6 +113,8 @@ class DailySelection:
     session_date: date
     source_count: int
     eligible_count: int
+    source: tuple[Opportunity, ...]
+    ranked_eligible: tuple[Opportunity, ...]
     selected: tuple[Opportunity, ...]
 
     @property
@@ -122,6 +133,21 @@ class ProfitabilityReport:
     resolved_trades: int
     unresolved_trades: int
     outcome_coverage: float | None
+    valid_score_opportunities: int
+    score_validity_coverage: float | None
+    resolved_eligible_opportunities: int
+    unresolved_eligible_opportunities: int
+    eligible_outcome_coverage: float | None
+    resolved_unselected_opportunities: int
+    unselected_win_rate: float | None
+    unselected_win_rate_ci_high: float | None
+    unselected_expectancy_pct: float | None
+    unselected_expectancy_ci_high: float | None
+    selected_win_rate_lift: float | None
+    selected_win_rate_lift_ci_low: float | None
+    selected_expectancy_lift_pct: float | None
+    selected_expectancy_lift_ci_low: float | None
+    score_return_correlation: float | None
     wins: int
     losses: int
     breakeven: int
@@ -201,6 +227,105 @@ def _leakage_paths(value: Any, prefix: str = "features") -> list[str]:
         for index, child in enumerate(value):
             found.extend(_leakage_paths(child, f"{prefix}[{index}]"))
     return found
+
+
+def opportunity_mapping_from_intelligence_score(
+    score: Mapping[str, Any],
+    *,
+    session_date: Any = None,
+    outcome: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convert one canonical pre-entry score into the strict evaluator row."""
+
+    if not isinstance(score, Mapping):
+        raise ProfitabilityDataError("intelligence_score must be an object")
+    identity = score.get("identity")
+    if not isinstance(identity, Mapping):
+        raise ProfitabilityDataError("intelligence_score.identity must be an object")
+    canonical_id = str(
+        identity.get("canonical_signal_id") or identity.get("opportunity_id") or ""
+    ).strip()
+    client_id = str(identity.get("client_id") or "").strip()
+    execution_mode = str(identity.get("execution_mode") or "").strip().upper()
+    if not canonical_id:
+        raise ProfitabilityDataError("intelligence_score canonical identity is required")
+    if not client_id:
+        raise ProfitabilityDataError("intelligence_score client identity is required")
+    if not execution_mode:
+        raise ProfitabilityDataError("intelligence_score execution mode is required")
+    observed_at = _aware_datetime(score.get("scored_at"), "intelligence_score.scored_at")
+    market_session = (
+        _session_date(session_date)
+        if session_date is not None
+        else observed_at.astimezone(_MARKET_TZ).date()
+    )
+    policy_score = score.get("policy_score")
+    valid = bool(score.get("score_valid"))
+    normalized_score = _finite_number(
+        policy_score if valid and policy_score is not None else 0.0,
+        "intelligence_score.policy_score",
+    )
+    features = {
+        "score_version": score.get("score_version"),
+        "score_config_hash": score.get("score_config_hash"),
+        "raw_profile_score": score.get("raw_profile_score"),
+        "raw_profile_score_max": score.get("raw_profile_score_max"),
+        "score_valid": valid,
+        "evidence_coverage": score.get("evidence_coverage"),
+        "unavailable_components": list(score.get("unavailable_components") or []),
+        "invalid_reasons": list(score.get("invalid_reasons") or []),
+        "block_recommendations": list(score.get("block_recommendations") or []),
+        "warnings": list(score.get("warnings") or []),
+        "components": dict(score.get("components") or {}),
+        "ticker": identity.get("ticker"),
+        "side": identity.get("side"),
+        "execution_mode": execution_mode,
+        "data_as_of": score.get("data_as_of"),
+        "score_input_hash": score.get("input_hash"),
+        "score_source": score.get("source"),
+    }
+    return {
+        "opportunity_id": "|".join((canonical_id, client_id, execution_mode)),
+        "client_id": client_id,
+        "session_date": market_session.isoformat(),
+        "observed_at": observed_at.isoformat(),
+        "policy_version": str(score.get("policy_version") or ""),
+        "policy_score": normalized_score,
+        "eligible": bool(valid and score.get("eligible_for_ranking")),
+        "features": features,
+        "outcome": dict(outcome) if isinstance(outcome, Mapping) else None,
+    }
+
+
+def opportunity_mapping_from_intelligence_snapshot(
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Convert a durable intelligence snapshot export without hand-copying fields."""
+
+    if not isinstance(snapshot, Mapping):
+        raise ProfitabilityDataError("intelligence snapshot must be an object")
+    payload = snapshot.get("payload") if isinstance(snapshot.get("payload"), Mapping) else snapshot
+    score = payload.get("intelligence_score") if isinstance(payload, Mapping) else None
+    return opportunity_mapping_from_intelligence_score(
+        score,
+        session_date=snapshot.get("session_date") or payload.get("session_date"),
+        outcome=snapshot.get("outcome"),
+    )
+
+
+def opportunity_mapping_from_trade_dossier(dossier: Mapping[str, Any]) -> dict[str, Any]:
+    """Convert a trade-dossier export using its attached canonical score."""
+
+    if not isinstance(dossier, Mapping):
+        raise ProfitabilityDataError("trade dossier must be an object")
+    payload = dossier.get("dossier")
+    if not isinstance(payload, Mapping):
+        raise ProfitabilityDataError("trade dossier payload is required")
+    return opportunity_mapping_from_intelligence_score(
+        payload.get("intelligence_score"),
+        session_date=dossier.get("trade_date"),
+        outcome=dossier.get("outcome"),
+    )
 
 
 def opportunity_from_mapping(row: Mapping[str, Any]) -> Opportunity:
@@ -321,6 +446,8 @@ def select_frozen_policy_candidates(
                 session_date=session,
                 source_count=len(group),
                 eligible_count=len(ranked),
+                source=tuple(sorted(group, key=lambda item: (item.observed_at, item.opportunity_id))),
+                ranked_eligible=tuple(ranked),
                 selected=selected,
             )
         )
@@ -346,6 +473,22 @@ def _mean_interval(values: Sequence[float], z: float) -> tuple[float | None, flo
         return center, None, None
     margin = z * stdev(values) / math.sqrt(len(values))
     return center, center - margin, center + margin
+
+
+def _correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
+    if len(left) != len(right) or len(left) < 2:
+        return None
+    left_mean = mean(left)
+    right_mean = mean(right)
+    left_delta = [value - left_mean for value in left]
+    right_delta = [value - right_mean for value in right]
+    denominator = math.sqrt(
+        sum(value * value for value in left_delta)
+        * sum(value * value for value in right_delta)
+    )
+    if denominator == 0:
+        return None
+    return sum(a * b for a, b in zip(left_delta, right_delta)) / denominator
 
 
 def evaluate_profitability(
@@ -378,6 +521,60 @@ def evaluate_profitability(
     underfilled = sum(1 for count in selected_counts if count < cfg.min_daily_selections)
     source_count = sum(source_counts)
     eligible_count = sum(batch.eligible_count for batch in selections)
+    source_opportunities = [item for batch in selections for item in batch.source]
+    eligible_opportunities = [item for batch in selections for item in batch.ranked_eligible]
+    selected_ids = {item.opportunity_id for item in selected}
+    resolved_eligible = [item for item in eligible_opportunities if item.resolved]
+    resolved_unselected = [
+        item for item in resolved_eligible if item.opportunity_id not in selected_ids
+    ]
+    unselected_returns = [
+        float(item.outcome_return_pct)
+        for item in resolved_unselected
+        if item.outcome_return_pct is not None
+    ]
+    unselected_wins = sum(1 for value in unselected_returns if value > 0)
+    unselected_win_rate = (
+        unselected_wins / len(unselected_returns) if unselected_returns else None
+    )
+    _unselected_win_low, unselected_win_high = _wilson_interval(
+        unselected_wins, len(unselected_returns), cfg.confidence_z
+    )
+    unselected_expectancy, _unselected_expectancy_low, unselected_expectancy_high = (
+        _mean_interval(unselected_returns, cfg.confidence_z)
+    )
+    selected_win_rate_lift = (
+        win_rate - unselected_win_rate
+        if win_rate is not None and unselected_win_rate is not None
+        else None
+    )
+    selected_expectancy_lift = (
+        expectancy - unselected_expectancy
+        if expectancy is not None and unselected_expectancy is not None
+        else None
+    )
+    selected_win_rate_lift_low = (
+        win_low - unselected_win_high
+        if win_low is not None and unselected_win_high is not None
+        else None
+    )
+    selected_expectancy_lift_low = (
+        expectancy_low - unselected_expectancy_high
+        if expectancy_low is not None and unselected_expectancy_high is not None
+        else None
+    )
+    score_return_correlation = _correlation(
+        [item.policy_score for item in resolved_eligible],
+        [float(item.outcome_return_pct) for item in resolved_eligible if item.outcome_return_pct is not None],
+    )
+    valid_score_count = sum(
+        1 for item in source_opportunities
+        if item.features.get("score_valid", True) is not False
+    )
+    score_validity_coverage = valid_score_count / source_count if source_count else None
+    eligible_outcome_coverage = (
+        len(resolved_eligible) / eligible_count if eligible_count else None
+    )
     enough_data = sessions >= cfg.min_holdout_sessions and len(resolved) >= cfg.min_resolved_trades
     outcome_coverage = len(resolved) / len(selected) if selected else None
 
@@ -386,6 +583,32 @@ def evaluate_profitability(
         "outcome_coverage": (
             outcome_coverage is not None
             and outcome_coverage >= cfg.min_outcome_coverage
+        ),
+        "score_validity_coverage": (
+            score_validity_coverage is not None
+            and score_validity_coverage >= cfg.min_score_coverage
+        ),
+        "eligible_outcome_coverage": (
+            eligible_outcome_coverage is not None
+            and eligible_outcome_coverage >= cfg.min_outcome_coverage
+        ),
+        "unselected_sample_size": (
+            len(resolved_unselected) >= cfg.min_resolved_unselected
+        ),
+        "positive_win_rate_lift": (
+            selected_win_rate_lift is not None and selected_win_rate_lift > 0
+        ),
+        "positive_expectancy_lift": (
+            selected_expectancy_lift is not None and selected_expectancy_lift > 0
+        ),
+        "confidence_positive_win_rate_lift": (
+            selected_win_rate_lift_low is not None and selected_win_rate_lift_low > 0
+        ),
+        "confidence_positive_expectancy_lift": (
+            selected_expectancy_lift_low is not None and selected_expectancy_lift_low > 0
+        ),
+        "positive_score_return_correlation": (
+            score_return_correlation is not None and score_return_correlation > 0
         ),
         "daily_selection_cap": all(count <= cfg.max_daily_selections for count in selected_counts),
         "observed_win_rate": win_rate is not None and win_rate >= cfg.target_win_rate,
@@ -419,21 +642,60 @@ def evaluate_profitability(
             reasons.append(f"holdout_sessions_{sessions}_below_{cfg.min_holdout_sessions}")
         if len(resolved) < cfg.min_resolved_trades:
             reasons.append(f"resolved_trades_{len(resolved)}_below_{cfg.min_resolved_trades}")
-    elif not checks["outcome_coverage"]:
+    elif not (
+        checks["outcome_coverage"]
+        and checks["score_validity_coverage"]
+        and checks["eligible_outcome_coverage"]
+    ):
         verdict = "HOLD_DATA_QUALITY"
-        reasons.append(
-            f"outcome_coverage_{(outcome_coverage or 0):.4f}_below_"
-            f"{cfg.min_outcome_coverage:.4f}"
-        )
+        if not checks["outcome_coverage"]:
+            reasons.append(
+                f"outcome_coverage_{(outcome_coverage or 0):.4f}_below_"
+                f"{cfg.min_outcome_coverage:.4f}"
+            )
+        if not checks["score_validity_coverage"]:
+            reasons.append(
+                f"score_validity_coverage_{(score_validity_coverage or 0):.4f}_below_"
+                f"{cfg.min_score_coverage:.4f}"
+            )
+        if not checks["eligible_outcome_coverage"]:
+            reasons.append(
+                f"eligible_outcome_coverage_{(eligible_outcome_coverage or 0):.4f}_below_"
+                f"{cfg.min_outcome_coverage:.4f}"
+            )
     elif not all(point_checks):
         verdict = "HOLD_TARGET_MISSED"
         reasons.extend(name for name, passed in checks.items() if name.startswith("observed_") and not passed)
     elif not all(confidence_checks):
         verdict = "HOLD_UNPROVEN"
         reasons.extend(name for name, passed in checks.items() if name.startswith("confidence_") and not passed)
+    elif not all(
+        checks[name]
+        for name in (
+            "unselected_sample_size",
+            "positive_win_rate_lift",
+            "positive_expectancy_lift",
+            "confidence_positive_win_rate_lift",
+            "confidence_positive_expectancy_lift",
+            "positive_score_return_correlation",
+        )
+    ):
+        verdict = "HOLD_UNPROVEN"
+        reasons.extend(
+            name
+            for name in (
+                "unselected_sample_size",
+                "positive_win_rate_lift",
+                "positive_expectancy_lift",
+                "confidence_positive_win_rate_lift",
+                "confidence_positive_expectancy_lift",
+                "positive_score_return_correlation",
+            )
+            if not checks[name]
+        )
     else:
         verdict = "PAPER_PROMOTION_CANDIDATE"
-        reasons.append("all_point_and_confidence_targets_met")
+        reasons.append("all_target_confidence_and_ranking_checks_met")
 
     if underfilled:
         reasons.append(f"underfilled_sessions_{underfilled}")
@@ -448,6 +710,21 @@ def evaluate_profitability(
         resolved_trades=len(resolved),
         unresolved_trades=len(selected) - len(resolved),
         outcome_coverage=outcome_coverage,
+        valid_score_opportunities=valid_score_count,
+        score_validity_coverage=score_validity_coverage,
+        resolved_eligible_opportunities=len(resolved_eligible),
+        unresolved_eligible_opportunities=eligible_count - len(resolved_eligible),
+        eligible_outcome_coverage=eligible_outcome_coverage,
+        resolved_unselected_opportunities=len(resolved_unselected),
+        unselected_win_rate=unselected_win_rate,
+        unselected_win_rate_ci_high=unselected_win_high,
+        unselected_expectancy_pct=unselected_expectancy,
+        unselected_expectancy_ci_high=unselected_expectancy_high,
+        selected_win_rate_lift=selected_win_rate_lift,
+        selected_win_rate_lift_ci_low=selected_win_rate_lift_low,
+        selected_expectancy_lift_pct=selected_expectancy_lift,
+        selected_expectancy_lift_ci_low=selected_expectancy_lift_low,
+        score_return_correlation=score_return_correlation,
         wins=len(wins),
         losses=len(losses),
         breakeven=breakeven,

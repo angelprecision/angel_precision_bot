@@ -12,7 +12,7 @@ from typing import Any, Optional
 PHASES = {"PRETRIGGER", "PREOPEN", "BREACH", "CONTRACT_SELECTED"}
 SNAPSHOT_STATUSES = {"COMPLETE", "PARTIAL", "STALE", "UNAVAILABLE", "ERROR"}
 JOB_STATUSES = {"PENDING", "RUNNING", "RETRY_PENDING", "COMPLETED", "FAILED_TERMINAL"}
-DEFAULT_PROFILE_VERSION = "intelligence_context_v1_observe_only"
+DEFAULT_PROFILE_VERSION = "intelligence_context_v2_canonical_score_observe_only"
 
 _MEMORY_JOBS: dict[str, dict[str, Any]] = {}
 _MEMORY_SNAPSHOTS: dict[str, dict[str, Any]] = {}

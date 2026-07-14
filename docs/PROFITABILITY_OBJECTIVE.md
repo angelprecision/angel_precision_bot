@@ -36,20 +36,55 @@ The report preserves both `source_opportunities` and `eligible_opportunities`
 so the operator can compare the evaluated population with the scanner's daily
 source count and detect a hand-picked or incomplete export.
 
+Score validity must cover at least 95% of the frozen source population, and
+resolved outcomes must cover at least 95% of all eligible opportunities—not
+only the selected trades. The report compares selected and unselected win rate
+and expectancy, requires at least 100 resolved unselected controls, and records
+score/return correlation. Conservative confidence bounds for both win-rate and
+expectancy lift must remain positive. This proves ranking lift instead of merely
+describing the trades the policy happened to choose.
+
 The bot should continue capturing rejected and unselected candidates through
 the existing counterfactual and dossier paths. The 5-7 cap controls client
 exposure, not research visibility.
+
+## Canonical intelligence score
+
+The ranking input is now `ap.intelligence_score`, not the dossier's separate
+case-quality grade and not the scanner's raw score. The score contract is:
+
+- detailed position-profile output remains on its diagnostic 0-120 scale;
+- `policy_score` is normalized to a strict 0-100 scale;
+- the formula, raw denominator, evidence threshold, and required components
+  are versioned and hashed into `policy_version`;
+- scanner quality, trigger geometry, and remaining opportunity must be
+  available, and weighted component coverage must be at least 70%;
+- invalid or under-covered scores remain in the source population with
+  `eligible=false` and `policy_score=0` when converted for evaluation;
+- block recommendations make a score ineligible for research ranking;
+- every score carries account/mode/opportunity identity, `scored_at`,
+  `data_as_of`, input hash, config hash, source, and git commit.
+
+The queue's existing observe-only PRETRIGGER intelligence handoff creates this
+score inside each durable intelligence snapshot. That is the population path
+for measuring the scanner stream. Trade dossiers reuse the matching durable
+score when it is already available; their fallback score is marked with its
+own source and remains fail-closed if evidence is incomplete. None of these
+fields participate in production admission or broker behavior.
 
 ## Promotion verdicts
 
 - `NOT_ENOUGH_DATA`: fewer than 20 holdout account-sessions or 100 resolved
   selected trades.
-- `HOLD_DATA_QUALITY`: fewer than 95% of selected trades have resolved outcomes.
+- `HOLD_DATA_QUALITY`: selected or eligible outcome coverage is below 95%, or
+  valid scores cover less than 95% of the frozen source population.
 - `HOLD_TARGET_MISSED`: enough data, but at least one observed target misses.
-- `HOLD_UNPROVEN`: observed targets pass, but 95% confidence bounds do not.
-- `PAPER_PROMOTION_CANDIDATE`: point targets and conservative confidence bounds
-  pass. This is permission for reviewed paper testing only, never automatic live
-  enablement.
+- `HOLD_UNPROVEN`: observed targets pass, but confidence bounds or ranking-lift
+  evidence do not.
+- `PAPER_PROMOTION_CANDIDATE`: point targets, conservative confidence bounds,
+  full-population data quality, and positive selected-vs-unselected ranking
+  evidence pass. This is permission for reviewed paper testing only, never
+  automatic live enablement.
 
 An observed 80% win rate over 100 trades normally remains `HOLD_UNPROVEN`
 because its lower confidence bound is below 80%. This is intentional.
@@ -88,6 +123,22 @@ python3 scripts/profitability_objective_report.py \
   --policy-version ap-ranker-v1 \
   --policy-frozen-at 2026-07-13T20:00:00+00:00
 ```
+
+The report command also accepts JSONL exports of intelligence snapshots or
+trade dossiers directly. It detects their shape automatically, or the format
+can be explicit:
+
+```bash
+python3 scripts/profitability_objective_report.py \
+  --source pretrigger_snapshot_export.jsonl \
+  --source-format intelligence-snapshot \
+  --policy-version intelligence_policy_score_v1_observe_only:<config-hash> \
+  --policy-frozen-at 2026-07-13T20:00:00+00:00
+```
+
+The snapshot row must contain either `intelligence_score` or
+`payload.intelligence_score`. An outcome, when later known, stays in the
+separate top-level `outcome` object.
 
 No code in this contract changes admission, watcher ownership, contract
 selection, order submission, position sizing, stops, targets, or exits.
