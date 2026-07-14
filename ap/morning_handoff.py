@@ -1044,7 +1044,12 @@ def run_morning_handoff_audit(
 
     can_skip_existing = bool(existing and str(existing.get("status") or "").lower() == "success" and existing.get("last_success_at"))
     if can_skip_existing and stage == "startup" and not dry_run:
-        if _has_unowned_pending_trigger_orders(client_id, entry_watcher, now=now):
+        if mode == "paper":
+            # Paper fan-out is idempotent and must run after every process
+            # restart. A prior success may predate newly-created shared signals
+            # or may contain no durable enqueue evidence from older code.
+            can_skip_existing = False
+        elif _has_unowned_pending_trigger_orders(client_id, entry_watcher, now=now):
             can_skip_existing = False
     if can_skip_existing:
         return {
@@ -1149,12 +1154,11 @@ def run_morning_handoff_audit(
         ok = False
         error = ",".join(warnings)
     elif not dry_run:
-        try:
-            # PR #183 final amendment: fanout is PAPER-ONLY.
-            # Live (Jason) already has trade_queue WATCHING rows written by
-            # overnight_reeval. Running fanout for live would create duplicate
-            # rows from shared/paper-origin ap_signals. Do not run for live.
-            if mode == "paper" and stage in ("post_overnight_reeval", "manual"):
+        # Fan-out and durable watcher recovery are independent. A temporary
+        # failure while discovering new paper signals must remain visible, but
+        # it must never strand PENDING_TRIGGER work that already exists.
+        if mode == "paper" and stage in ("startup", "post_overnight_reeval", "manual"):
+            try:
                 enqueue_result = enqueue_watching_signals_to_trade_queue(
                     target_client_id=client_id,
                     execution_mode=mode,
@@ -1162,36 +1166,44 @@ def run_morning_handoff_audit(
                     dry_run=False,
                     now=now,
                 )
-                # Any enqueue error fails the handoff visibly in paper mode.
-                # member_not_found_in_pod, paper_credentials_missing,
-                # fetch_watching_signals_failed:*, insert_error:* all abort.
+                # Enqueue errors fail the audit visibly without suppressing
+                # recovery of previously durable watcher work.
                 if enqueue_result.get("errors"):
                     ok = False
-                    error = enqueue_result["errors"][0]
+                    error = str(enqueue_result["errors"][0])
                     log.error(
                         "morning_handoff enqueue failed client=%s stage=%s errors=%s",
                         client_id, stage, enqueue_result["errors"],
                     )
-
-            if ok:
-                from ap_recovery import APStartupRecovery
-
-                recovery = APStartupRecovery(
-                    client_id=client_id,
-                    broker=broker,
-                    osm=osm,
-                    pm=pm,
-                    master_control=mc,
-                    exit_engine=exit_engine,
-                    entry_watcher=entry_watcher,
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                error = str(exc)
+                enqueue_result = {"errors": [f"enqueue_exception:{exc}"]}
+                log.error(
+                    "morning_handoff enqueue exception client=%s execution_mode=%s stage=%s err=%s",
+                    client_id, mode, stage, exc, exc_info=True,
                 )
-                recovery._reseed_watchers(recovery_result)
+
+        try:
+            from ap_recovery import APStartupRecovery
+
+            recovery = APStartupRecovery(
+                client_id=client_id,
+                broker=broker,
+                osm=osm,
+                pm=pm,
+                master_control=mc,
+                exit_engine=exit_engine,
+                entry_watcher=entry_watcher,
+            )
+            recovery._reseed_watchers(recovery_result)
         except Exception as exc:  # noqa: BLE001
             ok = False
-            error = str(exc)
+            if error is None:
+                error = str(exc)
             recovery_result.setdefault("errors", []).append(str(exc))
             log.error(
-                "morning_handoff failed client=%s execution_mode=%s stage=%s err=%s",
+                "morning_handoff recovery failed client=%s execution_mode=%s stage=%s err=%s",
                 client_id, mode, stage, exc, exc_info=True,
             )
 
