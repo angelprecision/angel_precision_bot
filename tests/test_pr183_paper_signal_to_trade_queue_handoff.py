@@ -523,7 +523,15 @@ def test_normalize_strips_chr10_chr13_chr9():
 from ap.morning_handoff import run_morning_handoff_audit
 
 
-def _run_handoff_audit(mode, stage, enqueue_result=None, enqueue_raises=False):
+def _run_handoff_audit(
+    mode,
+    stage,
+    enqueue_result=None,
+    enqueue_raises=False,
+    *,
+    watchers_requeued=0,
+    recovery_error=None,
+):
     """
     Simulate run_morning_handoff_audit with runner/OSM/watcher patched out.
     enqueue_result: what enqueue_watching_signals_to_trade_queue returns.
@@ -537,7 +545,9 @@ def _run_handoff_audit(mode, stage, enqueue_result=None, enqueue_raises=False):
     fake_runner.core.exit_eng   = MagicMock()
 
     def _fake_recovery_reseed(result_dict):
-        result_dict["watchers_requeued"] = 0
+        if recovery_error:
+            raise RuntimeError(recovery_error)
+        result_dict["watchers_requeued"] = watchers_requeued
 
     with patch("ap.morning_handoff._resolve_runner",        return_value=fake_runner), \
          patch("ap.morning_handoff._ensure_handoff_table"), \
@@ -689,9 +699,11 @@ def test_final_3c_paper_credentials_missing_causes_handoff_ok_false():
         mode="paper",
         stage="post_overnight_reeval",
         enqueue_result=enqueue_err_result,
+        watchers_requeued=2,
     )
     assert result["ok"] is False
     assert result.get("error") == "paper_credentials_missing"
+    assert result["watchers_requeued"] == 2
 
 
 def test_final_3d_insert_error_causes_handoff_ok_false():
@@ -705,18 +717,37 @@ def test_final_3d_insert_error_causes_handoff_ok_false():
         mode="paper",
         stage="post_overnight_reeval",
         enqueue_result=enqueue_err_result,
+        watchers_requeued=3,
     )
     assert result["ok"] is False
+    assert result["watchers_requeued"] == 3
 
 
-def test_final_3e_live_with_no_enqueue_still_succeeds():
+def test_final_3e_enqueue_and_recovery_errors_are_reported_independently():
+    enqueue_err_result = {
+        "errors": ["paper_credentials_missing"],
+        "inserted": [], "skipped_duplicate": [], "rejected": [],
+        "signals_found": 0,
+    }
+    result, _ = _run_handoff_audit(
+        mode="paper",
+        stage="startup",
+        enqueue_result=enqueue_err_result,
+        recovery_error="reseed_failed",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "paper_credentials_missing"
+    assert result["errors"] == ["reseed_failed"]
+
+
+def test_final_3f_live_with_no_enqueue_still_succeeds():
     """Live mode skips enqueue entirely — handoff must still succeed."""
     result, mock_enqueue = _run_handoff_audit(mode="live", stage="post_overnight_reeval")
     mock_enqueue.assert_not_called()
     assert result["ok"] is True
 
 
-def test_final_3f_paper_with_no_errors_still_succeeds():
+def test_final_3g_paper_with_no_errors_still_succeeds():
     """Paper mode with clean enqueue result — handoff succeeds."""
     enqueue_ok_result = {
         "errors": [], "inserted": [{"signal_id": "sig-001", "ticker": "NKE"}],

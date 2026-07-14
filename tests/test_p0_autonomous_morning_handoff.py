@@ -182,6 +182,80 @@ def test_startup_same_day_restart_does_not_skip_when_watcher_ownership_missing(m
     assert reseed_calls == [True]
 
 
+def test_paper_startup_success_lock_without_orders_still_enqueues_and_reseeds(monkeypatch):
+    monkeypatch.setattr(
+        morning_handoff,
+        "_load_handoff_run_lock",
+        lambda **kwargs: {
+            "status": "success",
+            "last_success_at": "2026-06-22T09:25:00-04:00",
+            "details": {"enqueue_result": {}},
+        },
+    )
+    monkeypatch.setattr(morning_handoff, "_upsert_handoff_run_lock", lambda **kwargs: None)
+    monkeypatch.setattr(
+        morning_handoff,
+        "_count_state",
+        lambda client_id: {"watching_rows": 0, "new_rows": 0, "pending_trigger_rows": 0},
+    )
+    monkeypatch.setattr(
+        morning_handoff,
+        "_has_unowned_pending_trigger_orders",
+        lambda *args, **kwargs: False,
+    )
+
+    enqueue_calls = []
+    monkeypatch.setattr(
+        morning_handoff,
+        "enqueue_watching_signals_to_trade_queue",
+        lambda **kwargs: enqueue_calls.append(kwargs) or {
+            "errors": [],
+            "inserted": [{"signal_id": "new-sig"}],
+            "skipped_duplicate": [],
+            "rejected": [],
+            "signals_found": 1,
+        },
+    )
+
+    reseed_calls = []
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def _reseed_watchers(self, result):
+            reseed_calls.append(True)
+            result["watchers_requeued"] = 1
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "ap_recovery", type("_M", (), {"APStartupRecovery": _Recovery}))
+
+    class _Core:
+        broker = object()
+        exit_eng = object()
+        entry_watcher = object()
+
+    class _Runner:
+        order_state_machine = object()
+        position_manager = object()
+        master_control = object()
+        core = _Core()
+
+    result = morning_handoff.run_morning_handoff_audit(
+        client_id="paper@example.com",
+        execution_mode="paper",
+        stage="startup",
+        dry_run=False,
+        runner=_Runner(),
+    )
+
+    assert result["ok"] is True
+    assert not result.get("skipped")
+    assert len(enqueue_calls) == 1
+    assert reseed_calls == [True]
+
+
 def test_missing_osm_is_safe_and_non_crashing(monkeypatch):
     writes = []
 
