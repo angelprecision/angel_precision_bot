@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -993,7 +994,7 @@ def test_fa4_log_file_not_in_branch():
     result = subprocess.run(
         ["git", "ls-files", "logs/signal_ledger.jsonl"],
         capture_output=True, text=True,
-        cwd="/home/claude/angel_precision_bot",
+        cwd=Path(__file__).resolve().parents[1],
     )
     tracked = result.stdout.strip()
     assert not tracked, (
@@ -1175,3 +1176,197 @@ def test_fix2_broker_ready_invalid_plan_retains_without_calling_scaffold():
     assert "broker_ready_recovery_plan_invalid" in errors_str, (
         f"Must record broker_ready_recovery_plan_invalid error; errors={result.get('errors')}"
     )
+
+
+def test_final_materialization_retry_cleanup_never_uses_generic_expire_on_cas_miss():
+    """A fenced materialization retry callback must never fall back to generic
+    pending-entry cleanup when its exact terminal CAS misses.
+    """
+    from ap_execution_core import APExecutionCore
+
+    calls = {"fenced": 0, "expire": 0, "cancel": 0}
+
+    class _OSM:
+        def terminalize_materialization_retry(self, oid, **kw):
+            calls["fenced"] += 1
+            assert kw["owner"] == "retry-owner"
+            assert kw["generation"] == 7
+            assert kw["retry_attempt"] == 3
+            assert kw["client_id"] == CLIENT_ID
+            assert kw["execution_mode"] == "paper"
+            return False
+        def expire_pending_entry(self, *a, **kw):
+            calls["expire"] += 1
+            return True
+        def cancel_pending_entry(self, *a, **kw):
+            calls["cancel"] += 1
+            return True
+        def get_order(self, oid):
+            return {
+                "status": "PENDING_TRIGGER",
+                "broker_order_id": None,
+                "submitted_ts": None,
+                "meta": {
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_owner": "new-owner",
+                    "materialization_generation": 8,
+                    "retry_attempt": 4,
+                },
+            }
+
+    core = object.__new__(APExecutionCore)
+    core.order_state_machine = _OSM()
+    watched = SimpleNamespace(
+        ticker="RTX",
+        signal={
+            "local_order_id": LOCAL_ORDER_ID,
+            "_callback_ownership_context": {
+                "is_recovered": True,
+                "ownership_kind": "materialization_retry",
+                "owner": "retry-owner",
+                "generation": 7,
+                "retry_attempt": 3,
+                "client_id": CLIENT_ID,
+                "execution_mode": "paper",
+            },
+        },
+    )
+
+    ok = core._cleanup_pending_entry_order(
+        watched, action="expire", reason="breach_risk_check_false",
+    )
+
+    assert ok is False
+    assert calls["fenced"] == 1
+    assert calls["expire"] == 0
+    assert calls["cancel"] == 0
+
+
+def test_final_materialization_retry_early_osm_rejection_uses_fenced_terminal():
+    """The early OSM capability rejection path must terminalize with the
+    materialization retry owner/generation/attempt, not generic expire.
+    """
+    from ap_execution_core import APExecutionCore
+
+    calls = {"fenced": 0, "expire": 0}
+
+    class _OSM:
+        def get_order(self, oid):
+            return {
+                "local_order_id": LOCAL_ORDER_ID,
+                "client_id": CLIENT_ID,
+                "execution_mode": "paper",
+                "status": "PENDING_TRIGGER",
+                "broker_order_id": None,
+                "submitted_ts": None,
+                "meta": {
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_status": "RUNNING",
+                    "materialization_in_flight": True,
+                    "materialization_owner": "retry-owner",
+                    "materialization_generation": 7,
+                    "retry_attempt": 3,
+                },
+            }
+        def terminalize_materialization_retry(self, oid, **kw):
+            calls["fenced"] += 1
+            assert kw["reason"] == "osm_missing_submit_existing_entry"
+            assert kw["owner"] == "retry-owner"
+            assert kw["generation"] == 7
+            assert kw["retry_attempt"] == 3
+            return True
+        def expire_pending_entry(self, *a, **kw):
+            calls["expire"] += 1
+            return True
+
+    core = object.__new__(APExecutionCore)
+    core.client_id = CLIENT_ID
+    core.email = CLIENT_ID
+    core.execution_mode = "paper"
+    core.mode = "PAPER"
+    core.order_state_machine = _OSM()
+    core.store = MagicMock()
+    core._breach_risk_check = lambda watched: True
+
+    plan = SimpleNamespace(
+        client_id=CLIENT_ID,
+        execution_mode="paper",
+        metadata={
+            "ownership_kind": "materialization_retry",
+            "contract_deferred": True,
+            "materialization_generation": 7,
+            "retry_attempt": 3,
+            "recovery_submit_fenced": True,
+            "recovery_submit_owner": "retry-owner",
+            "recovery_submit_generation": 7,
+        },
+    )
+    watched = SimpleNamespace(
+        ticker="RTX",
+        trigger_price=130.0,
+        signal={
+            "signal_id": SIGNAL_ID,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "ownership_kind": "materialization_retry",
+            "owner": "retry-owner",
+            "fenced": True,
+            "materialization_generation": 7,
+            "retry_attempt": 3,
+            "recovery_submit_fenced": True,
+            "recovery_submit_owner": "retry-owner",
+            "recovery_submit_generation": 7,
+            "_approved_plan": plan,
+        },
+    )
+
+    core._on_entry_trigger(watched)
+
+    assert calls["fenced"] == 1
+    assert calls["expire"] == 0
+
+
+def test_final_schedule_retry_clears_stale_watcher_token_and_adoption_stamps_new_token():
+    """Scheduling RETRY_WAIT clears the stale token; restart rearm adopts the
+    current process token through an exact RETRY_WAIT CAS.
+    """
+    from ap.order_state_machine import APOrderStateMachine
+
+    patches = []
+    osm = object.__new__(APOrderStateMachine)
+    osm.client_id = CLIENT_ID
+
+    fake_conn = _FakeConn(rowcount=1, patches=patches)
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        ok = osm.schedule_deferred_materialization_retry(
+            LOCAL_ORDER_ID,
+            owner="retry-owner",
+            generation=7,
+            reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            attempt=3,
+            max_attempts=5,
+            next_retry_at="2026-07-14T12:00:00+00:00",
+            selector_failure={"reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED"},
+        )
+
+    assert ok is True
+    assert patches[-1]["watcher_token"] == ""
+
+    patches.clear()
+    fake_conn = _FakeConn(rowcount=1, patches=patches)
+    with patch("ap.order_state_machine.conn", return_value=fake_conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **kw: fn()):
+        adopted = osm.adopt_deferred_retry_watcher(
+            LOCAL_ORDER_ID,
+            watcher_token="watcher:new-process",
+            generation=7,
+            retry_attempt=3,
+            next_retry_at="2026-07-14T12:00:00+00:00",
+            execution_mode="paper",
+        )
+
+    assert adopted is True
+    assert patches[-1]["watcher_token"] == "watcher:new-process"
+    assert patches[-1]["watcher_generation"] == 7

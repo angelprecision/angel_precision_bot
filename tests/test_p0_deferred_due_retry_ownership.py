@@ -786,6 +786,7 @@ def test_spec_acceptance_single_claim_seam():
     claimed_meta = dict(before_meta)
     claimed_meta.update({
         "lifecycle_state": "MATERIALIZING",
+        "materialization_status": "RUNNING",
         "materialization_generation": 2,
         "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
         "materialization_in_flight": True,
@@ -1121,6 +1122,137 @@ def test_amend2_absent_generation_fails_when_expected_provided():
     )
     assert proof["proven"] is False
     assert proof["reason_code"] == "PROOF_GENERATION_MISMATCH"
+
+
+def test_final_malformed_generation_quarantines_first_row_and_second_due_retry_runs():
+    """A malformed counter in one row must not abort the complete recovery
+    sweep. The bad row is retained, and a later valid due row executes.
+    """
+    from unittest.mock import patch
+    from ap import db as db_mod
+    from ap_recovery import APStartupRecovery
+
+    bad = _row()
+    bad["local_order_id"] = "oid-bad-counter"
+    bad["meta"]["materialization_generation"] = "not-an-int"
+
+    good = _row()
+    good["local_order_id"] = "oid-good-counter"
+
+    resume_calls = []
+    mock_core = MagicMock()
+    def _resume(**kw):
+        resume_calls.append(kw["local_order_id"])
+        return {"disposition": "CLAIM_LOST", "reason_code": "test_claim_lost"}
+    mock_core.resume_deferred_materialization_retry.side_effect = _resume
+
+    retained = []
+    class _OSM:
+        client_id = CLIENT_ID
+        def update_order_meta(self, oid, patch):
+            retained.append((oid, patch))
+            return True
+        def get_order(self, oid):
+            return good if oid == "oid-good-counter" else bad
+        def get_orders_for_position(self, *a, **kw): return []
+
+    class _C:
+        rowcount = 2
+        def execute(self, *a, **kw): return self
+        def fetchall(self): return [bad, good]
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=_OSM(),
+        pm=MagicMock(), master_control=SimpleNamespace(mode="PAPER"),
+        exit_engine=None, entry_watcher=None, execution_core=mock_core,
+    )
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    assert resume_calls == ["oid-good-counter"]
+    assert any(oid == "oid-bad-counter" for oid, _ in retained)
+    assert "recovery_malformed_counter:oid-bad-counter:materialization_generation" in str(result["errors"])
+
+
+def test_final_malformed_retry_attempt_during_cas_miss_is_row_local():
+    """A malformed retry_attempt discovered while classifying a fenced CAS miss
+    records a row-local error and the sweep continues to later rows.
+    """
+    from unittest.mock import patch
+    from ap import db as db_mod
+    from ap_recovery import APStartupRecovery
+
+    first = _row()
+    first["local_order_id"] = "oid-cas-malformed"
+    second = _row()
+    second["local_order_id"] = "oid-after-cas-malformed"
+
+    resume_calls = []
+    mock_core = MagicMock()
+    def _resume(local_order_id, **kw):
+        resume_calls.append(local_order_id)
+        if local_order_id == "oid-cas-malformed":
+            return {
+                "disposition": "TERMINAL_REQUIRED",
+                "reason_code": "RETRY_MAX_ATTEMPTS_EXCEEDED",
+                "terminal_status": "EXPIRED",
+                "expected_generation": 1,
+                "expected_prior_retry_attempt": 1,
+                "expected_client_id": CLIENT_ID,
+                "expected_execution_mode": "paper",
+                "expected_lifecycle_state": "RETRY_WAIT",
+                "expected_materialization_status": "RETRY_PENDING",
+                "owner": "owner-cas",
+                "generation": 2,
+            }
+        return {"disposition": "CLAIM_LOST", "reason_code": "test_claim_lost"}
+    mock_core.resume_deferred_materialization_retry.side_effect = _resume
+
+    retained = []
+    class _OSM:
+        client_id = CLIENT_ID
+        def terminalize_deferred_retry_if_unchanged(self, *a, **kw):
+            return False
+        def get_order(self, oid):
+            if oid == "oid-cas-malformed":
+                row = _row()
+                row["local_order_id"] = oid
+                row["meta"]["retry_attempt"] = "bad-attempt"
+                return row
+            return second
+        def update_order_meta(self, oid, patch):
+            retained.append((oid, patch))
+            return True
+        def get_orders_for_position(self, *a, **kw): return []
+
+    class _C:
+        rowcount = 2
+        def execute(self, *a, **kw): return self
+        def fetchall(self): return [first, second]
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=_OSM(),
+        pm=MagicMock(), master_control=SimpleNamespace(mode="PAPER"),
+        exit_engine=None, entry_watcher=None, execution_core=mock_core,
+    )
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    assert resume_calls == ["oid-cas-malformed", "oid-after-cas-malformed"]
+    assert "recovery_malformed_counter:oid-cas-malformed:retry_attempt" in str(result["errors"])
+    assert any(oid == "oid-cas-malformed" for oid, _ in retained)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

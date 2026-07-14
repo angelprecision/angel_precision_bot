@@ -2686,6 +2686,14 @@ class APExecutionCore:
             "_approved_plan": recovered_plan,
             "materialization_retry_owner": owner,
             "materialization_retry_attempt": _expected_attempt,
+            "ownership_kind": "materialization_retry",
+            "owner": owner,
+            "materialization_generation": _new_generation,
+            "retry_attempt": _expected_attempt,
+            "fenced": True,
+            "recovery_submit_fenced": True,
+            "recovery_submit_owner": owner,
+            "recovery_submit_generation": _new_generation,
         }
         watched = SimpleNamespace(
             signal=signal, ticker=ticker, side=direction,
@@ -2971,54 +2979,168 @@ class APExecutionCore:
         _initial_meta = getattr(_initial_plan, "metadata", None) or {}
         if not isinstance(_initial_meta, dict):
             _initial_meta = {}
+        _ownership_kind = str(
+            sig.get("ownership_kind")
+            or _initial_meta.get("ownership_kind")
+            or "broker_ready_recovery"
+        ).strip()
         _is_recovered = bool(
             sig.get("recovery_submit_fenced")
             or _initial_meta.get("recovery_submit_fenced")
+            or sig.get("fenced")
+            or _initial_meta.get("fenced")
         )
         _recovery_owner = str(
             sig.get("recovery_submit_owner")
             or _initial_meta.get("recovery_submit_owner")
+            or sig.get("owner")
+            or _initial_meta.get("owner")
             or ""
         ).strip()
         _recovery_generation_raw = (
             sig.get("recovery_submit_generation")
             if sig.get("recovery_submit_generation") is not None
-            else _initial_meta.get("recovery_submit_generation")
+            else (
+                _initial_meta.get("recovery_submit_generation")
+                if _initial_meta.get("recovery_submit_generation") is not None
+                else (
+                    sig.get("materialization_generation")
+                    if sig.get("materialization_generation") is not None
+                    else _initial_meta.get("materialization_generation")
+                )
+            )
         )
         try:
             _recovery_generation = int(_recovery_generation_raw)
         except (TypeError, ValueError):
             _recovery_generation = None
+        _recovery_attempt_raw = (
+            sig.get("retry_attempt")
+            if sig.get("retry_attempt") is not None
+            else (
+                _initial_meta.get("retry_attempt")
+                if _initial_meta.get("retry_attempt") is not None
+                else (
+                    sig.get("materialization_retry_attempt")
+                    if sig.get("materialization_retry_attempt") is not None
+                    else _initial_meta.get("materialization_retry_attempt")
+                )
+            )
+        )
+        try:
+            _recovery_attempt = int(_recovery_attempt_raw)
+        except (TypeError, ValueError):
+            _recovery_attempt = None
         _callback_mode = str(
             sig.get("execution_mode")
             or getattr(_initial_plan, "execution_mode", None)
             or getattr(self, "execution_mode", None)
             or ""
         ).strip().lower()
+        _callback_client_id = str(
+            sig.get("client_id")
+            or getattr(_initial_plan, "client_id", None)
+            or getattr(self, "client_id", None)
+            or getattr(self, "email", None)
+            or ""
+        ).strip().lower()
         _callback_local_order_id = str(sig.get("local_order_id") or "").strip()
         _ownership_context = MappingProxyType({
             "is_recovered": _is_recovered,
+            "ownership_kind": _ownership_kind,
+            "local_order_id": _callback_local_order_id,
+            "client_id": _callback_client_id,
+            "fenced": bool(_is_recovered),
             "owner": _recovery_owner,
             "generation": _recovery_generation,
+            "retry_attempt": _recovery_attempt,
             "execution_mode": _callback_mode,
-            "local_order_id": _callback_local_order_id,
         })
         sig["_callback_ownership_context"] = _ownership_context
         if _is_recovered and (
             not _recovery_owner
             or _recovery_generation is None
             or _callback_mode not in {"live", "paper"}
+            or not _callback_client_id
             or not _callback_local_order_id
+            or _ownership_kind not in {"broker_ready_recovery", "materialization_retry"}
         ):
             log.critical(
-                "[%s] RECOVERY_CALLBACK_OWNERSHIP_INVALID order=%s owner=%r generation=%r mode=%r",
-                ticker, _callback_local_order_id, _recovery_owner,
-                _recovery_generation, _callback_mode,
+                "[%s] RECOVERY_CALLBACK_OWNERSHIP_INVALID order=%s kind=%r "
+                "owner=%r generation=%r attempt=%r client=%r mode=%r",
+                ticker, _callback_local_order_id, _ownership_kind,
+                _recovery_owner, _recovery_generation, _recovery_attempt,
+                _callback_client_id, _callback_mode,
             )
             return {
                 "disposition": "KEEP_WATCHER",
                 "reason_code": "RECOVERY_CALLBACK_OWNERSHIP_INVALID",
             }
+        if _is_recovered and _ownership_kind == "materialization_retry":
+            if _recovery_attempt is None or _recovery_attempt < 1:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_OWNERSHIP_INVALID_ATTEMPT",
+                }
+            if self.order_state_machine is None:
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_OSM_UNAVAILABLE",
+                }
+            try:
+                _owned_row = self.order_state_machine.get_order(_callback_local_order_id)
+            except Exception as _own_exc:
+                log.critical(
+                    "[%s] MATERIALIZATION_CALLBACK_ROW_READ_FAILED order=%s exc=%s",
+                    ticker, _callback_local_order_id, _own_exc,
+                )
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_ROW_READ_FAILED",
+                }
+            _owned_meta = {}
+            if isinstance(_owned_row, dict):
+                _owned_meta = _owned_row.get("meta") or {}
+            if isinstance(_owned_meta, str):
+                try:
+                    _owned_meta = json.loads(_owned_meta)
+                except Exception:
+                    _owned_meta = {}
+            if not isinstance(_owned_meta, dict):
+                _owned_meta = {}
+            try:
+                _owned_generation = int(_owned_meta.get("materialization_generation") or 0)
+            except (TypeError, ValueError):
+                _owned_generation = 0
+            try:
+                _owned_attempt = int(_owned_meta.get("retry_attempt") or 0)
+            except (TypeError, ValueError):
+                _owned_attempt = 0
+            _owned_ok = (
+                isinstance(_owned_row, dict)
+                and str(_owned_row.get("status") or "").upper() == "PENDING_TRIGGER"
+                and not str(_owned_row.get("broker_order_id") or "").strip()
+                and not _owned_row.get("submitted_ts")
+                and str(_owned_row.get("client_id") or "").strip().lower() == _callback_client_id
+                and str(_owned_row.get("execution_mode") or "").strip().lower() == _callback_mode
+                and str(_owned_meta.get("lifecycle_state") or "").upper() == "MATERIALIZING"
+                and str(_owned_meta.get("materialization_status") or "").upper() == "RUNNING"
+                and _owned_meta.get("materialization_in_flight") is True
+                and str(_owned_meta.get("materialization_owner") or "").strip() == _recovery_owner
+                and _owned_generation == _recovery_generation
+                and _owned_attempt == _recovery_attempt
+            )
+            if not _owned_ok:
+                log.critical(
+                    "[%s] MATERIALIZATION_CALLBACK_OWNERSHIP_VERIFY_FAILED "
+                    "order=%s owner=%r generation=%r attempt=%r",
+                    ticker, _callback_local_order_id, _recovery_owner,
+                    _recovery_generation, _recovery_attempt,
+                )
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MATERIALIZATION_CALLBACK_OWNERSHIP_VERIFY_FAILED",
+                }
 
         # P0 hotfix — resolve client identity from the signal dict first, then
         # fall back to self.client_id (set in __init__), then self.email.
@@ -7486,6 +7608,34 @@ class APExecutionCore:
 
         ownership = sig.get("_callback_ownership_context") or {}
         if ownership.get("is_recovered"):
+            if ownership.get("ownership_kind") == "materialization_retry":
+                terminalize = getattr(
+                    self.order_state_machine, "terminalize_materialization_retry", None
+                )
+                if not callable(terminalize):
+                    sig["_recovery_cleanup_disposition"] = "KEEP_WATCHER"
+                    return False
+                terminal_status = "EXPIRED" if action == "expire" else "CANCELED"
+                try:
+                    ok = bool(terminalize(
+                        local_order_id,
+                        owner=str(ownership.get("owner") or ""),
+                        generation=ownership.get("generation"),
+                        retry_attempt=ownership.get("retry_attempt"),
+                        client_id=str(ownership.get("client_id") or ""),
+                        execution_mode=str(ownership.get("execution_mode") or ""),
+                        terminal_status=terminal_status,
+                        reason=reason,
+                    ))
+                except Exception as exc:
+                    log.error("[%s] materialization retry terminal CAS raised: %s", watched.ticker, exc)
+                    ok = False
+                if not ok:
+                    sig["_recovery_cleanup_disposition"] = self._classify_recovered_ownership_loss(
+                        local_order_id
+                    )
+                return ok
+
             terminalize = getattr(self.order_state_machine, "terminalize_recovered_entry", None)
             if not callable(terminalize):
                 sig["_recovery_cleanup_disposition"] = "KEEP_WATCHER"

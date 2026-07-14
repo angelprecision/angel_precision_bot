@@ -1146,6 +1146,42 @@ class APStartupRecovery:
         now = datetime.now(timezone.utc)
         recovered = 0
 
+        def _strict_durable_counter(
+            meta_dict: dict,
+            key: str,
+            local_order_id: str,
+            *,
+            minimum: int = 0,
+            missing_default: int | None = None,
+        ):
+            raw = (meta_dict or {}).get(key)
+            if raw is None or raw == "":
+                if missing_default is not None:
+                    return missing_default
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                log.critical(
+                    "[%s] RECOVERY_MALFORMED_DURABLE_COUNTER local_order_id=%s "
+                    "field=%s raw=%r",
+                    self.client_id, local_order_id, key, raw,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_malformed_counter:{local_order_id}:{key}"
+                )
+                return None
+            if value < minimum:
+                log.critical(
+                    "[%s] RECOVERY_INVALID_DURABLE_COUNTER local_order_id=%s "
+                    "field=%s value=%r minimum=%d",
+                    self.client_id, local_order_id, key, value, minimum,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_invalid_counter:{local_order_id}:{key}"
+                )
+                return None
+            return value
+
         # ── AMENDMENT §7: verified terminalization ─────────────────────
         # terminalize_deferred_breach returns True only when Postgres
         # confirmed rowcount > 0. A False return means the row was NOT
@@ -1323,8 +1359,16 @@ class APStartupRecovery:
                 )
                 return {"result": "ALREADY_TERMINAL"}
 
-            _rr_gen = int((_rr_meta or {}).get("materialization_generation") or 0)
-            _rr_attempt = int((_rr_meta or {}).get("retry_attempt") or 0)
+            _rr_gen = _strict_durable_counter(
+                _rr_meta or {}, "materialization_generation", loid,
+                minimum=0, missing_default=0,
+            )
+            _rr_attempt = _strict_durable_counter(
+                _rr_meta or {}, "retry_attempt", loid,
+                minimum=0, missing_default=0,
+            )
+            if _rr_gen is None or _rr_attempt is None:
+                return {"result": "WRITE_FAILED"}
             _exp_gen = int(outcome.get("expected_generation") or 0)
             _exp_attempt_prior = int(outcome.get("expected_prior_retry_attempt") or 0)
 
@@ -1825,6 +1869,32 @@ class APStartupRecovery:
                     )
                     continue
 
+                _retry_generation = None
+                _retry_attempt = None
+                _retry_max_attempts = None
+                if _is_retry_row:
+                    _retry_generation = _strict_durable_counter(
+                        meta, "materialization_generation", local_order_id,
+                        minimum=1, missing_default=1,
+                    )
+                    _retry_attempt = _strict_durable_counter(
+                        meta, "retry_attempt", local_order_id,
+                        minimum=0, missing_default=0,
+                    )
+                    _retry_max_attempts = _strict_durable_counter(
+                        meta, "retry_max_attempts", local_order_id,
+                        minimum=0, missing_default=0,
+                    )
+                    if (
+                        _retry_generation is None
+                        or _retry_attempt is None
+                        or _retry_max_attempts is None
+                    ):
+                        _retain_recovery_ownership(
+                            local_order_id, reason="retry_wait_malformed_counter",
+                        )
+                        continue
+
                 _is_due = _due_at is not None and _due_at <= now
 
                 # ── Due-retry path (blocker §4: watcher not required) ─────────
@@ -1842,7 +1912,7 @@ class APStartupRecovery:
                                     expected_client_id=self.client_id,
                                     expected_execution_mode=recovery_mode,
                                     expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
-                                    expected_generation=int(meta.get("materialization_generation") or 1),
+                                    expected_generation=_retry_generation,
                                     durable_next_retry_at=str(_durable_next_retry_at),
                                     durable_retry_deadline=(
                                         str(meta.get("absolute_entry_deadline"))
@@ -1880,8 +1950,8 @@ class APStartupRecovery:
                         )
                         # Fall through to the future-due / legacy rearm block.
                     else:
-                        _expected_generation = int(meta.get("materialization_generation") or 1)
-                        _expected_attempt = int(meta.get("retry_attempt") or 0) + 1
+                        _expected_generation = int(_retry_generation)
+                        _expected_attempt = int(_retry_attempt) + 1
                         _takeover_owner = (
                             f"recovery_retry:{self.client_id}:{local_order_id}:"
                             f"{_expected_generation + 1}"
@@ -2002,7 +2072,7 @@ class APStartupRecovery:
                                     expected_client_id=self.client_id,
                                     expected_execution_mode=recovery_mode,
                                     expected_watcher_token=str(meta.get("watcher_token") or "").strip() or None,
-                                    expected_generation=int(meta.get("materialization_generation") or 1),
+                                    expected_generation=_retry_generation,
                                     durable_next_retry_at=str(_durable_next_retry_at),
                                     durable_retry_deadline=(
                                         str(meta.get("absolute_entry_deadline"))
@@ -2074,9 +2144,13 @@ class APStartupRecovery:
                     )
                     continue
 
-                plan.metadata["materialization_generation"] = int(
-                    meta.get("materialization_generation") or 1
+                plan.metadata["materialization_generation"] = (
+                    int(_retry_generation) if _retry_generation is not None else int(
+                        meta.get("materialization_generation") or 1
+                    )
                 )
+                if _retry_attempt is not None:
+                    plan.metadata["retry_attempt"] = int(_retry_attempt)
                 plan.metadata["contract_deferred"] = True
                 armed = bool(self.entry_watcher.watch(
                     plan,

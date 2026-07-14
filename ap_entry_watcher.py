@@ -2829,6 +2829,47 @@ class APEntryWatcher:
             signal_dict["__recovery_rearm"] = True
         if _materialization_resume:
             signal_dict["__materialization_resume"] = True
+        if _recovery_rearm and _materialization_resume:
+            _plan_meta_for_adopt = getattr(plan, "metadata", None) or {}
+            _adopt_fn = getattr(
+                getattr(self, "order_state_machine", None),
+                "adopt_deferred_retry_watcher",
+                None,
+            )
+            _durable_next_retry = (
+                _plan_meta_for_adopt.get("materialization_next_retry_at")
+                or _plan_meta_for_adopt.get("next_retry_at")
+            )
+            if not callable(_adopt_fn):
+                log.critical(
+                    "[%s] RECOVERY_REARM_WATCHER_ADOPT_UNAVAILABLE local_order_id=%s",
+                    ticker, local_order_id,
+                )
+                return False
+            try:
+                _adopt_ok = bool(_adopt_fn(
+                    local_order_id,
+                    watcher_token=self.owner_token,
+                    generation=int(_plan_meta_for_adopt.get("materialization_generation") or 1),
+                    retry_attempt=int(_plan_meta_for_adopt.get("retry_attempt") or 0),
+                    next_retry_at=str(_durable_next_retry or ""),
+                    execution_mode=str(signal_dict.get("execution_mode") or ""),
+                ))
+            except Exception as _adopt_exc:
+                log.critical(
+                    "[%s] RECOVERY_REARM_WATCHER_ADOPT_RAISED local_order_id=%s error=%s",
+                    ticker, local_order_id, _adopt_exc,
+                )
+                return False
+            if not _adopt_ok:
+                log.critical(
+                    "[%s] RECOVERY_REARM_WATCHER_ADOPT_CAS_MISS local_order_id=%s "
+                    "generation=%s attempt=%s",
+                    ticker, local_order_id,
+                    _plan_meta_for_adopt.get("materialization_generation"),
+                    _plan_meta_for_adopt.get("retry_attempt"),
+                )
+                return False
 
         if _recovery_rearm and not _materialization_resume:
             try:

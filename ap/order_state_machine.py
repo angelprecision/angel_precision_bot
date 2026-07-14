@@ -2209,6 +2209,7 @@ class APOrderStateMachine:
             "materialization_in_flight": False,
             "materialization_owner": "",
             "materialization_lease_until": "",
+            "watcher_token": "",
             "materialization_generation": _generation,
             "retry_reason": _reason,
             "retry_attempt": _attempt,
@@ -2254,6 +2255,90 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] schedule_deferred_materialization_retry failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def adopt_deferred_retry_watcher(
+        self,
+        local_order_id: str,
+        *,
+        watcher_token: str,
+        generation: int,
+        retry_attempt: int,
+        next_retry_at: str,
+        execution_mode: str,
+    ) -> bool:
+        """Durably adopt a RETRY_WAIT row for the current watcher process."""
+        import json as _json_local
+
+        _token = str(watcher_token or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _next = str(next_retry_at or "").strip()
+        try:
+            _generation = int(generation)
+            _attempt = int(retry_attempt)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _token
+            or _generation < 1
+            or _attempt < 0
+            or not _next
+            or _mode not in {"live", "paper"}
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "watcher_token": _token,
+            "watcher_generation": _generation,
+            "watcher_retry_attempt": _attempt,
+            "watcher_registered_at": _now,
+            "watcher_next_retry_at": _next,
+            "current_owner": _token,
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _adopt():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'RETRY_WAIT'
+                      AND COALESCE(meta->>'materialization_status','') = 'RETRY_PENDING'
+                      AND COALESCE(meta->>'materialization_in_flight', 'false') = 'false'
+                      AND COALESCE(meta->>'broker_ready', 'false') = 'false'
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE((meta->>'retry_attempt')::int, 0) = %s
+                      AND COALESCE(meta->>'materialization_next_retry_at', '') = %s
+                      AND COALESCE(meta->>'watcher_token', '') = ''
+                    """,
+                    (
+                        _patch_json, local_order_id, self.client_id, _mode,
+                        _generation, _attempt, _next,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_adopt) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] adopt_deferred_retry_watcher failed order=%s: %s",
                 self.client_id, local_order_id, exc,
             )
             return False
@@ -2365,6 +2450,110 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] persist_pre_submit_proof_retry failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def terminalize_materialization_retry(
+        self,
+        local_order_id: str,
+        *,
+        reason: str,
+        terminal_status: str = "EXPIRED",
+        owner: str,
+        generation: int,
+        retry_attempt: int,
+        client_id: str,
+        execution_mode: str,
+        diagnostics: dict | None = None,
+    ) -> bool:
+        """Terminalize only the exact in-flight materialization retry claim."""
+        import json as _json_local
+
+        _reason = str(reason or "").strip()
+        _status = str(terminal_status or "EXPIRED").strip().upper()
+        _owner = str(owner or "").strip()
+        _client = str(client_id or "").strip().lower()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = int(generation)
+            _attempt = int(retry_attempt)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _reason
+            or _status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}
+            or not _owner
+            or _generation < 1
+            or _attempt < 1
+            or not _client
+            or _mode not in {"live", "paper"}
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = dict(diagnostics or {})
+        _patch.update({
+            "lifecycle_state": _status,
+            "materialization_status": "FAILED_TERMINAL",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "current_owner": "",
+            "watcher_token": "",
+            "materialization_lease_until": "",
+            "broker_ready": False,
+            "reason_code": _reason,
+            "materialization_reason": _reason,
+            "final_reason": _reason,
+            "materialization_finished_at": _now,
+            "selector_completed_at": _now,
+            "materialization_retry_terminal_fenced": True,
+            "materialization_retry_terminal_owner": _owner,
+            "materialization_retry_terminal_generation": _generation,
+            "materialization_retry_terminal_attempt": _attempt,
+        })
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _terminalize():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET status = %s,
+                        last_error = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'materialization_status','') = 'RUNNING'
+                      AND COALESCE(meta->>'materialization_in_flight', 'false') = 'true'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE((meta->>'retry_attempt')::int, 0) = %s
+                    """,
+                    (
+                        _status, _reason, _patch_json,
+                        local_order_id, _client, _mode,
+                        _owner, _generation, _attempt,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_terminalize) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] terminalize_materialization_retry failed order=%s: %s",
                 self.client_id, local_order_id, exc,
             )
             return False
