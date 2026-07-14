@@ -69,6 +69,7 @@ jobs:
             tests/test_p0_deferred_due_retry_ownership.py \
             tests/test_p0_fenced_retry_terminalization.py \
             tests/test_p0_regression_replay_harness.py \
+            tests/test_p0_regression_replay_sequences.py \
             -v --tb=short --color=yes
 
       - name: Summary
