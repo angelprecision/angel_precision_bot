@@ -6,3 +6,4 @@ ap_state.db-shm
 ap_state.db-wal
 __pycache__/
 *.pyc
+logs/*.jsonl

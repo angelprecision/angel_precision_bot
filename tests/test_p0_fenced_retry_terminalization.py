@@ -712,3 +712,290 @@ def test_terminal_required_carries_expected_state():
     assert "expected_execution_mode" in result
     assert result["expected_lifecycle_state"] == "RETRY_WAIT"
     assert result["expected_materialization_status"] == "RETRY_PENDING"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Final-amendment required tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fa1_fenced_terminal_unavailable_no_broad_fallback():
+    """When terminalize_deferred_retry_if_unchanged is missing from the OSM,
+    _terminalize_fenced_retry must NOT call terminalize_deferred_breach.
+    It must return FENCED_TERMINAL_UNAVAILABLE and record the error.
+    """
+    from ap_recovery import APStartupRecovery
+    from ap import db as db_mod
+
+    broad_calls = [0]
+
+    class _OSM:
+        client_id = CLIENT_ID
+        # terminalize_deferred_retry_if_unchanged intentionally ABSENT
+        def terminalize_deferred_breach(self, *a, **kw):
+            broad_calls[0] += 1
+            return True
+        def get_order(self, oid):
+            return {
+                "local_order_id": LOCAL_ORDER_ID, "client_id": CLIENT_ID,
+                "execution_mode": "paper", "signal_id": SIGNAL_ID,
+                "status": "PENDING_TRIGGER", "broker_order_id": None,
+                "submitted_ts": None, "meta": {
+                    "lifecycle_state": "RETRY_WAIT",
+                    "materialization_status": "RETRY_PENDING",
+                    "materialization_generation": 4,
+                    "retry_attempt": 1,
+                    "retry_max_attempts": 3,
+                    "next_retry_at": _iso(_now() - timedelta(seconds=60)),
+                    "materialization_next_retry_at": _iso(_now() - timedelta(seconds=60)),
+                    "trigger_crossed_at": _iso(_now() - timedelta(minutes=2)),
+                    "trigger_price": 130.0,
+                },
+            }
+        def update_order_meta(self, *a, **kw): return True
+        def get_orders_for_position(self, *a, **kw): return []
+
+    TERMINAL_REQUIRED_outcome = {
+        "disposition": "TERMINAL_REQUIRED",
+        "reason_code": "RETRY_MAX_ATTEMPTS_EXCEEDED",
+        "terminal_status": "EXPIRED",
+        "expected_generation": 4,
+        "expected_prior_retry_attempt": 1,
+        "expected_client_id": CLIENT_ID,
+        "expected_execution_mode": "paper",
+        "expected_lifecycle_state": "RETRY_WAIT",
+        "expected_materialization_status": "RETRY_PENDING",
+        "attempt": 2, "max_attempts": 3,
+        "owner": "recovery:owner:1", "generation": 5,
+    }
+
+    mock_core = MagicMock()
+    mock_core.resume_deferred_materialization_retry.return_value = TERMINAL_REQUIRED_outcome
+
+    mc = SimpleNamespace(mode="PAPER")
+    osm = _OSM()
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=osm,
+        pm=MagicMock(), master_control=mc, exit_engine=None,
+        entry_watcher=None, execution_core=mock_core,
+    )
+
+    row = osm.get_order(LOCAL_ORDER_ID)
+
+    class _C:
+        def execute(self, *a, **k): return self
+        def fetchall(self): return [row]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    # Broad terminalize must NEVER be called
+    assert broad_calls[0] == 0, (
+        f"terminalize_deferred_breach must NOT be called when fenced method is absent; "
+        f"called {broad_calls[0]} times"
+    )
+    # Error must be recorded
+    assert "recovery_fenced_terminal_unavailable" in str(result.get("errors", [])), (
+        f"Must record fenced_terminal_unavailable error; errors={result.get('errors')}"
+    )
+
+
+def test_fa2_due_retry_missing_direction_reaches_resume():
+    """A due RETRY_WAIT row with missing direction must reach
+    resume_deferred_materialization_retry() even if _build_recovery_plan_from_order
+    would fail. The consumer validates direction and returns TERMINAL_REQUIRED.
+    The row must NOT be silently skipped.
+    """
+    from ap_recovery import APStartupRecovery
+    from ap import db as db_mod
+
+    row_no_dir = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-nd",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": None,   # ← MISSING
+        "score": 78.0, "tier": "B", "trigger_price": 130.0,
+        "stop_underlying": 128.0, "target_underlying": 133.0,
+        "pattern": "3-1-2", "timeframe": "1d",
+        "contract": "DEFERRED:RTX", "qty": 1,
+        "limit_price": 0.01, "reserved_cost": 0.0,
+        "meta": {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_generation": 1,
+            "retry_attempt": 1,
+            "retry_max_attempts": 3,
+            "next_retry_at": _iso(_now() - timedelta(seconds=30)),
+            "materialization_next_retry_at": _iso(_now() - timedelta(seconds=30)),
+            "trigger_crossed_at": _iso(_now() - timedelta(minutes=2)),
+            "trigger_price": 130.0,
+        },
+    }
+
+    resume_calls = [0]
+
+    mock_core = MagicMock()
+    def _resume(**kw):
+        resume_calls[0] += 1
+        return {
+            "disposition": "TERMINAL_REQUIRED",
+            "reason_code": "RETRY_MISSING_OR_INVALID_DIRECTION:got=''",
+            "terminal_status": "ERROR",
+            "expected_generation": 1,
+            "expected_prior_retry_attempt": 0,
+            "expected_client_id": CLIENT_ID,
+            "expected_execution_mode": "paper",
+            "expected_lifecycle_state": "RETRY_WAIT",
+            "expected_materialization_status": "RETRY_PENDING",
+        }
+    mock_core.resume_deferred_materialization_retry.side_effect = _resume
+
+    class _OSM:
+        client_id = CLIENT_ID
+        def get_order(self, oid): return row_no_dir
+        def update_order_meta(self, *a, **kw): return True
+        def terminalize_deferred_retry_if_unchanged(self, *a, **kw): return True
+        def get_orders_for_position(self, *a, **kw): return []
+
+    mc = SimpleNamespace(mode="PAPER")
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=_OSM(),
+        pm=MagicMock(), master_control=mc, exit_engine=None,
+        entry_watcher=None, execution_core=mock_core,
+    )
+
+    class _C:
+        def execute(self, *a, **k): return self
+        def fetchall(self): return [row_no_dir]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    from ap import db as db_mod
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    assert resume_calls[0] == 1, (
+        f"resume_deferred_materialization_retry must be called for due row with "
+        f"missing direction; called {resume_calls[0]} times"
+    )
+
+
+def test_fa3_future_retry_invalid_plan_retains_ownership():
+    """A future-due RETRY_WAIT row where _build_recovery_plan_from_order returns
+    None must retain ownership with reason retry_rearm_plan_invalid and record
+    the error. Must NOT silently continue, cancel, or broadly terminalize.
+    """
+    from ap_recovery import APStartupRecovery
+    from ap import db as db_mod
+
+    now = _now()
+    future_ts = _iso(now + timedelta(minutes=5))  # future = NOT due
+
+    row_future = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-nd",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": None,  # ← missing direction → plan builder returns None
+        "score": 78.0, "tier": "B", "trigger_price": 130.0,
+        "stop_underlying": 128.0, "target_underlying": 133.0,
+        "pattern": "3-1-2", "timeframe": "1d",
+        "contract": "DEFERRED:RTX", "qty": 1,
+        "limit_price": 0.01, "reserved_cost": 0.0,
+        "meta": {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_generation": 1,
+            "retry_attempt": 1,
+            "retry_max_attempts": 3,
+            "next_retry_at": future_ts,          # future — not due
+            "materialization_next_retry_at": future_ts,
+            "trigger_crossed_at": _iso(now - timedelta(minutes=2)),
+            "trigger_price": 130.0,
+            # No side/direction in meta either
+        },
+    }
+
+    retain_patches = []
+
+    class _OSM:
+        client_id = CLIENT_ID
+        def get_order(self, oid): return row_future
+        def update_order_meta(self, oid, patch):
+            if isinstance(patch, dict) and patch.get("recovery_owner"):
+                retain_patches.append(patch)
+            return True
+        def terminalize_deferred_breach(self, *a, **kw): return True
+        def terminalize_deferred_retry_if_unchanged(self, *a, **kw): return True
+        def get_orders_for_position(self, *a, **kw): return []
+
+    mock_core = MagicMock()
+    mock_core.resume_deferred_materialization_retry.return_value = None
+
+    # A watcher that is registered but has a mismatched generation so proof
+    # fails, and has_order=False so the registry skip is bypassed.
+    class _Watcher:
+        def has_order(self, oid): return False
+        def prove_materialization_retry_owner(self, *a, **kw):
+            return {"proven": False, "reason_code": "PROOF_GENERATION_MISMATCH"}
+        def watch(self, *a, **kw): return False
+
+    mc = SimpleNamespace(mode="PAPER")
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=_OSM(),
+        pm=MagicMock(), master_control=mc, exit_engine=None,
+        entry_watcher=_Watcher(), execution_core=mock_core,
+    )
+
+    class _C:
+        def execute(self, *a, **k): return self
+        def fetchall(self): return [row_future]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    assert "recovery_retry_rearm_plan_invalid" in str(result.get("errors", [])), (
+        f"Must record retry_rearm_plan_invalid error; errors={result.get('errors')}"
+    )
+    assert retain_patches, "Must retain ownership when plan is invalid for future-due retry row"
+
+
+def test_fa4_log_file_not_in_branch():
+    """logs/signal_ledger.jsonl must not be a tracked file in the PR branch."""
+    import subprocess
+    result = subprocess.run(
+        ["git", "ls-files", "logs/signal_ledger.jsonl"],
+        capture_output=True, text=True,
+        cwd="/home/claude/angel_precision_bot",
+    )
+    tracked = result.stdout.strip()
+    assert not tracked, (
+        f"logs/signal_ledger.jsonl must not be tracked by git; found: {tracked!r}"
+    )

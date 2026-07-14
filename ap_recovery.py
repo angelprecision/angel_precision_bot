@@ -1197,27 +1197,27 @@ class APStartupRecovery:
             predicate fences against concurrent lifecycle advances.
 
             Returns a classification dict:
-              {"result": "TERMINALIZED"}           — fenced CAS succeeded
-              {"result": "ALREADY_TERMINAL"}       — row already terminal
-              {"result": "CLAIM_LOST"}             — concurrent winner advanced
-              {"result": "OWNERSHIP_ADVANCED"}     — submit intent / broker-ready
-              {"result": "WRITE_FAILED"}           — true write failure, retain ownership
+              {"result": "TERMINALIZED"}                — fenced CAS succeeded
+              {"result": "ALREADY_TERMINAL"}            — row already terminal
+              {"result": "CLAIM_LOST"}                  — concurrent winner advanced
+              {"result": "OWNERSHIP_ADVANCED"}          — submit intent / broker-ready
+              {"result": "WRITE_FAILED"}                — true write failure, retain ownership
+              {"result": "FENCED_TERMINAL_UNAVAILABLE"} — OSM method missing; retain
             """
             _fn = getattr(self.osm, "terminalize_deferred_retry_if_unchanged", None)
             if not callable(_fn):
+                # INVARIANT: never fall back to broad terminalize_deferred_breach.
+                # A missing or outdated OSM is an infrastructure gap — fail closed
+                # and retain the row so a future pass can attempt the fenced write
+                # once OSM is updated. Restoring the unfenced race is not acceptable.
                 log.critical(
                     "[%s] RECOVERY_FENCED_TERM_UNAVAILABLE local_order_id=%s "
-                    "— falling back to broad terminalize; upgrade OSM",
+                    "— terminalize_deferred_retry_if_unchanged missing from OSM; "
+                    "row retained; deploy OSM update to unblock",
                     self.client_id, loid,
                 )
-                # Fallback: use broad terminalize (existing behaviour, still better than nothing)
-                _broad_ok = _terminalize_verified(
-                    loid,
-                    reason_code=str(outcome.get("reason_code") or "RETRY_TERMINAL"),
-                    terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
-                    diagnostics=extra_diagnostics or {},
-                )
-                return {"result": "TERMINALIZED" if _broad_ok else "WRITE_FAILED"}
+                result.setdefault("errors", []).append("recovery_fenced_terminal_unavailable")
+                return {"result": "FENCED_TERMINAL_UNAVAILABLE"}
 
             _ok = False
             try:
@@ -1443,31 +1443,8 @@ class APStartupRecovery:
                 )
                 continue
 
-            plan = self._build_recovery_plan_from_order(order)
-            if plan is None:
-                continue
-
-            # ── Plan-level identity proof ────────────────────────────
-            # After building the plan, verify the plan carries the exact
-            # client_id and execution_mode we expect. The plan builder no
-            # longer infers execution_mode from the runner (Amendment 1),
-            # so a persisted row with a blank mode surfaces here as an
-            # empty plan.execution_mode string and is skipped.
-            plan_client_id = str(getattr(plan, "client_id", "") or "").strip().lower()
-            if plan_client_id and plan_client_id != self.client_id:
-                log.error(
-                    "[%s] RECOVERY_SKIP plan_client_id_mismatch local_order_id=%s plan=%r",
-                    self.client_id, local_order_id, plan_client_id,
-                )
-                continue
-            plan_mode_raw = str(getattr(plan, "execution_mode", "") or "").strip().upper()
-            if plan_mode_raw != recovery_mode:
-                log.error(
-                    "[%s] RECOVERY_SKIP plan_execution_mode_mismatch local_order_id=%s "
-                    "plan_mode=%r recovery_mode=%s",
-                    self.client_id, local_order_id, plan_mode_raw, recovery_mode,
-                )
-                continue
+            # Plan construction deferred: due-retry rows processed first (P0 final amendment)
+            # The plan is built only inside should_resume for future-due rearm paths.
 
             # ── AMENDMENT §6: broker-ambiguity crash window ────────────────
             # If a durable submit intent was persisted (submit_intent_at) but
@@ -1568,7 +1545,8 @@ class APStartupRecovery:
                     continue
 
                 try:
-                    outcome = resume_fn(local_order_id=local_order_id, plan=plan) or {}
+                    _br_plan = self._build_recovery_plan_from_order(order)
+                    outcome = resume_fn(local_order_id=local_order_id, plan=_br_plan) or {}
                 except Exception as exc:
                     log.error(
                         "[%s] resume_deferred_broker_ready_order raised "
@@ -1871,6 +1849,12 @@ class APStartupRecovery:
                                 _retain_recovery_ownership(
                                     local_order_id, reason=f"fenced_term_write_failed:{_reason}",
                                 )
+                            elif _fenced_result == "FENCED_TERMINAL_UNAVAILABLE":
+                                # OSM method missing — retain ownership so a future
+                                # pass can retry once OSM is deployed.
+                                _retain_recovery_ownership(
+                                    local_order_id, reason="fenced_terminal_unavailable",
+                                )
                             # ALREADY_TERMINAL / CLAIM_LOST / OWNERSHIP_ADVANCED:
                             # row is owned by another worker — no retention, no error
                         elif _disp in {"TERMINAL_DURABLE", "TERMINAL_ALREADY_DURABLE"}:
@@ -1961,6 +1945,50 @@ class APStartupRecovery:
                         continue
                     # RETRY_WAIT rows with no durable timestamp are quarantined
                     # above, so _due_at is always set here. Fall through to rearm.
+
+                # ── Build recovery plan lazily (P0 final amendment) ─────────
+                # Plan construction was moved here so that due-retry rows can
+                # reach resume_deferred_materialization_retry() above without
+                # being blocked by a missing or malformed plan. Only rearm
+                # paths (future-due watcher rearm, orphan rearm) need the plan.
+                plan = self._build_recovery_plan_from_order(order)
+                if plan is None:
+                    if _is_retry_row:
+                        # A future-due RETRY_WAIT row with an invalid plan
+                        # cannot be rearmed — retain ownership so a future pass
+                        # can retry after the row is repaired.
+                        log.critical(
+                            "[%s] RECOVERY_RETRY_REARM_PLAN_INVALID local_order_id=%s "
+                            "lifecycle=%s — retaining ownership; row not rearmed",
+                            self.client_id, local_order_id, lifecycle,
+                        )
+                        result.setdefault("errors", []).append(
+                            "recovery_retry_rearm_plan_invalid"
+                        )
+                        _retain_recovery_ownership(
+                            local_order_id, reason="retry_rearm_plan_invalid",
+                        )
+                    # For non-retry orphans: silently skip (pre-existing behaviour
+                    # — the plan builder already logged the reason).
+                    continue
+
+                # ── Plan-level identity proof ────────────────────────────
+                plan_client_id = str(getattr(plan, "client_id", "") or "").strip().lower()
+                if plan_client_id and plan_client_id != self.client_id:
+                    log.error(
+                        "[%s] RECOVERY_SKIP plan_client_id_mismatch local_order_id=%s plan=%r",
+                        self.client_id, local_order_id, plan_client_id,
+                    )
+                    continue
+                plan_mode_raw = str(getattr(plan, "execution_mode", "") or "").strip().upper()
+                if plan_mode_raw != recovery_mode:
+                    log.error(
+                        "[%s] RECOVERY_SKIP plan_execution_mode_mismatch local_order_id=%s "
+                        "plan_mode=%r recovery_mode=%s",
+                        self.client_id, local_order_id, plan_mode_raw, recovery_mode,
+                    )
+                    continue
+
                 plan.metadata["materialization_generation"] = int(
                     meta.get("materialization_generation") or 1
                 )
