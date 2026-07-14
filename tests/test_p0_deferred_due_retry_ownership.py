@@ -29,6 +29,7 @@ ownership + orchestration primitives added by this PR:
 from __future__ import annotations
 
 import os
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -724,7 +725,12 @@ def test_12_recovery_never_calls_broker_directly():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_spec_acceptance_single_claim_seam():
+@pytest.mark.parametrize(
+    "starting_contract",
+    ["DEFERRED:RTX", "RTX260117C00129000"],
+    ids=["placeholder_contract", "stale_real_contract"],
+)
+def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     """Real seam test: resume_deferred_materialization_retry → real _on_entry_trigger
     deferred path → selector mock → durable copyback → canonical submit seam.
 
@@ -738,6 +744,22 @@ def test_spec_acceptance_single_claim_seam():
     import ap_execution_core as core_mod
 
     now = datetime.now(timezone.utc)
+    fake_execution = SimpleNamespace(
+        _refresh_ask_at_submit=lambda *_args, **_kwargs: (
+            2.10,
+            5,
+            True,
+            "ok",
+            {
+                "submit_bid": 2.05,
+                "submit_ask": 2.10,
+                "submit_last": 2.08,
+                "submit_mid": 2.075,
+                "spread_pct": 0.024,
+            },
+        )
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
 
     # ── Build a production-shape durable row (RETRY_WAIT attempt=1) ──
     before_meta = {
@@ -775,7 +797,7 @@ def test_spec_acceptance_single_claim_seam():
         "target_underlying": 133.0,
         "pattern": "3-1-2",
         "timeframe": "1d",
-        "contract": "DEFERRED:RTX",
+        "contract": starting_contract,
         "qty": 1,
         "limit_price": 0.01,
         "reserved_cost": 0.0,
@@ -816,25 +838,25 @@ def test_spec_acceptance_single_claim_seam():
 
     # ── Build minimal execution core ──────────────────────────────────
     claim_call_count = [0]
+    copyback_calls = []
+    submit_calls = []
 
     class _OSM:
         client_id = CLIENT_ID
-        _claimed = False  # flips True when claim_deferred_materialization is called
+
+        def __init__(self):
+            self.row = before_row
 
         def get_order(self, oid):
-            # Before claim: return the before-state row (RETRY_WAIT)
-            # After claim: return the after-claim row (MATERIALIZING) so the
-            # pre-claim bypass verification can confirm lifecycle=MATERIALIZING
-            if not _OSM._claimed:
-                return before_row
-            return after_claim_row
+            return self.row
 
         def claim_deferred_materialization(self, oid, **kw):
             claim_call_count[0] += 1
-            _OSM._claimed = True
+            self.row = after_claim_row
             return True
 
         def update_order_meta(self, oid, patch):
+            self.row.setdefault("meta", {}).update(patch)
             return True
 
         def schedule_deferred_materialization_retry(self, oid, **kw):
@@ -844,12 +866,39 @@ def test_spec_acceptance_single_claim_seam():
             return True
 
         def submit_existing_entry(self, *a, **kw):
-            return {"status": "SUBMITTED", "broker_order_id": "BR-TEST-1"}
+            submit_calls.append(kw)
+            self.row["status"] = "SUBMITTED"
+            self.row["broker_order_id"] = "BR-TEST-1"
+            self.row["submitted_ts"] = _iso(datetime.now(timezone.utc))
+            return {
+                "ok": True,
+                "status": "SUBMITTED",
+                "local_order_id": LOCAL_ORDER_ID,
+                "broker_order_id": "BR-TEST-1",
+            }
 
         def get_orders_for_position(self, *a, **kw):
             return []
 
         def persist_deferred_broker_ready(self, *a, **kw):
+            copyback_calls.append(kw)
+            next_row = dict(broker_ready_row)
+            next_meta = dict(broker_ready_row["meta"])
+            next_row.update({
+                "contract": kw["contract"],
+                "limit_price": float(kw["limit_price"]),
+                "qty": int(kw["qty"]),
+                "reserved_cost": float(kw["reserved_cost"]),
+            })
+            next_meta.update({
+                "materialization_owner": kw["owner"],
+                "materialization_generation": int(kw["generation"]),
+                "selected_contract": kw["contract"],
+                "selected_limit": float(kw["limit_price"]),
+                "selected_qty": int(kw["qty"]),
+            })
+            next_row["meta"] = next_meta
+            self.row = next_row
             return True
 
         def claim_deferred_broker_ready_submit(self, *a, **kw):
@@ -944,11 +993,18 @@ def test_spec_acceptance_single_claim_seam():
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
     )
-    # Outcome must be BROKER_READY or SUBMITTED (not CLAIM_LOST, not KEEP_WATCHER)
-    assert result["disposition"] in {"BROKER_READY", "SUBMITTED", "RETRY_WAIT"}, (
-        f"Expected BROKER_READY/SUBMITTED/RETRY_WAIT; got {result['disposition']}: "
-        f"{result.get('reason_code')}"
-    )
+    assert copyback_calls, "validated retry selection must reach durable copyback"
+    assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
+    assert float(copyback_calls[-1]["limit_price"]) > 0.01
+    assert len(submit_calls) == 1
+    assert submit_calls[0]["plan"].contract_symbol == "RTX260117C00130000"
+    assert float(submit_calls[0]["limit_price"]) > 0.01
+    assert result["disposition"] == "SUBMITTED"
+    assert result["broker_order_id"] == "BR-TEST-1"
+    assert osm.row["status"] == "SUBMITTED"
+    assert osm.row["contract"] == "RTX260117C00130000"
+    assert float(osm.row["limit_price"]) > 0.01
+    assert osm.row["broker_order_id"] == "BR-TEST-1"
     # generation and attempt advanced
     assert result["generation"] == 2
     assert result["attempt"] == 2

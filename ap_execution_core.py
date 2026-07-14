@@ -3969,7 +3969,6 @@ class APExecutionCore:
                     _sel_qty_candidate,
                 ) = _validate_deferred_selector_result(_sel, ticker)
                 _live_contract = str(getattr(approved_plan, "contract_symbol", "") or "").strip()
-                _plan_is_placeholder = (not _live_contract) or _live_contract.upper().startswith("DEFERRED:")
                 _sel_is_real = self._is_real_occ_contract(_sel_contract, ticker)
 
                 if _sel is not None and not _sel_result_valid:
@@ -3985,7 +3984,14 @@ class APExecutionCore:
                     )
                     return {"disposition": "TERMINAL_DURABLE"}
 
-                if _sel_is_real and _plan_is_placeholder:
+                # A deferred breach retry can start from a durable row that
+                # already contains an OCC-shaped contract while its executable
+                # fields are still placeholders (for example limit_price=0.01,
+                # broker_ready=false).  The selector result is the fresh
+                # breach-time authority in every deferred attempt.  Restricting
+                # copyback to DEFERRED:* plans discards a successful retry and
+                # leaves the stale contract/penny limit in place.
+                if _sel_is_real:
                     try:
                         approved_plan.contract_symbol = _sel_contract
                         _sel_price = _sel_price_candidate
