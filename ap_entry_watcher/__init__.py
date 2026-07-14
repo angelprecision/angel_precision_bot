@@ -127,6 +127,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
         *,
         recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False,
+        materialization_resume: bool = False,
     ) -> bool:
         if plan is None:
             _base.log.warning("watch() called with None plan -- skipping")
@@ -178,6 +179,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             local_order_id,
             recovery_rearm=recovery_rearm,
             no_cancel_on_reject=no_cancel_on_reject,
+            materialization_resume=materialization_resume,
         )
 
     def _get_quote(self, ticker: str) -> dict:
