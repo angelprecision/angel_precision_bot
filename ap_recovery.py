@@ -1191,10 +1191,11 @@ class APStartupRecovery:
         def _terminalize_fenced_retry(loid, *, outcome: dict, extra_diagnostics: dict | None = None):
             """Fenced terminal CAS via terminalize_deferred_retry_if_unchanged.
 
-            P0 FINAL AMENDMENT: called when resume_deferred_materialization_retry()
-            returns TERMINAL_REQUIRED. The outcome dict carries the expected
-            generation, prior attempt, client, and mode so the terminal CAS
-            predicate fences against concurrent lifecycle advances.
+            All fencing identity fields MUST come from the TERMINAL_REQUIRED outcome
+            dict. No fallback to self.client_id, recovery_mode, or zero values — any
+            missing or malformed field returns INVALID_FENCED_OUTCOME and retains
+            ownership. This prevents a stale runner with wrong identity from being
+            silently substituted into the SQL predicate.
 
             Returns a classification dict:
               {"result": "TERMINALIZED"}                — fenced CAS succeeded
@@ -1203,13 +1204,10 @@ class APStartupRecovery:
               {"result": "OWNERSHIP_ADVANCED"}          — submit intent / broker-ready
               {"result": "WRITE_FAILED"}                — true write failure, retain ownership
               {"result": "FENCED_TERMINAL_UNAVAILABLE"} — OSM method missing; retain
+              {"result": "INVALID_FENCED_OUTCOME"}      — outcome missing required fields; retain
             """
             _fn = getattr(self.osm, "terminalize_deferred_retry_if_unchanged", None)
             if not callable(_fn):
-                # INVARIANT: never fall back to broad terminalize_deferred_breach.
-                # A missing or outdated OSM is an infrastructure gap — fail closed
-                # and retain the row so a future pass can attempt the fenced write
-                # once OSM is updated. Restoring the unfenced race is not acceptable.
                 log.critical(
                     "[%s] RECOVERY_FENCED_TERM_UNAVAILABLE local_order_id=%s "
                     "— terminalize_deferred_retry_if_unchanged missing from OSM; "
@@ -1219,16 +1217,66 @@ class APStartupRecovery:
                 result.setdefault("errors", []).append("recovery_fenced_terminal_unavailable")
                 return {"result": "FENCED_TERMINAL_UNAVAILABLE"}
 
+            # ── Require all fencing identity fields from the outcome dict ────
+            # Never substitute self.client_id, recovery_mode, or zero values.
+            # An incomplete outcome means the consumer did not produce reliable
+            # expected-state fields; calling the CAS with inferred defaults can
+            # terminalize the wrong generation or a different client's row.
+            _exp_client = str(outcome.get("expected_client_id") or "").strip().lower()
+            _exp_mode = str(outcome.get("expected_execution_mode") or "").strip().lower()
+            _exp_lc = str(outcome.get("expected_lifecycle_state") or "").strip().upper()
+            _exp_ms = str(outcome.get("expected_materialization_status") or "").strip().upper()
+            _exp_reason = str(outcome.get("reason_code") or "").strip()
+            _exp_status = str(outcome.get("terminal_status") or "").strip().upper()
+            try:
+                _exp_gen = int(outcome["expected_generation"])
+            except (KeyError, TypeError, ValueError):
+                _exp_gen = None
+            try:
+                _exp_prior = int(outcome["expected_prior_retry_attempt"])
+            except (KeyError, TypeError, ValueError):
+                _exp_prior = None
+
+            _missing = []
+            if not _exp_client:
+                _missing.append("expected_client_id")
+            if _exp_mode not in {"live", "paper"}:
+                _missing.append("expected_execution_mode")
+            if _exp_lc != "RETRY_WAIT":
+                _missing.append("expected_lifecycle_state=RETRY_WAIT")
+            if _exp_ms != "RETRY_PENDING":
+                _missing.append("expected_materialization_status=RETRY_PENDING")
+            if _exp_gen is None or _exp_gen < 1:
+                _missing.append("expected_generation>=1")
+            if _exp_prior is None or _exp_prior < 0:
+                _missing.append("expected_prior_retry_attempt>=0")
+            if not _exp_reason:
+                _missing.append("reason_code")
+            if _exp_status not in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
+                _missing.append("terminal_status in {REJECTED,EXPIRED,CANCELED,ERROR}")
+
+            if _missing:
+                log.critical(
+                    "[%s] RECOVERY_FENCED_TERM_INVALID_OUTCOME local_order_id=%s "
+                    "missing_or_invalid=%s — row retained; outcome did not carry "
+                    "required fencing fields",
+                    self.client_id, loid, _missing,
+                )
+                result.setdefault("errors", []).append(
+                    f"recovery_fenced_outcome_invalid:{','.join(_missing)}"
+                )
+                return {"result": "INVALID_FENCED_OUTCOME"}
+
             _ok = False
             try:
                 _ok = bool(_fn(
                     loid,
-                    reason_code=str(outcome.get("reason_code") or "RETRY_TERMINAL"),
-                    terminal_status=str(outcome.get("terminal_status") or "EXPIRED"),
-                    expected_client_id=str(outcome.get("expected_client_id") or self.client_id or ""),
-                    expected_execution_mode=str(outcome.get("expected_execution_mode") or recovery_mode or ""),
-                    expected_generation=int(outcome.get("expected_generation") or 0),
-                    expected_prior_retry_attempt=int(outcome.get("expected_prior_retry_attempt") or 0),
+                    reason_code=_exp_reason,
+                    terminal_status=_exp_status,
+                    expected_client_id=_exp_client,
+                    expected_execution_mode=_exp_mode,
+                    expected_generation=_exp_gen,
+                    expected_prior_retry_attempt=_exp_prior,
                     diagnostics={
                         **(extra_diagnostics or {}),
                         "recovery_classification": "fenced_retry_terminal",
@@ -1544,8 +1592,47 @@ class APStartupRecovery:
                     )
                     continue
 
+                # Build and validate the plan before passing to the scaffold.
+                # A None plan means the row has malformed or missing identity
+                # metadata — the scaffold must not be called with None.
+                _br_plan = self._build_recovery_plan_from_order(order)
+                if _br_plan is None:
+                    log.critical(
+                        "[%s] BROKER_READY_RECOVERY_PLAN_INVALID local_order_id=%s "
+                        "— plan construction failed; row retained without submit",
+                        self.client_id, local_order_id,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="broker_ready_recovery_plan_invalid",
+                    )
+                    result.setdefault("errors", []).append(
+                        "broker_ready_recovery_plan_invalid"
+                    )
+                    continue
+                _br_plan_client = str(getattr(_br_plan, "client_id", "") or "").strip().lower()
+                _br_plan_mode = str(getattr(_br_plan, "execution_mode", "") or "").strip().upper()
+                if _br_plan_client and _br_plan_client != self.client_id:
+                    log.error(
+                        "[%s] BROKER_READY_RECOVERY_PLAN_CLIENT_MISMATCH "
+                        "local_order_id=%s plan_client=%r",
+                        self.client_id, local_order_id, _br_plan_client,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="broker_ready_recovery_plan_client_mismatch",
+                    )
+                    continue
+                if _br_plan_mode != recovery_mode:
+                    log.error(
+                        "[%s] BROKER_READY_RECOVERY_PLAN_MODE_MISMATCH "
+                        "local_order_id=%s plan_mode=%r recovery_mode=%s",
+                        self.client_id, local_order_id, _br_plan_mode, recovery_mode,
+                    )
+                    _retain_recovery_ownership(
+                        local_order_id, reason="broker_ready_recovery_plan_mode_mismatch",
+                    )
+                    continue
+
                 try:
-                    _br_plan = self._build_recovery_plan_from_order(order)
                     outcome = resume_fn(local_order_id=local_order_id, plan=_br_plan) or {}
                 except Exception as exc:
                     log.error(
@@ -1849,11 +1936,9 @@ class APStartupRecovery:
                                 _retain_recovery_ownership(
                                     local_order_id, reason=f"fenced_term_write_failed:{_reason}",
                                 )
-                            elif _fenced_result == "FENCED_TERMINAL_UNAVAILABLE":
-                                # OSM method missing — retain ownership so a future
-                                # pass can retry once OSM is deployed.
+                            elif _fenced_result in {"FENCED_TERMINAL_UNAVAILABLE", "INVALID_FENCED_OUTCOME"}:
                                 _retain_recovery_ownership(
-                                    local_order_id, reason="fenced_terminal_unavailable",
+                                    local_order_id, reason=_fenced_result.lower(),
                                 )
                             # ALREADY_TERMINAL / CLAIM_LOST / OWNERSHIP_ADVANCED:
                             # row is owned by another worker — no retention, no error

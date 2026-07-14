@@ -999,3 +999,179 @@ def test_fa4_log_file_not_in_branch():
     assert not tracked, (
         f"logs/signal_ledger.jsonl must not be tracked by git; found: {tracked!r}"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 1: INVALID_FENCED_OUTCOME — incomplete outcome fails closed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fix1_incomplete_outcome_returns_invalid_fenced_outcome():
+    """When the TERMINAL_REQUIRED outcome is missing required fencing fields,
+    _terminalize_fenced_retry must return INVALID_FENCED_OUTCOME, retain
+    ownership, and record the error. It must NOT call the OSM terminal CAS
+    and must NOT fall back to self.client_id or recovery_mode.
+    """
+    from ap_recovery import APStartupRecovery
+    from ap import db as db_mod
+
+    cas_calls = [0]
+
+    class _OSM:
+        client_id = CLIENT_ID
+        def terminalize_deferred_retry_if_unchanged(self, *a, **kw):
+            cas_calls[0] += 1
+            return True
+        def get_order(self, oid):
+            return {
+                "local_order_id": LOCAL_ORDER_ID, "client_id": CLIENT_ID,
+                "execution_mode": "paper", "signal_id": SIGNAL_ID,
+                "status": "PENDING_TRIGGER", "broker_order_id": None, "submitted_ts": None,
+                "meta": {
+                    "lifecycle_state": "RETRY_WAIT",
+                    "materialization_status": "RETRY_PENDING",
+                    "materialization_generation": 4,
+                    "retry_attempt": 1,
+                    "retry_max_attempts": 3,
+                    "next_retry_at": _iso(_now() - timedelta(seconds=60)),
+                    "materialization_next_retry_at": _iso(_now() - timedelta(seconds=60)),
+                    "trigger_crossed_at": _iso(_now() - timedelta(minutes=2)),
+                    "trigger_price": 130.0,
+                },
+            }
+        def update_order_meta(self, *a, **kw): return True
+        def get_orders_for_position(self, *a, **kw): return []
+
+    # Outcome is TERMINAL_REQUIRED but missing critical fencing fields
+    incomplete_outcome = {
+        "disposition": "TERMINAL_REQUIRED",
+        "reason_code": "RETRY_MAX_ATTEMPTS_EXCEEDED",
+        "terminal_status": "EXPIRED",
+        # expected_client_id: MISSING
+        # expected_execution_mode: MISSING
+        # expected_generation: MISSING
+        # expected_prior_retry_attempt: MISSING
+        # expected_lifecycle_state: MISSING
+        # expected_materialization_status: MISSING
+    }
+
+    mock_core = MagicMock()
+    mock_core.resume_deferred_materialization_retry.return_value = incomplete_outcome
+
+    mc = SimpleNamespace(mode="PAPER")
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=_OSM(),
+        pm=MagicMock(), master_control=mc, exit_engine=None,
+        entry_watcher=None, execution_core=mock_core,
+    )
+
+    row = _OSM().get_order(LOCAL_ORDER_ID)
+
+    class _C:
+        def execute(self, *a, **k): return self
+        def fetchall(self): return [row]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    # CAS must NOT be called with inferred/fallback values
+    assert cas_calls[0] == 0, (
+        f"terminalize_deferred_retry_if_unchanged must NOT be called when outcome "
+        f"is missing fencing fields; called {cas_calls[0]} times"
+    )
+    # Error must be recorded
+    errors_str = str(result.get("errors", []))
+    assert "fenced_outcome_invalid" in errors_str or "recovery_fenced_outcome_invalid" in errors_str, (
+        f"Must record invalid fenced outcome error; errors={result.get('errors')}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fix 2: BROKER_READY recovery validates plan before calling scaffold
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_fix2_broker_ready_invalid_plan_retains_without_calling_scaffold():
+    """When _build_recovery_plan_from_order returns None for a BROKER_READY row,
+    recovery must retain ownership with broker_ready_recovery_plan_invalid and
+    record the error. It must NOT call resume_deferred_broker_ready_order.
+    """
+    from ap_recovery import APStartupRecovery
+    from ap import db as db_mod
+
+    scaffold_calls = [0]
+
+    class _OSM:
+        client_id = CLIENT_ID
+        def get_order(self, oid): return None
+        def update_order_meta(self, oid, patch): return True
+        def get_orders_for_position(self, *a, **kw): return []
+
+    mock_core = MagicMock()
+    def _scaffold(**kw):
+        scaffold_calls[0] += 1
+        return {"disposition": "RETRY_WAIT"}
+    mock_core.resume_deferred_broker_ready_order.side_effect = _scaffold
+
+    mc = SimpleNamespace(mode="PAPER")
+    rec = APStartupRecovery(
+        client_id=CLIENT_ID, broker=MagicMock(), osm=_OSM(),
+        pm=MagicMock(), master_control=mc, exit_engine=None,
+        entry_watcher=None, execution_core=mock_core,
+    )
+
+    # A BROKER_READY row with missing direction AND no OCC contract
+    # → plan builder cannot infer direction → returns None
+    br_row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-1",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "symbol": "RTX",
+        "direction": None,   # ← missing
+        "score": 78.0, "tier": "B", "trigger_price": 130.0,
+        "stop_underlying": 128.0, "target_underlying": 133.0,
+        "pattern": "3-1-2", "timeframe": "1d",
+        "contract": "",      # ← no OCC contract → resolver cannot infer CALL/PUT
+        "qty": 1, "limit_price": 2.10, "reserved_cost": 210.0,
+        "meta": {
+            "lifecycle_state": "BROKER_READY",
+            "broker_ready": True,
+            "selected_contract": "",   # no OCC contract in meta either
+            "selected_limit": 2.10,
+            "selected_qty": 1,
+            "materialization_generation": 2,
+            # No submit_intent_at → not in crash window
+        },
+    }
+
+    class _C:
+        def execute(self, *a, **k): return self
+        def fetchall(self): return [br_row]
+        rowcount = 1
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *a): return False
+
+    result = {"deferred_lifecycles_recovered": 0, "errors": []}
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        rec._recover_deferred_breach_lifecycles(result)
+
+    assert scaffold_calls[0] == 0, (
+        f"resume_deferred_broker_ready_order must NOT be called when plan is None; "
+        f"called {scaffold_calls[0]} times"
+    )
+    errors_str = str(result.get("errors", []))
+    assert "broker_ready_recovery_plan_invalid" in errors_str, (
+        f"Must record broker_ready_recovery_plan_invalid error; errors={result.get('errors')}"
+    )
