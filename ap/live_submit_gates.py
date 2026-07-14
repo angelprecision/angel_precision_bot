@@ -67,6 +67,7 @@ USAGE
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -91,8 +92,12 @@ class GateOutcome:
     LIVE_SUBMIT_EXECUTION_MODE_MISMATCH    = "LIVE_SUBMIT_EXECUTION_MODE_MISMATCH"
 
     # Market validity gate (Gate 2)
-    CURRENT_PRICE_MISSING                  = "CURRENT_PRICE_MISSING"
+    CURRENT_PRICE_AGE_UNKNOWN              = "CURRENT_PRICE_AGE_UNKNOWN"
+    CURRENT_PRICE_FETCH_FAILED             = "CURRENT_PRICE_FETCH_FAILED"
+    CURRENT_PRICE_INVALID                  = "CURRENT_PRICE_INVALID"
+    CURRENT_PRICE_FRESH_SYNC_FETCH         = "CURRENT_PRICE_FRESH_SYNC_FETCH"
     CURRENT_PRICE_STALE                    = "CURRENT_PRICE_STALE"
+    CURRENT_PRICE_MISSING                  = "CURRENT_PRICE_MISSING"
     CURRENT_PRICE_ZERO                     = "CURRENT_PRICE_ZERO"
     TARGET_ALREADY_INVALID                 = "TARGET_ALREADY_INVALID"
     REMAINING_OPPORTUNITY_TOO_SMALL        = "REMAINING_OPPORTUNITY_TOO_SMALL"
@@ -354,6 +359,8 @@ def _remaining_opportunity_pct(
         cp, tg, tr = float(current_price), float(target_price), float(trigger_price)
     except (TypeError, ValueError):
         return None
+    if not all(math.isfinite(v) for v in (cp, tg, tr)):
+        return None
 
     _side = str(side or "").strip().upper()
     if _side == "CALL":
@@ -379,6 +386,10 @@ def check_market_validity_gate(
     current_ask: Optional[float],
     quote_age_ms: Optional[float] = None,
     quote_source: Optional[str] = None,
+    quote_fetched_at: Optional[object] = None,
+    quote_provenance: Optional[str] = None,
+    quote_fetch_failed: bool = False,
+    quote_fetch_error: Optional[str] = None,
     execution_mode: str = "live",
     max_quote_age_ms: Optional[int] = None,
     min_remaining_opportunity_pct: Optional[float] = None,
@@ -404,6 +415,7 @@ def check_market_validity_gate(
       • Same checks but log-only. Result.passed always True in paper.
     """
     max_age_ms = max_quote_age_ms if max_quote_age_ms is not None else _int_env("LIVE_SUBMIT_MAX_QUOTE_AGE_MS", 5000)
+    max_future_skew_ms = _int_env("LIVE_SYNC_QUOTE_MAX_FUTURE_SKEW_MS", 1000)
     min_rem_pct = min_remaining_opportunity_pct if min_remaining_opportunity_pct is not None else _float_env("LIVE_SUBMIT_MIN_REMAINING_OPPORTUNITY_PCT", 0.10)
     _mode = str(execution_mode or "").strip().lower()
     _live = _mode == "live"
@@ -414,10 +426,70 @@ def check_market_validity_gate(
         except (TypeError, ValueError):
             return None
 
+    def _finite_float(v):
+        f = _to_float(v)
+        return f if f is not None and math.isfinite(f) else None
+
+    def _quote_value_was_supplied(v) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, str) and not v.strip():
+            return False
+        return True
+
     bid = _to_float(current_bid)
     ask = _to_float(current_ask)
+    bid_supplied = _quote_value_was_supplied(current_bid)
+    ask_supplied = _quote_value_was_supplied(current_ask)
+    bid_malformed = bid is None and bid_supplied
+    ask_malformed = ask is None and ask_supplied
+    provider_age_ms = _to_float(quote_age_ms)
+    provider_age_invalid = provider_age_ms is not None and not math.isfinite(provider_age_ms)
+    provenance = str(quote_provenance or "").strip().lower()
+    fetched_at_iso = None
+    fetched_age_ms = None
+    fetched_at_invalid = False
+    fetched_at_future_ms = None
+    now = _now_utc()
+    if quote_fetched_at is not None:
+        try:
+            if isinstance(quote_fetched_at, datetime):
+                fetched_at = quote_fetched_at
+            else:
+                fetched_at = datetime.fromisoformat(
+                    str(quote_fetched_at).strip().replace("Z", "+00:00")
+                )
+            if fetched_at.tzinfo is None:
+                raise ValueError("quote_fetched_at must include timezone")
+            fetched_at = fetched_at.astimezone(timezone.utc)
+            fetched_at_iso = fetched_at.isoformat()
+            raw_fetched_age_ms = (now - fetched_at).total_seconds() * 1000.0
+            if not math.isfinite(raw_fetched_age_ms):
+                fetched_at_invalid = True
+            elif raw_fetched_age_ms < -float(max_future_skew_ms):
+                fetched_at_future_ms = abs(raw_fetched_age_ms)
+                fetched_at_invalid = True
+            else:
+                fetched_age_ms = max(0.0, raw_fetched_age_ms)
+        except (TypeError, ValueError, OverflowError):
+            fetched_at_iso = None
+            fetched_age_ms = None
+            fetched_at_invalid = True
+
+    effective_age_ms = provider_age_ms
+    freshness_code = None
+    if provider_age_invalid:
+        effective_age_ms = None
+    if effective_age_ms is None and provenance == "synchronous_submit_fetch" and not fetched_at_invalid:
+        effective_age_ms = fetched_age_ms
+        if effective_age_ms is not None:
+            freshness_code = GateOutcome.CURRENT_PRICE_FRESH_SYNC_FETCH
     mid = None
-    if bid is not None and ask is not None and bid > 0 and ask > 0:
+    if (
+        bid is not None and ask is not None
+        and math.isfinite(bid) and math.isfinite(ask)
+        and bid > 0 and ask > 0 and ask >= bid
+    ):
         mid = (bid + ask) / 2.0
 
     audit = {
@@ -431,9 +503,18 @@ def check_market_validity_gate(
         "current_bid":                bid,
         "current_ask":                ask,
         "current_mid":                mid,
-        "quote_age_ms":               _to_float(quote_age_ms),
+        "quote_age_ms":               effective_age_ms,
+        "provider_quote_age_ms":      provider_age_ms,
         "quote_source":               str(quote_source or "").strip() or None,
+        "quote_fetched_at":           fetched_at_iso,
+        "quote_fetched_at_invalid":   fetched_at_invalid,
+        "quote_fetched_at_future_ms": fetched_at_future_ms,
+        "quote_provenance":           provenance or None,
+        "quote_fetch_failed":         bool(quote_fetch_failed),
+        "quote_fetch_error":          str(quote_fetch_error or "").strip() or None,
+        "quote_freshness_code":       freshness_code,
         "max_quote_age_ms":           int(max_age_ms),
+        "max_future_skew_ms":         int(max_future_skew_ms),
         "min_remaining_opportunity_pct": min_rem_pct,
     }
 
@@ -451,33 +532,59 @@ def check_market_validity_gate(
             audit=_audit_out,
         )
 
-    # Rule: quote presence
-    if bid is None or ask is None or bid <= 0 or ask <= 0:
-        if bid is None and ask is None:
-            return _fail(GateOutcome.CURRENT_PRICE_MISSING, "no bid/ask received")
+    # Rule: fetch transport completed successfully.
+    if quote_fetch_failed:
+        return _fail(
+            GateOutcome.CURRENT_PRICE_FETCH_FAILED,
+            f"submit-time quote fetch failed: {quote_fetch_error or 'unknown'}",
+        )
+
+    # Rule: quote presence and numeric validity.
+    if bid is None and ask is None:
+        return _fail(GateOutcome.CURRENT_PRICE_MISSING, "no bid/ask received")
+    if bid_malformed or ask_malformed:
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"bid={current_bid!r} ask={current_ask!r}")
+    if bid is None or ask is None:
+        return _fail(GateOutcome.CURRENT_PRICE_MISSING, f"bid={bid} ask={ask}")
+    if not math.isfinite(bid) or not math.isfinite(ask):
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"bid={bid} ask={ask}")
+    if bid <= 0 or ask <= 0:
         return _fail(GateOutcome.CURRENT_PRICE_ZERO, f"bid={bid} ask={ask}")
+    if ask < bid:
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"inverted bid/ask bid={bid} ask={ask}")
+    if provider_age_invalid:
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"quote_age_ms={provider_age_ms}")
+    if fetched_at_invalid and provenance == "synchronous_submit_fetch" and provider_age_ms is None:
+        return _fail(
+            GateOutcome.CURRENT_PRICE_AGE_UNKNOWN,
+            "invalid synchronous quote fetch timestamp",
+        )
 
     # Rule: quote freshness
-    if quote_age_ms is None and str(execution_mode or "").lower() == "live":
-        # LIVE: unknown age is not the same as fresh. If the adapter returned a
-        # valid bid/ask from a synchronous fetch, it should have stamped age=0.
-        # A None age here means the provider genuinely didn't report it — treat
-        # as stale to enforce verified freshness for LIVE money.
+    if effective_age_ms is None and _live:
         return _fail(
-            GateOutcome.CURRENT_PRICE_STALE,
-            "quote_age_ms=unknown — LIVE requires verified freshness "
-            "(synchronous fetch path stamps age=0)",
+            GateOutcome.CURRENT_PRICE_AGE_UNKNOWN,
+            "quote age unknown — LIVE requires provider age or explicit "
+            "synchronous_submit_fetch provenance with a valid UTC fetch timestamp",
         )
-    if quote_age_ms is not None and float(quote_age_ms) > max_age_ms:
+    if effective_age_ms is not None and effective_age_ms < 0:
+        return _fail(GateOutcome.CURRENT_PRICE_AGE_UNKNOWN, "quote age is negative")
+    if effective_age_ms is not None and effective_age_ms > max_age_ms:
         return _fail(
             GateOutcome.CURRENT_PRICE_STALE,
-            f"quote_age_ms={quote_age_ms:.0f} > max={max_age_ms}",
+            f"quote_age_ms={effective_age_ms:.0f} > max={max_age_ms}",
         )
 
     _side = str(side or "").strip().upper()
-    tr = _to_float(trigger_price) or 0
-    tg = _to_float(target_price)
-    st = _to_float(stop_price)
+    tr = _finite_float(trigger_price)
+    tg = _finite_float(target_price)
+    st = _finite_float(stop_price)
+    if tr is None:
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"trigger_price={trigger_price!r}")
+    if target_price is not None and tg is None:
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"target_price={target_price!r}")
+    if stop_price is not None and st is None:
+        return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"stop_price={stop_price!r}")
 
     # Rule: direction-specific geometry
     # Amendment 3 (PR #305): use ASK (CALL) / BID (PUT) as primary trigger-
@@ -534,7 +641,12 @@ def check_market_validity_gate(
         passed=True,
         reason_code=GateOutcome.PASS,
         detail=f"market valid: mid={mid:.4f} side={_side}",
-        audit={**audit, "passed": True, "reason_code": GateOutcome.PASS},
+        audit={
+            **audit,
+            "passed": True,
+            "reason_code": GateOutcome.PASS,
+            "quote_freshness_code": freshness_code,
+        },
     )
 
 
@@ -707,6 +819,10 @@ def run_all_live_submit_gates(
     current_ask: Optional[float] = None,
     quote_age_ms: Optional[float] = None,
     quote_source: Optional[str] = None,
+    quote_fetched_at: Optional[object] = None,
+    quote_provenance: Optional[str] = None,
+    quote_fetch_failed: bool = False,
+    quote_fetch_error: Optional[str] = None,
     # Trigger age
     trigger_crossed_at: Optional[str] = None,
     trigger_confirmed_at: Optional[str] = None,
@@ -743,6 +859,10 @@ def run_all_live_submit_gates(
         current_ask=current_ask,
         quote_age_ms=quote_age_ms,
         quote_source=quote_source,
+        quote_fetched_at=quote_fetched_at,
+        quote_provenance=quote_provenance,
+        quote_fetch_failed=quote_fetch_failed,
+        quote_fetch_error=quote_fetch_error,
         execution_mode=str(execution_mode or "").strip().lower(),
     )
     combined_audit["market_validity_gate"] = mv_res.audit

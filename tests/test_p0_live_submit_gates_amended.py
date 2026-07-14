@@ -229,6 +229,7 @@ class TestTriggerLaneMarketValidity:
             target_price=110.0,
             current_bid=98.5,
             current_ask=99.5,   # ask=99.5 < trigger=100.0
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False
@@ -243,6 +244,7 @@ class TestTriggerLaneMarketValidity:
             target_price=110.0,
             current_bid=99.8,
             current_ask=100.0,   # ask exactly at trigger
+            quote_age_ms=0,
             execution_mode="live",
         )
         # Trigger check passes; remaining opportunity check may block but not trigger check
@@ -257,6 +259,7 @@ class TestTriggerLaneMarketValidity:
             target_price=110.0,
             current_bid=99.2,   # bid below trigger — fine for CALL
             current_ask=100.8,  # ask above trigger — breach confirmed
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.reason_code != GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER
@@ -271,6 +274,7 @@ class TestTriggerLaneMarketValidity:
             target_price=90.0,
             current_bid=100.5,   # bid=100.5 > trigger=100.0
             current_ask=101.0,
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False
@@ -285,6 +289,7 @@ class TestTriggerLaneMarketValidity:
             target_price=90.0,
             current_bid=100.0,   # exactly at trigger
             current_ask=100.5,
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.reason_code != GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
@@ -298,6 +303,7 @@ class TestTriggerLaneMarketValidity:
             target_price=90.0,
             current_bid=99.5,   # bid below trigger — breach confirmed
             current_ask=100.8,  # ask above trigger — fine for PUT
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.reason_code != GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
@@ -306,7 +312,7 @@ class TestTriggerLaneMarketValidity:
     def test_target_already_hit_blocks(self):
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=105.5, current_ask=105.8,
+            current_bid=105.5, current_ask=105.8, quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False
@@ -315,7 +321,7 @@ class TestTriggerLaneMarketValidity:
     def test_stop_broken_blocks(self):
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
-            current_bid=94.0, current_ask=94.5,   # mid=94.25 < stop=95
+            current_bid=94.0, current_ask=94.5, quote_age_ms=0,  # mid=94.25 < stop=95
             execution_mode="live",
         )
         assert r.passed is False
@@ -329,7 +335,7 @@ class TestTriggerLaneMarketValidity:
         """target=105, trigger=100, current=104.8 → remaining=(105-104.8)/(105-100)=4%."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=104.6, current_ask=104.8,
+            current_bid=104.6, current_ask=104.8, quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False

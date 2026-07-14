@@ -6713,35 +6713,54 @@ class APExecutionCore:
 
             # ── Gate 2: market validity — LIVE only fails closed
             # Fetch a fresh underlying quote from the broker. If the fetch
-            # itself fails, treat as CURRENT_PRICE_MISSING (fail closed LIVE).
+            # itself fails, classify CURRENT_PRICE_FETCH_FAILED (fail closed LIVE).
             # Amendment 6: quote adapter — try the real production quote path.
             # Use the same quote provider shape the watcher and selector use.
-            # Supports bid/ask/source/quote_age_ms. If age is unavailable, stamp
-            # quote_age_ms=None and source but do NOT fake freshness.
+            # Supports bid/ask/source/quote_age_ms. Provider age is optional on
+            # a synchronous response; explicit fetch provenance below proves
+            # freshness without pretending that a cached/unknown quote is new.
             _mv_bid = None
             _mv_ask = None
-            _mv_quote_age_ms = None  # None = age unknown, not "fresh"
+            _mv_quote_age_ms = None
             _mv_quote_source = None
+            _mv_quote_fetched_at = None
+            _mv_quote_provenance = None
+            _mv_quote_fetch_failed = True
+            _mv_quote_fetch_error = "quote_adapter_unavailable"
             try:
                 _mv_q: dict = {}
+                _mv_raw_q = None
                 # Method 1: broker.get_quote() — primary production path
                 if hasattr(self.broker, "get_quote"):
-                    _mv_q = self.broker.get_quote(ticker) or {}
+                    _mv_raw_q = self.broker.get_quote(ticker)
+                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
                 # Method 2: broker.get_bid_ask() — alternate production adapter
                 elif hasattr(self.broker, "get_bid_ask"):
-                    _ba = self.broker.get_bid_ask(ticker) or {}
-                    _mv_q = {
-                        "bid": _ba.get("bid"),
-                        "ask": _ba.get("ask"),
-                        "source": _ba.get("source", "get_bid_ask"),
-                    }
+                    _ba = self.broker.get_bid_ask(ticker)
+                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
+                    if isinstance(_ba, dict):
+                        _mv_raw_q = {
+                            "bid": _ba.get("bid"),
+                            "ask": _ba.get("ask"),
+                            "quote_age_ms": _ba.get("quote_age_ms"),
+                            "source": _ba.get("source", "get_bid_ask"),
+                        }
+                    else:
+                        _mv_raw_q = _ba
                 # Method 3: broker.quote() — older adapter shape
                 elif hasattr(self.broker, "quote"):
-                    _mv_q = self.broker.quote(ticker) or {}
+                    _mv_raw_q = self.broker.quote(ticker)
+                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
                 # Method 4: data_broker attr (paper pods may wire data separately)
                 elif hasattr(self, "data_broker") and hasattr(self.data_broker, "get_quote"):
-                    _mv_q = self.data_broker.get_quote(ticker) or {}
-                if isinstance(_mv_q, dict):
+                    _mv_raw_q = self.data_broker.get_quote(ticker)
+                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
+
+                if isinstance(_mv_raw_q, dict):
+                    _mv_q = _mv_raw_q
+                    _mv_quote_fetch_failed = False
+                    _mv_quote_fetch_error = None
+                    _mv_quote_provenance = "synchronous_submit_fetch"
                     _mv_bid = _mv_q.get("bid")
                     _mv_ask = _mv_q.get("ask")
                     _mv_quote_age_ms = _mv_q.get("quote_age_ms")
@@ -6751,21 +6770,13 @@ class APExecutionCore:
                         or _mv_q.get("provider")
                         or "unknown"
                     )
-                    if _mv_quote_age_ms is None:
-                        _quote_ts_raw = (
-                            _mv_q.get("quote_timestamp")
-                            or _mv_q.get("timestamp")
-                            or _mv_q.get("as_of")
-                        )
-                        if _quote_ts_raw:
-                            _quote_ts = datetime.fromisoformat(str(_quote_ts_raw).replace("Z", "+00:00"))
-                            if _quote_ts.tzinfo is None:
-                                _quote_ts = _quote_ts.replace(tzinfo=timezone.utc)
-                            _mv_quote_age_ms = max(
-                                0.0,
-                                (datetime.now(timezone.utc) - _quote_ts).total_seconds() * 1000.0,
-                            )
+                elif _mv_quote_fetched_at is not None:
+                    _mv_quote_fetch_error = (
+                        f"invalid_quote_response_type:{type(_mv_raw_q).__name__}"
+                    )
             except Exception as _mv_exc:
+                _mv_quote_fetch_failed = True
+                _mv_quote_fetch_error = f"{type(_mv_exc).__name__}:{_mv_exc}"
                 log.warning(
                     "[%s] LIVE_SUBMIT_GATE market quote fetch failed "
                     "order_id=%s source=%r error=%s",
@@ -6786,6 +6797,10 @@ class APExecutionCore:
                 current_ask=_mv_ask,
                 quote_age_ms=_mv_quote_age_ms,
                 quote_source=_mv_quote_source,
+                quote_fetched_at=_mv_quote_fetched_at,
+                quote_provenance=_mv_quote_provenance,
+                quote_fetch_failed=_mv_quote_fetch_failed,
+                quote_fetch_error=_mv_quote_fetch_error,
                 execution_mode=_gate_exec_mode,
             )
             _final_market_validity_audit = _mv_res.audit

@@ -141,6 +141,7 @@ class TestMarketValidityGate:
             target_price=105.0,
             current_bid=105.10,
             current_ask=105.20,   # mid = 105.15 >= target 105.0
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False
@@ -154,6 +155,7 @@ class TestMarketValidityGate:
             target_price=95.0,
             current_bid=94.90,
             current_ask=94.95,   # mid = 94.925 <= target 95
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False
@@ -169,6 +171,7 @@ class TestMarketValidityGate:
             target_price=105.0,
             current_bid=104.75,
             current_ask=104.85,
+            quote_age_ms=0,
             execution_mode="live",
         )
         assert r.passed is False
@@ -220,7 +223,7 @@ class TestMarketValidityGate:
         before we could submit. Never send a stale entry."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=99.4, current_ask=99.6, execution_mode="live",
+            current_bid=99.4, current_ask=99.6, quote_age_ms=0, execution_mode="live",
         )
         assert r.passed is False
         assert r.reason_code == GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER
@@ -228,7 +231,7 @@ class TestMarketValidityGate:
     def test_09b_blocks_put_no_longer_below_trigger(self):
         r = check_market_validity_gate(
             side="PUT", trigger_price=100.0, stop_price=105.0, target_price=95.0,
-            current_bid=100.5, current_ask=100.7, execution_mode="live",
+            current_bid=100.5, current_ask=100.7, quote_age_ms=0, execution_mode="live",
         )
         assert r.passed is False
         assert r.reason_code == GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
@@ -236,7 +239,7 @@ class TestMarketValidityGate:
     def test_10_blocks_call_stop_broken_before_submit(self):
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=94.5, current_ask=94.9, execution_mode="live",
+            current_bid=94.5, current_ask=94.9, quote_age_ms=0, execution_mode="live",
         )
         assert r.passed is False
         # This will match CALL_NO_LONGER_ABOVE_TRIGGER since 94 < 100 first
@@ -399,6 +402,7 @@ class TestGateIntegration:
             side="CALL", trigger_price=100.0,
             target_price=105.0,
             current_bid=105.5, current_ask=105.7,   # target hit
+            quote_age_ms=0,
             trigger_crossed_at=self._iso(30),
         )
         assert result.passed is False
