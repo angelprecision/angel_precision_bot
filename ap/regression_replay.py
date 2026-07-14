@@ -2,9 +2,9 @@ from __future__ import annotations
 
 """Deterministic, read-only regression replay primitives.
 
-This module intentionally has no database, broker, HTTP, queue, or order-state
-imports. It loads immutable recorded fixtures, runs explicitly supplied pure
-stage adapters, and reports the first behavioral divergence between two traces.
+The harness imports no database, broker, HTTP, queue, or order-state code. It
+loads immutable recorded evidence, runs explicitly injected pure stage adapters,
+and reports the first behavioral divergence between two traces.
 """
 
 import argparse
@@ -17,7 +17,6 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 UNKNOWN = "UNKNOWN"
 SCHEMA_VERSION = 1
-
 STAGE_ORDER: tuple[str, ...] = (
     "scanner",
     "queue_normalization",
@@ -32,7 +31,6 @@ STAGE_ORDER: tuple[str, ...] = (
     "protective_exit_submission",
     "reconciliation",
 )
-
 _CRITICAL_EVIDENCE_FIELDS = (
     "execution_mode",
     "signal_id",
@@ -50,7 +48,27 @@ _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$", re.IGNORECASE)
 
 
 class FixtureValidationError(ValueError):
-    """Raised when a fixture would conceal, invent, or leak evidence."""
+    """Raised when fixture data would conceal, invent, or leak evidence."""
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(k): _deep_freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in value)
+    if isinstance(value, set):
+        return frozenset(_deep_freeze(v) for v in value)
+    return value
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in sorted(value.items())}
+    if isinstance(value, (tuple, list)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(_json_safe(v) for v in value)
+    return value
 
 
 @dataclass(frozen=True)
@@ -140,7 +158,13 @@ class ReplayTrace:
     derived_win: bool
 
     def by_stage(self) -> Mapping[str, StageEvent]:
+        """Return the final event per stage for convenient point lookups."""
         return MappingProxyType({event.stage: event for event in self.events})
+
+    def events_for_stage(self, stage: str) -> tuple[StageEvent, ...]:
+        if stage not in STAGE_ORDER:
+            raise FixtureValidationError(f"unknown replay stage: {stage!r}")
+        return tuple(event for event in self.events if event.stage == stage)
 
 
 @dataclass(frozen=True)
@@ -154,22 +178,12 @@ class ReplayComparison:
     changed: bool
 
 
+StageRunnerResult = (
+    StageEvent | Mapping[str, Any] | Sequence[StageEvent | Mapping[str, Any]]
+)
 StageRunner = Callable[
-    [Mapping[str, Any], tuple[StageEvent, ...]],
-    StageEvent | Mapping[str, Any],
+    [Mapping[str, Any], tuple[StageEvent, ...]], StageRunnerResult
 ]
-
-
-def _deep_freeze(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({str(k): _deep_freeze(v) for k, v in value.items()})
-    if isinstance(value, list):
-        return tuple(_deep_freeze(v) for v in value)
-    if isinstance(value, tuple):
-        return tuple(_deep_freeze(v) for v in value)
-    if isinstance(value, set):
-        return frozenset(_deep_freeze(v) for v in value)
-    return value
 
 
 def _walk(value: Any, path: str = "") -> Iterable[tuple[str, Any]]:
@@ -213,11 +227,10 @@ def _validate_fixture_payload(payload: Mapping[str, Any], current_main: str) -> 
         raise FixtureValidationError(
             f"{fixture_id}: deployment_git_commits must be a non-empty list"
         )
-    for commit in commits:
-        if commit != UNKNOWN and not _SHA_RE.fullmatch(str(commit)):
-            raise FixtureValidationError(
-                f"{fixture_id}: invalid deployment commit evidence: {commit!r}"
-            )
+    if any(
+        commit != UNKNOWN and not _SHA_RE.fullmatch(str(commit)) for commit in commits
+    ):
+        raise FixtureValidationError(f"{fixture_id}: invalid deployment commit evidence")
 
     evidence = payload.get("evidence")
     if not isinstance(evidence, Mapping):
@@ -225,10 +238,9 @@ def _validate_fixture_payload(payload: Mapping[str, Any], current_main: str) -> 
     for field_name in _CRITICAL_EVIDENCE_FIELDS:
         if field_name not in evidence:
             raise FixtureValidationError(
-                f"{fixture_id}: missing critical field {field_name}; "
-                "write UNKNOWN explicitly"
+                f"{fixture_id}: missing critical field {field_name}; write UNKNOWN explicitly"
             )
-        if evidence[field_name] is None or evidence[field_name] == "":
+        if evidence[field_name] in (None, ""):
             raise FixtureValidationError(
                 f"{fixture_id}: {field_name} must be a value or explicit UNKNOWN"
             )
@@ -243,18 +255,15 @@ def _validate_fixture_payload(payload: Mapping[str, Any], current_main: str) -> 
         float(pnl)
     except (TypeError, ValueError) as exc:
         raise FixtureValidationError(
-            f"{fixture_id}: outcome requires numeric realized_pnl_pct "
-            "or option_pnl_pct"
+            f"{fixture_id}: outcome requires numeric realized_pnl_pct or option_pnl_pct"
         ) from exc
 
-    trace = payload.get("historical_trace")
-    if not isinstance(trace, list) or not trace:
+    if not isinstance(payload.get("historical_trace"), list) or not payload[
+        "historical_trace"
+    ]:
         raise FixtureValidationError(f"{fixture_id}: historical_trace is required")
-
-    gaps = payload.get("evidence_gaps")
-    if not isinstance(gaps, list):
+    if not isinstance(payload.get("evidence_gaps"), list):
         raise FixtureValidationError(f"{fixture_id}: evidence_gaps must be a list")
-
     _validate_no_sensitive_data(payload, fixture_id)
 
 
@@ -267,13 +276,13 @@ def load_fixture_bundle(path: str | Path) -> tuple[ReplayFixture, ...]:
             f"unsupported schema_version={raw.get('schema_version')!r}"
         )
     current_main = str(raw.get("current_main") or "").strip()
-    fixtures = raw.get("fixtures")
-    if not isinstance(fixtures, list) or not fixtures:
+    payloads = raw.get("fixtures")
+    if not isinstance(payloads, list) or not payloads:
         raise FixtureValidationError("fixture bundle must contain fixtures")
 
     loaded: list[ReplayFixture] = []
     seen_ids: set[str] = set()
-    for payload in fixtures:
+    for payload in payloads:
         if not isinstance(payload, Mapping):
             raise FixtureValidationError("each fixture must be an object")
         _validate_fixture_payload(payload, current_main)
@@ -290,7 +299,7 @@ def load_fixture_bundle(path: str | Path) -> tuple[ReplayFixture, ...]:
                 side=str(payload["side"]).upper(),
                 timeframe=str(payload["timeframe"]),
                 deployment_git_commits=tuple(
-                    str(v) for v in payload["deployment_git_commits"]
+                    str(value) for value in payload["deployment_git_commits"]
                 ),
                 deployment_commit_confidence=str(
                     payload.get("deployment_commit_confidence") or UNKNOWN
@@ -302,21 +311,49 @@ def load_fixture_bundle(path: str | Path) -> tuple[ReplayFixture, ...]:
                     StageEvent.from_mapping(event)
                     for event in payload["historical_trace"]
                 ),
-                evidence_gaps=tuple(str(v) for v in payload["evidence_gaps"]),
+                evidence_gaps=tuple(str(value) for value in payload["evidence_gaps"]),
             )
         )
     return tuple(loaded)
 
 
 def historical_trace(fixture: ReplayFixture) -> ReplayTrace:
-    version = "+".join(fixture.deployment_git_commits)
     return ReplayTrace(
         fixture_id=fixture.fixture_id,
-        version=version,
+        version="+".join(fixture.deployment_git_commits),
         events=fixture.historical_trace,
         authoritative_pnl_pct=fixture.authoritative_pnl_pct,
         derived_win=fixture.derived_win,
     )
+
+
+def _coerce_runner_events(
+    fixture_id: str, stage: str, result: StageRunnerResult
+) -> tuple[StageEvent, ...]:
+    if isinstance(result, StageEvent) or isinstance(result, Mapping):
+        raw_events: Sequence[StageEvent | Mapping[str, Any]] = (result,)
+    elif isinstance(result, Sequence) and not isinstance(result, (str, bytes)):
+        raw_events = result
+    else:
+        raise FixtureValidationError(
+            f"{fixture_id}: runner for {stage} returned unsupported result"
+        )
+    if not raw_events:
+        raise FixtureValidationError(f"{fixture_id}: runner for {stage} returned no events")
+
+    events: list[StageEvent] = []
+    for raw_event in raw_events:
+        event = (
+            raw_event
+            if isinstance(raw_event, StageEvent)
+            else StageEvent.from_mapping(raw_event)
+        )
+        if event.stage != stage:
+            raise FixtureValidationError(
+                f"{fixture_id}: runner for {stage} returned stage={event.stage}"
+            )
+        events.append(event)
+    return tuple(events)
 
 
 def run_replay(
@@ -325,13 +362,7 @@ def run_replay(
     version: str,
     stage_runners: Mapping[str, StageRunner],
 ) -> ReplayTrace:
-    """Run supplied pure adapters in canonical order.
-
-    The harness does not discover or import production services. A caller must
-    explicitly supply an adapter for each stage it wants to exercise. Missing
-    adapters are represented as NOT_RUN, which prevents missing evidence from
-    being silently interpreted as a pass.
-    """
+    """Run supplied pure adapters in canonical stage order."""
 
     events: list[StageEvent] = []
     fixture_view = fixture.read_only_view()
@@ -346,19 +377,11 @@ def run_replay(
                 )
             )
             continue
-        result = runner(fixture_view, tuple(events))
-        event = (
-            result
-            if isinstance(result, StageEvent)
-            else StageEvent.from_mapping(result)
-        )
-        if event.stage != stage:
-            raise FixtureValidationError(
-                f"{fixture.fixture_id}: runner for {stage} "
-                f"returned stage={event.stage}"
+        events.extend(
+            _coerce_runner_events(
+                fixture.fixture_id, stage, runner(fixture_view, tuple(events))
             )
-        events.append(event)
-
+        )
     return ReplayTrace(
         fixture_id=fixture.fixture_id,
         version=str(version),
@@ -368,9 +391,7 @@ def run_replay(
     )
 
 
-def _event_signature(event: StageEvent | None) -> tuple[Any, ...] | None:
-    if event is None:
-        return None
+def _event_signature(event: StageEvent) -> tuple[Any, ...]:
     return (
         event.decision,
         event.reason_code,
@@ -379,37 +400,43 @@ def _event_signature(event: StageEvent | None) -> tuple[Any, ...] | None:
     )
 
 
-def _json_safe(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(k): _json_safe(v) for k, v in sorted(value.items())}
-    if isinstance(value, (tuple, list)):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, (set, frozenset)):
-        return sorted(_json_safe(v) for v in value)
-    return value
-
-
 def compare_traces(
-    baseline: ReplayTrace,
-    candidate: ReplayTrace,
+    baseline: ReplayTrace, candidate: ReplayTrace
 ) -> ReplayComparison:
     if baseline.fixture_id != candidate.fixture_id:
         raise FixtureValidationError("cannot compare traces from different fixtures")
-    baseline_by_stage = baseline.by_stage()
-    candidate_by_stage = candidate.by_stage()
     for stage in STAGE_ORDER:
-        base_event = baseline_by_stage.get(stage)
-        cand_event = candidate_by_stage.get(stage)
-        if _event_signature(base_event) != _event_signature(cand_event):
-            return ReplayComparison(
-                fixture_id=baseline.fixture_id,
-                baseline_version=baseline.version,
-                candidate_version=candidate.version,
-                first_divergence_stage=stage,
-                baseline_event=base_event,
-                candidate_event=cand_event,
-                changed=True,
-            )
+        base_events = baseline.events_for_stage(stage)
+        cand_events = candidate.events_for_stage(stage)
+        if tuple(map(_event_signature, base_events)) == tuple(
+            map(_event_signature, cand_events)
+        ):
+            continue
+        mismatch_index = 0
+        shared = min(len(base_events), len(cand_events))
+        while (
+            mismatch_index < shared
+            and _event_signature(base_events[mismatch_index])
+            == _event_signature(cand_events[mismatch_index])
+        ):
+            mismatch_index += 1
+        return ReplayComparison(
+            fixture_id=baseline.fixture_id,
+            baseline_version=baseline.version,
+            candidate_version=candidate.version,
+            first_divergence_stage=stage,
+            baseline_event=(
+                base_events[mismatch_index]
+                if mismatch_index < len(base_events)
+                else None
+            ),
+            candidate_event=(
+                cand_events[mismatch_index]
+                if mismatch_index < len(cand_events)
+                else None
+            ),
+            changed=True,
+        )
     return ReplayComparison(
         fixture_id=baseline.fixture_id,
         baseline_version=baseline.version,
@@ -453,12 +480,11 @@ def comparison_to_dict(comparison: ReplayComparison) -> dict[str, Any]:
 
 
 def build_fixture_summary(fixtures: Sequence[ReplayFixture]) -> dict[str, Any]:
-    wins = sum(1 for fixture in fixtures if fixture.derived_win)
-    losses = len(fixtures) - wins
+    wins = sum(fixture.derived_win for fixture in fixtures)
     return {
         "fixtures": len(fixtures),
         "wins": wins,
-        "losses": losses,
+        "losses": len(fixtures) - wins,
         "current_main": sorted({fixture.current_main for fixture in fixtures}),
         "deployment_commits": sorted(
             {
@@ -468,15 +494,12 @@ def build_fixture_summary(fixtures: Sequence[ReplayFixture]) -> dict[str, Any]:
             }
         ),
         "fixtures_with_unknown_execution_mode": sum(
-            1
-            for fixture in fixtures
-            if fixture.evidence.get("execution_mode") == UNKNOWN
+            fixture.evidence.get("execution_mode") == UNKNOWN for fixture in fixtures
         ),
         "fixtures_with_missing_identity": sum(
-            1
-            for fixture in fixtures
-            if fixture.evidence.get("signal_id") == UNKNOWN
+            fixture.evidence.get("signal_id") == UNKNOWN
             or fixture.evidence.get("local_order_id") == UNKNOWN
+            for fixture in fixtures
         ),
     }
 
@@ -496,21 +519,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Validate read-only AP regression fixtures"
     )
     parser.add_argument("--fixtures", type=Path, default=_default_fixture_path())
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="emit machine-readable JSON",
-    )
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-
-    fixtures = load_fixture_bundle(args.fixtures)
-    summary = build_fixture_summary(fixtures)
+    summary = build_fixture_summary(load_fixture_bundle(args.fixtures))
     if args.json:
         print(json.dumps(summary, sort_keys=True))
     else:
         print(
-            "Regression fixtures: "
-            f"{summary['fixtures']} total, "
+            f"Regression fixtures: {summary['fixtures']} total, "
             f"{summary['wins']} wins, {summary['losses']} losses; "
             f"unknown_mode={summary['fixtures_with_unknown_execution_mode']}; "
             f"missing_identity={summary['fixtures_with_missing_identity']}"
