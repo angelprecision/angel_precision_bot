@@ -7009,6 +7009,37 @@ class APExecutionCore:
             limit_price=submit_limit,
         )
 
+        if submit_res.get("reconciliation_required") or submit_res.get("split_brain"):
+            reason_code = str(
+                submit_res.get("error")
+                or (
+                    "ENTRY_SPLIT_BRAIN_QUARANTINED"
+                    if submit_res.get("split_brain")
+                    else "ENTRY_BROKER_IDENTITY_UNPROVEN"
+                )
+            )
+            broker_order_id = submit_res.get("broker_order_id")
+            log.warning(
+                "[%s] Entry submit requires broker reconciliation | local=%s "
+                "broker=%s error=%s reconciliation_required=%s split_brain=%s",
+                ticker,
+                submit_res.get("local_order_id") or queue_local_order_id,
+                broker_order_id,
+                reason_code,
+                submit_res.get("reconciliation_required"),
+                submit_res.get("split_brain"),
+            )
+            if signal_id:
+                self.store.update_signal_fields(signal_id, {
+                    "decision_status": "reconcile_pending",
+                    "context_notes": f"osm_reconcile_broker_intent={reason_code}",
+                })
+            return {
+                "disposition": "RECONCILE_BROKER_INTENT",
+                "reason_code": reason_code,
+                "broker_order_id": broker_order_id,
+            }
+
         if submit_res.get("ok"):
             local_order_id = submit_res.get("local_order_id")
             broker_order_id = submit_res.get("broker_order_id")

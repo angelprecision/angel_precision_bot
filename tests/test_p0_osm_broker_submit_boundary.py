@@ -63,6 +63,18 @@ def _make_osm() -> APOrderStateMachine:
     return APOrderStateMachine(_CLIENT)
 
 
+def _patch_copyback_retry(retry_fn):
+    """Patch the exact globals used by persist_deferred_broker_ready().
+
+    Full-suite imports can leave multiple module aliases around this legacy
+    OSM surface. Patching the method globals keeps these diagnostics tests
+    bound to the function under test instead of whichever module alias pytest
+    imported first.
+    """
+    method_globals = APOrderStateMachine.persist_deferred_broker_ready.__globals__
+    return patch.dict(method_globals, {"run_with_retry": retry_fn})
+
+
 def test_real_uuid_uses_exact_canonical_32_character_broker_tag():
     assert len(_LOID) == 36
     assert len(_TAG) == 32
@@ -207,7 +219,7 @@ class TestCopybackSchemaError:
         def _raise(_fn):
             raise Exception("column contract_selection_status does not exist")
 
-        with patch("ap.order_state_machine.run_with_retry", _raise), \
+        with _patch_copyback_retry(_raise), \
              caplog.at_level(logging.CRITICAL, logger="ap.order_state_machine"):
             result = osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -221,7 +233,7 @@ class TestCopybackSchemaError:
         def _raise(_fn):
             raise Exception("column \"contract_selection_status\" of relation \"orders\" does not exist")
 
-        with patch("ap.order_state_machine.run_with_retry", _raise), \
+        with _patch_copyback_retry(_raise), \
              caplog.at_level(logging.CRITICAL, logger="ap.order_state_machine"):
             result = osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -234,7 +246,7 @@ class TestCopybackSchemaError:
         def _raise(_fn):
             raise Exception("column contract_selection_status does not exist")
 
-        with patch("ap.order_state_machine.run_with_retry", _raise), \
+        with _patch_copyback_retry(_raise), \
              caplog.at_level(logging.DEBUG, logger="ap.order_state_machine"):
             osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -250,7 +262,7 @@ class TestCopybackDbError:
         def _raise(_fn):
             raise Exception("connection reset by peer")
 
-        with patch("ap.order_state_machine.run_with_retry", _raise), \
+        with _patch_copyback_retry(_raise), \
              caplog.at_level(logging.CRITICAL, logger="ap.order_state_machine"):
             result = osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -264,7 +276,7 @@ class TestCopybackDbError:
         def _raise(_fn):
             raise Exception("connection reset by peer")
 
-        with patch("ap.order_state_machine.run_with_retry", _raise), \
+        with _patch_copyback_retry(_raise), \
              caplog.at_level(logging.DEBUG, logger="ap.order_state_machine"):
             osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -298,7 +310,7 @@ class TestCopybackCasMiss:
             "recovery_submit_owner": "",
             "submit_intent_at": "",
         }
-        with patch("ap.order_state_machine.run_with_retry", self._rwr_zero_then_row(reread)), \
+        with _patch_copyback_retry(self._rwr_zero_then_row(reread)), \
              caplog.at_level(logging.CRITICAL, logger="ap.order_state_machine"):
             result = osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -319,7 +331,7 @@ class TestCopybackCasMiss:
             "recovery_submit_owner": "",
             "submit_intent_at": "2026-07-15T09:29:59Z",
         }
-        with patch("ap.order_state_machine.run_with_retry", self._rwr_zero_then_row(reread)), \
+        with _patch_copyback_retry(self._rwr_zero_then_row(reread)), \
              caplog.at_level(logging.CRITICAL, logger="ap.order_state_machine"):
             osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -339,7 +351,7 @@ class TestCopybackCasMiss:
 
         osm.transition = _record_transition  # type: ignore[assignment]
 
-        with patch("ap.order_state_machine.run_with_retry", self._rwr_zero_then_row(None)), \
+        with _patch_copyback_retry(self._rwr_zero_then_row(None)), \
              caplog.at_level(logging.CRITICAL, logger="ap.order_state_machine"):
             osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -350,7 +362,7 @@ class TestCopybackCasMiss:
 
     def test_cas_miss_not_mislabeled_schema_or_db_error(self, caplog):
         osm = _make_osm()
-        with patch("ap.order_state_machine.run_with_retry", self._rwr_zero_then_row(None)), \
+        with _patch_copyback_retry(self._rwr_zero_then_row(None)), \
              caplog.at_level(logging.DEBUG, logger="ap.order_state_machine"):
             osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
@@ -367,7 +379,7 @@ class TestCopybackSuccess:
         def _rwr(_fn):
             return 1  # simulate a successful UPDATE rowcount
 
-        with patch("ap.order_state_machine.run_with_retry", _rwr), \
+        with _patch_copyback_retry(_rwr), \
              caplog.at_level(logging.DEBUG, logger="ap.order_state_machine"):
             result = osm.persist_deferred_broker_ready(_LOID, **_persist_args())
 
