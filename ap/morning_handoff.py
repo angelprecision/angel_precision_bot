@@ -1154,7 +1154,7 @@ def run_morning_handoff_audit(
             # Live (Jason) already has trade_queue WATCHING rows written by
             # overnight_reeval. Running fanout for live would create duplicate
             # rows from shared/paper-origin ap_signals. Do not run for live.
-            if mode == "paper" and stage in ("post_overnight_reeval", "manual"):
+            if mode == "paper" and stage in ("startup", "post_overnight_reeval", "manual"):
                 enqueue_result = enqueue_watching_signals_to_trade_queue(
                     target_client_id=client_id,
                     execution_mode=mode,

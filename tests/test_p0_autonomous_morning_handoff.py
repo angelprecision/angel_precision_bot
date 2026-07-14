@@ -125,6 +125,19 @@ def test_startup_same_day_restart_does_not_skip_when_watcher_ownership_missing(m
     )
     monkeypatch.setattr(morning_handoff, "_has_unowned_pending_trigger_orders", lambda *args, **kwargs: True)
 
+    enqueue_calls = []
+    monkeypatch.setattr(
+        morning_handoff,
+        "enqueue_watching_signals_to_trade_queue",
+        lambda **kwargs: enqueue_calls.append(kwargs) or {
+            "errors": [],
+            "inserted": [],
+            "skipped_duplicate": [{"signal_id": "sig-1"}],
+            "rejected": [],
+            "signals_found": 1,
+        },
+    )
+
     reseed_calls = []
 
     class _Recovery:
@@ -159,6 +172,13 @@ def test_startup_same_day_restart_does_not_skip_when_watcher_ownership_missing(m
     )
     assert result["ok"] is True
     assert not result.get("skipped")
+    assert enqueue_calls == [{
+        "target_client_id": "paper@example.com",
+        "execution_mode": "paper",
+        "trading_date": result["trading_date"],
+        "dry_run": False,
+        "now": None,
+    }]
     assert reseed_calls == [True]
 
 

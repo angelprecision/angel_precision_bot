@@ -585,10 +585,23 @@ def test_final_1b_live_mode_startup_stage_also_skips_enqueue():
     mock_enqueue.assert_not_called()
 
 
-def test_final_1c_paper_startup_stage_also_skips_enqueue():
-    """startup stage for paper must not enqueue (only post_overnight_reeval and manual)."""
-    _, mock_enqueue = _run_handoff_audit(mode="paper", stage="startup")
-    mock_enqueue.assert_not_called()
+def test_final_1c_paper_startup_stage_enqueues_for_autonomous_restart():
+    """Paper startup must fan out signals without waiting for a scheduled job."""
+    enqueue_ok_result = {
+        "errors": [],
+        "inserted": [{"signal_id": "sig-001", "ticker": "NKE"}],
+        "skipped_duplicate": [],
+        "rejected": [],
+        "signals_found": 1,
+    }
+    result, mock_enqueue = _run_handoff_audit(
+        mode="paper",
+        stage="startup",
+        enqueue_result=enqueue_ok_result,
+    )
+    mock_enqueue.assert_called_once()
+    assert result["ok"] is True
+    assert result["enqueue_result"] == enqueue_ok_result
 
 
 # ── Test 2: queued_at NULL rows not selected ─────────────────────────────────
