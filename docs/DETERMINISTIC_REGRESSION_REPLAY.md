@@ -27,11 +27,22 @@ Deployment SHAs come from `decision_events.git_commit` at the recorded trade win
 11. protective exit submission
 12. reconciliation
 
+Repeated events at one stage remain ordered. For example, a scale-out followed by profit lock is not collapsed into one final exit decision.
+
 ## Usage
 
 ```bash
 python -m ap.regression_replay --json
-python -m pytest tests/test_p0_regression_replay_harness.py -v
+python -m pytest \
+  tests/test_p0_regression_replay_harness.py \
+  tests/test_p0_regression_replay_sequences.py \
+  -v
 ```
 
-The next integration step is to add pure adapters for current-main stage evaluators. Adapter wiring must remain dependency-injected so the harness itself never discovers production credentials or services.
+Local verification before opening this PR: `15 passed`.
+
+The current fixture summary is intentionally honest: ten fixtures, four numeric wins, six numeric losses, and all ten fixtures missing provable historical execution mode and durable signal/order identity.
+
+## Scope limitation
+
+This PR supplies the deterministic foundation and recorded historical traces. It does **not** claim current-main production evaluators are already wired into replay. The next integration must add pure, dependency-injected stage adapters so the harness itself never discovers production credentials, database connections, or live services.
