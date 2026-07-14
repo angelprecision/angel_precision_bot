@@ -64,6 +64,11 @@ def _make_row(
     **extra,
 ) -> dict:
     """Construct a minimal synthetic orders row for classifier tests."""
+    if meta is None:
+        meta = {
+            "watcher_token": "watcher-token-001",
+            "current_owner": "entry_watcher:test@example.com",
+        }
     return {
         "local_order_id": "ord-test-001",
         "client_id":      "test@example.com",
@@ -80,7 +85,7 @@ def _make_row(
         "created_ts":     "2026-07-14T09:00:00+00:00",
         "updated_ts":     updated_ts or "2026-07-14T13:55:00+00:00",
         "last_error":     None,
-        "meta":           meta or {},
+        "meta":           meta,
         **extra,
     }
 
@@ -172,6 +177,15 @@ class TestMetaHelpers:
         assert ts is None
         assert field == ""
 
+    def test_resolve_retry_malformed_authoritative_field_does_not_fall_back(self):
+        meta = {
+            "materialization_next_retry_at": "not-a-timestamp",
+            "deferred_retry_next_attempt_at": _FUTURE,
+        }
+        ts, field = _resolve_retry_timestamp(meta)
+        assert ts is None
+        assert field == "materialization_next_retry_at"
+
     def test_parse_iso_utc_naive_returns_none(self):
         """Timezone-naive timestamps must be treated as malformed (not silently UTC)."""
         result = _parse_iso_utc("2026-07-14T14:10:00")  # no tz info
@@ -215,6 +229,21 @@ class TestPreBreach:
     def test_pre_breach_state_updated_at_populated(self):
         r = _classify(_make_row(updated_ts="2026-07-14T13:55:00+00:00"))
         assert "2026-07-14" in (r["state_updated_at"] or "")
+
+    def test_ownerless_pending_trigger_is_not_reported_healthy(self):
+        row = _make_row(status="PENDING_TRIGGER", meta={})
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.PRE_BREACH_OWNERSHIP_UNPROVEN
+        assert r["action_required"] is True
+        assert r["no_broker_id_reason"] == "PRE_BREACH_OWNERSHIP_UNPROVEN"
+
+    def test_watcher_token_proves_pre_breach_ownership(self):
+        row = _make_row(status="PENDING_TRIGGER", meta={"watcher_token": "wt-1"})
+        assert _classify(row)["execution_state"] == EntryExecutionState.PRE_BREACH
+
+    def test_current_owner_proves_pre_breach_ownership(self):
+        row = _make_row(status="PENDING_TRIGGER", meta={"current_owner": "entry_watcher:test"})
+        assert _classify(row)["execution_state"] == EntryExecutionState.PRE_BREACH
 
 
 class TestFutureRetryScheduled:
@@ -378,6 +407,20 @@ class TestMaterializing:
         r = _classify(_make_row(contract="DEFERRED:AAPL", limit_price=0.01, meta=meta))
         assert r["execution_state"] == EntryExecutionState.MATERIALIZING
 
+    def test_expired_materialization_lease_requires_action(self):
+        r = _classify(self._row(
+            materialization_lease_until=(_NOW - _dt.timedelta(seconds=30)).isoformat()
+        ))
+        assert r["execution_state"] == EntryExecutionState.MATERIALIZING
+        assert r["no_broker_id_reason"] == "MATERIALIZATION_LEASE_EXPIRED"
+        assert r["action_required"] is True
+
+    def test_malformed_materialization_lease_requires_action(self):
+        r = _classify(self._row(materialization_lease_until="not-a-timestamp"))
+        assert r["execution_state"] == EntryExecutionState.MATERIALIZING
+        assert "MALFORMED_MATERIALIZATION_LEASE" in r["no_broker_id_reason"]
+        assert r["action_required"] is True
+
 
 class TestBrokerReady:
     """BROKER_READY — contract selected, awaiting broker POST."""
@@ -388,6 +431,7 @@ class TestBrokerReady:
             "materialization_status": "SELECTED",
             "materialization_in_flight": False,
             "broker_ready": True,
+            "broker_ready_at": (_NOW - _dt.timedelta(seconds=30)).isoformat(),
             "materialization_generation": 1,
             "current_owner": "watcher:AAPL:abc",
         }
@@ -409,9 +453,33 @@ class TestBrokerReady:
         r = _classify(self._row())
         assert "BROKER_SUBMITTED" in r["next_expected_transition"]
 
+    def test_missing_broker_ready_timestamp_requires_action(self):
+        row = self._row()
+        row["meta"].pop("broker_ready_at")
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.BROKER_READY
+        assert r["no_broker_id_reason"] == "BROKER_READY_TIMESTAMP_MISSING"
+        assert r["action_required"] is True
+
+    def test_stale_broker_ready_requires_action(self):
+        row = self._row()
+        row["meta"]["broker_ready_at"] = (_NOW - _dt.timedelta(minutes=30)).isoformat()
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.BROKER_READY
+        assert r["no_broker_id_reason"] == "STALE_BROKER_READY"
+        assert r["action_required"] is True
+
+    def test_malformed_broker_ready_timestamp_requires_action(self):
+        row = self._row()
+        row["meta"]["broker_ready_at"] = "not-a-timestamp"
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.BROKER_READY
+        assert "MALFORMED_BROKER_READY_TIMESTAMP" in r["no_broker_id_reason"]
+        assert r["action_required"] is True
+
 
 class TestFinalGateBlocked:
-    """FINAL_GATE_BLOCKED — live submit gate blocked and order terminated."""
+    """FINAL_GATE_BLOCKED_NOT_TERMINALIZED — blocked gate on nonterminal row."""
 
     def _row(self, reason_code: str = "CURRENT_PRICE_STALE") -> dict:
         meta = {
@@ -434,19 +502,19 @@ class TestFinalGateBlocked:
 
     def test_state(self):
         r = _classify(self._row())
-        assert r["execution_state"] == EntryExecutionState.FINAL_GATE_BLOCKED
+        assert r["execution_state"] == EntryExecutionState.FINAL_GATE_BLOCKED_NOT_TERMINALIZED
 
     def test_no_broker_id_reason_is_reason_code(self):
         r = _classify(self._row("CALL_NO_LONGER_ABOVE_TRIGGER"))
         assert r["no_broker_id_reason"] == "CALL_NO_LONGER_ABOVE_TRIGGER"
 
-    def test_action_not_required_already_terminated(self):
+    def test_action_required_until_terminalized(self):
         r = _classify(self._row())
-        assert r["action_required"] is False
+        assert r["action_required"] is True
 
-    def test_next_transition_terminal(self):
+    def test_next_transition_requires_terminalization_or_recovery(self):
         r = _classify(self._row())
-        assert "TERMINAL" in r["next_expected_transition"]
+        assert "terminalization" in r["next_expected_transition"].lower()
 
     def test_all_known_gate_reason_codes(self):
         codes = [
@@ -461,7 +529,7 @@ class TestFinalGateBlocked:
         ]
         for code in codes:
             r = _classify(self._row(code))
-            assert r["execution_state"] == EntryExecutionState.FINAL_GATE_BLOCKED
+            assert r["execution_state"] == EntryExecutionState.FINAL_GATE_BLOCKED_NOT_TERMINALIZED
             assert r["no_broker_id_reason"] == code
 
 
@@ -571,6 +639,18 @@ class TestBrokerSubmitted:
         row = _make_row(status="WORKING", broker_order_id="TRD-99999")
         assert _classify(row)["execution_state"] == EntryExecutionState.BROKER_SUBMITTED
 
+    def test_submitted_ts_without_broker_id_is_broker_proof(self):
+        row = _make_row(
+            status="SUBMITTED",
+            broker_order_id=None,
+            submitted_ts="2026-07-14T13:58:00+00:00",
+        )
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.BROKER_SUBMITTED
+        assert r["broker_proof_source"] == "SUBMITTED_TS"
+        assert r["no_broker_id_reason"] == "BROKER_ID_MISSING_AFTER_SUBMIT"
+        assert r["action_required"] is True
+
 
 class TestTerminal:
     """TERMINAL — order is in a terminal lifecycle state."""
@@ -596,6 +676,39 @@ class TestTerminal:
     def test_terminal_overdue_none(self):
         row = _make_row(status="REJECTED")
         assert _classify(row)["overdue_seconds"] is None
+
+    def test_filled_with_broker_id_and_submit_intent_is_terminal(self):
+        meta = {
+            "submit_intent_at": "2026-07-14T13:50:00+00:00",
+            "broker_submit_key": "ord-001",
+        }
+        row = _make_row(status="FILLED", broker_order_id="TRD-1", meta=meta)
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.TERMINAL
+        assert r["broker_proof_source"] == "BROKER_ORDER_ID"
+
+    def test_rejected_with_broker_id_and_submit_intent_is_terminal(self):
+        meta = {
+            "submit_intent_at": "2026-07-14T13:50:00+00:00",
+            "broker_submit_key": "ord-001",
+        }
+        row = _make_row(status="REJECTED", broker_order_id="TRD-1", meta=meta)
+        assert _classify(row)["execution_state"] == EntryExecutionState.TERMINAL
+
+    def test_expired_with_submitted_ts_and_submit_intent_is_terminal(self):
+        meta = {
+            "submit_intent_at": "2026-07-14T13:50:00+00:00",
+            "broker_submit_key": "ord-001",
+        }
+        row = _make_row(
+            status="EXPIRED",
+            broker_order_id=None,
+            submitted_ts="2026-07-14T13:52:00+00:00",
+            meta=meta,
+        )
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.TERMINAL
+        assert r["broker_proof_source"] == "SUBMITTED_TS"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -648,26 +761,6 @@ class TestInconsistentStateInvariants:
         row = _make_row(status="PENDING_TRIGGER", broker_order_id="TRD-999")
         r = self._check(row)
         assert "BROKER_ORDER_ID_WITH_PENDING_TRIGGER_STATUS" in r["no_broker_id_reason"]
-
-    def test_inv4_submit_intent_after_terminal_rejected(self):
-        """Invariant 4: submit_intent_at set after terminal status REJECTED."""
-        meta = {
-            "submit_intent_at": "2026-07-14T13:50:00+00:00",
-            "broker_submit_key": "ord-001",
-            "lifecycle_state": "SUBMITTING",
-        }
-        row = _make_row(status="REJECTED", broker_order_id=None, meta=meta)
-        r = self._check(row)
-        assert "SUBMIT_INTENT_AFTER_TERMINAL_STATUS" in r["no_broker_id_reason"]
-
-    def test_inv4_submit_intent_after_terminal_expired(self):
-        """Invariant 4: submit_intent_at set after EXPIRED."""
-        meta = {
-            "submit_intent_at": "2026-07-14T13:50:00+00:00",
-            "broker_submit_key": "ord-001",
-        }
-        row = _make_row(status="EXPIRED", broker_order_id=None, meta=meta)
-        self._check(row)
 
     def test_inv5_retry_wait_without_retry_timestamp(self):
         """Invariant 5: RETRY_WAIT lifecycle with no retry timestamp at all."""
@@ -800,6 +893,11 @@ class TestOrderRowDisplay:
     """_order_row() must show correct execution_mode display and expose diagnostics."""
 
     def _make(self, meta: dict | None = None, **kw) -> dict:
+        if meta is None:
+            meta = {
+                "watcher_token": "watcher-token-001",
+                "current_owner": "entry_watcher:test@example.com",
+            }
         raw = {
             "local_order_id": "ord-001",
             "client_id": "test@example.com",
@@ -817,7 +915,7 @@ class TestOrderRowDisplay:
             "created_ts": "2026-07-14T09:00:00+00:00",
             "updated_ts": "2026-07-14T13:55:00+00:00",
             "last_error": None,
-            "meta": meta or {},
+            "meta": meta,
             **kw,
         }
         return _order_row(raw)
@@ -1091,10 +1189,8 @@ class TestRetryTimestampPrecedenceContradiction:
     def test_naive_retry_timestamp_yields_inconsistent_state(self):
         """A timezone-naive retry timestamp is malformed — must produce INCONSISTENT_STATE.
 
-        The correctness fix requires _parse_iso_utc to return None for naive
-        timestamps instead of silently assuming UTC.  A RETRY_WAIT row with
-        only a naive timestamp has no parseable retry timestamp at all, which
-        triggers invariant 5 (RETRY_WAIT_WITHOUT_RETRY_TIMESTAMP).
+        The authoritative populated field wins. If it is malformed, the
+        classifier must fail closed instead of falling back to weaker fields.
         """
         meta = {
             "lifecycle_state": "RETRY_WAIT",
@@ -1107,8 +1203,16 @@ class TestRetryTimestampPrecedenceContradiction:
         row = _make_row(contract="DEFERRED:AAPL", limit_price=0.01, meta=meta)
         r = _classify(row)
         assert r["execution_state"] == EntryExecutionState.INCONSISTENT_STATE
-        # The invariant is missing-timestamp because the naive value is unparseable
-        assert "RETRY_WAIT_WITHOUT_RETRY_TIMESTAMP" in r["no_broker_id_reason"]
+        assert "MALFORMED_RETRY_TIMESTAMP:materialization_next_retry_at" in r["no_broker_id_reason"]
+
+    def test_malformed_authoritative_retry_timestamp_does_not_fall_back(self):
+        row = self._row_with_timestamps(
+            mat_next="not-a-timestamp",
+            deferred_next=_FUTURE,
+        )
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.INCONSISTENT_STATE
+        assert r["no_broker_id_reason"] == "MALFORMED_RETRY_TIMESTAMP:materialization_next_retry_at"
 
 
 class TestRouteResponseFixtures:
@@ -1166,7 +1270,10 @@ class TestRouteResponseFixtures:
             "created_ts":      kw.get("created_ts", "2026-07-14T09:00:00+00:00"),
             "updated_ts":      kw.get("updated_ts", "2026-07-14T13:55:00+00:00"),
             "last_error":      kw.get("last_error", None),
-            "meta":            kw.get("meta", {}),
+            "meta":            kw.get("meta", {
+                "watcher_token": "watcher-token-001",
+                "current_owner": "entry_watcher:test@example.com",
+            }),
         }
 
     # ── Top-level response shape ───────────────────────────────────────────
@@ -1413,10 +1520,12 @@ class TestRouteResponseFixtures:
 
 
 class TestEntryExecutionStateConstants:
-    def test_all_eleven_states_defined(self):
+    def test_all_states_defined(self):
         expected = {
-            "PRE_BREACH", "FUTURE_RETRY_SCHEDULED", "DUE_RETRY_PENDING",
+            "PRE_BREACH", "PRE_BREACH_OWNERSHIP_UNPROVEN",
+            "FUTURE_RETRY_SCHEDULED", "DUE_RETRY_PENDING",
             "MATERIALIZING", "BROKER_READY", "FINAL_GATE_BLOCKED",
+            "FINAL_GATE_BLOCKED_NOT_TERMINALIZED",
             "SUBMIT_INTENT_PENDING", "RECONCILE_PENDING",
             "BROKER_SUBMITTED", "TERMINAL", "INCONSISTENT_STATE",
         }

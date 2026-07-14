@@ -17,8 +17,8 @@ every ENTRY order row — derives a single, mutually exclusive
 
 Classification precedence (strict — no row may match two states):
 
-    A. broker_order_id present               → BROKER_SUBMITTED
-    B. terminal order status                 → TERMINAL
+    A. terminal order status                 → TERMINAL
+    B. broker_order_id/submitted_ts present  → BROKER_SUBMITTED
     C. submit_intent_at present, no broker id
          current_owner = broker_reconciler:* → RECONCILE_PENDING
          otherwise                           → SUBMIT_INTENT_PENDING
@@ -29,8 +29,9 @@ Classification precedence (strict — no row may match two states):
          retry timestamp future              → FUTURE_RETRY_SCHEDULED
          retry timestamp due / past          → DUE_RETRY_PENDING
          timestamp missing / malformed       → INCONSISTENT_STATE
-    G. final_market_validity.passed = false  → FINAL_GATE_BLOCKED
-    H. status = PENDING_TRIGGER              → PRE_BREACH
+    G. final_market_validity.passed = false  → FINAL_GATE_BLOCKED_NOT_TERMINALIZED
+    H. status = PENDING_TRIGGER with owner   → PRE_BREACH
+       status = PENDING_TRIGGER no owner     → PRE_BREACH_OWNERSHIP_UNPROVEN
     I. otherwise                             → INCONSISTENT_STATE
 
 Invariant violations always produce INCONSISTENT_STATE regardless of which
@@ -45,6 +46,7 @@ Read-only contract: this module must never issue UPDATE / INSERT / DELETE.
 from __future__ import annotations
 
 import datetime as _dt
+import os as _os
 from typing import Any
 
 
@@ -81,11 +83,13 @@ def empty_queue_counts() -> dict[str, int]:
 class EntryExecutionState:
     """Mutually exclusive execution states for every ENTRY order row."""
     PRE_BREACH             = "PRE_BREACH"
+    PRE_BREACH_OWNERSHIP_UNPROVEN = "PRE_BREACH_OWNERSHIP_UNPROVEN"
     FUTURE_RETRY_SCHEDULED = "FUTURE_RETRY_SCHEDULED"
     DUE_RETRY_PENDING      = "DUE_RETRY_PENDING"
     MATERIALIZING          = "MATERIALIZING"
     BROKER_READY           = "BROKER_READY"
     FINAL_GATE_BLOCKED     = "FINAL_GATE_BLOCKED"
+    FINAL_GATE_BLOCKED_NOT_TERMINALIZED = "FINAL_GATE_BLOCKED_NOT_TERMINALIZED"
     SUBMIT_INTENT_PENDING  = "SUBMIT_INTENT_PENDING"
     RECONCILE_PENDING      = "RECONCILE_PENDING"
     BROKER_SUBMITTED       = "BROKER_SUBMITTED"
@@ -95,10 +99,20 @@ class EntryExecutionState:
 
 # Orders whose status alone indicates the lifecycle is over.
 _TERMINAL_ORDER_STATUSES: frozenset[str] = frozenset({
-    "REJECTED", "EXPIRED", "CANCELED", "ERROR", "FILLED",
+    "REJECTED", "EXPIRED", "CANCELED", "CANCELLED", "ERROR", "FILLED",
     "WATCHER_INVALIDATED", "INTERNAL_ERROR", "BROKER_REJECTED",
     "MISSED", "CLIENT_SKIPPED", "ENTRY_CONFIRMATION_FAILED",
 })
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(_os.getenv(name, str(default))))
+    except Exception:
+        return default
+
+
+_BROKER_READY_STALE_AFTER_SECONDS = _int_env("OPERATOR_BROKER_READY_STALE_AFTER_SECONDS", 300)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,7 +204,6 @@ def _check_entry_invariants(
     violation short-circuits classification to INCONSISTENT_STATE.
     """
     broker_ready     = _meta_bool(meta, "broker_ready")
-    submit_intent_at = _meta_str(meta, "submit_intent_at")
     lifecycle_state  = _meta_str(meta, "lifecycle_state").upper()
     mat_in_flight    = _meta_bool(meta, "materialization_in_flight")
     mat_generation   = meta.get("materialization_generation")
@@ -215,10 +228,6 @@ def _check_entry_invariants(
     # Invariant 3: broker_order_id present while status=PENDING_TRIGGER
     if broker_order_id and status_upper == "PENDING_TRIGGER":
         return True, "BROKER_ORDER_ID_WITH_PENDING_TRIGGER_STATUS"
-
-    # Invariant 4: submit_intent_at present after terminal status
-    if submit_intent_at and status_upper in _TERMINAL_ORDER_STATUSES:
-        return True, f"SUBMIT_INTENT_AFTER_TERMINAL_STATUS:{status_upper}"
 
     # Invariant 5: RETRY_WAIT with no retry timestamp at all.
     # All three timestamp fields are checked — same priority order as
@@ -281,9 +290,19 @@ def _resolve_retry_timestamp(meta: dict) -> tuple[_dt.datetime | None, str]:
         val = _meta_str(meta, field)
         if val:
             parsed = _parse_iso_utc(val)
-            if parsed:
-                return parsed, field
+            return parsed, field
     return None, ""
+
+
+def _parse_meta_timestamp(meta: dict, *fields: str) -> tuple[_dt.datetime | None, str, bool]:
+    """Return the first populated timestamp field and whether it was malformed."""
+    for field in fields:
+        val = _meta_str(meta, field)
+        if not val:
+            continue
+        parsed = _parse_iso_utc(val)
+        return parsed, field, parsed is None
+    return None, "", False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +353,7 @@ def classify_entry_execution_state(
     status        = str(row.get("status") or "").strip().upper()
     contract      = str(row.get("contract") or "").strip()
     broker_order_id = str(row.get("broker_order_id") or "").strip()
+    submitted_ts    = str(row.get("submitted_ts") or "").strip()
     limit_price   = row.get("limit_price")
     execution_mode = str(row.get("execution_mode") or "").strip().lower()
     updated_ts    = row.get("updated_ts")
@@ -382,6 +402,11 @@ def classify_entry_execution_state(
         "broker_ready":                broker_ready,
         "current_owner":               current_owner or None,
         "watcher_token":               _meta_str(meta, "watcher_token") or None,
+        "materialization_started_at":  _meta_str(meta, "materialization_started_at") or None,
+        "materialization_lease_until": _meta_str(meta, "materialization_lease_until") or None,
+        "broker_ready_at":             _meta_str(meta, "broker_ready_at") or None,
+        "selector_completed_at":       _meta_str(meta, "selector_completed_at") or None,
+        "submit_started_at":           _meta_str(meta, "submit_started_at") or None,
         "submit_intent_at":            submit_intent_at or None,
         "broker_submit_key":           broker_submit_key or None,
         "recovery_retention_reason":   _meta_str(meta, "recovery_retention_reason") or None,
@@ -395,10 +420,12 @@ def classify_entry_execution_state(
         action_reason: str,
         next_transition: str,
         overdue: float | None = None,
+        broker_proof_source: str | None = None,
     ) -> dict:
         return {
             "execution_state":          state,
             "no_broker_id_reason":      no_bid_reason,
+            "broker_proof_source":      broker_proof_source,
             "action_required":          action,
             "action_required_reason":   action_reason,
             "next_expected_transition": next_transition,
@@ -427,17 +454,8 @@ def classify_entry_execution_state(
 
     # ── Precedence chain ───────────────────────────────────────────────────
 
-    # A. broker_order_id present → BROKER_SUBMITTED
-    if broker_order_id:
-        return _result(
-            EntryExecutionState.BROKER_SUBMITTED,
-            no_bid_reason=None,
-            action=False,
-            action_reason="None — order at broker",
-            next_transition="FILLED or REJECTED or EXPIRED at broker",
-        )
-
-    # B. terminal order status → TERMINAL
+    # A. terminal order status → TERMINAL.  Submit intent and broker proof are
+    # historical diagnostics on terminal rows, not live inconsistency.
     if status in _TERMINAL_ORDER_STATUSES:
         return _result(
             EntryExecutionState.TERMINAL,
@@ -445,6 +463,24 @@ def classify_entry_execution_state(
             action=False,
             action_reason="None — terminal state",
             next_transition="None",
+            broker_proof_source="BROKER_ORDER_ID" if broker_order_id else ("SUBMITTED_TS" if submitted_ts else None),
+        )
+
+    # B. broker_order_id or submitted_ts present → BROKER_SUBMITTED.
+    # submitted_ts is durable local proof that the submit path handed the order
+    # to broker handling even if broker_order_id copyback is absent.
+    if broker_order_id or submitted_ts:
+        missing_id_after_submit = bool(submitted_ts and not broker_order_id)
+        return _result(
+            EntryExecutionState.BROKER_SUBMITTED,
+            no_bid_reason="BROKER_ID_MISSING_AFTER_SUBMIT" if missing_id_after_submit else None,
+            action=missing_id_after_submit,
+            action_reason=(
+                "Broker submit timestamp exists but broker_order_id is absent — "
+                "verify broker truth/reconciliation"
+            ) if missing_id_after_submit else "None — order at broker",
+            next_transition="FILLED or REJECTED or EXPIRED at broker",
+            broker_proof_source="SUBMITTED_TS" if missing_id_after_submit else "BROKER_ORDER_ID",
         )
 
     # C. submit_intent_at present and broker_order_id absent
@@ -489,6 +525,35 @@ def classify_entry_execution_state(
 
     # D. broker_ready = true → BROKER_READY
     if broker_ready:
+        ready_ts, ready_field, ready_malformed = _parse_meta_timestamp(
+            meta, "broker_ready_at", "selector_completed_at", "submit_started_at"
+        )
+        if ready_malformed:
+            return _result(
+                EntryExecutionState.BROKER_READY,
+                no_bid_reason=f"MALFORMED_BROKER_READY_TIMESTAMP:{ready_field}",
+                action=True,
+                action_reason="Broker-ready timestamp is malformed; freshness cannot be proven",
+                next_transition="Manual investigation required",
+            )
+        if ready_ts is None:
+            return _result(
+                EntryExecutionState.BROKER_READY,
+                no_bid_reason="BROKER_READY_TIMESTAMP_MISSING",
+                action=True,
+                action_reason="Broker-ready row lacks timestamp proof; age cannot be bounded",
+                next_transition="Broker submit or manual investigation",
+            )
+        ready_age = max(0.0, (now - ready_ts).total_seconds())
+        if ready_age > _BROKER_READY_STALE_AFTER_SECONDS:
+            return _result(
+                EntryExecutionState.BROKER_READY,
+                no_bid_reason="STALE_BROKER_READY",
+                action=True,
+                action_reason=f"Broker-ready row has not submitted for {ready_age:.0f}s",
+                next_transition="Broker submit or manual investigation",
+                overdue=ready_age,
+            )
         return _result(
             EntryExecutionState.BROKER_READY,
             no_bid_reason="BROKER_READY_AWAITING_SUBMIT",
@@ -500,6 +565,27 @@ def classify_entry_execution_state(
     # E. active materialization → MATERIALIZING
     if lifecycle_state == "MATERIALIZING" or mat_in_flight:
         owner_display = mat_owner or current_owner or "unknown"
+        lease_until, lease_field, lease_malformed = _parse_meta_timestamp(
+            meta, "materialization_lease_until"
+        )
+        if lease_malformed:
+            return _result(
+                EntryExecutionState.MATERIALIZING,
+                no_bid_reason=f"MALFORMED_MATERIALIZATION_LEASE:{lease_field}",
+                action=True,
+                action_reason="Materialization lease timestamp is malformed",
+                next_transition="Manual investigation required",
+            )
+        if lease_until is not None and lease_until <= now:
+            overdue_sec = max(0.0, (now - lease_until).total_seconds())
+            return _result(
+                EntryExecutionState.MATERIALIZING,
+                no_bid_reason="MATERIALIZATION_LEASE_EXPIRED",
+                action=True,
+                action_reason=f"Materialization lease expired {overdue_sec:.0f}s ago",
+                next_transition="Recovery should reclaim or terminalize",
+                overdue=overdue_sec,
+            )
         return _result(
             EntryExecutionState.MATERIALIZING,
             no_bid_reason="MATERIALIZATION_IN_PROGRESS",
@@ -512,7 +598,14 @@ def classify_entry_execution_state(
     if lifecycle_state == "RETRY_WAIT" or mat_status == "RETRY_PENDING":
         retry_ts, retry_field = _resolve_retry_timestamp(meta)
         if retry_ts is None:
-            # Invariant 5 should have caught this, but be defensive.
+            if retry_field:
+                return _result(
+                    EntryExecutionState.INCONSISTENT_STATE,
+                    no_bid_reason=f"MALFORMED_RETRY_TIMESTAMP:{retry_field}",
+                    action=True,
+                    action_reason=f"Authoritative retry timestamp is malformed: {retry_field}",
+                    next_transition="Manual investigation required",
+                )
             return _result(
                 EntryExecutionState.INCONSISTENT_STATE,
                 no_bid_reason="RETRY_WAIT_WITHOUT_RETRY_TIMESTAMP",
@@ -543,7 +636,8 @@ def classify_entry_execution_state(
             overdue=overdue_sec,
         )
 
-    # G. final gate blocked → FINAL_GATE_BLOCKED
+    # G. final gate blocked on a nonterminal row → action required.  The
+    # terminal branch above owns final-gate rows that were durably closed.
     if final_mv:
         fmv_passed = final_mv.get("passed")
         # passed=False (explicit) or any falsy non-None value means blocked.
@@ -554,18 +648,27 @@ def classify_entry_execution_state(
                 or "FINAL_GATE_BLOCKED"
             )
             return _result(
-                EntryExecutionState.FINAL_GATE_BLOCKED,
+                EntryExecutionState.FINAL_GATE_BLOCKED_NOT_TERMINALIZED,
                 no_bid_reason=str(gate_reason),
-                action=False,
+                action=True,
                 action_reason=(
-                    f"Final gate blocked and order terminated "
+                    f"Final gate blocked but the row is not terminal "
                     f"(reason={gate_reason})"
                 ),
-                next_transition="TERMINAL (already terminated)",
+                next_transition="Durable terminalization or recovery required",
             )
 
-    # H. status = PENDING_TRIGGER, pre-breach healthy row
+    # H. status = PENDING_TRIGGER. A DB-only endpoint must not claim healthy
+    # pre-breach ownership unless durable owner/token evidence is present.
     if status == "PENDING_TRIGGER":
+        if not (_meta_str(meta, "watcher_token") or current_owner or mat_owner):
+            return _result(
+                EntryExecutionState.PRE_BREACH_OWNERSHIP_UNPROVEN,
+                no_bid_reason="PRE_BREACH_OWNERSHIP_UNPROVEN",
+                action=True,
+                action_reason="PENDING_TRIGGER row has no durable watcher/owner proof",
+                next_transition="Startup recovery should re-own or terminalize",
+            )
         return _result(
             EntryExecutionState.PRE_BREACH,
             no_bid_reason="WAITING_FOR_TRIGGER",
@@ -677,6 +780,11 @@ def _order_row(row: Any) -> dict:
         "current_owner":              _meta_str(meta, "current_owner") or None,
         "materialization_owner":      _meta_str(meta, "materialization_owner") or None,
         "watcher_token":              _meta_str(meta, "watcher_token") or None,
+        "materialization_started_at": _meta_str(meta, "materialization_started_at") or None,
+        "materialization_lease_until": _meta_str(meta, "materialization_lease_until") or None,
+        "broker_ready_at":            _meta_str(meta, "broker_ready_at") or None,
+        "selector_completed_at":      _meta_str(meta, "selector_completed_at") or None,
+        "submit_started_at":          _meta_str(meta, "submit_started_at") or None,
         "submit_intent_at":           _meta_str(meta, "submit_intent_at") or None,
         "broker_submit_key":          _meta_str(meta, "broker_submit_key") or None,
         "recovery_retention_reason":  _meta_str(meta, "recovery_retention_reason") or None,
@@ -716,6 +824,7 @@ def _order_row(row: Any) -> dict:
         # ── Classification fields (every ENTRY row) ────────────────────────
         "execution_state":            execution_classification["execution_state"],
         "no_broker_id_reason":        execution_classification["no_broker_id_reason"],
+        "broker_proof_source":        execution_classification["broker_proof_source"],
         "action_required":            execution_classification["action_required"],
         "action_required_reason":     execution_classification["action_required_reason"],
         "next_expected_transition":   execution_classification["next_expected_transition"],
@@ -773,7 +882,10 @@ def build_operator_queue_read_model(
         "WHERE " + " AND ".join(order_where) + " "
         "  AND kind = 'ENTRY' "
         "  AND UPPER(COALESCE(status,'')) IN "
-        "      ('PENDING_TRIGGER','SUBMITTED','ACK','ACKNOWLEDGED','WORKING','REJECTED','EXPIRED') "
+        "      ('PENDING_TRIGGER','SUBMITTED','ACK','ACKNOWLEDGED','WORKING','PARTIAL_FILL',"
+        "       'REJECTED','EXPIRED','CANCELED','CANCELLED','ERROR','FILLED',"
+        "       'WATCHER_INVALIDATED','INTERNAL_ERROR','BROKER_REJECTED','MISSED',"
+        "       'CLIENT_SKIPPED','ENTRY_CONFIRMATION_FAILED') "
         "ORDER BY updated_ts DESC LIMIT %s"
     )
 

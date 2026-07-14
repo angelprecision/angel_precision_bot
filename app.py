@@ -4646,7 +4646,7 @@ def admin_operator_entry_queue():
         return jsonify(result)
     except Exception as exc:
         admin_log.error("operator/entry-queue failed: %s", exc)
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        return jsonify({"ok": False, "error": "operator_entry_queue_failed"}), 500
 
 
 # PR #90 — Live Execution Journal (read-only, admin-protected)
