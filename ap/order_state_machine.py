@@ -2099,11 +2099,24 @@ class APOrderStateMachine:
             _reserved = round(float(reserved_cost or 0), 2)
         except (TypeError, ValueError):
             return False
+        # ── Req 2: MATERIALIZATION_COPYBACK_INVALID_PAYLOAD ─────────────────────
+        # Emit structured diagnostic before returning False so operators can
+        # distinguish "selector called this with bad args" from a DB-level failure.
+        # Only safe fields are logged — no broker tokens or order secrets.
         if (
             not _owner or not _signal_id or _mode not in ("live", "paper")
             or not _contract or _contract.upper().startswith("DEFERRED:")
             or _limit <= 0.01 or _qty <= 0 or _reserved <= 0
         ):
+            log.critical(
+                "[%s] MATERIALIZATION_COPYBACK_INVALID_PAYLOAD | order=%s "
+                "client_id=%s execution_mode=%s signal_id=%s "
+                "contract=%r limit_price=%s qty=%s reserved_cost=%s "
+                "generation=%s owner_present=%s",
+                self.client_id, local_order_id,
+                self.client_id, _mode, _signal_id,
+                _contract, _limit, _qty, _reserved, _generation, bool(_owner),
+            )
             return False
 
         _now = now_utc_iso()
@@ -2168,12 +2181,81 @@ class APOrderStateMachine:
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
         try:
-            return bool(run_with_retry(_persist) > 0)
+            _rowcount = run_with_retry(_persist)
+            if _rowcount == 0:
+                # ── Req 2: MATERIALIZATION_COPYBACK_CAS_MISS ─────────────────
+                # The fenced UPDATE matched zero rows. The row exists but the
+                # predicate did not match — a concurrent owner, lifecycle advance,
+                # or stale generation claim. Re-read for diagnostics.
+                # NEVER terminalize here — caller owns the terminal decision.
+                _row: dict = {}
+                try:
+                    def _reread_for_miss():
+                        with conn() as c:
+                            c.execute(
+                                "SELECT status, broker_order_id, submitted_ts, "
+                                "execution_mode, signal_id, "
+                                "meta->>'lifecycle_state' AS lifecycle_state, "
+                                "meta->>'materialization_owner' AS materialization_owner, "
+                                "meta->>'materialization_generation' AS materialization_generation, "
+                                "meta->>'recovery_submit_owner' AS recovery_submit_owner, "
+                                "meta->>'submit_intent_at' AS submit_intent_at "
+                                "FROM orders "
+                                "WHERE local_order_id = %s AND client_id = %s",
+                                (local_order_id, self.client_id),
+                            )
+                            return c.fetchone()
+                    _raw = run_with_retry(_reread_for_miss)
+                    _row = dict(_raw) if _raw else {}
+                except Exception:
+                    pass
+                log.critical(
+                    "[%s] MATERIALIZATION_COPYBACK_CAS_MISS | order=%s "
+                    "current_status=%s broker_order_id_present=%s "
+                    "submitted_ts_present=%s durable_execution_mode=%s "
+                    "durable_signal_id=%s lifecycle_state=%s "
+                    "materialization_owner=%s materialization_generation=%s "
+                    "recovery_submit_owner=%s submit_intent_present=%s",
+                    self.client_id, local_order_id,
+                    _row.get("status"),
+                    bool(_row.get("broker_order_id")),
+                    bool(_row.get("submitted_ts")),
+                    _row.get("execution_mode"),
+                    _row.get("signal_id"),
+                    _row.get("lifecycle_state"),
+                    _row.get("materialization_owner"),
+                    _row.get("materialization_generation"),
+                    _row.get("recovery_submit_owner"),
+                    bool(_row.get("submit_intent_at")),
+                )
+                return False
+            return bool(_rowcount > 0)
         except Exception as exc:
-            log.warning(
-                "[%s] persist_deferred_broker_ready failed order=%s: %s",
-                self.client_id, local_order_id, exc,
-            )
+            # ── Req 2: classify schema errors separately from generic DB errors ─
+            _exc_str = str(exc)
+            _is_schema_error = False
+            if pg_errors is not None and isinstance(
+                exc, (pg_errors.UndefinedColumn, pg_errors.UndefinedTable)
+            ):
+                _is_schema_error = True
+            elif any(
+                kw in _exc_str.lower()
+                for kw in ("column", "does not exist", "undefined", "no such column")
+            ):
+                _is_schema_error = True
+
+            if _is_schema_error:
+                log.critical(
+                    "[%s] MATERIALIZATION_COPYBACK_SCHEMA_ERROR | order=%s | "
+                    "schema mismatch — verify contract_selection_status column "
+                    "migration has been applied | error=%s",
+                    self.client_id, local_order_id, _exc_str,
+                )
+            else:
+                log.critical(
+                    "[%s] MATERIALIZATION_COPYBACK_DB_ERROR | order=%s | error=%s",
+                    self.client_id, local_order_id, _exc_str,
+                )
             return False
 
     def schedule_deferred_materialization_retry(
@@ -3158,11 +3240,89 @@ class APOrderStateMachine:
             return {"ok": False, "local_order_id": local_order_id,
                     "broker_order_id": current.get("broker_order_id"),
                     "status": OrderStatus.ERROR, "error": error_msg}
+        # ── Req 3: submitted-like state must have proven broker identity ────────
+        # SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL: idempotent success only if
+        # broker_order_id is present.  If it is missing, attempt tag lookup to
+        # recover the identity without reposting.  If tag lookup also fails,
+        # return ENTRY_BROKER_IDENTITY_UNPROVEN — never return ok=True without
+        # proven identity and never repost.
+        #
+        # FILLED: require broker_order_id OR durable fill proof (filled_ts/fill_price).
+        # Without either, return identity-unproven for reconciliation.
         if status in (OrderStatus.SUBMITTED, OrderStatus.ACKNOWLEDGED,
-                      OrderStatus.PARTIAL_FILL, OrderStatus.FILLED):
-            return {"ok": True, "local_order_id": local_order_id,
-                    "broker_order_id": current.get("broker_order_id"),
-                    "status": status, "error": None}
+                      OrderStatus.PARTIAL_FILL):
+            _existing_bid = current.get("broker_order_id")
+            if _existing_bid:
+                # Idempotent success — broker identity already proven.
+                return {"ok": True, "local_order_id": local_order_id,
+                        "broker_order_id": _existing_bid,
+                        "status": status, "error": None}
+            # Missing broker_order_id — attempt recovery via Tradier tag.
+            _lu_base_url = (
+                getattr(broker, "base_url", None)
+                or getattr(getattr(broker, "cfg", None), "base_url", None)
+                or ""
+            )
+            _lu_account = (
+                getattr(broker, "account_id", None)
+                or getattr(getattr(broker, "cfg", None), "account_id", None)
+                or ""
+            )
+            _recovered_bid = self._lookup_order_by_tag(
+                broker, _lu_base_url, _lu_account, str(local_order_id),
+            )
+            if _recovered_bid:
+                self._attach_broker_identity_if_missing(
+                    local_order_id,
+                    broker_order_id=_recovered_bid,
+                    current_status=status,
+                )
+                log.info(
+                    "[%s] ENTRY_BROKER_IDENTITY_RECONCILED_BY_TAG | "
+                    "order=%s broker_id=%s status=%s",
+                    self.client_id, local_order_id, _recovered_bid, status,
+                )
+                return {"ok": True, "local_order_id": local_order_id,
+                        "broker_order_id": _recovered_bid,
+                        "status": status, "error": None,
+                        "reconciled_by_tag": True}
+            # Tag lookup also found nothing — identity unproven.
+            log.critical(
+                "[%s] ENTRY_BROKER_IDENTITY_UNPROVEN | order=%s status=%s | "
+                "no broker_order_id and no tag match — reconciliation required, "
+                "no repost will be issued",
+                self.client_id, local_order_id, status,
+            )
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": None,
+                "status": status,
+                "error": "ENTRY_BROKER_IDENTITY_UNPROVEN",
+                "reconciliation_required": True,
+            }
+
+        if status == OrderStatus.FILLED:
+            _existing_bid = current.get("broker_order_id")
+            _fill_proof   = current.get("filled_ts") or current.get("fill_price")
+            if _existing_bid or _fill_proof:
+                return {"ok": True, "local_order_id": local_order_id,
+                        "broker_order_id": _existing_bid,
+                        "status": status, "error": None}
+            log.critical(
+                "[%s] ENTRY_BROKER_IDENTITY_UNPROVEN | order=%s status=FILLED | "
+                "no broker_order_id and no fill proof — reconciliation required",
+                self.client_id, local_order_id,
+            )
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": None,
+                "status": status,
+                "error": "ENTRY_BROKER_IDENTITY_UNPROVEN",
+                "reconciliation_required": True,
+            }
+
         if status in (OrderStatus.REJECTED, OrderStatus.CANCELED,
                       OrderStatus.EXPIRED, OrderStatus.ERROR):
             error_msg = f"submit_existing_entry_terminal_status:{status}"
@@ -3535,6 +3695,35 @@ class APOrderStateMachine:
                 return {"ok": False, "local_order_id": local_order_id,
                         "broker_order_id": broker_order_id, "status": OrderStatus.ERROR,
                         "error": error_msg, "split_brain": True}
+            elif broker_order_id and not self._is_broker_accept_status(broker_status):
+                # ── Req 4: BROKER_STATUS_UNKNOWN_WITH_ID ─────────────────────
+                # Broker returned a real broker_order_id with a status string we
+                # do not recognise. The ID is evidence of possible broker-side
+                # ownership. Preserve it unconditionally via the existing
+                # split-brain/quarantine mechanism so reconciliation can resolve it.
+                # Never discard a broker ID. Never issue a replacement submit.
+                _sb_reason = f"BROKER_STATUS_UNKNOWN_WITH_ID:status={broker_status!r}"
+                self._flag_split_brain_order(
+                    local_order_id,
+                    broker_order_id=broker_order_id,
+                    error_msg=_sb_reason,
+                )
+                log.critical(
+                    "[%s] BROKER_STATUS_UNKNOWN_WITH_ID | order=%s broker_id=%s "
+                    "broker_status=%r | preserving broker identity via split-brain "
+                    "quarantine; no replacement submit until reconciliation resolves "
+                    "the known broker ID",
+                    self.client_id, local_order_id, broker_order_id, broker_status,
+                )
+                return {
+                    "ok": False,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": broker_order_id,
+                    "status": OrderStatus.ERROR,
+                    "error": _sb_reason,
+                    "split_brain": True,
+                    "reconciliation_required": True,
+                }
             else:
                 error_msg = (f"broker_status:{broker_status or 'unknown'} "
                              f"broker_order_id_missing:{not bool(broker_order_id)}")
@@ -4078,6 +4267,13 @@ class APOrderStateMachine:
             # local position thinks it's still open. Stop repeated exit firing
             # by marking the local position stale so the exit engine stops
             # evaluating it on every tick.
+            # ── Req 5: synthetic-flat block — ALL writes nested under the exact condition ──
+            # The broker-truth metadata update, warning log, and positions CLOSED
+            # mutation must execute ONLY when:
+            #   1. blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT"
+            #   2. broker_truth.get("is_fresh_exact") is True
+            #   3. int(broker_truth.get("broker_truth_open_qty") or 0) == 0
+            # Any other blocked reason must NOT mark the position CLOSED.
             if blocked_reason == "SYNTHETIC_POSITION_STALE_BROKER_FLAT":
                 broker_truth_audit.update(
                     {
@@ -4087,18 +4283,24 @@ class APOrderStateMachine:
                     }
                 )
                 _upd_bt = getattr(self, "update_order_meta", None)
-            if callable(_upd_bt):
-                try:
-                    _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
-                except Exception as _upd_bt_exc:
-                    log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
+                if callable(_upd_bt):
+                    try:
+                        _upd_bt(local_id, {"exit_safety": {"broker_truth": broker_truth_audit}})
+                    except Exception as _upd_bt_exc:
+                        log.debug("submit_exit broker_truth audit write failed: %s", _upd_bt_exc)
                 log.warning(
                     "[%s] SYNTHETIC_POSITION_STALE_BROKER_FLAT "
                     "position_id=%s contract=%s — broker is flat; "
                     "marking local position stale to stop repeated exit firing",
                     self.client_id, position_id, contract,
                 )
-                if broker_truth.get("is_fresh_exact"):
+                # ── Triple-condition guard on the CLOSED write ────────────────
+                # Only mark the position CLOSED when all three are true.
+                # Missing, non-exact, or non-zero broker truth must not close it.
+                if (
+                    broker_truth.get("is_fresh_exact") is True
+                    and int(broker_truth.get("broker_truth_open_qty") or 0) == 0
+                ):
                     try:
                         with conn() as _stale_c:
                             _stale_c.execute(
@@ -4125,7 +4327,7 @@ class APOrderStateMachine:
                                 ),
                             )
                         log.info(
-                            "[%s] position %s marked CLOSED (broker flat, fresh exact broker truth) | reconciler/manual-close-needed",
+                            "[%s] position %s marked CLOSED (broker flat, fresh exact broker truth, qty=0) | reconciler/manual-close-needed",
                             self.client_id, position_id,
                         )
                     except Exception as _stale_exc:
@@ -4399,6 +4601,92 @@ class APOrderStateMachine:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _attach_broker_identity_if_missing(
+        self,
+        local_order_id: str,
+        *,
+        broker_order_id: str,
+        current_status: str,
+    ) -> bool:
+        """Atomically attach a recovered broker_order_id to an order that is already
+        in a submitted-like state but is missing its broker identity.
+
+        Req 3 (PR spec): Used when _lookup_order_by_tag() recovers a broker_order_id
+        for a SUBMITTED/ACKNOWLEDGED/PARTIAL_FILL order that lacks one. Must never
+        change or regress the order status, never cross client_id or execution_mode
+        boundaries, and never write if broker_order_id is already set.
+
+        CAS predicates:
+          * exact local_order_id
+          * exact client_id
+          * matching current_status
+          * empty / NULL broker_order_id (only attaches if identity is absent)
+
+        Returns True when Postgres confirms rowcount > 0.
+        Returns False on CAS miss, validation failure, or write error.
+        """
+        _bid = str(broker_order_id or "").strip()
+        _status = str(current_status or "").strip().upper()
+        if not _bid or not _status:
+            return False
+        _allowed = {
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.PARTIAL_FILL,
+        }
+        if _status not in _allowed:
+            log.warning(
+                "[%s] _attach_broker_identity_if_missing: status=%s not in allowed set "
+                "order=%s broker_id=%s — refused",
+                self.client_id, _status, local_order_id, _bid,
+            )
+            return False
+
+        _now = now_utc_iso()
+
+        def _attach():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET broker_order_id = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND UPPER(COALESCE(status, '')) = %s
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                    """,
+                    (
+                        _bid,
+                        json.dumps({
+                            "broker_id_attached_by_tag_recovery": True,
+                            "broker_id_attached_at": _now,
+                            "broker_id_recovered_from_tag": str(local_order_id)[:32],
+                        }),
+                        local_order_id,
+                        self.client_id,
+                        _status,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            result = bool(run_with_retry(_attach) > 0)
+            if result:
+                log.info(
+                    "[%s] broker identity attached via tag recovery | "
+                    "order=%s broker_id=%s status=%s",
+                    self.client_id, local_order_id, _bid, _status,
+                )
+            return result
+        except Exception as exc:
+            log.warning(
+                "[%s] _attach_broker_identity_if_missing failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
 
     def _lookup_order_by_tag(
         self,
