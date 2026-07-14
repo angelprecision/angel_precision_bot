@@ -39,7 +39,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 
-from ap.order_state_machine import APOrderStateMachine, OrderStatus  # noqa: E402
+from ap.order_state_machine import (  # noqa: E402
+    APOrderStateMachine,
+    OrderStatus,
+)
+from ap.broker_submit_identity import canonical_broker_submit_key  # noqa: E402
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,7 +51,8 @@ from ap.order_state_machine import APOrderStateMachine, OrderStatus  # noqa: E40
 # ─────────────────────────────────────────────────────────────────────────────
 
 _CLIENT   = "jason@test.com"
-_LOID     = "order-aaa-111"
+_LOID     = "123e4567-e89b-12d3-a456-426614174000"
+_TAG      = "123e4567-e89b-12d3-a456-42661417"
 _SIGNAL   = "SIG-001"
 _CONTRACT = "NVDA260117C00900000"
 _DEFERRED = "DEFERRED:NVDA"
@@ -56,6 +61,12 @@ _SYMBOL   = "NVDA"
 
 def _make_osm() -> APOrderStateMachine:
     return APOrderStateMachine(_CLIENT)
+
+
+def test_real_uuid_uses_exact_canonical_32_character_broker_tag():
+    assert len(_LOID) == 36
+    assert len(_TAG) == 32
+    assert canonical_broker_submit_key(_LOID) == _TAG
 
 
 def _persist_args(**overrides) -> dict:
@@ -398,7 +409,7 @@ class _BrokerWithTag:
         resp.status_code = 200
         resp.json.return_value = {
             "orders": {
-                "order": [{"id": self.FOUND_ID, "tag": _LOID, "status": "open"}]
+                "order": [{"id": self.FOUND_ID, "tag": _TAG, "status": "open"}]
             }
         }
         self.session.get.return_value = resp
@@ -457,8 +468,12 @@ class TestSubmittedMissingBrokerIdentity:
         row = _order_row(status="SUBMITTED", broker_order_id=None)
         attach_calls: list = []
 
-        def _fake_attach(loid, *, broker_order_id, current_status):
-            attach_calls.append((loid, broker_order_id, current_status))
+        def _fake_attach(
+            loid, *, broker_order_id, current_status, current_execution_mode
+        ):
+            attach_calls.append(
+                (loid, broker_order_id, current_status, current_execution_mode)
+            )
             return True
 
         with patch.object(osm, "_attach_broker_identity_if_missing", _fake_attach):
@@ -477,6 +492,19 @@ class TestSubmittedMissingBrokerIdentity:
         row = _order_row(status="SUBMITTED", broker_order_id=None)
         with patch.object(osm, "_attach_broker_identity_if_missing", return_value=True):
             _run_submit(osm, broker, row)
+        broker.session.post.assert_not_called()
+
+    def test_tag_recovery_attach_cas_miss_fails_closed(self):
+        osm = _make_osm()
+        broker = _BrokerWithTag()
+        row = _order_row(status="SUBMITTED", broker_order_id=None)
+        with patch.object(osm, "_attach_broker_identity_if_missing", return_value=False):
+            result = _run_submit(osm, broker, row)
+        assert result["ok"] is False
+        assert result["error"] == "ENTRY_BROKER_IDENTITY_PERSIST_FAILED"
+        assert result["broker_order_id"] == _BrokerWithTag.FOUND_ID
+        assert result.get("reconciliation_required") is True
+        assert result.get("reconciled_by_tag") is not True
         broker.session.post.assert_not_called()
 
     def test_submitted_no_broker_id_no_tag_returns_identity_unproven(self):
@@ -593,17 +621,232 @@ def _run_from_pending(osm, broker, row=None) -> dict:
         row = _pending_row()
     flag_calls: list = []
 
-    def _flag(loid, *, broker_order_id, error_msg):
-        flag_calls.append({"loid": loid, "bid": broker_order_id, "msg": error_msg})
+    def _meta_dict():
+        raw = row.get("meta") or {}
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        return dict(raw)
 
-    with patch.object(osm, "_get_order", side_effect=[row, row, row, row]), \
-         patch.object(osm, "transition", return_value=True), \
-         patch.object(osm, "update_order_meta", return_value=True), \
-         patch.object(osm, "_flag_split_brain_order", side_effect=_flag), \
-         patch("ap.order_state_machine.run_with_retry", lambda fn: fn()):
+    def _persist_intent(_loid, **kwargs):
+        meta = _meta_dict()
+        meta.update({
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": "2026-07-15T09:30:00Z",
+            "broker_submit_key": kwargs["broker_submit_key"],
+            "broker_submit_payload_hash": kwargs["payload_hash"],
+            "current_owner": f"broker_submit:{kwargs['broker_submit_key']}",
+        })
+        row["meta"] = json.dumps(meta)
+        return True
+
+    def _transition(_loid, new_status, **fields):
+        row["status"] = str(new_status)
+        row.update(fields)
+        return True
+
+    def _update_meta(_loid, patch_value):
+        meta = _meta_dict()
+        meta.update(patch_value)
+        row["meta"] = json.dumps(meta)
+        return True
+
+    def _flag(loid, *, broker_order_id, execution_mode, error_msg):
+        flag_calls.append({
+            "loid": loid,
+            "bid": broker_order_id,
+            "mode": execution_mode,
+            "msg": error_msg,
+        })
+        row.update({
+            "status": "SUBMITTED",
+            "broker_order_id": broker_order_id,
+            "submitted_ts": "2026-07-15T09:30:01Z",
+            "last_error": f"SPLIT_BRAIN:{error_msg}",
+        })
+        _update_meta(loid, {
+            "lifecycle_state": "SUBMITTED",
+            "split_brain_quarantine": True,
+            "reconciliation_required": True,
+            "broker_order_id": broker_order_id,
+        })
+        return True
+
+    with patch.object(osm, "_get_order", side_effect=lambda _loid: dict(row)), \
+         patch.object(osm, "persist_entry_submit_intent", side_effect=_persist_intent), \
+         patch.object(osm, "persist_materialized_submit_intent", side_effect=_persist_intent), \
+         patch.object(osm, "transition", side_effect=_transition), \
+         patch.object(osm, "update_order_meta", side_effect=_update_meta), \
+         patch.object(osm, "_flag_split_brain_order", side_effect=_flag):
         result = osm.submit_existing_entry(local_order_id=_LOID, broker=broker)
     result["_flag_split_brain_calls"] = flag_calls
+    result["_durable_row"] = dict(row)
     return result
+
+
+class TestExistingBrokerProofGate:
+    def test_pending_prior_submit_intent_without_tag_never_posts(self):
+        osm = _make_osm()
+        broker = _BrokerNoTag()
+        row = _pending_row()
+        meta = json.loads(row["meta"])
+        meta.update({
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": "2026-07-15T09:29:59Z",
+            "broker_submit_key": _TAG,
+            "current_owner": f"broker_submit:{_TAG}",
+        })
+        row["meta"] = json.dumps(meta)
+        result = _run_from_pending(osm, broker, row)
+        assert result["ok"] is False
+        assert result["error"] == "ENTRY_PRIOR_SUBMIT_PROOF_RECONCILIATION_REQUIRED"
+        assert result.get("reconciliation_required") is True
+        broker.session.post.assert_not_called()
+
+    def test_pending_row_with_existing_broker_id_never_posts(self):
+        osm = _make_osm()
+        broker = _BrokerNoTag()
+        row = _pending_row(broker_order_id="BID-EXISTING")
+        result = _run_from_pending(osm, broker, row)
+        assert result["ok"] is True
+        assert result["broker_order_id"] == "BID-EXISTING"
+        assert result.get("reconciled_by_tag") is True
+        broker.session.post.assert_not_called()
+
+
+class TestAmbiguousBrokerResponseRecovery:
+    @staticmethod
+    def _broker_with_lookup():
+        broker = MagicMock()
+        broker.base_url = "https://sandbox.tradier.com"
+        broker.account_id = "VA00000000"
+        lookup = MagicMock()
+        lookup.status_code = 200
+        lookup.json.return_value = {
+            "orders": {"order": [{"id": "BID-AMBIGUOUS", "tag": _TAG}]}
+        }
+        broker.session.get.return_value = lookup
+        return broker
+
+    def test_ambiguous_json_uses_canonical_tag_and_posts_once(self):
+        osm = _make_osm()
+        broker = self._broker_with_lookup()
+        response = MagicMock(status_code=200)
+        response.json.side_effect = ValueError("truncated json")
+        broker.session.post.return_value = response
+        result = _run_from_pending(osm, broker)
+        assert result["ok"] is True
+        assert result["broker_order_id"] == "BID-AMBIGUOUS"
+        assert result["_durable_row"]["status"] == "SUBMITTED"
+        assert result["_durable_row"]["broker_order_id"] == "BID-AMBIGUOUS"
+        broker.session.post.assert_called_once()
+        broker.session.get.assert_called_once()
+
+    def test_read_timeout_uses_canonical_tag_and_posts_once(self):
+        from requests.exceptions import ReadTimeout
+
+        osm = _make_osm()
+        broker = self._broker_with_lookup()
+        broker.session.post.side_effect = ReadTimeout("response lost after POST")
+        result = _run_from_pending(osm, broker)
+        assert result["ok"] is True
+        assert result["broker_order_id"] == "BID-AMBIGUOUS"
+        assert result["_durable_row"]["status"] == "SUBMITTED"
+        assert result["_durable_row"]["broker_order_id"] == "BID-AMBIGUOUS"
+        broker.session.post.assert_called_once()
+        broker.session.get.assert_called_once()
+
+    def test_multiple_live_tag_matches_fail_closed(self):
+        osm = _make_osm()
+        broker = self._broker_with_lookup()
+        broker.session.get.return_value.json.return_value = {
+            "orders": {"order": [
+                {"id": "BID-A", "tag": _TAG, "status": "open"},
+                {"id": "BID-B", "tag": _TAG, "status": "pending"},
+            ]}
+        }
+        assert osm._lookup_order_by_tag(
+            broker, broker.base_url, broker.account_id, _LOID,
+        ) is None
+
+    def test_one_live_and_one_terminal_tag_match_adopts_live_identity(self):
+        osm = _make_osm()
+        broker = self._broker_with_lookup()
+        broker.session.get.return_value.json.return_value = {
+            "orders": {"order": [
+                {"id": "BID-OLD", "tag": _TAG, "status": "canceled"},
+                {"id": "BID-LIVE", "tag": _TAG, "status": "open"},
+            ]}
+        }
+        assert osm._lookup_order_by_tag(
+            broker, broker.base_url, broker.account_id, _LOID,
+        ) == "BID-LIVE"
+
+    @pytest.mark.parametrize(
+        "failure_kind",
+        ["json", "read_timeout", "connection_error", "request_exception", "unexpected"],
+    )
+    def test_ambiguous_without_tag_proof_never_reposts(self, failure_kind):
+        from requests.exceptions import ConnectionError, ReadTimeout, RequestException
+
+        osm = _make_osm()
+        broker = _broker_post(broker_id="UNUSED", status_str="open")
+        if failure_kind == "json":
+            response = MagicMock(status_code=200)
+            response.json.side_effect = ValueError("truncated json")
+            broker.session.post.return_value = response
+        else:
+            error_type = {
+                "read_timeout": ReadTimeout,
+                "connection_error": ConnectionError,
+                "request_exception": RequestException,
+                "unexpected": RuntimeError,
+            }[failure_kind]
+            broker.session.post.side_effect = error_type("response lost after POST")
+
+        result = _run_from_pending(osm, broker)
+
+        assert result["ok"] is False
+        assert result["reconciliation_required"] is True
+        assert result["identity_quarantine"] is True
+        assert result["error"].startswith("BROKER_AMBIGUOUS_")
+        if failure_kind == "unexpected":
+            assert result["error"].startswith("BROKER_AMBIGUOUS_UNEXPECTED_")
+        durable_meta = json.loads(result["_durable_row"]["meta"])
+        assert result["_durable_row"]["status"] == "PENDING_TRIGGER"
+        assert durable_meta["lifecycle_state"] == "SUBMITTING"
+        assert durable_meta["broker_submit_key"] == _TAG
+        broker.session.post.assert_called_once()
+        broker.session.get.assert_called_once()
+
+    @pytest.mark.parametrize("broker_status", ["open", "mystery_status", ""])
+    def test_clean_2xx_without_id_reconciles_then_retains_intent_and_never_reposts(
+        self, broker_status,
+    ):
+        osm = _make_osm()
+        broker = _broker_post(broker_id=None, status_str=broker_status)
+        row = _pending_row()
+
+        first = _run_from_pending(osm, broker, row)
+
+        assert first["ok"] is False
+        assert first["error"] == (
+            "BROKER_AMBIGUOUS_2XX_MISSING_ID_RECONCILIATION_REQUIRED:"
+            f"status={broker_status or 'empty'}"
+        )
+        assert first["reconciliation_required"] is True
+        assert first["identity_quarantine"] is True
+        assert first["_durable_row"]["status"] == "PENDING_TRIGGER"
+        durable_meta = json.loads(first["_durable_row"]["meta"])
+        assert durable_meta["submit_intent_at"]
+        assert durable_meta["broker_submit_key"] == _TAG
+        assert broker.session.post.call_args.kwargs["data"]["tag"] == _TAG
+        broker.session.post.assert_called_once()
+        broker.session.get.assert_called_once()
+
+        second = _run_from_pending(osm, broker, row)
+        assert second["ok"] is False
+        assert second["reconciliation_required"] is True
+        assert broker.session.post.call_count == 1
 
 
 class TestUnknownBrokerStatusWithId:
@@ -620,6 +863,13 @@ class TestUnknownBrokerStatusWithId:
         assert result.get("split_brain") is True
         assert result.get("reconciliation_required") is True
         assert result["broker_order_id"] == "BID-UNKNOWN-001"
+        assert result["status"] == "SUBMITTED"
+        assert result.get("quarantine_persisted") is True
+        durable = result["_durable_row"]
+        assert durable["status"] == "SUBMITTED"
+        assert durable["broker_order_id"] == "BID-UNKNOWN-001"
+        assert durable["last_error"].startswith("SPLIT_BRAIN:")
+        assert json.loads(durable["meta"])["split_brain_quarantine"] is True
         assert "BROKER_STATUS_UNKNOWN_WITH_ID" in caplog.text
         assert len(result["_flag_split_brain_calls"]) == 1
 
@@ -631,20 +881,31 @@ class TestUnknownBrokerStatusWithId:
         assert result["broker_order_id"] == "BID-PRESERVE-ME"
 
     def test_unknown_status_with_id_no_replacement_submit(self):
-        """After quarantine, no second POST is issued."""
+        """A second invocation after quarantine performs zero replacement POSTs."""
         osm = _make_osm()
         broker = _broker_post(broker_id="BID-ONCE", status_str="bizarre_status")
-        _run_from_pending(osm, broker)
-        # Exactly one POST — the original attempt that returned unknown status
+        row = _pending_row()
+        first = _run_from_pending(osm, broker, row)
+        second = _run_from_pending(osm, broker, row)
+        assert first["_durable_row"]["status"] == "SUBMITTED"
+        assert first["_durable_row"]["broker_order_id"] == "BID-ONCE"
+        assert second["ok"] is False
+        assert second["error"] == "ENTRY_SPLIT_BRAIN_QUARANTINED"
         assert broker.session.post.call_count == 1
 
-    def test_unknown_status_without_id_does_not_quarantine(self):
-        """No broker_order_id → normal error classification, no split_brain."""
+    def test_unknown_status_without_id_holds_for_identity_reconciliation(self):
+        """A clean 2xx without identity is ambiguous, never submit-eligible."""
         osm = _make_osm()
         broker = _broker_post(broker_id=None, status_str="mystery_status_no_id")
         result = _run_from_pending(osm, broker)
         assert result.get("split_brain") is not True
-        assert result.get("reconciliation_required") is not True
+        assert result.get("reconciliation_required") is True
+        assert result.get("identity_quarantine") is True
+        assert result["error"].startswith("BROKER_AMBIGUOUS_2XX_MISSING_ID")
+        assert result["_durable_row"]["status"] == OrderStatus.PENDING_TRIGGER
+        assert json.loads(result["_durable_row"]["meta"])["lifecycle_state"] == "SUBMITTING"
+        assert broker.session.post.call_count == 1
+        broker.session.get.assert_called_once()
         assert not result["_flag_split_brain_calls"]
 
     def test_accepted_status_with_id_does_not_quarantine(self):
@@ -674,16 +935,36 @@ class TestUnknownBrokerStatusWithId:
 class TestNormalEntryRegressions:
     """Standard PENDING_TRIGGER entries must still reach Tradier after changes."""
 
+    def test_materialized_deferred_first_submit_is_exactly_once_and_durable(self):
+        osm = _make_osm()
+        broker = _broker_post(broker_id="BID-DEFERRED", status_str="open")
+        row = _pending_row()
+        meta = json.loads(row["meta"])
+        meta.update({
+            "contract_deferred": False,
+            "materialization_generation": 7,
+            "materialization_entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+            "lifecycle_state": "BROKER_READY",
+            "broker_ready": True,
+        })
+        row["meta"] = json.dumps(meta)
+        result = _run_from_pending(osm, broker, row)
+        durable = result["_durable_row"]
+        durable_meta = json.loads(durable["meta"])
+        assert result["ok"] is True
+        assert broker.session.post.call_count == 1
+        assert broker.session.post.call_args.kwargs["data"]["tag"] == _TAG
+        assert durable["status"] == "SUBMITTED"
+        assert durable["broker_order_id"] == "BID-DEFERRED"
+        assert durable["submitted_ts"]
+        assert durable_meta["submit_intent_at"]
+        assert durable_meta["broker_submit_key"] == _TAG
+
     def test_preselected_pending_trigger_reaches_broker_post(self):
         osm = _make_osm()
         broker = _broker_post(broker_id="BID-STANDARD", status_str="open")
         row = _pending_row()
-
-        with patch.object(osm, "_get_order", side_effect=[row, row, row, row]), \
-             patch.object(osm, "transition", return_value=True), \
-             patch.object(osm, "update_order_meta", return_value=True), \
-             patch("ap.order_state_machine.run_with_retry", lambda fn: fn()):
-            result = osm.submit_existing_entry(local_order_id=_LOID, broker=broker)
+        result = _run_from_pending(osm, broker, row)
 
         assert result["ok"] is True
         assert result["broker_order_id"] == "BID-STANDARD"
@@ -704,3 +985,407 @@ class TestNormalEntryRegressions:
         assert result["ok"] is False
         assert "DEFERRED_CONTRACT_BLOCKED" in (result.get("error") or "")
         broker.session.post.assert_not_called()
+
+
+def test_real_postgres_broker_ready_intent_quarantine_and_reconciler(monkeypatch):
+    """Production-shaped end-to-end submit ownership seam on real PostgreSQL."""
+    from contextlib import contextmanager
+    import hashlib
+    import uuid
+
+    import psycopg2
+    import psycopg2.extras
+
+    from ap_reconciler import APBrokerReconciler
+
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not database_url:
+        pytest.skip("disposable PostgreSQL URL not configured")
+
+    schema = f"osm_p0_{uuid.uuid4().hex}"
+
+    class _Wrapper:
+        def __init__(self, connection, cursor):
+            self.connection = connection
+            self.cursor = cursor
+
+        @property
+        def rowcount(self):
+            return self.cursor.rowcount
+
+        def execute(self, sql, params=None):
+            self.cursor.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            return self.cursor.fetchone()
+
+        def fetchall(self):
+            return self.cursor.fetchall()
+
+    @contextmanager
+    def _pg_conn():
+        connection = psycopg2.connect(database_url)
+        cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+            yield _Wrapper(connection, cursor)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    position_id TEXT,
+                    plan_id TEXT,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    filled_ts TIMESTAMPTZ,
+                    fill_price NUMERIC,
+                    execution_mode TEXT NOT NULL,
+                    signal_id TEXT,
+                    contract TEXT,
+                    contract_selection_status TEXT,
+                    symbol TEXT,
+                    direction TEXT,
+                    side TEXT,
+                    timeframe TEXT,
+                    score NUMERIC,
+                    trigger_price NUMERIC,
+                    pattern TEXT,
+                    qty INTEGER,
+                    limit_price NUMERIC,
+                    reserved_cost NUMERIC,
+                    meta JSONB,
+                    last_error TEXT,
+                    created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+
+        method_globals = APOrderStateMachine.persist_deferred_broker_ready.__globals__
+        monkeypatch.setitem(method_globals, "conn", _pg_conn)
+        monkeypatch.setitem(method_globals, "run_with_retry", lambda fn, *a, **k: fn())
+        import ap.db as db_module
+        monkeypatch.setattr(db_module, "conn", _pg_conn)
+        monkeypatch.setattr(db_module, "run_with_retry", lambda fn, *a, **k: fn())
+
+        accepted_id = "223e4567-e89b-12d3-a456-426614174000"
+        accepted_tag = canonical_broker_submit_key(accepted_id)
+        accepted_owner = "watcher-accepted"
+        unknown_owner = "watcher-unknown"
+
+        def _materializing_meta(*, owner: str, generation: int) -> dict:
+            return {
+                "direction": "CALL",
+                "side": "CALL",
+                "timeframe": "5m",
+                "score": 0.85,
+                "trigger_price": 450.50,
+                "underlying_price": 448.20,
+                "signal_entry_price": 450.50,
+                "pattern": "3-1-2",
+                "signal_id": _SIGNAL,
+                "symbol": _SYMBOL,
+                "execution_mode": "paper",
+                "client_id": _CLIENT,
+                "contract_deferred": True,
+                "lifecycle_state": "MATERIALIZING",
+                "materialization_owner": owner,
+                "materialization_generation": generation,
+            }
+
+        def _insert_materializing(local_order_id: str, *, owner: str, generation: int):
+            with _pg_conn() as c:
+                c.execute(
+                    """
+                    INSERT INTO orders (
+                        local_order_id, client_id, kind, status, execution_mode,
+                        signal_id, contract, symbol, direction, side, timeframe,
+                        score, trigger_price, pattern, qty, limit_price,
+                        reserved_cost, meta
+                    ) VALUES (
+                        %s,%s,'ENTRY','PENDING_TRIGGER','paper',%s,%s,%s,
+                        'CALL','CALL','5m',0.85,450.50,'3-1-2',1,0.01,1.00,%s::jsonb
+                    )
+                    """,
+                    (
+                        local_order_id,
+                        _CLIENT,
+                        _SIGNAL,
+                        _DEFERRED,
+                        _SYMBOL,
+                        json.dumps(_materializing_meta(owner=owner, generation=generation)),
+                    ),
+                )
+
+        def _assert_committed_intent_then(response, local_order_id: str, expected_tag: str):
+            def _post(*_args, **kwargs):
+                order_data = kwargs["data"]
+                expected_hash = hashlib.sha256(
+                    json.dumps(
+                        order_data,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                with _pg_conn() as c:
+                    c.execute(
+                        "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
+                        (local_order_id, _CLIENT),
+                    )
+                    before_response = dict(c.fetchone())
+                intent_meta = before_response["meta"]
+                assert before_response["status"] == "PENDING_TRIGGER"
+                assert before_response["broker_order_id"] is None
+                assert before_response["submitted_ts"] is None
+                assert intent_meta["lifecycle_state"] == "SUBMITTING"
+                assert intent_meta["submit_intent_at"]
+                assert intent_meta["broker_submit_key"] == expected_tag
+                assert intent_meta["broker_submit_payload_hash"] == expected_hash
+                assert intent_meta["current_owner"] == f"broker_submit:{expected_tag}"
+                return response
+
+            return _post
+
+        _insert_materializing(accepted_id, owner=accepted_owner, generation=8)
+        _insert_materializing(_LOID, owner=unknown_owner, generation=7)
+
+        osm = _make_osm()
+        for local_order_id, owner, generation in (
+            (accepted_id, accepted_owner, 8),
+            (_LOID, unknown_owner, 7),
+        ):
+            assert osm.persist_deferred_broker_ready(
+                local_order_id,
+                owner=owner,
+                generation=generation,
+                signal_id=_SIGNAL,
+                execution_mode="paper",
+                contract=_CONTRACT,
+                limit_price=1.25,
+                qty=1,
+                reserved_cost=125.0,
+                selector_meta={"selector_debug": "postgres_acceptance"},
+            )
+
+        # Accepted broker truth: the POST callback opens a separate connection,
+        # proving submit intent and its exact payload hash committed before any
+        # broker response exists.
+        accepted_broker = _broker_post(
+            broker_id="BID-PG-ACCEPTED",
+            status_str="open",
+        )
+        accepted_response = accepted_broker.session.post.return_value
+        accepted_broker.session.post.side_effect = _assert_committed_intent_then(
+            accepted_response,
+            accepted_id,
+            accepted_tag,
+        )
+        accepted = osm.submit_existing_entry(
+            local_order_id=accepted_id,
+            broker=accepted_broker,
+        )
+        assert accepted["ok"] is True
+        assert accepted["broker_order_id"] == "BID-PG-ACCEPTED"
+        accepted_broker.session.post.assert_called_once()
+        assert accepted_broker.session.post.call_args.kwargs["data"]["tag"] == accepted_tag
+
+        with _pg_conn() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
+                (accepted_id, _CLIENT),
+            )
+            accepted_durable = dict(c.fetchone())
+        assert accepted_durable["contract"] == _CONTRACT
+        assert float(accepted_durable["limit_price"]) == 1.25
+        assert accepted_durable["contract_selection_status"] == "CONTRACT_SELECTED"
+        assert accepted_durable["status"] == "SUBMITTED"
+        assert accepted_durable["broker_order_id"] == "BID-PG-ACCEPTED"
+        assert accepted_durable["submitted_ts"] is not None
+        assert accepted_durable["meta"]["submit_intent_at"]
+        assert accepted_durable["meta"]["broker_submit_key"] == accepted_tag
+        assert accepted_durable["meta"]["submit_completed_at"]
+
+        # Unknown broker status with a real ID is quarantined after the same
+        # durable-before-POST proof and cannot issue a replacement submit.
+        unknown_broker = _broker_post(
+            broker_id="BID-PG-UNKNOWN",
+            status_str="unexpected_broker_state",
+        )
+        unknown_response = unknown_broker.session.post.return_value
+        unknown_broker.session.post.side_effect = _assert_committed_intent_then(
+            unknown_response,
+            _LOID,
+            _TAG,
+        )
+        result = osm.submit_existing_entry(local_order_id=_LOID, broker=unknown_broker)
+        assert result["ok"] is False
+        assert result["quarantine_persisted"] is True
+        assert unknown_broker.session.post.call_count == 1
+        assert unknown_broker.session.post.call_args.kwargs["data"]["tag"] == _TAG
+
+        with _pg_conn() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
+                (_LOID, _CLIENT),
+            )
+            durable = dict(c.fetchone())
+        assert durable["contract"] == _CONTRACT
+        assert float(durable["limit_price"]) == 1.25
+        assert durable["contract_selection_status"] == "CONTRACT_SELECTED"
+        assert durable["status"] == "SUBMITTED"
+        assert durable["broker_order_id"] == "BID-PG-UNKNOWN"
+        assert durable["submitted_ts"] is not None
+        assert durable["meta"]["submit_intent_at"]
+        assert durable["meta"]["broker_submit_key"] == _TAG
+        assert durable["meta"]["split_brain_quarantine"] is True
+
+        rows = db_module.get_open_orders_for_reconcile(
+            client_id=_CLIENT,
+            execution_mode="paper",
+        )
+        assert {row["local_order_id"] for row in rows} == {accepted_id, _LOID}
+
+        second = osm.submit_existing_entry(local_order_id=_LOID, broker=unknown_broker)
+        assert second["ok"] is False
+        assert second["error"] == "ENTRY_SPLIT_BRAIN_QUARANTINED"
+        assert unknown_broker.session.post.call_count == 1
+
+        # Exercise the actual reconciler, not the resolver directly. Exact-ID
+        # broker truth clears only the quarantined row through the fenced OSM CAS.
+        reconcile_broker = MagicMock()
+        reconcile_broker.get_order.side_effect = (
+            lambda broker_order_id: {"id": broker_order_id, "status": "open"}
+        )
+        with patch.object(APBrokerReconciler, "_register_health", return_value=None):
+            reconciler = APBrokerReconciler(
+                broker=reconcile_broker,
+                client_id=_CLIENT,
+                osm=osm,
+                pm=MagicMock(),
+                execution_mode="paper",
+            )
+        summary: dict = {}
+        with patch.object(reconciler, "_check_ghost_fills", return_value=None):
+            reconciler._reconcile_orders(summary)
+        assert summary["orders_checked"] == 2
+        assert summary["split_brain_resolved"] == 1
+        assert reconcile_broker.get_order.call_count == 2
+        assert osm.get_split_brain_orders(execution_mode="paper") == []
+
+        with _pg_conn() as c:
+            c.execute(
+                "SELECT last_error, meta FROM orders WHERE local_order_id=%s AND client_id=%s",
+                (_LOID, _CLIENT),
+            )
+            reconciled = dict(c.fetchone())
+        assert reconciled["last_error"] == "RECONCILED_SPLIT_BRAIN:broker_status=open"
+        assert reconciled["meta"]["split_brain_quarantine"] is False
+        assert reconciled["meta"]["reconciliation_required"] is False
+        assert reconciled["meta"]["split_brain_resolved_by"] == "ap_reconciler"
+
+        # Fresh submitted/no-ID rows share a signal ID but remain isolated by
+        # local ID + client + execution mode. No signal-level alias may attach
+        # identity or permit Jason to submit Jose's row.
+        jason_identity_id = "323e4567-e89b-12d3-a456-426614174000"
+        jose_identity_id = "423e4567-e89b-12d3-a456-426614174000"
+        jose_client = "jose@test.com"
+        shared_signal_id = "SIG-SHARED-IDENTITY-FENCE"
+        identity_meta = json.dumps({"lifecycle_state": "SUBMITTED"})
+        with _pg_conn() as c:
+            for local_order_id, client_id in (
+                (jason_identity_id, _CLIENT),
+                (jose_identity_id, jose_client),
+            ):
+                c.execute(
+                    """
+                    INSERT INTO orders (
+                        local_order_id, client_id, kind, status, execution_mode,
+                        signal_id, contract, symbol, qty, limit_price, meta
+                    ) VALUES (%s,%s,'ENTRY','SUBMITTED','paper',%s,%s,%s,1,1.25,%s::jsonb)
+                    """,
+                    (
+                        local_order_id,
+                        client_id,
+                        shared_signal_id,
+                        _CONTRACT,
+                        _SYMBOL,
+                        identity_meta,
+                    ),
+                )
+
+        jose = APOrderStateMachine(jose_client)
+        assert not osm._attach_broker_identity_if_missing(
+            jason_identity_id,
+            broker_order_id="BID-WRONG-MODE",
+            current_status="SUBMITTED",
+            current_execution_mode="live",
+        )
+        assert not jose._attach_broker_identity_if_missing(
+            jason_identity_id,
+            broker_order_id="BID-WRONG-CLIENT",
+            current_status="SUBMITTED",
+            current_execution_mode="paper",
+        )
+        assert osm._attach_broker_identity_if_missing(
+            jason_identity_id,
+            broker_order_id="BID-JASON-PAPER",
+            current_status="SUBMITTED",
+            current_execution_mode="paper",
+        )
+
+        cross_client_broker = _broker_post(
+            broker_id="BID-MUST-NOT-POST",
+            status_str="open",
+        )
+        cross_client_result = osm.submit_existing_entry(
+            local_order_id=jose_identity_id,
+            broker=cross_client_broker,
+        )
+        assert cross_client_result["ok"] is False
+        assert cross_client_result["error"] == "existing_entry_order_not_found"
+        cross_client_broker.session.post.assert_not_called()
+        assert jose._attach_broker_identity_if_missing(
+            jose_identity_id,
+            broker_order_id="BID-JOSE-PAPER",
+            current_status="SUBMITTED",
+            current_execution_mode="paper",
+        )
+
+        with _pg_conn() as c:
+            c.execute(
+                """
+                SELECT local_order_id, client_id, execution_mode, signal_id, broker_order_id
+                FROM orders
+                WHERE local_order_id IN (%s, %s)
+                ORDER BY local_order_id
+                """,
+                (jason_identity_id, jose_identity_id),
+            )
+            identity_rows = [dict(row) for row in c.fetchall()]
+        assert [row["signal_id"] for row in identity_rows] == [
+            shared_signal_id,
+            shared_signal_id,
+        ]
+        assert identity_rows[0]["broker_order_id"] == "BID-JASON-PAPER"
+        assert identity_rows[1]["broker_order_id"] == "BID-JOSE-PAPER"
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()

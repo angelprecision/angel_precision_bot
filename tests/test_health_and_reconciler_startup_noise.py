@@ -73,7 +73,10 @@ class TestBugA_ReconcilerStartupGrace:
         osm = MagicMock()
         osm.client_id = "test@x.com"
         pm = MagicMock()
-        r = APBrokerReconciler(broker=broker, client_id="test@x.com", osm=osm, pm=pm)
+        r = APBrokerReconciler(
+            broker=broker, client_id="test@x.com", osm=osm, pm=pm,
+            execution_mode="paper",
+        )
         return r
 
     def test_grace_attribute_exists(self):

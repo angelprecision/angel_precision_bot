@@ -53,6 +53,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.db import conn, run_with_retry
 from ap.exit_safety import (
     alert_exit_submission_halted,
@@ -976,6 +977,7 @@ class APOrderStateMachine:
         submitted_ts=None,
         filled_ts=None,
         position_id=None,
+        allow_submit_owner_terminalization: bool = False,
     ) -> bool:
         current = self._get_order(local_order_id)
         if not current:
@@ -995,6 +997,7 @@ class APOrderStateMachine:
         kind        = str(current.get("kind") or "")
         prev_filled = self._safe_int(current.get("filled_qty"), 0)
         same_state_fill_update = False
+        same_state_identity_update = False
 
         if filled_qty is not None:
             incoming_filled = self._safe_int(filled_qty, None)
@@ -1017,6 +1020,13 @@ class APOrderStateMachine:
         if old_status == new_status:
             if new_status in (OrderStatus.PARTIAL_FILL, OrderStatus.EXIT_PARTIAL_FILL):
                 same_state_fill_update = True
+            elif broker_order_id or submitted_ts:
+                # A same-state broker adoption is not a no-op.  A concurrent
+                # worker may have advanced the lifecycle status without
+                # persisting the broker identity.  Execute the fenced UPDATE so
+                # True means the exact broker id is durable, not merely that the
+                # status string already matches.
+                same_state_identity_update = True
             else:
                 log.debug("[%s] %s already %s -- no-op", self.client_id, local_order_id, new_status)
                 return True
@@ -1033,7 +1043,11 @@ class APOrderStateMachine:
             )
             return False
 
-        if not same_state_fill_update and not OrderStatus.can_transition(old_status, new_status):
+        if (
+            not same_state_fill_update
+            and not same_state_identity_update
+            and not OrderStatus.can_transition(old_status, new_status)
+        ):
             reason = f"illegal_transition:{old_status}->{new_status}"
             log.critical(
                 "[%s] ILLEGAL TRANSITION -- %s: %s -> %s | kind=%s broker=%s filled=%s price=%s",
@@ -1080,6 +1094,32 @@ class APOrderStateMachine:
             f"UPDATE orders SET {', '.join(updates)} "
             f"WHERE local_order_id=%s AND client_id=%s AND status=%s"
         )
+        if broker_order_id:
+            # Never replace a different durable broker identity.  Empty/equal
+            # are the only idempotent acceptance states.
+            sql += " AND (broker_order_id IS NULL OR broker_order_id='' OR broker_order_id=%s)"
+            params.append(str(broker_order_id))
+        if (
+            kind.upper() == "ENTRY"
+            and old_status in {OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER}
+            and OrderStatus.is_terminal(new_status)
+            and not allow_submit_owner_terminalization
+        ):
+            # Atomic cleanup fence: a generic timeout/cancel must not race a
+            # durable broker-submit intent written after its Python-side read.
+            # Only the submit path may opt out after a broker response is
+            # conclusively classified as not owning an order.
+            sql += (
+                " AND (broker_order_id IS NULL OR broker_order_id='')"
+                " AND submitted_ts IS NULL"
+                " AND COALESCE(meta->>'submit_intent_at','')=''"
+                " AND UPPER(COALESCE(meta->>'lifecycle_state',''))"
+                "     NOT IN ('SUBMITTING','SUBMITTED')"
+                " AND COALESCE(meta->>'broker_submit_key','')=''"
+                " AND COALESCE(meta->>'recovery_submit_owner','')=''"
+                " AND COALESCE(meta->>'split_brain_quarantine','')=''"
+                " AND COALESCE(last_error,'') NOT LIKE 'SPLIT_BRAIN:%%'"
+            )
 
         def _fn():
             with conn() as c:
@@ -1095,23 +1135,49 @@ class APOrderStateMachine:
             #   (c) row genuinely missing                             -> real error
             latest = self._get_order(local_order_id)
             if latest:
-                latest_status = str(dict(latest).get("status") or "")
+                latest_row = dict(latest)
+                latest_status = str(latest_row.get("status") or "")
                 if latest_status == new_status:
-                    log.info(
-                        "[%s] transition CAS no-op -- %s already advanced to %s by "
-                        "a concurrent worker; treating as success",
-                        self.client_id, local_order_id, new_status,
+                    if broker_order_id:
+                        latest_broker_id = str(
+                            latest_row.get("broker_order_id") or ""
+                        ).strip()
+                        if latest_broker_id != str(broker_order_id).strip():
+                            reason = (
+                                "transition_broker_identity_unproven:"
+                                f"expected={broker_order_id}:actual={latest_broker_id or 'missing'}"
+                            )
+                            log.critical(
+                                "[%s] OSM BROKER IDENTITY CAS MISS | order=%s "
+                                "status=%s expected_broker=%s actual_broker=%s",
+                                self.client_id, local_order_id, new_status,
+                                broker_order_id, latest_broker_id or "missing",
+                            )
+                        else:
+                            log.info(
+                                "[%s] transition CAS no-op -- %s already advanced "
+                                "to %s with exact broker identity %s",
+                                self.client_id, local_order_id, new_status,
+                                broker_order_id,
+                            )
+                            return True
+                    else:
+                        log.info(
+                            "[%s] transition CAS no-op -- %s already advanced to %s by "
+                            "a concurrent worker; treating as success",
+                            self.client_id, local_order_id, new_status,
+                        )
+                        return True
+                else:
+                    reason = (
+                        f"transition_cas_conflict:{old_status}->{new_status}"
+                        f" (actual_now={latest_status})"
                     )
-                    return True
-                reason = (
-                    f"transition_cas_conflict:{old_status}->{new_status}"
-                    f" (actual_now={latest_status})"
-                )
-                log.critical(
-                    "[%s] OSM CAS CONFLICT | %s | expected_from=%s wanted=%s actual=%s "
-                    "-- concurrent writer changed status; refusing to overwrite",
-                    self.client_id, local_order_id, old_status, new_status, latest_status,
-                )
+                    log.critical(
+                        "[%s] OSM CAS CONFLICT | %s | expected_from=%s wanted=%s actual=%s "
+                        "-- concurrent writer changed status; refusing to overwrite",
+                        self.client_id, local_order_id, old_status, new_status, latest_status,
+                    )
             else:
                 reason = f"transition_update_no_rows:{old_status}->{new_status}"
                 log.critical("[%s] OSM UPDATE TOUCHED ZERO ROWS (row missing) | %s | %s",
@@ -1720,7 +1786,7 @@ class APOrderStateMachine:
         import json as _json_local
         owner = str(owner or "").strip()
         mode = str(execution_mode or "").strip().lower()
-        submit_key = str(broker_submit_key or "").strip()[:32]
+        submit_key = canonical_broker_submit_key(broker_submit_key)
         payload_hash = str(payload_hash or "").strip()
         try:
             generation = int(generation)
@@ -1778,6 +1844,8 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         generation: int,
+        execution_mode: str,
+        signal_id: str,
         payload_hash: str,
         broker_submit_key: str,
     ) -> bool:
@@ -1789,12 +1857,20 @@ class APOrderStateMachine:
         """
         import json as _json_local
         payload_hash = str(payload_hash or "").strip()
-        submit_key = str(broker_submit_key or "").strip()[:32]
+        submit_key = canonical_broker_submit_key(broker_submit_key)
+        mode = str(execution_mode or "").strip().lower()
+        durable_signal_id = str(signal_id or "").strip()
         try:
             generation = int(generation)
         except (TypeError, ValueError):
             return False
-        if generation < 1 or not payload_hash or not submit_key:
+        if (
+            generation < 1
+            or mode not in {"live", "paper"}
+            or not durable_signal_id
+            or not payload_hash
+            or not submit_key
+        ):
             return False
         now = now_utc_iso()
         patch = _json_local.dumps({
@@ -1815,6 +1891,8 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND COALESCE(signal_id,'') = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -1825,7 +1903,10 @@ class APOrderStateMachine:
                       AND COALESCE(meta->>'submit_intent_at','') = ''
                       AND COALESCE(meta->>'recovery_submit_owner','') = ''
                     """,
-                    (patch, local_order_id, self.client_id, generation),
+                    (
+                        patch, local_order_id, self.client_id, mode,
+                        durable_signal_id, generation,
+                    ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
@@ -1834,6 +1915,95 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] persist_materialized_submit_intent failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def persist_entry_submit_intent(
+        self,
+        local_order_id: str,
+        *,
+        current_status: str,
+        execution_mode: str,
+        signal_id: str,
+        contract: str,
+        qty: int,
+        limit_price: float,
+        payload_hash: str,
+        broker_submit_key: str,
+    ) -> bool:
+        """Atomically claim the first broker POST for an ordinary entry row."""
+        submit_key = canonical_broker_submit_key(broker_submit_key)
+        mode = str(execution_mode or "").strip().lower()
+        status = str(current_status or "").strip().upper()
+        durable_signal_id = str(signal_id or "").strip()
+        durable_contract = str(contract or "").strip()
+        payload_hash = str(payload_hash or "").strip()
+        try:
+            durable_qty = int(qty)
+            durable_limit = round(float(limit_price), 2)
+        except (TypeError, ValueError):
+            return False
+        if (
+            status not in {OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER}
+            or mode not in {"live", "paper"}
+            or not durable_signal_id
+            or not durable_contract
+            or durable_qty <= 0
+            or durable_limit <= 0
+            or not payload_hash
+            or not submit_key
+        ):
+            return False
+
+        now = now_utc_iso()
+        patch = json.dumps({
+            "lifecycle_state": "SUBMITTING",
+            "submit_started_at": now,
+            "submit_intent_at": now,
+            "broker_submit_key": submit_key,
+            "broker_submit_payload_hash": payload_hash,
+            "current_owner": f"broker_submit:{submit_key}",
+        })
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND COALESCE(signal_id,'') = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = %s
+                      AND COALESCE(contract,'') = %s
+                      AND COALESCE(qty,0) = %s
+                      AND ROUND(COALESCE(limit_price,0)::numeric, 2) = %s
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'submit_intent_at','') = ''
+                      AND UPPER(COALESCE(meta->>'lifecycle_state',''))
+                          NOT IN ('SUBMITTING','SUBMITTED')
+                      AND COALESCE(meta->>'recovery_submit_owner','') = ''
+                      AND COALESCE(meta->>'split_brain_quarantine','') = ''
+                      AND COALESCE(last_error,'') NOT LIKE 'SPLIT_BRAIN:%%'
+                    """,
+                    (
+                        patch, local_order_id, self.client_id, mode,
+                        durable_signal_id, status, durable_contract,
+                        durable_qty, durable_limit,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_entry_submit_intent failed order=%s: %s",
                 self.client_id, local_order_id, exc,
             )
             return False
@@ -3240,6 +3410,37 @@ class APOrderStateMachine:
             return {"ok": False, "local_order_id": local_order_id,
                     "broker_order_id": current.get("broker_order_id"),
                     "status": OrderStatus.ERROR, "error": error_msg}
+
+        _raw_meta = current.get("meta") or {}
+        if isinstance(_raw_meta, str):
+            try:
+                _raw_meta = json.loads(_raw_meta)
+            except Exception:
+                _raw_meta = {}
+        if not isinstance(_raw_meta, dict):
+            _raw_meta = {}
+        _plan_meta = getattr(plan, "metadata", None) if plan is not None else None
+        _plan_meta = _plan_meta if isinstance(_plan_meta, dict) else {}
+        _recovery_owner = str(_plan_meta.get("recovery_submit_owner") or "").strip()
+        _recovery_generation = _plan_meta.get("recovery_submit_generation")
+        _is_recovery_submit = bool(
+            _plan_meta.get("recovery_submit_fenced") or _recovery_owner
+        )
+        _quarantined = bool(
+            str(current.get("last_error") or "").startswith("SPLIT_BRAIN:")
+            or _raw_meta.get("split_brain_quarantine")
+            or _raw_meta.get("reconciliation_required")
+        )
+        if _quarantined:
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": current.get("broker_order_id"),
+                "status": status,
+                "error": "ENTRY_SPLIT_BRAIN_QUARANTINED",
+                "split_brain": True,
+                "reconciliation_required": True,
+            }
         # ── Req 3: submitted-like state must have proven broker identity ────────
         # SUBMITTED, ACKNOWLEDGED, PARTIAL_FILL: idempotent success only if
         # broker_order_id is present.  If it is missing, attempt tag lookup to
@@ -3269,14 +3470,25 @@ class APOrderStateMachine:
                 or ""
             )
             _recovered_bid = self._lookup_order_by_tag(
-                broker, _lu_base_url, _lu_account, str(local_order_id),
+                broker, _lu_base_url, _lu_account,
+                canonical_broker_submit_key(local_order_id),
             )
             if _recovered_bid:
-                self._attach_broker_identity_if_missing(
+                _attached = self._attach_broker_identity_if_missing(
                     local_order_id,
                     broker_order_id=_recovered_bid,
                     current_status=status,
+                    current_execution_mode=str(current.get("execution_mode") or ""),
                 )
+                if not _attached:
+                    return {
+                        "ok": False,
+                        "local_order_id": local_order_id,
+                        "broker_order_id": _recovered_bid,
+                        "status": status,
+                        "error": "ENTRY_BROKER_IDENTITY_PERSIST_FAILED",
+                        "reconciliation_required": True,
+                    }
                 log.info(
                     "[%s] ENTRY_BROKER_IDENTITY_RECONCILED_BY_TAG | "
                     "order=%s broker_id=%s status=%s",
@@ -3339,6 +3551,97 @@ class APOrderStateMachine:
                     "broker_order_id": current.get("broker_order_id"),
                     "status": status, "error": error_msg}
 
+        # Any broker ownership evidence that predates this invocation blocks a
+        # replacement POST.  The sole exception is the exact unexpired recovery
+        # owner carried by this call; persist_deferred_submit_intent() must still
+        # atomically transfer that claim before submission.
+        _durable_recovery_owner = str(
+            _raw_meta.get("recovery_submit_owner") or ""
+        ).strip()
+        _owned_recovery_transfer = bool(
+            _is_recovery_submit
+            and _recovery_owner
+            and _durable_recovery_owner == _recovery_owner
+            and not current.get("broker_order_id")
+            and not current.get("submitted_ts")
+            and not str(_raw_meta.get("submit_intent_at") or "").strip()
+            and str(_raw_meta.get("lifecycle_state") or "").upper() == "BROKER_READY"
+        )
+        _has_prior_broker_proof = bool(
+            current.get("broker_order_id")
+            or current.get("submitted_ts")
+            or str(_raw_meta.get("submit_intent_at") or "").strip()
+            or str(_raw_meta.get("lifecycle_state") or "").upper()
+               in {"SUBMITTING", "SUBMITTED"}
+            or str(_raw_meta.get("broker_submit_key") or "").strip()
+            or str(_raw_meta.get("current_owner") or "").startswith("broker_submit:")
+            or (_durable_recovery_owner and not _owned_recovery_transfer)
+        )
+        if _has_prior_broker_proof:
+            _existing_bid = str(current.get("broker_order_id") or "").strip()
+            if not _existing_bid:
+                _lu_base_url = (
+                    getattr(broker, "base_url", None)
+                    or getattr(getattr(broker, "cfg", None), "base_url", None)
+                    or ""
+                )
+                _lu_account = (
+                    getattr(broker, "account_id", None)
+                    or getattr(getattr(broker, "cfg", None), "account_id", None)
+                    or ""
+                )
+                _existing_bid = str(self._lookup_order_by_tag(
+                    broker,
+                    _lu_base_url,
+                    _lu_account,
+                    canonical_broker_submit_key(local_order_id),
+                ) or "").strip()
+            if _existing_bid:
+                _reconciled = self.transition(
+                    local_order_id,
+                    OrderStatus.SUBMITTED,
+                    broker_order_id=_existing_bid,
+                    submitted_ts=now_utc_iso(),
+                )
+                if _reconciled:
+                    self.update_order_meta(local_order_id, {
+                        "lifecycle_state": "SUBMITTED",
+                        "submit_completed_at": now_utc_iso(),
+                        "broker_order_id": _existing_bid,
+                        "current_owner": "broker",
+                        "reconciled_by_tag": True,
+                    })
+                    return {
+                        "ok": True,
+                        "local_order_id": local_order_id,
+                        "broker_order_id": _existing_bid,
+                        "status": OrderStatus.SUBMITTED,
+                        "error": None,
+                        "reconciled_by_tag": True,
+                    }
+                self._flag_split_brain_order(
+                    local_order_id,
+                    broker_order_id=_existing_bid,
+                    error_msg="ENTRY_PRIOR_SUBMIT_IDENTITY_ATTACH_FAILED",
+                    execution_mode=str(current.get("execution_mode") or ""),
+                )
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": _existing_bid or None,
+                "status": status,
+                "error": (
+                    "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+                    if (
+                        _durable_recovery_owner
+                        or _raw_meta.get("materialization_generation")
+                        or _raw_meta.get("contract_deferred")
+                    )
+                    else "ENTRY_PRIOR_SUBMIT_PROOF_RECONCILIATION_REQUIRED"
+                ),
+                "reconciliation_required": True,
+            }
+
         # Durable state is authoritative.  A caller may pass an in-memory plan
         # only as an agreement proof; it may never repair or override the row at
         # submit time.  Deferred copyback must have committed atomically before
@@ -3353,15 +3656,6 @@ class APOrderStateMachine:
             or _db_contract.upper().startswith("DEFERRED:")
             or _db_contract.upper() == str(_ticker).upper()
         )
-
-        _raw_meta = current.get("meta") or {}
-        if isinstance(_raw_meta, str):
-            try:
-                _raw_meta = json.loads(_raw_meta)
-            except Exception:
-                _raw_meta = {}
-        if not isinstance(_raw_meta, dict):
-            _raw_meta = {}
 
         _is_materialized_deferred = bool(
             _raw_meta.get("contract_deferred")
@@ -3538,20 +3832,20 @@ class APOrderStateMachine:
                       or getattr(getattr(broker, "cfg", None), "account_id", None)
                       or "")
         error_msg = broker_order_id = None
+        _submit_key = canonical_broker_submit_key(local_order_id)
         # Build order payload with Tradier 'tag' for idempotency on retry.
-        # tag MUST be local_order_id so _lookup_order_by_tag can recover from
+        # tag MUST be the canonical submit key so _lookup_order_by_tag can recover from
         # ambiguous broker responses (read timeout, JSON parse fail) without
         # double-submitting.
         _order_data = {
             "class": "option", "symbol": ticker, "option_symbol": contract,
             "side": "buy_to_open", "quantity": qty,
             "type": "limit", "price": round(lp, 2), "duration": "day",
-            "tag": str(local_order_id)[:32],
+            "tag": _submit_key,
         }
         # Persist the exact durable submit intent before any broker bytes leave
         # the process.  The Tradier tag is the stable idempotency/reconciliation
         # key for the crash window after POST but before broker_order_id commit.
-        _had_prior_submit_intent = bool(_raw_meta.get("submit_intent_at"))
         _payload_hash = hashlib.sha256(
             json.dumps(_order_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
@@ -3568,11 +3862,6 @@ class APOrderStateMachine:
             )
         except Exception:
             _breach_to_submit_ms = None
-        _plan_meta = getattr(plan, "metadata", None) if plan is not None else None
-        _plan_meta = _plan_meta if isinstance(_plan_meta, dict) else {}
-        _recovery_owner = str(_plan_meta.get("recovery_submit_owner") or "").strip()
-        _recovery_generation = _plan_meta.get("recovery_submit_generation")
-        _is_recovery_submit = bool(_plan_meta.get("recovery_submit_fenced") or _recovery_owner)
         try:
             _materialization_generation = int(_raw_meta.get("materialization_generation") or 0)
         except (TypeError, ValueError):
@@ -3584,7 +3873,7 @@ class APOrderStateMachine:
                 generation=_recovery_generation,
                 execution_mode=str(current.get("execution_mode") or ""),
                 payload_hash=_payload_hash,
-                broker_submit_key=str(local_order_id)[:32],
+                broker_submit_key=_submit_key,
             )
             _intent_error = "RECOVERY_SUBMIT_INTENT_FENCE_LOST"
         elif _is_materialized_deferred:
@@ -3593,8 +3882,10 @@ class APOrderStateMachine:
                 and self.persist_materialized_submit_intent(
                     local_order_id,
                     generation=_materialization_generation,
+                    execution_mode=str(current.get("execution_mode") or ""),
+                    signal_id=str(current.get("signal_id") or ""),
                     payload_hash=_payload_hash,
-                    broker_submit_key=str(local_order_id)[:32],
+                    broker_submit_key=_submit_key,
                 )
             )
             if not _intent_ok:
@@ -3627,16 +3918,18 @@ class APOrderStateMachine:
             else:
                 _intent_error = "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent"
         else:
-            # Preserve the established non-recovery submission path.
-            _intent_ok = self.update_order_meta(local_order_id, {
-                "lifecycle_state": "SUBMITTING",
-                "submit_started_at": now_utc_iso(),
-                "submit_intent_at": now_utc_iso(),
-                "broker_submit_key": str(local_order_id)[:32],
-                "current_owner": f"broker_submit:{str(local_order_id)[:32]}",
-                "broker_submit_payload_hash": _payload_hash,
-            })
-            _intent_error = "MATERIALIZATION_STATE_WRITE_FAILED:submit_intent"
+            _intent_ok = self.persist_entry_submit_intent(
+                local_order_id,
+                current_status=latest_status,
+                execution_mode=str(latest.get("execution_mode") or ""),
+                signal_id=str(latest.get("signal_id") or ""),
+                contract=contract,
+                qty=qty,
+                limit_price=lp,
+                payload_hash=_payload_hash,
+                broker_submit_key=_submit_key,
+            )
+            _intent_error = "ENTRY_SUBMIT_INTENT_FENCE_LOST"
         if not _intent_ok:
             return {
                 "ok": False,
@@ -3645,31 +3938,62 @@ class APOrderStateMachine:
                 "status": OrderStatus.ERROR,
                 "error": _intent_error,
             }
-        if _had_prior_submit_intent:
-            _existing_oid = self._lookup_order_by_tag(
-                broker, base_url, account_id, str(local_order_id),
-            )
-            if _existing_oid:
-                ok = self.transition(
-                    local_order_id, OrderStatus.SUBMITTED,
-                    broker_order_id=_existing_oid, submitted_ts=now_utc_iso(),
-                )
-                if ok:
-                    self.update_order_meta(local_order_id, {
-                        "lifecycle_state": "SUBMITTED",
-                        "submit_completed_at": now_utc_iso(),
-                        "broker_order_id": str(_existing_oid),
-                        "current_owner": "broker",
-                        "total_breach_to_submit_ms": _breach_to_submit_ms,
-                    })
-                    return {
-                        "ok": True,
-                        "local_order_id": local_order_id,
-                        "broker_order_id": _existing_oid,
-                        "status": OrderStatus.SUBMITTED,
-                        "error": None,
-                        "reconciled_by_tag": True,
-                    }
+
+        # Final durable proof immediately before the irreversible network call.
+        # This re-read must show exactly this invocation's intent and no broker
+        # identity/quarantine evidence.  A CAS success alone is not sufficient.
+        _intent_row = self._get_order(local_order_id)
+        _intent_row = dict(_intent_row) if _intent_row else {}
+        _intent_meta = _intent_row.get("meta") or {}
+        if isinstance(_intent_meta, str):
+            try:
+                _intent_meta = json.loads(_intent_meta)
+            except Exception:
+                _intent_meta = {}
+        if not isinstance(_intent_meta, dict):
+            _intent_meta = {}
+        _intent_status = str(_intent_row.get("status") or "").upper()
+        _intent_quarantined = bool(
+            str(_intent_row.get("last_error") or "").startswith("SPLIT_BRAIN:")
+            or _intent_meta.get("split_brain_quarantine")
+            or _intent_meta.get("reconciliation_required")
+        )
+        try:
+            _intent_qty = int(_intent_row.get("qty") or 0)
+            _intent_limit = float(_intent_row.get("limit_price") or 0)
+        except (TypeError, ValueError):
+            _intent_qty = -1
+            _intent_limit = -1.0
+        _intent_proven = bool(
+            _intent_status in {OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER}
+            and str(_intent_row.get("client_id") or "").strip().lower()
+                == str(self.client_id or "").strip().lower()
+            and str(_intent_row.get("execution_mode") or "").strip().lower()
+                == str(latest.get("execution_mode") or "").strip().lower()
+            and str(_intent_row.get("signal_id") or "")
+                == str(latest.get("signal_id") or "")
+            and str(_intent_row.get("contract") or "") == contract
+            and _intent_qty == qty
+            and abs(_intent_limit - lp) <= 0.001
+            and not _intent_row.get("broker_order_id")
+            and not _intent_row.get("submitted_ts")
+            and str(_intent_meta.get("lifecycle_state") or "").upper() == "SUBMITTING"
+            and bool(str(_intent_meta.get("submit_intent_at") or "").strip())
+            and str(_intent_meta.get("broker_submit_key") or "") == _submit_key
+            and str(_intent_meta.get("broker_submit_payload_hash") or "") == _payload_hash
+            and str(_intent_meta.get("current_owner") or "")
+                == f"broker_submit:{_submit_key}"
+            and not _intent_quarantined
+        )
+        if not _intent_proven:
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": _intent_row.get("broker_order_id"),
+                "status": _intent_status or OrderStatus.ERROR,
+                "error": "ENTRY_SUBMIT_INTENT_DURABLE_PROOF_FAILED",
+                "reconciliation_required": True,
+            }
         order, error_msg, broker_order_id, broker_status = self._submit_order_with_retry(
             broker=broker, base_url=base_url, account_id=account_id,
             order_data=_order_data, local_id=local_order_id, op_label="existing_entry",
@@ -3691,7 +4015,8 @@ class APOrderStateMachine:
                             "status": OrderStatus.SUBMITTED, "error": None}
                 error_msg = "submitted_transition_failed_after_broker_accept"
                 self._flag_split_brain_order(local_order_id, broker_order_id=broker_order_id,
-                                             error_msg=error_msg)
+                                             error_msg=error_msg,
+                                             execution_mode=str(current.get("execution_mode") or ""))
                 return {"ok": False, "local_order_id": local_order_id,
                         "broker_order_id": broker_order_id, "status": OrderStatus.ERROR,
                         "error": error_msg, "split_brain": True}
@@ -3703,10 +4028,11 @@ class APOrderStateMachine:
                 # split-brain/quarantine mechanism so reconciliation can resolve it.
                 # Never discard a broker ID. Never issue a replacement submit.
                 _sb_reason = f"BROKER_STATUS_UNKNOWN_WITH_ID:status={broker_status!r}"
-                self._flag_split_brain_order(
+                _quarantine_persisted = self._flag_split_brain_order(
                     local_order_id,
                     broker_order_id=broker_order_id,
                     error_msg=_sb_reason,
+                    execution_mode=str(current.get("execution_mode") or ""),
                 )
                 log.critical(
                     "[%s] BROKER_STATUS_UNKNOWN_WITH_ID | order=%s broker_id=%s "
@@ -3719,19 +4045,49 @@ class APOrderStateMachine:
                     "ok": False,
                     "local_order_id": local_order_id,
                     "broker_order_id": broker_order_id,
-                    "status": OrderStatus.ERROR,
+                    "status": OrderStatus.SUBMITTED if _quarantine_persisted else OrderStatus.ERROR,
                     "error": _sb_reason,
                     "split_brain": True,
+                    "reconciliation_required": True,
+                    "quarantine_persisted": _quarantine_persisted,
+                }
+            elif self._is_broker_accept_status(broker_status):
+                # A 2xx/accepted response without an identity is still an
+                # ownership ambiguity.  Keep the pre-POST submit intent and the
+                # row's submit-eligible status fenced for reconciliation; never
+                # terminalize it or authorize another POST.
+                return {
+                    "ok": False,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": None,
+                    "status": _intent_status,
+                    "error": "BROKER_ACCEPTED_MISSING_ID_RECONCILIATION_REQUIRED",
+                    "identity_quarantine": True,
                     "reconciliation_required": True,
                 }
             else:
                 error_msg = (f"broker_status:{broker_status or 'unknown'} "
                              f"broker_order_id_missing:{not bool(broker_order_id)}")
 
+        if str(error_msg or "").startswith("BROKER_AMBIGUOUS_"):
+            return {
+                "ok": False,
+                "local_order_id": local_order_id,
+                "broker_order_id": None,
+                "status": _intent_status,
+                "error": error_msg,
+                "identity_quarantine": True,
+                "reconciliation_required": True,
+            }
+
         # AUDIT-7: include broker rejection reason in observability event so
         # structured audit trail captures WHY Tradier rejected the order.
-        self.transition(local_order_id, OrderStatus.ERROR,
-                        last_error=error_msg or "unknown_error")
+        self.transition(
+            local_order_id,
+            OrderStatus.ERROR,
+            last_error=error_msg or "unknown_error",
+            allow_submit_owner_terminalization=True,
+        )
         self.update_order_meta(local_order_id, {
             "lifecycle_state": "ERROR",
             "materialization_in_flight": False,
@@ -3771,17 +4127,16 @@ class APOrderStateMachine:
         On success: error_msg is None, order_dict contains broker payload.
         On failure: order_dict is None, error_msg describes the terminal failure.
 
-        Used by submit_entry, submit_existing_entry, and (via inline copy)
-        submit_exit. Same classified-retry pattern as submit_exit:
+        Used by submit_entry and submit_existing_entry.  submit_exit mirrors
+        the same classified boundary:
 
           RETRYABLE (max 3 attempts, exponential backoff 1s/2s/4s):
-            - Connection error (request never reached broker)
-            - 5xx server errors
-            - 429 rate limit
+            - ConnectTimeout only (no HTTP connection was established)
 
           AMBIGUOUS (order MAY have landed — tag-lookup before retry):
-            - ReadTimeout (POST sent, response lost)
-            - JSON parse failure mid-response
+            - connection reset / ReadTimeout / generic request failure
+            - 5xx / 429 / JSON parse failure / unclassified exception
+            - clean 2xx without a broker order id
 
           PERMANENT (no retry):
             - 4xx (not 429): bad symbol, auth failure, etc.
@@ -3829,15 +4184,19 @@ class APOrderStateMachine:
                     return None, error_msg, None, ""
 
                 if _sc is not None and (_sc >= 500 or _sc == 429):
-                    error_msg = f"broker_http_{_sc}_retryable"
-                    log.warning(
-                        "[%s] submit_%s retryable HTTP %s | local=%s attempt=%d/%d",
-                        self.client_id, op_label, _sc, local_id, _attempt, _max_attempts,
+                    _existing_oid = self._lookup_order_by_tag(
+                        broker, base_url, account_id,
+                        canonical_broker_submit_key(local_id),
                     )
-                    if _attempt < _max_attempts:
-                        _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                        continue
-                    return None, error_msg, None, ""
+                    if _existing_oid:
+                        return ({"id": _existing_oid, "status": "open"}, None,
+                                _existing_oid, "open")
+                    return (
+                        None,
+                        f"BROKER_AMBIGUOUS_HTTP_{_sc}_RECONCILIATION_REQUIRED",
+                        None,
+                        "",
+                    )
 
                 # 2xx — parse JSON
                 try:
@@ -3849,7 +4208,8 @@ class APOrderStateMachine:
                         self.client_id, op_label, local_id, _attempt, _je,
                     )
                     _existing_oid = self._lookup_order_by_tag(
-                        broker, base_url, account_id, str(local_id),
+                        broker, base_url, account_id,
+                        canonical_broker_submit_key(local_id),
                     )
                     if _existing_oid:
                         log.info(
@@ -3859,18 +4219,37 @@ class APOrderStateMachine:
                         )
                         order = {"id": _existing_oid, "status": "open"}
                     else:
-                        error_msg = f"broker_ambiguous_parse:{_je}"
-                        if _attempt < _max_attempts:
-                            _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                            continue
+                        error_msg = (
+                            "BROKER_AMBIGUOUS_JSON_RECONCILIATION_REQUIRED:"
+                            f"{_je}"
+                        )
                         return None, error_msg, None, ""
 
                 status          = str(order.get("status") or "").lower().strip()
                 broker_order_id = order.get("id") or order.get("order_id")
+                if (
+                    not broker_order_id
+                    and status not in {"rejected", "canceled", "cancelled", "expired"}
+                ):
+                    _existing_oid = self._lookup_order_by_tag(
+                        broker, base_url, account_id,
+                        canonical_broker_submit_key(local_id),
+                    )
+                    if _existing_oid:
+                        return ({"id": _existing_oid, "status": "open"}, None,
+                                _existing_oid, "open")
+                    return (
+                        None,
+                        "BROKER_AMBIGUOUS_2XX_MISSING_ID_RECONCILIATION_REQUIRED:"
+                        f"status={status or 'empty'}",
+                        None,
+                        status,
+                    )
                 return order, None, broker_order_id, status
 
-            except (_ConnectTimeout, _ConnectionError) as _ce:
-                # RETRYABLE_CONN — request did not reach broker, safe to retry
+            except _ConnectTimeout as _ce:
+                # A connect-phase timeout occurs before an HTTP response is
+                # established and remains retryable.
                 error_msg = f"broker_conn_error:{_ce}"
                 log.warning(
                     "[%s] submit_%s conn error | local=%s attempt=%d/%d err=%s",
@@ -3881,6 +4260,25 @@ class APOrderStateMachine:
                     continue
                 return None, error_msg, None, ""
 
+            except _ConnectionError as _ce:
+                # ConnectionError also covers resets after request bytes were
+                # sent.  Treat it as ambiguous unless the exact broker tag is
+                # found; never issue a blind replacement POST.
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
+                )
+                if _existing_oid:
+                    return ({"id": _existing_oid, "status": "open"}, None,
+                            _existing_oid, "open")
+                return (
+                    None,
+                    "BROKER_AMBIGUOUS_CONNECTION_RECONCILIATION_REQUIRED:"
+                    f"{_ce}",
+                    None,
+                    "",
+                )
+
             except _ReadTimeout as _rt:
                 # AMBIGUOUS — Tradier got it, response lost. Query by tag.
                 log.warning(
@@ -3888,7 +4286,8 @@ class APOrderStateMachine:
                     self.client_id, op_label, local_id, _attempt, _rt,
                 )
                 _existing_oid = self._lookup_order_by_tag(
-                    broker, base_url, account_id, str(local_id),
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
                 )
                 if _existing_oid:
                     log.info(
@@ -3898,31 +4297,51 @@ class APOrderStateMachine:
                     )
                     return ({"id": _existing_oid, "status": "open"}, None,
                             _existing_oid, "open")
-                error_msg = f"broker_read_timeout:{_rt}"
-                if _attempt < _max_attempts:
-                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                    continue
+                error_msg = (
+                    "BROKER_AMBIGUOUS_READ_TIMEOUT_RECONCILIATION_REQUIRED:"
+                    f"{_rt}"
+                )
                 return None, error_msg, None, ""
 
             except _RequestException as _re:
-                error_msg = f"broker_request_error:{_re}"
-                log.warning(
-                    "[%s] submit_%s request error | local=%s attempt=%d/%d err=%s",
-                    self.client_id, op_label, local_id, _attempt, _max_attempts, _re,
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
                 )
-                if _attempt < _max_attempts:
-                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                    continue
-                return None, error_msg, None, ""
+                if _existing_oid:
+                    return ({"id": _existing_oid, "status": "open"}, None,
+                            _existing_oid, "open")
+                return (
+                    None,
+                    "BROKER_AMBIGUOUS_REQUEST_RECONCILIATION_REQUIRED:"
+                    f"{_re}",
+                    None,
+                    "",
+                )
 
             except Exception as _e:
-                # Unknown — do not retry, do not assume safe
-                error_msg = f"broker_error:{_e}"
+                # The exception happened at or after the POST boundary.  Unless
+                # exact tag recovery proves ownership, preserve the durable
+                # submit intent and require reconciliation; never authorize a
+                # blind replacement POST.
                 log.error(
                     "[%s] submit_%s unexpected error | local=%s attempt=%d err=%s",
                     self.client_id, op_label, local_id, _attempt, _e,
                 )
-                return None, error_msg, None, ""
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
+                )
+                if _existing_oid:
+                    return ({"id": _existing_oid, "status": "open"}, None,
+                            _existing_oid, "open")
+                return (
+                    None,
+                    "BROKER_AMBIGUOUS_UNEXPECTED_RECONCILIATION_REQUIRED:"
+                    f"{_e}",
+                    None,
+                    "",
+                )
 
         # Loop fell through without explicit return — defensive
         return None, error_msg or "submit_exhausted_no_return", None, ""
@@ -3935,76 +4354,30 @@ class APOrderStateMachine:
         limit_price=None,
         reserved_cost=None,
     ) -> dict:
-        local_id = self.create_entry_order(plan, limit_price=limit_price, reserved_cost=reserved_cost)
-        lp       = float(limit_price or getattr(plan, "limit_price", 0) or 0)
-        symbol   = getattr(plan, "contract_symbol", None) or plan.ticker
+        local_id = self.create_entry_order(
+            plan,
+            limit_price=limit_price,
+            reserved_cost=reserved_cost,
+            execution_mode=(
+                getattr(plan, "execution_mode", None)
+                or getattr(plan, "mode", None)
+            ),
+        )
+        lp = float(limit_price or getattr(plan, "limit_price", 0) or 0)
         if lp <= 0:
             error_msg = "invalid_entry_limit_price"
             self.transition(local_id, OrderStatus.ERROR, last_error=error_msg)
             return {"ok": False, "local_order_id": local_id, "broker_order_id": None,
                     "status": OrderStatus.ERROR, "error": error_msg}
-
-        base_url   = (getattr(broker, "base_url", None)
-                      or getattr(getattr(broker, "cfg", None), "base_url", None)
-                      or "https://sandbox.tradier.com")
-        account_id = (getattr(broker, "account_id", None)
-                      or getattr(getattr(broker, "cfg", None), "account_id", None)
-                      or "")
-        error_msg = broker_order_id = None
-        _order_data = {
-            "class": "option", "symbol": plan.ticker, "option_symbol": symbol,
-            "side": "buy_to_open", "quantity": int(plan.contracts),
-            "type": "limit", "price": round(lp, 2), "duration": "day",
-            "tag": str(local_id)[:32],
-        }
-        order, error_msg, broker_order_id, status = self._submit_order_with_retry(
-            broker=broker, base_url=base_url, account_id=account_id,
-            order_data=_order_data, local_id=local_id, op_label="entry",
-        )
-        if error_msg is None:
-            if self._is_broker_accept_status(status) and broker_order_id:
-                ok = self.transition(local_id, OrderStatus.SUBMITTED,
-                                     broker_order_id=broker_order_id, submitted_ts=now_utc_iso())
-                if ok:
-                    return {"ok": True, "local_order_id": local_id,
-                            "broker_order_id": broker_order_id,
-                            "status": OrderStatus.SUBMITTED, "error": None}
-                # AUDIT-3: split-brain path now matches submit_existing_entry.
-                # Previously: moved to ERROR with no flag, no split_brain key.
-                # Now: flags the order, preserves broker_order_id, returns split_brain=True
-                # so the runner can freeze the client and the reconciler can recover.
-                error_msg = "submitted_transition_failed_after_broker_accept"
-                self._flag_split_brain_order(
-                    local_id,
-                    broker_order_id=broker_order_id,
-                    error_msg=error_msg,
-                )
-                return {
-                    "ok":             False,
-                    "local_order_id": local_id,
-                    "broker_order_id": broker_order_id,
-                    "status":         OrderStatus.ERROR,
-                    "error":          error_msg,
-                    "split_brain":    True,
-                }
-            else:
-                error_msg = (f"broker_status:{status or 'unknown'} "
-                             f"broker_order_id_missing:{not bool(broker_order_id)}")
-
-        # AUDIT-7: broker rejection reason in observability
-        self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
-        self._emit_transition_event(
+        # One entry boundary owns intent persistence, durable re-read, broker
+        # identity recovery, and quarantine.  Direct entries must not maintain a
+        # second implementation that can drift into a duplicate-POST path.
+        return self.submit_existing_entry(
             local_order_id=local_id,
-            old_status=OrderStatus.CREATED,
-            new_status=OrderStatus.ERROR,
-            decision="ERROR",
-            reason_code="BROKER_REJECTED_ENTRY",
-            explanation=error_msg or "unknown_error",
-            broker_order_id=broker_order_id,
-            extra_inputs={"broker_rejection_reason": error_msg or "unknown_error"},
+            broker=broker,
+            plan=plan,
+            limit_price=lp,
         )
-        return {"ok": False, "local_order_id": local_id, "broker_order_id": broker_order_id,
-                "status": OrderStatus.ERROR, "error": error_msg}
 
     def submit_exit(
         self,
@@ -4375,16 +4748,14 @@ class APOrderStateMachine:
         # Tradier accepts a 'tag' field — using local_id provides client-side
         # idempotency. If we retry on ambiguous response, we can find this tag
         # in /orders to confirm the order landed without double-submitting.
-        _order_data["tag"] = str(local_id)[:32]  # Tradier tag max 32 chars
+        _order_data["tag"] = canonical_broker_submit_key(local_id)
 
         # ── Retry-safe broker submission ──────────────────────────────────────
         # Failure classes:
-        #   RETRYABLE_CONN  — connection failed before send (safe to retry)
-        #   RETRYABLE_5XX   — server error (safe to retry)
-        #   RETRYABLE_429   — rate limit (retry with backoff)
+        #   RETRYABLE_CONNECT_TIMEOUT — no HTTP connection was established
         #   AMBIGUOUS       — read timeout / mid-response failure — order MAY
-        #                     have landed. Must query Tradier to confirm before
-        #                     retrying, or we risk a double exit.
+        #                     have landed. Query Tradier once; absent exact tag
+        #                     proof, hold for reconciliation and never re-POST.
         #   PERMANENT_REJECT — 4xx (not 429) — broker rejected, do not retry
         #   BROKER_REJECTED — Tradier returned rejected status, do not retry
         try:
@@ -4451,15 +4822,19 @@ class APOrderStateMachine:
                     break
 
                 if _sc is not None and (_sc >= 500 or _sc == 429):
-                    # RETRYABLE_5XX / 429 — retry with backoff
-                    error_msg = f"broker_http_{_sc}_retryable"
-                    log.warning(
-                        "[%s] submit_exit retryable HTTP %s | pos=%s attempt=%d/%d",
-                        self.client_id, _sc, position_id, _attempt, _max_attempts,
+                    _existing_oid = self._lookup_order_by_tag(
+                        broker, base_url, account_id,
+                        canonical_broker_submit_key(local_id),
                     )
-                    if _attempt < _max_attempts:
-                        _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                        continue
+                    if _existing_oid:
+                        order = {"id": _existing_oid, "status": "open"}
+                        broker_order_id = _existing_oid
+                        status = "open"
+                        error_msg = None
+                    else:
+                        error_msg = (
+                            f"BROKER_AMBIGUOUS_HTTP_{_sc}_RECONCILIATION_REQUIRED"
+                        )
                     break
 
                 # 2xx — parse JSON
@@ -4473,7 +4848,8 @@ class APOrderStateMachine:
                         self.client_id, position_id, _attempt, _je,
                     )
                     _existing_oid = self._lookup_order_by_tag(
-                        broker, base_url, account_id, str(local_id),
+                        broker, base_url, account_id,
+                        canonical_broker_submit_key(local_id),
                     )
                     if _existing_oid:
                         log.info(
@@ -4483,20 +4859,40 @@ class APOrderStateMachine:
                         )
                         order = {"id": _existing_oid, "status": "open"}
                     else:
-                        error_msg = f"broker_ambiguous_parse:{_je}"
-                        if _attempt < _max_attempts:
-                            _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                            continue
+                        error_msg = (
+                            "BROKER_AMBIGUOUS_JSON_RECONCILIATION_REQUIRED:"
+                            f"{_je}"
+                        )
                         break
 
                 status          = str(order.get("status") or "").lower().strip()
                 broker_order_id = order.get("id") or order.get("order_id")
+                if (
+                    not broker_order_id
+                    and status not in {"rejected", "canceled", "cancelled", "expired"}
+                ):
+                    _existing_oid = self._lookup_order_by_tag(
+                        broker, base_url, account_id,
+                        canonical_broker_submit_key(local_id),
+                    )
+                    if _existing_oid:
+                        order = {"id": _existing_oid, "status": "open"}
+                        broker_order_id = _existing_oid
+                        status = "open"
+                        error_msg = None
+                    else:
+                        error_msg = (
+                            "BROKER_AMBIGUOUS_2XX_MISSING_ID_RECONCILIATION_REQUIRED:"
+                            f"status={status or 'empty'}"
+                        )
+                    break
                 # Got a clean response — exit retry loop
                 error_msg = None
                 break
 
-            except (_ConnectTimeout, _ConnectionError) as _ce:
-                # RETRYABLE_CONN — request did not reach broker, safe to retry
+            except _ConnectTimeout as _ce:
+                # Connect-phase timeout is the only connection class we can
+                # safely retry without broker identity proof.
                 error_msg = f"broker_conn_error:{_ce}"
                 log.warning(
                     "[%s] submit_exit conn error | pos=%s attempt=%d/%d err=%s",
@@ -4507,6 +4903,23 @@ class APOrderStateMachine:
                     continue
                 break
 
+            except _ConnectionError as _ce:
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
+                )
+                if _existing_oid:
+                    order = {"id": _existing_oid, "status": "open"}
+                    broker_order_id = _existing_oid
+                    status = "open"
+                    error_msg = None
+                else:
+                    error_msg = (
+                        "BROKER_AMBIGUOUS_CONNECTION_RECONCILIATION_REQUIRED:"
+                        f"{_ce}"
+                    )
+                break
+
             except _ReadTimeout as _rt:
                 # AMBIGUOUS — Tradier received the request, response was lost.
                 # Order MAY have landed. Query by tag before any retry.
@@ -4515,7 +4928,8 @@ class APOrderStateMachine:
                     self.client_id, position_id, _attempt, _rt,
                 )
                 _existing_oid = self._lookup_order_by_tag(
-                    broker, base_url, account_id, str(local_id),
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
                 )
                 if _existing_oid:
                     log.info(
@@ -4528,32 +4942,51 @@ class APOrderStateMachine:
                     status = "open"
                     error_msg = None
                     break
-                # Not found at broker → safe to retry
-                error_msg = f"broker_read_timeout:{_rt}"
-                if _attempt < _max_attempts:
-                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                    continue
+                error_msg = (
+                    "BROKER_AMBIGUOUS_READ_TIMEOUT_RECONCILIATION_REQUIRED:"
+                    f"{_rt}"
+                )
                 break
 
             except _RequestException as _re:
-                # Other requests-level error — treat as retryable conn-class
-                error_msg = f"broker_request_error:{_re}"
-                log.warning(
-                    "[%s] submit_exit request error | pos=%s attempt=%d/%d err=%s",
-                    self.client_id, position_id, _attempt, _max_attempts, _re,
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
                 )
-                if _attempt < _max_attempts:
-                    _time_module.sleep(_backoff_base_s * (2 ** (_attempt - 1)))
-                    continue
+                if _existing_oid:
+                    order = {"id": _existing_oid, "status": "open"}
+                    broker_order_id = _existing_oid
+                    status = "open"
+                    error_msg = None
+                else:
+                    error_msg = (
+                        "BROKER_AMBIGUOUS_REQUEST_RECONCILIATION_REQUIRED:"
+                        f"{_re}"
+                    )
                 break
 
             except Exception as _e:
-                # Unknown — do not retry, do not assume safe
-                error_msg = f"broker_error:{_e}"
+                # Unknown failures at/after POST are ownership-ambiguous.  A
+                # missing lookup result is not proof that the broker rejected
+                # the order, so keep EXIT_REQUESTED fenced for reconciliation.
                 log.error(
                     "[%s] submit_exit unexpected error | pos=%s attempt=%d err=%s",
                     self.client_id, position_id, _attempt, _e,
                 )
+                _existing_oid = self._lookup_order_by_tag(
+                    broker, base_url, account_id,
+                    canonical_broker_submit_key(local_id),
+                )
+                if _existing_oid:
+                    order = {"id": _existing_oid, "status": "open"}
+                    broker_order_id = _existing_oid
+                    status = "open"
+                    error_msg = None
+                else:
+                    error_msg = (
+                        "BROKER_AMBIGUOUS_UNEXPECTED_RECONCILIATION_REQUIRED:"
+                        f"{_e}"
+                    )
                 break
 
         # ── Process the final response ────────────────────────────────────────
@@ -4567,7 +5000,8 @@ class APOrderStateMachine:
                             "status": OrderStatus.EXIT_SUBMITTED, "error": None}
                 error_msg = "exit_submitted_transition_failed_after_broker_accept"
                 self._flag_split_brain_order(local_id, broker_order_id=broker_order_id,
-                                             error_msg=error_msg)
+                                             error_msg=error_msg,
+                                             execution_mode=str(execution_mode or ""))
                 return {"ok": False, "local_order_id": local_id,
                         "broker_order_id": broker_order_id, "status": OrderStatus.ERROR,
                         "error": error_msg, "split_brain": True}
@@ -4579,10 +5013,49 @@ class APOrderStateMachine:
                         "status": OrderStatus.EXIT_SUBMITTED if ok else OrderStatus.ERROR,
                         "error": error_msg, "identity_quarantine": True}
             elif error_msg is None:
+                if broker_order_id:
+                    _sb_reason = f"BROKER_STATUS_UNKNOWN_WITH_ID:status={status!r}"
+                    _quarantine_persisted = self._flag_split_brain_order(
+                        local_id,
+                        broker_order_id=broker_order_id,
+                        error_msg=_sb_reason,
+                        execution_mode=str(execution_mode or ""),
+                    )
+                    return {
+                        "ok": False,
+                        "local_order_id": local_id,
+                        "broker_order_id": broker_order_id,
+                        "status": (
+                            OrderStatus.EXIT_SUBMITTED
+                            if _quarantine_persisted
+                            else OrderStatus.ERROR
+                        ),
+                        "error": _sb_reason,
+                        "split_brain": True,
+                        "reconciliation_required": True,
+                        "quarantine_persisted": _quarantine_persisted,
+                    }
                 error_msg = (f"broker_status:{status or 'unknown'} "
                              f"broker_order_id_missing:{not bool(broker_order_id)}")
         except Exception as e:
-            error_msg = error_msg or f"broker_error:{e}"
+            # We already crossed the broker boundary.  A local response-
+            # processing exception cannot prove rejection, so keep this exit
+            # non-terminal and reconciliation-visible.
+            error_msg = error_msg or (
+                "BROKER_AMBIGUOUS_RESPONSE_PROCESSING_RECONCILIATION_REQUIRED:"
+                f"{e}"
+            )
+
+        if str(error_msg or "").startswith("BROKER_AMBIGUOUS_"):
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.EXIT_REQUESTED,
+                "error": error_msg,
+                "identity_quarantine": True,
+                "reconciliation_required": True,
+            }
 
         self.transition(local_id, OrderStatus.ERROR, last_error=error_msg or "unknown_error")
         self._emit_transition_event(
@@ -4608,6 +5081,7 @@ class APOrderStateMachine:
         *,
         broker_order_id: str,
         current_status: str,
+        current_execution_mode: str,
     ) -> bool:
         """Atomically attach a recovered broker_order_id to an order that is already
         in a submitted-like state but is missing its broker identity.
@@ -4628,7 +5102,8 @@ class APOrderStateMachine:
         """
         _bid = str(broker_order_id or "").strip()
         _status = str(current_status or "").strip().upper()
-        if not _bid or not _status:
+        _mode = str(current_execution_mode or "").strip().lower()
+        if not _bid or not _status or _mode not in {"live", "paper"}:
             return False
         _allowed = {
             OrderStatus.SUBMITTED,
@@ -4655,6 +5130,7 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
+                      AND LOWER(COALESCE(execution_mode, '')) = %s
                       AND UPPER(COALESCE(status, '')) = %s
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                     """,
@@ -4663,10 +5139,13 @@ class APOrderStateMachine:
                         json.dumps({
                             "broker_id_attached_by_tag_recovery": True,
                             "broker_id_attached_at": _now,
-                            "broker_id_recovered_from_tag": str(local_order_id)[:32],
+                            "broker_id_recovered_from_tag": canonical_broker_submit_key(
+                                local_order_id
+                            ),
                         }),
                         local_order_id,
                         self.client_id,
+                        _mode,
                         _status,
                     ),
                 )
@@ -4700,11 +5179,12 @@ class APOrderStateMachine:
         Used to recover from ambiguous broker responses (read timeout, JSON
         parse failure mid-response) WITHOUT double-submitting. If the order
         landed at Tradier before the response was lost, the tag we sent will
-        be on it and we can find it again — safe retry.
+        be on it and we can adopt it. A missing/multiple match remains
+        ambiguous and callers must hold for reconciliation.
 
         Returns the broker_order_id if found, else None.
-        Best-effort: any error returns None so the caller can fall through
-        to its normal retry path.
+        Best-effort: any error returns None; this is never proof that retrying
+        the POST is safe.
         """
         if not tag or not broker or not base_url or not account_id:
             return None
@@ -4728,7 +5208,8 @@ class APOrderStateMachine:
                 orders = [orders]
             if not isinstance(orders, list):
                 return None
-            tag_str = str(tag)
+            tag_str = canonical_broker_submit_key(tag)
+            matches = []
             for o in orders:
                 if not isinstance(o, dict):
                     continue
@@ -4736,7 +5217,23 @@ class APOrderStateMachine:
                 if str(o.get("tag") or "") == tag_str:
                     oid = o.get("id") or o.get("order_id")
                     if oid:
-                        return str(oid)
+                        matches.append(o)
+            if len(matches) == 1:
+                only = matches[0]
+                return str(only.get("id") or only.get("order_id"))
+
+            # Repegs intentionally reuse the same tag, so the order history may
+            # contain a terminal predecessor plus one live replacement.  Adopt
+            # only a single nonterminal identity; multiple live/unknown matches
+            # are ambiguous and must remain fail-closed.
+            terminal = {"canceled", "cancelled", "rejected", "expired", "filled"}
+            live_matches = [
+                item for item in matches
+                if str(item.get("status") or "").strip().lower() not in terminal
+            ]
+            if len(live_matches) == 1:
+                only = live_matches[0]
+                return str(only.get("id") or only.get("order_id"))
             return None
         except Exception as _e:
             log.debug(
@@ -4751,41 +5248,179 @@ class APOrderStateMachine:
         *,
         broker_order_id: str,
         error_msg: str,
-    ) -> None:
+        execution_mode: str,
+    ) -> bool:
         """
-        FIX-J: Write split-brain marker when broker accepted but DB transition failed.
-        Preserves broker_order_id via COALESCE and prefixes last_error with SPLIT_BRAIN:.
+        Quarantine an order that may already be broker-owned.
+
+        A broker ID is durable ownership proof, so ENTRY rows move to SUBMITTED
+        and EXIT rows move to EXIT_SUBMITTED.  Those states are non-submit-
+        eligible and are already selected by the reconciler/fill monitor.  The
+        fenced update never rewrites client, mode, signal, contract, quantity,
+        or existing submit metadata.
         """
+        _bid = str(broker_order_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        if not _bid or _mode not in {"live", "paper"}:
+            return False
         try:
             def _mark():
                 with conn() as c:
-                    c.execute(
+                    cur = c.execute(
                         """
                         UPDATE orders
-                        SET broker_order_id = COALESCE(NULLIF(broker_order_id, ''), %s),
+                        SET status = CASE
+                                WHEN kind = 'ENTRY'
+                                     AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER')
+                                    THEN 'SUBMITTED'
+                                WHEN kind = 'EXIT'
+                                     AND UPPER(COALESCE(status,'')) = 'EXIT_REQUESTED'
+                                    THEN 'EXIT_SUBMITTED'
+                                ELSE status
+                            END,
+                            broker_order_id = COALESCE(NULLIF(broker_order_id, ''), %s),
+                            submitted_ts = COALESCE(submitted_ts, NOW()),
                             last_error      = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                                'split_brain_quarantine', true,
+                                'reconciliation_required', true,
+                                'split_brain_reason', %s,
+                                'broker_order_id', %s,
+                                'current_owner', 'broker',
+                                'submit_completed_at', %s,
+                                'lifecycle_state', CASE
+                                    WHEN kind = 'EXIT' THEN 'EXIT_SUBMITTED'
+                                    ELSE 'SUBMITTED'
+                                END
+                            ),
                             updated_ts      = NOW()
-                        WHERE local_order_id = %s AND client_id = %s
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND LOWER(COALESCE(execution_mode,'')) = %s
+                          AND kind IN ('ENTRY','EXIT')
+                          AND (
+                                (kind = 'ENTRY' AND UPPER(COALESCE(status,'')) IN (
+                                    'CREATED','PENDING_TRIGGER','SUBMITTED',
+                                    'ACKNOWLEDGED','PARTIAL_FILL'
+                                ))
+                             OR (kind = 'EXIT' AND UPPER(COALESCE(status,'')) IN (
+                                    'EXIT_REQUESTED','EXIT_SUBMITTED',
+                                    'EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'
+                                ))
+                          )
+                          AND (
+                                broker_order_id IS NULL
+                             OR broker_order_id = ''
+                             OR broker_order_id = %s
+                          )
                         """,
-                        (broker_order_id, f"SPLIT_BRAIN:{error_msg}",
-                         local_order_id, self.client_id),
+                        (
+                            _bid,
+                            f"SPLIT_BRAIN:{error_msg}",
+                            str(error_msg or ""),
+                            _bid,
+                            now_utc_iso(),
+                            local_order_id,
+                            self.client_id,
+                            _mode,
+                            _bid,
+                        ),
                     )
-            run_with_retry(_mark)
+                    return int(
+                        getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0
+                    )
+            marked = bool(run_with_retry(_mark) > 0)
+            if not marked:
+                log.critical(
+                    "[%s] SPLIT_BRAIN QUARANTINE CAS MISSED | order=%s broker=%s",
+                    self.client_id, local_order_id, _bid,
+                )
+                return False
             log.critical(
                 "[%s] SPLIT_BRAIN FLAGGED | order=%s broker=%s | "
                 "broker accepted but DB transition failed; reconciler will recover on next pass",
-                self.client_id, local_order_id, broker_order_id,
+                self.client_id, local_order_id, _bid,
             )
+            return True
         except Exception as flag_err:
             log.critical(
                 "[%s] SPLIT_BRAIN FLAG WRITE FAILED | order=%s broker=%s | "
                 "MANUAL INTERVENTION REQUIRED -- broker has live order with no DB record | "
                 "flag_error=%s",
-                self.client_id, local_order_id, broker_order_id, flag_err,
+                self.client_id, local_order_id, _bid, flag_err,
             )
+            return False
 
-    def get_split_brain_orders(self) -> list:
-        """Return all orders flagged as split-brain for this client."""
+    def resolve_split_brain_quarantine(
+        self,
+        local_order_id: str,
+        *,
+        broker_order_id: str,
+        execution_mode: str,
+        broker_status: str,
+    ) -> bool:
+        """Clear quarantine only after broker truth is retrieved by exact ID."""
+        bid = str(broker_order_id or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        raw_status = str(broker_status or "").strip().lower()
+        if not bid or mode not in {"live", "paper"} or not raw_status:
+            return False
+        resolved_at = now_utc_iso()
+        patch = json.dumps({
+            "split_brain_quarantine": False,
+            "reconciliation_required": False,
+            "split_brain_resolved_at": resolved_at,
+            "split_brain_resolved_broker_status": raw_status,
+            "split_brain_resolved_by": "ap_reconciler",
+        })
+
+        def _resolve():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET last_error = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(COALESCE(execution_mode,'')) = %s
+                      AND broker_order_id = %s
+                      AND (
+                            COALESCE(last_error,'') LIKE 'SPLIT_BRAIN:%%'
+                         OR COALESCE((meta->>'split_brain_quarantine')::boolean, false) = true
+                      )
+                    """,
+                    (
+                        f"RECONCILED_SPLIT_BRAIN:broker_status={raw_status}",
+                        patch,
+                        local_order_id,
+                        self.client_id,
+                        mode,
+                        bid,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_resolve) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] resolve_split_brain_quarantine failed order=%s broker=%s: %s",
+                self.client_id, local_order_id, bid, exc,
+            )
+            return False
+
+    def get_split_brain_orders(self, *, execution_mode: str | None = None) -> list:
+        """Return split-brain orders for this exact client and runner mode."""
+        mode = str(execution_mode or "").strip().lower()
+        if mode not in {"live", "paper"}:
+            log.error(
+                "[%s] get_split_brain_orders blocked: execution_mode missing/invalid",
+                self.client_id,
+            )
+            return []
+
         def _fn():
             with conn() as c:
                 c.execute(
@@ -4793,10 +5428,11 @@ class APOrderStateMachine:
                     SELECT *
                     FROM orders
                     WHERE client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
                       AND last_error LIKE 'SPLIT_BRAIN:%%'
                     ORDER BY created_ts DESC
                     """,
-                    (self.client_id,),
+                    (self.client_id, mode),
                 )
                 return c.fetchall()
         try:

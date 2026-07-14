@@ -72,6 +72,8 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from ap.broker_submit_identity import canonical_broker_submit_key
+
 log = logging.getLogger("ap.retry_engine")
 
 
@@ -382,7 +384,7 @@ def apply_repeg(
             qty=qty,
             limit_price=decision.new_limit_price,
             side="buy_to_open",
-            tag=str(local_oid),
+            tag=canonical_broker_submit_key(local_oid),
         )
     except Exception as e:
         log.error("[%s] REPEG_RESUBMIT_FAILED local=%s err=%s", client_id, local_oid, e)

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
 from ap.broker import BrokerAdapter, BrokerOrderResponse, normalize_status
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.logger import get_logger
 
 log = get_logger("ap.brokers.tradier")
@@ -311,8 +312,7 @@ class TradierBroker(BrokerAdapter):
         if limit_price is not None:
             data["price"] = f"{float(limit_price):.2f}"
         if tag:
-            # Tradier accepts tag (max 32 chars). Trim defensively.
-            data["tag"] = str(tag)[:32]
+            data["tag"] = canonical_broker_submit_key(tag)
 
         if os.getenv("TRADIER_DEBUG_ORDERS", "0") == "1":
             log.info(

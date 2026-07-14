@@ -758,10 +758,21 @@ def list_orders(client_id: str | None = None, limit: int = 200,
 
 
 def get_open_orders_for_reconcile(client_id: str | None = None,
-                                   limit: int = 200) -> list[dict]:
+                                   limit: int = 200,
+                                   execution_mode: str | None = None) -> list[dict]:
     def _fn():
         with conn() as c:
-            if client_id:
+            mode = str(execution_mode or "").strip().lower()
+            if client_id and mode in {"live", "paper"}:
+                c.execute(
+                    "SELECT * FROM orders WHERE client_id=%s "
+                    "AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
+                    "AND status IN ("
+                    "  'CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+                    "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+                    ") "
+                    "ORDER BY created_ts DESC LIMIT %s", (client_id, mode, limit))
+            elif client_id:
                 c.execute(
                     "SELECT * FROM orders WHERE client_id=%s "
                     "AND status IN ("
@@ -776,6 +787,33 @@ def get_open_orders_for_reconcile(client_id: str | None = None,
                     "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
                     ") "
                     "ORDER BY created_ts DESC LIMIT %s", (limit,))
+            return c.fetchall()
+    return run_with_retry(_fn)
+
+
+def get_open_orders_with_invalid_execution_mode(client_id: str,
+                                                 limit: int = 200) -> list[dict]:
+    """Return open orders whose persisted execution mode has no safe owner.
+
+    This is a diagnostic-only selection.  LIVE/PAPER reconcilers must never
+    query the broker or advance these rows because neither runner can prove
+    ownership.  Keeping it separate from ``get_open_orders_for_reconcile``
+    also prevents startup recovery from accidentally consuming unknown-mode
+    rows when it requests an exact runner mode.
+    """
+    def _fn():
+        with conn() as c:
+            c.execute(
+                "SELECT * FROM orders WHERE client_id=%s "
+                "AND LOWER(TRIM(COALESCE(execution_mode,''))) "
+                "NOT IN ('live','paper') "
+                "AND status IN ("
+                "  'CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL',"
+                "  'EXIT_REQUESTED','EXIT_SUBMITTED','EXIT_ACKNOWLEDGED','EXIT_PARTIAL_FILL'"
+                ") "
+                "ORDER BY created_ts DESC LIMIT %s",
+                (client_id, limit),
+            )
             return c.fetchall()
     return run_with_retry(_fn)
 

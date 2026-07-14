@@ -96,7 +96,7 @@ class TestReconcilerAutoClosePartialGuard(unittest.TestCase):
         osm    = MagicMock()
         pm     = MagicMock()
         rec    = APBrokerReconciler(broker=broker, client_id="jasoncosby1@gmail.com",
-                                    osm=osm, pm=pm)
+                                    osm=osm, pm=pm, execution_mode="paper")
         return rec, _empty_summary("jasoncosby1@gmail.com")
 
     def test_quantity_remaining_zeroed_when_broker_is_flat(self):
@@ -336,7 +336,7 @@ class TestRepairClosedPositionsWithRemainingQty(unittest.TestCase):
         osm    = MagicMock()
         pm     = MagicMock()
         rec    = APBrokerReconciler(broker=broker, client_id="jasoncosby1@gmail.com",
-                                    osm=osm, pm=pm)
+                                    osm=osm, pm=pm, execution_mode="paper")
         return rec, _empty_summary("jasoncosby1@gmail.com")
 
     def test_broker_flat_repair_zeros_remaining(self):
@@ -644,7 +644,7 @@ class TestPartialCloseSkipsProofTrade(unittest.TestCase):
 
         broker = MagicMock()
         rec    = APBrokerReconciler(broker=broker, client_id="jasoncosby1@gmail.com",
-                                    osm=MagicMock(), pm=MagicMock())
+                                    osm=MagicMock(), pm=MagicMock(), execution_mode="paper")
         summary = _empty_summary("jasoncosby1@gmail.com")
 
         db_row = {"quantity_remaining": 3, "qty": 5}
@@ -740,7 +740,7 @@ class TestRunOnceSummaryShape(unittest.TestCase):
 
         broker = MagicMock()
         rec    = APBrokerReconciler(broker=broker, client_id="test@ap.com",
-                                    osm=MagicMock(), pm=MagicMock())
+                                    osm=MagicMock(), pm=MagicMock(), execution_mode="paper")
         # Pre-set a cached summary so the skipped path returns it
         cached = _empty_summary("test@ap.com")
         rec._last_run_once_summary = cached

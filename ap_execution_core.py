@@ -35,6 +35,7 @@ from ap_tier_engine          import APShadowTracker
 from ap_proof_logger         import APProofLogger, funnel
 from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.utils                import now_utc_iso
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
@@ -2894,7 +2895,7 @@ class APExecutionCore:
         except Exception as exc:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": f"RECONCILE_BROKER_QUERY_FAILED:{type(exc).__name__}"}
 
-        tag = str(broker_submit_key or local_order_id)[:32]
+        tag = canonical_broker_submit_key(broker_submit_key or local_order_id)
         exact_tag = [o for o in broker_orders if isinstance(o, dict) and str(o.get("tag") or "") == tag]
         expected_contract = str(row.get("contract") or "")
         expected_qty = int(row.get("qty") or 0)
@@ -2909,23 +2910,15 @@ class APExecutionCore:
         if exact_tag and not strong:
             return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_TAG_IDENTITY_MISMATCH"}
         if not strong:
-            # An empty authoritative response is still held through the
-            # ambiguity window. The next recovery pass can re-enter Part A.
-            try:
-                intent_dt = datetime.fromisoformat(str(submit_intent_at))
-                if intent_dt.tzinfo is None: intent_dt = intent_dt.replace(tzinfo=timezone.utc)
-                elapsed = (datetime.now(timezone.utc) - intent_dt).total_seconds()
-            except Exception:
-                elapsed = 0
-            window = int(os.getenv("DEFERRED_BROKER_AMBIGUITY_SECONDS", "30"))
-            if elapsed < window:
-                return {**_base, "disposition": "RECONCILE_PENDING", "reason_code": "RECONCILE_AMBIGUITY_WINDOW_ACTIVE"}
-            osm.update_order_meta(local_order_id, {
-                "submit_intent_at": None, "broker_submit_key": None,
-                "recovery_submit_owner": "", "current_owner": _owner_label,
-                "reconcile_authoritative_no_match_at": now_utc_iso(),
-            })
-            return {**_base, "disposition": "NOT_IN_CRASH_WINDOW", "reason_code": "RECONCILE_AUTHORITATIVE_NO_MATCH"}
+            # A broker order listing can be delayed, paginated, or incomplete.
+            # Once submit intent is durable, one empty listing can never prove
+            # that the POST did not land.  Retain the identity fence until exact
+            # broker truth or an explicit operator reconciliation resolves it.
+            return {
+                **_base,
+                "disposition": "RECONCILE_PENDING",
+                "reason_code": "RECONCILE_BROKER_NO_MATCH_HELD",
+            }
 
         remote = strong[0]
         remote_id = str(remote.get("id") or remote.get("order_id") or "")

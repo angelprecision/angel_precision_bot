@@ -304,12 +304,14 @@ class _RuntimeOSM:
     ):
         self.row["meta"].update(
             {
+                "lifecycle_state": "SUBMITTING",
                 "submit_intent_at": datetime.now(timezone.utc).isoformat(),
                 "recovery_submit_owner": owner,
                 "recovery_submit_generation": generation,
                 "recovery_submit_execution_mode": execution_mode,
                 "broker_submit_payload_hash": payload_hash,
                 "broker_submit_key": broker_submit_key,
+                "current_owner": f"broker_submit:{broker_submit_key}",
             }
         )
         return True
@@ -372,7 +374,14 @@ def _run_real_live_submit(monkeypatch, *, side="CALL", fail_all_pass_audit=False
         "underlying_entry": quote["ask"] if side == "CALL" else quote["bid"],
         "broker_order_id": None,
         "submitted_ts": None,
-        "meta": {"trigger_crossed_at": (now - timedelta(seconds=2)).isoformat()},
+        "meta": {
+            "trigger_crossed_at": (now - timedelta(seconds=2)).isoformat(),
+            "contract_deferred": True,
+            "broker_ready": True,
+            "lifecycle_state": "BROKER_READY",
+            "materialization_generation": 7,
+            "recovery_submit_owner": "broker-ready-owner-1",
+        },
     }
     plan = SimpleNamespace(
         contract_symbol=contract,

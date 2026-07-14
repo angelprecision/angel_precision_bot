@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import ap.db as db_module
 import ap.queue as queue
 import ap_execution_core as core_mod
 import ap_handoff_run_lock as handoff_lock
@@ -165,6 +166,19 @@ def test_execution_core_accepts_approved_plan_mode_alias(monkeypatch, mode_value
     core.broker = SimpleNamespace(cfg=SimpleNamespace(base_url="https://api.tradier.com"))
     core.store = MagicMock()
     core.order_state_machine = MagicMock()
+    core.order_state_machine.client_id = "client@example.com"
+    core.order_state_machine.execution_mode = "paper"
+    durable_order = {
+        "client_id": "client@example.com",
+        "meta": {},
+    }
+    core.order_state_machine.get_order.side_effect = lambda _local_id: durable_order
+
+    def persist_meta(_local_id, patch):
+        durable_order["meta"].update(patch)
+        return True
+
+    core.order_state_machine.update_order_meta.side_effect = persist_meta
     core.order_state_machine.expire_pending_entry.return_value = True
     core.contract_selector = MagicMock()
     core._breach_risk_check = MagicMock(return_value=True)
@@ -193,7 +207,9 @@ def test_execution_core_accepts_approved_plan_mode_alias(monkeypatch, mode_value
 
     core_mod.APExecutionCore._on_entry_trigger(core, watched)
 
-    core.order_state_machine.submit_existing_entry.assert_called_once()
+    assert core.order_state_machine.submit_existing_entry.call_count == 1, (
+        core.order_state_machine.mock_calls
+    )
     core.order_state_machine.expire_pending_entry.assert_not_called()
 
 
@@ -311,10 +327,11 @@ def test_reconciler_unknown_mode_skips_terminal_correction(monkeypatch):
         client_id="client@example.com",
         osm=MagicMock(),
         pm=MagicMock(),
+        execution_mode="live",
     )
     summary = _empty_summary("client@example.com")
     fake_db = types.ModuleType("ap.db")
-    fake_db.get_open_orders_for_reconcile = lambda client_id=None: [
+    fake_db.get_open_orders_for_reconcile = lambda client_id=None, execution_mode=None: [
         {
             "local_order_id": "local-rec-1",
             "broker_order_id": "broker-rec-1",
@@ -324,6 +341,7 @@ def test_reconciler_unknown_mode_skips_terminal_correction(monkeypatch):
             "execution_mode": "staging",
         }
     ]
+    fake_db.get_open_orders_with_invalid_execution_mode = lambda client_id=None: []
     fake_db.run_with_retry = lambda fn, *a, **k: fn()
 
     @contextmanager
@@ -343,6 +361,137 @@ def test_reconciler_unknown_mode_skips_terminal_correction(monkeypatch):
 
     rec.osm.transition.assert_not_called()
     assert "reconciler_unknown_execution_mode" in summary["errors"]
+
+
+def test_paper_reconciler_queries_paper_only_and_rejects_returned_live_row(monkeypatch):
+    """Defense in depth: a bad DB result must not cross the mode boundary."""
+    queried = []
+    broker = MagicMock()
+    osm = MagicMock()
+    rec = APBrokerReconciler(
+        broker=broker,
+        client_id="client@example.com",
+        osm=osm,
+        pm=MagicMock(),
+        execution_mode="paper",
+    )
+    rec._write_order_last_error = MagicMock()
+    rec._check_ghost_fills = MagicMock()
+    summary = _empty_summary("client@example.com")
+
+    fake_db = types.ModuleType("ap.db")
+
+    def get_open_orders_for_reconcile(*, client_id=None, execution_mode=None):
+        queried.append((client_id, execution_mode))
+        # Simulate a broken repository filter returning a LIVE row to a PAPER
+        # reconciler. The reconciler's row-level fence must still stop it.
+        return [
+            {
+                "local_order_id": "local-live-returned-to-paper",
+                "broker_order_id": "broker-live-1",
+                "status": "ACKNOWLEDGED",
+                "kind": "ENTRY",
+                "contract": "SPY260626C00500000",
+                "execution_mode": "live",
+                "last_error": "SPLIT_BRAIN:broker_identity_unknown",
+                "meta": {"split_brain_quarantine": True},
+            }
+        ]
+
+    fake_db.get_open_orders_for_reconcile = get_open_orders_for_reconcile
+    fake_db.get_open_orders_with_invalid_execution_mode = lambda client_id=None: []
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+
+    rec._reconcile_orders(summary)
+
+    assert queried == [("client@example.com", "paper")]
+    rec._write_order_last_error.assert_not_called()
+    assert "reconciler_execution_mode_mismatch" in summary["errors"]
+    broker.get_order.assert_not_called()
+    osm.resolve_split_brain_quarantine.assert_not_called()
+    osm.transition.assert_not_called()
+
+
+def test_reconciler_audits_real_invalid_mode_query_without_broker_or_osm(monkeypatch):
+    """NULL/malformed modes are observable but never assigned to LIVE/PAPER."""
+    queries = []
+    invalid_rows = [
+        {
+            "local_order_id": "local-null-mode",
+            "broker_order_id": "broker-null-mode",
+            "status": "SUBMITTED",
+            "kind": "ENTRY",
+            "contract": "SPY260626C00500000",
+            "execution_mode": None,
+        },
+        {
+            "local_order_id": "local-staging-mode",
+            "broker_order_id": None,
+            "status": "PENDING_TRIGGER",
+            "kind": "ENTRY",
+            "contract": "QQQ260626P00450000",
+            "execution_mode": "staging",
+        },
+    ]
+
+    class _Conn:
+        def __init__(self):
+            self._rows = []
+
+        def execute(self, sql, params):
+            normalized = " ".join(str(sql).split())
+            queries.append((normalized, params))
+            self._rows = (
+                invalid_rows
+                if "NOT IN ('live','paper')" in normalized
+                else []
+            )
+            return self
+
+        def fetchall(self):
+            return list(self._rows)
+
+    @contextmanager
+    def fake_conn():
+        yield _Conn()
+
+    monkeypatch.setattr(db_module, "conn", fake_conn)
+    monkeypatch.setattr(APBrokerReconciler, "_register_health", lambda self: None)
+
+    broker = MagicMock()
+    osm = MagicMock()
+    rec = APBrokerReconciler(
+        broker=broker,
+        client_id="client@example.com",
+        osm=osm,
+        pm=MagicMock(),
+        execution_mode="live",
+    )
+    rec._write_order_last_error = MagicMock()
+    rec._check_ghost_fills = MagicMock()
+    summary = _empty_summary("client@example.com")
+
+    rec._reconcile_orders(summary)
+
+    invalid_query = next(q for q in queries if "NOT IN ('live','paper')" in q[0])
+    assert "'PENDING_TRIGGER'" in invalid_query[0]
+    assert invalid_query[1] == ("client@example.com", 200)
+    assert any(
+        "LOWER(TRIM(COALESCE(execution_mode,'')))=%s" in sql
+        and params == ("client@example.com", "live", 200)
+        for sql, params in queries
+    )
+    assert summary["orders_invalid_execution_mode"] == 2
+    assert summary["orders_checked"] == 0
+    assert summary["errors"].count("reconciler_unknown_execution_mode") == 2
+    assert summary["orders_alerted"] == 2
+    assert rec._write_order_last_error.call_args_list == [
+        (("local-null-mode", "reconciler_unknown_execution_mode"),),
+        (("local-staging-mode", "reconciler_unknown_execution_mode"),),
+    ]
+    broker.get_order.assert_not_called()
+    osm.transition.assert_not_called()
 
 
 def test_handoff_unknown_mode_rejected_with_reason():

@@ -145,7 +145,22 @@ def _submit_osm(intent_results):
     osm.execution_mode = "live"
     row = _row()
     osm._get_order = MagicMock(return_value=row)
-    osm.persist_deferred_submit_intent = MagicMock(side_effect=intent_results)
+    results = iter(intent_results)
+
+    def _persist_intent(*_args, **kwargs):
+        persisted = next(results)
+        if persisted:
+            submit_key = kwargs["broker_submit_key"]
+            row["meta"].update({
+                "lifecycle_state": "SUBMITTING",
+                "submit_intent_at": datetime.now(timezone.utc).isoformat(),
+                "broker_submit_key": submit_key,
+                "broker_submit_payload_hash": kwargs["payload_hash"],
+                "current_owner": f"broker_submit:{submit_key}",
+            })
+        return persisted
+
+    osm.persist_deferred_submit_intent = MagicMock(side_effect=_persist_intent)
     osm.update_order_meta = MagicMock(return_value=True)
     osm.transition = MagicMock(return_value=True)
     osm._submit_order_with_retry = MagicMock(return_value=(

@@ -608,13 +608,17 @@ class APStartupRecovery:
         If broker disagrees, advance the OSM to broker truth.
         This prevents phantom 'open' entries from blocking new trades after restart.
         """
-        if self._execution_mode() is None:
+        recovery_mode = self._execution_mode()
+        if recovery_mode is None:
             result.setdefault("errors", []).append("recovery_unknown_execution_mode")
             return
         from ap.db import get_open_orders_for_reconcile, run_with_retry
 
         orders = run_with_retry(
-            lambda: get_open_orders_for_reconcile(client_id=self.client_id)
+            lambda: get_open_orders_for_reconcile(
+                client_id=self.client_id,
+                execution_mode=recovery_mode.lower(),
+            )
         )
         # Only entry orders here
         entry_orders = [o for o in (orders or []) if o.get("kind") == "ENTRY"]
@@ -1593,9 +1597,17 @@ class APStartupRecovery:
                     )
                     continue
                 if rec_disposition == "NOT_IN_CRASH_WINDOW":
-                    # Reconciler proved the row never reached the broker
-                    # boundary — fall through to the normal resume path below.
-                    pass
+                    # This block was entered with durable submit_intent_at.
+                    # A contradictory classifier result can never authorize a
+                    # replacement POST; retain the row fail-closed.
+                    _retain_recovery_ownership(
+                        local_order_id,
+                        reason=str(
+                            rec.get("reason_code")
+                            or "crash_window_classifier_contradiction"
+                        ),
+                    )
+                    continue
                 else:
                     # KEEP_WATCHER / unknown → retain ownership, do not resume.
                     _retain_recovery_ownership(

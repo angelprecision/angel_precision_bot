@@ -98,6 +98,23 @@ def test_no_submit_intent_returns_not_in_crash_window():
     assert result["reason_code"] == "RECONCILE_NO_SUBMIT_INTENT"
 
 
+def test_old_submit_intent_with_empty_broker_list_stays_fail_closed():
+    core = _make_core()
+    core.broker.list_orders.side_effect = None
+    core.broker.list_orders.return_value = []
+    old = _row()
+    old["meta"]["submit_intent_at"] = (
+        datetime.now(timezone.utc) - timedelta(days=2)
+    ).isoformat()
+    core.order_state_machine.get_order.return_value = old
+
+    result = core.reconcile_deferred_broker_intent(local_order_id="oid-1")
+
+    assert result["disposition"] == "RECONCILE_PENDING"
+    assert result["reason_code"] == "RECONCILE_BROKER_NO_MATCH_HELD"
+    core.order_state_machine.update_order_meta.assert_not_called()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Hard invariants: never broker, never mutate
 # ═══════════════════════════════════════════════════════════════════════
@@ -300,9 +317,8 @@ def test_recovery_crash_window_without_execution_core_retains(monkeypatch):
     assert patch["recovery_retention_reason"] == "crash_window_reconciler_unavailable"
 
 
-def test_recovery_not_in_crash_window_falls_through_to_resume(monkeypatch):
-    """A row the reconciler classifies NOT_IN_CRASH_WINDOW proceeds to the
-    normal §2 resume path."""
+def test_recovery_submit_intent_rejects_contradictory_not_in_crash_window(monkeypatch):
+    """Durable submit intent always blocks resume, even if a classifier lies."""
     osm = _osm()
     ec = types.SimpleNamespace(
         reconcile_deferred_broker_intent=MagicMock(return_value={
@@ -323,6 +339,6 @@ def test_recovery_not_in_crash_window_falls_through_to_resume(monkeypatch):
     _run(monkeypatch, [_crash_window_recovery_row()],
          osm=osm, entry_watcher=watcher, execution_core=ec)
     ec.reconcile_deferred_broker_intent.assert_called_once()
-    # Fell through to the §2 resume path
-    ec.resume_deferred_broker_ready_order.assert_called_once()
+    ec.resume_deferred_broker_ready_order.assert_not_called()
     osm.submit_existing_entry.assert_not_called()
+    osm.update_order_meta.assert_called_once()

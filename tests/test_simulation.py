@@ -573,6 +573,7 @@ class TestReconciler:
             broker=broker,
             client_id=client_id,
             osm=osm,
+            execution_mode="paper",
             pm=None,
             alert_fn=lambda msg: alerts.append(msg),
         )

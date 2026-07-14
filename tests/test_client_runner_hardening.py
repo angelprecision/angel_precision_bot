@@ -633,7 +633,7 @@ class TestFix8OrderMonitorWatcherWiring:
                 self.expire_calls: list[tuple[str, str]] = []
                 self.transition_calls: list[tuple[str, str, dict]] = []
 
-            def get_split_brain_orders(self):
+            def get_split_brain_orders(self, *, execution_mode=None):
                 return []
 
             def expire_pending_entry(self, local_order_id: str, *, reason: str):
