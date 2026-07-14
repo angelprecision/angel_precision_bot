@@ -1,0 +1,390 @@
+{
+  "schema_version": 1,
+  "current_main": "9776cf7fd83e4fb42ecf944f662e283a345735c3",
+  "source_note": "Read-only, redacted fixtures derived from proof_trades and decision_events. Missing evidence is explicit UNKNOWN; numeric P&L is outcome authority.",
+  "fixtures": [
+    {
+      "fixture_id": "mnst_call_2026_06_10",
+      "source_window": "2026-06-10T19:05:56Z/2026-06-10T19:16:12Z",
+      "client_alias": "paper_reference",
+      "ticker": "MNST",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["b9742c4", "d12b4fb"],
+      "deployment_commit_confidence": "mixed_window_commit_transition",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "UNKNOWN",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": 90.855,
+        "entry_option_price": 1.95,
+        "exit_option_price": 2.15,
+        "underlying_entry": 90.855,
+        "underlying_exit": 90.98,
+        "proof_trade_id": 269
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": 10.26,
+        "proof_win": true,
+        "exit_reason": "TOUCHED_PROFIT_STOP"
+      },
+      "historical_trace": [
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "TOUCHED_PROFIT_STOP", "timestamp": "2026-06-10T19:16:05.363837Z"},
+        {"stage": "protective_exit_submission", "decision": "SUBMITTED", "reason_code": "OSM_PENDING_EXIT_ORDER_SET", "timestamp": "2026-06-10T19:16:05.625852Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-10T19:16:13.032470Z"}
+      ],
+      "evidence_gaps": ["entry-stage decision events cross a deployment transition", "execution_mode", "signal identity", "selected contract", "scanner score", "pattern"]
+    },
+    {
+      "fixture_id": "rivn_put_win_2026_06_10",
+      "source_window": "2026-06-10T19:21:17Z/2026-06-10T20:01:50Z",
+      "client_alias": "paper_reference",
+      "ticker": "RIVN",
+      "side": "PUT",
+      "timeframe": "1d",
+      "deployment_git_commits": ["d12b4fb"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "RIVN260612P00016000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 0.97,
+        "exit_option_price": 1.25,
+        "underlying_entry": "UNKNOWN",
+        "underlying_exit": 14.815,
+        "proof_trade_id": 271
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": 28.87,
+        "proof_win": true,
+        "exit_reason": "PROFIT_PROTECT_W3"
+      },
+      "historical_trace": [
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "TP_SCALE_OUT", "timestamp": "2026-06-10T19:21:17.519452Z"},
+        {"stage": "protective_exit_submission", "decision": "SUBMITTED", "reason_code": "OSM_PENDING_EXIT_ORDER_SET", "contract": "RIVN260612P00016000"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "PROFIT_PROTECT_W3", "timestamp": "2026-06-10T19:35:24.844672Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-10T20:01:50.891262Z"}
+      ],
+      "evidence_gaps": ["execution_mode", "signal identity", "scanner score", "pattern", "entry underlying"]
+    },
+    {
+      "fixture_id": "bac_call_2026_06_15",
+      "source_window": "2026-06-15T15:43:53Z/2026-06-15T16:25:01Z",
+      "client_alias": "live_reference",
+      "ticker": "BAC",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["9d716d2"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "BAC260626C00056000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 1.08,
+        "exit_option_price": 1.18,
+        "underlying_entry": "UNKNOWN",
+        "underlying_exit": 56.4,
+        "proof_trade_id": 273,
+        "selector_reject_counts": {"OI_TOO_LOW": 18, "SPREAD_TOO_WIDE": 4, "DELTA_OUT_OF_RANGE": 3, "VOLUME_TOO_LOW": 1}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": 9.26,
+        "proof_win": true,
+        "exit_reason": "PROFIT_LOCK"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-06-15T15:43:53.156213Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "contract": "BAC260626C00056000", "timestamp": "2026-06-15T15:44:01.694440Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "contract": "BAC260626C00056000", "timestamp": "2026-06-15T15:44:30.692530Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "PROFIT_LOCK", "timestamp": "2026-06-15T16:24:51.077358Z"},
+        {"stage": "protective_exit_submission", "decision": "SUBMITTED", "reason_code": "OSM_PENDING_EXIT_ORDER_SET", "timestamp": "2026-06-15T16:24:51.335644Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-15T16:25:01.435761Z"}
+      ],
+      "evidence_gaps": ["execution_mode", "signal identity", "scanner score", "pattern", "entry underlying"]
+    },
+    {
+      "fixture_id": "wfc_call_data_quality_2026_06_15",
+      "source_window": "2026-06-15T15:47:16Z/2026-06-15T16:32:27Z",
+      "client_alias": "live_reference",
+      "ticker": "WFC",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["9d716d2"],
+      "deployment_commit_confidence": "same_runtime_window",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "WFC260626C00058000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 0.75,
+        "exit_option_price": 0.74,
+        "proof_trade_id": 274
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": -1.33,
+        "proof_win": true,
+        "exit_reason": "TIME_STOP"
+      },
+      "historical_trace": [
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "contract": "WFC260626C00058000"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "TIME_STOP"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED"}
+      ],
+      "evidence_gaps": ["proof win flag conflicts with numeric P&L", "execution_mode", "signal identity", "scanner score", "pattern"]
+    },
+    {
+      "fixture_id": "c_call_2026_06_18",
+      "source_window": "2026-06-18T14:29:10Z/2026-06-18T14:42:45Z",
+      "client_alias": "live_reference",
+      "ticker": "C",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["e76fc42"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "C260626C00150000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 1.33,
+        "exit_option_price": 1.08,
+        "underlying_entry": "UNKNOWN",
+        "underlying_exit": 146.75,
+        "proof_trade_id": 275,
+        "selector_reject_counts": {"OI_TOO_LOW": 38, "SPREAD_TOO_WIDE": 12, "NO_AFFORDABLE_CONTRACT": 2}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": -18.8,
+        "proof_win": false,
+        "exit_reason": "THESIS_FAIL_SOFT_STOP"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-06-18T14:29:10.776242Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "contract": "C260626C00150000", "timestamp": "2026-06-18T14:29:13.776062Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "contract": "C260626C00150000", "timestamp": "2026-06-18T14:29:56.766234Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "THESIS_FAIL_SOFT_STOP", "timestamp": "2026-06-18T14:42:31.519310Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-18T14:42:38.855545Z"}
+      ],
+      "evidence_gaps": ["underlying confirmation unavailable at exit", "execution_mode", "signal identity", "scanner score", "pattern"]
+    },
+    {
+      "fixture_id": "pypl_call_2026_06_22",
+      "source_window": "2026-06-22T13:40:12Z/2026-06-22T13:47:26Z",
+      "client_alias": "live_reference",
+      "ticker": "PYPL",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["6cff00a"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "UNKNOWN",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": 42.88,
+        "entry_option_price": 0.72,
+        "exit_option_price": 0.77,
+        "underlying_entry": 42.88,
+        "underlying_exit": 43.1,
+        "proof_trade_id": 285,
+        "selector_reject_counts": {"SPREAD_TOO_WIDE": 20, "NO_CHAIN_DATA": 10, "NO_AFFORDABLE_CONTRACT": 6}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": 6.94,
+        "proof_win": true,
+        "exit_reason": "PROFIT_LOCK"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-06-22T13:40:12.553376Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "timestamp": "2026-06-22T13:40:15.147016Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "timestamp": "2026-06-22T13:40:45.204058Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "TP_SCALE_OUT", "timestamp": "2026-06-22T13:45:46.099621Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "PROFIT_LOCK", "timestamp": "2026-06-22T13:47:14.914076Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-22T13:47:26.128109Z"}
+      ],
+      "evidence_gaps": ["execution_mode", "signal identity", "selected contract", "scanner score", "pattern"]
+    },
+    {
+      "fixture_id": "nke_put_2026_06_23",
+      "source_window": "2026-06-23T13:38:30Z/2026-06-23T13:43:06Z",
+      "client_alias": "live_reference",
+      "ticker": "NKE",
+      "side": "PUT",
+      "timeframe": "1d",
+      "deployment_git_commits": ["6cff00a"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "NKE260626P00044000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 1.46,
+        "exit_option_price": 1.24,
+        "underlying_entry": "UNKNOWN",
+        "underlying_exit": 43.06,
+        "proof_trade_id": 289,
+        "selector_reject_counts": {"SPREAD_TOO_WIDE": 75, "DIRECT_QUOTE_ZERO_BID_ASK": 15, "NO_CHAIN_DATA": 15}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": -15.07,
+        "proof_win": false,
+        "exit_reason": "THESIS_FAIL_SOFT_STOP"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-06-23T13:38:30.647702Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "contract": "NKE260626P00044000", "timestamp": "2026-06-23T13:38:32.429400Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "contract": "NKE260626P00044000", "timestamp": "2026-06-23T13:39:29.706525Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "THESIS_FAIL_SOFT_STOP", "timestamp": "2026-06-23T13:43:01.576890Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-23T13:43:06.352309Z"}
+      ],
+      "evidence_gaps": ["underlying confirmation unavailable at exit", "execution_mode", "signal identity", "scanner score", "pattern"]
+    },
+    {
+      "fixture_id": "rivn_put_loss_2026_06_23",
+      "source_window": "2026-06-23T13:38:14Z/2026-06-23T13:51:38Z",
+      "client_alias": "live_reference",
+      "ticker": "RIVN",
+      "side": "PUT",
+      "timeframe": "1d",
+      "deployment_git_commits": ["6cff00a"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "RIVN260626P00016000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 1.16,
+        "exit_option_price": 0.99,
+        "underlying_entry": "UNKNOWN",
+        "underlying_exit": 15.14,
+        "proof_trade_id": 292,
+        "selector_reject_counts": {"SPREAD_TOO_WIDE": 80, "DIRECT_QUOTE_ZERO_BID_ASK": 20, "NO_CHAIN_DATA": 20}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": -14.66,
+        "proof_win": false,
+        "exit_reason": "NEVER_GREEN_STOP"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-06-23T13:38:14.379192Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "contract": "RIVN260626P00016000", "timestamp": "2026-06-23T13:38:55.142732Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "contract": "RIVN260626P00016000", "timestamp": "2026-06-23T13:38:58.469522Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "NEVER_GREEN_STOP", "timestamp": "2026-06-23T13:51:34.651191Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-06-23T13:51:38.455074Z"}
+      ],
+      "evidence_gaps": ["underlying confirmation unavailable at exit", "execution_mode", "signal identity", "scanner score", "pattern"]
+    },
+    {
+      "fixture_id": "googl_call_2026_07_07",
+      "source_window": "2026-07-07T14:23:45Z/2026-07-07T14:26:48Z",
+      "client_alias": "live_reference",
+      "ticker": "GOOGL",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["184dcd4"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "UNKNOWN",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": 371.5725,
+        "entry_option_price": 1.1,
+        "exit_option_price": 0.86,
+        "underlying_entry": 371.5725,
+        "underlying_exit": 370.615,
+        "proof_trade_id": 301,
+        "selector_reject_counts": {"OI_TOO_LOW": 49, "VOLUME_TOO_LOW": 39, "CHAIN_ROW_ZERO_BID_ASK": 33, "SPREAD_TOO_WIDE": 17}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": -21.82,
+        "proof_win": false,
+        "exit_reason": "DEEP_LOSS_STOP"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-07-07T14:23:45.015087Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "timestamp": "2026-07-07T14:24:26.369202Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "timestamp": "2026-07-07T14:24:27.173795Z"},
+        {"stage": "exit_decision", "decision": "SUBMIT", "reason_code": "EXIT_DECISION_TP_FIRED", "timestamp": "2026-07-07T14:26:37.255321Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-07-07T14:26:48.462423Z"}
+      ],
+      "evidence_gaps": ["execution_mode", "signal identity", "selected contract", "scanner score", "pattern", "exact exit taxonomy mismatch between decision ledger and proof reason"]
+    },
+    {
+      "fixture_id": "meta_call_2026_07_07",
+      "source_window": "2026-07-07T14:27:04Z/2026-07-07T14:48:05Z",
+      "client_alias": "live_reference",
+      "ticker": "META",
+      "side": "CALL",
+      "timeframe": "1d",
+      "deployment_git_commits": ["184dcd4"],
+      "deployment_commit_confidence": "decision_event_exact",
+      "evidence": {
+        "execution_mode": "UNKNOWN",
+        "signal_id": "UNKNOWN",
+        "local_order_id": "UNKNOWN",
+        "selected_contract": "META260708C00625000",
+        "score": "UNKNOWN",
+        "pattern": "UNKNOWN",
+        "entry_trigger": "UNKNOWN",
+        "entry_option_price": 1.96,
+        "exit_option_price": 1.3,
+        "underlying_entry": "UNKNOWN",
+        "underlying_exit": 607.475,
+        "proof_trade_id": 303,
+        "selector_reject_counts": {"OI_TOO_LOW": 78, "CHAIN_ROW_ZERO_BID_ASK": 70, "SPREAD_TOO_WIDE": 54, "VOLUME_TOO_LOW": 38}
+      },
+      "outcome": {
+        "realized_pnl_pct": "UNKNOWN",
+        "option_pnl_pct": -33.67,
+        "proof_win": false,
+        "exit_reason": "SENTINEL_FORCED_EXIT_NO_EXIT_ORDER"
+      },
+      "historical_trace": [
+        {"stage": "master_control", "decision": "APPROVE", "reason_code": "UNKNOWN", "timestamp": "2026-07-07T14:27:04.822048Z"},
+        {"stage": "contract_selector", "decision": "ALLOW", "reason_code": "SELECTED", "contract": "META260708C00625000", "timestamp": "2026-07-07T14:28:24.406481Z"},
+        {"stage": "fill", "decision": "CONFIRMED", "reason_code": "ENTRY_FILLED", "contract": "META260708C00625000", "timestamp": "2026-07-07T14:28:36.466140Z"},
+        {"stage": "exit_decision", "decision": "HOLD", "reason_code": "DATA_DEGRADED_HOLD", "timestamp": "2026-07-07T14:35:15.962743Z", "details": {"repeated_events": 15}},
+        {"stage": "protective_exit_submission", "decision": "SUBMITTED", "reason_code": "OSM_PENDING_EXIT_ORDER_SET", "timestamp": "2026-07-07T14:48:03.233568Z"},
+        {"stage": "reconciliation", "decision": "CLOSED", "reason_code": "BROKER_CONFIRMED_CLOSED", "timestamp": "2026-07-07T14:48:05.167652Z"}
+      ],
+      "evidence_gaps": ["execution_mode", "signal identity", "scanner score", "pattern", "normal protective exit ownership absent until sentinel window"]
+    }
+  ]
+}
