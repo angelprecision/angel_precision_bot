@@ -4580,6 +4580,75 @@ def admin_force_exit_position(position_id: str):
 
 
 # =============================================================================
+# PR #335 — Entry Execution State Classifier (read-only, admin-protected)
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /admin/operator/entry-queue
+#
+# Returns every ENTRY order in the operator queue with a mutually exclusive
+# execution_state classification so the operator console can answer:
+#
+#   Why does this row have no broker_order_id?
+#   Is it healthy?  Is it overdue?  Does action need to be taken?
+#
+# Query params (all optional):
+#   client_id   filter to a single client
+#   hours       lookback window in hours (default 24, max 168)
+#   limit       max rows (default 200, max 1000)
+#
+# Response shape:
+#   ok                     bool
+#   client_id              str | null
+#   hours                  int
+#   counts                 { NEW, WATCHING, TRIGGERED, REJECTED, EXPIRED }
+#   active_queue_signals   int
+#   rows[]                 order rows, each with:
+#       execution_state        one of 11 EntryExecutionState constants
+#       no_broker_id_reason    str | null
+#       action_required        bool
+#       action_required_reason str
+#       next_expected_transition str
+#       overdue_seconds        float | null
+#       state_updated_at       ISO-8601 str | null
+#       raw_diagnostics        { 30 meta / column fields for drill-down }
+#       display_contract       str  (DEFERRED: hidden; shows pending state)
+#       display_limit_price    str | float
+#
+# READ-ONLY: this endpoint never mutates any row.
+# =============================================================================
+
+@app.get("/admin/operator/entry-queue")
+@_require_admin
+def admin_operator_entry_queue():
+    """Operator entry-queue with execution-state classification.
+
+    Every ENTRY order row includes a mutually exclusive ``execution_state``
+    that replaces the generic WATCHING bucket and precisely identifies why
+    the row has no broker_order_id (or confirms it does).
+
+    Query params: client_id, hours (default 24), limit (default 200).
+    """
+    try:
+        from ap.operator_queue_read_model import build_operator_queue_read_model
+        client_id = request.args.get("client_id") or None
+        try:
+            hours = int(request.args.get("hours") or 24)
+        except (TypeError, ValueError):
+            hours = 24
+        try:
+            limit = int(request.args.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        result = build_operator_queue_read_model(
+            client_id=client_id,
+            hours=hours,
+            limit=limit,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        admin_log.error("operator/entry-queue failed: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 # PR #90 — Live Execution Journal (read-only, admin-protected)
 #
 # Two endpoints behind @_require_admin (same HMAC pattern as every other

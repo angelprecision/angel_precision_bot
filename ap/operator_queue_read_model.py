@@ -141,7 +141,14 @@ def _meta_str(meta: dict, key: str) -> str:
 def _parse_iso_utc(ts: Any) -> _dt.datetime | None:
     """Parse an ISO-8601 timestamp string to a UTC-aware datetime.
 
-    Returns None if the value is absent, blank, or unparseable.  Never raises.
+    Returns None if the value is absent, blank, unparseable, or timezone-naive.
+
+    Timezone-naive timestamps are treated as malformed and return None rather
+    than being silently assumed to be UTC.  The execution lifecycle stamps all
+    retry timestamps with explicit UTC offsets; a naive value means the
+    metadata is corrupted or was written by a non-conforming code path.
+    Returning None causes the invariant checker or the retry branch to produce
+    INCONSISTENT_STATE, which is the correct fail-closed behaviour.
     """
     s = str(ts or "").strip()
     if not s:
@@ -153,7 +160,8 @@ def _parse_iso_utc(ts: Any) -> _dt.datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=_dt.timezone.utc)
+        # Naive timestamp — treat as malformed, not as UTC.
+        return None
     return dt
 
 
@@ -255,15 +263,20 @@ def _check_entry_invariants(
 def _resolve_retry_timestamp(meta: dict) -> tuple[_dt.datetime | None, str]:
     """Return (parsed_ts, field_name) for the most authoritative retry timestamp.
 
-    Priority:
-        1. materialization_next_retry_at  (canonical OSM field)
-        2. next_retry_at                  (legacy / adopt field)
-        3. deferred_retry_next_attempt_at (pre-OSM deferred path)
+    Priority must match the merged deferred-lifecycle canonical order:
+        1. materialization_next_retry_at  (canonical OSM field — claim_deferred_materialization)
+        2. deferred_retry_next_attempt_at (pre-OSM deferred path — stamp_retry_metadata)
+        3. next_retry_at                  (legacy adopt / watcher_next_retry_at field)
+
+    This ordering matters when rows carry both legacy and canonical fields with
+    different values.  If deferred_retry_next_attempt_at is already overdue but
+    next_retry_at is still in the future, choosing next_retry_at would produce
+    FUTURE_RETRY_SCHEDULED when DUE_RETRY_PENDING is correct.
     """
     for field in (
         "materialization_next_retry_at",
-        "next_retry_at",
         "deferred_retry_next_attempt_at",
+        "next_retry_at",
     ):
         val = _meta_str(meta, field)
         if val:

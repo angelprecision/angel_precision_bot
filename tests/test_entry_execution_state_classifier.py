@@ -136,11 +136,26 @@ class TestMetaHelpers:
     def test_resolve_retry_prefers_materialization_next(self):
         meta = {
             "materialization_next_retry_at": _FUTURE,
-            "next_retry_at": (_NOW - _dt.timedelta(hours=1)).isoformat(),
+            "deferred_retry_next_attempt_at": (_NOW - _dt.timedelta(hours=1)).isoformat(),
+            "next_retry_at": (_NOW - _dt.timedelta(hours=2)).isoformat(),
         }
         ts, field = _resolve_retry_timestamp(meta)
         assert field == "materialization_next_retry_at"
         assert ts > _NOW
+
+    def test_resolve_retry_prefers_deferred_over_next_retry_at(self):
+        """deferred_retry_next_attempt_at has priority 2; next_retry_at has priority 3.
+
+        This is the critical ordering: when deferred is overdue but next_retry_at
+        is future, the result must be DUE_RETRY_PENDING (not FUTURE_RETRY_SCHEDULED).
+        """
+        meta = {
+            "deferred_retry_next_attempt_at": _PAST,
+            "next_retry_at": _FUTURE,
+        }
+        ts, field = _resolve_retry_timestamp(meta)
+        assert field == "deferred_retry_next_attempt_at"
+        assert ts < _NOW  # overdue
 
     def test_resolve_retry_falls_back_to_next_retry_at(self):
         meta = {"next_retry_at": _FUTURE}
@@ -156,6 +171,16 @@ class TestMetaHelpers:
         ts, field = _resolve_retry_timestamp({})
         assert ts is None
         assert field == ""
+
+    def test_parse_iso_utc_naive_returns_none(self):
+        """Timezone-naive timestamps must be treated as malformed (not silently UTC)."""
+        result = _parse_iso_utc("2026-07-14T14:10:00")  # no tz info
+        assert result is None, "naive timestamp must not be silently assumed to be UTC"
+
+    def test_parse_iso_utc_aware_z_returns_datetime(self):
+        result = _parse_iso_utc("2026-07-14T14:10:00Z")
+        assert result is not None
+        assert result.tzinfo is not None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -999,6 +1024,393 @@ class TestSqlQueryGuards:
 # ─────────────────────────────────────────────────────────────────────────────
 # EntryExecutionState constants
 # ─────────────────────────────────────────────────────────────────────────────
+
+class TestRetryTimestampPrecedenceContradiction:
+    """Contradiction tests: legacy (next_retry_at) and canonical timestamps disagree."""
+
+    def _row_with_timestamps(self, mat_next=None, deferred_next=None, next_retry=None) -> dict:
+        meta: dict = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "retry_reason": "MONEYNESS_OUT_OF_RANGE",
+        }
+        if mat_next is not None:
+            meta["materialization_next_retry_at"] = mat_next
+        if deferred_next is not None:
+            meta["deferred_retry_next_attempt_at"] = deferred_next
+        if next_retry is not None:
+            meta["next_retry_at"] = next_retry
+        return _make_row(contract="DEFERRED:AAPL", limit_price=0.01, meta=meta)
+
+    def test_contradiction_deferred_overdue_next_retry_future_yields_due(self):
+        """Canonical contradiction: deferred is overdue, legacy next_retry_at is future.
+
+        With the correct precedence (deferred > next_retry_at), the result must be
+        DUE_RETRY_PENDING — not FUTURE_RETRY_SCHEDULED.  This is the exact scenario
+        that would misclassify with the wrong field order.
+        """
+        row = self._row_with_timestamps(
+            deferred_next=_PAST,    # overdue — should win
+            next_retry=_FUTURE,     # future — must lose to deferred
+        )
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.DUE_RETRY_PENDING, (
+            "deferred_retry_next_attempt_at (overdue) must take priority over "
+            "next_retry_at (future) — wrong precedence would return FUTURE_RETRY_SCHEDULED"
+        )
+        assert r["overdue_seconds"] is not None
+        assert r["overdue_seconds"] > 0
+
+    def test_contradiction_materialization_overdue_deferred_future(self):
+        """materialization_next_retry_at (overdue) beats deferred_next (future)."""
+        row = self._row_with_timestamps(
+            mat_next=_PAST,
+            deferred_next=_FUTURE,
+        )
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.DUE_RETRY_PENDING
+
+    def test_contradiction_all_three_materialization_is_authoritative(self):
+        """materialization_next_retry_at is always the most authoritative field."""
+        row = self._row_with_timestamps(
+            mat_next=_FUTURE,   # future — wins priority 1
+            deferred_next=_PAST,
+            next_retry=_PAST,
+        )
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.FUTURE_RETRY_SCHEDULED
+
+    def test_contradiction_only_next_retry_future_yields_future(self):
+        """Only next_retry_at present and future → FUTURE_RETRY_SCHEDULED."""
+        row = self._row_with_timestamps(next_retry=_FUTURE)
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.FUTURE_RETRY_SCHEDULED
+
+    def test_naive_retry_timestamp_yields_inconsistent_state(self):
+        """A timezone-naive retry timestamp is malformed — must produce INCONSISTENT_STATE.
+
+        The correctness fix requires _parse_iso_utc to return None for naive
+        timestamps instead of silently assuming UTC.  A RETRY_WAIT row with
+        only a naive timestamp has no parseable retry timestamp at all, which
+        triggers invariant 5 (RETRY_WAIT_WITHOUT_RETRY_TIMESTAMP).
+        """
+        meta = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            # Naive timestamp — no timezone offset
+            "materialization_next_retry_at": "2026-07-14T14:10:00",
+        }
+        row = _make_row(contract="DEFERRED:AAPL", limit_price=0.01, meta=meta)
+        r = _classify(row)
+        assert r["execution_state"] == EntryExecutionState.INCONSISTENT_STATE
+        # The invariant is missing-timestamp because the naive value is unparseable
+        assert "RETRY_WAIT_WITHOUT_RETRY_TIMESTAMP" in r["no_broker_id_reason"]
+
+
+class TestRouteResponseFixtures:
+    """Route-level and response-fixture tests.
+
+    These tests prove that the deployed API returns the classification fields
+    every operator-console consumer depends on.  They call the read model
+    directly (no DB; uses synthetic row builders) to validate the response
+    shape the /admin/operator/entry-queue endpoint will return.
+    """
+
+    def _fixture_response(self, rows: list[dict] | None = None) -> dict:
+        """Build a synthetic response matching build_operator_queue_read_model output."""
+        from ap.operator_queue_read_model import (
+            _order_row, empty_queue_counts, dashboard_queue_bucket,
+        )
+        built_rows = [_order_row(r) for r in (rows or [])]
+        counts = empty_queue_counts()
+        for row in built_rows:
+            bucket = row.get("dashboard_status")
+            if bucket in counts:
+                counts[bucket] += 1
+        active = counts["NEW"] + counts["WATCHING"] + counts["TRIGGERED"]
+        return {
+            "ok": True,
+            "client_id": None,
+            "hours": 24,
+            "counts": counts,
+            "NEW": counts["NEW"],
+            "WATCHING": counts["WATCHING"],
+            "TRIGGERED": counts["TRIGGERED"],
+            "REJECTED": counts["REJECTED"],
+            "EXPIRED": counts["EXPIRED"],
+            "active_queue_signals": active,
+            "pending_signals": active,
+            "rows": built_rows,
+        }
+
+    def _make_order_for_fixture(self, **kw) -> dict:
+        """Synthetic orders row suitable for _order_row()."""
+        return {
+            "local_order_id": kw.get("local_order_id", "ord-fix-001"),
+            "client_id":       kw.get("client_id", "test@example.com"),
+            "signal_id":       kw.get("signal_id", "sig-fix-001"),
+            "plan_id":         kw.get("plan_id", "plan-fix-001"),
+            "status":          kw.get("status", "PENDING_TRIGGER"),
+            "broker_order_id": kw.get("broker_order_id", None),
+            "symbol":          kw.get("symbol", "AAPL"),
+            "side":            kw.get("side", "CALL"),
+            "contract":        kw.get("contract", _OCC),
+            "limit_price":     kw.get("limit_price", 2.50),
+            "score":           kw.get("score", 85.0),
+            "execution_mode":  kw.get("execution_mode", "paper"),
+            "submitted_ts":    kw.get("submitted_ts", None),
+            "created_ts":      kw.get("created_ts", "2026-07-14T09:00:00+00:00"),
+            "updated_ts":      kw.get("updated_ts", "2026-07-14T13:55:00+00:00"),
+            "last_error":      kw.get("last_error", None),
+            "meta":            kw.get("meta", {}),
+        }
+
+    # ── Top-level response shape ───────────────────────────────────────────
+
+    def test_response_top_level_ok(self):
+        r = self._fixture_response()
+        assert r["ok"] is True
+
+    def test_response_has_counts(self):
+        r = self._fixture_response()
+        assert "counts" in r
+        assert set(r["counts"].keys()) == {"NEW", "WATCHING", "TRIGGERED", "REJECTED", "EXPIRED"}
+
+    def test_response_has_active_queue_signals(self):
+        r = self._fixture_response()
+        assert "active_queue_signals" in r
+        assert isinstance(r["active_queue_signals"], int)
+
+    def test_response_has_rows_list(self):
+        r = self._fixture_response()
+        assert "rows" in r
+        assert isinstance(r["rows"], list)
+
+    def test_response_counts_match_rows(self):
+        """WATCHING count must equal the number of PENDING_TRIGGER rows."""
+        raw_rows = [
+            self._make_order_for_fixture(local_order_id="ord-001", status="PENDING_TRIGGER"),
+            self._make_order_for_fixture(local_order_id="ord-002", status="PENDING_TRIGGER"),
+        ]
+        r = self._fixture_response(raw_rows)
+        assert r["WATCHING"] == 2
+
+    # ── Every operator-visible classification field present in each row ─────
+
+    def test_every_row_has_execution_state(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert len(r["rows"]) == 1
+        assert "execution_state" in r["rows"][0]
+
+    def test_every_row_has_no_broker_id_reason(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "no_broker_id_reason" in r["rows"][0]
+
+    def test_every_row_has_action_required(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        row = r["rows"][0]
+        assert "action_required" in row
+        assert isinstance(row["action_required"], bool)
+
+    def test_every_row_has_action_required_reason(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "action_required_reason" in r["rows"][0]
+
+    def test_every_row_has_next_expected_transition(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "next_expected_transition" in r["rows"][0]
+        assert r["rows"][0]["next_expected_transition"]
+
+    def test_every_row_has_overdue_seconds(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "overdue_seconds" in r["rows"][0]
+
+    def test_every_row_has_state_updated_at(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "state_updated_at" in r["rows"][0]
+
+    def test_every_row_has_raw_diagnostics(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "raw_diagnostics" in r["rows"][0]
+        assert isinstance(r["rows"][0]["raw_diagnostics"], dict)
+
+    def test_every_row_has_display_contract(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "display_contract" in r["rows"][0]
+
+    def test_every_row_has_display_limit_price(self):
+        raw = [self._make_order_for_fixture()]
+        r = self._fixture_response(raw)
+        assert "display_limit_price" in r["rows"][0]
+
+    # ── Per-state fixture spot checks ──────────────────────────────────────
+
+    def test_fixture_pre_breach_classification(self):
+        raw = [self._make_order_for_fixture(status="PENDING_TRIGGER")]
+        r = self._fixture_response(raw)
+        assert r["rows"][0]["execution_state"] == EntryExecutionState.PRE_BREACH
+        assert r["rows"][0]["action_required"] is False
+
+    def test_fixture_due_retry_action_required(self):
+        # Use a timestamp well in the past so _utcnow() always sees it as overdue,
+        # regardless of when the test suite actually runs.
+        _CLEARLY_PAST = "2026-06-01T00:00:00+00:00"
+        meta = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "materialization_next_retry_at": _CLEARLY_PAST,
+        }
+        raw = [self._make_order_for_fixture(
+            contract="DEFERRED:AAPL", limit_price=0.01, meta=meta,
+        )]
+        r = self._fixture_response(raw)
+        row = r["rows"][0]
+        assert row["execution_state"] == EntryExecutionState.DUE_RETRY_PENDING
+        assert row["action_required"] is True
+        assert row["overdue_seconds"] is not None and row["overdue_seconds"] > 0
+
+    def test_fixture_broker_submitted_no_broker_id_reason_null(self):
+        raw = [self._make_order_for_fixture(
+            status="SUBMITTED", broker_order_id="TRD-12345",
+        )]
+        r = self._fixture_response(raw)
+        assert r["rows"][0]["execution_state"] == EntryExecutionState.BROKER_SUBMITTED
+        assert r["rows"][0]["no_broker_id_reason"] is None
+
+    def test_fixture_inconsistent_returns_action_required(self):
+        """INCONSISTENT_STATE rows must surface action_required=True in the fixture."""
+        # inv3: broker_order_id present with PENDING_TRIGGER status
+        raw = [self._make_order_for_fixture(
+            status="PENDING_TRIGGER", broker_order_id="TRD-999",
+        )]
+        r = self._fixture_response(raw)
+        assert r["rows"][0]["execution_state"] == EntryExecutionState.INCONSISTENT_STATE
+        assert r["rows"][0]["action_required"] is True
+
+    def test_fixture_retry_attempt_in_raw_diagnostics(self):
+        """retry_attempt and retry_max_attempts must be in raw_diagnostics for UI display."""
+        meta = {
+            "lifecycle_state": "RETRY_WAIT",
+            "materialization_status": "RETRY_PENDING",
+            "materialization_in_flight": False,
+            "broker_ready": False,
+            "retry_attempt": 2,
+            "retry_max_attempts": 3,
+            "materialization_next_retry_at": _FUTURE,
+        }
+        raw = [self._make_order_for_fixture(
+            contract="DEFERRED:AAPL", limit_price=0.01, meta=meta,
+        )]
+        r = self._fixture_response(raw)
+        diag = r["rows"][0]["raw_diagnostics"]
+        assert diag["retry_attempt"] == 2
+        assert diag["retry_max_attempts"] == 3
+
+    def test_fixture_final_market_validity_in_raw_diagnostics(self):
+        """final_market_validity.reason_code must be accessible via raw_diagnostics."""
+        meta = {
+            "broker_ready": False,
+            "lifecycle_state": "",
+            "materialization_in_flight": False,
+            "final_market_validity": {
+                "gate": "market_validity",
+                "passed": False,
+                "reason_code": "CALL_NO_LONGER_ABOVE_TRIGGER",
+            },
+        }
+        raw = [self._make_order_for_fixture(
+            status="PENDING_TRIGGER", execution_mode="live", meta=meta,
+        )]
+        r = self._fixture_response(raw)
+        diag = r["rows"][0]["raw_diagnostics"]
+        fmv = diag.get("final_market_validity") or {}
+        assert fmv.get("reason_code") == "CALL_NO_LONGER_ABOVE_TRIGGER"
+
+    def test_fixture_submit_intent_at_in_raw_diagnostics(self):
+        """submit_intent_at must surface in raw_diagnostics for reconcile-state display."""
+        meta = {
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": "2026-07-14T13:50:00+00:00",
+            "broker_submit_key": "ord-fix-001",
+            "current_owner": "broker_submit:ord-fix-001",
+            "broker_ready": True,
+            "materialization_generation": 1,
+            "materialization_in_flight": False,
+        }
+        raw = [self._make_order_for_fixture(meta=meta)]
+        r = self._fixture_response(raw)
+        diag = r["rows"][0]["raw_diagnostics"]
+        assert diag["submit_intent_at"] == "2026-07-14T13:50:00+00:00"
+
+    # ── Route registration test (no DB required) ───────────────────────────
+    #
+    # We read app.py as raw text instead of importing it to avoid triggering
+    # the module-level DB connection initialisation that runs at import time.
+    # A text-level search is sufficient to prove the route and delegation are
+    # present; the response-shape tests above prove the classification payload.
+
+    @staticmethod
+    def _app_source() -> str:
+        import os
+        app_path = os.path.join(os.path.dirname(__file__), "..", "app.py")
+        with open(os.path.normpath(app_path)) as fh:
+            return fh.read()
+
+    def test_entry_queue_route_registered_in_app_source(self):
+        """The /admin/operator/entry-queue endpoint must be registered in app.py."""
+        src = self._app_source()
+        assert "/admin/operator/entry-queue" in src, (
+            "/admin/operator/entry-queue route is not registered in app.py"
+        )
+
+    def test_entry_queue_route_calls_build_operator_queue_read_model(self):
+        """The route implementation must delegate to build_operator_queue_read_model."""
+        src = self._app_source()
+        assert "build_operator_queue_read_model" in src, (
+            "build_operator_queue_read_model not called from app.py"
+        )
+        # Split on the function definition (not the comment) so we get only
+        # the handler body, then find the next top-level @app decorator.
+        handler_src = src.split("def admin_operator_entry_queue():", 1)[1]
+        handler_body = handler_src.split("\n@app", 1)[0]
+        assert "build_operator_queue_read_model" in handler_body, (
+            "build_operator_queue_read_model not found in admin_operator_entry_queue body"
+        )
+
+    def test_entry_queue_endpoint_is_read_only_in_source(self):
+        """The entry-queue endpoint must not issue any DML."""
+        src = self._app_source()
+        # Isolate handler body (between def and the next top-level decorator)
+        eq_body = src.split("admin_operator_entry_queue", 1)[1].split("@app", 1)[0]
+        import re as _re
+        sql_updates = _re.findall(r"\bUPDATE\s+\w", eq_body)
+        assert sql_updates == [], f"SQL mutation in entry-queue handler: {sql_updates}"
+
+    def test_entry_queue_route_protected_by_require_admin(self):
+        """The route must be behind the @_require_admin decorator."""
+        src = self._app_source()
+        # The decorator must appear between the @app.get and the def
+        route_block = src.split("/admin/operator/entry-queue", 1)[1]
+        before_def = route_block.split("def admin_operator_entry_queue", 1)[0]
+        assert "_require_admin" in before_def, (
+            "@_require_admin decorator not found before admin_operator_entry_queue"
+        )
+
 
 class TestEntryExecutionStateConstants:
     def test_all_eleven_states_defined(self):
