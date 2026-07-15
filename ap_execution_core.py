@@ -7704,6 +7704,94 @@ class APExecutionCore:
                 )
             return ok
 
+        # ── Materialization ownership guard (Rule 1 / Rule 3) ──────────────────
+        # Production proof (July 15 2026, TMO LIVE): after a deferred entry
+        # triggers and schedules a contract-selection retry, the watcher is reset
+        # to PENDING (line 4329 ap_entry_watcher.py) so the retry delay is
+        # honoured.  On the *next* poll tick, check() sees now >= expire_at and
+        # returns EXPIRED.  Without this guard, _cleanup_pending_entry_order
+        # calls expire_pending_entry() and the order becomes EXPIRED with
+        # last_error="watcher_expired" while materialization_status=RETRY_PENDING
+        # — an impossible and terminal lifecycle combination.
+        #
+        # Rule 1: RETRY_PENDING / RUNNING / QUEUED is an active owner state.
+        #   The materializer still holds this order; watcher cleanup may not
+        #   terminalize it.
+        # Rule 3: Original watcher expiry controls untriggered setups only.
+        #   Once contract materialization has begun, use the materializer
+        #   lifecycle deadline and entry cutoff — not the watcher's expire_at.
+        # Rule 5: Cleanup cannot overwrite newer lifecycle state.
+        if action == "expire":
+            try:
+                _get_order_fn = getattr(self.order_state_machine, "get_order", None)
+                if callable(_get_order_fn):
+                    _snap = _get_order_fn(local_order_id)
+                    if _snap:
+                        _snap_meta = _snap.get("meta") or {}
+                        if isinstance(_snap_meta, str):
+                            try:
+                                import json as _jg
+                                _snap_meta = _jg.loads(_snap_meta)
+                            except Exception:
+                                _snap_meta = {}
+                        if not isinstance(_snap_meta, dict):
+                            _snap_meta = {}
+                        _mat_status = str(_snap_meta.get("materialization_status") or "").upper()
+                        _lc_state   = str(_snap_meta.get("lifecycle_state") or "").upper()
+                        _in_flight  = bool(_snap_meta.get("materialization_in_flight"))
+                        _is_active_mat = (
+                            _mat_status in {"QUEUED", "RUNNING", "RETRY_PENDING"}
+                            or _lc_state  in {"MATERIALIZING", "RETRY_WAIT"}
+                            or _in_flight
+                        )
+                        if _is_active_mat:
+                            _sig_id_for_log  = str(_snap.get("signal_id") or "").strip()
+                            _client_for_log  = str(_snap.get("client_id") or "").strip()
+                            _mode_for_log    = str(_snap.get("execution_mode") or "").strip()
+                            _gen_for_log     = _snap_meta.get("materialization_generation")
+                            _attempt_for_log = _snap_meta.get("retry_attempt")
+                            _token_for_log   = (
+                                str(_snap_meta.get("materialization_owner") or "")
+                                or str(_snap_meta.get("watcher_token") or "")
+                            ).strip()
+                            _next_retry      = str(_snap_meta.get("next_retry_at")
+                                                   or _snap_meta.get("materialization_next_retry_at")
+                                                   or "").strip()
+                            _deadline        = str(_snap_meta.get("absolute_entry_deadline")
+                                                   or _snap_meta.get("materialization_lifecycle_deadline")
+                                                   or "").strip()
+                            log.critical(
+                                "[%s] WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION | "
+                                "order=%s client_id=%s execution_mode=%s signal_id=%s "
+                                "materialization_status=%s lifecycle_state=%s "
+                                "materialization_generation=%s retry_attempt=%s "
+                                "watcher_token=%s next_retry_at=%s lifecycle_deadline=%s "
+                                "expire_reason=%s — watcher expiry suppressed; "
+                                "materializer retains lifecycle ownership",
+                                watched.ticker, local_order_id, _client_for_log,
+                                _mode_for_log, _sig_id_for_log,
+                                _mat_status, _lc_state,
+                                _gen_for_log, _attempt_for_log,
+                                _token_for_log, _next_retry, _deadline,
+                                reason,
+                            )
+                            sig["_watcher_expiry_skipped"] = True
+                            sig["_watcher_expiry_skip_reason"] = "WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION"
+                            return False
+            except Exception as _guard_exc:
+                # Fail closed: if we cannot verify materialization state, do not
+                # expire the order. An order that stays alive is recoverable;
+                # an order that is incorrectly terminalized is not.
+                log.critical(
+                    "[%s] WATCHER_EXPIRY_GUARD_CHECK_FAILED (fail-closed) | "
+                    "order=%s expire_reason=%s guard_error=%s — "
+                    "suppressing expiry; manual inspection required",
+                    watched.ticker, local_order_id, reason, _guard_exc,
+                )
+                sig["_watcher_expiry_skipped"] = True
+                sig["_watcher_expiry_skip_reason"] = "WATCHER_EXPIRY_GUARD_CHECK_FAILED"
+                return False
+
         try:
             if action == "expire" and hasattr(self.order_state_machine, "expire_pending_entry"):
                 ok = self.order_state_machine.expire_pending_entry(local_order_id, reason=reason)
@@ -7820,9 +7908,21 @@ class APExecutionCore:
                     reason_code=_expire_reason,
                     local_order_id=_local_oid_exp or None,
                 )
+            # When cleanup was suppressed by the materialization ownership guard,
+            # use the exact skip reason so the quarantine CRITICAL log shows the
+            # real cause (WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION) rather than
+            # the opaque "cleanup_returned_false:watcher_expired" string.
+            _skip_reason = str(
+                (getattr(watched, "signal", {}) or {}).get("_watcher_expiry_skip_reason") or ""
+            ).strip()
+            _failed_reason = (
+                _skip_reason
+                if _skip_reason
+                else f"cleanup_returned_false:{_expire_reason}"
+            )
             return _WCR(
                 outcome=_WCO.FAILED,
-                reason_code=f"cleanup_returned_false:{_expire_reason}",
+                reason_code=_failed_reason,
                 local_order_id=_local_oid_exp or None,
             )
         except Exception:
