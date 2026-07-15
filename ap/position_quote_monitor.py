@@ -430,8 +430,61 @@ class APPositionQuoteMonitor:
                     or _safe_float(_get_attr(pos, "entry_fill_price", default=None), 0.0)
                 )
                 cur_opt = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
-                if cost_basis > 0 and cur_opt > 0:
-                    pnl_pct = (cur_opt - cost_basis) / cost_basis
+
+                # ── Repair 1 & 2: Separate analytics mark from executable bid ──
+                # For LIVE long-option positions the only price at which we can
+                # exit is the current bid.  Using midpoint for profit decisions
+                # (touched_profit, peak, floor, trailing stops, small-win lock)
+                # produces fictitious P&L that arms exits which then fill at
+                # the actual bid — generating a real loss while the system
+                # logs a "profit stop".
+                #
+                # Production proof (July 15 2026, Jason LIVE BA):
+                #   Entry fill $1.59; bid $1.63 ask $1.79; mid $1.71
+                #   Mid P&L +7.55% → touched_profit=True → floor armed
+                #   Executable bid P&L +2.52% → floor should NOT arm at bid
+                #   Exit quote: bid $1.45 → actual fill -8.81%
+                #   System claimed "TOUCHED PROFIT STOP peaked +7% now 0%"
+                #
+                # Rule:
+                #   analytics_mark_price  = mid/mark  (for charts, dashboard)
+                #   executable_exit_price = bid        (for all profit decisions on LIVE)
+                #   PAPER uses mid explicitly labeled as paper_mid_simulation
+                _exec_mode = str(
+                    _get_attr(pos, "executionmode", "execution_mode", default="") or ""
+                ).lower().strip()
+                _is_live = (_exec_mode == "live")
+
+                # Always write analytics mark for charting / observability.
+                self._write_field(pos, "analytics_mark_price", cur_opt)
+                self._write_field(pos, "analyticsmarkprice",   cur_opt)
+
+                # Determine the executable exit price.
+                cur_bid_now = _safe_float(_get_attr(pos, "currentbid", "current_bid", default=None), 0.0)
+                if _is_live:
+                    if cur_bid_now > 0:
+                        # LIVE: use bid for all P&L decisions.
+                        exec_price = cur_bid_now
+                        self._write_field(pos, "live_executable_price_source", "bid")
+                        self._write_field(pos, "liveexecutablepricesource",    "bid")
+                        # Override current_option_price to bid so the exit
+                        # engine's option_pnl_pct property also uses executable
+                        # price.  analytics_mark_price preserves the mid.
+                        self._write_field(pos, "currentoptionprice",  cur_bid_now)
+                        self._write_field(pos, "current_option_price", cur_bid_now)
+                    else:
+                        # Bid missing / stale — cannot claim any executable profit.
+                        exec_price = 0.0
+                        self._write_field(pos, "live_executable_price_source", "bid_missing")
+                        self._write_field(pos, "liveexecutablepricesource",    "bid_missing")
+                else:
+                    # PAPER: mid/mark simulation (unchanged behavior).
+                    exec_price = cur_opt
+                    self._write_field(pos, "live_executable_price_source", "paper_mid_simulation")
+                    self._write_field(pos, "liveexecutablepricesource",    "paper_mid_simulation")
+
+                if cost_basis > 0 and exec_price > 0:
+                    pnl_pct = (exec_price - cost_basis) / cost_basis
                     peak = max(
                         pnl_pct,
                         _safe_float(_get_attr(pos, "peakpnlpct", "peak_pnl_pct", default=None), float("-inf")),
@@ -443,6 +496,8 @@ class APPositionQuoteMonitor:
                     self._write_field(pos, "max_profit_seen", peak)
                     self._write_field(pos, "optionpnlpct", pnl_pct)
                     self._write_field(pos, "option_pnl_pct", pnl_pct)
+                    # touched_profit arms from executable bid for LIVE,
+                    # mid simulation for PAPER — both use exec_price.
                     if pnl_pct >= 0.05:
                         self._write_field(pos, "touchedprofit", True)
                         self._write_field(pos, "touched_profit", True)
@@ -453,7 +508,7 @@ class APPositionQuoteMonitor:
                     # the exit engine continues to read in-memory state.
                     self._persist_quote_to_db(
                         position_id     = pid,
-                        option_price    = cur_opt,
+                        option_price    = exec_price,
                         underlying_price= und_last,
                         option_pnl_pct  = pnl_pct,
                         now_utc         = now_utc,
@@ -463,9 +518,9 @@ class APPositionQuoteMonitor:
                         contract    = c,
                         option_pnl_pct = pnl_pct,
                         now_utc     = now_utc,
-                        source      = price_source,
+                        source      = ("bid" if _is_live else price_source),
                     )
-                elif cost_basis > 0 and cur_opt <= 0:
+                elif cost_basis > 0 and exec_price <= 0:
                     self._mark_mfe_mae_unavailable(
                         position_id = pid,
                         contract = c,

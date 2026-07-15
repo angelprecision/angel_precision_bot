@@ -1820,6 +1820,150 @@ class APExitEngine:
             return False
 
 
+    def adopt_canonical_position_identity(
+        self,
+        *,
+        contract: str,
+        canonical_position_id: str,
+        local_order_id: str,
+        broker_order_id: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        entry_fill: float,
+        entry_ts,
+        execution_mode: str,
+        client_id: str,
+        score: float = 0.0,
+        tier: str = "",
+        pattern: str = "",
+        direction: str = "",
+        underlying_stop: float = 0.0,
+        underlying_target: float = 0.0,
+    ) -> bool:
+        """Atomically upgrade a broker-repair position to canonical filled-order identity.
+
+        Repair 4 (spec): A temporary broker-repair position may be created only when
+        the canonical filled ENTRY cannot yet be resolved. When the canonical ENTRY fill
+        arrives, this method upgrades the in-memory position in place without creating
+        a duplicate or losing quote/peak state already accumulated.
+
+        Production proof (July 15 2026, Jason LIVE BA260717C00222500):
+          Broker-repair position:  broker-repair-jasoncosby1@gmail.com-BA260717C00222500
+          Canonical position:      d7668918-bc1d-45f3-a783-357c7fe51afc
+          Canonical ENTRY order:   944f4c9d-7808-4d55-9947-5bfb6563626e
+          Exit proof row used synthetic ID → execution_mode=unknown, score=0.
+
+        Returns True when a broker-repair position was found and upgraded.
+        Returns False when no broker-repair position was found (caller should seed).
+        """
+        _contract = str(contract or "").upper().strip()
+        _canon_id = str(canonical_position_id or "").strip()
+        _client   = str(client_id or "").strip().lower()
+        _mode     = str(execution_mode or "").strip().lower()
+        if not _contract or not _canon_id:
+            return False
+
+        with self._lock:
+            for pos in self._positions:
+                _pid = str(pos.position_id or "")
+                _sym = str(pos.option_symbol or "").upper().strip()
+                _is_repair = _pid.startswith("broker-repair-")
+                _same_contract = (_sym == _contract)
+                if not (_is_repair and _same_contract and not pos.closed):
+                    continue
+
+                # Found the broker-repair position — upgrade in place.
+                old_id = _pid
+
+                # Canonical identity
+                pos.position_id = _canon_id
+                if client_id:
+                    pos.client_id = _client
+                if signal_id:
+                    pos.signal_id = signal_id
+                if canonical_signal_id:
+                    try:
+                        pos.canonical_signal_id = canonical_signal_id
+                    except Exception:
+                        pass
+                if execution_mode:
+                    pos.execution_mode = _mode
+
+                # Entry truth (use canonical fill if better than repair estimate)
+                if entry_fill > 0:
+                    pos.entry_price = entry_fill
+                    # Reset peak/touched_profit based on current price vs real fill
+                    # (repair may have used a stale broker cost_basis)
+                    cur_exec = getattr(pos, "current_bid", 0.0) or getattr(pos, "current_option_price", 0.0)
+                    if cur_exec > 0 and entry_fill > 0:
+                        _rebased_pnl = (cur_exec - entry_fill) / entry_fill
+                        if _rebased_pnl > pos.peak_pnl_pct:
+                            pos.peak_pnl_pct = _rebased_pnl
+                        if _rebased_pnl > (getattr(pos, "max_profit_seen", 0.0) or 0.0):
+                            pos.max_profit_seen = _rebased_pnl
+                        pos.touched_profit = (_rebased_pnl >= 0.05)
+
+                # Order / broker identity
+                try:
+                    pos.entry_local_order_id = local_order_id
+                except Exception:
+                    pass
+                try:
+                    pos.entry_broker_order_id = broker_order_id
+                except Exception:
+                    pass
+
+                # Signal metadata
+                if score:
+                    try:
+                        pos.score = score
+                    except Exception:
+                        pass
+                if tier:
+                    try:
+                        pos.tier = tier
+                    except Exception:
+                        pass
+                if pattern:
+                    try:
+                        pos.pattern = pattern
+                    except Exception:
+                        pass
+                if direction:
+                    try:
+                        pos.side = direction.upper()
+                    except Exception:
+                        pass
+                if underlying_stop > 0:
+                    try:
+                        pos.underlying_stop = underlying_stop
+                    except Exception:
+                        pass
+                if underlying_target > 0:
+                    try:
+                        pos.underlying_target = underlying_target
+                    except Exception:
+                        pass
+
+                # Update O(1) index atomically
+                self._positions_by_id.pop(old_id, None)
+                self._positions_by_id[_canon_id] = pos
+
+                log.info(
+                    "[exit_eng] CANONICAL_POSITION_ADOPTED "
+                    "contract=%s old_id=%s new_id=%s local_order=%s broker_order=%s "
+                    "signal_id=%s execution_mode=%s entry_fill=%.4f "
+                    "peak_pnl_pct=%.2f%% touched_profit=%s",
+                    _contract, old_id, _canon_id,
+                    local_order_id or "?", broker_order_id or "?",
+                    signal_id or "?", _mode, entry_fill or 0.0,
+                    (pos.peak_pnl_pct or 0.0) * 100,
+                    pos.touched_profit,
+                )
+                return True
+
+        return False
+
     def add_position(self, pos: ManagedPosition):
         """Track a newly broker-confirmed open position for exit protection."""
         if pos is None:
