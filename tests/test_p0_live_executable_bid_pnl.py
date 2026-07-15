@@ -645,14 +645,17 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,  # different from repair client
         )
-        assert result is False
+        assert result.disposition == "RETRY_CLIENT_MISMATCH"
+        assert result.adopted is False
         assert engine._positions[0].position_id.startswith("broker-repair-")
 
     def test_no_adoption_when_canonical_already_exists(self):
         engine = self._base_engine()
         self._add_repair(engine)
-        # Pre-populate canonical entry in index
-        canon_pos = _Pos(position_id="canon-existing", option_symbol=_CONTRACT)
+        # Pre-populate canonical entry in index AND positions list
+        canon_pos = _Pos(position_id="canon-existing", option_symbol=_CONTRACT,
+                         client_id=_CLIENT, execution_mode="live")
+        engine._positions.append(canon_pos)
         engine._positions_by_id["canon-existing"] = canon_pos
 
         result = engine.adopt_canonical_position_identity(
@@ -661,9 +664,9 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,
         )
-        # Canonical already exists → returns True (already adopted) or False (conflict)
-        # but must NOT create a duplicate
-        assert len(engine._positions) == 1
+        # Canonical + repair → collapse; must end with exactly 1 active
+        assert result.adopted is True
+        assert len([p for p in engine._positions if not p.closed]) == 1
 
     def test_repair_to_paper_mismatch_refused(self):
         engine = self._base_engine()
@@ -674,7 +677,8 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="paper",  # canonical says paper
             client_id=_CLIENT,
         )
-        assert result is False
+        assert result.disposition == "RETRY_MODE_MISMATCH"
+        assert result.adopted is False
 
     def test_blank_repair_mode_accepts_live_canonical(self):
         engine = self._base_engine()
@@ -685,7 +689,8 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,
         )
-        assert result is True
+        assert result.disposition == "ADOPTED"
+        assert result.adopted is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -809,3 +814,262 @@ class TestNoDuplicateAfterAdoption:
         with patch("ap_exit_engine._normalize_ticker", return_value=_TICKER):
             engine.add_position(pos2)
         assert len(engine._positions) == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Final Blocker 1 — Canonical + repair collapses to one object
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCanonicalPlusRepairCollapse:
+    """When both canonical and repair positions exist, adoption must merge
+    and remove the repair so exactly one active object remains."""
+
+    def _make_engine_with_both(self):
+        from ap_exit_engine import APExitEngine, CanonicalAdoptionResult
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+
+        canon_id  = "d7668918-bc1d-45f3-a783-357c7fe51afc"
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+
+        # Canonical: already exists
+        canon = _Pos(position_id=canon_id, execution_mode="live",
+                     option_symbol=_CONTRACT, client_id=_CLIENT,
+                     current_bid=1.63, peak_pnl_pct=0.025, touched_profit=False)
+        engine._positions.append(canon)
+        engine._positions_by_id[canon_id] = canon
+
+        # Repair: also exists (the problem case)
+        repair = _Pos(position_id=repair_id, execution_mode="",
+                      option_symbol=_CONTRACT, client_id=_CLIENT,
+                      current_bid=1.64, peak_pnl_pct=0.0755,  # contaminated mid peak
+                      touched_profit=True)
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+
+        return engine, canon_id, repair_id
+
+    def test_one_active_object_after_collapse(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="944f4c9d", broker_order_id="136961009",
+            signal_id=_SIG, canonical_signal_id=_SIG,
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        active = [p for p in engine._positions if not p.closed]
+        assert len(active) == 1, f"Expected 1 active, got {len(active)}"
+
+    def test_canonical_id_retained(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert engine._positions[0].position_id == canon_id
+
+    def test_repair_removed_from_index(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert repair_id not in engine._positions_by_id
+        assert canon_id in engine._positions_by_id
+
+    def test_repair_absent_from_positions_list(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        for p in engine._positions:
+            assert not str(p.position_id).startswith("broker-repair-")
+
+    def test_disposition_is_already_canonical_repair_removed(self):
+        from ap_exit_engine import CanonicalAdoptionResult
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert isinstance(result, CanonicalAdoptionResult)
+        assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+        assert result.adopted is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Final Blocker 2 — Structured CanonicalAdoptionResult + RETRY cannot fall through
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestStructuredAdoptionResult:
+    """CanonicalAdoptionResult is returned for all paths; RETRY never seeds."""
+
+    def _engine(self):
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        return engine
+
+    def _add_repair(self, engine, *, client=_CLIENT, mode="", contract=_CONTRACT):
+        from ap_exit_engine import CanonicalAdoptionResult
+        repair_id = f"broker-repair-{client}-{contract}"
+        pos = _Pos(position_id=repair_id, execution_mode=mode,
+                   client_id=client, option_symbol=contract,
+                   current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.append(pos)
+        engine._positions_by_id[repair_id] = pos
+
+    def test_adopted_disposition_on_success(self):
+        from ap_exit_engine import CanonicalAdoptionResult
+        engine = self._engine()
+        self._add_repair(engine)
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert isinstance(r, CanonicalAdoptionResult)
+        assert r.disposition == "ADOPTED"
+        assert r.adopted is True
+        assert r.safe_to_seed is False
+
+    def test_no_repair_found_disposition(self):
+        from ap_exit_engine import CanonicalAdoptionResult
+        engine = self._engine()  # no positions
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert r.disposition == "NO_REPAIR_FOUND"
+        assert r.safe_to_seed is True
+
+    def test_client_mismatch_returns_retry_not_seeds(self):
+        from ap_exit_engine import CanonicalAdoptionResult
+        engine = self._engine()
+        self._add_repair(engine, client="other@client.com")
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live",
+            client_id=_CLIENT,  # different from repair
+        )
+        assert r.disposition == "RETRY_CLIENT_MISMATCH"
+        assert r.adopted is False
+        assert r.safe_to_seed is False
+        assert r.retryable is True
+        # Repair position must still exist (not adopted)
+        assert len(engine._positions) == 1
+        assert engine._positions[0].position_id.startswith("broker-repair-")
+
+    def test_mode_mismatch_returns_retry_not_seeds(self):
+        from ap_exit_engine import CanonicalAdoptionResult
+        engine = self._engine()
+        self._add_repair(engine, mode="live")
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="paper",  # mismatch
+            client_id=_CLIENT,
+        )
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.safe_to_seed is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Final Blocker 3 — _normalize_canonical_ts
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestNormalizeCanonicalTs:
+    """All timestamp formats produce correct aware UTC datetime."""
+
+    def _norm(self, ts, *, fallback=None):
+        from ap_exit_engine import _normalize_canonical_ts
+        return _normalize_canonical_ts(ts, fallback=fallback, local_order_id="test-order")
+
+    def test_aware_datetime_returned_as_utc(self):
+        from datetime import datetime, timezone, timedelta
+        eastern = timezone(timedelta(hours=-5))
+        ts = datetime(2026, 7, 15, 9, 30, 0, tzinfo=eastern)
+        result = self._norm(ts)
+        assert result.tzinfo == timezone.utc
+        assert result.hour == 14  # 9:30 ET = 14:30 UTC
+
+    def test_naive_datetime_assumed_utc(self):
+        from datetime import datetime, timezone
+        ts = datetime(2026, 7, 15, 9, 30, 0)  # naive
+        result = self._norm(ts)
+        assert result.tzinfo == timezone.utc
+        assert result.hour == 9
+
+    def test_iso_string_with_z(self):
+        result = self._norm("2026-07-15T09:30:00Z")
+        from datetime import timezone
+        assert result.tzinfo == timezone.utc
+        assert result.hour == 9
+
+    def test_iso_string_with_offset(self):
+        result = self._norm("2026-07-15T09:30:00-05:00")
+        assert result.hour == 14  # 14:30 UTC
+
+    def test_numeric_epoch(self):
+        from datetime import datetime, timezone
+        ts = datetime(2026, 7, 15, 14, 30, 0, tzinfo=timezone.utc).timestamp()
+        result = self._norm(ts)
+        assert result.hour == 14
+
+    def test_malformed_string_uses_fallback(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ap_exit_engine"):
+            result = self._norm("NOT_A_DATE", fallback="2026-07-15T14:30:00Z")
+        assert result.hour == 14
+        assert "CANONICAL_ENTRY_TIMESTAMP_FALLBACK" in caplog.text
+
+    def test_malformed_string_no_fallback_returns_now(self, caplog):
+        import logging
+        from datetime import datetime, timezone
+        with caplog.at_level(logging.WARNING, logger="ap_exit_engine"):
+            result = self._norm("NOT_A_DATE")
+        assert isinstance(result, datetime)
+        assert result.tzinfo == timezone.utc
+        assert "CANONICAL_ENTRY_TIMESTAMP_FALLBACK" in caplog.text
+
+    def test_adoption_uses_normalized_ts(self):
+        """opened_at must be an aware datetime after adoption."""
+        from ap_exit_engine import APExitEngine
+        from datetime import timezone
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        pos = _Pos(position_id=repair_id, execution_mode="",
+                   current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.append(pos)
+        engine._positions_by_id[repair_id] = pos
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts="2026-07-15T09:30:00Z",
+            execution_mode="live", client_id=_CLIENT,
+        )
+        opened_at = getattr(engine._positions[0], "opened_at", None)
+        assert opened_at is not None
+        assert hasattr(opened_at, "tzinfo") and opened_at.tzinfo is not None
+        assert opened_at.hour == 9

@@ -1288,19 +1288,41 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 underlying_stop       = _safe_float(order.get("stop_underlying") or order.get("underlying_stop") or 0.0),
                 underlying_target     = _safe_float(order.get("target_underlying") or order.get("underlying_target") or 0.0),
             )
-            if _adopted:
+
+            # Handle CanonicalAdoptionResult (structured) or legacy bool.
+            _disposition = getattr(_adopted, "disposition", None)
+            if _disposition in ("ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED"):
                 log.info(
-                    "[%s] _seed_exit_engine: canonical adoption completed "
-                    "contract=%s position_id=%s — no new position created",
-                    order.get("client_id"), _contract_for_adopt, position_id,
+                    "[%s] _seed_exit_engine: %s contract=%s position_id=%s",
+                    order.get("client_id"), _disposition, _contract_for_adopt, position_id,
                 )
                 return
+            elif _disposition == "NO_REPAIR_FOUND":
+                pass  # fall through to normal seed
+            elif _disposition and _disposition.startswith("RETRY_"):
+                # Adoption conflict — must NOT fall through to add_position.
+                # Retaining existing protective monitoring; do not create duplicate exit owner.
+                log.critical(
+                    "[%s] CANONICAL_ADOPTION_RETRY_REQUIRED | "
+                    "disposition=%s contract=%s position_id=%s reason=%s — "
+                    "protective monitoring retained; no new exit owner created",
+                    order.get("client_id"), _disposition,
+                    _contract_for_adopt, position_id,
+                    getattr(_adopted, "reason", ""),
+                )
+                return
+            elif _adopted is True:  # legacy bool path
+                return
+            elif _adopted is False:  # legacy bool — no repair found, seed normally
+                pass
         except Exception as _adopt_err:
-            log.warning(
-                "[%s] canonical adoption failed (non-fatal) contract=%s: %s — "
-                "proceeding with normal seed",
+            log.critical(
+                "[%s] CANONICAL_ADOPTION_RETRY_REQUIRED | "
+                "disposition=RETRY_ADOPTION_ERROR contract=%s: %s — "
+                "protective monitoring retained; NOT falling through to add_position",
                 order.get("client_id"), _contract_for_adopt, _adopt_err,
             )
+            return
 
     try:
         getter = getattr(exit_engine, "get_position", None)
