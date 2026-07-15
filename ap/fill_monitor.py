@@ -229,7 +229,14 @@ def get_pending_orders(client_id: str) -> list[dict]:
                     trigger_price,
                     timeframe,
                     filled_qty,
-                    fill_price
+                    fill_price,
+                    execution_mode,
+                    filled_ts,
+                    meta,
+                    meta->>'canonical_signal_id' AS canonical_signal_id,
+                    meta->>'underlying_entry'    AS underlying_entry_meta,
+                    meta->>'entry_underlying'    AS entry_underlying_meta,
+                    meta->>'last_underlying_price' AS last_underlying_price_meta
                 FROM orders
                 WHERE client_id = %s
                   AND kind IN ('ENTRY','EXIT')
@@ -1240,6 +1247,27 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             _entry_fill_for_adopt = _safe_float(
                 result.get("avg_fill") or order.get("fill_price") or 0.0
             )
+            # Blocker 4: canonical fill timestamp (broker > order fallback > now).
+            from datetime import datetime, timezone as _tz
+            _now_utc = datetime.now(_tz.utc)
+            _entry_ts_for_adopt = (
+                result.get("filled_ts")
+                or result.get("filled_at")
+                or result.get("timestamp")
+                or order.get("filled_ts")
+                or _now_utc
+            )
+            # Blocker 4: underlying entry with same precedence as normal seeding.
+            _underlying_entry_for_adopt = _safe_float(
+                order.get("underlying_entry")
+                or order.get("entry_underlying")
+                or order.get("last_underlying_price")
+                or order.get("last_underlying_price_meta")
+                or order.get("entry_underlying_meta")
+                or order.get("underlying_entry_meta")
+                or order.get("trigger_price")
+                or 0.0
+            )
             _adopted = _adopt_fn(
                 contract              = _contract_for_adopt,
                 canonical_position_id = position_id,
@@ -1248,13 +1276,15 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 signal_id             = signal_id or str(order.get("signal_id") or ""),
                 canonical_signal_id   = str(order.get("canonical_signal_id") or ""),
                 entry_fill            = _entry_fill_for_adopt,
-                entry_ts              = order.get("filled_ts") or order.get("created_ts"),
+                entry_ts              = _entry_ts_for_adopt,
                 execution_mode        = str(order.get("execution_mode") or ""),
                 client_id             = str(order.get("client_id") or ""),
+                underlying_entry      = _underlying_entry_for_adopt,
                 score                 = _safe_float(order.get("score") or 0.0),
                 tier                  = str(order.get("tier") or ""),
                 pattern               = str(order.get("pattern") or ""),
                 direction             = str(order.get("direction") or _side or ""),
+                timeframe             = str(order.get("timeframe") or ""),
                 underlying_stop       = _safe_float(order.get("stop_underlying") or order.get("underlying_stop") or 0.0),
                 underlying_target     = _safe_float(order.get("target_underlying") or order.get("underlying_target") or 0.0),
             )

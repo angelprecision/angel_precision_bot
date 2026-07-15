@@ -1833,10 +1833,12 @@ class APExitEngine:
         entry_ts,
         execution_mode: str,
         client_id: str,
+        underlying_entry: float = 0.0,
         score: float = 0.0,
         tier: str = "",
         pattern: str = "",
         direction: str = "",
+        timeframe: str = "",
         underlying_stop: float = 0.0,
         underlying_target: float = 0.0,
     ) -> bool:
@@ -1864,6 +1866,22 @@ class APExitEngine:
             return False
 
         with self._lock:
+            # ── Blocker 5: Conflict detection ─────────────────────────────────
+            # If a canonical position already exists for this position_id,
+            # do not blindly overwrite it — emit a critical event and refuse.
+            _existing_canon = self._positions_by_id.get(_canon_id)
+            if _existing_canon is not None:
+                _existing_sym = str(getattr(_existing_canon, "option_symbol", "") or "").upper().strip()
+                if _existing_sym == _contract and not getattr(_existing_canon, "closed", False):
+                    log.critical(
+                        "[exit_eng] CANONICAL_POSITION_ADOPTION_CONFLICT | "
+                        "contract=%s canonical_id=%s — canonical position already "
+                        "exists in engine; refusing adoption to prevent duplicate "
+                        "exit owner | existing_pos_id=%s",
+                        _contract, _canon_id, _canon_id,
+                    )
+                    return True  # already canonical — no action needed
+
             for pos in self._positions:
                 _pid = str(pos.position_id or "")
                 _sym = str(pos.option_symbol or "").upper().strip()
@@ -1872,10 +1890,71 @@ class APExitEngine:
                 if not (_is_repair and _same_contract and not pos.closed):
                     continue
 
-                # Found the broker-repair position — upgrade in place.
+                # ── Blocker 5: Client and mode fencing ────────────────────────
+                # The repair position must belong to the same client and a
+                # compatible execution mode before we overwrite identity fields.
+                _repair_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                if _client and _repair_client and _repair_client != _client:
+                    log.critical(
+                        "[exit_eng] CANONICAL_POSITION_ADOPTION_CLIENT_MISMATCH | "
+                        "contract=%s repair_client=%s canonical_client=%s — "
+                        "refusing cross-client adoption",
+                        _contract, _repair_client, _client,
+                    )
+                    return False
+
+                _repair_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                # Compatible mode: repair is blank/unknown (can be upgraded to anything)
+                # or repair and canonical modes match.
+                _mode_ok = (
+                    not _repair_mode
+                    or not _mode
+                    or _repair_mode == _mode
+                    or _repair_mode in ("", "unknown")
+                    or (_mode == "live" and _repair_mode in ("", "unknown"))
+                )
+                if not _mode_ok:
+                    log.critical(
+                        "[exit_eng] CANONICAL_POSITION_ADOPTION_MODE_MISMATCH | "
+                        "contract=%s repair_mode=%s canonical_mode=%s — "
+                        "refusing incompatible mode adoption",
+                        _contract, _repair_mode, _mode,
+                    )
+                    return False
+
+                # Found a valid broker-repair position — upgrade in place.
                 old_id = _pid
 
-                # Canonical identity
+                # ── Blocker 3: Remove contaminated midpoint state ────────────
+                _prior_peak_source = str(
+                    getattr(pos, "live_executable_price_source", "")
+                    or getattr(pos, "liveexecutablepricesource", "")
+                    or ""
+                ).lower().strip()
+                _prior_peak_is_bid_proven = (_prior_peak_source == "bid")
+
+                if entry_fill > 0:
+                    pos.entry_price = entry_fill
+                    _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    if _fresh_bid > 0:
+                        _rebased_pnl = (_fresh_bid - entry_fill) / entry_fill
+                    else:
+                        _rebased_pnl = 0.0
+
+                    if _prior_peak_is_bid_proven:
+                        _keep_peak = max(
+                            float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0),
+                            _rebased_pnl,
+                        )
+                        pos.peak_pnl_pct    = _keep_peak
+                        pos.max_profit_seen = _keep_peak
+                        pos.touched_profit  = (_keep_peak >= 0.05)
+                    else:
+                        pos.peak_pnl_pct    = max(0.0, _rebased_pnl)
+                        pos.max_profit_seen = max(0.0, _rebased_pnl)
+                        pos.touched_profit  = (_rebased_pnl >= 0.05)
+
+                # ── Canonical identity fields ──────────────────────────────────
                 pos.position_id = _canon_id
                 if client_id:
                     pos.client_id = _client
@@ -1889,20 +1968,6 @@ class APExitEngine:
                 if execution_mode:
                     pos.execution_mode = _mode
 
-                # Entry truth (use canonical fill if better than repair estimate)
-                if entry_fill > 0:
-                    pos.entry_price = entry_fill
-                    # Reset peak/touched_profit based on current price vs real fill
-                    # (repair may have used a stale broker cost_basis)
-                    cur_exec = getattr(pos, "current_bid", 0.0) or getattr(pos, "current_option_price", 0.0)
-                    if cur_exec > 0 and entry_fill > 0:
-                        _rebased_pnl = (cur_exec - entry_fill) / entry_fill
-                        if _rebased_pnl > pos.peak_pnl_pct:
-                            pos.peak_pnl_pct = _rebased_pnl
-                        if _rebased_pnl > (getattr(pos, "max_profit_seen", 0.0) or 0.0):
-                            pos.max_profit_seen = _rebased_pnl
-                        pos.touched_profit = (_rebased_pnl >= 0.05)
-
                 # Order / broker identity
                 try:
                     pos.entry_local_order_id = local_order_id
@@ -1913,35 +1978,62 @@ class APExitEngine:
                 except Exception:
                     pass
 
-                # Signal metadata
+                # ── Blocker 4: Canonical production fields ─────────────────────
+                if entry_ts is not None:
+                    try:
+                        pos.opened_at = entry_ts
+                    except Exception:
+                        pass
+
+                if underlying_entry > 0:
+                    try:
+                        pos.underlying_entry = underlying_entry
+                    except Exception:
+                        pass
+
+                # Signal metadata — written to both direct attrs and pos.signal
+                # so proof and exit code reading either surface gets canonical values.
+                _sig_patch: dict = {}
                 if score:
-                    try:
-                        pos.score = score
-                    except Exception:
-                        pass
+                    try: pos.score = score
+                    except Exception: pass
+                    _sig_patch["score"] = score
                 if tier:
-                    try:
-                        pos.tier = tier
-                    except Exception:
-                        pass
+                    try: pos.tier = tier
+                    except Exception: pass
+                    _sig_patch["tier"] = tier
                 if pattern:
-                    try:
-                        pos.pattern = pattern
-                    except Exception:
-                        pass
+                    try: pos.pattern = pattern
+                    except Exception: pass
+                    _sig_patch["pattern"] = pattern
+                if timeframe:
+                    try: pos.timeframe = timeframe
+                    except Exception: pass
+                    _sig_patch["timeframe"] = timeframe
                 if direction:
-                    try:
-                        pos.side = direction.upper()
-                    except Exception:
-                        pass
+                    try: pos.side = direction.upper()
+                    except Exception: pass
+                    _sig_patch["side"] = direction.upper()
                 if underlying_stop > 0:
-                    try:
-                        pos.underlying_stop = underlying_stop
-                    except Exception:
-                        pass
+                    try: pos.underlying_stop = underlying_stop
+                    except Exception: pass
                 if underlying_target > 0:
+                    try: pos.underlying_target = underlying_target
+                    except Exception: pass
+                if canonical_signal_id:
+                    _sig_patch["canonical_signal_id"] = canonical_signal_id
+                if signal_id:
+                    _sig_patch["signal_id"] = signal_id
+                if execution_mode:
+                    _sig_patch["execution_mode"] = _mode
+
+                if _sig_patch:
                     try:
-                        pos.underlying_target = underlying_target
+                        _existing_sig = getattr(pos, "signal", None)
+                        if isinstance(_existing_sig, dict):
+                            _existing_sig.update(_sig_patch)
+                        else:
+                            pos.signal = _sig_patch
                     except Exception:
                         pass
 
@@ -1952,11 +2044,13 @@ class APExitEngine:
                 log.info(
                     "[exit_eng] CANONICAL_POSITION_ADOPTED "
                     "contract=%s old_id=%s new_id=%s local_order=%s broker_order=%s "
-                    "signal_id=%s execution_mode=%s entry_fill=%.4f "
-                    "peak_pnl_pct=%.2f%% touched_profit=%s",
+                    "signal_id=%s execution_mode=%s entry_fill=%.4f opened_at=%s "
+                    "underlying_entry=%.4f peak_pnl_pct=%.2f%% touched_profit=%s",
                     _contract, old_id, _canon_id,
                     local_order_id or "?", broker_order_id or "?",
                     signal_id or "?", _mode, entry_fill or 0.0,
+                    str(entry_ts or ""),
+                    float(underlying_entry or 0.0),
                     (pos.peak_pnl_pct or 0.0) * 100,
                     pos.touched_profit,
                 )
