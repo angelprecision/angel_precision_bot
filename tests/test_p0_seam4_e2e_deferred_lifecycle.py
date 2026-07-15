@@ -304,7 +304,7 @@ class _StatefulOSM:
             "submit_started_at": _iso(),
             "submit_intent_at": _iso(),
             "broker_submit_key": kwargs["broker_submit_key"],
-            "current_owner": kwargs["owner"],
+            "current_owner": f"broker_submit:{kwargs['broker_submit_key']}",
             "broker_submit_payload_hash": kwargs["payload_hash"],
         })
         return True
@@ -514,8 +514,9 @@ def _live_broker_ready_watched(plan) -> types.SimpleNamespace:
 
 
 class _ConcurrentTxnStore:
-    def __init__(self, row: dict) -> None:
+    def __init__(self, row: dict, *, interleaving: str) -> None:
         self.row = copy.deepcopy(row)
+        self.interleaving = interleaving
         self.lock = threading.Lock()
         self.intent_barrier = threading.Barrier(2)
         self.watcher_intent_ready = threading.Event()
@@ -561,9 +562,9 @@ class _ConcurrentTxnStore:
             and len(params) == 5
         ):
             return self._execute_recovery_claim(params)
-        if "LOWER(COALESCE(execution_mode,'')) = %s" in sql and len(params) == 6:
+        if "NULLIF(meta->>'recovery_submit_lease_until','')" in sql and len(params) == 6:
             return self._execute_recovery_submit_intent(params)
-        if "COALESCE(meta->>'recovery_submit_owner','') = ''" in sql and len(params) == 4:
+        if "COALESCE(signal_id,'') = %s" in sql and len(params) == 6:
             return self._execute_watcher_submit_intent(params)
         raise AssertionError(sql)
 
@@ -599,7 +600,8 @@ class _ConcurrentTxnStore:
         patch = json.loads(patch_json)
         self.recovery_intent_attempts += 1
         self.recovery_intent_ready.set()
-        self.intent_barrier.wait(timeout=5)
+        if self.interleaving == "watcher_reaches_pre_submit_first":
+            self.intent_barrier.wait(timeout=5)
         with self.lock:
             meta = self.row["meta"]
             ok = (
@@ -625,7 +627,7 @@ class _ConcurrentTxnStore:
         return rc
 
     def _execute_watcher_submit_intent(self, params: tuple) -> int:
-        patch_json, local_order_id, client_id, generation = params
+        patch_json, local_order_id, client_id, mode, signal_id, generation = params
         patch = json.loads(patch_json)
         self.watcher_intent_attempts += 1
         self.watcher_intent_ready.set()
@@ -636,6 +638,8 @@ class _ConcurrentTxnStore:
             ok = (
                 self.row["local_order_id"] == local_order_id
                 and self.row["client_id"] == client_id
+                and str(self.row["execution_mode"] or "").lower() == str(mode)
+                and str(self.row["signal_id"] or "") == str(signal_id)
                 and str(self.row["status"] or "").upper() == "PENDING_TRIGGER"
                 and not self.row.get("broker_order_id")
                 and self.row.get("submitted_ts") is None
@@ -1018,7 +1022,7 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
 )
 def test_live_watcher_and_recovery_worker_race_to_single_broker_post(monkeypatch, interleaving):
     broker = _Broker()
-    store = _ConcurrentTxnStore(_broker_ready_row())
+    store = _ConcurrentTxnStore(_broker_ready_row(), interleaving=interleaving)
     osm = _ConcurrentOSM(store)
     watcher_plan = _live_broker_ready_plan()
     recovery_plan = copy.deepcopy(watcher_plan)
@@ -1138,7 +1142,9 @@ def test_live_watcher_and_recovery_worker_race_to_single_broker_post(monkeypatch
     assert store.recovery_claim_successes == 1
     assert store.recovery_intent_attempts == 1
     assert store.recovery_intent_successes == 1
-    assert store.watcher_intent_attempts == 1
+    assert store.watcher_intent_attempts == (
+        1 if interleaving == "watcher_reaches_pre_submit_first" else 0
+    )
     assert store.watcher_intent_successes == 0
 
     assert len(osm.post_payloads) == 1
@@ -1155,8 +1161,13 @@ def test_live_watcher_and_recovery_worker_race_to_single_broker_post(monkeypatch
     assert recovery_outcome["disposition"] == "SUBMITTED"
     assert recovery_outcome["reason_code"] == "RECOVERY_CANONICAL_SUBMIT_ACCEPTED"
 
-    assert watcher_outcome["disposition"] in {"RECONCILE_PENDING", "OWNERSHIP_TRANSFERRED", "SUBMITTED"}
-    assert watcher_outcome["reason_code"] == "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+    if interleaving == "watcher_reaches_pre_submit_first":
+        assert watcher_outcome["disposition"] in {
+            "RECONCILE_PENDING", "OWNERSHIP_TRANSFERRED", "SUBMITTED",
+        }
+        assert watcher_outcome["reason_code"] == "MATERIALIZATION_SUBMIT_OWNERSHIP_TRANSFERRED"
+    else:
+        assert watcher_result.get("value") is None
 
     assert osm.cancel_calls == 0
     assert osm.expire_calls == 0

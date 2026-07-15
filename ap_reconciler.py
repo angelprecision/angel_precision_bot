@@ -65,7 +65,10 @@ Bug-fix history (see inline comments tagged FIX-N):
   FIX-8  run_once: added pass timing (elapsed_sec in summary + log line).
 
 Usage:
-    reconciler = APBrokerReconciler(broker=broker, client_id=email, osm=osm, pm=pm)
+    reconciler = APBrokerReconciler(
+        broker=broker, client_id=email, osm=osm, pm=pm,
+        execution_mode="live",
+    )
     reconciler.exit_engine = exit_engine
     reconciler.start()
     # or call reconciler.run_once() directly in tests
@@ -236,6 +239,7 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
         "orders_checked":      0,
         "orders_corrected":    0,
         "orders_alerted":      0,
+        "orders_invalid_execution_mode": 0,
         "positions_checked":   0,
         "positions_alerted":   0,
         "positions_corrected": 0,
@@ -278,6 +282,7 @@ class APBrokerReconciler:
         pm,                         # APPositionManager
         alert_fn=None,              # callable(msg: str) for Discord/Supabase alerts
         interval_sec: int = RECONCILE_INTERVAL_SEC,
+        execution_mode: str | None = None,
     ):
         self.broker      = broker
         self.client_id   = client_id
@@ -285,6 +290,7 @@ class APBrokerReconciler:
         self.pm          = pm
         self._alert_fn   = alert_fn or (lambda msg: log.warning(msg))
         self._interval   = interval_sec
+        self.execution_mode = _normalize_execution_mode(execution_mode)
         self._stop       = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._run_count  = 0
@@ -1065,10 +1071,59 @@ class APBrokerReconciler:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _reconcile_orders(self, summary: dict):
-        from ap.db import get_open_orders_for_reconcile, run_with_retry
+        from ap.db import (
+            get_open_orders_for_reconcile,
+            get_open_orders_with_invalid_execution_mode,
+            run_with_retry,
+        )
+
+        if self.execution_mode is None:
+            summary.setdefault("errors", []).append(
+                "reconciler_expected_execution_mode_missing"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            log.error(
+                "[%s] RECONCILER_BLOCKED expected execution_mode missing",
+                self.client_id,
+            )
+            return
+
+        # Invalid/NULL modes have no safe runner owner.  Audit them separately
+        # from the exact-mode broker selection so they are visible without ever
+        # reaching broker.get_order(), OSM.transition(), or recovery mutation.
+        try:
+            invalid_mode_orders = run_with_retry(
+                lambda: get_open_orders_with_invalid_execution_mode(
+                    client_id=self.client_id,
+                )
+            ) or []
+        except Exception as exc:
+            invalid_mode_orders = []
+            summary.setdefault("errors", []).append(
+                "reconciler_invalid_execution_mode_audit_failed"
+            )
+            summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+            log.error(
+                "[%s] invalid execution-mode order audit failed: %s",
+                self.client_id, exc,
+            )
+
+        summary["orders_invalid_execution_mode"] = len(invalid_mode_orders)
+        for invalid_order in invalid_mode_orders:
+            local_id = invalid_order.get("local_order_id") or invalid_order.get("id")
+            contract = invalid_order.get("contract") or invalid_order.get("symbol") or "?"
+            self._write_order_last_error(
+                str(local_id or ""), "reconciler_unknown_execution_mode"
+            )
+            self._record_unknown_execution_mode(
+                summary, str(local_id or contract or "?")
+            )
 
         open_orders = run_with_retry(
-            lambda: get_open_orders_for_reconcile(client_id=self.client_id)
+            lambda: get_open_orders_for_reconcile(
+                client_id=self.client_id,
+                execution_mode=self.execution_mode,
+            )
         ) or []
         summary["orders_checked"] = len(open_orders)
 
@@ -1078,9 +1133,25 @@ class APBrokerReconciler:
             db_status  = (order.get("status") or "").upper()
             contract   = order.get("contract") or order.get("symbol") or "?"
 
-            if _normalize_execution_mode(order.get("execution_mode")) is None:
+            row_mode = _normalize_execution_mode(order.get("execution_mode"))
+            if row_mode is None:
                 self._write_order_last_error(str(local_id or ""), "reconciler_unknown_execution_mode")
                 self._record_unknown_execution_mode(summary, str(local_id or contract or "?"))
+                continue
+            if row_mode != self.execution_mode:
+                # A valid row owned by the other execution mode is strictly
+                # read-only here.  Alert locally, but never let a PAPER
+                # reconciler write a LIVE row (or vice versa), even if the DB
+                # selection layer regresses and leaks it into this result.
+                summary.setdefault("errors", []).append(
+                    "reconciler_execution_mode_mismatch"
+                )
+                summary["orders_alerted"] = int(summary.get("orders_alerted", 0)) + 1
+                log.error(
+                    "[%s] RECONCILER_BLOCKED row mode mismatch order=%s "
+                    "expected=%s actual=%s",
+                    self.client_id, local_id, self.execution_mode, row_mode,
+                )
                 continue
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
@@ -1111,6 +1182,50 @@ class APBrokerReconciler:
                     "[%s] Unrecognized broker status '%s' for order %s",
                     self.client_id, broker_status, local_id,
                 )
+
+            # A split-brain flag exists only because broker ownership was
+            # previously ambiguous.  Once get_order(exact broker ID) returns a
+            # recognized state, clear that quarantine through the OSM's
+            # client/mode/ID-fenced writer.  Unknown/error payloads remain held.
+            meta = order.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    import json as _json
+                    meta = _json.loads(meta)
+                except Exception:
+                    meta = {}
+            is_split_brain = bool(
+                str(order.get("last_error") or "").startswith("SPLIT_BRAIN:")
+                or (isinstance(meta, dict) and meta.get("split_brain_quarantine"))
+            )
+            broker_truth_known = bool(
+                broker_status in BROKER_FILLED
+                or broker_status in BROKER_TERMINAL
+                or broker_status in {"open", "pending", "partially_filled"}
+            )
+            if is_split_brain and broker_truth_known:
+                resolver = getattr(self.osm, "resolve_split_brain_quarantine", None)
+                mode = _normalize_execution_mode(order.get("execution_mode"))
+                resolved = bool(
+                    callable(resolver)
+                    and mode
+                    and resolver(
+                        str(local_id or ""),
+                        broker_order_id=str(broker_oid),
+                        execution_mode=mode,
+                        broker_status=broker_status,
+                    )
+                )
+                if resolved:
+                    summary["split_brain_resolved"] = int(
+                        summary.get("split_brain_resolved") or 0
+                    ) + 1
+                else:
+                    log.warning(
+                        "[%s] split-brain quarantine resolution failed | order=%s "
+                        "broker=%s status=%s",
+                        self.client_id, local_id, broker_oid, broker_status,
+                    )
 
         self._check_ghost_fills(summary)
 

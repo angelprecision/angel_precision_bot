@@ -325,7 +325,7 @@ def test_submit_path_requires_durable_intent_and_stable_tag():
     source = open("ap/order_state_machine.py", encoding="utf-8").read()
     assert '"submit_intent_at"' in source
     assert '"broker_submit_payload_hash"' in source
-    assert '"tag": str(local_order_id)[:32]' in source
+    assert "canonical_broker_submit_key(local_order_id)" in source
     assert "persist_deferred_broker_ready" in source
 
 

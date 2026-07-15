@@ -55,6 +55,7 @@ jobs:
             tests/test_p0_deferred_breach_lifecycle_completion.py \
             tests/test_p0_amendment10_recovery_full_wiring.py \
             tests/test_p0_amendment11_ownership_through_cleanup.py \
+            tests/test_p0_watcher_recovery_execution_ownership.py \
             tests/test_p0_seam1_pre_submit_proof_retry.py \
             tests/test_p0_seam2_timing_boundary.py \
             tests/test_p0_selector_retry_taxonomy.py \
@@ -68,6 +69,12 @@ jobs:
             tests/test_p0_setup_lifecycle_owner.py \
             tests/test_p0_deferred_due_retry_ownership.py \
             tests/test_p0_fenced_retry_terminalization.py \
+            tests/test_p0_deferred_materialization_copyback_before_proof.py \
+            tests/test_p0_amendment3_monotonic_generation_fencing.py \
+            tests/test_p0_amendment6_broker_ambiguity_reconciler.py \
+            tests/test_p0_osm_broker_submit_boundary.py \
+            tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
+            tests/test_p0_unknown_execution_mode_fail_closed.py \
             -v --tb=short --color=yes
 
       - name: Summary

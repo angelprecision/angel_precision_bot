@@ -2,8 +2,8 @@
 tests/test_osm_retry_idempotency.py — P0-1 + P0-2 codified.
 
 Covers:
-  - Exit submission retry (503, ReadTimeout dedupe, ConnError, 400 permanent)
-  - Entry submission retry — submit_entry + submit_existing_entry
+  - Exit submission ambiguity holds (503/429, ReadTimeout, ConnError) and 400 rejection
+  - Entry submission ambiguity holds — submit_entry + submit_existing_entry
   - Tradier tag idempotency on all submit paths
   - apply_repeg passes tag through
   - SimBroker backward compat (tag kw-only, default None)
@@ -78,6 +78,16 @@ def mock_osm():
     class _MockOSM:
         def __init__(self):
             self.client_id = "test@x.com"
+            self.row = {
+                "local_order_id": "L-EX-001", "status": "CREATED", "kind": "ENTRY",
+                "ticker": "BA", "contract": "BA260522C00220000", "qty": 2,
+                "limit_price": 1.50, "plan_id": "p", "signal_id": "s",
+                "client_id": "test@x.com", "direction": "CALL",
+                "execution_mode": "paper", "timeframe": "1d", "pattern": "2-3",
+                "score": 75.0, "trigger_price": 220.0, "underlying_entry": 220.25,
+                "target_price": 223.0, "stop_price": 218.5,
+                "broker_order_id": None, "submitted_ts": None, "meta": {},
+            }
 
         _lookup_order_by_tag      = APOrderStateMachine._lookup_order_by_tag
         _submit_order_with_retry  = APOrderStateMachine._submit_order_with_retry
@@ -88,9 +98,40 @@ def mock_osm():
         # Stubs for behavior outside the unit under test
         def _get_active_exit_order(self, pid): return None
         def create_exit_order(self, **kw): return "L-EXIT-001"
-        def create_entry_order(self, plan, **kw): return "L-ENTRY-001"
-        def transition(self, *a, **kw): return True
-        def update_order_meta(self, *a, **kw): return True
+        def create_entry_order(self, plan, **kw):
+            self.row.update({
+                "local_order_id": "L-ENTRY-001",
+                "plan_id": plan.plan_id,
+                "signal_id": plan.signal_id,
+                "contract": plan.contract_symbol,
+                "qty": int(plan.contracts),
+                "limit_price": float(kw.get("limit_price") or plan.limit_price),
+                "execution_mode": str(
+                    kw.get("execution_mode") or plan.execution_mode
+                ).lower(),
+                "status": "CREATED",
+                "broker_order_id": None,
+                "submitted_ts": None,
+                "meta": {},
+            })
+            return "L-ENTRY-001"
+        def transition(self, _local_order_id, status, **fields):
+            self.row["status"] = str(status)
+            self.row.update(fields)
+            return True
+        def update_order_meta(self, _local_order_id, patch):
+            self.row["meta"].update(patch)
+            return True
+        def persist_entry_submit_intent(self, _local_order_id, **kwargs):
+            key = kwargs["broker_submit_key"]
+            self.row["meta"].update({
+                "lifecycle_state": "SUBMITTING",
+                "submit_intent_at": "2026-07-15T09:30:00Z",
+                "broker_submit_key": key,
+                "broker_submit_payload_hash": kwargs["payload_hash"],
+                "current_owner": f"broker_submit:{key}",
+            })
+            return True
         def _resolve_underlying_symbol(self, *, symbol, contract): return symbol
         @staticmethod
         def _is_broker_accept_status(s): return s in ("open", "pending", "ok", "accepted")
@@ -98,15 +139,7 @@ def mock_osm():
         def _flag_split_brain_order(self, *a, **kw): pass
 
         def _get_order(self, oid):
-            return {
-                "local_order_id": "L-EX-001", "status": "CREATED", "kind": "ENTRY",
-                "ticker": "BA", "contract": "BA260522C00220000", "qty": 2,
-                "limit_price": 1.50, "plan_id": "p", "signal_id": "s",
-                "client_id": "test@x.com", "direction": "CALL",
-                "execution_mode": "paper", "timeframe": "1d", "pattern": "2-3",
-                "score": 75.0, "trigger_price": 220.0, "underlying_entry": 220.25,
-                "target_price": 223.0, "stop_price": 218.5,
-            }
+            return dict(self.row)
 
     return _MockOSM()
 
@@ -149,22 +182,31 @@ def _resp(status_code, json_body=None, text=""):
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestExitRetryAndIdempotency:
-    """Exit submission retries on transient broker errors; recovers from
-    ambiguous read-timeouts via Tradier tag lookup (no double-submit)."""
+    """Exit submission never blindly retries a response that may conceal an
+    accepted broker order; it first reconciles the canonical Tradier tag."""
 
-    def test_exit_retries_on_503_then_succeeds(self, mock_osm, mock_broker, fast_sleep):
-        mock_broker.session.post.side_effect = [
-            _resp(503, text="down"),
-            _resp(200, json_body={"order": {"id": "BO-EXIT-1", "status": "ok"}}),
-        ]
+    @pytest.mark.parametrize("status_code", [503, 429])
+    def test_exit_http_ambiguity_without_tag_proof_never_reposts(
+        self, mock_osm, mock_broker, fast_sleep, status_code,
+    ):
+        mock_broker.session.post.return_value = _resp(status_code, text="uncertain")
+        mock_broker.session.get.return_value = _resp(
+            200, json_body={"orders": {"order": []}},
+        )
         result = mock_osm.submit_exit(
             broker=mock_broker, position_id="pos-1",
             contract="BA260522C00220000", symbol="BA",
             direction="CALL", qty=1, limit_price=1.50,
         )
-        assert result["ok"] is True
-        assert mock_broker.session.post.call_count == 2
-        assert result["broker_order_id"] == "BO-EXIT-1"
+        assert result["ok"] is False
+        assert result["status"] == "EXIT_REQUESTED"
+        assert result["error"] == (
+            f"BROKER_AMBIGUOUS_HTTP_{status_code}_RECONCILIATION_REQUIRED"
+        )
+        assert result["reconciliation_required"] is True
+        assert result["identity_quarantine"] is True
+        assert mock_broker.session.post.call_count == 1
+        assert mock_broker.session.get.call_count == 1
 
     def test_exit_read_timeout_recovers_via_tag_lookup(
         self, mock_osm, mock_broker, fast_sleep,
@@ -184,9 +226,51 @@ class TestExitRetryAndIdempotency:
         )
         assert result["ok"] is True
         assert result["broker_order_id"] == "BO-RECOVERED"
+        assert mock_osm.row["status"] == "EXIT_SUBMITTED"
+        assert mock_osm.row["broker_order_id"] == "BO-RECOVERED"
         # CRITICAL: post called only ONCE — no double-submit
         assert mock_broker.session.post.call_count == 1
         # GET called to look up by tag
+        assert mock_broker.session.get.call_count == 1
+
+    @pytest.mark.parametrize(
+        "failure_kind",
+        ["json", "read_timeout", "connection_error", "request_exception", "unexpected"],
+    )
+    def test_exit_ambiguous_without_tag_proof_never_reposts(
+        self, mock_osm, mock_broker, fast_sleep, failure_kind,
+    ):
+        import requests
+
+        if failure_kind == "json":
+            response = _resp(200)
+            response.json.side_effect = ValueError("truncated json")
+            mock_broker.session.post.return_value = response
+        else:
+            error_type = {
+                "read_timeout": requests.exceptions.ReadTimeout,
+                "connection_error": requests.exceptions.ConnectionError,
+                "request_exception": requests.exceptions.RequestException,
+                "unexpected": RuntimeError,
+            }[failure_kind]
+            mock_broker.session.post.side_effect = error_type("t")
+        mock_broker.session.get.return_value = _resp(
+            200, json_body={"orders": {"order": []}},
+        )
+
+        result = mock_osm.submit_exit(
+            broker=mock_broker, position_id="pos-1",
+            contract="BA260522C00220000", symbol="BA",
+            direction="CALL", qty=1, limit_price=1.50,
+        )
+
+        assert result["ok"] is False
+        assert result["reconciliation_required"] is True
+        assert result["identity_quarantine"] is True
+        assert result["error"].startswith("BROKER_AMBIGUOUS_")
+        if failure_kind == "unexpected":
+            assert result["error"].startswith("BROKER_AMBIGUOUS_UNEXPECTED_")
+        assert mock_broker.session.post.call_count == 1
         assert mock_broker.session.get.call_count == 1
 
     def test_exit_400_is_permanent_no_retry(self, mock_osm, mock_broker, fast_sleep):
@@ -201,16 +285,24 @@ class TestExitRetryAndIdempotency:
         assert mock_broker.session.post.call_count == 1
         assert "broker_http_400" in result["error"]
 
-    def test_exit_3x_503_exhausts(self, mock_osm, mock_broker, fast_sleep):
+    def test_exit_503_recovers_by_tag_without_second_post(
+        self, mock_osm, mock_broker, fast_sleep,
+    ):
         mock_broker.session.post.return_value = _resp(503, text="down")
+        mock_broker.session.get.return_value = _resp(200, json_body={
+            "orders": {"order": [{
+                "id": "BO-EXIT-503", "tag": "L-EXIT-001", "status": "open",
+            }]},
+        })
         result = mock_osm.submit_exit(
             broker=mock_broker, position_id="pos-1",
             contract="BA260522C00220000", symbol="BA",
             direction="CALL", qty=1, limit_price=1.50,
         )
-        assert result["ok"] is False
-        # Exhausted at 3 attempts
-        assert mock_broker.session.post.call_count == 3
+        assert result["ok"] is True
+        assert result["broker_order_id"] == "BO-EXIT-503"
+        assert mock_broker.session.post.call_count == 1
+        assert mock_broker.session.get.call_count == 1
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -232,16 +324,23 @@ class TestEntryRetryAndIdempotency:
         assert data["tag"] == "L-ENTRY-001"
         assert data["side"] == "buy_to_open"
 
-    def test_submit_entry_retries_on_503(
-        self, mock_osm, mock_broker, plan_stub, fast_sleep,
+    @pytest.mark.parametrize("status_code", [503, 429])
+    def test_submit_entry_http_ambiguity_without_tag_proof_never_reposts(
+        self, mock_osm, mock_broker, plan_stub, fast_sleep, status_code,
     ):
-        mock_broker.session.post.side_effect = [
-            _resp(503, text="down"),
-            _resp(200, json_body={"order": {"id": "BO-ENTRY-2", "status": "ok"}}),
-        ]
+        mock_broker.session.post.return_value = _resp(status_code, text="uncertain")
+        mock_broker.session.get.return_value = _resp(
+            200, json_body={"orders": {"order": []}},
+        )
         result = mock_osm.submit_entry(broker=mock_broker, plan=plan_stub, limit_price=1.50)
-        assert result["ok"] is True
-        assert mock_broker.session.post.call_count == 2
+        assert result["ok"] is False
+        assert result["error"] == (
+            f"BROKER_AMBIGUOUS_HTTP_{status_code}_RECONCILIATION_REQUIRED"
+        )
+        assert result["reconciliation_required"] is True
+        assert result["identity_quarantine"] is True
+        assert mock_broker.session.post.call_count == 1
+        assert mock_broker.session.get.call_count == 1
 
     def test_submit_entry_read_timeout_recovers_via_tag(
         self, mock_osm, mock_broker, plan_stub, fast_sleep,
@@ -278,18 +377,25 @@ class TestEntryRetryAndIdempotency:
         data = mock_broker.session.post.call_args.kwargs["data"]
         assert data["tag"] == "L-EX-001"
 
-    def test_submit_existing_entry_retries_on_503(
-        self, mock_osm, mock_broker, fast_sleep,
+    @pytest.mark.parametrize("status_code", [503, 429])
+    def test_submit_existing_entry_http_ambiguity_never_reposts(
+        self, mock_osm, mock_broker, fast_sleep, status_code,
     ):
-        mock_broker.session.post.side_effect = [
-            _resp(503, text="down"),
-            _resp(200, json_body={"order": {"id": "BO-EX2", "status": "ok"}}),
-        ]
+        mock_broker.session.post.return_value = _resp(status_code, text="uncertain")
+        mock_broker.session.get.return_value = _resp(
+            200, json_body={"orders": {"order": []}},
+        )
         result = mock_osm.submit_existing_entry(
             broker=mock_broker, local_order_id="L-EX-001",
         )
-        assert result["ok"] is True
-        assert mock_broker.session.post.call_count == 2
+        assert result["ok"] is False
+        assert result["error"] == (
+            f"BROKER_AMBIGUOUS_HTTP_{status_code}_RECONCILIATION_REQUIRED"
+        )
+        assert result["reconciliation_required"] is True
+        assert result["identity_quarantine"] is True
+        assert mock_broker.session.post.call_count == 1
+        assert mock_broker.session.get.call_count == 1
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -363,7 +469,7 @@ class TestBrokerTagSignature:
 # ────────────────────────────────────────────────────────────────────────────
 
 class TestRepegPassesTag:
-    """apply_repeg in retry_engine.py must forward `tag=str(local_oid)` to
+    """apply_repeg must forward the canonical local id as the broker tag so
     broker.place_order so repegs also benefit from broker-side idempotency."""
 
     def test_apply_repeg_source_passes_tag(self):
@@ -376,8 +482,8 @@ class TestRepegPassesTag:
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef) and node.name == "apply_repeg":
                 fn_src = ast.get_source_segment(src, node)
-                assert "tag=str(local_oid)" in fn_src, (
-                    "apply_repeg must pass tag=str(local_oid) to place_order"
+                assert "tag=canonical_broker_submit_key(local_oid)" in fn_src, (
+                    "apply_repeg must pass the canonical submit key to place_order"
                 )
                 return
         pytest.fail("apply_repeg function not found in retry_engine.py")

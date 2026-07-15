@@ -35,6 +35,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.db import conn, run_with_retry
 from ap.observability import emit_decision_event, get_git_commit, make_config_hash
 from ap.utils import now_utc_iso
@@ -4281,7 +4282,7 @@ class APOrderMonitor:
                 qty=qty,
                 limit_price=(float(new_limit) if new_limit is not None else None),
                 side="buy_to_open",
-                tag=str(local_oid) if local_oid else None,
+                tag=canonical_broker_submit_key(local_oid) if local_oid else None,
             )
         except Exception as e:
             log.error(

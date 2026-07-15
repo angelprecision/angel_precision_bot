@@ -1090,7 +1090,9 @@ class ClientRunner(threading.Thread):
             return False
 
         try:
-            remaining = self.order_state_machine.get_split_brain_orders()
+            remaining = self.order_state_machine.get_split_brain_orders(
+                execution_mode=str(self.mode).strip().lower(),
+            )
         except Exception as exc:
             logger.warning("[%s] split-brain recovery check failed: %s", self.email, exc)
             return False
@@ -2313,7 +2315,9 @@ class ClientRunner(threading.Thread):
         # Start in degraded mode if any exist — entries are blocked until the
         # reconciler advances the flagged orders on its next pass.
         try:
-            split_brain_orders = self.order_state_machine.get_split_brain_orders()
+            split_brain_orders = self.order_state_machine.get_split_brain_orders(
+                execution_mode=str(self.mode).strip().lower(),
+            )
         except Exception as _sb_exc:
             logger.error("[%s] Split-brain startup audit failed: %s", self.email, _sb_exc)
             split_brain_orders = []
@@ -3247,6 +3251,7 @@ class ClientRunner(threading.Thread):
                 client_id=self.email,
                 osm=self.order_state_machine,
                 pm=self.position_manager,
+                execution_mode=str(self.mode).strip().lower(),
             )
             self.reconciler.exit_engine = exit_eng
             # P0-3: give reconciler master_control reference so it can self-

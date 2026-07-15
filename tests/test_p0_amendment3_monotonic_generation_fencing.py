@@ -266,10 +266,16 @@ def test_stale_owner_copyback_blocked_by_generation_cas(db_spy):
         reserved_cost=125.0,
         selector_meta={},
     ) is False
-    sql, params = sink[-1]
+    # Req 2 (P0/osm-broker-submit-proof-and-identity): on CAS miss the helper
+    # now issues a diagnostic re-read SELECT after the UPDATE. The UPDATE is
+    # therefore at sink[-2]; the SELECT is at sink[-1].
+    sql, params = sink[-2]   # the fenced UPDATE (was sink[-1] before re-read)
     assert "COALESCE((meta->>'materialization_generation')::int, 0) = %s" in sql
     assert params[-1] == 1        # binds the stale caller's generation
     assert params[-2] == "materializer:worker-A"
+    # Re-read SELECT must also have been issued
+    reread_sql, _ = sink[-1]
+    assert "SELECT" in reread_sql.upper() or "select" in reread_sql
 
 
 def test_stale_owner_retry_schedule_blocked_by_generation_cas(db_spy):

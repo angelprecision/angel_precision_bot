@@ -846,7 +846,7 @@ def test_broker_other_account_does_not_override_breaker(monkeypatch, mock_broker
 
 def test_broker_truth_unavailable_preserves_original_breaker(monkeypatch, mock_broker):
     monkeypatch.setenv("MAX_EXIT_REJECTIONS_BEFORE_HALT", "5")
-    _patch_db(
+    fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row() if "FROM positions" in sql else {"rejection_count": 5},
     )
@@ -867,10 +867,14 @@ def test_broker_truth_unavailable_preserves_original_breaker(monkeypatch, mock_b
     assert result["ok"] is False
     assert result["reason"] == "exit_circuit_breaker_tripped"
     assert mock_broker.session.post.call_count == 0
+    assert not any(
+        "UPDATE positions" in sql and "status = 'CLOSED'" in sql
+        for sql, _ in fake_conn.queries
+    )
 
 
 def test_requested_qty_greater_than_broker_truth_blocks_no_oversell(monkeypatch, mock_broker):
-    _patch_db(
+    fake_conn = _patch_db(
         monkeypatch,
         lambda sql, params: _open_position_row(quantity_remaining=2) if "FROM positions" in sql else {"rejection_count": 0},
     )
@@ -893,6 +897,10 @@ def test_requested_qty_greater_than_broker_truth_blocks_no_oversell(monkeypatch,
     assert result["ok"] is False
     assert result["reason"] == "EXIT_BLOCKED_BROKER_QTY_INSUFFICIENT"
     assert mock_broker.session.post.call_count == 0
+    assert not any(
+        "UPDATE positions" in sql and "status = 'CLOSED'" in sql
+        for sql, _ in fake_conn.queries
+    )
 
 
 def test_empty_positions_marks_stale_position_closed(monkeypatch, mock_broker):
