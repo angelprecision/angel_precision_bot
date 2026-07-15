@@ -35,6 +35,8 @@ def _signal(**overrides):
         "stop_price": 95.0,
         "target_price": 105.0,
         "local_order_id": "lo-1",
+        "client_id": "paper@example.com",
+        "execution_mode": "paper",
         "contract_symbol": "AAPL260717C00100000",
         "timeframe": "1d",
         "trigger": {"entry": 100.0, "stop": 95.0, "pt1": 105.0},
@@ -47,6 +49,7 @@ def _add_intraday_signal(watcher: TestWatcher, **overrides):
     watched = WatchedSignal(_signal(**overrides), overnight=False)
     watched._watcher_ref = watcher
     watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
     return watched
 
 
@@ -127,10 +130,10 @@ def test_active_watcher_does_not_trigger_from_last_only_quote():
     assert triggered == []
     assert len(watcher._pending) == 1
     assert watcher._pending[0].state == WatchState.PENDING
-    assert any(row[1]["reason_code"] == "watcher_bid_ask_unavailable" for row in watcher.audit_rows)
+    assert watcher._pending[0].breach_count == 0
 
 
-def test_on_trigger_failure_keeps_watcher_pending_for_retry_then_success_removes():
+def test_on_trigger_failure_keeps_watcher_pending_for_retry_then_durable_success_removes():
     watcher = TestWatcher(DummyBroker())
     _prime_trigger(watcher)
     calls = {"count": 0}
@@ -139,6 +142,7 @@ def test_on_trigger_failure_keeps_watcher_pending_for_retry_then_success_removes
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("transient db hiccup")
+        return {"disposition": "SUBMITTED"}
 
     watcher.on_trigger = flaky_on_trigger
 
@@ -148,17 +152,20 @@ def test_on_trigger_failure_keeps_watcher_pending_for_retry_then_success_removes
     assert calls["count"] == 1
     assert len(watcher._pending) == 1
     assert watcher._pending[0].state == WatchState.PENDING
-    assert watcher._pending[0].triggered_at is None
-    assert watcher._pending[0].trigger_price is None
+    # First-breach evidence is deliberately preserved across callback retries.
+    assert watcher._pending[0].triggered_at is not None
+    assert watcher._pending[0].trigger_price == 101.0
     assert getattr(watcher._pending[0], "_trigger_attempts") == 1
+    assert "sig-1" in watcher._dedup_set
 
-    watcher._poll_active_signals()  # retained watcher retries and succeeds
+    watcher._poll_active_signals()  # retained watcher retries and hands off
 
     assert calls["count"] == 2
     assert watcher._pending == []
+    assert "sig-1" not in watcher._dedup_set
 
 
-def test_on_trigger_three_failures_expires_and_calls_on_expire():
+def test_on_trigger_three_failures_enters_ownership_quarantine_without_release():
     watcher = TestWatcher(DummyBroker())
     _prime_trigger(watcher)
     expired = []
@@ -172,9 +179,15 @@ def test_on_trigger_three_failures_expires_and_calls_on_expire():
     watcher._poll_active_signals()  # first momentum poll
     watcher._poll_active_signals()  # attempt 1
     watcher._poll_active_signals()  # attempt 2
-    watcher._poll_active_signals()  # attempt 3 -> expire
+    watcher._poll_active_signals()  # attempt 3 -> no durable terminalization available
 
-    assert watcher._pending == []
-    assert len(expired) == 1
-    assert expired[0].state == WatchState.EXPIRED
-    assert any(row[1]["reason_code"] == "on_trigger_exhausted_3_attempts" for row in watcher.audit_rows)
+    assert len(watcher._pending) == 1
+    retained = watcher._pending[0]
+    assert retained.state == WatchState.PENDING
+    assert getattr(retained, "_ownership_quarantine", False) is True
+    assert getattr(retained, "_trigger_attempts") == 3
+    assert "sig-1" in watcher._dedup_set
+    assert expired == []
+    assert str(getattr(retained, "_quarantine_reason", "")).startswith(
+        "trigger_exhaustion_terminal_write_failed:"
+    )
