@@ -62,11 +62,11 @@ def _watcher_with_row(row: dict) -> APEntryWatcher:
     return watcher
 
 
-def test_package_watcher_inherits_base_poll_loop():
-    assert "_poll_active_signals" not in APEntryWatcher.__dict__
+def test_package_watcher_wraps_base_poll_loop_without_reimplementing_processors():
+    assert "_poll_active_signals" in APEntryWatcher.__dict__
+    assert APEntryWatcher._poll_active_signals is not ap_entry_watcher._BaseAPEntryWatcher._poll_active_signals
     assert "_process_triggered_poll_result" not in APEntryWatcher.__dict__
     assert "_process_terminal_poll_result" not in APEntryWatcher.__dict__
-    assert APEntryWatcher._poll_active_signals is ap_entry_watcher._BaseAPEntryWatcher._poll_active_signals
 
 
 def test_reconcile_broker_intent_keeps_watcher_and_dedup_until_retry_time():
