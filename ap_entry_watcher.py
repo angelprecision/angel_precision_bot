@@ -4658,11 +4658,24 @@ class APEntryWatcher:
             )
         elif ack.outcome == "FAILED":
             self._enter_ownership_quarantine(w, ack)
-            log.critical(
-                "[%s] WATCHER_DISPATCH_FAILED %s local_order_id=%s reason=%s "
-                "→ ownership quarantine. P0 invariant violation.",
-                w.ticker, _state_name, _local_oid or "?", ack.reason_code,
-            )
+            # When cleanup was intentionally suppressed because the order has
+            # active deferred contract selection, this is expected behaviour —
+            # not a P0 invariant violation. Log at WARNING, not CRITICAL.
+            _is_mat_skip = str(getattr(ack, "reason_code", "") or "").startswith(
+                "WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION"
+            ) or str(getattr(ack, "reason_code", "") or "") == "WATCHER_EXPIRY_GUARD_CHECK_FAILED"
+            if _is_mat_skip:
+                log.warning(
+                    "[%s] WATCHER_DISPATCH_FAILED %s local_order_id=%s reason=%s "
+                    "→ quarantine retained; materializer owns retry lifecycle",
+                    w.ticker, _state_name, _local_oid or "?", ack.reason_code,
+                )
+            else:
+                log.critical(
+                    "[%s] WATCHER_DISPATCH_FAILED %s local_order_id=%s reason=%s "
+                    "→ ownership quarantine. P0 invariant violation.",
+                    w.ticker, _state_name, _local_oid or "?", ack.reason_code,
+                )
         else:
             # RETRY_OWNED or REARMED — watcher stays in _pending as-is.
             log.info(
