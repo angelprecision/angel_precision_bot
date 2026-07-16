@@ -2092,25 +2092,33 @@ class APExitEngine:
                 #   incoming blank  + canonical any    → RETRY (unproven mode)
                 #   incoming live   + canonical paper  → RETRY_MODE_MISMATCH
                 #   incoming paper  + canonical live   → RETRY_MODE_MISMATCH
-                _norm_incoming = _mode
+                _norm_incoming  = _mode
                 _norm_canonical = _canon_mode
-                # Both must be the same known mode; blank on either side is unproven.
+                # Both must be the same *known* mode: {"live", "paper"}.
+                # blank+blank, blank+live, live+blank, unknown+anything, etc.
+                # are ALL unproven and must fail closed with RETRY_MODE_MISMATCH.
+                # The `(_norm_incoming or _norm_canonical)` guard that was here
+                # previously allowed blank+blank to bypass the check — removed.
                 _mode_compatible = (
-                    _norm_incoming != ""
-                    and _norm_canonical != ""
+                    _norm_incoming in {"live", "paper"}
+                    and _norm_canonical in {"live", "paper"}
                     and _norm_incoming == _norm_canonical
                 )
-                if not _mode_compatible and (_norm_incoming or _norm_canonical):
+                if not _mode_compatible:
                     log.critical(
                         "[exit_eng] RETRY_MODE_MISMATCH | canonical_id=%s "
                         "canonical_mode=%r incoming_mode=%r contract=%s — "
-                        "LIVE and PAPER may not collapse into one exit owner",
+                        "both modes must be explicitly known and equal; "
+                        "blank/unknown/mismatched mode may not collapse positions",
                         _canon_id, _canon_mode, _mode, _contract,
                     )
                     return CanonicalAdoptionResult(
                         disposition="RETRY_MODE_MISMATCH", adopted=False,
                         safe_to_seed=False, retryable=True,
-                        reason=f"canonical_mode={_canon_mode!r} vs incoming={_mode!r}",
+                        reason=(
+                            f"canonical_mode={_norm_canonical!r} "
+                            f"incoming_mode={_norm_incoming!r}"
+                        ),
                     )
 
                 _canon_ok = (

@@ -1392,3 +1392,156 @@ class TestTimestampFallbackRegression:
         # Should fall back to order_filled_ts or now_utc without raising
         pos = engine._positions[0]
         assert getattr(pos, "opened_at", None) is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1 final — blank+blank and unproven mode combinations must fail closed
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCanonicalBlankBlankModeFencing:
+    """blank+blank and all unproven combinations must return RETRY_MODE_MISMATCH.
+
+    The previous guard `if not _mode_compatible and (_norm_incoming or _norm_canonical):`
+    allowed blank+blank to bypass the mode check and collapse two unproven-mode
+    positions. Broker-repair positions are exactly the blank-mode incident class.
+    """
+
+    def _engine_with_canon(self, canon_mode: str):
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        canon = _Pos(position_id="canon1", option_symbol=_CONTRACT,
+                     client_id=_CLIENT, execution_mode=canon_mode)
+        engine._positions.append(canon)
+        engine._positions_by_id["canon1"] = canon
+        return engine
+
+    def _adopt(self, engine, incoming_mode: str):
+        return engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode=incoming_mode,
+            client_id=_CLIENT,
+        )
+
+    # ── Exact required tests from spec ──────────────────────────────────────
+
+    def test_blank_canonical_blank_incoming_is_mismatch(self):
+        """blank + blank → RETRY_MODE_MISMATCH; repair position remains protected."""
+        engine = self._engine_with_canon("")
+        r = self._adopt(engine, incoming_mode="")
+        assert r.disposition == "RETRY_MODE_MISMATCH", (
+            f"blank+blank must be RETRY_MODE_MISMATCH, got {r.disposition}"
+        )
+        assert r.adopted is False
+        assert r.safe_to_seed is False
+        assert r.retryable is True
+        # Canon position must not have been collapsed with repair
+        assert engine._positions[0].position_id == "canon1"
+
+    def test_blank_canonical_blank_incoming_repair_not_collapsed(self):
+        """Repair position must survive when blank+blank is rejected."""
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        # Both canonical and repair with blank modes
+        canon_id  = "canon-blank"
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        canon = _Pos(position_id=canon_id, option_symbol=_CONTRACT,
+                     client_id=_CLIENT, execution_mode="")
+        repair = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
+                      client_id=_CLIENT, execution_mode="")
+        engine._positions.extend([canon, repair])
+        engine._positions_by_id[canon_id]  = canon
+        engine._positions_by_id[repair_id] = repair
+
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="",
+            client_id=_CLIENT,
+        )
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        # Both positions must still exist — no collapse occurred
+        assert len(engine._positions) == 2
+        assert repair_id in engine._positions_by_id
+
+    def test_unknown_incoming_unknown_canonical_is_mismatch(self):
+        engine = self._engine_with_canon("unknown")
+        r = self._adopt(engine, incoming_mode="unknown")
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.adopted is False
+
+    def test_blank_incoming_unknown_canonical_is_mismatch(self):
+        engine = self._engine_with_canon("unknown")
+        r = self._adopt(engine, incoming_mode="")
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.adopted is False
+
+    def test_unknown_incoming_blank_canonical_is_mismatch(self):
+        engine = self._engine_with_canon("")
+        r = self._adopt(engine, incoming_mode="unknown")
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.adopted is False
+
+    # ── Verify valid combinations still work ─────────────────────────────────
+
+    def test_live_live_collapse_still_works(self):
+        """live+live must not be broken by the tightened check."""
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        canon = _Pos(position_id="canon1", option_symbol=_CONTRACT,
+                     client_id=_CLIENT, execution_mode="live")
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
+                      client_id=_CLIENT, execution_mode="live",
+                      current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.extend([canon, repair])
+        engine._positions_by_id["canon1"]   = canon
+        engine._positions_by_id[repair_id]  = repair
+
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live",
+            client_id=_CLIENT,
+        )
+        assert r.adopted is True
+        assert r.disposition in ("ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED")
+
+    def test_paper_paper_collapse_still_works(self):
+        """paper+paper must not be broken by the tightened check."""
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        canon = _Pos(position_id="canon1", option_symbol=_CONTRACT,
+                     client_id=_CLIENT, execution_mode="paper")
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
+                      client_id=_CLIENT, execution_mode="paper",
+                      current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.extend([canon, repair])
+        engine._positions_by_id["canon1"]   = canon
+        engine._positions_by_id[repair_id]  = repair
+
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="paper",
+            client_id=_CLIENT,
+        )
+        assert r.adopted is True
