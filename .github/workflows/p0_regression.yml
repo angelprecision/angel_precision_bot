@@ -75,6 +75,7 @@ jobs:
             tests/test_p0_osm_broker_submit_boundary.py \
             tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
             tests/test_p0_unknown_execution_mode_fail_closed.py \
+            tests/test_p0_live_executable_bid_pnl.py \
             -v --tb=short --color=yes
 
       - name: Summary
