@@ -1324,11 +1324,12 @@ def _dispatch(
             if _is_paper_recovery:
                 log.info(
                     "[%s] PAPER_RECOVERY_RESTART_GUARD_BYPASS "
-                    "signal_id=%s job_id=%s execution_mode=%s "
+                    "signal_id=%s job_id=%s client_id=%s execution_mode=%s "
                     "recovery_ts=%s lookback_hours=%s",
                     ticker,
                     signal_id,
                     job_id,
+                    client_id,
                     str(_execution_mode or "").upper(),
                     payload.get("recovery_rescue_ts") if isinstance(payload, dict) else None,
                     payload.get("recovery_rescue_lookback_hours") if isinstance(payload, dict) else None,

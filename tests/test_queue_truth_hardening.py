@@ -198,7 +198,7 @@ def test_cutoff_runs_before_create_entry_order():
         disp,
     )
     create_marker = re.search(
-        r"order_state_machine\.create_entry_order\s*\(\s*plan\s*\)",
+        r"order_state_machine\.create_entry_order\s*\(\s*plan",
         disp,
     )
     assert cutoff_marker, (
