@@ -2148,6 +2148,7 @@ class ClientRunner(threading.Thread):
         # BUG-3 FIX: guard both URL and key — an empty service key produces a
         # confusing auth error inside Supabase rather than a clear None here.
         sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if (SUPABASE_URL and SUPABASE_SERVICE_KEY) else None
+        self.supabase = sb  # Requirement 2: stored so reconciler and other subsystems share one client
 
         self.position_manager = APPositionManager(client_id=self.email)
 
@@ -3381,6 +3382,7 @@ class ClientRunner(threading.Thread):
                 osm=self.order_state_machine,
                 pm=self.position_manager,
                 execution_mode=str(self.mode).strip().lower(),
+                supabase_client=getattr(self, "supabase", None),  # Requirement 3
             )
             self.reconciler.exit_engine = exit_eng
             # P0-3: give reconciler master_control reference so it can self-
