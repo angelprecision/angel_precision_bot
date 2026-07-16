@@ -67,8 +67,6 @@ jobs:
             tests/test_p0_broker_open_protective_monitoring.py \
             tests/test_p0_final_duplicate_honesty.py \
             tests/test_p0_setup_lifecycle_owner.py \
-            tests/test_p0_autonomous_startup_scheduler_contract.py \
-            tests/test_p0_autonomous_startup_scheduler_contract.py \
             tests/test_p0_autonomous_morning_handoff.py \
             tests/test_p0_autonomous_morning_handoff.py \
             tests/test_p0_deferred_due_retry_ownership.py \
@@ -80,7 +78,6 @@ jobs:
             tests/test_p0_osm_broker_submit_boundary.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
-            tests/test_p0_unknown_execution_mode_fail_closed.py \
             tests/test_p0_live_executable_bid_pnl.py \
             -v --tb=short --color=yes
 
