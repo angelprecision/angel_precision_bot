@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os as _os
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -43,12 +44,31 @@ def _normalize_mode(value: str | None) -> str:
     return str(value or "").strip().lower()
 
 
+def _autonomy_runtime_context(execution_mode: str | None = None) -> dict:
+    commit_sha = (
+        _os.getenv("RENDER_GIT_COMMIT")
+        or _os.getenv("COMMIT_SHA")
+        or _os.getenv("GITHUB_SHA")
+        or "unknown"
+    )
+    mode = _normalize_mode(execution_mode)
+    client_count = None
+    try:
+        expected = _expected_clients_by_mode()
+        client_count = len(expected.get(mode, [])) if mode else sum(len(v) for v in expected.values())
+    except Exception:
+        client_count = None
+    return {
+        "commit_sha": str(commit_sha)[:12],
+        "pod_id": _os.getenv("POD_ID", "").strip() or "unknown",
+        "client_count": client_count,
+        "execution_mode": mode,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PR #183 amendment — ap_signals → trade_queue WATCHING handoff
 # ─────────────────────────────────────────────────────────────────────────────
-
-import os as _os
-
 
 def _normalize_account_id(raw: str | None) -> str:
     """Strip chr(10)/chr(13)/chr(9) and whitespace from Tradier account IDs."""
@@ -1042,16 +1062,48 @@ def run_morning_handoff_audit(
     core = getattr(runner, "core", None) if runner is not None else None
     entry_watcher = getattr(core, "entry_watcher", None) if core else None
 
+    autonomy_ctx = _autonomy_runtime_context(mode)
+    log.info(
+        "CLIENT_HANDOFF_STARTED client_id=%s execution_mode=%s stage=%s trading_date=%s "
+        "commit_sha=%s pod_id=%s client_count=%s",
+        client_id,
+        mode,
+        stage,
+        trading_date,
+        autonomy_ctx["commit_sha"],
+        autonomy_ctx["pod_id"],
+        autonomy_ctx["client_count"],
+    )
+
     can_skip_existing = bool(existing and str(existing.get("status") or "").lower() == "success" and existing.get("last_success_at"))
     if can_skip_existing and stage == "startup" and not dry_run:
-        if mode == "paper":
-            # Paper fan-out is idempotent and must run after every process
-            # restart. A prior success may predate newly-created shared signals
-            # or may contain no durable enqueue evidence from older code.
-            can_skip_existing = False
-        elif _has_unowned_pending_trigger_orders(client_id, entry_watcher, now=now):
-            can_skip_existing = False
+        # Startup is process ownership, not only a daily job event. A prior
+        # success may predate a restart, deployment, or partial handoff crash,
+        # so it cannot prove this runtime owns watchers or retry consumers.
+        can_skip_existing = False
     if can_skip_existing:
+        summary = {
+            "client_id": client_id,
+            "execution_mode": mode,
+            "overnight_rows_found": 0,
+            "morning_rows_accepted": 0,
+            "watchers_restored": 0,
+            "deferred_retries_restored": 0,
+            "orders_already_durably_owned": 0,
+            "errors": [],
+            "skipped": True,
+        }
+        log.info(
+            "CLIENT_HANDOFF_COMPLETE client_id=%s execution_mode=%s stage=%s status=skipped "
+            "commit_sha=%s pod_id=%s client_count=%s summary=%s",
+            client_id,
+            mode,
+            stage,
+            autonomy_ctx["commit_sha"],
+            autonomy_ctx["pod_id"],
+            autonomy_ctx["client_count"],
+            summary,
+        )
         return {
             "ok": True,
             "skipped": True,
@@ -1061,6 +1113,7 @@ def run_morning_handoff_audit(
             "stage": stage,
             "trading_date": trading_date,
             "last_success_at": existing.get("last_success_at"),
+            "summary": summary,
         }
 
     _upsert_handoff_run_lock(
@@ -1086,7 +1139,35 @@ def run_morning_handoff_audit(
             details={"dry_run": dry_run},
             mark_success=False,
         )
-        return {"ok": False, "error": err, "client_id": client_id, "execution_mode": mode, "stage": stage}
+        summary = {
+            "client_id": client_id,
+            "execution_mode": mode,
+            "overnight_rows_found": 0,
+            "morning_rows_accepted": 0,
+            "watchers_restored": 0,
+            "deferred_retries_restored": 0,
+            "orders_already_durably_owned": 0,
+            "errors": [err],
+        }
+        log.info(
+            "CLIENT_HANDOFF_COMPLETE client_id=%s execution_mode=%s stage=%s status=failed "
+            "commit_sha=%s pod_id=%s client_count=%s summary=%s",
+            client_id,
+            mode,
+            stage,
+            autonomy_ctx["commit_sha"],
+            autonomy_ctx["pod_id"],
+            autonomy_ctx["client_count"],
+            summary,
+        )
+        return {
+            "ok": False,
+            "error": err,
+            "client_id": client_id,
+            "execution_mode": mode,
+            "stage": stage,
+            "summary": summary,
+        }
 
     osm = getattr(runner, "order_state_machine", None)
     pm = getattr(runner, "position_manager", None)
@@ -1208,6 +1289,26 @@ def run_morning_handoff_audit(
             )
 
     after = _count_state(client_id)
+    accepted_rows = 0
+    if enqueue_result:
+        accepted_rows = len(enqueue_result.get("inserted") or []) + len(
+            enqueue_result.get("skipped_duplicate") or []
+        )
+    summary_errors = list(warnings)
+    if error and error not in summary_errors:
+        summary_errors.append(error)
+    summary_errors.extend(str(item) for item in (enqueue_result.get("errors") or []))
+    summary_errors.extend(str(item) for item in (recovery_result.get("errors") or []))
+    summary = {
+        "client_id": client_id,
+        "execution_mode": mode,
+        "overnight_rows_found": int(enqueue_result.get("signals_found") or 0) if enqueue_result else 0,
+        "morning_rows_accepted": int(accepted_rows),
+        "watchers_restored": int(recovery_result.get("watchers_requeued", 0) or 0),
+        "deferred_retries_restored": int(recovery_result.get("deferred_lifecycles_recovered", 0) or 0),
+        "orders_already_durably_owned": int(before.get("pending_trigger_rows") or 0),
+        "errors": summary_errors,
+    }
     details = {
         "dry_run": dry_run,
         "before": before,
@@ -1221,6 +1322,7 @@ def run_morning_handoff_audit(
         # so the audit endpoint shows exactly what was archived/terminalized.
         "watching_readiness": readiness_result,
         "readiness_warnings": readiness_warnings,
+        "summary": summary,
     }
     _upsert_handoff_run_lock(
         client_id=client_id,
@@ -1232,7 +1334,7 @@ def run_morning_handoff_audit(
         details=details,
         mark_success=ok,
     )
-    return {
+    result = {
         "ok": ok,
         "client_id": client_id,
         "execution_mode": mode,
@@ -1245,5 +1347,24 @@ def run_morning_handoff_audit(
         "warnings": warnings,
         "errors": list(recovery_result.get("errors") or []),
         "error": error,
+        "summary": summary,
+        "overnight_rows_found": summary["overnight_rows_found"],
+        "morning_rows_accepted": summary["morning_rows_accepted"],
+        "watchers_restored": summary["watchers_restored"],
+        "deferred_retries_restored": summary["deferred_retries_restored"],
+        "orders_already_durably_owned": summary["orders_already_durably_owned"],
         "enqueue_result": enqueue_result,  # PR #183: signals inserted/skipped/rejected
     }
+    log.info(
+        "CLIENT_HANDOFF_COMPLETE client_id=%s execution_mode=%s stage=%s status=%s "
+        "commit_sha=%s pod_id=%s client_count=%s summary=%s",
+        client_id,
+        mode,
+        stage,
+        "success" if ok else "failed",
+        autonomy_ctx["commit_sha"],
+        autonomy_ctx["pod_id"],
+        autonomy_ctx["client_count"],
+        summary,
+    )
+    return result

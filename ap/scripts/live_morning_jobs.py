@@ -34,6 +34,19 @@ log = logging.getLogger("ap.scripts.live_morning_jobs")
 ET = ZoneInfo("America/New_York")
 
 
+def _commit_sha() -> str:
+    return str(
+        os.getenv("RENDER_GIT_COMMIT")
+        or os.getenv("COMMIT_SHA")
+        or os.getenv("GITHUB_SHA")
+        or "unknown"
+    )[:12]
+
+
+def _pod_id() -> str:
+    return str(os.getenv("POD_ID", "") or "unknown").strip() or "unknown"
+
+
 def _resolve_job_from_env() -> str:
     job = str(os.getenv("MORNING_JOB", "") or "").strip().lower()
     if job:
@@ -119,7 +132,37 @@ def main() -> int:
     if mode_filter is not None:
         calls = [call for call in calls if call.execution_mode == mode_filter]
 
+    execution_modes = ",".join(sorted({call.execution_mode for call in calls})) or "none"
+    log.info(
+        "AUTONOMY_JOB_REGISTERED job=%s commit_sha=%s pod_id=%s client_count=%s execution_mode=%s",
+        job_name,
+        _commit_sha(),
+        _pod_id(),
+        len(calls),
+        execution_modes,
+    )
+
     for call in calls:
+        if call.job_name.startswith("overnight_reeval"):
+            log.info(
+                "OVERNIGHT_JOB_STARTED job=%s client_scope=%s execution_mode=%s commit_sha=%s pod_id=%s client_count=%s",
+                call.job_name,
+                call.client_scope,
+                call.execution_mode,
+                _commit_sha(),
+                _pod_id(),
+                len(calls),
+            )
+        elif call.endpoint == "/admin/morning_handoff_audit":
+            log.info(
+                "MORNING_REEVAL_STARTED job=%s client_scope=%s execution_mode=%s commit_sha=%s pod_id=%s client_count=%s",
+                call.job_name,
+                call.client_scope,
+                call.execution_mode,
+                _commit_sha(),
+                _pod_id(),
+                len(calls),
+            )
         result = call_admin_endpoint(
             bot_url=bot_url,
             endpoint=call.endpoint,
