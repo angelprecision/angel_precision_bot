@@ -263,6 +263,214 @@ SMALL_WIN_TRAIL       = 0.08   # floor 8pt below peak (seen +20% → floor at +1
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
 
+
+def _normalize_canonical_ts(ts, *, fallback=None, local_order_id: str = ""):
+    """Normalize a broker fill timestamp to an aware UTC datetime.
+
+    Accepts: aware datetime, naive datetime (assumed UTC), ISO 8601 string
+    with Z or offset, numeric epoch (seconds).
+
+    On failure: uses fallback, or datetime.now(UTC).
+    Emits CANONICAL_ENTRY_TIMESTAMP_FALLBACK on any fallback path.
+    """
+    import datetime as _dt
+    _UTC = _dt.timezone.utc
+
+    def _try(v):
+        if v is None:
+            return None
+        if isinstance(v, _dt.datetime):
+            return v.replace(tzinfo=_UTC) if v.tzinfo is None else v.astimezone(_UTC)
+        if isinstance(v, (int, float)):
+            try:
+                return _dt.datetime.fromtimestamp(float(v), tz=_UTC)
+            except Exception:
+                return None
+        if isinstance(v, str):
+            s = v.strip().replace("Z", "+00:00")
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z",
+                        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S.%f%z",
+                        "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    p = _dt.datetime.strptime(s, fmt)
+                    return p.replace(tzinfo=_UTC) if p.tzinfo is None else p.astimezone(_UTC)
+                except ValueError:
+                    continue
+        return None
+
+    result = _try(ts)
+    if result is not None:
+        return result
+
+    log.warning(
+        "[exit_eng] CANONICAL_ENTRY_TIMESTAMP_FALLBACK | "
+        "order=%s original_ts=%r — using fallback or now_utc",
+        local_order_id or "?", ts,
+    )
+    if fallback is not None:
+        result = _try(fallback)
+        if result is not None:
+            return result
+    return _dt.datetime.now(_UTC)
+
+
+@dataclass(frozen=True)
+class CanonicalAdoptionResult:
+    """Structured result from adopt_canonical_position_identity().
+
+    Dispositions:
+      ADOPTED                          - repair upgraded in place; caller returns.
+      ALREADY_CANONICAL_REPAIR_REMOVED - canonical present; repair(s) merged and removed.
+      NO_REPAIR_FOUND                  - no broker-repair; caller should seed normally.
+      RETRY_CLIENT_MISMATCH            - client IDs do not match; retain protective monitoring.
+      RETRY_MODE_MISMATCH              - execution modes incompatible; retain monitoring.
+      RETRY_IDENTITY_CONFLICT          - canonical object mismatch; retain monitoring.
+      RETRY_ADOPTION_ERROR             - unexpected exception; retain monitoring.
+    """
+    disposition: str
+    adopted:     bool
+    safe_to_seed: bool   # True only for NO_REPAIR_FOUND
+    retryable:   bool
+    reason:      str = ""
+
+
+@dataclass
+class ExecutableQuoteApplication:
+    """Result of _apply_option_quote_for_decision().
+
+    pricing_mode       - "paper" | "live" | "live_risk_unproven"
+    executable_price   - bid for LIVE/unproven (0 when bid missing), mid for PAPER
+    executable_valid   - True only when an actual bid drove the price
+    analytics_mark     - mid/mark for charts/dashboard regardless of mode
+    source             - live_executable_price_source stamp
+    """
+    pricing_mode:     str
+    executable_price: float
+    executable_valid: bool
+    analytics_mark:   float
+    source:           str
+
+
+def _apply_option_quote_for_decision(
+    pos: "ManagedPosition",
+    *,
+    bid: float,
+    ask: float,
+    mark: float,
+    quote_ts: "Optional[datetime]" = None,
+    source: str = "",
+) -> ExecutableQuoteApplication:
+    """Single authoritative function for writing option-price state onto a position.
+
+    P0 contract (July 15 2026 BA incident):
+      ALL writers of current_option_price must route through this function.
+      For LIVE and unknown-mode positions, current_option_price is ALWAYS the
+      executable bid — never midpoint, mark, ask, or last.
+
+    Pricing logic:
+      paper                → current_option_price = mid (simulation)
+      live / unproven      → current_option_price = bid (executable)
+                             When bid <= 0: current_option_price = 0.0
+                             No profit decision may use mark/ask/mid.
+
+    Proof-of-enforcement: every call site that sets current_option_price must
+    pass through here. grep for direct .current_option_price = assignments and
+    verify each is either (a) this function, (b) fill-price after confirmed
+    broker fill, or (c) internal persistence from a previously validated value.
+    """
+    _raw_mode = str(getattr(pos, "execution_mode", "") or "").strip()
+    _norm_mode = _raw_mode.lower()
+
+    if _norm_mode == "paper":
+        _pricing_mode = "paper"
+    elif _norm_mode == "live":
+        _pricing_mode = "live"
+    else:
+        _pricing_mode = "live_risk_unproven"
+
+    _mid = round((bid + ask) / 2.0, 4) if (bid > 0 and ask > 0) else (mark or ask or 0.0)
+    _analytics_mark = mark if mark > 0 else _mid
+
+    # Always stamp analytics mark for charting regardless of pricing mode.
+    try:
+        pos.analytics_mark_price = _analytics_mark
+        pos.analyticsmarkprice   = _analytics_mark
+    except Exception as _e:
+        log.debug("_aqfd: analytics_mark write failed: %s", _e)
+
+    # Set bid/ask on position unconditionally.
+    try:
+        pos.current_bid = bid
+        pos.currentbid  = bid
+    except Exception as _e:
+        log.debug("_aqfd: current_bid write failed: %s", _e)
+    try:
+        pos.current_ask = ask
+        pos.currentask  = ask
+    except Exception as _e:
+        log.debug("_aqfd: current_ask write failed: %s", _e)
+
+    if _pricing_mode == "paper":
+        _exec_price = _mid if _mid > 0 else ask
+        _valid = _exec_price > 0
+        _src   = source or "paper_mid_simulation"
+        try:
+            pos.current_option_price = _exec_price
+            pos.currentoptionprice   = _exec_price
+        except Exception as _e:
+            log.debug("_aqfd: paper current_option_price write failed: %s", _e)
+    else:
+        # LIVE or live_risk_unproven: executable price is ONLY the bid.
+        if bid > 0:
+            _exec_price = bid
+            _valid = True
+            _src   = source or ("bid" if _pricing_mode == "live" else "bid_live_risk_unproven")
+            try:
+                pos.current_option_price = bid
+                pos.currentoptionprice   = bid
+            except Exception as _e:
+                log.debug("_aqfd: live bid write failed: %s", _e)
+        else:
+            # Missing or zero bid — clear the decision price so no profit
+            # logic can read a stale mid/mark from a prior cycle.
+            _exec_price = 0.0
+            _valid = False
+            _src   = ("bid_missing" if _pricing_mode == "live"
+                      else "bid_missing_live_risk_unproven")
+            try:
+                pos.current_option_price = 0.0
+                pos.currentoptionprice   = 0.0
+            except Exception as _e:
+                log.debug("_aqfd: bid_missing zero-write failed: %s", _e)
+
+    # Stamp executable metadata.
+    try:
+        pos.executable_exit_price    = _exec_price
+        pos.executable_quote_valid   = _valid
+        pos.live_executable_price_source = _src
+        pos.liveexecutablepricesource    = _src
+        pos.pricing_mode             = _pricing_mode
+        pos.raw_execution_mode       = _raw_mode
+    except Exception as _e:
+        log.debug("_aqfd: executable metadata write failed: %s", _e)
+
+    # Update quote timestamp.
+    if quote_ts is not None:
+        try:
+            pos.last_option_quote_update_ts = quote_ts
+            pos.lastoptionquoteupdatets     = quote_ts
+        except Exception as _e:
+            log.debug("_aqfd: quote_ts write failed: %s", _e)
+
+    return ExecutableQuoteApplication(
+        pricing_mode     = _pricing_mode,
+        executable_price = _exec_price,
+        executable_valid = _valid,
+        analytics_mark   = _analytics_mark,
+        source           = _src,
+    )
+
+
 @dataclass
 class ManagedPosition:
     # Identity
@@ -1820,6 +2028,373 @@ class APExitEngine:
             return False
 
 
+    def adopt_canonical_position_identity(
+        self,
+        *,
+        contract: str,
+        canonical_position_id: str,
+        local_order_id: str,
+        broker_order_id: str,
+        signal_id: str,
+        canonical_signal_id: str,
+        entry_fill: float,
+        entry_ts,
+        execution_mode: str,
+        client_id: str,
+        order_filled_ts=None,
+        underlying_entry: float = 0.0,
+        score: float = 0.0,
+        tier: str = "",
+        pattern: str = "",
+        direction: str = "",
+        timeframe: str = "",
+        underlying_stop: float = 0.0,
+        underlying_target: float = 0.0,
+    ) -> CanonicalAdoptionResult:
+        """Atomically upgrade a broker-repair position to canonical filled-order identity.
+
+        Returns CanonicalAdoptionResult. Callers must check disposition:
+          ADOPTED / ALREADY_CANONICAL_REPAIR_REMOVED → return
+          NO_REPAIR_FOUND → seed normally
+          RETRY_* → emit critical, preserve monitoring, do not seed
+        """
+        _contract = str(contract or "").upper().strip()
+        _canon_id = str(canonical_position_id or "").strip()
+        _client   = str(client_id or "").strip().lower()
+        _mode     = str(execution_mode or "").strip().lower()
+        if not _contract or not _canon_id:
+            return CanonicalAdoptionResult(
+                disposition="RETRY_ADOPTION_ERROR", adopted=False,
+                safe_to_seed=False, retryable=True, reason="missing_contract_or_id",
+            )
+
+        with self._lock:
+            # ── Final Blocker 1: Canonical + repair collapse ───────────────────
+            # When a canonical object already exists for canonical_position_id,
+            # do not simply return True — find every active broker-repair for the
+            # same client/contract, merge safe state into the canonical object,
+            # then remove the repair objects so exactly one active position remains.
+            _existing_canon = self._positions_by_id.get(_canon_id)
+            if _existing_canon is not None:
+                _canon_sym  = str(getattr(_existing_canon, "option_symbol", "") or "").upper().strip()
+                _canon_cli  = str(getattr(_existing_canon, "client_id", "") or "").strip().lower()
+                _canon_mode = str(getattr(_existing_canon, "execution_mode", "") or "").strip().lower()
+
+                # P1: Execution mode fencing — LIVE and PAPER must never collapse into
+                # one exit owner. Blank/unknown canonical mode is unproven; do not
+                # allow cross-mode collapse.
+                #
+                # Compatible mode matrix:
+                #   incoming live   + canonical live   → OK
+                #   incoming paper  + canonical paper  → OK
+                #   incoming live   + canonical blank  → RETRY (cannot prove it's live)
+                #   incoming paper  + canonical blank  → RETRY (cannot prove it's paper)
+                #   incoming blank  + canonical any    → RETRY (unproven mode)
+                #   incoming live   + canonical paper  → RETRY_MODE_MISMATCH
+                #   incoming paper  + canonical live   → RETRY_MODE_MISMATCH
+                _norm_incoming  = _mode
+                _norm_canonical = _canon_mode
+                # Both must be the same *known* mode: {"live", "paper"}.
+                # blank+blank, blank+live, live+blank, unknown+anything, etc.
+                # are ALL unproven and must fail closed with RETRY_MODE_MISMATCH.
+                # The `(_norm_incoming or _norm_canonical)` guard that was here
+                # previously allowed blank+blank to bypass the check — removed.
+                _mode_compatible = (
+                    _norm_incoming in {"live", "paper"}
+                    and _norm_canonical in {"live", "paper"}
+                    and _norm_incoming == _norm_canonical
+                )
+                if not _mode_compatible:
+                    log.critical(
+                        "[exit_eng] RETRY_MODE_MISMATCH | canonical_id=%s "
+                        "canonical_mode=%r incoming_mode=%r contract=%s — "
+                        "both modes must be explicitly known and equal; "
+                        "blank/unknown/mismatched mode may not collapse positions",
+                        _canon_id, _canon_mode, _mode, _contract,
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_MODE_MISMATCH", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason=(
+                            f"canonical_mode={_norm_canonical!r} "
+                            f"incoming_mode={_norm_incoming!r}"
+                        ),
+                    )
+
+                _canon_ok = (
+                    _canon_sym == _contract
+                    and (not _client or _canon_cli == _client)
+                    and not getattr(_existing_canon, "closed", False)
+                )
+                if not _canon_ok:
+                    log.critical(
+                        "[exit_eng] RETRY_IDENTITY_CONFLICT | canonical=%s contract=%s "
+                        "client=%s — existing canonical does not match; refusing adoption",
+                        _canon_id, _contract, _client,
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_IDENTITY_CONFLICT",
+                        adopted=False, safe_to_seed=False, retryable=True,
+                        reason="canonical_object_mismatch",
+                    )
+
+                # Merge every active broker-repair for this client/contract into canonical.
+                _repairs_to_remove = [
+                    p for p in self._positions
+                    if str(getattr(p, "position_id", "") or "").startswith("broker-repair-")
+                    and str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
+                    and not getattr(p, "closed", False)
+                ]
+                for _rp in _repairs_to_remove:
+                    # Merge freshest quote timestamps
+                    for _ts_attr in ("last_option_quote_update_ts", "last_underlying_quote_update_ts",
+                                     "lastoptionquoteupdatets", "lastunderlyingquoteupdatets"):
+                        _rp_ts = getattr(_rp, _ts_attr, None)
+                        _cn_ts = getattr(_existing_canon, _ts_attr, None)
+                        if _rp_ts and (not _cn_ts or _rp_ts > _cn_ts):
+                            try: setattr(_existing_canon, _ts_attr, _rp_ts)
+                            except Exception: pass
+                    # Merge current bid/ask/underlying
+                    for _price_attr in ("current_bid", "currentbid", "current_ask", "currentask",
+                                        "current_underlying", "currentunderlying"):
+                        _rp_v = getattr(_rp, _price_attr, 0.0) or 0.0
+                        if _rp_v > 0:
+                            try: setattr(_existing_canon, _price_attr, _rp_v)
+                            except Exception: pass
+                    # Merge bid-proven peak only
+                    _rp_src = str(getattr(_rp, "live_executable_price_source", "") or "").lower()
+                    if _rp_src == "bid":
+                        _rp_peak = float(getattr(_rp, "peak_pnl_pct", 0.0) or 0.0)
+                        _cn_peak = float(getattr(_existing_canon, "peak_pnl_pct", 0.0) or 0.0)
+                        if _rp_peak > _cn_peak:
+                            try:
+                                _existing_canon.peak_pnl_pct   = _rp_peak
+                                _existing_canon.max_profit_seen = _rp_peak
+                                _existing_canon.touched_profit  = (_rp_peak >= 0.05)
+                            except Exception as _e:
+                                log.debug("[exit_eng] merge peak from repair: %s", _e)
+
+                    _rp_id = str(getattr(_rp, "position_id", "") or "")
+                    self._positions.remove(_rp)
+                    self._positions_by_id.pop(_rp_id, None)
+                    log.info(
+                        "[exit_eng] ALREADY_CANONICAL_REPAIR_REMOVED | "
+                        "canonical=%s repair=%s contract=%s",
+                        _canon_id, _rp_id, _contract,
+                    )
+
+                # Assert exactly one nonclosed active object for this contract.
+                _active_for_contract = [
+                    p for p in self._positions
+                    if str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
+                    and not getattr(p, "closed", False)
+                ]
+                if len(_active_for_contract) != 1:
+                    log.critical(
+                        "[exit_eng] CANONICAL_COLLAPSE_INVARIANT_VIOLATED | "
+                        "contract=%s active_count=%d — expected exactly 1",
+                        _contract, len(_active_for_contract),
+                    )
+
+                return CanonicalAdoptionResult(
+                    disposition="ALREADY_CANONICAL_REPAIR_REMOVED",
+                    adopted=True, safe_to_seed=False, retryable=False,
+                    reason=f"removed_{len(_repairs_to_remove)}_repair_objects",
+                )
+
+            for pos in self._positions:
+                _pid = str(pos.position_id or "")
+                _sym = str(pos.option_symbol or "").upper().strip()
+                _is_repair = _pid.startswith("broker-repair-")
+                _same_contract = (_sym == _contract)
+                if not (_is_repair and _same_contract and not pos.closed):
+                    continue
+
+                # ── Blocker 5: Client and mode fencing ────────────────────────
+                # The repair position must belong to the same client and a
+                # compatible execution mode before we overwrite identity fields.
+                _repair_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                if _client and _repair_client and _repair_client != _client:
+                    log.critical(
+                        "[exit_eng] RETRY_CLIENT_MISMATCH | "
+                        "contract=%s repair_client=%s canonical_client=%s — "
+                        "refusing cross-client adoption",
+                        _contract, _repair_client, _client,
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_CLIENT_MISMATCH", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason=f"repair_client={_repair_client} != {_client}",
+                    )
+
+                _repair_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                _mode_ok = (
+                    not _repair_mode
+                    or not _mode
+                    or _repair_mode == _mode
+                    or _repair_mode in ("", "unknown")
+                    or (_mode == "live" and _repair_mode in ("", "unknown"))
+                )
+                if not _mode_ok:
+                    log.critical(
+                        "[exit_eng] RETRY_MODE_MISMATCH | "
+                        "contract=%s repair_mode=%s canonical_mode=%s — "
+                        "refusing incompatible mode adoption",
+                        _contract, _repair_mode, _mode,
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_MODE_MISMATCH", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason=f"repair_mode={_repair_mode} vs canonical={_mode}",
+                    )
+
+                # Found a valid broker-repair position — upgrade in place.
+                old_id = _pid
+
+                # ── Blocker 3: Remove contaminated midpoint state ────────────
+                _prior_peak_source = str(
+                    getattr(pos, "live_executable_price_source", "")
+                    or getattr(pos, "liveexecutablepricesource", "")
+                    or ""
+                ).lower().strip()
+                _prior_peak_is_bid_proven = (_prior_peak_source == "bid")
+
+                if entry_fill > 0:
+                    pos.entry_price = entry_fill
+                    _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    if _fresh_bid > 0:
+                        _rebased_pnl = (_fresh_bid - entry_fill) / entry_fill
+                    else:
+                        _rebased_pnl = 0.0
+
+                    if _prior_peak_is_bid_proven:
+                        _keep_peak = max(
+                            float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0),
+                            _rebased_pnl,
+                        )
+                        pos.peak_pnl_pct    = _keep_peak
+                        pos.max_profit_seen = _keep_peak
+                        pos.touched_profit  = (_keep_peak >= 0.05)
+                    else:
+                        pos.peak_pnl_pct    = max(0.0, _rebased_pnl)
+                        pos.max_profit_seen = max(0.0, _rebased_pnl)
+                        pos.touched_profit  = (_rebased_pnl >= 0.05)
+
+                # ── Canonical identity fields ──────────────────────────────────
+                pos.position_id = _canon_id
+                if client_id:
+                    pos.client_id = _client
+                if signal_id:
+                    pos.signal_id = signal_id
+                if canonical_signal_id:
+                    try:
+                        pos.canonical_signal_id = canonical_signal_id
+                    except Exception as _e:
+                        log.debug("[exit_eng] adopt canonical_signal_id: %s", _e)
+                if execution_mode:
+                    pos.execution_mode = _mode
+
+                # Order / broker identity
+                try:
+                    pos.entry_local_order_id = local_order_id
+                except Exception as _e:
+                    log.debug("[exit_eng] adopt entry_local_order_id: %s", _e)
+                try:
+                    pos.entry_broker_order_id = broker_order_id
+                except Exception as _e:
+                    log.debug("[exit_eng] adopt entry_broker_order_id: %s", _e)
+
+                # ── Blocker 3+4: Normalize canonical fill timestamp ────────────
+                if entry_ts is not None or order_filled_ts is not None:
+                    try:
+                        _norm_ts = _normalize_canonical_ts(
+                            entry_ts,
+                            fallback=order_filled_ts,
+                            local_order_id=local_order_id or "",
+                        )
+                        pos.opened_at = _norm_ts
+                    except Exception as _e:
+                        log.debug("[exit_eng] adopt opened_at: %s", _e)
+
+                if underlying_entry > 0:
+                    try:
+                        pos.underlying_entry = underlying_entry
+                    except Exception as _ue_err:
+                        log.debug("[exit_eng] adopt: underlying_entry set skipped: %s", _ue_err)
+
+                # Signal metadata — written to both direct attrs and pos.signal
+                # so proof and exit code reading either surface gets canonical values.
+                _sig_patch: dict = {}
+                if score:
+                    try: pos.score = score
+                    except Exception as _e: log.debug("[exit_eng] adopt score: %s", _e)
+                    _sig_patch["score"] = score
+                if tier:
+                    try: pos.tier = tier
+                    except Exception as _e: log.debug("[exit_eng] adopt tier: %s", _e)
+                    _sig_patch["tier"] = tier
+                if pattern:
+                    try: pos.pattern = pattern
+                    except Exception as _e: log.debug("[exit_eng] adopt pattern: %s", _e)
+                    _sig_patch["pattern"] = pattern
+                if timeframe:
+                    try: pos.timeframe = timeframe
+                    except Exception as _e: log.debug("[exit_eng] adopt timeframe: %s", _e)
+                    _sig_patch["timeframe"] = timeframe
+                if direction:
+                    try: pos.side = direction.upper()
+                    except Exception as _e: log.debug("[exit_eng] adopt side: %s", _e)
+                    _sig_patch["side"] = direction.upper()
+                if underlying_stop > 0:
+                    try: pos.underlying_stop = underlying_stop
+                    except Exception as _e: log.debug("[exit_eng] adopt underlying_stop: %s", _e)
+                if underlying_target > 0:
+                    try: pos.underlying_target = underlying_target
+                    except Exception as _e: log.debug("[exit_eng] adopt underlying_target: %s", _e)
+                if canonical_signal_id:
+                    _sig_patch["canonical_signal_id"] = canonical_signal_id
+                if signal_id:
+                    _sig_patch["signal_id"] = signal_id
+                if execution_mode:
+                    _sig_patch["execution_mode"] = _mode
+
+                if _sig_patch:
+                    try:
+                        _existing_sig = getattr(pos, "signal", None)
+                        if isinstance(_existing_sig, dict):
+                            _existing_sig.update(_sig_patch)
+                        else:
+                            pos.signal = _sig_patch
+                    except Exception as _sig_err:
+                        log.debug("[exit_eng] adopt signal dict merge failed: %s", _sig_err)
+
+                # Update O(1) index atomically
+                self._positions_by_id.pop(old_id, None)
+                self._positions_by_id[_canon_id] = pos
+
+                log.info(
+                    "[exit_eng] CANONICAL_POSITION_ADOPTED "
+                    "contract=%s old_id=%s new_id=%s local_order=%s broker_order=%s "
+                    "signal_id=%s execution_mode=%s entry_fill=%.4f opened_at=%s "
+                    "underlying_entry=%.4f peak_pnl_pct=%.2f%% touched_profit=%s",
+                    _contract, old_id, _canon_id,
+                    local_order_id or "?", broker_order_id or "?",
+                    signal_id or "?", _mode, entry_fill or 0.0,
+                    str(entry_ts or ""),
+                    float(underlying_entry or 0.0),
+                    (pos.peak_pnl_pct or 0.0) * 100,
+                    pos.touched_profit,
+                )
+                return CanonicalAdoptionResult(
+                    disposition="ADOPTED", adopted=True,
+                    safe_to_seed=False, retryable=False,
+                )
+
+        return CanonicalAdoptionResult(
+            disposition="NO_REPAIR_FOUND", adopted=False,
+            safe_to_seed=True, retryable=False,
+        )
+
     def add_position(self, pos: ManagedPosition):
         """Track a newly broker-confirmed open position for exit protection."""
         if pos is None:
@@ -2584,19 +3159,30 @@ class APExitEngine:
                     continue
 
                 try:
-                    current_underlying = float(snap.get("current_underlying") or 0.0)
+                    current_underlying   = float(snap.get("current_underlying") or 0.0)
                     current_option_price = float(snap.get("current_option_price") or 0.0)
-                    current_bid = float(snap.get("current_bid") or 0.0)
-                    current_ask = float(snap.get("current_ask") or 0.0)
+                    current_bid          = float(snap.get("current_bid") or 0.0)
+                    current_ask          = float(snap.get("current_ask") or 0.0)
+                    analytics_mark       = float(snap.get("analytics_mark_price") or 0.0)
 
                     if current_underlying > 0:
                         pos.current_underlying = current_underlying
+                    # P0 contract: QPM already writes bid-based current_option_price
+                    # for LIVE positions. apply_quote_snapshots trusts that invariant
+                    # and propagates it. analytics_mark_price is always propagated
+                    # separately for charts.
                     if current_option_price > 0:
                         pos.current_option_price = current_option_price
                     if current_bid > 0:
                         pos.current_bid = current_bid
                     if current_ask > 0:
                         pos.current_ask = current_ask
+                    if analytics_mark > 0:
+                        try:
+                            pos.analytics_mark_price = analytics_mark
+                            pos.analyticsmarkprice   = analytics_mark
+                        except Exception:
+                            pass
 
                     if snap.get("last_underlying_quote_update_ts") is not None:
                         pos.last_underlying_quote_update_ts = snap.get("last_underlying_quote_update_ts")
@@ -4789,12 +5375,15 @@ class APExitEngine:
             _quote_status = "OK" if broker_mark > 0 else "QUOTE_UNAVAILABLE"
 
             # Position is ALWAYS added regardless of quote availability
-            if broker_mark > 0:
-                pos.current_option_price = broker_mark
-                if hasattr(pos, "current_bid"):
-                    pos.current_bid = broker_bid
-                if hasattr(pos, "current_ask"):
-                    pos.current_ask = broker_ask
+            if broker_mark > 0 or broker_bid > 0:
+                # P0 fix: route through the authoritative quote helper so LIVE
+                # positions get bid-based current_option_price, not broker_mark.
+                _broker_aqr = _apply_option_quote_for_decision(
+                    pos,
+                    bid  = broker_bid,
+                    ask  = broker_ask,
+                    mark = broker_mark,
+                )
             else:
                 log.warning(
                     "[exit_eng] EXIT_BROKER_PRECHECK_QUOTE_UNAVAILABLE "
@@ -4803,10 +5392,12 @@ class APExitEngine:
                     self._email, sym,
                 )
 
-            # Seed peak P&L / touched_profit if broker price shows a gain
+            # Seed peak P&L / touched_profit using executable price (never mid).
             broker_pnl_pct = 0.0
-            if pos.entry_price > 0 and broker_mark > 0:
-                broker_pnl_pct = (broker_mark - pos.entry_price) / pos.entry_price
+            _seed_exec_price = (pos.current_option_price if pos.current_option_price > 0
+                                else (broker_bid if broker_bid > 0 else 0.0))
+            if pos.entry_price > 0 and _seed_exec_price > 0:
+                broker_pnl_pct = (_seed_exec_price - pos.entry_price) / pos.entry_price
                 if broker_pnl_pct > 0:
                     if broker_pnl_pct > pos.peak_pnl_pct:
                         pos.peak_pnl_pct = broker_pnl_pct
@@ -5048,11 +5639,19 @@ class APExitEngine:
                 if _quote_authority_available and _QUOTES is not None:
                     _snap = _QUOTES.get_fresh(pos.option_symbol, max_age_s=12)
                     if _snap is not None:
-                        if _snap.bid > 0:
-                            pos.current_bid          = _snap.bid
-                            pos.current_ask          = _snap.ask
-                            pos.current_option_price = _snap.mid
-                            pos.last_option_quote_update_ts  = now_utc
+                        if _snap.bid > 0 or _snap.ask > 0:
+                            # P0 fix: route through the single authoritative quote helper.
+                            # LIVE positions must use bid, never _snap.mid.
+                            _apply_option_quote_for_decision(
+                                pos,
+                                bid      = float(_snap.bid or 0.0),
+                                ask      = float(_snap.ask or 0.0),
+                                mark     = float(getattr(_snap, "mid", 0.0)
+                                                 or getattr(_snap, "mark", 0.0)
+                                                 or 0.0),
+                                quote_ts = now_utc,
+                                source   = "",   # helper stamps bid/paper based on mode
+                            )
                             pos.last_option_quote_missing_ts = None
                             pos.last_quote_update_ts  = now_utc
                             pos.last_quote_missing_ts = None
@@ -6241,10 +6840,13 @@ class APExitEngine:
                 if oq:
                     bid = float(oq.get("bid", 0) or 0)
                     ask = float(oq.get("ask", 0) or 0)
-                    if bid > 0 and ask > 0:
-                        pos.current_bid          = bid
-                        pos.current_ask          = ask
-                        pos.current_option_price = (bid + ask) / 2
-                        pos.last_option_quote_update_ts = now_utc
+                    if bid > 0 or ask > 0:
+                        _apply_option_quote_for_decision(
+                            pos,
+                            bid      = bid,
+                            ask      = ask,
+                            mark     = float(oq.get("mark", 0) or oq.get("mid", 0) or 0),
+                            quote_ts = now_utc,
+                        )
 
         log.info("_refresh_quotes: refreshed %d position(s) with live quotes", len(active))

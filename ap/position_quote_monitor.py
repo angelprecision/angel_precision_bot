@@ -429,9 +429,85 @@ class APPositionQuoteMonitor:
                     or _safe_float(_get_attr(pos, "avgfill", "avg_fill_price", default=None), 0.0)
                     or _safe_float(_get_attr(pos, "entry_fill_price", default=None), 0.0)
                 )
+                # cur_opt is the analytics mark (mid/mark) — retained for charting only.
                 cur_opt = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
-                if cost_basis > 0 and cur_opt > 0:
-                    pnl_pct = (cur_opt - cost_basis) / cost_basis
+
+                # ── Blocker 1: Three-tier execution mode classification ────────
+                # Only exact "paper" may use midpoint/mark simulation.
+                # Blank, unknown, None, or malformed must never use PAPER mid.
+                _raw_exec_mode = str(
+                    _get_attr(pos, "executionmode", "execution_mode", default="") or ""
+                ).strip()
+                _norm_mode = _raw_exec_mode.lower()
+                if _norm_mode == "paper":
+                    _pricing_mode = "paper"
+                elif _norm_mode == "live":
+                    _pricing_mode = "live"
+                else:
+                    # blank / "unknown" / malformed / missing → conservative path
+                    _pricing_mode = "live_risk_unproven"
+
+                self._write_field(pos, "pricing_mode",       _pricing_mode)
+                self._write_field(pos, "raw_execution_mode", _raw_exec_mode)
+
+                # Always write analytics mark for charting / observability.
+                self._write_field(pos, "analytics_mark_price", cur_opt)
+                self._write_field(pos, "analyticsmarkprice",   cur_opt)
+
+                # ── Blocker 2: Executable price selection ──────────────────────
+                # LIVE / live_risk_unproven: decision price is the bid only.
+                # Missing bid → executable quote invalid; suppress all profit decisions.
+                # mark/ask/mid may NOT overwrite current_option_price for live paths.
+                cur_bid_now = _safe_float(_get_attr(pos, "currentbid", "current_bid", default=None), 0.0)
+
+                if _pricing_mode == "paper":
+                    exec_price = cur_opt
+                    _exec_quote_valid = cur_opt > 0
+                    self._write_field(pos, "live_executable_price_source", "paper_mid_simulation")
+                    self._write_field(pos, "liveexecutablepricesource",    "paper_mid_simulation")
+                    self._write_field(pos, "executable_quote_valid",       _exec_quote_valid)
+                    self._write_field(pos, "executable_exit_price",        exec_price)
+                else:
+                    # LIVE or live_risk_unproven: bid is the only valid exit price.
+                    if cur_bid_now > 0:
+                        exec_price = cur_bid_now
+                        _exec_quote_valid = True
+                        _src = "bid" if _pricing_mode == "live" else "bid_live_risk_unproven"
+                        self._write_field(pos, "live_executable_price_source", _src)
+                        self._write_field(pos, "liveexecutablepricesource",    _src)
+                        self._write_field(pos, "executable_quote_valid",       True)
+                        self._write_field(pos, "executable_exit_price",        exec_price)
+                        # Override current_option_price to bid so exit engine's
+                        # option_pnl_pct returns executable P&L.
+                        self._write_field(pos, "currentoptionprice",  cur_bid_now)
+                        self._write_field(pos, "current_option_price", cur_bid_now)
+                    else:
+                        # Missing bid — do NOT let mark/ask remain as the exit engine's
+                        # decision price.  The opt_price written above may be ask or
+                        # mark; clear it from current_option_price now.
+                        exec_price = 0.0
+                        _exec_quote_valid = False
+                        _src = "bid_missing" if _pricing_mode == "live" else "bid_missing_live_risk_unproven"
+                        self._write_field(pos, "live_executable_price_source", _src)
+                        self._write_field(pos, "liveexecutablepricesource",    _src)
+                        self._write_field(pos, "executable_quote_valid",       False)
+                        self._write_field(pos, "executable_exit_price",        0.0)
+                        # Explicitly zero out current_option_price so the exit engine's
+                        # option_pnl_pct cannot use the mark/ask that was written
+                        # earlier in this cycle.
+                        self._write_field(pos, "currentoptionprice",  0.0)
+                        self._write_field(pos, "current_option_price", 0.0)
+                        log.warning(
+                            "[%s] LIVE_EXECUTABLE_MODE_OR_BID_UNPROVEN | "
+                            "pos=%s contract=%s pricing_mode=%s raw_mode=%r "
+                            "bid=0 analytics_mark=%.4f — "
+                            "non-emergency profit decisions suppressed",
+                            self.client_id, pid, c, _pricing_mode, _raw_exec_mode, cur_opt,
+                        )
+                        self.request_immediate_refresh(c)
+
+                if cost_basis > 0 and exec_price > 0 and _exec_quote_valid:
+                    pnl_pct = (exec_price - cost_basis) / cost_basis
                     peak = max(
                         pnl_pct,
                         _safe_float(_get_attr(pos, "peakpnlpct", "peak_pnl_pct", default=None), float("-inf")),
@@ -447,25 +523,21 @@ class APPositionQuoteMonitor:
                         self._write_field(pos, "touchedprofit", True)
                         self._write_field(pos, "touched_profit", True)
 
-                    # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
-                    # Persist quote/PnL to positions table. Throttled and
-                    # non-fatal. Dashboard/audit/restart-recovery only —
-                    # the exit engine continues to read in-memory state.
                     self._persist_quote_to_db(
                         position_id     = pid,
-                        option_price    = cur_opt,
+                        option_price    = exec_price,
                         underlying_price= und_last,
                         option_pnl_pct  = pnl_pct,
                         now_utc         = now_utc,
                     )
                     self._persist_mfe_mae_to_orders(
-                        position_id = pid,
-                        contract    = c,
+                        position_id    = pid,
+                        contract       = c,
                         option_pnl_pct = pnl_pct,
-                        now_utc     = now_utc,
-                        source      = price_source,
+                        now_utc        = now_utc,
+                        source         = ("bid" if _pricing_mode != "paper" else price_source),
                     )
-                elif cost_basis > 0 and cur_opt <= 0:
+                elif cost_basis > 0 and (exec_price <= 0 or not _exec_quote_valid):
                     self._mark_mfe_mae_unavailable(
                         position_id = pid,
                         contract = c,

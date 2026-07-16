@@ -229,7 +229,14 @@ def get_pending_orders(client_id: str) -> list[dict]:
                     trigger_price,
                     timeframe,
                     filled_qty,
-                    fill_price
+                    fill_price,
+                    execution_mode,
+                    filled_ts,
+                    meta,
+                    meta->>'canonical_signal_id' AS canonical_signal_id,
+                    meta->>'underlying_entry'    AS underlying_entry_meta,
+                    meta->>'entry_underlying'    AS entry_underlying_meta,
+                    meta->>'last_underlying_price' AS last_underlying_price_meta
                 FROM orders
                 WHERE client_id = %s
                   AND kind IN ('ENTRY','EXIT')
@@ -1210,6 +1217,12 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
 
     PR #235 (hardening #2): resolve side from order/OCC — fail-closed on
     unresolved, do NOT default to CALL.
+
+    Repair 4: If the exit engine already holds a broker-repair position for
+    the same contract, upgrade it to canonical identity instead of creating
+    a second in-memory position.  This closes the BA production incident:
+    the broker-repair position held synthetic ID and unknown execution_mode;
+    exits and proof rows were never attributed to the canonical fill.
     """
     if not exit_engine or not position_id:
         return
@@ -1221,6 +1234,96 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     if not _side:
         _emit_side_unresolved(order, reason_code="EXIT_ENGINE_SEED_SIDE_UNRESOLVED")
         return
+
+    # ── Repair 4: canonical adoption of broker-repair position ───────────────
+    # Before creating a new position, check whether the exit engine is already
+    # tracking a broker-repair position for the same contract. If yes, upgrade
+    # it atomically so we never have two in-memory positions for the same open
+    # trade and all subsequent exits use canonical identity.
+    _contract_for_adopt = str(order.get("contract") or order.get("symbol") or "").upper().strip()
+    _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
+    if callable(_adopt_fn) and _contract_for_adopt and position_id:
+        try:
+            _entry_fill_for_adopt = _safe_float(
+                result.get("avg_fill") or order.get("fill_price") or 0.0
+            )
+            # Blocker 4: canonical fill timestamp (broker > order fallback > now).
+            from datetime import datetime, timezone as _tz
+            _now_utc = datetime.now(_tz.utc)
+            _entry_ts_for_adopt = (
+                result.get("filled_ts")
+                or result.get("filled_at")
+                or result.get("timestamp")
+                or order.get("filled_ts")
+                or _now_utc
+            )
+            # Blocker 4: underlying entry with same precedence as normal seeding.
+            _underlying_entry_for_adopt = _safe_float(
+                order.get("underlying_entry")
+                or order.get("entry_underlying")
+                or order.get("last_underlying_price")
+                or order.get("last_underlying_price_meta")
+                or order.get("entry_underlying_meta")
+                or order.get("underlying_entry_meta")
+                or order.get("trigger_price")
+                or 0.0
+            )
+            _adopted = _adopt_fn(
+                contract              = _contract_for_adopt,
+                canonical_position_id = position_id,
+                local_order_id        = str(order.get("local_order_id") or ""),
+                broker_order_id       = str(order.get("broker_order_id") or ""),
+                signal_id             = signal_id or str(order.get("signal_id") or ""),
+                canonical_signal_id   = str(order.get("canonical_signal_id") or ""),
+                entry_fill            = _entry_fill_for_adopt,
+                entry_ts              = _entry_ts_for_adopt,
+                order_filled_ts       = order.get("filled_ts"),
+                execution_mode        = str(order.get("execution_mode") or ""),
+                client_id             = str(order.get("client_id") or ""),
+                underlying_entry      = _underlying_entry_for_adopt,
+                score                 = _safe_float(order.get("score") or 0.0),
+                tier                  = str(order.get("tier") or ""),
+                pattern               = str(order.get("pattern") or ""),
+                direction             = str(order.get("direction") or _side or ""),
+                timeframe             = str(order.get("timeframe") or ""),
+                underlying_stop       = _safe_float(order.get("stop_underlying") or order.get("underlying_stop") or 0.0),
+                underlying_target     = _safe_float(order.get("target_underlying") or order.get("underlying_target") or 0.0),
+            )
+
+            # Handle CanonicalAdoptionResult (structured) or legacy bool.
+            _disposition = getattr(_adopted, "disposition", None)
+            if _disposition in ("ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED"):
+                log.info(
+                    "[%s] _seed_exit_engine: %s contract=%s position_id=%s",
+                    order.get("client_id"), _disposition, _contract_for_adopt, position_id,
+                )
+                return
+            elif _disposition == "NO_REPAIR_FOUND":
+                pass  # fall through to normal seed
+            elif _disposition and _disposition.startswith("RETRY_"):
+                # Adoption conflict — must NOT fall through to add_position.
+                # Retaining existing protective monitoring; do not create duplicate exit owner.
+                log.critical(
+                    "[%s] CANONICAL_ADOPTION_RETRY_REQUIRED | "
+                    "disposition=%s contract=%s position_id=%s reason=%s — "
+                    "protective monitoring retained; no new exit owner created",
+                    order.get("client_id"), _disposition,
+                    _contract_for_adopt, position_id,
+                    getattr(_adopted, "reason", ""),
+                )
+                return
+            elif _adopted is True:  # legacy bool path
+                return
+            elif _adopted is False:  # legacy bool — no repair found, seed normally
+                pass
+        except Exception as _adopt_err:
+            log.critical(
+                "[%s] CANONICAL_ADOPTION_RETRY_REQUIRED | "
+                "disposition=RETRY_ADOPTION_ERROR contract=%s: %s — "
+                "protective monitoring retained; NOT falling through to add_position",
+                order.get("client_id"), _contract_for_adopt, _adopt_err,
+            )
+            return
 
     try:
         getter = getattr(exit_engine, "get_position", None)
@@ -1262,6 +1365,12 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.position_id = position_id
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
+        # Repair 5: preserve execution_mode from the order so proof rows
+        # record "live" not "unknown".
+        try:
+            mp.execution_mode = str(order.get("execution_mode") or "")
+        except Exception:
+            pass
 
         try:
             mp.current_underlying = _safe_float(order.get("last_underlying_price") or 0.0)
