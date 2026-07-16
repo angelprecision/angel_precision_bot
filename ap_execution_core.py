@@ -37,6 +37,7 @@ from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.utils                import now_utc_iso
+from ap_canonical_signal     import build_canonical_signal_id
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -3845,6 +3846,7 @@ class APExecutionCore:
                     _prior_mat_attempt = 0
                 # ── AMENDMENT §3: strictly monotonic generation ──────────
                 _persisted_generation = 0
+                _durable_row = None
                 try:
                     _durable_row = self.order_state_machine.get_order(queue_local_order_id)
                     if isinstance(_durable_row, dict):
@@ -3859,6 +3861,7 @@ class APExecutionCore:
                         )
                 except Exception:
                     _persisted_generation = 0
+                    _durable_row = None
                 _mat_generation = _persisted_generation + 1
                 _deferred_claim_context.update({
                     "owner": _mat_owner,
@@ -3885,6 +3888,60 @@ class APExecutionCore:
                             or _mat_trigger_price
                             or 0
                         )
+                        _plan_meta_for_identity = getattr(approved_plan, "metadata", {}) or {}
+                        if not isinstance(_plan_meta_for_identity, dict):
+                            _plan_meta_for_identity = {}
+                        _signal_payload_for_identity = sig if isinstance(sig, dict) else {}
+                        _expected_source_signal_id = str(
+                            getattr(approved_plan, "signal_id", "")
+                            or _signal_payload_for_identity.get("signal_id", "")
+                            or ""
+                        ).strip()
+                        _durable_canonical_id = ""
+                        _durable_signal_id = ""
+                        _durable_client_id = ""
+                        _durable_exec_mode = ""
+                        if isinstance(_durable_row, dict):
+                            _durable_canonical_id = str(_durable_row.get("canonical_signal_id") or "").strip()
+                            _durable_signal_id = str(_durable_row.get("signal_id") or "").strip()
+                            _durable_client_id = str(_durable_row.get("client_id") or "").strip().lower()
+                            _durable_exec_mode = str(_durable_row.get("execution_mode") or "").strip().lower()
+                        _canonical_signal_id = str(
+                            _durable_canonical_id
+                            or getattr(approved_plan, "canonical_signal_id", "")
+                            or _plan_meta_for_identity.get("canonical_signal_id", "")
+                            or _signal_payload_for_identity.get("canonical_signal_id", "")
+                            or build_canonical_signal_id(
+                                _expected_source_signal_id,
+                                _signal_payload_for_identity,
+                            )
+                            or ""
+                        ).strip()
+                        _identity_ok = (
+                            bool(_canonical_signal_id)
+                            and bool(_expected_source_signal_id)
+                            and _durable_canonical_id == _canonical_signal_id
+                            and _durable_signal_id == _expected_source_signal_id
+                            and _durable_client_id == str(_breach_client_id or "").strip().lower()
+                            and _durable_exec_mode == str(_mat_exec_mode or "").strip().lower()
+                        )
+                        if not _identity_ok:
+                            log.critical(
+                                "[%s] MATERIALIZATION_IDENTITY_MISMATCH order=%s "
+                                "durable_signal=%s expected_signal=%s durable_canonical=%s "
+                                "resolved_canonical=%s durable_client=%s expected_client=%s "
+                                "durable_mode=%s expected_mode=%s — selector and broker blocked",
+                                ticker, queue_local_order_id,
+                                _durable_signal_id, _expected_source_signal_id,
+                                _durable_canonical_id, _canonical_signal_id,
+                                _durable_client_id, str(_breach_client_id or "").strip().lower(),
+                                _durable_exec_mode, str(_mat_exec_mode or "").strip().lower(),
+                            )
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": "MATERIALIZATION_IDENTITY_MISMATCH",
+                                "retry_after_seconds": 5,
+                            }
                         _mat_claimed = bool(_mat_claim(
                             str(queue_local_order_id or ""),
                             owner=_mat_owner,
@@ -3893,8 +3950,12 @@ class APExecutionCore:
                             trigger_crossed_at=_crossed_at,
                             trigger_price=_mat_trigger_price,
                             observed_underlying_price=_observed_underlying,
-                            signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                            signal_id=_expected_source_signal_id,
                             execution_mode=_mat_exec_mode,
+                            canonical_signal_id=_canonical_signal_id,
+                            expected_order_status="PENDING_TRIGGER",
+                            expected_materialization_status="WAITING_FOR_TRIGGER",
+                            expected_lifecycle_state="",
                         ))
                     except Exception as _mat_claim_exc:
                         log.critical(
@@ -3912,6 +3973,48 @@ class APExecutionCore:
                             return {"disposition": "SUBMITTED"}
                         if _claim_status in {"REJECTED", "EXPIRED", "CANCELED", "ERROR"}:
                             return {"disposition": "TERMINAL_DURABLE"}
+                        _claim_meta = _claim_row.get("meta") or {}
+                        if isinstance(_claim_meta, str):
+                            try:
+                                _claim_meta = json.loads(_claim_meta)
+                            except Exception:
+                                _claim_meta = {}
+                        _claim_owner = str((_claim_meta or {}).get("materialization_owner") or "").strip()
+                        _claim_lease = str((_claim_meta or {}).get("materialization_lease_until") or "").strip()
+                        _claim_lease_live = False
+                        if _claim_lease:
+                            try:
+                                _lease_dt = datetime.fromisoformat(_claim_lease.replace("Z", "+00:00"))
+                                if _lease_dt.tzinfo is None:
+                                    _lease_dt = _lease_dt.replace(tzinfo=timezone.utc)
+                                _claim_lease_live = _lease_dt > datetime.now(timezone.utc)
+                            except Exception:
+                                _claim_lease_live = False
+                        _claim_canonical = str(_claim_row.get("canonical_signal_id") or "").strip()
+                        _claim_client = str(_claim_row.get("client_id") or "").strip().lower()
+                        _claim_mode = str(_claim_row.get("execution_mode") or "").strip().lower()
+                        _already_owned = (
+                            _claim_status == "PENDING_TRIGGER"
+                            and str((_claim_meta or {}).get("lifecycle_state") or "").upper() == "MATERIALIZING"
+                            and bool((_claim_meta or {}).get("materialization_in_flight"))
+                            and bool(_claim_owner)
+                            and _claim_lease_live
+                            and _claim_client == str(_breach_client_id or "").strip().lower()
+                            and _claim_mode == str(_mat_exec_mode or "").strip().lower()
+                            and _claim_canonical == str(_canonical_signal_id or "").strip()
+                        )
+                        if _already_owned:
+                            log.info(
+                                "[%s] MATERIALIZATION_ALREADY_CLAIMED order=%s owner=%s "
+                                "canonical_signal_id=%s lease_until=%s",
+                                ticker, queue_local_order_id, _claim_owner,
+                                _claim_canonical, _claim_lease,
+                            )
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": "MATERIALIZATION_ALREADY_CLAIMED",
+                                "retry_after_seconds": 2,
+                            }
                     log.critical(
                         "[%s] MATERIALIZATION_STATE_WRITE_FAILED order=%s — "
                         "selector and broker submission blocked; watcher retains ownership",

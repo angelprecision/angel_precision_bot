@@ -2098,6 +2098,10 @@ class APOrderStateMachine:
         # always shows the correct attempt count for the in-flight claim, even
         # if the process crashes between claim and schedule_deferred_materialization_retry.
         retry_attempt: int | None = None,
+        canonical_signal_id: str | None = None,
+        expected_order_status: str = "PENDING_TRIGGER",
+        expected_materialization_status: str | None = None,
+        expected_lifecycle_state: str | None = None,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -2133,6 +2137,8 @@ class APOrderStateMachine:
         _owner = str(owner or "").strip()
         _signal_id = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
+        _canonical = str(canonical_signal_id or "").strip()
+        _expected_order_status = str(expected_order_status or "PENDING_TRIGGER").strip().upper()
 
         # ── §3: resolve the target new generation ────────────────────
         # new_generation takes precedence when both are supplied.
@@ -2197,6 +2203,24 @@ class APOrderStateMachine:
             with conn() as c:
                 _attempt_predicate = ""
                 _attempt_params: list = []
+                _claim_predicates = [
+                    "UPPER(COALESCE(status,'')) = %s",
+                    "COALESCE(meta->>'submit_intent_at','') = ''",
+                ]
+                _claim_params: list = [_expected_order_status]
+                if _canonical:
+                    _claim_predicates.append("canonical_signal_id = %s")
+                    _claim_params.append(_canonical)
+                if expected_materialization_status:
+                    _claim_predicates.append(
+                        "COALESCE(meta->>'materialization_status','') IN ('', %s)"
+                    )
+                    _claim_params.append(str(expected_materialization_status).strip().upper())
+                if expected_lifecycle_state is not None:
+                    _claim_predicates.append(
+                        "COALESCE(meta->>'lifecycle_state','') = %s"
+                    )
+                    _claim_params.append(str(expected_lifecycle_state).strip().upper())
                 if _prev_attempt is not None:
                     # Verify the canonical retry_attempt is at the expected
                     # prior value — prevents double-claiming an attempt slot.
@@ -2212,7 +2236,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND kind = 'ENTRY'
-                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND """ + "\n                      AND ".join(_claim_predicates) + """
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
@@ -2226,7 +2250,7 @@ class APOrderStateMachine:
                     """ + _attempt_predicate,
                     (
                         _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _expected_previous_generation,
+                        *_claim_params, _signal_id, _mode, _now, _expected_previous_generation,
                         *_attempt_params,
                     ),
                 )

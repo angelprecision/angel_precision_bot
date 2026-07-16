@@ -2232,6 +2232,39 @@ class APContractSelectionEngine:
             "failure":   None,
         }
 
+        # Direct option requests are scarce. Prioritize rows that can plausibly
+        # fit the client's remaining position budget while preserving every
+        # existing quality gate and the later scoring/ranking pass. Unknown
+        # chain asks remain ahead of clearly unaffordable asks so a fresh quote
+        # can still rescue a stale chain row.
+        try:
+            _qty_for_affordability = max(1, int(
+                _safe_plan_attr(plan, "contracts", 1)
+                or _safe_plan_attr(plan, "quantity", 1)
+                or 1
+            ))
+        except (TypeError, ValueError):
+            _qty_for_affordability = 1
+        _max_affordable_premium = float(budget or 0) / (_qty_for_affordability * 100.0)
+        _chain_with_order = list(enumerate(chain))
+
+        def _affordability_order(item):
+            _index, _opt = item
+            try:
+                _ask = float(_opt.get("ask") or 0)
+            except (TypeError, ValueError):
+                _ask = 0.0
+            if _ask <= 0:
+                return (1, 0.0, _index)
+            _unaffordable = _ask > _max_affordable_premium
+            return (
+                1 if _unaffordable else 0,
+                max(0.0, _ask - _max_affordable_premium),
+                _index,
+            )
+
+        chain = [opt for _, opt in sorted(_chain_with_order, key=_affordability_order)]
+
         # ── B. HARD QUALITY FILTER ────────────────────────────────────────────
         # No self-mutation: effective thresholds passed directly to _quality_filter.
         # This is thread-safe when worker_loop and entry_watcher breach both call

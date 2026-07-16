@@ -2302,16 +2302,16 @@ class APStartupRecovery:
                 )
                 return c.fetchall()
 
-        # ── PR #143 regression fix: LIVE never replays WATCHING rows ─────
-        # The _reset() block above resets WATCHING → NEW and tags rows with
-        # payload.recovery_rescue=true. PR #143 used this for paper-mode
-        # immediate-entry recovery. On 2026-06-16 Jason's LIVE pod replayed
-        # 23 WATCHING rows through MC/contract_selector with current (post-
-        # trigger) market data. The selector's earnings/IV/chain gates
-        # rejected all 23 with contract_selection:no_contract_found. Zero
-        # live trades. LIVE must NEVER replay stale signals through the
-        # selector — it can only reattach watcher ownership to current-
-        # session WATCHING/PENDING_TRIGGER rows.
+        # ── PR #143 regression fix: LIVE never blind-replays WATCHING rows ─
+        # The _reset() block above is PAPER-only. It resets WATCHING → NEW and
+        # tags payload.recovery_rescue=true so PAPER recovery can immediately
+        # promote safe rows. LIVE recovery must not use that broad UPDATE:
+        # each WATCHING row is first loaded read-only, scoped to today's ET
+        # session, checked for exact client/mode/identity/geometry, checked
+        # for active ENTRY orders and broker/submission/fill truth, then either
+        # restored through the normal breach-only queue path or durably marked
+        # LIVE_RECOVERY_MISSED_TRIGGER if the trigger crossed while ownership
+        # was absent.
         #
         # Detection: read mc.mode (canonical mode source per execution_core
         # PR-B / FIX-3). Default to PAPER on lookup failure to preserve PR
@@ -2362,17 +2362,236 @@ class APStartupRecovery:
                 return False
             return any(_le.startswith(_p) for _p in _READINESS_SKIP_LAST_ERRORS)
 
+        def _recover_unowned_live_watching_signals() -> int:
+            session_start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+            session_end_et = session_start_et + timedelta(days=1)
+            session_start_utc = session_start_et.astimezone(timezone.utc).isoformat()
+            session_end_utc = session_end_et.astimezone(timezone.utc).isoformat()
+
+            def _load_candidates():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT id, client_id, signal_id, status, payload, created_ts,
+                               started_ts, finished_ts, last_error
+                        FROM trade_queue
+                        WHERE client_id = %s
+                          AND status = 'WATCHING'
+                          AND created_ts >= %s
+                          AND created_ts < %s
+                          AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
+                        ORDER BY created_ts ASC
+                        """,
+                        (self.client_id, session_start_utc, session_end_utc),
+                    )
+                    return c.fetchall()
+
+            def _active_entry_order_exists(signal_id: str, canonical_signal_id: str) -> bool:
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT 1
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND status IN ('CREATED','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL','PENDING_TRIGGER')
+                          AND (
+                                signal_id = %s
+                             OR (%s <> '' AND canonical_signal_id = %s)
+                          )
+                          AND (
+                                COALESCE(broker_order_id,'') <> ''
+                             OR submitted_ts IS NOT NULL
+                             OR filled_ts IS NOT NULL
+                             OR status = 'PENDING_TRIGGER'
+                          )
+                        LIMIT 1
+                        """,
+                        (self.client_id, signal_id, canonical_signal_id, canonical_signal_id),
+                    )
+                    return c.fetchone() is not None
+
+            def _current_underlying(symbol: str):
+                broker = self.broker
+                for method_name in ("get_quote", "quote"):
+                    method = getattr(broker, method_name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        raw = method(symbol)
+                    except Exception as exc:
+                        log.warning(
+                            "LIVE_RECOVERY_QUOTE_UNAVAILABLE client_id=%s symbol=%s method=%s error=%s",
+                            self.client_id, symbol, method_name, exc,
+                        )
+                        continue
+                    if isinstance(raw, dict):
+                        vals = [
+                            raw.get("last"), raw.get("mark"), raw.get("mid"),
+                            raw.get("price"), raw.get("ask"), raw.get("bid"),
+                        ]
+                    else:
+                        vals = [
+                            getattr(raw, "last", None), getattr(raw, "mark", None),
+                            getattr(raw, "mid", None), getattr(raw, "price", None),
+                            getattr(raw, "ask", None), getattr(raw, "bid", None),
+                        ]
+                    for val in vals:
+                        px = _safe_float(val, 0.0)
+                        if px > 0:
+                            return px
+                return None
+
+            def _payload_dict(row) -> dict:
+                payload = row.get("payload") if isinstance(row, dict) else None
+                if isinstance(payload, dict):
+                    return dict(payload)
+                if isinstance(payload, str):
+                    try:
+                        parsed = json.loads(payload)
+                        return parsed if isinstance(parsed, dict) else {}
+                    except Exception:
+                        return {}
+                return {}
+
+            def _classify(row) -> tuple[str, dict]:
+                row = dict(row or {})
+                payload = _payload_dict(row)
+                signal_id = str(row.get("signal_id") or payload.get("signal_id") or "").strip()
+                canonical_signal_id = str(payload.get("canonical_signal_id") or "").strip()
+                if not canonical_signal_id:
+                    try:
+                        from ap_canonical_signal import build_canonical_signal_id
+                        canonical_signal_id = build_canonical_signal_id(signal_id, payload)
+                    except Exception:
+                        canonical_signal_id = ""
+                symbol = str(
+                    payload.get("ticker") or payload.get("symbol") or payload.get("underlying") or ""
+                ).strip().upper()
+                direction = str(payload.get("direction") or payload.get("side") or "").strip().upper()
+                trigger = _safe_float(
+                    payload.get("trigger_price")
+                    or payload.get("entry_price")
+                    or payload.get("trigger")
+                    or payload.get("entry"),
+                    0.0,
+                )
+                last_error = row.get("last_error")
+                if _last_error_is_readiness_skip(last_error):
+                    return "skip", {"reason": "terminal_readiness_classification"}
+                if str(last_error or "").upper().startswith(("POLICY_", "RISK_VETO", "POLICY_BLOCKED")):
+                    return "skip", {"reason": "terminal_policy_classification"}
+                if not signal_id or not canonical_signal_id:
+                    return "skip", {"reason": "missing_canonical_signal_identity"}
+                if not symbol or direction not in {"CALL", "PUT"} or trigger <= 0:
+                    return "skip", {"reason": "invalid_symbol_direction_or_trigger"}
+                if _active_entry_order_exists(signal_id, canonical_signal_id):
+                    return "skip", {"reason": "active_entry_order_exists"}
+                current = _current_underlying(symbol)
+                if current is None:
+                    return "skip", {"reason": "current_underlying_unavailable"}
+                crossed = (
+                    current >= trigger if direction == "CALL"
+                    else current <= trigger
+                )
+                diag = {
+                    "client_id": self.client_id,
+                    "execution_mode": "live",
+                    "signal_id": signal_id,
+                    "canonical_signal_id": canonical_signal_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "trigger_price": trigger,
+                    "current_underlying": current,
+                    "trigger_crossed_at": payload.get("trigger_crossed_at") or "",
+                    "recovery_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "source_queue_row": row.get("id"),
+                    "reason": "ownership_absent_at_trigger" if crossed else "eligible_untriggered",
+                }
+                return ("missed" if crossed else "eligible"), diag
+
+            def _mark_missed(row_id, diag: dict) -> bool:
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE trade_queue
+                        SET last_error = 'LIVE_RECOVERY_MISSED_TRIGGER:ownership_absent_at_trigger',
+                            payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb,
+                            finished_ts = NOW()
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status = 'WATCHING'
+                        """,
+                        (json.dumps({"live_recovery_outcome": "LIVE_RECOVERY_MISSED_TRIGGER", **diag}, default=str),
+                         row_id, self.client_id),
+                    )
+                    return int(getattr(c, "rowcount", 0) or 0) == 1
+
+            def _restore(row_id, diag: dict) -> bool:
+                marker = {
+                    "live_recovery_outcome": "LIVE_RECOVERY_WATCHER_RESTORED",
+                    "live_recovery_breach_only": True,
+                    "live_recovery_restored_at": datetime.now(timezone.utc).isoformat(),
+                    "canonical_signal_id": diag.get("canonical_signal_id"),
+                }
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE trade_queue
+                        SET status = 'NEW',
+                            payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb,
+                            started_ts = NULL,
+                            finished_ts = NULL,
+                            last_error = NULL
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status = 'WATCHING'
+                        """,
+                        (json.dumps(marker, default=str), row_id, self.client_id),
+                    )
+                    return int(getattr(c, "rowcount", 0) or 0) == 1
+
+            restored = 0
+            rows = run_with_retry(_load_candidates) or []
+            for row in rows:
+                row = dict(row or {})
+                row_id = row.get("id")
+                outcome, diag = _classify(row)
+                if outcome == "eligible":
+                    if run_with_retry(lambda row_id=row_id, diag=diag: _restore(row_id, diag)):
+                        restored += 1
+                    continue
+                if outcome == "missed":
+                    run_with_retry(lambda row_id=row_id, diag=diag: _mark_missed(row_id, diag))
+                    log.warning(
+                        "LIVE_RECOVERY_MISSED_TRIGGER client_id=%s signal_id=%s canonical_signal_id=%s "
+                        "symbol=%s direction=%s trigger=%.4f current=%.4f reason=ownership_absent_at_trigger",
+                        self.client_id,
+                        diag.get("signal_id"),
+                        diag.get("canonical_signal_id"),
+                        diag.get("symbol"),
+                        diag.get("direction"),
+                        float(diag.get("trigger_price") or 0),
+                        float(diag.get("current_underlying") or 0),
+                    )
+                    continue
+                log.info(
+                    "LIVE_RECOVERY_WATCHING_SKIP client_id=%s signal_id=%s reason=%s",
+                    self.client_id,
+                    row.get("signal_id"),
+                    diag.get("reason"),
+                )
+            return restored
+
         if _is_live:
-            # Audit-required log; emitted before any DB write so it's
-            # visible even if downstream paths fail.
+            # LIVE recovery only restores rows that passed the classifier
+            # above. It never writes the PAPER immediate-promotion marker.
             log.warning(
-                "LIVE_RECOVERY_REPLAY_SKIPPED client_id=%s mode=%s "
-                "reason=live_no_replay_policy lookback_hours=%d cutoff=%s "
-                "| WATCHING rows are NOT reset for LIVE clients; only "
-                "orphaned PENDING_TRIGGER watcher reattachment will run",
-                self.client_id, _mc_mode, _lookback_hours, cutoff_utc[:19],
+                "LIVE_RECOVERY_CLASSIFIED_RESEED client_id=%s mode=%s "
+                "session_date_et=%s | loading WATCHING rows before mutation",
+                self.client_id, _mc_mode, now_et.date().isoformat(),
             )
-            count = 0  # No WATCHING rows reset for LIVE.
+            count = int(run_with_retry(_recover_unowned_live_watching_signals) or 0)
         else:
             count = run_with_retry(_reset) or 0
         rearmed = 0
@@ -2547,7 +2766,7 @@ class APStartupRecovery:
         result["already_verified_owner_rows"] = int(already_verified_owner_rows or 0)
         result["watchers_requeued"] = count + rearmed
         log.info(
-            "[%s] RECOVERY: %d WATCHING signals reset to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
+            "[%s] RECOVERY: %d WATCHING signals restored to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
             "for watcher reseed (lookback=%dh cutoff=%s)",
             self.client_id, count, rearmed, _lookback_hours, cutoff_utc[:19],
         )
