@@ -68,6 +68,7 @@ jobs:
             tests/test_p0_final_duplicate_honesty.py \
             tests/test_p0_setup_lifecycle_owner.py \
             tests/test_p0_deferred_due_retry_ownership.py \
+            tests/test_p0_watcher_materialization_ownership.py \
             tests/test_p0_fenced_retry_terminalization.py \
             tests/test_p0_deferred_materialization_copyback_before_proof.py \
             tests/test_p0_amendment3_monotonic_generation_fencing.py \
