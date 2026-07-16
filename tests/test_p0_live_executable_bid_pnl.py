@@ -1073,3 +1073,322 @@ class TestNormalizeCanonicalTs:
         assert opened_at is not None
         assert hasattr(opened_at, "tzinfo") and opened_at.tzinfo is not None
         assert opened_at.hour == 9
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P0 — Direct _exit_loop / _apply_option_quote_for_decision tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestExitLoopQuoteAuthority:
+    """Exact BA regression: _QUOTES.get_fresh() must not write _snap.mid to
+    current_option_price for a LIVE position."""
+
+    def _make_snap(self, bid, ask, mid=None, underlying=220.0):
+        snap = SimpleNamespace(
+            bid             = bid,
+            ask             = ask,
+            mid             = mid if mid is not None else round((bid + ask) / 2.0, 4),
+            mark            = mid if mid is not None else round((bid + ask) / 2.0, 4),
+            underlying_price = underlying,
+        )
+        return snap
+
+    def _run_exit_loop_quote(self, pos: _Pos, snap) -> _Pos:
+        """Reproduce the _exit_loop quote application block using the production helper."""
+        from ap_exit_engine import _apply_option_quote_for_decision
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        if snap.bid > 0 or snap.ask > 0:
+            _apply_option_quote_for_decision(
+                pos,
+                bid  = float(snap.bid or 0.0),
+                ask  = float(snap.ask or 0.0),
+                mark = float(getattr(snap, "mid", 0.0) or getattr(snap, "mark", 0.0) or 0.0),
+                quote_ts = now_utc,
+            )
+        return pos
+
+    def test_live_quote1_current_option_price_is_bid(self):
+        """BA quote 1: bid=1.63, mid=1.71 → current_option_price must be 1.63."""
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        assert abs(pos.current_option_price - 1.63) < 0.001, (
+            f"current_option_price must be bid=1.63, got {pos.current_option_price}"
+        )
+
+    def test_live_quote1_option_pnl_is_bid_based(self):
+        """option_pnl_pct uses current_option_price — must be bid-based."""
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        pnl = (pos.current_option_price - _ENTRY) / _ENTRY
+        assert abs(pnl - 0.0252) < 0.002, f"Bid P&L must be ~+2.52%, got {pnl*100:.2f}%"
+
+    def test_live_quote1_touched_profit_false(self):
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        assert pos.touched_profit is False
+
+    def test_live_analytics_mark_is_mid(self):
+        """Analytics mark captures mid for dashboards; decision uses bid."""
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        mark = getattr(pos, "analytics_mark_price", 0.0)
+        assert abs(mark - 1.71) < 0.01 or mark > 1.63
+
+    def test_live_quote2_executable_pnl_is_minus_881(self):
+        """BA quote 2: bid=1.45 → P&L -8.81%, no TOUCHED_PROFIT_STOP possible."""
+        pos = _Pos(execution_mode="live")
+        # Quote 1 — does NOT arm touched_profit
+        self._run_exit_loop_quote(pos, self._make_snap(bid=1.63, ask=1.79, mid=1.71))
+        assert pos.touched_profit is False
+        # Quote 2
+        self._run_exit_loop_quote(pos, self._make_snap(bid=1.45, ask=1.74, mid=1.595))
+        pnl = (pos.current_option_price - _ENTRY) / _ENTRY
+        assert pnl < 0, f"Quote 2 must produce negative P&L, got {pnl*100:.2f}%"
+        assert abs(pnl - (-0.0881)) < 0.002
+
+    def test_guard_mid_never_written_to_current_option_price_for_live(self):
+        """Guard: _snap.mid must never appear as current_option_price for LIVE."""
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        # 1.71 is the mid — it must NOT be current_option_price
+        assert abs(pos.current_option_price - 1.71) > 0.05, (
+            "current_option_price must not be mid=1.71 for a LIVE position"
+        )
+
+    def test_missing_bid_clears_current_option_price(self):
+        """bid=0 with ask/mark → current_option_price must be 0 for LIVE."""
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=0.0, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        assert pos.current_option_price == 0.0
+        assert getattr(pos, "executable_quote_valid", True) is False
+
+    def test_paper_uses_mid(self):
+        """PAPER positions must still use mid/mark for current_option_price."""
+        pos = _Pos(execution_mode="paper")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        # PAPER: current_option_price should be mid (1.71 area)
+        assert pos.current_option_price > 1.63, (
+            "PAPER current_option_price must use mid, not bid"
+        )
+
+    def test_unknown_mode_uses_bid_not_mid(self):
+        """Unknown/blank mode falls to live_risk_unproven → bid, not mid."""
+        pos = _Pos(execution_mode="unknown")
+        snap = self._make_snap(bid=1.63, ask=1.79, mid=1.71)
+        self._run_exit_loop_quote(pos, snap)
+        assert abs(pos.current_option_price - 1.63) < 0.001
+
+    def test_rising_ask_flat_bid_current_option_price_stays_flat(self):
+        """Ask rising while bid flat → current_option_price stays bid."""
+        pos = _Pos(execution_mode="live")
+        snap = self._make_snap(bid=1.60, ask=2.10, mid=1.85)
+        self._run_exit_loop_quote(pos, snap)
+        assert abs(pos.current_option_price - 1.60) < 0.001
+
+
+class TestApplyOptionQuoteForDecision:
+    """Unit tests for the _apply_option_quote_for_decision helper directly."""
+
+    def test_returns_executable_quote_application(self):
+        from ap_exit_engine import _apply_option_quote_for_decision, ExecutableQuoteApplication
+        pos = _Pos(execution_mode="live")
+        result = _apply_option_quote_for_decision(pos, bid=1.63, ask=1.79, mark=1.71)
+        assert isinstance(result, ExecutableQuoteApplication)
+
+    def test_live_bid_valid_sets_executable_valid(self):
+        from ap_exit_engine import _apply_option_quote_for_decision
+        pos = _Pos(execution_mode="live")
+        r = _apply_option_quote_for_decision(pos, bid=1.63, ask=1.79, mark=1.71)
+        assert r.executable_valid is True
+        assert r.executable_price == 1.63
+        assert r.source == "bid"
+
+    def test_live_missing_bid_sets_executable_invalid(self):
+        from ap_exit_engine import _apply_option_quote_for_decision
+        pos = _Pos(execution_mode="live")
+        r = _apply_option_quote_for_decision(pos, bid=0.0, ask=1.79, mark=1.71)
+        assert r.executable_valid is False
+        assert r.executable_price == 0.0
+        assert "bid_missing" in r.source
+
+    def test_paper_uses_mid(self):
+        from ap_exit_engine import _apply_option_quote_for_decision
+        pos = _Pos(execution_mode="paper")
+        r = _apply_option_quote_for_decision(pos, bid=1.63, ask=1.79, mark=1.71)
+        assert "paper_mid_simulation" in r.source
+        assert r.executable_price > 1.63
+
+    def test_analytics_mark_always_captured(self):
+        from ap_exit_engine import _apply_option_quote_for_decision
+        pos = _Pos(execution_mode="live")
+        _apply_option_quote_for_decision(pos, bid=1.63, ask=1.79, mark=1.71)
+        assert abs(getattr(pos, "analytics_mark_price", 0) - 1.71) < 0.01
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P1 — Canonical cross-mode conflicts
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestCanonicalCrossMode:
+    """LIVE and PAPER canonical positions must never collapse across modes."""
+
+    def _engine_with_canon(self, canon_mode: str):
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        # Canonical position exists
+        canon = _Pos(position_id="canon1", option_symbol=_CONTRACT,
+                     client_id=_CLIENT, execution_mode=canon_mode)
+        engine._positions.append(canon)
+        engine._positions_by_id["canon1"] = canon
+        return engine
+
+    def test_canonical_live_incoming_paper_is_mismatch(self):
+        engine = self._engine_with_canon("live")
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="paper", client_id=_CLIENT,
+        )
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.adopted is False
+        assert r.retryable is True
+
+    def test_canonical_paper_incoming_live_is_mismatch(self):
+        engine = self._engine_with_canon("paper")
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.adopted is False
+
+    def test_canonical_live_incoming_live_collapse_allowed(self):
+        engine = self._engine_with_canon("live")
+        # Add repair position
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
+                      client_id=_CLIENT, execution_mode="live",
+                      current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        assert r.adopted is True
+        assert r.disposition in ("ADOPTED", "ALREADY_CANONICAL_REPAIR_REMOVED")
+
+    def test_canonical_paper_incoming_paper_collapse_allowed(self):
+        engine = self._engine_with_canon("paper")
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
+                      client_id=_CLIENT, execution_mode="paper",
+                      current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="paper", client_id=_CLIENT,
+        )
+        assert r.adopted is True
+
+    def test_canonical_unknown_incoming_live_is_fail_closed(self):
+        """canonical blank/unknown + incoming live → fail closed (retryable)."""
+        engine = self._engine_with_canon("")  # unknown canonical mode
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+        # blank canonical mode is unproven → must not allow collapse
+        assert r.disposition == "RETRY_MODE_MISMATCH"
+        assert r.retryable is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# P2 — Undefined timestamp fallback regression
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestTimestampFallbackRegression:
+    """Engine with _last_order_filled_ts must not raise on adoption."""
+
+    def _engine_with_repair(self):
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock  = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        pos = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
+                   client_id=_CLIENT, execution_mode="",
+                   current_bid=1.63, peak_pnl_pct=0.0)
+        engine._positions.append(pos)
+        engine._positions_by_id[repair_id] = pos
+        return engine
+
+    def test_adoption_does_not_raise_with_last_order_filled_ts_present(self):
+        """P2 regression: engine._last_order_filled_ts must not trigger NameError."""
+        from datetime import datetime, timezone
+        engine = self._engine_with_repair()
+        # Simulate the attribute that was incorrectly referenced via hasattr()
+        engine._last_order_filled_ts = datetime.now(timezone.utc)
+
+        # Must not raise
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts="2026-07-15T09:30:00Z",
+            order_filled_ts="2026-07-15T09:30:00Z",
+            execution_mode="live", client_id=_CLIENT,
+        )
+        assert result.adopted is True
+
+    def test_opened_at_is_normalized_aware_utc(self):
+        from datetime import timezone
+        engine = self._engine_with_repair()
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts="2026-07-15T09:30:00Z",
+            execution_mode="live", client_id=_CLIENT,
+        )
+        pos = engine._positions[0]
+        opened = getattr(pos, "opened_at", None)
+        assert opened is not None
+        assert opened.tzinfo is not None
+        assert opened.tzinfo == timezone.utc or str(opened.tzinfo) in ("UTC", "+00:00")
+
+    def test_malformed_entry_ts_falls_back_gracefully(self, caplog):
+        import logging
+        engine = self._engine_with_repair()
+        with caplog.at_level(logging.WARNING, logger="ap_exit_engine"):
+            result = engine.adopt_canonical_position_identity(
+                contract=_CONTRACT, canonical_position_id="canon1",
+                local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+                entry_fill=1.59, entry_ts="NOT_A_DATE",
+                order_filled_ts="2026-07-15T09:30:00Z",
+                execution_mode="live", client_id=_CLIENT,
+            )
+        assert result.adopted is True
+        # Should fall back to order_filled_ts or now_utc without raising
+        pos = engine._positions[0]
+        assert getattr(pos, "opened_at", None) is not None

@@ -335,6 +335,143 @@ class CanonicalAdoptionResult:
 
 
 @dataclass
+class ExecutableQuoteApplication:
+    """Result of _apply_option_quote_for_decision().
+
+    pricing_mode       - "paper" | "live" | "live_risk_unproven"
+    executable_price   - bid for LIVE/unproven (0 when bid missing), mid for PAPER
+    executable_valid   - True only when an actual bid drove the price
+    analytics_mark     - mid/mark for charts/dashboard regardless of mode
+    source             - live_executable_price_source stamp
+    """
+    pricing_mode:     str
+    executable_price: float
+    executable_valid: bool
+    analytics_mark:   float
+    source:           str
+
+
+def _apply_option_quote_for_decision(
+    pos: "ManagedPosition",
+    *,
+    bid: float,
+    ask: float,
+    mark: float,
+    quote_ts: "Optional[datetime]" = None,
+    source: str = "",
+) -> ExecutableQuoteApplication:
+    """Single authoritative function for writing option-price state onto a position.
+
+    P0 contract (July 15 2026 BA incident):
+      ALL writers of current_option_price must route through this function.
+      For LIVE and unknown-mode positions, current_option_price is ALWAYS the
+      executable bid — never midpoint, mark, ask, or last.
+
+    Pricing logic:
+      paper                → current_option_price = mid (simulation)
+      live / unproven      → current_option_price = bid (executable)
+                             When bid <= 0: current_option_price = 0.0
+                             No profit decision may use mark/ask/mid.
+
+    Proof-of-enforcement: every call site that sets current_option_price must
+    pass through here. grep for direct .current_option_price = assignments and
+    verify each is either (a) this function, (b) fill-price after confirmed
+    broker fill, or (c) internal persistence from a previously validated value.
+    """
+    _raw_mode = str(getattr(pos, "execution_mode", "") or "").strip()
+    _norm_mode = _raw_mode.lower()
+
+    if _norm_mode == "paper":
+        _pricing_mode = "paper"
+    elif _norm_mode == "live":
+        _pricing_mode = "live"
+    else:
+        _pricing_mode = "live_risk_unproven"
+
+    _mid = round((bid + ask) / 2.0, 4) if (bid > 0 and ask > 0) else (mark or ask or 0.0)
+    _analytics_mark = mark if mark > 0 else _mid
+
+    # Always stamp analytics mark for charting regardless of pricing mode.
+    try:
+        pos.analytics_mark_price = _analytics_mark
+        pos.analyticsmarkprice   = _analytics_mark
+    except Exception as _e:
+        log.debug("_aqfd: analytics_mark write failed: %s", _e)
+
+    # Set bid/ask on position unconditionally.
+    try:
+        pos.current_bid = bid
+        pos.currentbid  = bid
+    except Exception as _e:
+        log.debug("_aqfd: current_bid write failed: %s", _e)
+    try:
+        pos.current_ask = ask
+        pos.currentask  = ask
+    except Exception as _e:
+        log.debug("_aqfd: current_ask write failed: %s", _e)
+
+    if _pricing_mode == "paper":
+        _exec_price = _mid if _mid > 0 else ask
+        _valid = _exec_price > 0
+        _src   = source or "paper_mid_simulation"
+        try:
+            pos.current_option_price = _exec_price
+            pos.currentoptionprice   = _exec_price
+        except Exception as _e:
+            log.debug("_aqfd: paper current_option_price write failed: %s", _e)
+    else:
+        # LIVE or live_risk_unproven: executable price is ONLY the bid.
+        if bid > 0:
+            _exec_price = bid
+            _valid = True
+            _src   = source or ("bid" if _pricing_mode == "live" else "bid_live_risk_unproven")
+            try:
+                pos.current_option_price = bid
+                pos.currentoptionprice   = bid
+            except Exception as _e:
+                log.debug("_aqfd: live bid write failed: %s", _e)
+        else:
+            # Missing or zero bid — clear the decision price so no profit
+            # logic can read a stale mid/mark from a prior cycle.
+            _exec_price = 0.0
+            _valid = False
+            _src   = ("bid_missing" if _pricing_mode == "live"
+                      else "bid_missing_live_risk_unproven")
+            try:
+                pos.current_option_price = 0.0
+                pos.currentoptionprice   = 0.0
+            except Exception as _e:
+                log.debug("_aqfd: bid_missing zero-write failed: %s", _e)
+
+    # Stamp executable metadata.
+    try:
+        pos.executable_exit_price    = _exec_price
+        pos.executable_quote_valid   = _valid
+        pos.live_executable_price_source = _src
+        pos.liveexecutablepricesource    = _src
+        pos.pricing_mode             = _pricing_mode
+        pos.raw_execution_mode       = _raw_mode
+    except Exception as _e:
+        log.debug("_aqfd: executable metadata write failed: %s", _e)
+
+    # Update quote timestamp.
+    if quote_ts is not None:
+        try:
+            pos.last_option_quote_update_ts = quote_ts
+            pos.lastoptionquoteupdatets     = quote_ts
+        except Exception as _e:
+            log.debug("_aqfd: quote_ts write failed: %s", _e)
+
+    return ExecutableQuoteApplication(
+        pricing_mode     = _pricing_mode,
+        executable_price = _exec_price,
+        executable_valid = _valid,
+        analytics_mark   = _analytics_mark,
+        source           = _src,
+    )
+
+
+@dataclass
 class ManagedPosition:
     # Identity
     ticker:           str
@@ -1904,6 +2041,7 @@ class APExitEngine:
         entry_ts,
         execution_mode: str,
         client_id: str,
+        order_filled_ts=None,
         underlying_entry: float = 0.0,
         score: float = 0.0,
         tier: str = "",
@@ -1941,6 +2079,40 @@ class APExitEngine:
                 _canon_sym  = str(getattr(_existing_canon, "option_symbol", "") or "").upper().strip()
                 _canon_cli  = str(getattr(_existing_canon, "client_id", "") or "").strip().lower()
                 _canon_mode = str(getattr(_existing_canon, "execution_mode", "") or "").strip().lower()
+
+                # P1: Execution mode fencing — LIVE and PAPER must never collapse into
+                # one exit owner. Blank/unknown canonical mode is unproven; do not
+                # allow cross-mode collapse.
+                #
+                # Compatible mode matrix:
+                #   incoming live   + canonical live   → OK
+                #   incoming paper  + canonical paper  → OK
+                #   incoming live   + canonical blank  → RETRY (cannot prove it's live)
+                #   incoming paper  + canonical blank  → RETRY (cannot prove it's paper)
+                #   incoming blank  + canonical any    → RETRY (unproven mode)
+                #   incoming live   + canonical paper  → RETRY_MODE_MISMATCH
+                #   incoming paper  + canonical live   → RETRY_MODE_MISMATCH
+                _norm_incoming = _mode
+                _norm_canonical = _canon_mode
+                # Both must be the same known mode; blank on either side is unproven.
+                _mode_compatible = (
+                    _norm_incoming != ""
+                    and _norm_canonical != ""
+                    and _norm_incoming == _norm_canonical
+                )
+                if not _mode_compatible and (_norm_incoming or _norm_canonical):
+                    log.critical(
+                        "[exit_eng] RETRY_MODE_MISMATCH | canonical_id=%s "
+                        "canonical_mode=%r incoming_mode=%r contract=%s — "
+                        "LIVE and PAPER may not collapse into one exit owner",
+                        _canon_id, _canon_mode, _mode, _contract,
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_MODE_MISMATCH", adopted=False,
+                        safe_to_seed=False, retryable=True,
+                        reason=f"canonical_mode={_canon_mode!r} vs incoming={_mode!r}",
+                    )
+
                 _canon_ok = (
                     _canon_sym == _contract
                     and (not _client or _canon_cli == _client)
@@ -2125,11 +2297,11 @@ class APExitEngine:
                     log.debug("[exit_eng] adopt entry_broker_order_id: %s", _e)
 
                 # ── Blocker 3+4: Normalize canonical fill timestamp ────────────
-                if entry_ts is not None:
+                if entry_ts is not None or order_filled_ts is not None:
                     try:
                         _norm_ts = _normalize_canonical_ts(
                             entry_ts,
-                            fallback=order_filled_ts if hasattr(self, "_last_order_filled_ts") else None,
+                            fallback=order_filled_ts,
                             local_order_id=local_order_id or "",
                         )
                         pos.opened_at = _norm_ts
@@ -2979,19 +3151,30 @@ class APExitEngine:
                     continue
 
                 try:
-                    current_underlying = float(snap.get("current_underlying") or 0.0)
+                    current_underlying   = float(snap.get("current_underlying") or 0.0)
                     current_option_price = float(snap.get("current_option_price") or 0.0)
-                    current_bid = float(snap.get("current_bid") or 0.0)
-                    current_ask = float(snap.get("current_ask") or 0.0)
+                    current_bid          = float(snap.get("current_bid") or 0.0)
+                    current_ask          = float(snap.get("current_ask") or 0.0)
+                    analytics_mark       = float(snap.get("analytics_mark_price") or 0.0)
 
                     if current_underlying > 0:
                         pos.current_underlying = current_underlying
+                    # P0 contract: QPM already writes bid-based current_option_price
+                    # for LIVE positions. apply_quote_snapshots trusts that invariant
+                    # and propagates it. analytics_mark_price is always propagated
+                    # separately for charts.
                     if current_option_price > 0:
                         pos.current_option_price = current_option_price
                     if current_bid > 0:
                         pos.current_bid = current_bid
                     if current_ask > 0:
                         pos.current_ask = current_ask
+                    if analytics_mark > 0:
+                        try:
+                            pos.analytics_mark_price = analytics_mark
+                            pos.analyticsmarkprice   = analytics_mark
+                        except Exception:
+                            pass
 
                     if snap.get("last_underlying_quote_update_ts") is not None:
                         pos.last_underlying_quote_update_ts = snap.get("last_underlying_quote_update_ts")
@@ -5184,12 +5367,15 @@ class APExitEngine:
             _quote_status = "OK" if broker_mark > 0 else "QUOTE_UNAVAILABLE"
 
             # Position is ALWAYS added regardless of quote availability
-            if broker_mark > 0:
-                pos.current_option_price = broker_mark
-                if hasattr(pos, "current_bid"):
-                    pos.current_bid = broker_bid
-                if hasattr(pos, "current_ask"):
-                    pos.current_ask = broker_ask
+            if broker_mark > 0 or broker_bid > 0:
+                # P0 fix: route through the authoritative quote helper so LIVE
+                # positions get bid-based current_option_price, not broker_mark.
+                _broker_aqr = _apply_option_quote_for_decision(
+                    pos,
+                    bid  = broker_bid,
+                    ask  = broker_ask,
+                    mark = broker_mark,
+                )
             else:
                 log.warning(
                     "[exit_eng] EXIT_BROKER_PRECHECK_QUOTE_UNAVAILABLE "
@@ -5198,10 +5384,12 @@ class APExitEngine:
                     self._email, sym,
                 )
 
-            # Seed peak P&L / touched_profit if broker price shows a gain
+            # Seed peak P&L / touched_profit using executable price (never mid).
             broker_pnl_pct = 0.0
-            if pos.entry_price > 0 and broker_mark > 0:
-                broker_pnl_pct = (broker_mark - pos.entry_price) / pos.entry_price
+            _seed_exec_price = (pos.current_option_price if pos.current_option_price > 0
+                                else (broker_bid if broker_bid > 0 else 0.0))
+            if pos.entry_price > 0 and _seed_exec_price > 0:
+                broker_pnl_pct = (_seed_exec_price - pos.entry_price) / pos.entry_price
                 if broker_pnl_pct > 0:
                     if broker_pnl_pct > pos.peak_pnl_pct:
                         pos.peak_pnl_pct = broker_pnl_pct
@@ -5443,11 +5631,19 @@ class APExitEngine:
                 if _quote_authority_available and _QUOTES is not None:
                     _snap = _QUOTES.get_fresh(pos.option_symbol, max_age_s=12)
                     if _snap is not None:
-                        if _snap.bid > 0:
-                            pos.current_bid          = _snap.bid
-                            pos.current_ask          = _snap.ask
-                            pos.current_option_price = _snap.mid
-                            pos.last_option_quote_update_ts  = now_utc
+                        if _snap.bid > 0 or _snap.ask > 0:
+                            # P0 fix: route through the single authoritative quote helper.
+                            # LIVE positions must use bid, never _snap.mid.
+                            _apply_option_quote_for_decision(
+                                pos,
+                                bid      = float(_snap.bid or 0.0),
+                                ask      = float(_snap.ask or 0.0),
+                                mark     = float(getattr(_snap, "mid", 0.0)
+                                                 or getattr(_snap, "mark", 0.0)
+                                                 or 0.0),
+                                quote_ts = now_utc,
+                                source   = "",   # helper stamps bid/paper based on mode
+                            )
                             pos.last_option_quote_missing_ts = None
                             pos.last_quote_update_ts  = now_utc
                             pos.last_quote_missing_ts = None
@@ -6636,10 +6832,13 @@ class APExitEngine:
                 if oq:
                     bid = float(oq.get("bid", 0) or 0)
                     ask = float(oq.get("ask", 0) or 0)
-                    if bid > 0 and ask > 0:
-                        pos.current_bid          = bid
-                        pos.current_ask          = ask
-                        pos.current_option_price = (bid + ask) / 2
-                        pos.last_option_quote_update_ts = now_utc
+                    if bid > 0 or ask > 0:
+                        _apply_option_quote_for_decision(
+                            pos,
+                            bid      = bid,
+                            ask      = ask,
+                            mark     = float(oq.get("mark", 0) or oq.get("mid", 0) or 0),
+                            quote_ts = now_utc,
+                        )
 
         log.info("_refresh_quotes: refreshed %d position(s) with live quotes", len(active))
