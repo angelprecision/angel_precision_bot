@@ -47,6 +47,93 @@ def _pod_id() -> str:
     return str(os.getenv("POD_ID", "") or "unknown").strip() or "unknown"
 
 
+def _normalized_client_id(client_id: object) -> str:
+    return str(client_id or "").strip().lower()
+
+
+def _normalize_execution_mode(mode: object) -> str:
+    value = str(mode or "").strip().lower()
+    return value if value in {"paper", "live"} else "unknown"
+
+
+def _client_telemetry_from_calls(calls, *, client_mode_hints: dict[str, str] | None = None) -> dict:
+    mode_hints = {
+        _normalized_client_id(client_id): _normalize_execution_mode(mode)
+        for client_id, mode in (client_mode_hints or {}).items()
+        if _normalized_client_id(client_id)
+    }
+    clients_by_key: dict[str, dict[str, str]] = {}
+    client_order: list[str] = []
+
+    for call in calls:
+        call_mode = _normalize_execution_mode(getattr(call, "execution_mode", ""))
+        payload = getattr(call, "payload", {}) or {}
+        payload_modes = {}
+        clients = None
+        if isinstance(payload, dict):
+            clients = payload.get("clients")
+            raw_modes = payload.get("client_modes") or payload.get("client_execution_modes") or {}
+            if isinstance(raw_modes, dict):
+                payload_modes = {
+                    _normalized_client_id(client_id): _normalize_execution_mode(mode)
+                    for client_id, mode in raw_modes.items()
+                    if _normalized_client_id(client_id)
+                }
+            if not clients and payload.get("client_id"):
+                clients = [payload.get("client_id")]
+        if not clients:
+            scope = str(getattr(call, "client_scope", "") or "")
+            clients = [item.strip() for item in scope.split(",") if item.strip()]
+
+        for item in clients or []:
+            if isinstance(item, dict):
+                client = str(
+                    item.get("client_id")
+                    or item.get("email")
+                    or item.get("id")
+                    or ""
+                ).strip()
+                item_mode = _normalize_execution_mode(
+                    item.get("execution_mode") or item.get("mode")
+                )
+            else:
+                client = str(item or "").strip()
+                item_mode = payload_modes.get(_normalized_client_id(client), "unknown")
+            key = _normalized_client_id(client)
+            if not key:
+                continue
+            if key not in clients_by_key:
+                clients_by_key[key] = {"client_id": client, "mode": "unknown"}
+                client_order.append(key)
+            mode = item_mode
+            if mode == "unknown":
+                mode = mode_hints.get(key, "unknown")
+            if mode == "unknown":
+                mode = call_mode
+            if clients_by_key[key]["mode"] == "unknown" and mode in {"paper", "live"}:
+                clients_by_key[key]["mode"] = mode
+
+    by_mode: dict[str, list[str]] = {"paper": [], "live": [], "unknown": []}
+    for key in client_order:
+        item = clients_by_key[key]
+        by_mode[item["mode"]].append(item["client_id"])
+
+    paper_client_ids = sorted(by_mode["paper"])
+    live_client_ids = sorted(by_mode["live"])
+    unknown_client_ids = sorted(by_mode["unknown"])
+    client_ids = paper_client_ids + live_client_ids + unknown_client_ids
+    return {
+        "client_count": len(client_ids),
+        "paper_client_count": len(paper_client_ids),
+        "live_client_count": len(live_client_ids),
+        "unknown_client_count": len(unknown_client_ids),
+        "client_ids": client_ids,
+        "paper_client_ids": paper_client_ids,
+        "live_client_ids": live_client_ids,
+        "unknown_client_ids": unknown_client_ids,
+    }
+
+
 def _resolve_job_from_env() -> str:
     job = str(os.getenv("MORNING_JOB", "") or "").strip().lower()
     if job:
@@ -133,35 +220,70 @@ def main() -> int:
         calls = [call for call in calls if call.execution_mode == mode_filter]
 
     execution_modes = ",".join(sorted({call.execution_mode for call in calls})) or "none"
+    client_mode_hints = {
+        _normalized_client_id(client): "paper"
+        for client in paper_clients
+        if _normalized_client_id(client)
+    }
+    if _normalized_client_id(live_client):
+        client_mode_hints[_normalized_client_id(live_client)] = "live"
+    client_telemetry = _client_telemetry_from_calls(calls, client_mode_hints=client_mode_hints)
     log.info(
-        "AUTONOMY_JOB_REGISTERED job=%s commit_sha=%s pod_id=%s client_count=%s execution_mode=%s",
+        "AUTONOMY_JOB_REGISTERED job=%s commit_sha=%s pod_id=%s client_count=%s "
+        "paper_client_count=%s live_client_count=%s unknown_client_count=%s "
+        "client_ids=%s paper_client_ids=%s live_client_ids=%s unknown_client_ids=%s execution_mode=%s",
         job_name,
         _commit_sha(),
         _pod_id(),
-        len(calls),
+        client_telemetry["client_count"],
+        client_telemetry["paper_client_count"],
+        client_telemetry["live_client_count"],
+        client_telemetry["unknown_client_count"],
+        ",".join(client_telemetry["client_ids"]),
+        ",".join(client_telemetry["paper_client_ids"]),
+        ",".join(client_telemetry["live_client_ids"]),
+        ",".join(client_telemetry["unknown_client_ids"]),
         execution_modes,
     )
 
     for call in calls:
         if call.job_name.startswith("overnight_reeval"):
             log.info(
-                "OVERNIGHT_JOB_STARTED job=%s client_scope=%s execution_mode=%s commit_sha=%s pod_id=%s client_count=%s",
+                "OVERNIGHT_JOB_STARTED job=%s client_scope=%s execution_mode=%s commit_sha=%s "
+                "pod_id=%s client_count=%s paper_client_count=%s live_client_count=%s "
+                "unknown_client_count=%s client_ids=%s paper_client_ids=%s live_client_ids=%s unknown_client_ids=%s",
                 call.job_name,
                 call.client_scope,
                 call.execution_mode,
                 _commit_sha(),
                 _pod_id(),
-                len(calls),
+                client_telemetry["client_count"],
+                client_telemetry["paper_client_count"],
+                client_telemetry["live_client_count"],
+                client_telemetry["unknown_client_count"],
+                ",".join(client_telemetry["client_ids"]),
+                ",".join(client_telemetry["paper_client_ids"]),
+                ",".join(client_telemetry["live_client_ids"]),
+                ",".join(client_telemetry["unknown_client_ids"]),
             )
         elif call.endpoint == "/admin/morning_handoff_audit":
             log.info(
-                "MORNING_REEVAL_STARTED job=%s client_scope=%s execution_mode=%s commit_sha=%s pod_id=%s client_count=%s",
+                "MORNING_REEVAL_STARTED job=%s client_scope=%s execution_mode=%s commit_sha=%s "
+                "pod_id=%s client_count=%s paper_client_count=%s live_client_count=%s "
+                "unknown_client_count=%s client_ids=%s paper_client_ids=%s live_client_ids=%s unknown_client_ids=%s",
                 call.job_name,
                 call.client_scope,
                 call.execution_mode,
                 _commit_sha(),
                 _pod_id(),
-                len(calls),
+                client_telemetry["client_count"],
+                client_telemetry["paper_client_count"],
+                client_telemetry["live_client_count"],
+                client_telemetry["unknown_client_count"],
+                ",".join(client_telemetry["client_ids"]),
+                ",".join(client_telemetry["paper_client_ids"]),
+                ",".join(client_telemetry["live_client_ids"]),
+                ",".join(client_telemetry["unknown_client_ids"]),
             )
         result = call_admin_endpoint(
             bot_url=bot_url,

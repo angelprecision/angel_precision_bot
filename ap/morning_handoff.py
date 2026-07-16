@@ -1089,7 +1089,13 @@ def run_morning_handoff_audit(
             "morning_rows_accepted": 0,
             "watchers_restored": 0,
             "deferred_retries_restored": 0,
-            "orders_already_durably_owned": 0,
+            "preexisting_pending_trigger_rows": 0,
+            "pending_trigger_watchers_rearmed": 0,
+            "deferred_lifecycles_recovered": 0,
+            "already_verified_owner_rows": 0,
+            "orders_with_verified_owner": 0,
+            "orders_missing_runtime_owner": 0,
+            "watching_rows_reset": 0,
             "errors": [],
             "skipped": True,
         }
@@ -1146,7 +1152,13 @@ def run_morning_handoff_audit(
             "morning_rows_accepted": 0,
             "watchers_restored": 0,
             "deferred_retries_restored": 0,
-            "orders_already_durably_owned": 0,
+            "preexisting_pending_trigger_rows": 0,
+            "pending_trigger_watchers_rearmed": 0,
+            "deferred_lifecycles_recovered": 0,
+            "already_verified_owner_rows": 0,
+            "orders_with_verified_owner": 0,
+            "orders_missing_runtime_owner": 0,
+            "watching_rows_reset": 0,
             "errors": [err],
         }
         log.info(
@@ -1299,14 +1311,41 @@ def run_morning_handoff_audit(
         summary_errors.append(error)
     summary_errors.extend(str(item) for item in (enqueue_result.get("errors") or []))
     summary_errors.extend(str(item) for item in (recovery_result.get("errors") or []))
+    preexisting_pending_trigger_rows = int(before.get("pending_trigger_rows") or 0)
+    pending_trigger_watchers_rearmed = int(
+        recovery_result.get("pending_trigger_watchers_rearmed", 0) or 0
+    )
+    deferred_lifecycles_recovered = int(
+        recovery_result.get("deferred_lifecycles_recovered", 0) or 0
+    )
+    already_verified_owner_rows = int(
+        recovery_result.get("already_verified_owner_rows", 0) or 0
+    )
+    watching_rows_reset = int(recovery_result.get("watching_rows_reset", 0) or 0)
+    orders_with_verified_owner = min(
+        pending_trigger_watchers_rearmed
+        + deferred_lifecycles_recovered
+        + already_verified_owner_rows,
+        preexisting_pending_trigger_rows,
+    )
+    orders_missing_runtime_owner = max(
+        preexisting_pending_trigger_rows - orders_with_verified_owner,
+        0,
+    )
     summary = {
         "client_id": client_id,
         "execution_mode": mode,
         "overnight_rows_found": int(enqueue_result.get("signals_found") or 0) if enqueue_result else 0,
         "morning_rows_accepted": int(accepted_rows),
         "watchers_restored": int(recovery_result.get("watchers_requeued", 0) or 0),
-        "deferred_retries_restored": int(recovery_result.get("deferred_lifecycles_recovered", 0) or 0),
-        "orders_already_durably_owned": int(before.get("pending_trigger_rows") or 0),
+        "deferred_retries_restored": deferred_lifecycles_recovered,
+        "preexisting_pending_trigger_rows": preexisting_pending_trigger_rows,
+        "pending_trigger_watchers_rearmed": pending_trigger_watchers_rearmed,
+        "deferred_lifecycles_recovered": deferred_lifecycles_recovered,
+        "already_verified_owner_rows": already_verified_owner_rows,
+        "orders_with_verified_owner": orders_with_verified_owner,
+        "orders_missing_runtime_owner": orders_missing_runtime_owner,
+        "watching_rows_reset": watching_rows_reset,
         "errors": summary_errors,
     }
     details = {
@@ -1352,7 +1391,13 @@ def run_morning_handoff_audit(
         "morning_rows_accepted": summary["morning_rows_accepted"],
         "watchers_restored": summary["watchers_restored"],
         "deferred_retries_restored": summary["deferred_retries_restored"],
-        "orders_already_durably_owned": summary["orders_already_durably_owned"],
+        "preexisting_pending_trigger_rows": summary["preexisting_pending_trigger_rows"],
+        "pending_trigger_watchers_rearmed": summary["pending_trigger_watchers_rearmed"],
+        "deferred_lifecycles_recovered": summary["deferred_lifecycles_recovered"],
+        "already_verified_owner_rows": summary["already_verified_owner_rows"],
+        "orders_with_verified_owner": summary["orders_with_verified_owner"],
+        "orders_missing_runtime_owner": summary["orders_missing_runtime_owner"],
+        "watching_rows_reset": summary["watching_rows_reset"],
         "enqueue_result": enqueue_result,  # PR #183: signals inserted/skipped/rejected
     }
     log.info(

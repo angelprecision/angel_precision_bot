@@ -134,6 +134,10 @@ def test_live_startup_success_lock_still_runs_recovery(monkeypatch):
         def _reseed_watchers(self, result):
             reseed_calls.append(True)
             result["watchers_requeued"] = 2
+            result["watching_rows_reset"] = 0
+            result["pending_trigger_watchers_rearmed"] = 2
+            result["deferred_lifecycles_recovered"] = 0
+            result["already_verified_owner_rows"] = 0
 
     import sys
 
@@ -162,7 +166,124 @@ def test_live_startup_success_lock_still_runs_recovery(monkeypatch):
     assert not result.get("skipped")
     assert reseed_calls == [True]
     assert result["summary"]["watchers_restored"] == 2
-    assert result["summary"]["orders_already_durably_owned"] == 2
+    assert result["summary"]["preexisting_pending_trigger_rows"] == 2
+    assert result["summary"]["pending_trigger_watchers_rearmed"] == 2
+    assert result["summary"]["watching_rows_reset"] == 0
+    assert result["summary"]["orders_with_verified_owner"] == 2
+    assert result["summary"]["orders_missing_runtime_owner"] == 0
+
+
+def _run_handoff_with_recovery_payload(monkeypatch, *, before: dict, recovery_payload: dict) -> dict:
+    monkeypatch.setattr(morning_handoff, "_load_handoff_run_lock", lambda **kwargs: None)
+    monkeypatch.setattr(morning_handoff, "_upsert_handoff_run_lock", lambda **kwargs: None)
+    monkeypatch.setattr(morning_handoff, "_count_state", lambda client_id: dict(before))
+    monkeypatch.setattr(morning_handoff, "_has_unowned_pending_trigger_orders", lambda *args, **kwargs: False)
+
+    class _Recovery:
+        def __init__(self, **kwargs):
+            pass
+
+        def _reseed_watchers(self, result):
+            result.update(recovery_payload)
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "ap_recovery", type("_M", (), {"APStartupRecovery": _Recovery}))
+
+    class _Core:
+        broker = object()
+        exit_eng = object()
+        entry_watcher = object()
+
+    class _Runner:
+        order_state_machine = object()
+        position_manager = object()
+        master_control = object()
+        core = _Core()
+
+    return morning_handoff.run_morning_handoff_audit(
+        client_id="jason@example.com",
+        execution_mode="live",
+        stage="startup",
+        dry_run=False,
+        runner=_Runner(),
+    )
+
+
+def test_watching_rows_reset_do_not_hide_ownerless_pending_trigger_order(monkeypatch):
+    result = _run_handoff_with_recovery_payload(
+        monkeypatch,
+        before={"watching_rows": 5, "new_rows": 0, "pending_trigger_rows": 1},
+        recovery_payload={
+            "watchers_requeued": 5,
+            "watching_rows_reset": 5,
+            "pending_trigger_watchers_rearmed": 0,
+            "deferred_lifecycles_recovered": 0,
+            "already_verified_owner_rows": 0,
+        },
+    )
+
+    summary = result["summary"]
+    assert summary["watching_rows_reset"] == 5
+    assert summary["orders_with_verified_owner"] == 0
+    assert summary["orders_missing_runtime_owner"] == 1
+
+
+def test_pending_trigger_watcher_rearm_counts_as_verified_owner(monkeypatch):
+    result = _run_handoff_with_recovery_payload(
+        monkeypatch,
+        before={"watching_rows": 0, "new_rows": 0, "pending_trigger_rows": 1},
+        recovery_payload={
+            "watchers_requeued": 1,
+            "watching_rows_reset": 0,
+            "pending_trigger_watchers_rearmed": 1,
+            "deferred_lifecycles_recovered": 0,
+            "already_verified_owner_rows": 0,
+        },
+    )
+
+    summary = result["summary"]
+    assert summary["pending_trigger_watchers_rearmed"] == 1
+    assert summary["orders_with_verified_owner"] == 1
+    assert summary["orders_missing_runtime_owner"] == 0
+
+
+def test_deferred_lifecycle_recovery_counts_as_verified_owner(monkeypatch):
+    result = _run_handoff_with_recovery_payload(
+        monkeypatch,
+        before={"watching_rows": 0, "new_rows": 0, "pending_trigger_rows": 1},
+        recovery_payload={
+            "watchers_requeued": 0,
+            "watching_rows_reset": 0,
+            "pending_trigger_watchers_rearmed": 0,
+            "deferred_lifecycles_recovered": 1,
+            "already_verified_owner_rows": 0,
+        },
+    )
+
+    summary = result["summary"]
+    assert summary["orders_with_verified_owner"] == 1
+    assert summary["orders_missing_runtime_owner"] == 0
+
+
+def test_verified_owner_counts_are_capped_to_preexisting_pending_trigger_rows(monkeypatch):
+    result = _run_handoff_with_recovery_payload(
+        monkeypatch,
+        before={"watching_rows": 7, "new_rows": 0, "pending_trigger_rows": 2},
+        recovery_payload={
+            "watchers_requeued": 12,
+            "watching_rows_reset": 7,
+            "pending_trigger_watchers_rearmed": 3,
+            "deferred_lifecycles_recovered": 2,
+            "already_verified_owner_rows": 1,
+        },
+    )
+
+    summary = result["summary"]
+    assert 0 <= summary["orders_with_verified_owner"] <= summary["preexisting_pending_trigger_rows"]
+    assert 0 <= summary["orders_missing_runtime_owner"] <= summary["preexisting_pending_trigger_rows"]
+    assert summary["orders_with_verified_owner"] == 2
+    assert summary["orders_missing_runtime_owner"] == 0
 
 
 def test_startup_same_day_restart_does_not_skip_when_watcher_ownership_missing(monkeypatch):
