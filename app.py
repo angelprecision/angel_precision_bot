@@ -4654,6 +4654,59 @@ def admin_live_execution_truth_sample():
 
 
 # =============================================================================
+# Trade Queue Dashboard — /admin/operator/entry-queue
+#
+# Read-only. Serves the Operator Console Trade Queue card by querying both
+# trade_queue (staged signals) and orders (active ENTRY lifecycle rows) and
+# merging them into the five dashboard buckets: NEW/WATCHING/TRIGGERED/
+# REJECTED/EXPIRED.
+#
+# Schema note: orders.direction (not orders.side) is the column name.
+# trade_queue has no updated_ts — uses created_ts.
+# =============================================================================
+
+@app.get("/admin/operator/entry-queue")
+@_require_admin
+def admin_operator_entry_queue():
+    """Return merged trade_queue + orders view for the dashboard Trade Queue card.
+
+    Query params (all optional):
+      client_id   filter to one client
+      hours       lookback window in hours (default 24, max 168)
+      limit       max rows returned (default 200, max 1000)
+
+    Read-only. Never mutates DB or trading state.
+    """
+    try:
+        from ap.operator_queue_read_model import build_operator_queue_read_model
+    except Exception as e:
+        admin_log.error("entry-queue: import failed: %s", e)
+        return jsonify({"ok": False, "error": f"read model unavailable: {e}"}), 503
+
+    client_id = (request.args.get("client_id") or "").strip() or None
+    try:
+        hours = int(request.args.get("hours") or 24)
+    except (TypeError, ValueError):
+        hours = 24
+    try:
+        limit = int(request.args.get("limit") or 200)
+    except (TypeError, ValueError):
+        limit = 200
+
+    try:
+        result = build_operator_queue_read_model(
+            client_id=client_id,
+            hours=hours,
+            limit=limit,
+        )
+    except Exception as e:
+        admin_log.error("entry-queue: build failed: %s", e)
+        return jsonify({"ok": False, "error": f"queue read failed: {e}"}), 500
+
+    return jsonify(result)
+
+
+# =============================================================================
 # PR #91 — Daily Operator Folders -> Weekly Archive Pipeline
 # =============================================================================
 # Archive/reporting only. No trading logic changes.

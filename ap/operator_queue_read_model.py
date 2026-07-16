@@ -124,7 +124,7 @@ def _order_row(row: Any) -> dict:
         "status": status,
         "dashboard_status": bucket,
         "ticker": r.get("symbol") or meta.get("ticker") or meta.get("symbol"),
-        "side": r.get("side") or meta.get("side") or meta.get("direction"),
+        "side": r.get("direction") or meta.get("direction") or meta.get("side"),
         "score": r.get("score") or meta.get("score"),
         "trigger_price": meta.get("trigger_price") or meta.get("entry_trigger"),
         "contract": contract,
@@ -166,7 +166,7 @@ def build_operator_queue_read_model(*, client_id: str | None = None, hours: int 
         "ORDER BY created_ts DESC LIMIT %s"
     )
     order_sql = (
-        "SELECT local_order_id, client_id, kind, status, broker_order_id, symbol, side, contract, "
+        "SELECT local_order_id, client_id, kind, status, broker_order_id, symbol, direction, contract, "
         "       limit_price, score, signal_id, created_ts, updated_ts, last_error, meta "
         "FROM orders "
         "WHERE " + " AND ".join(order_where) + " "
