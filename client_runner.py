@@ -103,8 +103,20 @@ def _autonomy_log_context(execution_mode: str | None = None) -> dict:
         or "unknown"
     )
     mode = str(execution_mode or "").strip().lower()
+    paper_client_count = None
+    live_client_count = None
     try:
         with _registry_lock:
+            paper_client_count = sum(
+                1
+                for runner in _active_runners.values()
+                if str(getattr(runner, "mode", "") or "").strip().lower() == "paper"
+            )
+            live_client_count = sum(
+                1
+                for runner in _active_runners.values()
+                if str(getattr(runner, "mode", "") or "").strip().lower() == "live"
+            )
             client_count = sum(
                 1
                 for runner in _active_runners.values()
@@ -116,6 +128,8 @@ def _autonomy_log_context(execution_mode: str | None = None) -> dict:
         "commit_sha": str(commit_sha)[:12],
         "pod_id": os.getenv("POD_ID", "").strip() or "unknown",
         "client_count": client_count,
+        "paper_client_count": paper_client_count,
+        "live_client_count": live_client_count,
         "execution_mode": mode,
     }
 
@@ -3171,12 +3185,71 @@ class ClientRunner(threading.Thread):
         self._run_startup_morning_handoff()
 
 
+    def _log_startup_recovery_complete(
+        self,
+        *,
+        status: str,
+        started_at: float,
+        recovery_attempt_id: str,
+        result: dict | None = None,
+        errors: list[str] | None = None,
+    ) -> None:
+        result = result if isinstance(result, dict) else {}
+        autonomy_ctx = _autonomy_log_context(self.mode)
+        duration_ms = int(max(0.0, time.time() - started_at) * 1000)
+        error_list = [str(item) for item in (errors or result.get("errors") or []) if str(item)]
+        watchers_restored = int(
+            result.get("watchers_restored")
+            or result.get("watchers_requeued")
+            or 0
+        )
+        deferred_retries_restored = int(
+            result.get("deferred_retries_restored")
+            or result.get("deferred_lifecycles_recovered")
+            or 0
+        )
+        ownership_failures = result.get("ownership_failures")
+        if ownership_failures is None:
+            ownership_failures = len(error_list)
+        recovered_orders = int(
+            result.get("recovered_orders")
+            or result.get("entries_corrected")
+            or result.get("positions_recovered")
+            or 0
+        )
+        logger.info(
+            "STARTUP_RECOVERY_COMPLETE status=%s client_id=%s execution_mode=%s "
+            "duration_ms=%s errors=%s client_count=%s paper_client_count=%s "
+            "live_client_count=%s commit_sha=%s pod_id=%s watchers_restored=%s "
+            "deferred_retries_restored=%s ownership_failures=%s recovered_orders=%s "
+            "recovery_attempt_id=%s",
+            status,
+            self.email,
+            str(self.mode).lower(),
+            duration_ms,
+            error_list,
+            autonomy_ctx["client_count"],
+            autonomy_ctx["paper_client_count"],
+            autonomy_ctx["live_client_count"],
+            autonomy_ctx["commit_sha"],
+            autonomy_ctx["pod_id"],
+            watchers_restored,
+            deferred_retries_restored,
+            ownership_failures,
+            recovered_orders,
+            recovery_attempt_id,
+        )
+
+
     def _run_startup_recovery(self, broker, exit_eng):
         """Run startup recovery with a hard timeout to prevent blocking initialization.
         Recovery is best-effort — a timeout logs a warning but never blocks entries.
         """
         import concurrent.futures as _cf
         _RECOVERY_TIMEOUT = float(os.getenv("STARTUP_RECOVERY_TIMEOUT_SEC", "25"))
+        _recovery_attempt_id = uuid.uuid4().hex
+        _recovery_started_at = time.time()
+        _completion_logged = False
 
         def _do_recovery():
             recovery = APStartupRecovery(
@@ -3196,7 +3269,6 @@ class ClientRunner(threading.Thread):
                 _fut = _ex.submit(_do_recovery)
                 try:
                     rec_result = _fut.result(timeout=_RECOVERY_TIMEOUT)
-                    autonomy_ctx = _autonomy_log_context(self.mode)
                     logger.info(
                         "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
                         self.email,
@@ -3205,23 +3277,13 @@ class ClientRunner(threading.Thread):
                         rec_result.get("exits_reattached"),
                         rec_result.get("dedup_seeded"),
                     )
-                    logger.info(
-                        "STARTUP_RECOVERY_COMPLETE client_id=%s execution_mode=%s "
-                        "commit_sha=%s pod_id=%s client_count=%s positions_recovered=%s "
-                        "entries_corrected=%s exits_reattached=%s dedup_seeded=%s "
-                        "deferred_lifecycles_recovered=%s errors=%s",
-                        self.email,
-                        str(self.mode).lower(),
-                        autonomy_ctx["commit_sha"],
-                        autonomy_ctx["pod_id"],
-                        autonomy_ctx["client_count"],
-                        rec_result.get("positions_recovered"),
-                        rec_result.get("entries_corrected"),
-                        rec_result.get("exits_reattached"),
-                        rec_result.get("dedup_seeded"),
-                        rec_result.get("deferred_lifecycles_recovered"),
-                        rec_result.get("errors"),
+                    self._log_startup_recovery_complete(
+                        status="success",
+                        started_at=_recovery_started_at,
+                        recovery_attempt_id=_recovery_attempt_id,
+                        result=rec_result,
                     )
+                    _completion_logged = True
                 except _cf.TimeoutError:
                     logger.warning(
                         "[%s] Startup recovery timed out after %.0fs — continuing without full recovery. "
@@ -3229,7 +3291,30 @@ class ClientRunner(threading.Thread):
                         self.email, _RECOVERY_TIMEOUT,
                     )
                     _fut.cancel()
+                    self._log_startup_recovery_complete(
+                        status="timeout",
+                        started_at=_recovery_started_at,
+                        recovery_attempt_id=_recovery_attempt_id,
+                        errors=[f"startup_recovery_timeout:{_RECOVERY_TIMEOUT:g}s"],
+                    )
+                    _completion_logged = True
+                except Exception as exc:
+                    self._log_startup_recovery_complete(
+                        status="failed",
+                        started_at=_recovery_started_at,
+                        recovery_attempt_id=_recovery_attempt_id,
+                        errors=[str(exc)],
+                    )
+                    _completion_logged = True
+                    raise
         except Exception as exc:
+            if not _completion_logged:
+                self._log_startup_recovery_complete(
+                    status="failed",
+                    started_at=_recovery_started_at,
+                    recovery_attempt_id=_recovery_attempt_id,
+                    errors=[str(exc)],
+                )
             logger.error("[%s] Startup recovery error: %s", self.email, exc)
             # FIX-6: in LIVE mode a failed recovery means open positions from a prior
             # session may not be reseeded to the exit engine, leaving live contracts

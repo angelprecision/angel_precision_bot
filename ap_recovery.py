@@ -2376,6 +2376,7 @@ class APStartupRecovery:
         else:
             count = run_with_retry(_reset) or 0
         rearmed = 0
+        already_verified_owner_rows = 0
         if self.entry_watcher is None:
             log.warning(
                 "[%s] RECOVERY: entry_watcher missing — cannot reseed orphaned PENDING_TRIGGER orders",
@@ -2433,6 +2434,7 @@ class APStartupRecovery:
                             "[%s] RECOVERY: watcher already owns local_order_id=%s — skipping duplicate reseed",
                             self.client_id, local_order_id,
                         )
+                        already_verified_owner_rows += 1
                         continue
                 except Exception as exc:
                     log.warning(
@@ -2511,6 +2513,7 @@ class APStartupRecovery:
                             self.client_id, local_order_id, _outcome,
                         )
                     elif _outcome == _RowOutcome.RETRY_OWNED:
+                        already_verified_owner_rows += 1
                         log.info(
                             "[%s] RECOVERY: retry_owned | local_order_id=%s",
                             self.client_id, local_order_id,
@@ -2539,6 +2542,9 @@ class APStartupRecovery:
                     )
                     continue
 
+        result["watching_rows_reset"] = int(count or 0)
+        result["pending_trigger_watchers_rearmed"] = int(rearmed or 0)
+        result["already_verified_owner_rows"] = int(already_verified_owner_rows or 0)
         result["watchers_requeued"] = count + rearmed
         log.info(
             "[%s] RECOVERY: %d WATCHING signals reset to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
