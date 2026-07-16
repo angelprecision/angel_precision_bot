@@ -463,6 +463,7 @@ class APProofLogger:
         synthetic_entry:     bool = False,
         position_id:         str  = "",
         local_order_id:      str  = "",
+        execution_mode:      str  = "",
         # Adaptive exit pricing slippage fields (filled by exit engine)
         exit_bid:            float = 0.0,
         exit_ask:            float = 0.0,
@@ -480,7 +481,20 @@ class APProofLogger:
         # truth stamped at entry creation), NOT recomputed from self.mode — the
         # client may have switched modes while the position was open. Missing →
         # 'unknown' (never guess 'live').
-        _execution_mode = _resolve_entry_execution_mode(local_order_id)
+        # execution_mode precedence (Requirement 6):
+        #   1. Originating order mode is authoritative (stamped at entry creation).
+        #      A client may switch modes while a position is open; the reconciler's
+        #      current runtime mode must not overwrite a valid order-level mode.
+        #   2. Explicit caller mode is used only when the originating order is
+        #      unavailable or returns an invalid/unknown value.
+        #   3. Both missing/invalid → "unknown". Never guess "live".
+        _explicit_mode = str(execution_mode or "").strip().lower()
+        _origin_mode   = _resolve_entry_execution_mode(local_order_id)
+        _execution_mode = (
+            _origin_mode   if _origin_mode   in ("live", "paper") else
+            _explicit_mode if _explicit_mode in ("live", "paper") else
+            "unknown"
+        )
         _outcome = normalize_trade_outcome(exit_reason, option_pnl_pct, win)
         _win = _outcome["win"]
         row = {
@@ -558,19 +572,30 @@ class APProofLogger:
             "exit_reason", "option_pnl_pct", "underlying_pnl_pct", "win",
             "synthetic_entry", "position_id", "local_order_id",
         }
+        # ── Persistence-status tracking ──────────────────────────────────────
+        # _persisted is set True only after a confirmed Supabase insert.
+        # _persistence_error captures the last failure reason.
+        # These fields are added to the returned result dict but are NEVER
+        # included in any Supabase insert payload.
+        _persisted:         bool            = False
+        _persistence_error: str | None      = None
+
         if self.sb:
             try:
                 self.sb.table("proof_trades").insert(row).execute()
+                _persisted = True
                 log.debug("[PROOF] %s written to Supabase (full row)", ticker)
             except Exception as e1:
                 emsg1 = str(e1).lower()
                 if not any(k in emsg1 for k in ("column", "schema", "field", "violat", "null", "type")):
+                    _persistence_error = str(e1)
                     log.error("[PROOF] Supabase write failed (non-schema error): %s", e1)
                 else:
                     # Stage 2: strip diagnostic-only columns that may not exist yet.
                     _stage2 = {k: v for k, v in row.items() if k not in _DIAGNOSTIC_COLS}
                     try:
                         self.sb.table("proof_trades").insert(_stage2).execute()
+                        _persisted = True
                         log.warning(
                             "[PROOF] %s written without target_hit_option_loss diagnostic — "
                             "run migration migrations/20260626_target_hit_option_loss_diagnostic.sql",
@@ -579,6 +604,7 @@ class APProofLogger:
                     except Exception as e2:
                         emsg2 = str(e2).lower()
                         if not any(k in emsg2 for k in ("column", "schema", "field", "violat", "null", "type")):
+                            _persistence_error = str(e2)
                             log.error("[PROOF] Supabase write failed stage-2 (non-schema): %s", e2)
                         else:
                             # Stage 3: strip slippage columns + exit_bucket + diagnostics
@@ -586,6 +612,7 @@ class APProofLogger:
                                        if k not in _SLIPPAGE_COLS and k != "exit_bucket" and k not in _DIAGNOSTIC_COLS}
                             try:
                                 self.sb.table("proof_trades").insert(_stage3).execute()
+                                _persisted = True
                                 log.warning(
                                     "[PROOF] %s written without slippage columns — "
                                     "run proof_trades migration to add: %s",
@@ -595,12 +622,14 @@ class APProofLogger:
                             except Exception as e3:
                                 emsg3 = str(e3).lower()
                                 if not any(k in emsg3 for k in ("column", "schema", "field")):
+                                    _persistence_error = str(e3)
                                     log.error("[PROOF] Supabase write failed stage-3 (non-schema): %s", e3)
                                 else:
                                     # Stage 4: core columns only — guaranteed minimal write
                                     _stage4 = {k: v for k, v in row.items() if k in _CORE_COLS}
                                     try:
                                         self.sb.table("proof_trades").insert(_stage4).execute()
+                                        _persisted = True
                                         log.warning(
                                             "[PROOF] %s written with CORE COLUMNS ONLY — "
                                             "proof_trades schema is significantly out of date. "
@@ -608,13 +637,21 @@ class APProofLogger:
                                             ticker,
                                         )
                                     except Exception as e4:
+                                        _persistence_error = str(e4)
                                         log.error(
                                             "[PROOF] ALL WRITE ATTEMPTS FAILED for %s — "
                                             "TRADE WILL NOT APPEAR IN PROOF. Error: %s",
                                             ticker, e4,
                                         )
+        else:
+            _persistence_error = "missing_supabase_client"
 
-        return row
+        # Return trade fields plus private persistence metadata.
+        # Callers that only read trade fields are unaffected.
+        result = dict(row)
+        result["_proof_persisted"]         = _persisted
+        result["_proof_persistence_error"] = _persistence_error
+        return result
 
     # ── Daily summary rebuilt from Supabase ───────────────────────────────
 
