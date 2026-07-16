@@ -7873,6 +7873,55 @@ class APExecutionCore:
         except Exception:
             pass
 
+        # ── Required fix (PR #342 amendment): check cleanup suppression FIRST ──
+        # store.update_status(signal_id, "expired") and the watcher_invalidation_reason
+        # meta write must NOT be committed before we know whether
+        # _cleanup_pending_entry_order() suppressed the expiry for active
+        # deferred materialization.  Writing "expired" state unconditionally and
+        # then returning FAILED from the watcher left a contradictory durable row:
+        #   ap_signals.decision_status = "expired"   ← wrong
+        #   orders.meta.watcher_invalidation_reason = "watcher_expired"  ← wrong
+        # while materialization_status = "RETRY_PENDING" was still active.
+        _cleanup_ok = self._cleanup_pending_entry_order(
+            watched, action="expire", reason=_expire_reason
+        )
+
+        # Detect whether cleanup was suppressed by the active-materialization guard.
+        _skip_reason = str(
+            (getattr(watched, "signal", {}) or {}).get("_watcher_expiry_skip_reason") or ""
+        ).strip()
+        _expiry_suppressed = _skip_reason in (
+            "WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION",
+            "WATCHER_EXPIRY_GUARD_CHECK_FAILED",
+        )
+
+        if _expiry_suppressed:
+            # Active materialization owns this order.  Do NOT write any durable
+            # "expired" state — the materializer must be able to retry normally.
+            # Do NOT call store.update_status(..., "expired").
+            # Do NOT stamp expired_at or watcher_expired reason.
+            funnel.inc("watcher_expiry_suppressed_active_materialization")
+            log.info(
+                "[%s] _on_signal_expire: expiry suppressed — skip_reason=%s | "
+                "no expired state written; materialization retains ownership",
+                watched.ticker, _skip_reason,
+            )
+            try:
+                from ap.pending_trigger_classifier import (
+                    WatcherCompletionResult as _WCR,
+                    WatcherCompletionOutcome as _WCO,
+                )
+                return _WCR(
+                    outcome=_WCO.FAILED,
+                    reason_code=_skip_reason,
+                    local_order_id=_local_oid_exp or None,
+                )
+            except Exception:
+                return None
+
+        # Normal expiry path — cleanup either succeeded or failed for a genuine
+        # reason (not an active-materialization guard). Write durable expired state.
+
         # Persist watcher_invalidation_class for expire outcomes.
         _osm_exp = getattr(self, "order_state_machine", None)
         if _osm_exp is not None and _local_oid_exp:
@@ -7891,9 +7940,6 @@ class APExecutionCore:
 
         if signal_id:
             self.store.update_status(signal_id, "expired", timestamp_flag="expired_at")
-        _cleanup_ok = self._cleanup_pending_entry_order(
-            watched, action="expire", reason=_expire_reason
-        )
         funnel.inc("watcher_expired")
         log.info("[%s] Signal expired -- no breach", watched.ticker)
 
@@ -7908,21 +7954,9 @@ class APExecutionCore:
                     reason_code=_expire_reason,
                     local_order_id=_local_oid_exp or None,
                 )
-            # When cleanup was suppressed by the materialization ownership guard,
-            # use the exact skip reason so the quarantine CRITICAL log shows the
-            # real cause (WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION) rather than
-            # the opaque "cleanup_returned_false:watcher_expired" string.
-            _skip_reason = str(
-                (getattr(watched, "signal", {}) or {}).get("_watcher_expiry_skip_reason") or ""
-            ).strip()
-            _failed_reason = (
-                _skip_reason
-                if _skip_reason
-                else f"cleanup_returned_false:{_expire_reason}"
-            )
             return _WCR(
                 outcome=_WCO.FAILED,
-                reason_code=_failed_reason,
+                reason_code=f"cleanup_returned_false:{_expire_reason}",
                 local_order_id=_local_oid_exp or None,
             )
         except Exception:

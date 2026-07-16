@@ -648,3 +648,123 @@ class TestObservabilityReasonCode:
         assert "WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION" in str(_rc), (
             f"Expected WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION in reason_code, got: {_rc!r}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Amendment tests: _on_signal_expire must not write expired state before
+# checking whether cleanup was suppressed for active materialization
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestOnSignalExpireNoEarlyExpiredWrite:
+    """store.update_status(..., 'expired') and watcher_expired meta must NOT be
+    written when _cleanup_pending_entry_order returns False due to active
+    materialization (RETRY_PENDING / MATERIALIZING / GUARD_CHECK_FAILED)."""
+
+    def _make_core_with_retry_pending_row(self) -> tuple:
+        """Return (core, store_mock, osm_mock, watched) for a RETRY_PENDING order."""
+        row = _order_row()  # materialization_status=RETRY_PENDING
+
+        osm = MagicMock()
+        osm.get_order.return_value = row
+        osm.expire_pending_entry.return_value = True  # would succeed if called
+        osm.update_order_meta.return_value = True
+
+        store = MagicMock()
+        store.update_status = MagicMock()
+
+        core = _make_core(osm)
+        core.store = store
+
+        watched = _make_watched()
+        return core, store, osm, watched
+
+    def test_store_update_status_not_called_when_skipped_active_mat(self):
+        """Active RETRY_PENDING: store.update_status(..., 'expired') must NOT fire."""
+        core, store, osm, watched = self._make_core_with_retry_pending_row()
+        core._on_signal_expire(watched)
+        # store.update_status must never have been called with "expired"
+        for call in store.update_status.call_args_list:
+            args, kwargs = call
+            assert "expired" not in args, (
+                f"store.update_status was called with 'expired' args={args} "
+                "during active materialization suppression"
+            )
+
+    def test_update_order_meta_watcher_expired_not_written_when_skipped(self):
+        """Active RETRY_PENDING: update_order_meta must not write watcher_expired."""
+        core, store, osm, watched = self._make_core_with_retry_pending_row()
+        core._on_signal_expire(watched)
+        for call in osm.update_order_meta.call_args_list:
+            args, kwargs = call
+            meta_arg = args[1] if len(args) > 1 else {}
+            if isinstance(meta_arg, dict):
+                assert meta_arg.get("watcher_invalidation_reason") != "watcher_expired", (
+                    "watcher_invalidation_reason=watcher_expired must not be written "
+                    "while active materialization suppresses the expiry"
+                )
+
+    def test_expire_pending_entry_not_called_when_skipped(self):
+        """Active RETRY_PENDING: expire_pending_entry() must not be called at all."""
+        core, store, osm, watched = self._make_core_with_retry_pending_row()
+        core._on_signal_expire(watched)
+        osm.expire_pending_entry.assert_not_called()
+
+    def test_result_reason_code_is_skip_reason(self):
+        """Return value reason_code must be the exact skip reason, not 'cleanup_returned_false:watcher_expired'."""
+        core, store, osm, watched = self._make_core_with_retry_pending_row()
+        result = core._on_signal_expire(watched)
+        rc = getattr(result, "reason_code", None)
+        assert rc is not None
+        assert "WATCHER_EXPIRY_SKIPPED_ACTIVE_MATERIALIZATION" in str(rc), (
+            f"reason_code must be the skip reason, got {rc!r}"
+        )
+        assert "cleanup_returned_false" not in str(rc), (
+            "reason_code must not be the generic cleanup_returned_false string"
+        )
+
+    def test_normal_expiry_still_writes_expired(self):
+        """Untriggered watcher (no materialization): store.update_status('expired') must still fire."""
+        # Order with empty meta — no materialization state
+        row = _order_row(meta=json.dumps({}))
+        osm = MagicMock()
+        osm.get_order.return_value = row
+        osm.expire_pending_entry.return_value = True
+        osm.update_order_meta.return_value = True
+
+        store = MagicMock()
+        store.update_status = MagicMock()
+
+        core = _make_core(osm)
+        core.store = store
+
+        watched = _make_watched(signal_overrides={"signal_id": _SIG})
+        core._on_signal_expire(watched)
+
+        # For normal expiry, store.update_status must have been called with "expired"
+        calls = store.update_status.call_args_list
+        expired_calls = [c for c in calls if "expired" in c.args]
+        assert expired_calls, (
+            "Normal untriggered expiry must still call store.update_status(..., 'expired')"
+        )
+
+    def test_guard_check_failed_also_suppresses_expired_write(self):
+        """WATCHER_EXPIRY_GUARD_CHECK_FAILED path must also not write expired state."""
+        # Make get_order raise — triggers fail-closed path
+        osm = MagicMock()
+        osm.get_order.side_effect = Exception("DB timeout")
+
+        store = MagicMock()
+        store.update_status = MagicMock()
+
+        core = _make_core(osm)
+        core.store = store
+        watched = _make_watched()
+
+        core._on_signal_expire(watched)
+
+        for call in store.update_status.call_args_list:
+            args, kwargs = call
+            assert "expired" not in args, (
+                "GUARD_CHECK_FAILED path must not write expired state"
+            )
