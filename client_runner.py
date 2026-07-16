@@ -94,6 +94,32 @@ _ET = ZoneInfo("America/New_York")
 _time_module: object = time
 _members_cache: dict = {}
 
+
+def _autonomy_log_context(execution_mode: str | None = None) -> dict:
+    commit_sha = (
+        os.getenv("RENDER_GIT_COMMIT")
+        or os.getenv("COMMIT_SHA")
+        or os.getenv("GITHUB_SHA")
+        or "unknown"
+    )
+    mode = str(execution_mode or "").strip().lower()
+    try:
+        with _registry_lock:
+            client_count = sum(
+                1
+                for runner in _active_runners.values()
+                if not mode or str(getattr(runner, "mode", "") or "").strip().lower() == mode
+            )
+    except Exception:
+        client_count = None
+    return {
+        "commit_sha": str(commit_sha)[:12],
+        "pod_id": os.getenv("POD_ID", "").strip() or "unknown",
+        "client_count": client_count,
+        "execution_mode": mode,
+    }
+
+
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
@@ -3170,6 +3196,7 @@ class ClientRunner(threading.Thread):
                 _fut = _ex.submit(_do_recovery)
                 try:
                     rec_result = _fut.result(timeout=_RECOVERY_TIMEOUT)
+                    autonomy_ctx = _autonomy_log_context(self.mode)
                     logger.info(
                         "[%s] Startup recovery complete: positions=%s entries_corrected=%s exits=%s dedup=%s",
                         self.email,
@@ -3177,6 +3204,23 @@ class ClientRunner(threading.Thread):
                         rec_result.get("entries_corrected"),
                         rec_result.get("exits_reattached"),
                         rec_result.get("dedup_seeded"),
+                    )
+                    logger.info(
+                        "STARTUP_RECOVERY_COMPLETE client_id=%s execution_mode=%s "
+                        "commit_sha=%s pod_id=%s client_count=%s positions_recovered=%s "
+                        "entries_corrected=%s exits_reattached=%s dedup_seeded=%s "
+                        "deferred_lifecycles_recovered=%s errors=%s",
+                        self.email,
+                        str(self.mode).lower(),
+                        autonomy_ctx["commit_sha"],
+                        autonomy_ctx["pod_id"],
+                        autonomy_ctx["client_count"],
+                        rec_result.get("positions_recovered"),
+                        rec_result.get("entries_corrected"),
+                        rec_result.get("exits_reattached"),
+                        rec_result.get("dedup_seeded"),
+                        rec_result.get("deferred_lifecycles_recovered"),
+                        rec_result.get("errors"),
                     )
                 except _cf.TimeoutError:
                     logger.warning(
