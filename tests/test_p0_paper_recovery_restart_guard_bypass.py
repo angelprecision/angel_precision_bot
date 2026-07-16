@@ -16,6 +16,7 @@ from __future__ import annotations
 import sys
 import types
 import logging
+import importlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,6 +35,9 @@ ET = ZoneInfo(ET_NAME)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+class _StopAfterRecoveryBypass(Exception):
+    """Test sentinel: stop after restart-guard bypass before downstream queue stages."""
 
 def _now_ts(delta=timedelta(0)):
     return (datetime.now(timezone.utc) + delta).isoformat()
@@ -55,42 +59,75 @@ def _make_mc(mode):
     return mc
 
 
-def _run_dispatch(*, job_id, client_id, mode, payload, signal_id,
-                  should_skip_return=True):
+def _run_dispatch(
+    *,
+    job_id,
+    client_id,
+    mode,
+    payload,
+    signal_id,
+    should_skip_return=True,
+    master_control=None,
+    contract_selector=None,
+    order_state_machine=None,
+    entry_watcher=None,
+):
     """Run _dispatch with restart_guard stubbed and required mocks provided.
 
     _execution_mode inside _dispatch derives from master_control.mode; there
     is no execution_mode parameter on _dispatch itself.
     """
-    rg_stub = types.ModuleType("ap.restart_guard")
-    rg_stub.should_skip_on_restart = lambda p: should_skip_return
+    queue_mod = importlib.import_module("ap.queue")
 
-    rejected = []
+    restart_guard_stub = types.ModuleType("ap.restart_guard")
+    restart_guard_stub.should_skip_on_restart = lambda p: should_skip_return
+
+    rejection_stub = types.ModuleType("ap.rejection_feed")
+    rejection_stub.post_master_control_block = lambda **kwargs: None
+
+    marked = []
 
     def _fake_mark(jid, status, *, result=None, error=None):
-        if error == "restart_guard:overnight_skip":
-            rejected.append(error)
+        marked.append(
+            {
+                "job_id": jid,
+                "status": status,
+                "result": result,
+                "error": error,
+            }
+        )
 
-    sys.modules["ap.restart_guard"] = rg_stub
-    try:
-        with patch("ap.queue._mark_job", side_effect=_fake_mark), \
-             patch("ap.queue._get_sb_client", return_value=None), \
-             patch("ap.queue._log_rejection_to_db", return_value=None):
+    original_info = queue_mod.log.info
+
+    def _info_then_stop(msg, *args, **kwargs):
+        original_info(msg, *args, **kwargs)
+        if "PAPER_RECOVERY_RESTART_GUARD_BYPASS" in str(msg):
+            raise _StopAfterRecoveryBypass()
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.restart_guard": restart_guard_stub,
+            "ap.rejection_feed": rejection_stub,
+        },
+    ):
+        with patch.object(queue_mod, "_mark_job", side_effect=_fake_mark), \
+             patch.object(queue_mod, "_get_sb_client", return_value=None), \
+             patch.object(queue_mod, "_log_rejection_to_db", return_value=None), \
+             patch.object(queue_mod.log, "info", side_effect=_info_then_stop):
             try:
-                queue._dispatch(
+                queue_mod._dispatch(
                     job_id=job_id, client_id=client_id,
                     signal_id=signal_id, payload=payload,
                     job_last_error=None, job_result=None,
-                    master_control=_make_mc(mode),
-                    contract_selector=MagicMock(),
-                    order_state_machine=MagicMock(),
-                    entry_watcher=MagicMock(),
+                    master_control=master_control or _make_mc(mode),
+                    contract_selector=contract_selector or MagicMock(),
+                    order_state_machine=order_state_machine or MagicMock(),
+                    entry_watcher=entry_watcher or MagicMock(),
                 )
-            except Exception:
+            except _StopAfterRecoveryBypass:
                 pass
-    finally:
-        sys.modules.pop("ap.restart_guard", None)
-    return rejected
+    return marked
 
 
 # ── §1 Core classifier ────────────────────────────────────────────────────────
@@ -323,11 +360,11 @@ def test_integer_1_rescue_rejected():
 def test_dispatch_paper_valid_marker_passes_guard():
     """Overnight PAPER row with valid recovery marker must not be rejected."""
     payload = {**_marker(), "ticker": "TSLA", "side": "CALL", "score": 80.0}
-    rejected = _run_dispatch(
+    marked = _run_dispatch(
         job_id=1, client_id="jose@x.com", mode="PAPER",
         payload=payload, signal_id="sig-001"
     )
-    assert rejected == [], f"Valid PAPER recovery must pass guard. got={rejected}"
+    assert marked == []
 
 
 def test_dispatch_live_same_marker_rejected():
@@ -339,22 +376,56 @@ def test_dispatch_live_same_marker_rejected():
     """
     payload = {**_marker(), "ticker": "TSLA", "side": "CALL",
                "score": 80.0, "execution_mode": "live"}
-    rejected = _run_dispatch(
+    master_control = _make_mc("LIVE")
+    contract_selector = MagicMock()
+    order_state_machine = MagicMock()
+    entry_watcher = MagicMock()
+    marked = _run_dispatch(
         job_id=2, client_id="jason@x.com", mode="LIVE",
-        payload=payload, signal_id="sig-002"
+        payload=payload, signal_id="sig-002",
+        master_control=master_control,
+        contract_selector=contract_selector,
+        order_state_machine=order_state_machine,
+        entry_watcher=entry_watcher,
     )
-    assert len(rejected) == 1, f"LIVE must be rejected by restart guard. got={rejected}"
+    assert marked == [{
+        "job_id": 2,
+        "status": "REJECTED",
+        "result": None,
+        "error": "restart_guard:overnight_skip",
+    }]
+    assert master_control.method_calls == []
+    assert contract_selector.method_calls == []
+    assert order_state_machine.method_calls == []
+    assert entry_watcher.method_calls == []
 
 
 def test_dispatch_stale_paper_marker_rejected():
     """Yesterday's recovery marker must not bypass restart guard."""
     ts = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
     payload = {**_marker(ts_override=ts), "ticker": "TSLA", "side": "CALL", "score": 80.0}
-    rejected = _run_dispatch(
+    master_control = _make_mc("PAPER")
+    contract_selector = MagicMock()
+    order_state_machine = MagicMock()
+    entry_watcher = MagicMock()
+    marked = _run_dispatch(
         job_id=3, client_id="jose@x.com", mode="PAPER",
-        payload=payload, signal_id="sig-003"
+        payload=payload, signal_id="sig-003",
+        master_control=master_control,
+        contract_selector=contract_selector,
+        order_state_machine=order_state_machine,
+        entry_watcher=entry_watcher,
     )
-    assert len(rejected) == 1, f"Stale marker must be rejected. got={rejected}"
+    assert marked == [{
+        "job_id": 3,
+        "status": "REJECTED",
+        "result": None,
+        "error": "restart_guard:overnight_skip",
+    }]
+    assert master_control.method_calls == []
+    assert contract_selector.method_calls == []
+    assert order_state_machine.method_calls == []
+    assert entry_watcher.method_calls == []
 
 
 # ── §7 Producer contract ──────────────────────────────────────────────────────
@@ -485,36 +556,14 @@ def test_reseed_watchers_paper_scoped_by_client_id():
 def test_structured_log_emitted_on_recovery_bypass(caplog):
     """PAPER_RECOVERY_RESTART_GUARD_BYPASS must be logged when bypass fires."""
     payload = {**_marker(), "ticker": "TSLA", "side": "CALL", "score": 80.0}
-    rejected = []
-
-    rg_stub = types.ModuleType("ap.restart_guard")
-    rg_stub.should_skip_on_restart = lambda p: True
-    sys.modules["ap.restart_guard"] = rg_stub
-
-    def _fake_mark(jid, status, *, result=None, error=None):
-        if error == "restart_guard:overnight_skip":
-            rejected.append(error)
-
-    mc = _make_mc("PAPER")
-    try:
-        with caplog.at_level(logging.INFO), \
-             patch("ap.queue._mark_job", side_effect=_fake_mark), \
-             patch("ap.queue._get_sb_client", return_value=None), \
-             patch("ap.queue._log_rejection_to_db", return_value=None):
-            try:
-                queue._dispatch(
-                    job_id=99, client_id="jose@x.com",
-                    signal_id="sig-log", payload=payload,
-                    job_last_error=None, job_result=None,
-                    master_control=mc,
-                    contract_selector=MagicMock(),
-                    order_state_machine=MagicMock(),
-                    entry_watcher=MagicMock(),
-                )
-            except Exception:
-                pass
-    finally:
-        sys.modules.pop("ap.restart_guard", None)
+    with caplog.at_level(logging.INFO):
+        marked = _run_dispatch(
+            job_id=99,
+            client_id="jose@x.com",
+            mode="PAPER",
+            payload=payload,
+            signal_id="sig-log",
+        )
 
     msgs = [r.getMessage() for r in caplog.records]
     assert any("PAPER_RECOVERY_RESTART_GUARD_BYPASS" in m for m in msgs), \
@@ -522,7 +571,7 @@ def test_structured_log_emitted_on_recovery_bypass(caplog):
     # client_id must appear in the log (required field per spec)
     assert any("jose@x.com" in m for m in msgs if "PAPER_RECOVERY_RESTART_GUARD_BYPASS" in m), \
         f"client_id must appear in PAPER_RECOVERY_RESTART_GUARD_BYPASS log. got={msgs}"
-    assert rejected == [], "Row must not have been rejected after bypass"
+    assert marked == [], "Row must not have been rejected after bypass"
 
 
 # ── §9 Read-only classifier ───────────────────────────────────────────────────
