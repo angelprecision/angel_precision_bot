@@ -358,19 +358,41 @@ def test_dispatch_stale_paper_marker_rejected():
 
 
 # ── §7 Producer contract ──────────────────────────────────────────────────────
+#
+# Production reads self.mc.mode (not self.mode) to detect LIVE vs PAPER.
+# Tests must set rec.mc = SimpleNamespace(mode=...) or production defaults to
+# PAPER on AttributeError — making a test that sets rec.mode="live" silently
+# exercise the PAPER path while claiming to test LIVE.
 
-def test_reseed_watchers_writes_all_marker_fields():
-    """_reseed_watchers must stamp all three recovery_rescue fields atomically
-    via JSONB merge (||) so existing signal_id/ticker/score are preserved."""
+from types import SimpleNamespace as _NS
+
+
+def _make_paper_rec(client_id="jose.vasquez4011@gmail.com"):
     import ap_recovery as _r
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = client_id
+    rec.mc = _NS(mode="PAPER")
+    rec.entry_watcher = None
+    return rec
 
-    sqls = []
-    params_list = []
 
+def _make_live_rec(client_id="jasoncosby1@gmail.com"):
+    import ap_recovery as _r
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = client_id
+    rec.mc = _NS(mode="LIVE")
+    rec.entry_watcher = None
+    return rec
+
+
+def _fake_db_module(sqls, params_list=None):
+    """Return a fake ap.db module whose cursor records SQL/params."""
     class FakeCursor:
+        rowcount = 0
         def execute(self, sql, params=None):
             sqls.append(sql)
-            params_list.append(params or [])
+            if params_list is not None:
+                params_list.append(params or [])
         def __enter__(self): return self
         def __exit__(self, *_): pass
         def fetchall(self): return []
@@ -380,25 +402,24 @@ def test_reseed_watchers_writes_all_marker_fields():
         def __enter__(self): return FakeCursor()
         def __exit__(self, *_): pass
 
-    rec = object.__new__(_r.APStartupRecovery)
-    rec.client_id = "jose.vasquez4011@gmail.com"
-    rec.mode = "paper"
+    mod = types.ModuleType("ap.db")
+    mod.conn = FakeConn
+    mod.run_with_retry = lambda fn, *a, **k: fn()
+    return mod
 
-    fake_db = types.ModuleType("ap.db")
-    fake_db.conn = FakeConn
-    fake_db.run_with_retry = lambda fn, *a, **k: fn()
 
+def test_reseed_watchers_writes_all_marker_fields():
+    """_reseed_watchers must stamp all three recovery_rescue fields atomically
+    via JSONB merge (||) so existing signal_id/ticker/score are preserved."""
+    sqls, params_list = [], []
+    rec = _make_paper_rec()
     with patch("ap_recovery.os.getenv", return_value="48"), \
-         patch.dict(sys.modules, {"ap.db": fake_db}):
-        try:
-            rec._reseed_watchers({})
-        except Exception:
-            pass
+         patch.dict(sys.modules, {"ap.db": _fake_db_module(sqls, params_list)}):
+        rec._reseed_watchers({})   # must not raise
 
-    combined_sql = " ".join(sqls)
-    combined_params = " ".join(str(p) for p in params_list)
+    combined_sql    = " ".join(sqls)
+    combined_params = str(params_list)
 
-    # Marker fields appear in SQL params (passed as %s), not in the SQL string itself
     assert "WATCHING" in combined_sql, "SQL must filter by WATCHING status"
     assert "||" in combined_sql, "SQL must use JSONB merge (||) to preserve existing payload"
     assert "recovery_rescue" in combined_params, \
@@ -408,130 +429,54 @@ def test_reseed_watchers_writes_all_marker_fields():
 
 
 def test_reseed_watchers_only_targets_watching():
-    """_reseed_watchers UPDATE predicate must be restricted to status='WATCHING'.
-    The WHERE clause must include status = 'WATCHING' and must not include any
-    terminal status as a positive match target."""
-    import ap_recovery as _r
-
+    """UPDATE predicate must be restricted to status='WATCHING'.
+    Terminal status strings must not appear in the UPDATE clause."""
     sqls = []
-
-    class FakeCursor:
-        def execute(self, sql, params=None):
-            sqls.append(sql)
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def fetchall(self): return []
-        def fetchone(self): return None
-
-    class FakeConn:
-        def __enter__(self): return FakeCursor()
-        def __exit__(self, *_): pass
-
-    rec = object.__new__(_r.APStartupRecovery)
-    rec.client_id = "jose.vasquez4011@gmail.com"
-    rec.mode = "paper"
-
-    fake_db2 = types.ModuleType("ap.db")
-    fake_db2.conn = FakeConn
-    fake_db2.run_with_retry = lambda fn, *a, **k: fn()
-
+    rec = _make_paper_rec()
     with patch("ap_recovery.os.getenv", return_value="48"), \
-         patch.dict(sys.modules, {"ap.db": fake_db2}):
-        try:
-            rec._reseed_watchers({})
-        except Exception:
-            pass
+         patch.dict(sys.modules, {"ap.db": _fake_db_module(sqls)}):
+        rec._reseed_watchers({})   # must not raise
 
     assert sqls, "Expected at least one SQL statement"
     combined = " ".join(sqls)
-
-    # Must filter on WATCHING (the only rows eligible for reset)
     assert "WATCHING" in combined, "SQL must filter by status='WATCHING'"
 
-    # Direct check: the WHERE clause must not SET status for any terminal status.
-    # The UPDATE sets status='NEW' and the WHERE must only match 'WATCHING'.
-    # Confirm no terminal status appears as a SET target or an equality match
-    # that would widen the update predicate beyond WATCHING rows.
+    update_clause = combined.split("WHERE")[0] if "WHERE" in combined else combined
     for terminal in ("REJECTED", "ERROR", "CANCELED", "EXPIRED"):
-        # The terminal strings must not appear as a status value being targeted
-        # (e.g. status = 'REJECTED' in the WHERE or SET clause targeting NEW).
-        # Note: they may appear in NOT EXISTS subqueries; those are safe reads.
-        update_clause = combined.split("WHERE")[0] if "WHERE" in combined else combined
         assert f"'{terminal}'" not in update_clause, (
             f"Terminal status '{terminal}' must not appear in UPDATE clause"
         )
 
 
-def test_reseed_watchers_scoped_by_client_id_not_global():
-    """_reseed_watchers must scope the UPDATE to the runner's client_id.
-
-    The function runs for both LIVE and PAPER runners — the LIVE/PAPER gate
-    lives in _dispatch, not in _reseed_watchers itself. What _reseed_watchers
-    must guarantee is that its UPDATE never operates across clients: the WHERE
-    clause must include client_id = %s so a LIVE runner cannot accidentally
-    reset a PAPER client's rows or vice versa.
+def test_reseed_watchers_skips_reset_for_live():
+    """_reseed_watchers must NOT execute WATCHING->NEW for LIVE runners.
+    Production reads self.mc.mode (not self.mode). Setting rec.mc.mode=LIVE
+    causes _is_live=True and _reset() is skipped; no UPDATE trade_queue fires.
     """
-    import ap_recovery as _r
-
     sqls = []
-    params_list = []
-
-    class FakeCursor:
-        def execute(self, sql, params=None):
-            sqls.append(sql)
-            params_list.append(params or [])
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def fetchall(self): return []
-        def fetchone(self): return None
-        rowcount = 0
-
-    class FakeConn:
-        def __enter__(self): return FakeCursor()
-        def __exit__(self, *_): pass
-
-    rec = object.__new__(_r.APStartupRecovery)
-    rec.client_id = "jasoncosby1@gmail.com"
-    rec.mode = "live"
-
-    fake_db3 = types.ModuleType("ap.db")
-    fake_db3.conn = FakeConn
-    fake_db3.run_with_retry = lambda fn, *a, **k: fn()
-
+    rec = _make_live_rec()
     with patch("ap_recovery.os.getenv", return_value="48"), \
-         patch.dict(sys.modules, {"ap.db": fake_db3}):
-        try:
-            rec._reseed_watchers({})
-        except Exception:
-            pass
+         patch.dict(sys.modules, {"ap.db": _fake_db_module(sqls)}):
+        rec._reseed_watchers({})   # must not raise
 
-    # Must have executed SQL (producer runs for all modes)
-    assert len(sqls) >= 1, "Expected at least one SQL statement"
-    combined_params = str(params_list)
-
-    # The client_id must be in the SQL parameters (row-level scoping)
-    assert "jasoncosby1@gmail.com" in combined_params, (
-        "SQL must scope UPDATE to the runner's client_id — no global mutations"
+    combined = " ".join(sqls)
+    assert "UPDATE trade_queue" not in combined, (
+        "LIVE _reseed_watchers must not emit UPDATE trade_queue SET status='NEW'. "
+        f"Got SQL: {combined[:300]}"
     )
 
-    # The LIVE gate is in _dispatch: prove the classifier rejects LIVE mode
-    # even when the marker is present on the payload (stamped by _reseed_watchers)
-    import ap.queue as queue
-    live_recovery_payload = {
-        "recovery_rescue": True,
-        "recovery_rescue_ts": (
-            __import__("datetime").datetime.now(
-                __import__("datetime").timezone.utc
-            ).isoformat()
-        ),
-        "recovery_rescue_lookback_hours": 48,
-    }
-    assert not queue._is_current_session_paper_recovery(
-        payload=live_recovery_payload,
-        execution_mode="LIVE",
-    ), (
-        "Even with a valid recovery marker, LIVE execution_mode must be rejected "
-        "by the classifier — the LIVE gate in _dispatch prevents bypass"
+
+def test_reseed_watchers_paper_scoped_by_client_id():
+    """PAPER reset SQL must include the runner's client_id in params."""
+    sqls, params_list = [], []
+    rec = _make_paper_rec(client_id="jose.vasquez4011@gmail.com")
+    with patch("ap_recovery.os.getenv", return_value="48"), \
+         patch.dict(sys.modules, {"ap.db": _fake_db_module(sqls, params_list)}):
+        rec._reseed_watchers({})   # must not raise
+
+    combined_params = str(params_list)
+    assert "jose.vasquez4011@gmail.com" in combined_params, (
+        "SQL params must contain the runner's client_id — no global mutations"
     )
 
 
