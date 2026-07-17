@@ -1173,6 +1173,40 @@ def test_submit_wrapper_retires_reserved_exit_row_after_conclusive_pre_submit_fa
     assert engine.order_state_machine.active_order["last_error"] == "NO_POST_ATTEMPTED:validation_failed"
 
 
+def test_submit_wrapper_retires_reserved_exit_row_when_claim_acquisition_fails_in_live(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db down")))
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=MagicMock(), mode="LIVE")
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert engine.order_state_machine.active_order["last_error"].startswith("EXIT_DECISION_GENERATION_CLAIM_FAILED:")
+    assert pos.pending_exit_local_order_id == engine.order_state_machine.active_order["local_order_id"]
+
+
+def test_submit_wrapper_retires_reserved_exit_row_when_claim_meta_persist_fails_in_live(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=MagicMock(), mode="LIVE")
+
+    def broken_update(local_order_id, patch):
+        raise RuntimeError("meta write failed")
+
+    engine.order_state_machine.update_order_meta = broken_update
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert engine.order_state_machine.active_order["last_error"] == "EXIT_DECISION_LOCAL_EXIT_META_PERSIST_FAILED"
+    assert pos.pending_exit_local_order_id == ""
+
+
 def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
     generation_claims_table,
     monkeypatch,

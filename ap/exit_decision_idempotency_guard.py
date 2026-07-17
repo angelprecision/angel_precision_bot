@@ -297,10 +297,18 @@ def _ensure_local_exit_intent_row(
 
     update_meta = getattr(osm, "update_order_meta", None)
     if callable(update_meta):
-        update_meta(local_order_id, {
-            "exit_generation_claim_key": generation_key,
-            "exit_generation_claim": int(exit_generation),
-        })
+        try:
+            update_meta(local_order_id, {
+                "exit_generation_claim_key": generation_key,
+                "exit_generation_claim": int(exit_generation),
+            })
+        except Exception:
+            _retire_local_exit_intent_after_no_submit(
+                engine,
+                local_order_id,
+                error_text="EXIT_DECISION_LOCAL_EXIT_META_PERSIST_FAILED",
+            )
+            return ""
 
     with engine._lock:
         if not bool(getattr(pos, "closed", False)):
@@ -1273,6 +1281,11 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             exc,
                         )
                         if _durable_claim_outage_blocks_submit(self, pos):
+                            _retire_local_exit_intent_after_no_submit(
+                                self,
+                                local_order_id,
+                                error_text=f"EXIT_DECISION_GENERATION_CLAIM_FAILED:{exc}",
+                            )
                             return False
                         generation_key = ""
                         exit_generation = 0
