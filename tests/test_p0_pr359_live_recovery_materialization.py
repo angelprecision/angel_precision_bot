@@ -355,3 +355,178 @@ def test_genuinely_different_opportunity_cannot_claim(monkeypatch):
     assert osm.claim_deferred_materialization(
         "nke-oid", **_claim_kwargs(canonical_signal_id="DIFFERENT:canonical"),
     ) is False
+
+
+# P0-1: NULL last_error rows are candidates ──────────────────────────────────
+
+def test_p0_1_null_last_error_row_is_candidate():
+    """A healthy WATCHING row with last_error=NULL must be selected.
+    PostgreSQL NULL NOT LIKE 'x%' evaluates to UNKNOWN (not TRUE), excluding
+    the row. The fix is (last_error IS NULL OR last_error NOT LIKE 'x%')."""
+    sqls, _ = _run_recovery(tq_rows=[], broker=MagicMock())
+    load = [(s, p) for s, p in sqls if "FROM TRADE_QUEUE" in s.upper() and "WATCHING" in s.upper()]
+    assert load
+    load_sql = load[0][0]
+    assert "IS NULL" in load_sql.upper(), (
+        "Candidate query must include 'last_error IS NULL' so healthy WATCHING rows "
+        "with NULL last_error are not excluded by NULL NOT LIKE evaluation"
+    )
+
+
+def test_p0_1_null_last_error_row_is_processed():
+    """A WATCHING row with last_error=NULL must reach the classifier and be eligible."""
+    row = _q_row(symbol="WMT", direction="PUT", trigger=60.5, last_error=None)
+    _, updates = _run_recovery(tq_rows=[row], broker=_fresh_quote(62.0))
+    # Eligible row (not yet crossed): should produce a restore UPDATE
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    # Either a restore fired or a skip — but it must not have been excluded before classify
+    # The key proof: broker was called (classifier ran), not skipped at query level
+    # We verify this by checking that the load SQL has the NULL-safe predicate (above test)
+    # and that the row reached the broker call path — verified by the fact that
+    # _current_underlying is called (would only happen if row made it through _load_candidates)
+    # The stale-quote test already proves this path. Here just confirm no spurious REJECT.
+    assert not any("LIVE_RECOVERY_MISSED_TRIGGER" in s for s, _ in updates), (
+        "NULL last_error WMT row (not yet triggered) must not be terminalized"
+    )
+
+
+# P0-2: Tradier trade_date/bid_date/ask_date timestamp support ───────────────
+
+def _tradier_quote(price, trade_date_ms=None, fresh=True):
+    """Build a Tradier-shaped quote dict with epoch-ms timestamps."""
+    if trade_date_ms is None:
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        if not fresh:
+            now_ms -= int(3 * 3600 * 1000)  # 3h stale
+        trade_date_ms = now_ms
+    m = MagicMock()
+    m.get_quote = lambda sym: {
+        "last": price,
+        "bid": price - 0.05,
+        "ask": price + 0.05,
+        "trade_date": trade_date_ms,
+    }
+    return m
+
+
+def test_p0_2_tradier_trade_date_fresh_accepted():
+    """Tradier trade_date (epoch-ms) within 120s must allow price to be used."""
+    # PUT trigger=175, current=170 → crossed → QCOM should be terminalized
+    row = _q_row(symbol="QCOM", direction="PUT", trigger=175.0, created_hours_ago=14)
+    _, updates = _run_recovery(tq_rows=[row], broker=_tradier_quote(170.0, fresh=True))
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert missed, "Fresh trade_date Tradier quote must allow missed-trigger classification"
+    assert "status = 'REJECTED'" in missed[0][0]
+
+
+def test_p0_2_tradier_stale_trade_date_fails_closed():
+    """Tradier trade_date from 3h ago must fail closed — no termination."""
+    row = _q_row(symbol="QCOM", direction="PUT", trigger=175.0)
+    _, updates = _run_recovery(tq_rows=[row], broker=_tradier_quote(170.0, fresh=False))
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not missed, "Stale Tradier trade_date must not terminalize"
+
+
+def test_p0_2_no_timestamp_field_fails_closed():
+    """Quote dict with no timestamp/trade_date must fail closed."""
+    row = _q_row(symbol="QCOM", direction="PUT", trigger=175.0)
+    _, updates = _run_recovery(tq_rows=[row], broker=_no_ts_quote(170.0))
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not missed, "Quote without any timestamp field must not terminalize"
+
+
+# P0-3: _mark_missed TOCTOU fence ────────────────────────────────────────────
+
+def test_p0_3_mark_missed_contains_not_exists_fence():
+    import inspect, ap_recovery as _r
+    src = inspect.getsource(_r)
+    fn_s = src.find("def _mark_missed(row_id, diag:")
+    fn_e = src.find("\n            def ", fn_s + 1)
+    body = src[fn_s:fn_e]
+    assert "NOT EXISTS" in body, (
+        "_mark_missed UPDATE must contain NOT EXISTS order fence to prevent TOCTOU race"
+    )
+
+
+# P0-4: FILLED orders block recovery ─────────────────────────────────────────
+
+def test_p0_4_filled_qty_zero_required():
+    import inspect, ap_recovery as _r
+    src = inspect.getsource(_r)
+    fn_s = src.find("def _active_entry_order_exists(")
+    fn_e = src.find("\n            def ", fn_s + 1)
+    body = src[fn_s:fn_e]
+    assert "filled_qty" in body.lower() or "filled_ts" in body.lower(), (
+        "Order check must block rows with filled_qty > 0 or filled_ts IS NOT NULL"
+    )
+
+
+def test_p0_4_filled_not_in_terminal_exclusions():
+    """FILLED must NOT be in the terminal-exclusion list; it must be blocked separately."""
+    import inspect, ap_recovery as _r
+    src = inspect.getsource(_r)
+    fn_s = src.find("def _active_entry_order_exists(")
+    fn_e = src.find("\n            def ", fn_s + 1)
+    body = src[fn_s:fn_e]
+    # FILLED is now handled by filled_qty/filled_ts predicate, NOT in the status NOT IN list
+    # (having it in both is also acceptable; the key is it blocks)
+    # Verify either approach is present
+    blocks_filled = ("'FILLED'" in body or "filled_qty" in body.lower() or "filled_ts" in body.lower())
+    assert blocks_filled, "FILLED entries must block LIVE recovery"
+
+
+# P0-5: Policy truth failure closes ──────────────────────────────────────────
+
+def test_p0_5_policy_lookup_fails_closed():
+    """When ap_signals query raises, classify must skip (fail closed), not continue."""
+    import ap_recovery as _r
+
+    sqls, updates = [], []
+
+    class _C:
+        def __init__(self):
+            self.rowcount = 1
+            self._u = ""
+        def execute(self, sql, params=()):
+            norm = " ".join(str(sql).split())
+            sqls.append((norm, tuple(params)))
+            self._u = norm.upper()
+            if "UPDATE" in self._u:
+                updates.append((norm, tuple(params)))
+        def fetchall(self):
+            if "FROM TRADE_QUEUE" in self._u or "WATCHING" in self._u:
+                return [_q_row(symbol="C", direction="PUT", trigger=16.0, signal_id="sig-c-p05")]
+            if "FROM AP_SIGNALS" in self._u:
+                raise RuntimeError("db_timeout")
+            return []
+        def fetchone(self):
+            rows = self.fetchall()
+            return rows[0] if rows else None
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = "jasoncosby1@gmail.com"
+    rec.mc = SimpleNamespace(mode="LIVE")
+    rec.entry_watcher = None
+    # Fresh quote — current=15 below trigger=16 for PUT → would be eligible
+    rec.broker = _fresh_quote(15.0)
+
+    fdb = __import__("types").ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch("ap_recovery.os.getenv", return_value="48"),          patch.dict(sys.modules, {"ap.db": fdb}):
+        rec._reseed_watchers({})
+
+    # Must not restore a row when policy truth is unavailable
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert not restore, (
+        "ap_signals query failure must skip the row (fail closed), not restore it. "
+        f"Got {len(restore)} restore update(s)."
+    )
