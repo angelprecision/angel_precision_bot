@@ -37,7 +37,9 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo as _ZoneInfo
 
 from ap.state import update_state
 from ap_signal_store import canonical_client_email, upsert_ap_signal_row_with_fallback
@@ -266,6 +268,96 @@ _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
 _PAPER_OVERNIGHT_REEVAL_ONLY_ERROR = "after_hours_deferred:awaiting_overnight_reeval"
 _VALID_EXECUTION_MODES = frozenset({"PAPER", "LIVE"})
 
+# ── PAPER recovery restart-guard classifier ───────────────────────────────────
+# Production incident 2026-07-16: APStartupRecovery legitimately reset Jose's
+# current-session PAPER WATCHING rows to NEW and stamped recovery_rescue +
+# recovery_rescue_ts. The queue restart guard did not recognise that marker, so
+# 122 overnight-evaluated signals were terminally rejected as
+# restart_guard:overnight_skip after market open.
+#
+# Root cause: producer-consumer contract mismatch. The recovery producer
+# (APStartupRecovery._reseed_watchers) writes the three marker fields
+# atomically; the consumer (_manual_restart_guard_bypass_enabled) did not read
+# them. This block closes that gap.
+#
+# Scope: PAPER only. Current Eastern trading date only.
+# LIVE remains fail-closed and byte-for-byte delegates to the legacy paths.
+
+_ET = _ZoneInfo("America/New_York")
+_MAX_RECOVERY_LOOKBACK_HOURS = 48
+_MAX_FUTURE_CLOCK_SKEW = _timedelta(minutes=5)
+
+
+def _parse_aware_timestamp(value: Any) -> _datetime | None:
+    """Parse a timezone-aware ISO-8601 timestamp string.
+
+    Accepts ``+00:00`` and ``Z`` suffixes; rejects naive timestamps.
+    Returns a UTC-normalised datetime or None on any failure.
+    """
+    if isinstance(value, _datetime):
+        if value.tzinfo is None:
+            return None
+        return value.astimezone(_timezone.utc)
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = _datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(_timezone.utc)
+
+
+def _is_current_session_paper_recovery(
+    *,
+    payload: dict | None,
+    execution_mode: str | None,
+    now: _datetime | None = None,
+) -> bool:
+    """Return True only for a legitimately proven current-session PAPER recovery row.
+
+    All nine conditions must hold (fail-closed if any one fails):
+
+    1. Runtime execution mode is exactly PAPER (case-insensitive).
+    2. ``payload.recovery_rescue`` is the literal boolean ``True``.
+    3. ``payload.recovery_rescue_ts`` is present and non-empty.
+    4. The timestamp is parseable as ISO-8601.
+    5. The timestamp is timezone-aware.
+    6. The timestamp belongs to the current Eastern trading date.
+    7. The timestamp is not more than five minutes in the future.
+    8. ``recovery_rescue_lookback_hours`` is an integer (not a string).
+    9. The lookback is between 1 and 48 hours (inclusive).
+
+    LIVE is explicitly rejected in condition 1. Payload-embedded
+    ``execution_mode`` fields are ignored; runtime mode is authoritative.
+    """
+    if str(execution_mode or "").strip().upper() != "PAPER":
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("recovery_rescue") is not True:
+        return False
+
+    rescued_at_utc = _parse_aware_timestamp(payload.get("recovery_rescue_ts"))
+    if rescued_at_utc is None:
+        return False
+
+    raw_lookback = payload.get("recovery_rescue_lookback_hours")
+    if not isinstance(raw_lookback, int) or isinstance(raw_lookback, bool):
+        return False
+    if not 1 <= raw_lookback <= _MAX_RECOVERY_LOOKBACK_HOURS:
+        return False
+
+    now_utc = (now or _datetime.now(_timezone.utc)).astimezone(_timezone.utc)
+    if rescued_at_utc > now_utc + _MAX_FUTURE_CLOCK_SKEW:
+        return False
+
+    return rescued_at_utc.astimezone(_ET).date() == now_utc.astimezone(_ET).date()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PR #233 — Queue side fail-closed + breach diagnostics hardening
@@ -395,8 +487,16 @@ def _manual_restart_guard_bypass_enabled(
 ) -> bool:
     if str(execution_mode or "").strip().upper() != "PAPER":
         return False
+    # ── 1. Current-session PAPER recovery (production incident 2026-07-16) ──
+    if _is_current_session_paper_recovery(
+        payload=payload,
+        execution_mode=execution_mode,
+    ):
+        return True
+    # ── 2. Overnight-reeval-only deferred row ────────────────────────────────
     if _paper_overnight_reeval_only_enabled(payload=payload, execution_mode=execution_mode):
         return True
+    # ── 3. Manual rescue markers ─────────────────────────────────────────────
     if isinstance(job_result, dict) and bool(job_result.get("manual_rescue")):
         return True
     return str(job_last_error or "").strip() in _MANUAL_RESTART_GUARD_BYPASS_ERRORS
@@ -1216,13 +1316,32 @@ def _dispatch(
                 pass
             return
         if _restart_skip and _manual_rescue_bypass:
-            log.warning(
-                "[%s] RESTART GUARD BYPASS — continuing manual rescue row | signal_id=%s job_id=%s last_error=%s",
-                ticker,
-                signal_id,
-                job_id,
-                job_last_error,
+            # Emit a structured log so the reason for bypass is observable.
+            _is_paper_recovery = _is_current_session_paper_recovery(
+                payload=payload,
+                execution_mode=_execution_mode,
             )
+            if _is_paper_recovery:
+                log.info(
+                    "[%s] PAPER_RECOVERY_RESTART_GUARD_BYPASS "
+                    "signal_id=%s job_id=%s client_id=%s execution_mode=%s "
+                    "recovery_ts=%s lookback_hours=%s",
+                    ticker,
+                    signal_id,
+                    job_id,
+                    client_id,
+                    str(_execution_mode or "").upper(),
+                    payload.get("recovery_rescue_ts") if isinstance(payload, dict) else None,
+                    payload.get("recovery_rescue_lookback_hours") if isinstance(payload, dict) else None,
+                )
+            else:
+                log.warning(
+                    "[%s] RESTART GUARD BYPASS — continuing manual rescue row | signal_id=%s job_id=%s last_error=%s",
+                    ticker,
+                    signal_id,
+                    job_id,
+                    job_last_error,
+                )
     except ImportError:
         pass  # restart_guard not yet deployed — skip silently
 
