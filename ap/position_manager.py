@@ -474,6 +474,208 @@ class APPositionManager:
         self._position_columns_cache = None
         self._position_columns()
 
+    def _proof_row_exists(self, *, position_id: str = "", local_order_id: str = "") -> bool:
+        def _fn():
+            with conn() as c:
+                if position_id:
+                    c.execute(
+                        "SELECT 1 FROM proof_trades WHERE position_id=%s LIMIT 1",
+                        (position_id,),
+                    )
+                    if c.fetchone():
+                        return True
+                if local_order_id:
+                    c.execute(
+                        "SELECT 1 FROM proof_trades WHERE local_order_id=%s LIMIT 1",
+                        (local_order_id,),
+                    )
+                    if c.fetchone():
+                        return True
+                return False
+
+        try:
+            return bool(run_with_retry(_fn))
+        except Exception as exc:
+            log.warning("[%s] proof row existence check failed: %s", self.client_id, exc)
+            return False
+
+    def _claim_recent_broker_repair_proof(
+        self,
+        *,
+        position_id: str,
+        contract: str,
+        closed_at: str,
+        local_order_id: str = "",
+    ) -> bool:
+        repair_position_id = f"broker-repair-{self.client_id}-{contract}"
+        if not position_id or not contract or not closed_at:
+            return False
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    """
+                    UPDATE proof_trades
+                       SET position_id = %s,
+                           local_order_id = CASE
+                               WHEN COALESCE(local_order_id, '') = '' AND %s <> ''
+                               THEN %s
+                               ELSE local_order_id
+                           END
+                     WHERE id = (
+                         SELECT id
+                           FROM proof_trades
+                          WHERE client_email = %s
+                            AND position_id = %s
+                            AND closed_at BETWEEN (%s::timestamptz - INTERVAL '15 minutes')
+                                              AND (%s::timestamptz + INTERVAL '15 minutes')
+                          ORDER BY ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) ASC
+                          LIMIT 1
+                     )
+                    RETURNING id
+                    """,
+                    (
+                        position_id,
+                        local_order_id,
+                        local_order_id,
+                        self.client_id,
+                        repair_position_id,
+                        closed_at,
+                        closed_at,
+                        closed_at,
+                    ),
+                )
+                row = c.fetchone() or {}
+                return bool(row.get("id"))
+
+        try:
+            claimed = bool(run_with_retry(_fn))
+        except Exception as exc:
+            log.warning(
+                "[%s] broker repair proof claim failed | pos=%s contract=%s err=%s",
+                self.client_id, position_id, contract, exc,
+            )
+            return False
+
+        if claimed:
+            log.info(
+                "[%s] broker repair proof claimed | pos=%s contract=%s",
+                self.client_id, position_id, contract,
+            )
+        return claimed
+
+    def _write_missing_terminal_proof(
+        self,
+        *,
+        position_id: str,
+        local_order_id: str,
+        contract: str,
+        underlying: str,
+        side: str,
+        opened_at: str,
+        closed_at: str,
+        entry_option_price: float,
+        exit_option_price: float,
+        contracts: int,
+        exit_reason: str,
+        option_pnl_pct: float,
+        setup_status: str,
+        execution_mode: str = "",
+    ) -> bool:
+        resolved_mode = str(execution_mode or "").strip().lower()
+        if resolved_mode not in {"live", "paper"}:
+            try:
+                from ap.db import get_order_by_id
+                order = get_order_by_id(local_order_id) if local_order_id else None
+            except Exception as exc:
+                log.debug("[%s] execution_mode lookup failed for %s: %s", self.client_id, local_order_id, exc)
+                order = None
+            if order:
+                resolved_mode = str(order.get("execution_mode") or "").strip().lower()
+                if resolved_mode not in {"live", "paper"}:
+                    meta = order.get("meta")
+                    if isinstance(meta, str):
+                        try:
+                            import json as _json
+                            meta = _json.loads(meta)
+                        except Exception:
+                            meta = None
+                    if isinstance(meta, dict):
+                        resolved_mode = str(meta.get("execution_mode") or "").strip().lower()
+        if resolved_mode not in {"live", "paper"}:
+            resolved_mode = "unknown"
+
+        try:
+            with conn() as c:
+                c.execute(
+                    """
+                    INSERT INTO proof_trades (
+                        client_email,
+                        mode,
+                        execution_mode,
+                        system_version,
+                        opened_at,
+                        closed_at,
+                        ticker,
+                        pattern,
+                        side,
+                        timeframe,
+                        score,
+                        tier,
+                        context_score,
+                        setup_status,
+                        entry_trigger,
+                        entry_option_price,
+                        exit_option_price,
+                        underlying_entry,
+                        underlying_exit,
+                        contracts,
+                        exit_reason,
+                        option_pnl_pct,
+                        underlying_pnl_pct,
+                        win,
+                        spread_pct,
+                        chain_grade,
+                        synthetic_entry,
+                        position_id,
+                        local_order_id
+                    )
+                    VALUES (
+                        %s, %s, %s, 'v2',
+                        %s::timestamptz, %s::timestamptz,
+                        %s, '', %s, '1d', 0, 'A', 0, %s,
+                        %s, %s, %s, 0, 0,
+                        %s, %s, %s, 0, %s, 0, '', FALSE, %s, %s
+                    )
+                    """,
+                    (
+                        self.client_id,
+                        resolved_mode,
+                        resolved_mode,
+                        opened_at,
+                        closed_at,
+                        underlying or contract,
+                        side or "CALL",
+                        setup_status,
+                        float(entry_option_price or 0),
+                        float(entry_option_price or 0),
+                        float(exit_option_price or 0),
+                        max(int(contracts or 1), 1),
+                        exit_reason,
+                        round(float(option_pnl_pct or 0), 2),
+                        float(option_pnl_pct or 0) > 0,
+                        position_id or None,
+                        local_order_id or None,
+                    ),
+                )
+        except Exception as exc:
+            log.error(
+                "[%s] missing terminal proof write failed | pos=%s contract=%s err=%s",
+                self.client_id, position_id, contract, exc,
+            )
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # Market/session-day helpers
     # ------------------------------------------------------------------
@@ -1339,9 +1541,19 @@ class APPositionManager:
                 if not row:
                     return False, "update_no_row"
                 return True, {
-                    "status": row.get("status"), "exit_price": exit_px,
-                    "filled_qty": close_qty, "remaining": new_remaining,
-                    "realized_pnl": realized_pnl, "realized_pnl_pct": realized_pnl_pct,
+                    "status": row.get("status"),
+                    "exit_price": exit_px,
+                    "filled_qty": close_qty,
+                    "remaining": new_remaining,
+                    "realized_pnl": realized_pnl,
+                    "realized_pnl_pct": realized_pnl_pct,
+                    "contract": str(pos.get("contract") or ""),
+                    "underlying": str(pos.get("underlying") or pos.get("ticker") or ""),
+                    "side": str(pos.get("side") or ""),
+                    "opened_at": str(pos.get("entry_ts") or now_utc_iso()),
+                    "closed_at": str(ts),
+                    "entry_option_price": avg_fill,
+                    "local_order_id": str(local_order_id or pos.get("local_order_id") or ""),
                 }
 
         ok, detail = run_with_retry(_fn)
@@ -1410,6 +1622,39 @@ class APPositionManager:
                     "[%s] proof_trades fill repair failed (non-fatal): %s",
                     self.client_id, _proof_err,
                 )
+            if int(detail.get("remaining") or 0) <= 0:
+                proof_exists = self._proof_row_exists(
+                    position_id=position_id,
+                    local_order_id=str(detail.get("local_order_id") or ""),
+                )
+                if not proof_exists:
+                    claimed = self._claim_recent_broker_repair_proof(
+                        position_id=position_id,
+                        contract=str(detail.get("contract") or ""),
+                        closed_at=str(detail.get("closed_at") or ts),
+                        local_order_id=str(detail.get("local_order_id") or ""),
+                    )
+                    if not claimed:
+                        persisted = self._write_missing_terminal_proof(
+                            position_id=position_id,
+                            local_order_id=str(detail.get("local_order_id") or ""),
+                            contract=str(detail.get("contract") or ""),
+                            underlying=str(detail.get("underlying") or detail.get("contract") or ""),
+                            side=str(detail.get("side") or ""),
+                            opened_at=str(detail.get("opened_at") or ts),
+                            closed_at=str(detail.get("closed_at") or ts),
+                            entry_option_price=float(detail.get("entry_option_price") or 0),
+                            exit_option_price=exit_px,
+                            contracts=int(detail.get("filled_qty") or fill_qty or 1),
+                            exit_reason=exit_reason,
+                            option_pnl_pct=float(detail.get("realized_pnl_pct") or 0),
+                            setup_status=str(close_source or "broker_exit_fill"),
+                        )
+                        if persisted:
+                            log.info(
+                                "[%s] proof_trades inserted from broker-truth close | pos=%s source=%s",
+                                self.client_id, position_id, close_source,
+                            )
             return True
 
         log.warning(
@@ -1477,11 +1722,21 @@ class APPositionManager:
                     "WHERE id=%s AND client_id=%s",
                     tuple(vals),
                 )
-                detail = (
-                    "expired"
-                    if not PositionStatus.is_terminal(current_status)
-                    else f"already_terminal_repaired_remaining:{current_status}"
-                )
+                detail = {
+                    "result": (
+                        "expired"
+                        if not PositionStatus.is_terminal(current_status)
+                        else f"already_terminal_repaired_remaining:{current_status}"
+                    ),
+                    "contract": str(pos.get("contract") or ""),
+                    "underlying": str(pos.get("underlying") or pos.get("ticker") or ""),
+                    "side": str(pos.get("side") or ""),
+                    "opened_at": str(pos.get("entry_ts") or ts),
+                    "closed_at": str(ts),
+                    "entry_option_price": float(pos.get("avg_fill") or pos.get("entry_price") or 0),
+                    "contracts": int(pos.get("quantity_remaining") or pos.get("qty") or 1),
+                    "local_order_id": str(pos.get("local_order_id") or ""),
+                }
                 return True, detail
 
         ok, detail = run_with_retry(_fn)
@@ -1491,8 +1746,33 @@ class APPositionManager:
                 self.client_id,
                 position_id,
                 reason,
-                detail,
+                detail.get("result") if isinstance(detail, dict) else detail,
             )
+            proof_exists = self._proof_row_exists(
+                position_id=position_id,
+                local_order_id=str((detail or {}).get("local_order_id") or ""),
+            )
+            if not proof_exists:
+                persisted = self._write_missing_terminal_proof(
+                    position_id=position_id,
+                    local_order_id=str((detail or {}).get("local_order_id") or ""),
+                    contract=str((detail or {}).get("contract") or ""),
+                    underlying=str((detail or {}).get("underlying") or (detail or {}).get("contract") or ""),
+                    side=str((detail or {}).get("side") or ""),
+                    opened_at=str((detail or {}).get("opened_at") or ts),
+                    closed_at=str((detail or {}).get("closed_at") or ts),
+                    entry_option_price=float((detail or {}).get("entry_option_price") or 0),
+                    exit_option_price=0.0,
+                    contracts=int((detail or {}).get("contracts") or 1),
+                    exit_reason=exit_reason,
+                    option_pnl_pct=-100.0,
+                    setup_status=str(close_source or "expired_contract_cleanup"),
+                )
+                if persisted:
+                    log.info(
+                        "[%s] proof_trades inserted from contract expiry | pos=%s",
+                        self.client_id, position_id,
+                    )
         else:
             log.warning(
                 "[%s] close_expired_position failed | pos=%s detail=%s",

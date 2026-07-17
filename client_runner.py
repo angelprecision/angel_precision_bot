@@ -1893,6 +1893,26 @@ class ClientRunner(threading.Thread):
                                 )
                         run_with_retry(_close)
 
+                        try:
+                            pm = getattr(self, "position_manager", None)
+                            if pm and hasattr(pm, "_claim_recent_broker_repair_proof"):
+                                claimed = pm._claim_recent_broker_repair_proof(
+                                    position_id=str(pos_id),
+                                    contract=contract,
+                                    closed_at=now_iso,
+                                )
+                                if not claimed:
+                                    logger.error(
+                                        "[%s] MANUAL_CLOSE_PROOF_UNCLAIMED pos=%s contract=%s "
+                                        "closed_at=%s — position closed but no repair proof row bound",
+                                        self.email, pos_id, contract, now_iso,
+                                    )
+                        except Exception as proof_err:
+                            logger.error(
+                                "[%s] MANUAL_CLOSE_PROOF_BIND_FAILED pos=%s contract=%s err=%s",
+                                self.email, pos_id, contract, proof_err,
+                            )
+
                         # Also notify exit engine to remove this position
                         core = getattr(self, "core", None)
                         exit_eng = getattr(core, "exit_eng", None) if core else None
