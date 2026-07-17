@@ -27,24 +27,8 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-# Stub ap.db before any ap.* imports
-_fake_ap_db = types.ModuleType("ap.db")
-class _StubConn:
-    class _C:
-        rowcount = 0
-        def execute(self, *a, **k): pass
-        def fetchone(self): return None
-        def fetchall(self): return []
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-    def __enter__(self): return self._C()
-    def __exit__(self, *_): pass
-
-_fake_ap_db.conn = _StubConn
-_fake_ap_db.run_with_retry = lambda fn, *a, **k: fn()
-_fake_ap_db.get_open_orders_for_reconcile = lambda *a, **k: []
-_fake_ap_db.list_positions = lambda *a, **k: []
-sys.modules.setdefault("ap.db", _fake_ap_db)
+# ap.db is stubbed per-test inside _run_recovery() via patch.dict(sys.modules).
+# No global stub — that would poison unrelated tests in the same process.
 
 from zoneinfo import ZoneInfo
 ET = ZoneInfo("America/New_York")
@@ -297,6 +281,164 @@ def test_b7_c_put_intel_rejected_no_quote():
     assert calls == [], f"C PUT intel_rejected must skip before quote. Called: {calls}"
 
 
+# B1 fill-evidence behavioral tests ──────────────────────────────────────────
+
+def _order_row(*, status, filled_qty=0, filled_ts=None, signal_id="sig-001",
+               execution_mode="live"):
+    """Minimal orders-table row for fill-evidence tests."""
+    return {
+        "id": "ord-1",
+        "client_id": "jasoncosby1@gmail.com",
+        "kind": "ENTRY",
+        "execution_mode": execution_mode,
+        "status": status,
+        "signal_id": signal_id,
+        "canonical_signal_id": f"canonical-{signal_id}",
+        "filled_qty": filled_qty,
+        "filled_ts": filled_ts,
+        "broker_order_id": None,
+        "submitted_ts": None,
+    }
+
+
+def _run_recovery_with_orders(tq_rows, broker, orders_rows):
+    """Run recovery with explicit orders-table rows."""
+    return _run_recovery(tq_rows=tq_rows, broker=broker, orders_rows=orders_rows)
+
+
+def test_b1_filled_order_blocks_restore():
+    """A FILLED ENTRY order with filled_qty>0 must block queue restoration."""
+    tq = [_q_row(symbol="WMT", direction="PUT", trigger=60.5, signal_id="sig-001")]
+    # filled order: status='FILLED', filled_qty=2, filled_ts set
+    order = _order_row(status="FILLED", filled_qty=2,
+                       filled_ts="2026-07-16T09:35:00Z", signal_id="sig-001")
+    _, updates = _run_recovery_with_orders(tq, broker=_fresh_quote(62.0), orders_rows=[order])
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert not restore, (
+        "FILLED order with filled_qty=2 must block recovery. "
+        f"Got {len(restore)} restore update(s)."
+    )
+
+
+def test_b1_canceled_after_partial_fill_blocks_restore():
+    """CANCELED + filled_qty > 0 (partial fill before cancel) must block recovery."""
+    tq = [_q_row(symbol="QCOM", direction="PUT", trigger=175.0, signal_id="sig-002")]
+    order = _order_row(status="CANCELED", filled_qty=1,
+                       filled_ts="2026-07-16T09:36:00Z", signal_id="sig-002")
+    _, updates = _run_recovery_with_orders(tq, broker=_fresh_quote(176.0), orders_rows=[order])
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert not restore, (
+        "CANCELED order with filled_qty=1 (partial fill) must block recovery. "
+        f"Got {len(restore)} restore update(s)."
+    )
+
+
+def test_b1_partial_fill_order_blocks_restore():
+    """PARTIAL_FILL status must block recovery."""
+    tq = [_q_row(symbol="QCOM", direction="PUT", trigger=175.0, signal_id="sig-003")]
+    order = _order_row(status="PARTIAL_FILL", filled_qty=1, signal_id="sig-003")
+    _, updates = _run_recovery_with_orders(tq, broker=_fresh_quote(176.0), orders_rows=[order])
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert not restore, (
+        "PARTIAL_FILL order must block recovery. "
+        f"Got {len(restore)} restore update(s)."
+    )
+
+
+def test_b1_clean_rejected_sql_structure():
+    """Source inspection: REJECTED must be in status NOT IN list so clean rejections
+    are excluded from the exists-check without needing fill evidence."""
+    import inspect, ap_recovery as _r
+    src = inspect.getsource(_r)
+    fn_s = src.find("def _active_entry_order_exists(")
+    fn_e = src.find("\n            def ", fn_s + 1)
+    body = src[fn_s:fn_e]
+    assert "'REJECTED'" in body, "REJECTED must be in status NOT IN exclusion list"
+
+
+def test_b1_no_matching_order_allows_restore():
+    """When no blocking order exists in the DB, an eligible row is restored."""
+    # PUT trigger=60.5, current=62 — not yet crossed → eligible
+    tq = [_q_row(symbol="WMT", direction="PUT", trigger=60.5, signal_id="sig-004")]
+    _, updates = _run_recovery_with_orders(tq, broker=_fresh_quote(62.0), orders_rows=[])
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert restore, (
+        "When no blocking order exists, eligible row must be restored. "
+        f"Got {len(restore)} restore update(s)."
+    )
+
+
+def test_b1_paper_order_excluded_by_execution_mode_sql():
+    """Source inspection: execution_mode filter must prevent PAPER orders blocking LIVE."""
+    import inspect, ap_recovery as _r
+    src = inspect.getsource(_r)
+    fn_s = src.find("def _active_entry_order_exists(")
+    fn_e = src.find("\n            def ", fn_s + 1)
+    body = src[fn_s:fn_e]
+    assert "execution_mode" in body.lower(), "SQL must filter by execution_mode='live'"
+
+
+# B2 bid/ask midpoint freshness tests ────────────────────────────────────────
+
+def _tradier_mixed_quote(price, bid_fresh=True, ask_fresh=True):
+    """Build a Tradier quote where bid/ask timestamps are independently controllable."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    stale_ms = now_ms - int(3 * 3600 * 1000)  # 3h stale
+    m = MagicMock()
+    m.get_quote = lambda sym: {
+        "last": None,         # no last — forces midpoint path
+        "bid": price - 0.05,
+        "ask": price + 0.05,
+        "trade_date": None,   # no trade_date — forces bid/ask path
+        "bid_date": now_ms if bid_fresh else stale_ms,
+        "ask_date": now_ms if ask_fresh else stale_ms,
+    }
+    return m
+
+
+def test_b2_stale_bid_fresh_ask_fails_closed():
+    """Stale bid_date + fresh ask_date must not allow midpoint use."""
+    # PUT trigger=175, current=170 → would be crossed if midpoint accepted
+    row = _q_row(symbol="QCOM", direction="PUT", trigger=175.0)
+    _, updates = _run_recovery(
+        tq_rows=[row],
+        broker=_tradier_mixed_quote(170.0, bid_fresh=False, ask_fresh=True)
+    )
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not missed, (
+        "Stale bid_date + fresh ask_date must fail closed — midpoint must not be used. "
+        f"Got {len(missed)} missed-trigger update(s)."
+    )
+
+
+def test_b2_fresh_bid_stale_ask_fails_closed():
+    """Fresh bid_date + stale ask_date must not allow midpoint use."""
+    row = _q_row(symbol="QCOM", direction="PUT", trigger=175.0)
+    _, updates = _run_recovery(
+        tq_rows=[row],
+        broker=_tradier_mixed_quote(170.0, bid_fresh=True, ask_fresh=False)
+    )
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not missed, (
+        "Fresh bid_date + stale ask_date must fail closed. "
+        f"Got {len(missed)} missed-trigger update(s)."
+    )
+
+
+def test_b2_both_fresh_bid_ask_accepted():
+    """Both bid_date and ask_date fresh → midpoint accepted for classification."""
+    # CALL trigger=55, current midpoint≈58 → crossed → should terminalize
+    row = _q_row(symbol="WMT", direction="CALL", trigger=55.0)
+    _, updates = _run_recovery(
+        tq_rows=[row],
+        broker=_tradier_mixed_quote(58.0, bid_fresh=True, ask_fresh=True)
+    )
+    missed = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert missed, (
+        "Both fresh bid/ask timestamps → midpoint must be used for classification. "
+        f"No missed-trigger update produced."
+    )
+
 # OSM CAS (original PR #359) ─────────────────────────────────────────────────
 
 class _OsmCursor:
@@ -315,6 +457,21 @@ class _OsmConn:
     def __exit__(self, *_): return False
 
 def _patch_osm_db(monkeypatch, *, rowcount=1):
+    # Stub ap.db in sys.modules before importing OSM so DATABASE_URL is not required
+    _stub = types.ModuleType("ap.db")
+    class _StubConn:
+        class _C:
+            rowcount = 0
+            def execute(self, *a, **k): pass
+            def fetchone(self): return None
+            def fetchall(self): return []
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+        def __enter__(self): return self._C()
+        def __exit__(self, *_): pass
+    _stub.conn = _StubConn
+    _stub.run_with_retry = lambda fn, *a, **k: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _stub)
     import ap.order_state_machine as osm_mod
     sink = []
     monkeypatch.setattr(osm_mod, "conn", lambda: _OsmConn(sink, rowcount=rowcount))
@@ -337,8 +494,8 @@ def _claim_kwargs(**ov):
     base.update(ov); return base
 
 def test_reeval_suffixed_source_claim_uses_canonical_order_identity(monkeypatch):
-    from ap.order_state_machine import APOrderStateMachine
     sink = _patch_osm_db(monkeypatch, rowcount=1)
+    from ap.order_state_machine import APOrderStateMachine
     osm = APOrderStateMachine("jasoncosby1@gmail.com")
     assert osm.claim_deferred_materialization("nke-oid", **_claim_kwargs()) is True
     sql, params = sink[-1]
@@ -349,8 +506,8 @@ def test_reeval_suffixed_source_claim_uses_canonical_order_identity(monkeypatch)
     assert "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72" in params
 
 def test_genuinely_different_opportunity_cannot_claim(monkeypatch):
-    from ap.order_state_machine import APOrderStateMachine
     sink = _patch_osm_db(monkeypatch, rowcount=0)
+    from ap.order_state_machine import APOrderStateMachine
     osm = APOrderStateMachine("jasoncosby1@gmail.com")
     assert osm.claim_deferred_materialization(
         "nke-oid", **_claim_kwargs(canonical_signal_id="DIFFERENT:canonical"),

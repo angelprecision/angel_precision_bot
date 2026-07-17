@@ -2696,12 +2696,14 @@ class APStartupRecovery:
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
                           AND LOWER(COALESCE(execution_mode,'')) = 'live'
-                          AND status NOT IN (
-                                'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                'ERROR','DONE','ARCHIVED'
+                          AND (
+                                COALESCE(filled_qty, 0) > 0
+                             OR filled_ts IS NOT NULL
+                             OR status NOT IN (
+                                    'REJECTED','CANCELED','CANCELLED','EXPIRED',
+                                    'ERROR','DONE','ARCHIVED'
+                                )
                           )
-                          AND COALESCE(filled_qty, 0) = 0
-                          AND filled_ts IS NULL
                           AND (
                                 signal_id = %s
                              OR (%s <> '' AND canonical_signal_id = %s)
@@ -2803,14 +2805,11 @@ class APStartupRecovery:
                     if _last_px > 0 and _ts_age_ok(_trade_dt):
                         return _last_px
 
-                    # Bid/ask midpoint paired with the freshest bid/ask timestamp
-                    if _bid_px > 0 and _ask_px > 0:
-                        _ba_dt = max(
-                            (dt for dt in (_bid_dt, _ask_dt) if dt is not None),
-                            default=None,
-                        )
-                        if _ts_age_ok(_ba_dt):
-                            return (_bid_px + _ask_px) / 2.0
+                    # Bid/ask midpoint: BOTH timestamps must independently be fresh.
+                    # Using max() would accept a fresh ask + stale bid, permitting
+                    # a stale price component to influence classification.
+                    if _bid_px > 0 and _ask_px > 0 and _ts_age_ok(_bid_dt) and _ts_age_ok(_ask_dt):
+                        return (_bid_px + _ask_px) / 2.0
 
                     # Generic-timestamp path (non-Tradier brokers)
                     if _ts_age_ok(_generic_dt):
@@ -3001,9 +3000,13 @@ class APStartupRecovery:
                             WHERE orders.client_id = trade_queue.client_id
                               AND orders.kind = 'ENTRY'
                               AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
-                              AND orders.status NOT IN (
-                                    'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                    'ERROR','FILLED','DONE','ARCHIVED'
+                              AND (
+                                    COALESCE(orders.filled_qty, 0) > 0
+                                 OR orders.filled_ts IS NOT NULL
+                                 OR orders.status NOT IN (
+                                        'REJECTED','CANCELED','CANCELLED','EXPIRED',
+                                        'ERROR','DONE','ARCHIVED'
+                                    )
                               )
                               AND (
                                     orders.signal_id = %s
