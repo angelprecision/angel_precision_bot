@@ -86,15 +86,23 @@ def test_rows_without_positive_broker_fill_are_not_counted() -> None:
 
 
 @pytest.mark.parametrize(
-    ("execution_mode", "closed", "entry_id", "exit_id", "expected"),
+    (
+        "execution_mode",
+        "closed",
+        "entry_id",
+        "exit_id",
+        "all_exit_fills_broker_backed",
+        "expected",
+    ),
     [
-        ("live", True, "entry-1", "exit-1", True),
-        ("LIVE", True, "entry-1", "exit-1", True),
-        ("paper", True, "entry-1", "exit-1", False),
-        ("unknown", True, "entry-1", "exit-1", False),
-        ("live", False, "entry-1", "exit-1", False),
-        ("live", True, "", "exit-1", False),
-        ("live", True, "entry-1", "", False),
+        ("live", True, "entry-1", "exit-1", True, True),
+        ("LIVE", True, "entry-1", "exit-1", True, True),
+        ("paper", True, "entry-1", "exit-1", True, False),
+        ("unknown", True, "entry-1", "exit-1", True, False),
+        ("live", False, "entry-1", "exit-1", True, False),
+        ("live", True, "", "exit-1", True, False),
+        ("live", True, "entry-1", "", True, False),
+        ("live", True, "entry-1", "exit-2", False, False),
     ],
 )
 def test_official_live_proof_requires_complete_broker_lifecycle(
@@ -102,6 +110,7 @@ def test_official_live_proof_requires_complete_broker_lifecycle(
     closed: bool,
     entry_id: str,
     exit_id: str,
+    all_exit_fills_broker_backed: bool,
     expected: bool,
 ) -> None:
     assert official_live_eligibility(
@@ -109,4 +118,5 @@ def test_official_live_proof_requires_complete_broker_lifecycle(
         closed=closed,
         entry_broker_order_id=entry_id,
         exit_broker_order_id=exit_id,
+        all_exit_fills_broker_backed=all_exit_fills_broker_backed,
     ) is expected
