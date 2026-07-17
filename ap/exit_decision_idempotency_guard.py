@@ -113,6 +113,9 @@ _EXTERNAL_PRECHECK_TTL = _bounded_float_env(
 _PRECHECK_CACHE_MAX = _bounded_int_env(
     "EXIT_DECISION_PRECHECK_CACHE_MAX", 4096, 128, 100000
 )
+_CLAIM_LEASE_SECONDS = _bounded_float_env(
+    "EXIT_DECISION_CLAIM_LEASE_SECONDS", 300.0, 1.0, 86400.0
+)
 _TERMINAL_EXIT_STATUSES = (
     "EXIT_FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "ERROR",
 )
@@ -228,6 +231,50 @@ def _claim_durable_decision_generation(
     """Atomically claim one actionable decision for this durable generation."""
     def _claim() -> dict:
         with conn() as c:
+            row = c.execute(
+                "UPDATE exit_decision_generation_claims SET "
+                "client_id=%s, "
+                "position_id=%s, "
+                "remaining_qty=%s, "
+                "exit_generation=%s, "
+                "decision_action=%s, "
+                "decision_reason_code=%s, "
+                "claim_state=%s, "
+                "claimed_at=NOW(), "
+                "released_at=NULL, "
+                "local_order_id=NULL, "
+                "broker_order_id=NULL, "
+                "last_error=NULL "
+                "WHERE generation_key=%s AND claim_state=%s "
+                "AND claimed_at <= NOW() - (%s * INTERVAL '1 second') "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at",
+                (
+                    client_id,
+                    position_id,
+                    remaining_qty,
+                    exit_generation,
+                    str(getattr(decision, "action", "") or ""),
+                    str(getattr(decision, "reason_code", "") or ""),
+                    _CLAIM_STATE_CLAIMED,
+                    generation_key,
+                    _CLAIM_STATE_CLAIMED,
+                    _CLAIM_LEASE_SECONDS,
+                ),
+            ).fetchone()
+            if row:
+                claimed = dict(row)
+                claimed["claimed"] = True
+                log.critical(
+                    "EXIT_DECISION_STALE_CLAIM_RECLAIMED client=%s position=%s generation_key=%s lease_seconds=%s",
+                    client_id,
+                    position_id,
+                    generation_key,
+                    _CLAIM_LEASE_SECONDS,
+                )
+                return claimed
+
             row = c.execute(
                 "UPDATE exit_decision_generation_claims SET "
                 "client_id=%s, "

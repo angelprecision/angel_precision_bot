@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -97,6 +98,47 @@ class _FakeClaimConnection:
     def execute(self, sql, params=()):
         sql = " ".join(str(sql).split())
         if sql.startswith("UPDATE exit_decision_generation_claims SET client_id="):
+            if "claimed_at <= NOW() - (%s * INTERVAL '1 second')" in sql:
+                (
+                    client_id,
+                    position_id,
+                    remaining_qty,
+                    exit_generation,
+                    decision_action,
+                    decision_reason_code,
+                    update_state,
+                    generation_key,
+                    existing_state,
+                    lease_seconds,
+                ) = params
+                existing = self.store.get(generation_key)
+                claimed_at = (existing or {}).get("claimed_at")
+                if (
+                    existing is not None
+                    and existing.get("claim_state") == existing_state
+                    and claimed_at is not None
+                    and float(claimed_at) <= (time.time() - float(lease_seconds))
+                ):
+                    row = {
+                        "generation_key": generation_key,
+                        "client_id": client_id,
+                        "position_id": position_id,
+                        "remaining_qty": remaining_qty,
+                        "exit_generation": exit_generation,
+                        "decision_action": decision_action,
+                        "decision_reason_code": decision_reason_code,
+                        "claim_state": update_state,
+                        "local_order_id": None,
+                        "broker_order_id": None,
+                        "last_error": None,
+                        "claimed_at": time.time(),
+                        "released_at": None,
+                    }
+                    self.store[generation_key] = row
+                    self._row = dict(row)
+                else:
+                    self._row = None
+                return self
             (
                 client_id,
                 position_id,
@@ -154,7 +196,7 @@ class _FakeClaimConnection:
                     "local_order_id": None,
                     "broker_order_id": None,
                     "last_error": None,
-                    "claimed_at": None,
+                    "claimed_at": time.time(),
                     "released_at": None,
                 }
                 self.store[generation_key] = row
@@ -403,6 +445,44 @@ def test_durable_generation_claim_does_not_reclaim_existing_claimed_row(
     assert first["claimed"] is True
     assert second["claimed"] is False
     assert second["claim_state"] == guard._CLAIM_STATE_CLAIMED
+
+
+def test_durable_generation_claim_reclaims_stale_existing_claimed_row(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    first = guard._claim_durable_decision_generation(
+        generation_key="client|position|3|1",
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+    )
+    assert first["claimed"] is True
+
+    if _FAKE_CLAIMS_STORE is not None:
+        _FAKE_CLAIMS_STORE["client|position|3|1"]["claimed_at"] = time.time() - (guard._CLAIM_LEASE_SECONDS + 5.0)
+    else:
+        with conn() as c:
+            c.execute(
+                "UPDATE exit_decision_generation_claims "
+                "SET claimed_at = NOW() - (%s * INTERVAL '1 second') "
+                "WHERE generation_key=%s",
+                (guard._CLAIM_LEASE_SECONDS + 5.0, "client|position|3|1"),
+            )
+
+    reclaimed = guard._claim_durable_decision_generation(
+        generation_key="client|position|3|1",
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+    )
+    assert reclaimed["claimed"] is True
+    assert reclaimed["claim_state"] == guard._CLAIM_STATE_CLAIMED
 
 
 def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> None:
