@@ -196,6 +196,109 @@ def _normalize_execution_mode(value) -> str | None:
     return mode if mode in _VALID_EXECUTION_MODES else None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Prior-trading-session helpers (LIVE recovery session gate — Blocker 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prior_trading_session_date_et(now_et) -> "date":
+    """Return the prior NYSE trading session date relative to *now_et* (ET).
+
+    Walks back at least one calendar day and skips weekends AND NYSE
+    full-closure holidays via the canonical `ap.flatline_alarm.is_trading_day`
+    calendar.  On a Monday morning after a regular weekend the result is
+    Friday; after a 3-day holiday weekend it is the preceding Thursday.
+
+    Fail-safe: if the calendar import fails, falls back to weekend-only
+    walk-back (previous behaviour) — a holiday then simply passes the
+    session gate, which is conservative (admits rather than blocks).
+    """
+    from datetime import date as _date
+    d = now_et.date() - timedelta(days=1)
+    try:
+        from ap.flatline_alarm import is_trading_day as _td
+        guard = 0
+        while not _td(d) and guard < 14:
+            d -= timedelta(days=1)
+            guard += 1
+    except Exception:
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+    return d
+
+
+def _prior_trading_session_cutoff_utc(now_et) -> str:
+    """UTC ISO timestamp marking the start of the prior trading session day in ET.
+
+    Used as the SQL lower-bound ``created_ts >= %s`` for LIVE recovery
+    candidate selection.  This handles weekends and NYSE holidays:
+
+    * Monday after regular Friday: cutoff = Friday 00:00 ET → Friday 05:00 UTC
+      (~63h before Monday 09:15 ET, vs the broken 28h that excluded Friday)
+    * Post-holiday Monday: cutoff = Thursday 00:00 ET → Thursday 05:00 UTC
+      (covers a 3-day holiday weekend; 28h would exclude Thursday signals)
+    * Normal Wed morning: cutoff = Tuesday 00:00 ET (~33h back, well within
+      session, and Tuesday's completed-session signals are NOT doubly admitted
+      because _classify() enforces the exact-session identity check below)
+
+    Fail-safe: on calendar import failure, 4 calendar days covers the broadest
+    possible holiday weekend; the session gate in _classify() is the binding
+    decision authority either way.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _ET_TZ = _ZI("America/New_York")
+    try:
+        prior_session = _prior_trading_session_date_et(now_et)
+        session_start_et = datetime(
+            prior_session.year, prior_session.month, prior_session.day,
+            0, 0, 0, tzinfo=_ET_TZ,
+        )
+        return session_start_et.astimezone(timezone.utc).isoformat()
+    except Exception:
+        # Fail-safe: 4 calendar days covers 3-day holiday weekends
+        return (now_et.astimezone(timezone.utc) - timedelta(days=4)).isoformat()
+
+
+def _signal_date_from_payload_or_row(payload: dict, row: dict) -> "Optional[date]":
+    """Extract the signal generation date for session-gate checks.
+
+    Priority:
+      1. Explicit payload fields (created_at, signal_date, date, timestamp_iso)
+         — mirroring the ``_signal_date()`` approach in ap_overnight_reeval.
+      2. ``trade_queue.created_ts`` column — authoritative queue timestamp,
+         converted to ET to match the session boundary.
+
+    Returns None when no date can be reliably extracted; callers must treat
+    None as "session unprovable" and fail closed (skip the row).
+    """
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo as _ZI
+
+    # 1. Payload fields
+    for key in ("created_at", "signal_date", "date", "timestamp_iso"):
+        val = payload.get(key, "")
+        if val and len(str(val)) >= 10:
+            try:
+                return _date.fromisoformat(str(val)[:10])
+            except ValueError:
+                continue
+
+    # 2. Fallback: trade_queue.created_ts (in ET for session-boundary accuracy)
+    created_raw = row.get("created_ts")
+    if created_raw is None:
+        return None
+    try:
+        _ET_TZ = _ZI("America/New_York")
+        if isinstance(created_raw, datetime):
+            ts = created_raw
+        else:
+            ts = datetime.fromisoformat(str(created_raw))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(_ET_TZ).date()
+    except Exception:
+        return None
+
+
 def _resolve_side_from_order_or_meta(order: dict, meta: dict | None = None) -> tuple[str | None, str]:
     """Resolve strategy side without ever defaulting missing direction to CALL."""
     meta = meta or {}
@@ -2653,18 +2756,32 @@ class APStartupRecovery:
             return any(_le.startswith(_p) for _p in _READINESS_SKIP_LAST_ERRORS)
 
         def _recover_unowned_live_watching_signals() -> int:
-            # LIVE session window: cap at 28 hours so prior-evening scanner
-            # signals (generated ~16:00–22:00 ET the previous day, 10–22 hours
-            # ago) are included while signals from a completed session two days
-            # ago are excluded. 48 hours is too broad for LIVE — it can restore
-            # untriggered LIVE geometry from a previous trading day entirely.
-            # 28 hours covers: prior-evening scan (max ~22h ago) + today pre-market
-            # (max a few hours ago). Paper still uses the full _lookback_hours.
-            _LIVE_RECOVERY_MAX_HOURS = 28
-            _live_cutoff_utc = (
-                now_et.astimezone(timezone.utc)
-                - timedelta(hours=_LIVE_RECOVERY_MAX_HOURS)
-            ).isoformat()
+            # ── LIVE session window (prior-trading-session identity) ────────
+            # The prior rolling 28h cutoff was insufficient:
+            #   • On a normal weekday it still admitted signals from a COMPLETED
+            #     prior session (Wed 09:15 − 28h = Mon 05:15 → all of Tuesday).
+            #   • On Mon/post-holiday it EXCLUDED valid Friday-evening scanner
+            #     signals (~63h ago) and 3-day-holiday signals (~86h ago).
+            #
+            # The correct fence is the canonical NYSE prior trading session:
+            #   • cutoff = start of prior trading session day in ET → UTC
+            #   • Monday after Friday: cutoff = Friday 00:00 ET (~63h back)
+            #   • Post-holiday Monday: cutoff = Thursday 00:00 ET (~86h back)
+            #   • Normal Wednesday: cutoff = Tuesday 00:00 ET (~33h back)
+            #
+            # The SQL cutoff is the OUTER fence — it widens the candidate set
+            # to cover holiday weekends.  The BINDING session gate lives in
+            # _classify() below: it checks that the signal's actual generation
+            # date (from payload or created_ts) exactly equals the prior
+            # trading session date OR today's ET date (premarket).  Rows from
+            # a session two or more sessions back are excluded there.
+            #
+            # Fail-safe: _prior_trading_session_cutoff_utc() falls back to a
+            # 4-calendar-day window if the NYSE calendar import fails.
+            _live_cutoff_utc = _prior_trading_session_cutoff_utc(now_et)
+            # Precompute session boundaries once; captured by _classify() closure.
+            _prior_session_date = _prior_trading_session_date_et(now_et)
+            _today_et_date = now_et.date()
 
             def _load_candidates():
                 with conn() as c:
@@ -2914,6 +3031,28 @@ class APStartupRecovery:
                     return "skip", {"reason": "missing_canonical_signal_identity"}
                 if not symbol or direction not in {"CALL", "PUT"} or trigger <= 0:
                     return "skip", {"reason": "invalid_symbol_direction_or_trigger"}
+                # ── Session-identity gate (Blocker 1) ─────────────────────
+                # Only restore signals generated during the prior trading
+                # session OR explicitly today (premarket).  This blocks:
+                #   • Completed-prior-session rows on a normal weekday
+                #     (e.g. a Tuesday signal seen on Friday — two sessions
+                #     past — is now explicitly rejected rather than allowed
+                #     through by the old 28h window).
+                # And admits:
+                #   • Friday-evening scanner signals on Monday morning
+                #   • Holiday-weekend scanner signals post-holiday
+                # Fail closed: if the generation date cannot be extracted,
+                # skip the row (do not restore, do not terminalize).
+                _sig_date = _signal_date_from_payload_or_row(payload, row)
+                if _sig_date is None:
+                    return "skip", {"reason": "session_unprovable_no_date"}
+                if _sig_date != _prior_session_date and _sig_date != _today_et_date:
+                    return "skip", {
+                        "reason": "session_out_of_window",
+                        "signal_date": _sig_date.isoformat(),
+                        "prior_session": _prior_session_date.isoformat(),
+                        "today_et": _today_et_date.isoformat(),
+                    }
                 if _active_entry_order_exists(signal_id, canonical_signal_id):
                     return "skip", {"reason": "active_entry_order_exists"}
                 current = _current_underlying(symbol)

@@ -53,7 +53,15 @@ def _no_ts_quote(price):
 
 
 def _q_row(*, symbol, direction, trigger, signal_id="sig-001",
-           last_error=None, execution_mode="live", row_id=1, created_hours_ago=12):
+           last_error=None, execution_mode="live", row_id=1, created_hours_ago=12,
+           signal_date=None):
+    # signal_date in the payload is the session-gate anchor.  Default to today
+    # UTC (== today ET during business hours) so existing tests pass the
+    # _classify() session check (sig_date == today_et_date) without needing to
+    # mock the NYSE calendar.  Tests that exercise session-boundary behaviour
+    # pass an explicit signal_date string (ISO date, e.g. "2026-07-10").
+    from datetime import date as _date
+    _sig_date_str = signal_date if signal_date is not None else _date.today().isoformat()
     return {
         "id": row_id,
         "client_id": "jasoncosby1@gmail.com",
@@ -68,6 +76,7 @@ def _q_row(*, symbol, direction, trigger, signal_id="sig-001",
             "trigger_price": trigger, "entry_price": trigger,
             "execution_mode": execution_mode,
             "canonical_signal_id": f"canonical-{signal_id}",
+            "signal_date": _sig_date_str,
         },
     }
 
@@ -772,37 +781,40 @@ def _skip_old_test_b1_mark_missed_blocked():
 
 # Intended-session enforcement tests ─────────────────────────────────────────
 
-def test_intended_session_live_window_constant_exists():
-    """_LIVE_RECOVERY_MAX_HOURS must be defined and ≤28."""
-    import ap_recovery as _r, inspect, re
-    s = inspect.getsource(_r)
-    assert "_LIVE_RECOVERY_MAX_HOURS" in s, (
-        "_LIVE_RECOVERY_MAX_HOURS must be defined — LIVE window must be bounded"
+def test_intended_session_prior_trading_session_helpers_exist():
+    """Module-level prior-session helpers must exist and be callable."""
+    import ap_recovery as _r
+    assert callable(getattr(_r, "_prior_trading_session_date_et", None)), (
+        "_prior_trading_session_date_et must be a module-level callable"
     )
-    m = re.search(r"_LIVE_RECOVERY_MAX_HOURS\s*=\s*(\d+)", s)
-    assert m, "_LIVE_RECOVERY_MAX_HOURS must be a numeric constant"
-    hours = int(m.group(1))
-    assert hours <= 28, (
-        f"_LIVE_RECOVERY_MAX_HOURS={hours} too broad. Must be ≤28h "
-        "to exclude prior completed session signals (peak ~22h ago)."
+    assert callable(getattr(_r, "_prior_trading_session_cutoff_utc", None)), (
+        "_prior_trading_session_cutoff_utc must be a module-level callable"
+    )
+    assert callable(getattr(_r, "_signal_date_from_payload_or_row", None)), (
+        "_signal_date_from_payload_or_row must be a module-level callable"
     )
 
 
-def test_intended_session_cutoff_is_28h_not_48h():
-    """The LIVE candidate cutoff parameter must be ~28h ago, not 48h ago."""
-    sqls, _ = _run_recovery(tq_rows=[], broker=MagicMock())
-    load = [(s, p) for s, p in sqls if "FROM TRADE_QUEUE" in s.upper() and "WATCHING" in s.upper()]
-    assert load
-    # The cutoff param is the first string param (client_id is first, cutoff second)
-    params = load[0][1]
-    cutoff_param = next((p for p in params if isinstance(p, str) and "T" in str(p) and ":" in str(p)), None)
-    assert cutoff_param, f"No timestamp param found in load params: {params}"
-    from datetime import datetime, timezone
-    cutoff_dt = datetime.fromisoformat(str(cutoff_param).replace("Z", "+00:00"))
-    age_hours = (datetime.now(timezone.utc) - cutoff_dt).total_seconds() / 3600
-    assert age_hours <= 30, (
-        f"LIVE cutoff is {age_hours:.1f}h ago — must be ≤28h. "
-        f"A 48h window restores signals from prior completed sessions."
+def test_intended_session_friday_signal_accepted_on_monday():
+    """Signal from prior Friday evening session must be eligible on Monday morning.
+
+    The old 28h rolling window excluded this row (~63h ago). The new
+    prior-trading-session gate admits it because signal_date == Friday ==
+    _prior_session_date on Monday.
+    """
+    from datetime import date as _date
+    FRIDAY = _date(2026, 7, 10)   # prior trading session
+    # PUT: trigger=60.5, current=62 — not yet crossed → eligible
+    row = _q_row(symbol="WMT", direction="PUT", trigger=60.5,
+                 signal_date=FRIDAY.isoformat(), created_hours_ago=63)
+    with patch("ap_recovery._prior_trading_session_date_et", return_value=FRIDAY), \
+         patch("ap_recovery._prior_trading_session_cutoff_utc",
+               return_value=datetime(2026, 7, 10, 5, 0, tzinfo=timezone.utc).isoformat()):
+        sqls, updates = _run_recovery(tq_rows=[row], broker=_fresh_quote(62.0))
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert restore, (
+        "Friday-evening signal (63h ago) must be eligible on Monday morning. "
+        "Prior-session gate admits signal_date=Friday when prior_session=Friday."
     )
 
 
@@ -885,26 +897,121 @@ def test_b1_mark_missed_sql_contains_fill_predicate():
 
 # Intended-session enforcement tests ─────────────────────────────────────────
 
-def test_intended_session_live_window_constant_bounded():
-    import ap_recovery as _r, inspect, re
-    s = inspect.getsource(_r)
-    assert "_LIVE_RECOVERY_MAX_HOURS" in s
-    m = re.search(r"_LIVE_RECOVERY_MAX_HOURS\s*=\s*(\d+)", s)
-    assert m, "_LIVE_RECOVERY_MAX_HOURS must be numeric"
-    hours = int(m.group(1))
-    assert hours <= 28, f"_LIVE_RECOVERY_MAX_HOURS={hours} must be <=28h"
+def test_intended_session_holiday_weekend_signal_accepted():
+    """Signal from Thursday (last trading day before 3-day holiday) must be
+    eligible on the following Tuesday morning.
 
-
-def test_intended_session_cutoff_is_bounded():
-    sqls, _ = _run_recovery(tq_rows=[], broker=MagicMock())
-    load = [(s, p) for s, p in sqls
-            if "FROM TRADE_QUEUE" in s.upper() and "WATCHING" in s.upper()]
-    assert load
-    cutoff_param = next(
-        (p for p in load[0][1] if isinstance(p, str) and "T" in str(p) and ":" in str(p)), None
+    The old 28h window would exclude Thursday signals on Tuesday (~86h gap).
+    The prior-session gate admits them because signal_date == Thursday ==
+    _prior_session_date on the post-holiday Tuesday.
+    """
+    from datetime import date as _date
+    # July 4th 2026 falls on Saturday; no holiday but use a plausible 3-day weekend
+    # Independence Day observed on Thursday 2026-07-02 → Friday closed → Monday open
+    THURSDAY = _date(2026, 7, 2)  # last trading day before holiday weekend
+    row = _q_row(symbol="TSLA", direction="CALL", trigger=150.0,
+                 signal_date=THURSDAY.isoformat(), created_hours_ago=86)
+    with patch("ap_recovery._prior_trading_session_date_et", return_value=THURSDAY), \
+         patch("ap_recovery._prior_trading_session_cutoff_utc",
+               return_value=datetime(2026, 7, 2, 5, 0, tzinfo=timezone.utc).isoformat()):
+        _, updates = _run_recovery(tq_rows=[row], broker=_fresh_quote(145.0))
+    # CALL: current=145 < trigger=150 → not crossed → eligible → restore
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert restore, (
+        "Thursday signal (86h ago) must be eligible after 3-day holiday weekend. "
+        "Prior-session gate: signal_date=Thursday == prior_session=Thursday → admit."
     )
-    assert cutoff_param, f"No timestamp param in {load[0][1]}"
-    from datetime import datetime, timezone
-    cutoff_dt = datetime.fromisoformat(str(cutoff_param).replace("Z", "+00:00"))
-    age_hours = (datetime.now(timezone.utc) - cutoff_dt).total_seconds() / 3600
-    assert age_hours <= 30, f"LIVE cutoff {age_hours:.1f}h ago — must be <=28h"
+
+
+def test_intended_session_previous_completed_session_rejected():
+    """Signal from a session TWO trading days ago must be rejected.
+
+    The old 28h window could admit two-sessions-back signals on a normal
+    weekday (Wed 09:15 − 28h = Mon 05:15 → all of Tuesday).  The session
+    gate explicitly rejects any signal_date that is neither the prior session
+    nor today.
+    """
+    from datetime import date as _date
+    WEDNESDAY = _date(2026, 7, 15)   # current day (Thursday morning)
+    THURSDAY  = _date(2026, 7, 16)   # prior session (Thursday = yesterday for Friday)
+    TWO_SESSIONS_AGO = _date(2026, 7, 14)  # Wednesday — should be rejected on Friday
+    row = _q_row(symbol="AAPL", direction="CALL", trigger=200.0,
+                 signal_date=TWO_SESSIONS_AGO.isoformat(), created_hours_ago=50)
+    with patch("ap_recovery._prior_trading_session_date_et", return_value=THURSDAY), \
+         patch("ap_recovery._prior_trading_session_cutoff_utc",
+               return_value=datetime(2026, 7, 16, 5, 0, tzinfo=timezone.utc).isoformat()):
+        _, updates = _run_recovery(tq_rows=[row], broker=_fresh_quote(195.0))
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    missed  = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not restore and not missed, (
+        "Signal from two sessions ago must be rejected by the session gate. "
+        f"Got restore={len(restore)} missed={len(missed)}."
+    )
+
+
+def test_intended_session_missing_signal_date_fails_closed():
+    """When no date can be extracted from payload or created_ts, skip the row
+    (session_unprovable) — never restore, never terminalize."""
+    import ap_recovery as _r, types as _t
+    from datetime import date as _date
+
+    # Build a row with no signal_date in payload and no parseable created_ts
+    bad_row = {
+        "id": 99,
+        "client_id": "jasoncosby1@gmail.com",
+        "signal_id": "sig-nodatex",
+        "status": "WATCHING",
+        "created_ts": None,   # no created_ts
+        "started_ts": None, "finished_ts": None,
+        "last_error": None,
+        "payload": {
+            "ticker": "MSFT", "symbol": "MSFT",
+            "direction": "CALL", "side": "CALL",
+            "trigger_price": 400.0, "entry_price": 400.0,
+            "execution_mode": "live",
+            "canonical_signal_id": "canonical-sig-nodatex",
+            # deliberately no signal_date / created_at / date / timestamp_iso
+        },
+    }
+    sqls, updates = [], []
+
+    class _C:
+        def __init__(self): self.rowcount = 1; self._u = ""
+        def execute(self, sql, params=()):
+            norm = " ".join(str(sql).split())
+            sqls.append((norm, tuple(params)))
+            self._u = norm.upper()
+            if "UPDATE" in self._u:
+                updates.append((norm, tuple(params)))
+        def fetchall(self):
+            if "FROM TRADE_QUEUE" in self._u or "WATCHING" in self._u:
+                return [bad_row]
+            return []
+        def fetchone(self): return None
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = "jasoncosby1@gmail.com"
+    rec.mc = SimpleNamespace(mode="LIVE")
+    rec.entry_watcher = None
+    rec.broker = _fresh_quote(405.0)  # crossed CALL trigger=400
+
+    fdb = _t.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch("ap_recovery.os.getenv", return_value="48"), \
+         patch.dict(sys.modules, {"ap.db": fdb}):
+        rec._reseed_watchers({})
+
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    missed  = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not restore and not missed, (
+        "Row with no extractable signal date must be skipped (session_unprovable). "
+        f"Got restore={len(restore)} missed={len(missed)}."
+    )

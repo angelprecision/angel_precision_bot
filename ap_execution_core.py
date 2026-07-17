@@ -3920,7 +3920,15 @@ class APExecutionCore:
                         _identity_ok = (
                             bool(_canonical_signal_id)
                             and bool(_expected_source_signal_id)
-                            and _durable_canonical_id == _canonical_signal_id
+                            # canonical_signal_id is only enforced when the durable row
+                            # already carries it.  Rows written before the field existed
+                            # have an empty durable_canonical_id and must not be blocked
+                            # solely on that basis — signal_id + client + mode alignment
+                            # is sufficient identity proof for legacy rows.
+                            and (
+                                not _durable_canonical_id
+                                or _durable_canonical_id == _canonical_signal_id
+                            )
                             and _durable_signal_id == _expected_source_signal_id
                             and _durable_client_id == str(_breach_client_id or "").strip().lower()
                             and _durable_exec_mode == str(_mat_exec_mode or "").strip().lower()
