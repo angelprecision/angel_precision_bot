@@ -49,6 +49,22 @@ def _runner_arm_pct() -> float:
     return max(0.05, min(0.30, raw))
 
 
+def startup_policy_diagnostic() -> dict[str, Any]:
+    enabled = _enabled()
+    arm = _runner_arm_pct()
+    log.warning(
+        "LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE flag=%s runner_arm_pct=%.4f "
+        "live_exit_timing_changes_when_enabled=true",
+        "enabled" if enabled else "disabled",
+        arm,
+    )
+    return {
+        "enabled": enabled,
+        "runner_arm_pct": arm,
+        "changes_live_exit_timing_when_enabled": True,
+    }
+
+
 def should_hold_early_green_one_contract(
     pos: Any,
     decision: Any,
@@ -136,6 +152,7 @@ def wrap_evaluate_exit(
 def install_one_contract_exit_guard() -> None:
     import ap_exit_engine as engine_module
 
+    startup_policy_diagnostic()
     if getattr(engine_module, _PATCHED_ATTR, False):
         return
     original = engine_module.evaluate_exit

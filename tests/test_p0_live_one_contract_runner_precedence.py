@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
+
+import pytest
 
 import ap.one_contract_exit_guard as guard
 
@@ -172,6 +175,73 @@ def test_live_policy_change_is_default_off(monkeypatch) -> None:
 
     assert guard._enabled() is False
     assert wrapped(_pos()) is close
+
+
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "bad", "", "disabled"])
+def test_false_and_malformed_flag_values_preserve_original_decision(monkeypatch, value) -> None:
+    monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", value)
+    original = _touched_stop()
+    wrapped = guard.wrap_evaluate_exit(
+        lambda pos, now_et=None: original,
+        exit_decision_cls=Decision,
+        classify_decision=lambda decision: decision.reason_code,
+    )
+    assert guard._enabled() is False
+    assert wrapped(_pos()) is original
+
+
+@pytest.mark.parametrize(
+    ("pos", "decision"),
+    [
+        (_pos(), Decision(action="CLOSE_ALL", quantity=1, reason="underlying stop", reason_code="STOP_HIT")),
+        (_pos(), Decision(action="CLOSE_ALL", quantity=1, reason="hard stop", reason_code="HARD_STOP")),
+        (_pos(), Decision(action="CLOSE_ALL", quantity=1, reason="eod", reason_code="EOD_FORCE_CLOSE")),
+        (_pos(), Decision(action="CLOSE_ALL", quantity=1, reason="target", reason_code="TARGET_HIT")),
+        (_pos(option_pnl_pct=0.0), _touched_stop(pnl=0.0)),
+        (_pos(option_pnl_pct=-0.01), _touched_stop(pnl=-0.01)),
+        (_pos(execution_mode="paper"), _touched_stop()),
+    ],
+)
+def test_enabled_guard_preserves_every_non_targeted_exit_shape(monkeypatch, pos, decision) -> None:
+    monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
+    wrapped = guard.wrap_evaluate_exit(
+        lambda _pos, now_et=None: decision,
+        exit_decision_cls=Decision,
+        classify_decision=lambda value: value.reason_code,
+    )
+    assert wrapped(pos) is decision
+
+
+def test_startup_diagnostic_reports_disabled_flag_arm_and_timing_effect(monkeypatch) -> None:
+    monkeypatch.delenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", raising=False)
+    monkeypatch.setenv("SINGLE_CONTRACT_RUNNER_ARM_PCT", "0.14")
+    diagnostic = guard.startup_policy_diagnostic()
+    assert diagnostic == {
+        "enabled": False,
+        "runner_arm_pct": 0.14,
+        "changes_live_exit_timing_when_enabled": True,
+    }
+
+
+def test_installer_wraps_without_enabling_policy(monkeypatch) -> None:
+    monkeypatch.delenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", raising=False)
+
+    class Engine:
+        pass
+
+    original = lambda pos, now_et=None: _touched_stop()
+    fake_module = SimpleNamespace(
+        APExitEngine=Engine,
+        evaluate_exit=original,
+        ExitDecision=Decision,
+        _classify_exit_decision=lambda decision: decision.reason_code,
+    )
+    monkeypatch.setitem(sys.modules, "ap_exit_engine", fake_module)
+    guard.install_one_contract_exit_guard()
+    decision = fake_module.evaluate_exit(_pos())
+    assert decision.action == "CLOSE_ALL"
+    assert decision.reason_code == "TOUCHED_PROFIT_STOP"
+    assert guard._enabled() is False
 
 
 def test_runner_arm_env_is_bounded(monkeypatch) -> None:
