@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import ap.proof_taxonomy_guard as guard
 
@@ -301,3 +304,77 @@ def test_supplied_entry_for_different_position_is_rejected(monkeypatch) -> None:
     assert identity.local_order_id == "entry-order-canonical"
     assert identity.position_id == "position-1"
     assert identity.execution_mode == "paper"
+
+
+def _postgres_connection_or_skip():
+    psycopg2 = pytest.importorskip("psycopg2")
+    url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL")
+    if not url:
+        pytest.skip("PostgreSQL integration URL unavailable")
+    try:
+        return psycopg2.connect(url)
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL integration unavailable: {exc}")
+
+
+def test_migrations_run_in_stack_order_and_are_idempotent_on_postgres() -> None:
+    connection = _postgres_connection_or_skip()
+    connection.autocommit = True
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SET search_path TO pg_temp, public")
+            cursor.execute(
+                "CREATE TEMP TABLE proof_trades ("
+                "client_email TEXT, position_id TEXT, closed_at TIMESTAMPTZ)"
+            )
+            root = Path(__file__).resolve().parents[1]
+            generation_sql = (root / "migrations" / "20260717_exit_decision_generation_claims.sql").read_text()
+            taxonomy_sql = (root / "migrations" / "20260716_proof_performance_taxonomy.sql").read_text()
+            cursor.execute(generation_sql)
+            cursor.execute(taxonomy_sql)
+            cursor.execute(taxonomy_sql)
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema LIKE 'pg_temp_%%' AND table_name='proof_trades'"
+            )
+            columns = {row[0] for row in cursor.fetchall()}
+            assert {"performance_taxonomy", "training_eligible"} <= columns
+    finally:
+        connection.close()
+
+
+def test_duplicate_official_proofs_do_not_duplicate_live_kelly_history(monkeypatch) -> None:
+    connection = _postgres_connection_or_skip()
+    try:
+        from psycopg2.extras import RealDictCursor
+        cursor = connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("SET search_path TO pg_temp, public")
+        cursor.execute(
+            "CREATE TEMP TABLE positions (client_id TEXT, id TEXT, execution_mode TEXT, "
+            "status TEXT, realized_pnl NUMERIC, avg_fill NUMERIC, exit_price NUMERIC, qty INTEGER)"
+        )
+        cursor.execute(
+            "CREATE TEMP TABLE proof_trades (client_email TEXT, position_id TEXT, training_eligible BOOLEAN)"
+        )
+        cursor.execute(
+            "INSERT INTO positions VALUES "
+            "('live@example.com','position-1','live','CLOSED',80,1.2,2.0,1)"
+        )
+        cursor.execute(
+            "INSERT INTO proof_trades VALUES "
+            "('live@example.com','position-1',true),"
+            "('live@example.com','position-1',true)"
+        )
+
+        @contextmanager
+        def same_connection():
+            yield cursor
+
+        monkeypatch.setattr(guard.db, "conn", same_connection)
+        monkeypatch.setattr(guard.db, "run_with_retry", lambda fn: fn())
+        wrapped = guard.wrap_fetch_history(lambda *_: [])
+        rows = wrapped(SimpleNamespace(execution_mode="live"), "live@example.com")
+        assert len(rows) == 1
+        assert float(rows[0]["realized_pnl"]) == 80.0
+    finally:
+        connection.close()
