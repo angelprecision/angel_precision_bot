@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 import threading
 import time
 from pathlib import Path
@@ -148,6 +149,7 @@ class _FakeClaimConnection:
                 decision_action,
                 decision_reason_code,
                 update_state,
+                local_order_id,
                 generation_key,
                 released_state,
             ) = params
@@ -162,7 +164,7 @@ class _FakeClaimConnection:
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
                     "claim_state": update_state,
-                    "local_order_id": None,
+                    "local_order_id": local_order_id,
                     "broker_order_id": None,
                     "last_error": None,
                     "claimed_at": None,
@@ -182,6 +184,7 @@ class _FakeClaimConnection:
                 decision_action,
                 decision_reason_code,
                 inserted_state,
+                local_order_id,
             ) = params
             existing = self.store.get(generation_key)
             if existing is None:
@@ -194,7 +197,7 @@ class _FakeClaimConnection:
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
                     "claim_state": inserted_state,
-                    "local_order_id": None,
+                    "local_order_id": local_order_id,
                     "broker_order_id": None,
                     "last_error": None,
                     "claimed_at": time.time(),
@@ -204,33 +207,76 @@ class _FakeClaimConnection:
                 self._row = dict(row)
             else:
                 self._row = None
+        elif sql.startswith("UPDATE exit_decision_generation_claims SET last_error="):
+            token, generation_key, claim_state, like_pattern = params
+            row = self.store.get(generation_key)
+            last_error = str((row or {}).get("last_error") or "")
+            prefix = str(like_pattern).rstrip("%")
+            if (
+                row is not None
+                and row.get("claim_state") == claim_state
+                and (not last_error or last_error.startswith(prefix))
+            ):
+                row["last_error"] = token
+                self._row = dict(row)
+            else:
+                self._row = None
         elif sql.startswith("SELECT generation_key, client_id, position_id, remaining_qty"):
             generation_key = params[0]
             row = self.store.get(generation_key)
             self._row = dict(row) if row else None
         elif sql.startswith("UPDATE exit_decision_generation_claims SET claim_state="):
-            (
-                claim_state,
-                released_state_marker,
-                release_state_target,
-                local_order_id_check,
-                local_order_id,
-                broker_order_id_check,
-                broker_order_id,
-                error_check,
-                error_text,
-                generation_key,
-            ) = params
-            row = self.store[generation_key]
-            row["claim_state"] = claim_state
-            if released_state_marker == release_state_target == guard._CLAIM_STATE_RELEASED_NO_SUBMIT:
-                row["released_at"] = "released"
-            if local_order_id_check:
-                row["local_order_id"] = local_order_id
-            if broker_order_id_check:
-                row["broker_order_id"] = broker_order_id
-            row["last_error"] = error_text if error_check else None
-            self._row = None
+            if "COALESCE(last_error,'')=%s RETURNING" in sql:
+                (
+                    claim_state,
+                    released_state_marker,
+                    release_state_target,
+                    local_order_id_check,
+                    local_order_id,
+                    broker_order_id_check,
+                    broker_order_id,
+                    error_check,
+                    error_text,
+                    generation_key,
+                    expected_state,
+                    reconciliation_token,
+                ) = params
+                row = self.store[generation_key]
+                if row.get("claim_state") == expected_state and str(row.get("last_error") or "") == reconciliation_token:
+                    row["claim_state"] = claim_state
+                    if released_state_marker == release_state_target == guard._CLAIM_STATE_RELEASED_NO_SUBMIT:
+                        row["released_at"] = "released"
+                    if local_order_id_check:
+                        row["local_order_id"] = local_order_id
+                    if broker_order_id_check:
+                        row["broker_order_id"] = broker_order_id
+                    row["last_error"] = error_text if error_check else None
+                    self._row = dict(row)
+                else:
+                    self._row = None
+            else:
+                (
+                    claim_state,
+                    released_state_marker,
+                    release_state_target,
+                    local_order_id_check,
+                    local_order_id,
+                    broker_order_id_check,
+                    broker_order_id,
+                    error_check,
+                    error_text,
+                    generation_key,
+                ) = params
+                row = self.store[generation_key]
+                row["claim_state"] = claim_state
+                if released_state_marker == release_state_target == guard._CLAIM_STATE_RELEASED_NO_SUBMIT:
+                    row["released_at"] = "released"
+                if local_order_id_check:
+                    row["local_order_id"] = local_order_id
+                if broker_order_id_check:
+                    row["broker_order_id"] = broker_order_id
+                row["last_error"] = error_text if error_check else None
+                self._row = None
         elif sql.startswith("SELECT generation_key, claim_state, local_order_id, broker_order_id, last_error"):
             self._rows = [
                 {
@@ -332,6 +378,33 @@ def _invoke_submit_callback(engine, pos, decision):
     if action == "SCALE_OUT":
         return bool(engine.on_scale(pos, decision))
     return bool(engine.on_exit(pos, decision))
+
+
+def _mark_claim_stale_ambiguous(generation_key: str, *, local_order_id: str, broker_order_id: str = "", last_error: str | None = None):
+    error_text = last_error or guard._STALE_CLAIM_RECONCILIATION_REQUIRED
+    if _FAKE_CLAIMS_STORE is not None:
+        row = _FAKE_CLAIMS_STORE[generation_key]
+        row["claim_state"] = guard._CLAIM_STATE_AMBIGUOUS
+        row["local_order_id"] = local_order_id
+        row["broker_order_id"] = broker_order_id
+        row["last_error"] = error_text
+        row["claimed_at"] = time.time() - (guard._CLAIM_LEASE_SECONDS + 5.0)
+        return
+    with conn() as c:
+        c.execute(
+            "UPDATE exit_decision_generation_claims "
+            "SET claim_state=%s, local_order_id=%s, broker_order_id=%s, last_error=%s, "
+            "claimed_at = NOW() - (%s * INTERVAL '1 second') "
+            "WHERE generation_key=%s",
+            (
+                guard._CLAIM_STATE_AMBIGUOUS,
+                local_order_id,
+                broker_order_id,
+                error_text,
+                guard._CLAIM_LEASE_SECONDS + 5.0,
+                generation_key,
+            ),
+        )
 
 
 def test_active_exit_statuses_block_early_re_evaluation() -> None:
@@ -528,6 +601,281 @@ def test_submit_wrapper_blocks_stale_claimed_generation_without_resubmit(
     rows = _claim_rows()
     assert rows[0]["claim_state"] == guard._CLAIM_STATE_AMBIGUOUS
     assert rows[0]["last_error"] == guard._STALE_CLAIM_RECONCILIATION_REQUIRED
+
+
+def test_stale_claim_reconciliation_releases_no_submit_and_allows_retry(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+        local_order_id="exit-local-1",
+    )
+    _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
+    osm = SimpleNamespace(get_order=MagicMock(return_value={
+        "local_order_id": "exit-local-1",
+        "client_id": "client",
+        "position_id": "position",
+        "kind": "EXIT",
+        "status": "EXIT_REQUESTED",
+        "qty": 3,
+        "broker_order_id": "",
+        "submitted_ts": None,
+        "meta": {},
+    }))
+
+    reconciled = guard.reconcile_stale_exit_generation_claim(key, osm=osm)
+    assert reconciled["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+
+    retried = guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+        local_order_id="exit-local-1",
+    )
+    assert retried["claimed"] is True
+
+
+def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_callback(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+        local_order_id="exit-local-1",
+    )
+    _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
+    core = SimpleNamespace(
+        order_state_machine=SimpleNamespace(
+            get_order=MagicMock(side_effect=[
+                {
+                    "local_order_id": "exit-local-1",
+                    "client_id": "client",
+                    "position_id": "position",
+                    "kind": "EXIT",
+                    "status": "EXIT_REQUESTED",
+                    "qty": 3,
+                    "broker_order_id": "",
+                    "submitted_ts": None,
+                    "meta": {
+                        "submit_intent_at": "2026-07-17T12:00:00+00:00",
+                        "broker_submit_key": "exit-local-1",
+                    },
+                },
+                {
+                    "local_order_id": "exit-local-1",
+                    "client_id": "client",
+                    "position_id": "position",
+                    "kind": "EXIT",
+                    "status": "EXIT_SUBMITTED",
+                    "qty": 3,
+                    "broker_order_id": "broker-exit-1",
+                    "submitted_ts": "2026-07-17T12:00:01+00:00",
+                    "meta": {
+                        "submit_intent_at": "2026-07-17T12:00:00+00:00",
+                        "broker_submit_key": "exit-local-1",
+                    },
+                },
+            ]),
+        ),
+        reconcile_exit_broker_intent=MagicMock(return_value={
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": "broker-exit-1",
+            "status": "EXIT_SUBMITTED",
+        }),
+    )
+
+    reconciled = guard.reconcile_stale_exit_generation_claim(key, execution_core=core)
+    assert reconciled["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert core.reconcile_exit_broker_intent.call_count == 1
+
+    callback = MagicMock(return_value=True)
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is False
+    assert callback.call_count == 0
+
+
+def test_stale_claim_reconciliation_routes_confirmed_fill_once(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+        local_order_id="exit-local-fill",
+    )
+    _mark_claim_stale_ambiguous(key, local_order_id="exit-local-fill")
+    reconcile = MagicMock(return_value={})
+    fake_guard = SimpleNamespace(reconcile_confirmed_exit_fill=reconcile)
+    monkeypatch.setitem(sys.modules, "ap.exit_fill_truth_guard", fake_guard)
+    core = SimpleNamespace(
+        order_state_machine=SimpleNamespace(
+            get_order=MagicMock(side_effect=[
+                {
+                    "local_order_id": "exit-local-fill",
+                    "client_id": "client",
+                    "position_id": "position",
+                    "kind": "EXIT",
+                    "status": "EXIT_REQUESTED",
+                    "qty": 3,
+                    "broker_order_id": "",
+                    "submitted_ts": None,
+                    "meta": {
+                        "submit_intent_at": "2026-07-17T12:00:00+00:00",
+                        "broker_submit_key": "exit-local-fill",
+                    },
+                },
+                {
+                    "local_order_id": "exit-local-fill",
+                    "client_id": "client",
+                    "position_id": "position",
+                    "kind": "EXIT",
+                    "status": "EXIT_FILLED",
+                    "qty": 3,
+                    "broker_order_id": "broker-exit-fill",
+                    "filled_qty": 3,
+                    "fill_price": 2.15,
+                    "filled_ts": "2026-07-17T12:01:00+00:00",
+                    "submitted_ts": "2026-07-17T12:00:01+00:00",
+                    "meta": {
+                        "submit_intent_at": "2026-07-17T12:00:00+00:00",
+                        "broker_submit_key": "exit-local-fill",
+                    },
+                },
+            ]),
+        ),
+        reconcile_exit_broker_intent=MagicMock(return_value={
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": "broker-exit-fill",
+            "status": "EXIT_FILLED",
+        }),
+    )
+
+    reconciled = guard.reconcile_stale_exit_generation_claim(key, execution_core=core)
+    assert reconciled["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    reconcile.assert_called_once()
+
+
+def test_stale_claim_reconciliation_keeps_ambiguous_when_truth_unavailable(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+        local_order_id="exit-local-1",
+    )
+    _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
+    core = SimpleNamespace(
+        order_state_machine=SimpleNamespace(
+            get_order=MagicMock(return_value={
+                "local_order_id": "exit-local-1",
+                "client_id": "client",
+                "position_id": "position",
+                "kind": "EXIT",
+                "status": "EXIT_REQUESTED",
+                "qty": 3,
+                "broker_order_id": "",
+                "submitted_ts": None,
+                "meta": {
+                    "submit_intent_at": "2026-07-17T12:00:00+00:00",
+                    "broker_submit_key": "exit-local-1",
+                },
+            }),
+        ),
+        reconcile_exit_broker_intent=MagicMock(return_value={
+            "disposition": "RECONCILE_PENDING",
+            "reason_code": "RECONCILE_BROKER_QUERY_FAILED:TimeoutError",
+        }),
+    )
+
+    reconciled = guard.reconcile_stale_exit_generation_claim(key, execution_core=core)
+    assert reconciled["claim_state"] == guard._CLAIM_STATE_AMBIGUOUS
+    assert reconciled["last_error"].startswith(
+        "STALE_CLAIM_RECONCILIATION_REQUIRED:RECONCILE_BROKER_QUERY_FAILED"
+    )
+
+
+def test_stale_claim_reconciliation_race_allows_one_terminal_transition(monkeypatch) -> None:
+    key = "client|position|3|1"
+    claim = {
+        "generation_key": key,
+        "client_id": "client",
+        "position_id": "position",
+        "remaining_qty": 3,
+        "exit_generation": 1,
+        "claim_state": guard._CLAIM_STATE_AMBIGUOUS,
+        "local_order_id": "exit-local-1",
+        "broker_order_id": "",
+        "last_error": guard._STALE_CLAIM_RECONCILIATION_REQUIRED,
+    }
+    acquire_results = iter([
+        (dict(claim), "token-1"),
+        ({}, "token-2"),
+    ])
+    finish_calls = []
+    monkeypatch.setattr(guard, "_acquire_stale_claim_reconciliation", lambda *_: next(acquire_results))
+    monkeypatch.setattr(guard, "_load_durable_decision_generation", lambda *_: {
+        "generation_key": key,
+        "claim_state": guard._CLAIM_STATE_RELEASED_NO_SUBMIT,
+        "local_order_id": "exit-local-1",
+    })
+
+    def _finish(*args, **kwargs):
+        finish_calls.append(kwargs)
+        return {
+            "generation_key": key,
+            "claim_state": kwargs["claim_state"],
+            "local_order_id": "exit-local-1",
+        }
+
+    monkeypatch.setattr(guard, "_finish_stale_claim_reconciliation", _finish)
+    osm = SimpleNamespace(get_order=MagicMock(return_value={
+        "local_order_id": "exit-local-1",
+        "client_id": "client",
+        "position_id": "position",
+        "kind": "EXIT",
+        "status": "EXIT_REQUESTED",
+        "qty": 3,
+        "broker_order_id": "",
+        "submitted_ts": None,
+        "meta": {},
+    }))
+
+    first = guard.reconcile_stale_exit_generation_claim(key, osm=osm)
+    second = guard.reconcile_stale_exit_generation_claim(key, osm=osm)
+    assert first["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert second["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert len(finish_calls) == 1
 
 
 def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> None:

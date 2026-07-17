@@ -427,6 +427,7 @@ class APStartupRecovery:
             "entries_verified":    0,
             "entries_corrected":   0,
             "exits_reattached":    0,
+            "stale_exit_claims_reconciled": 0,
             "buying_power_reserved": 0.0,
             "dedup_seeded":        0,
             "watchers_requeued":   0,
@@ -463,6 +464,17 @@ class APStartupRecovery:
             )
             result["errors"].append(f"exit_fill_reconciliation: {e}")
             result["exit_fill_reconciliations_failed"] += 1
+
+        try:
+            self._reconcile_stale_exit_generation_claims(result)
+        except Exception as e:
+            log.critical(
+                "[%s] Stale EXIT claim reconciliation failed: %s",
+                self.client_id,
+                e,
+                exc_info=True,
+            )
+            result["errors"].append(f"stale_exit_claims: {e}")
 
         try:
             live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
@@ -944,6 +956,40 @@ class APStartupRecovery:
 
         row = run_with_retry(_load)
         return dict(row) if row else None
+
+    def _reconcile_stale_exit_generation_claims(self, result: dict) -> None:
+        from ap.db import conn, run_with_retry
+        from ap.exit_decision_idempotency_guard import (
+            reconcile_stale_exit_generation_claim,
+        )
+
+        def _load():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT generation_key
+                    FROM exit_decision_generation_claims
+                    WHERE client_id=%s
+                      AND claim_state='AMBIGUOUS'
+                      AND COALESCE(last_error,'') LIKE 'STALE_CLAIM_RECONCILIATION_REQUIRED%%'
+                    ORDER BY claimed_at ASC
+                    """,
+                    (self.client_id,),
+                )
+                return c.fetchall()
+
+        rows = run_with_retry(_load) or []
+        for raw in rows:
+            generation_key = str((dict(raw) if not isinstance(raw, dict) else raw).get("generation_key") or "").strip()
+            if not generation_key:
+                continue
+            reconciled = reconcile_stale_exit_generation_claim(
+                generation_key,
+                execution_core=self.execution_core,
+                osm=self.osm,
+            ) or {}
+            if str(reconciled.get("claim_state") or "").strip().upper() != "AMBIGUOUS":
+                result["stale_exit_claims_reconciled"] += 1
 
     def _recover_exit_fills_that_occurred_during_downtime(self, result: dict) -> list[dict]:
         """Route broker-confirmed downtime EXIT fills through the canonical reducer."""

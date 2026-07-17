@@ -26,6 +26,7 @@ import os
 import math
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 from ap.db import conn, run_with_retry
@@ -60,6 +61,7 @@ _CLAIM_STATE_BROKER_OWNED = "BROKER_OWNED"
 _CLAIM_STATE_RELEASED_NO_SUBMIT = "RELEASED_NO_SUBMIT"
 _CLAIM_STATE_AMBIGUOUS = "AMBIGUOUS"
 _STALE_CLAIM_RECONCILIATION_REQUIRED = "STALE_CLAIM_RECONCILIATION_REQUIRED"
+_STALE_CLAIM_RECONCILING = "STALE_CLAIM_RECONCILING"
 _CONCLUSIVE_NO_SUBMIT_STATUSES = {"ERROR", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}
 _CONCLUSIVE_PRE_SUBMIT_FAILURE_MARKERS = (
     "PRE_SUBMIT_VALIDATION_FAILED",
@@ -96,6 +98,13 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
         log.error("unsafe %s=%r; using conservative default=%s", name, raw, default)
         return default
     return min(max(value, minimum), maximum)
+
+
+def _float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 # Documented deployment bounds: TTLs are at least one second and at most one
@@ -221,6 +230,10 @@ def _durable_exit_generation(pos: Any, client_id: str) -> tuple[str, int] | None
     return key, generation
 
 
+def _claim_local_order_id(pos: Any) -> str:
+    return str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
+
+
 def _claim_durable_decision_generation(
     *,
     generation_key: str,
@@ -229,6 +242,7 @@ def _claim_durable_decision_generation(
     remaining_qty: int,
     exit_generation: int,
     decision: Any,
+    local_order_id: str = "",
 ) -> dict:
     """Atomically claim one actionable decision for this durable generation."""
     def _claim() -> dict:
@@ -285,7 +299,7 @@ def _claim_durable_decision_generation(
                 "claim_state=%s, "
                 "claimed_at=NOW(), "
                 "released_at=NULL, "
-                "local_order_id=NULL, "
+                "local_order_id=%s, "
                 "broker_order_id=NULL, "
                 "last_error=NULL "
                 "WHERE generation_key=%s AND claim_state=%s "
@@ -300,6 +314,7 @@ def _claim_durable_decision_generation(
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
                     _CLAIM_STATE_CLAIMED,
+                    local_order_id,
                     generation_key,
                     _CLAIM_STATE_RELEASED_NO_SUBMIT,
                 ),
@@ -314,7 +329,7 @@ def _claim_durable_decision_generation(
                 "generation_key, client_id, position_id, remaining_qty, "
                 "exit_generation, decision_action, decision_reason_code, "
                 "claim_state, claimed_at, released_at, local_order_id, broker_order_id, last_error"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,NULL,NULL,NULL) "
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,%s,NULL,NULL) "
                 "ON CONFLICT (generation_key) DO NOTHING "
                 "RETURNING generation_key, client_id, position_id, remaining_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
@@ -328,6 +343,7 @@ def _claim_durable_decision_generation(
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
                     _CLAIM_STATE_CLAIMED,
+                    local_order_id,
                 ),
             ).fetchone()
             if row:
@@ -347,6 +363,318 @@ def _claim_durable_decision_generation(
             return existing
 
     return dict(run_with_retry(_claim) or {"generation_key": generation_key, "claimed": False})
+
+
+def _load_durable_decision_generation(generation_key: str) -> dict:
+    def _read() -> dict:
+        with conn() as c:
+            row = c.execute(
+                "SELECT generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at "
+                "FROM exit_decision_generation_claims WHERE generation_key=%s LIMIT 1",
+                (generation_key,),
+            ).fetchone()
+            return dict(row) if row else {}
+
+    return dict(run_with_retry(_read) or {})
+
+
+def _stale_claim_error(reason: str) -> str:
+    text = str(reason or "").strip()
+    if not text:
+        return _STALE_CLAIM_RECONCILIATION_REQUIRED
+    return f"{_STALE_CLAIM_RECONCILIATION_REQUIRED}:{text}"
+
+
+def _claim_meta_dict(order: dict) -> dict:
+    meta = order.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            import json as _json_local
+
+            meta = _json_local.loads(meta)
+        except Exception:
+            meta = {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _acquire_stale_claim_reconciliation(generation_key: str) -> tuple[dict, str]:
+    token = f"{_STALE_CLAIM_RECONCILING}:{uuid.uuid4()}"
+
+    def _acquire() -> dict:
+        with conn() as c:
+            row = c.execute(
+                "UPDATE exit_decision_generation_claims "
+                "SET last_error=%s "
+                "WHERE generation_key=%s "
+                "  AND claim_state=%s "
+                "  AND (COALESCE(last_error,'') = '' OR COALESCE(last_error,'') LIKE %s) "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at",
+                (
+                    token,
+                    generation_key,
+                    _CLAIM_STATE_AMBIGUOUS,
+                    f"{_STALE_CLAIM_RECONCILIATION_REQUIRED}%",
+                ),
+            ).fetchone()
+            return dict(row) if row else {}
+
+    return dict(run_with_retry(_acquire) or {}), token
+
+
+def _finish_stale_claim_reconciliation(
+    generation_key: str,
+    *,
+    reconciliation_token: str,
+    claim_state: str,
+    reason: str = "",
+    local_order_id: str = "",
+    broker_order_id: str = "",
+) -> dict:
+    final_error = ""
+    if claim_state == _CLAIM_STATE_AMBIGUOUS:
+        final_error = _stale_claim_error(reason)
+
+    def _finish() -> dict:
+        with conn() as c:
+            row = c.execute(
+                "UPDATE exit_decision_generation_claims "
+                "SET claim_state=%s, "
+                "released_at=CASE WHEN %s=%s THEN NOW() ELSE released_at END, "
+                "local_order_id=CASE WHEN %s<>'' THEN %s ELSE local_order_id END, "
+                "broker_order_id=CASE WHEN %s<>'' THEN %s ELSE broker_order_id END, "
+                "last_error=CASE WHEN %s<>'' THEN %s ELSE NULL END "
+                "WHERE generation_key=%s "
+                "  AND claim_state=%s "
+                "  AND COALESCE(last_error,'')=%s "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at",
+                (
+                    claim_state,
+                    claim_state,
+                    _CLAIM_STATE_RELEASED_NO_SUBMIT,
+                    local_order_id,
+                    local_order_id,
+                    broker_order_id,
+                    broker_order_id,
+                    final_error,
+                    final_error,
+                    generation_key,
+                    _CLAIM_STATE_AMBIGUOUS,
+                    reconciliation_token,
+                ),
+            ).fetchone()
+            return dict(row) if row else {}
+
+    return dict(run_with_retry(_finish) or {})
+
+
+def reconcile_stale_exit_generation_claim(
+    generation_key: str,
+    *,
+    execution_core: Any | None = None,
+    osm: Any | None = None,
+) -> dict:
+    """Reconcile one stale ambiguous EXIT decision claim without submit/cancel authority."""
+    claim, token = _acquire_stale_claim_reconciliation(generation_key)
+    if not claim:
+        return _load_durable_decision_generation(generation_key)
+
+    local_order_id = str(claim.get("local_order_id") or "").strip()
+    broker_order_id = str(claim.get("broker_order_id") or "").strip()
+    position_id = str(claim.get("position_id") or "").strip()
+    client_id = str(claim.get("client_id") or "").strip().lower()
+    expected_qty = _int(claim.get("remaining_qty"), 0) or 0
+    runtime_osm = osm or getattr(execution_core, "order_state_machine", None) or getattr(execution_core, "osm", None)
+    if runtime_osm is None:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_OSM_UNAVAILABLE",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if not local_order_id:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_LOCAL_ORDER_ID_MISSING",
+        )
+
+    try:
+        order = runtime_osm.get_order(local_order_id)
+    except Exception as exc:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason=f"RECONCILE_ROW_READ_ERROR:{type(exc).__name__}",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if not isinstance(order, dict):
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_ROW_MISSING",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+
+    if str(order.get("client_id") or "").strip().lower() != client_id:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_CLIENT_ID_MISMATCH",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if str(order.get("kind") or "").strip().upper() != "EXIT":
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_KIND_MISMATCH",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if position_id and str(order.get("position_id") or "").strip() != position_id:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_POSITION_ID_MISMATCH",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if expected_qty > 0 and (_int(order.get("qty"), 0) or 0) != expected_qty:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_QTY_MISMATCH",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+
+    order_meta = _claim_meta_dict(order)
+    status = str(order.get("status") or "").strip().upper()
+    broker_order_id = str(order.get("broker_order_id") or broker_order_id or "").strip()
+    filled_qty = _int(order.get("filled_qty"), 0) or 0
+    fill_price = _float(order.get("fill_price"), 0.0) or 0.0
+
+    no_submit_proven = (
+        status in {"EXIT_REQUESTED", "ERROR", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}
+        and not broker_order_id
+        and not order.get("submitted_ts")
+        and not str(order_meta.get("submit_intent_at") or "").strip()
+        and not str(order_meta.get("broker_submit_key") or "").strip()
+    )
+    if no_submit_proven:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_RELEASED_NO_SUBMIT,
+            local_order_id=local_order_id,
+        )
+
+    if (
+        status == "EXIT_REQUESTED"
+        and str(order_meta.get("submit_intent_at") or "").strip()
+        and execution_core is not None
+        and callable(getattr(execution_core, "reconcile_exit_broker_intent", None))
+    ):
+        adapter_result = execution_core.reconcile_exit_broker_intent(local_order_id=local_order_id) or {}
+        disposition = str(adapter_result.get("disposition") or "").strip().upper()
+        if disposition == "RECONCILE_PENDING":
+            return _finish_stale_claim_reconciliation(
+                generation_key,
+                reconciliation_token=token,
+                claim_state=_CLAIM_STATE_AMBIGUOUS,
+                reason=str(adapter_result.get("reason_code") or "RECONCILE_PENDING"),
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+            )
+        try:
+            order = runtime_osm.get_order(local_order_id)
+        except Exception:
+            order = None
+        if not isinstance(order, dict):
+            return _finish_stale_claim_reconciliation(
+                generation_key,
+                reconciliation_token=token,
+                claim_state=_CLAIM_STATE_AMBIGUOUS,
+                reason="RECONCILE_ROW_MISSING_POST_ADOPTION",
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+            )
+        order_meta = _claim_meta_dict(order)
+        status = str(order.get("status") or "").strip().upper()
+        broker_order_id = str(order.get("broker_order_id") or broker_order_id or "").strip()
+        filled_qty = _int(order.get("filled_qty"), 0) or 0
+        fill_price = _float(order.get("fill_price"), 0.0) or 0.0
+
+    if status in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"} and broker_order_id and filled_qty > 0 and fill_price > 0:
+        from ap.exit_fill_truth_guard import reconcile_confirmed_exit_fill
+
+        canonical_result = {
+            "status": order.get("status"),
+            "broker_order_id": broker_order_id,
+            "filled_qty": order.get("filled_qty"),
+            "fill_price": order.get("fill_price"),
+            "filled_ts": order.get("filled_ts"),
+        }
+        try:
+            reconcile_confirmed_exit_fill(order, canonical_result)
+        except Exception as exc:
+            return _finish_stale_claim_reconciliation(
+                generation_key,
+                reconciliation_token=token,
+                claim_state=_CLAIM_STATE_AMBIGUOUS,
+                reason=f"EXIT_FILL_RECONCILE_FAILED:{type(exc).__name__}",
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+            )
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_BROKER_OWNED,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+
+    active_evidence = bool(
+        broker_order_id
+        or status in {"EXIT_SUBMITTED", "EXIT_ACKNOWLEDGED", "EXIT_PARTIAL_FILL", "EXIT_FILLED"}
+        or str(order_meta.get("submit_intent_at") or "").strip()
+        or bool(order_meta.get("split_brain_quarantine"))
+        or bool(order_meta.get("reconciliation_required"))
+    )
+    if active_evidence:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_BROKER_OWNED,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+
+    return _finish_stale_claim_reconciliation(
+        generation_key,
+        reconciliation_token=token,
+        claim_state=_CLAIM_STATE_AMBIGUOUS,
+        reason="RECONCILE_TRUTH_UNAVAILABLE",
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+    )
 
 
 def _update_durable_decision_generation(
@@ -784,6 +1112,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             remaining_qty=remaining_qty,
                             exit_generation=exit_generation,
                             decision=decision,
+                            local_order_id=_claim_local_order_id(pos),
                         )
                     except Exception as exc:
                         mode = _execution_mode(self, pos)
