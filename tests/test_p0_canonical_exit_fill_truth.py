@@ -4,6 +4,7 @@ import pytest
 
 from ap.exit_fill_truth_guard import (
     LifecycleProjectionError,
+    _is_partial_result,
     official_live_eligibility,
     project_position_from_exit_fills,
 )
@@ -83,6 +84,33 @@ def test_rows_without_positive_broker_fill_are_not_counted() -> None:
                 {"filled_qty": 1, "fill_price": None},
             ],
         )
+
+
+def test_partial_result_detection_uses_normalized_or_broker_status() -> None:
+    assert _is_partial_result({}, {"status": "EXIT_PARTIAL_FILL"}) is True
+    assert _is_partial_result({}, {"status": "partially_filled"}) is True
+    assert _is_partial_result({"status": "EXIT_PARTIAL_FILL"}, {}) is True
+    assert _is_partial_result({}, {"status": "FILLED"}) is False
+
+
+def test_fill_loader_never_sweeps_unrelated_synthetic_orders() -> None:
+    source = __import__("inspect").getsource(
+        __import__("ap.exit_fill_truth_guard", fromlist=["_load_exit_fills"])._load_exit_fills
+    )
+    assert "local_order_id=%s" in source
+    assert "position_id IS NULL" not in source
+    assert "broker-repair-%%" not in source
+
+
+def test_partial_exit_path_invokes_canonical_sync() -> None:
+    from pathlib import Path
+
+    source = Path("ap/fill_monitor.py").read_text()
+    partial_start = source.index('if mapped in ("PARTIAL_FILL", "EXIT_PARTIAL_FILL")')
+    ack_start = source.index("# ── ACKNOWLEDGED", partial_start)
+    partial_body = source[partial_start:ack_start]
+    assert "partial_applied and kind == \"EXIT\"" in partial_body
+    assert "_sync_exit_price(order, partial_result)" in partial_body
 
 
 @pytest.mark.parametrize(

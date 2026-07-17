@@ -28,6 +28,9 @@ _TERMINAL_POSITION_STATUSES = {
     "ERROR", "CANCELED", "CANCELLED",
 }
 _EXIT_FILL_STATUSES = ("EXIT_FILLED", "EXIT_PARTIAL_FILL")
+_PARTIAL_RESULT_STATUSES = {
+    "PARTIAL_FILL", "PARTIALLY_FILLED", "PARTIAL", "EXIT_PARTIAL_FILL",
+}
 
 
 class LifecycleProjectionError(ValueError):
@@ -148,10 +151,6 @@ def _synthetic_position_id(value: Any) -> bool:
     return not text or text.startswith("broker-repair-")
 
 
-def _position_entry_key(row: dict) -> str:
-    return str(row.get("entry_ts") or row.get("created_at") or "")
-
-
 def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
     client_id = str(order.get("client_id") or "").strip()
     contract = str(order.get("contract") or order.get("symbol") or "").strip().upper()
@@ -161,54 +160,64 @@ def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
 
     if requested_id and not _synthetic_position_id(requested_id):
         row = c.execute(
-            "SELECT * FROM positions WHERE client_id=%s AND id::text=%s LIMIT 1",
+            "SELECT * FROM positions WHERE client_id=%s AND id::text=%s "
+            "LIMIT 1 FOR UPDATE",
             (client_id, requested_id),
         ).fetchone()
         if row:
             resolved = dict(row)
             if str(resolved.get("contract") or "").strip().upper() == contract:
                 return resolved
+        # A supplied real position identity is authoritative.  Missing or
+        # contract-mismatched identity is corruption, not permission to guess
+        # from another same-contract lifecycle.
+        return None
 
+    # Synthetic/null identity is recoverable only when the broker fill can be
+    # bound to exactly one contemporaneous lifecycle.  Never choose the newest
+    # same-contract row: multiple positions may legitimately share an OCC
+    # contract, and a newest-row guess can move fills/P&L across trades.
     rows = c.execute(
         "SELECT * FROM positions WHERE client_id=%s AND UPPER(contract)=UPPER(%s) "
         "AND COALESCE(entry_ts, created_at, NOW()) <= COALESCE(%s, NOW()) "
-        "ORDER BY COALESCE(entry_ts, created_at) DESC LIMIT 2",
-        (client_id, contract, fill_ts),
+        "AND ("
+        "  UPPER(COALESCE(status,'')) NOT IN %s "
+        "  OR COALESCE(exit_ts, updated_at, created_at) >= "
+        "     COALESCE(%s, NOW()) - INTERVAL '10 minutes'"
+        ") "
+        "ORDER BY COALESCE(entry_ts, created_at) DESC LIMIT 3 FOR UPDATE",
+        (client_id, contract, fill_ts, tuple(_TERMINAL_POSITION_STATUSES), fill_ts),
     ).fetchall()
     candidates = [dict(row) for row in rows]
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-
-    active = [
-        row for row in candidates
-        if str(row.get("status") or "").upper() not in _TERMINAL_POSITION_STATUSES
-        and _int(row.get("quantity_remaining"), _int(row.get("qty"))) > 0
-    ]
-    if len(active) == 1:
-        return active[0]
-    if _position_entry_key(candidates[0]) and _position_entry_key(candidates[0]) != _position_entry_key(candidates[1]):
-        return candidates[0]
-    return None
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
     client_id = str(order.get("client_id") or "").strip()
     contract = str(position.get("contract") or order.get("contract") or "").strip().upper()
     position_id = str(position.get("id") or "").strip()
+    current_local_order_id = str(order.get("local_order_id") or "").strip()
     entry_ts = position.get("entry_ts") or position.get("created_at")
     rows = c.execute(
         "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
         "AND status IN %s AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
         "AND (%s IS NULL OR filled_ts >= %s) "
-        "AND (position_id::text=%s OR position_id IS NULL OR position_id::text='' "
-        "OR position_id::text LIKE 'broker-repair-%%') "
+        "AND (position_id::text=%s OR (%s<>'' AND local_order_id=%s)) "
         "ORDER BY filled_ts ASC, created_ts ASC",
-        (client_id, contract, _EXIT_FILL_STATUSES, entry_ts, entry_ts, position_id),
+        (
+            client_id, contract, _EXIT_FILL_STATUSES, entry_ts, entry_ts,
+            position_id, current_local_order_id, current_local_order_id,
+        ),
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _is_partial_result(order: dict, result: dict) -> bool:
+    status = str(
+        result.get("status") or result.get("state") or order.get("status") or ""
+    ).strip().upper()
+    return status in _PARTIAL_RESULT_STATUSES
 
 
 def _load_entry_order(c, position: dict, order: dict) -> dict:
@@ -292,8 +301,33 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
             entry_fill_price = _float(entry_order.get("fill_price") or position.get("avg_fill") or position.get("entry_price"))
             entry_filled_qty = _int(entry_order.get("filled_qty") or position.get("qty"))
             synthetic_entry = bool(position.get("synthetic_entry") or entry_order.get("synthetic_entry"))
+            partial_active = _is_partial_result(order, result) and not projection.closed
+            current_filled_qty = _int(
+                result.get("filled_qty"), _int(order.get("filled_qty"))
+            )
+            current_order_qty = _int(order.get("qty"))
+            remaining_on_current_order = max(0, current_order_qty - current_filled_qty)
 
             position_columns = _table_columns(c, "positions")
+            ownership_updates = (
+                {
+                    "exit_in_flight": True,
+                    "pending_exit_qty": remaining_on_current_order or None,
+                    "pending_exit_local_order_id": str(order.get("local_order_id") or "") or None,
+                    "pending_exit_broker_order_id": str(
+                        result.get("broker_order_id") or order.get("broker_order_id") or ""
+                    ) or None,
+                }
+                if partial_active
+                else {
+                    "exit_in_flight": False,
+                    "pending_exit_action": None,
+                    "pending_exit_reason": None,
+                    "pending_exit_qty": None,
+                    "pending_exit_local_order_id": None,
+                    "pending_exit_broker_order_id": None,
+                }
+            )
             position_updates = {
                 key: value
                 for key, value in {
@@ -302,12 +336,7 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                     "exit_price": projection.weighted_exit_price,
                     "realized_pnl": projection.realized_pnl,
                     "realized_pnl_pct": projection.realized_pnl_pct,
-                    "exit_in_flight": False,
-                    "pending_exit_action": None,
-                    "pending_exit_reason": None,
-                    "pending_exit_qty": None,
-                    "pending_exit_local_order_id": None,
-                    "pending_exit_broker_order_id": None,
+                    **ownership_updates,
                     "updated_at": datetime.now(timezone.utc),
                     **({"status": "CLOSED", "exit_ts": projection.final_fill_ts or fill_ts} if projection.closed else {}),
                 }.items()

@@ -1731,6 +1731,7 @@ def process_pending_order(
             extra_context={"osm_status": mapped},
         )
 
+        partial_applied = False
         if osm:
             try:
                 current_status = str(order.get("status") or "").upper()
@@ -1749,10 +1750,23 @@ def process_pending_order(
                         fill_price=result.get("avg_fill"),
                         broker_order_id=broker_id,
                     )
+                partial_applied = True
             except Exception as exc:
                 log.error("[%s] OSM partial update %s failed for %s: %s", client_id, mapped, local_id, exc)
         else:
             _legacy_update_order_status(local_id, "PARTIAL_FILL", filled_qty=new_filled)
+            partial_applied = True
+
+        # Canonical accounting must advance on every confirmed EXIT fill, not
+        # only when the broker order becomes terminal.  Stamp the normalized
+        # OSM status into the result so the reducer preserves durable in-flight
+        # ownership while the broker still owns the remainder.
+        if partial_applied and kind == "EXIT":
+            partial_result = dict(result)
+            partial_result["status"] = "EXIT_PARTIAL_FILL"
+            partial_result["filled_qty"] = new_filled
+            partial_result["broker_order_id"] = broker_id
+            _sync_exit_price(order, partial_result)
 
         audit(
             client_id,
