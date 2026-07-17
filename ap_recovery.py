@@ -453,6 +453,18 @@ class APStartupRecovery:
             result["errors"].append(f"deferred_lifecycle: {e}")
 
         try:
+            self._retry_canonical_exit_fill_reconciliations(result)
+        except Exception as e:
+            log.critical(
+                "[%s] Canonical EXIT-fill retry discovery failed: %s",
+                self.client_id,
+                e,
+                exc_info=True,
+            )
+            result["errors"].append(f"exit_fill_reconciliation: {e}")
+            result["exit_fill_reconciliations_failed"] += 1
+
+        try:
             self._recover_positions(result)
         except Exception as e:
             log.error("[%s] Position recovery error: %s", self.client_id, e)
@@ -469,18 +481,6 @@ class APStartupRecovery:
         except Exception as e:
             log.error("[%s] Exit reattachment error: %s", self.client_id, e)
             result["errors"].append(f"exits: {e}")
-
-        try:
-            self._retry_canonical_exit_fill_reconciliations(result)
-        except Exception as e:
-            log.critical(
-                "[%s] Canonical EXIT-fill retry discovery failed: %s",
-                self.client_id,
-                e,
-                exc_info=True,
-            )
-            result["errors"].append(f"exit_fill_reconciliation: {e}")
-            result["exit_fill_reconciliations_failed"] += 1
 
         try:
             self._recompute_buying_power(result)
@@ -552,7 +552,12 @@ class APStartupRecovery:
                 continue
             if status == "QUARANTINED":
                 result["exit_fill_reconciliations_quarantined"] += 1
-                diagnostic = (outcome.get("result") or {}).get("proof_reconciliation") or {}
+                outcome_result = outcome.get("result") or {}
+                diagnostic = (
+                    outcome_result.get("proof_reconciliation")
+                    or outcome_result
+                    or {}
+                )
                 reason = str(
                     diagnostic.get("reason_code")
                     or status

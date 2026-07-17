@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -946,7 +947,7 @@ def test_batch_recovery_reports_proof_quarantine_as_unresolved(monkeypatch) -> N
     }]
 
 
-def test_startup_recovery_runs_client_scoped_exit_retry_once_after_reattachment(
+def test_startup_recovery_runs_client_scoped_exit_retry_before_position_and_exit_recovery(
     monkeypatch,
 ) -> None:
     import ap.exit_fill_truth_guard as guard
@@ -973,11 +974,65 @@ def test_startup_recovery_runs_client_scoped_exit_retry_once_after_reattachment(
     recovery._reseed_dedup = lambda _result: events.append("dedup")
 
     result = recovery.run(include_watcher_reseed=False)
-    assert events.index("exits") < events.index("exit_fill_retry")
+    assert events.index("exit_fill_retry") < events.index("positions")
+    assert events.index("exit_fill_retry") < events.index("exits")
     assert events.count("exit_fill_retry") == 1
     scan.assert_called_once_with(client_id="jason@example.com", limit=100)
     assert result["exit_fill_reconciliations_attempted"] == 0
     assert result["errors"] == []
+
+
+def test_startup_recovery_retries_canonical_exit_fill_before_loading_stale_runtime_state(
+    monkeypatch,
+) -> None:
+    import ap.exit_fill_truth_guard as guard
+    from ap_recovery import APStartupRecovery
+
+    state = {"position_closed": False, "manual_resubmission": False}
+    scan = MagicMock(side_effect=lambda **_kwargs: state.__setitem__("position_closed", True) or [])
+    monkeypatch.setattr(guard, "retry_pending_exit_fill_reconciliations", scan)
+
+    recovery = APStartupRecovery.__new__(APStartupRecovery)
+    recovery.client_id = "jason@example.com"
+    recovery.pm = SimpleNamespace(register_recovered_position=MagicMock())
+    recovery.mc = SimpleNamespace(_position_count=0)
+    recovery._execution_mode = lambda: "live"
+    recovery._recover_deferred_breach_lifecycles = lambda _result: None
+    recovery._verify_pending_entries = lambda _result: None
+    recovery._reseed_dedup = lambda _result: None
+    recovery._recover_positions = lambda result: (
+        recovery.pm.register_recovered_position({"id": "stale-pos"})
+        if not state["position_closed"] else None,
+        result.__setitem__(
+            "positions_recovered",
+            result["positions_recovered"] + (0 if state["position_closed"] else 1),
+        ),
+        setattr(
+            recovery.mc,
+            "_position_count",
+            recovery.mc._position_count + (0 if state["position_closed"] else 1),
+        ),
+    )
+    recovery._reattach_exit_protections = lambda result: (
+        state.__setitem__("manual_resubmission", not state["position_closed"]),
+        result.__setitem__(
+            "exits_reattached",
+            result["exits_reattached"] + (0 if state["position_closed"] else 1),
+        ),
+    )
+    recovery._recompute_buying_power = lambda result: result.__setitem__(
+        "buying_power_reserved",
+        0.0 if state["position_closed"] else 250.0,
+    )
+
+    result = recovery.run(include_watcher_reseed=False)
+
+    recovery.pm.register_recovered_position.assert_not_called()
+    assert recovery.mc._position_count == 0
+    assert state["manual_resubmission"] is False
+    assert result["positions_recovered"] == 0
+    assert result["exits_reattached"] == 0
+    assert result["buying_power_reserved"] == 0.0
 
 
 def test_startup_exit_retry_records_resolved_quarantined_failed_and_claimed(
@@ -1062,6 +1117,62 @@ def test_startup_exit_retry_discovery_failure_is_diagnostic_not_fatal(monkeypatc
     result = recovery.run(include_watcher_reseed=False)
     assert result["exit_fill_reconciliations_failed"] == 1
     assert result["errors"] == ["exit_fill_reconciliation: catalog unavailable"]
+
+
+def test_batch_recovery_reports_position_ambiguity_as_quarantined(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    now = datetime.now(timezone.utc)
+    row = {
+        "client_id": "jason@example.com",
+        "local_order_id": "exit-local-ambiguous",
+        "meta": {"exit_fill_reconciliation": {
+            "status": "RETRY_REQUIRED",
+            "last_attempt_at": (now - timedelta(minutes=10)).isoformat(),
+        }},
+    }
+
+    class _Cursor:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchall(self):
+            return [row]
+
+    @contextmanager
+    def _conn():
+        yield _Cursor()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "retry_exit_fill_reconciliation",
+        MagicMock(
+            side_effect=ReconciliationIdentityError(
+                "CANONICAL_POSITION_AMBIGUOUS",
+                ["position-a", "position-b"],
+            )
+        ),
+    )
+
+    outcomes = retry_pending_exit_fill_reconciliations(
+        client_id="jason@example.com",
+        limit=100,
+    )
+
+    assert outcomes == [{
+        "client_id": "jason@example.com",
+        "local_order_id": "exit-local-ambiguous",
+        "status": "QUARANTINED",
+        "reconciled": False,
+        "result": {
+            "reason_code": "CANONICAL_POSITION_AMBIGUOUS",
+            "candidate_position_ids": ["position-a", "position-b"],
+            "error": "CANONICAL_POSITION_AMBIGUOUS",
+        },
+        "error": "CANONICAL_POSITION_AMBIGUOUS",
+    }]
 
 
 def test_successful_stale_recovery_finishes_reconciled(monkeypatch) -> None:

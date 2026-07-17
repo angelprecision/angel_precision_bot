@@ -1022,11 +1022,17 @@ def retry_pending_exit_fill_reconciliations(
                 "result": reconciled,
             })
         except Exception as exc:
+            status, reason_code, candidates = _failure_reason(exc)
             outcomes.append({
                 "client_id": row_client,
                 "local_order_id": row_local,
-                "status": "FAILED",
+                "status": "QUARANTINED" if status == "QUARANTINED" else "FAILED",
                 "reconciled": False,
+                "result": {
+                    "reason_code": reason_code,
+                    "candidate_position_ids": candidates,
+                    "error": str(exc),
+                } if status == "QUARANTINED" else None,
                 "error": str(exc),
             })
     return outcomes
