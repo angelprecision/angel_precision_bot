@@ -21,11 +21,18 @@ def install_deferred_materialization_persistence_guard() -> None:
     install_guard()
 
 
+def install_paper_selector_provenance_safety_guard() -> None:
+    from .paper_selector_provenance_guard import install_paper_selector_provenance_guard
+
+    install_paper_selector_provenance_guard()
+
+
 def install_entry_safety_guards() -> None:
     installers = (
         install_entry_metadata_safety_guards,
         install_underlying_confirmation_safety_guard,
         install_deferred_materialization_persistence_guard,
+        install_paper_selector_provenance_safety_guard,
     )
     for installer in installers:
         try:
