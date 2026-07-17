@@ -631,6 +631,8 @@ def test_pending_exit_ownership_migration_is_idempotent_on_postgres() -> None:
 
 
 def test_postgres_duplicate_proofs_are_not_mutated_by_production_sql() -> None:
+    from ap.db import _ConnWrapper
+
     test_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
     if not test_url or "test" not in test_url.lower():
         pytest.skip("PostgreSQL test database is unavailable")
@@ -640,6 +642,7 @@ def test_postgres_duplicate_proofs_are_not_mutated_by_production_sql() -> None:
     db.autocommit = True
     try:
         with db.cursor(cursor_factory=extras.RealDictCursor) as cursor:
+            wrapped = _ConnWrapper(db, cursor)
             cursor.execute("DROP SCHEMA IF EXISTS pr360_proof_test CASCADE")
             cursor.execute("CREATE SCHEMA pr360_proof_test")
             cursor.execute("SET search_path TO pr360_proof_test, public")
@@ -655,7 +658,7 @@ def test_postgres_duplicate_proofs_are_not_mutated_by_production_sql() -> None:
                 "('proof-b','jason@example.com','position-1',NULL,FALSE)"
             )
             changed, diagnostic = _update_canonical_proof_row(
-                cursor,
+                wrapped,
                 proof_columns={
                     "id", "client_email", "position_id", "local_order_id", "win"
                 },
