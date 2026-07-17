@@ -2671,7 +2671,10 @@ class APStartupRecovery:
                           AND status = 'WATCHING'
                           AND created_ts >= %s
                           AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
-                          AND last_error NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
+                          AND (
+                last_error IS NULL
+             OR last_error NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
+          )
                         ORDER BY created_ts ASC
                         """,
                         (self.client_id, _live_cutoff_utc),
@@ -2695,8 +2698,10 @@ class APStartupRecovery:
                           AND LOWER(COALESCE(execution_mode,'')) = 'live'
                           AND status NOT IN (
                                 'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                'ERROR','FILLED','DONE','ARCHIVED'
+                                'ERROR','DONE','ARCHIVED'
                           )
+                          AND COALESCE(filled_qty, 0) = 0
+                          AND filled_ts IS NULL
                           AND (
                                 signal_id = %s
                              OR (%s <> '' AND canonical_signal_id = %s)
@@ -2735,69 +2740,96 @@ class APStartupRecovery:
                             self.client_id, symbol, method_name, exc,
                         )
                         continue
-                    raw_dict = raw if isinstance(raw, dict) else vars(raw) if hasattr(raw, "__dict__") else {}
-                    # Freshness check: broker quote must include a timestamp
-                    _qt_raw = (
-                        raw_dict.get("quote_time") or raw_dict.get("timestamp")
+                    raw_dict = raw if isinstance(raw, dict) else (vars(raw) if hasattr(raw, "__dict__") else {})
+
+                    def _parse_epoch_ms(val):
+                        """Parse Tradier epoch-millisecond or epoch-second timestamps."""
+                        if val is None:
+                            return None
+                        try:
+                            ep = float(val)
+                            if ep > 1e10:  # milliseconds
+                                ep /= 1000.0
+                            dt = datetime.fromtimestamp(ep, tz=timezone.utc)
+                            return dt
+                        except Exception:
+                            return None
+
+                    def _ts_age_ok(dt):
+                        if dt is None:
+                            return False
+                        age = (now_utc_ts - dt).total_seconds()
+                        return -5 <= age <= _MAX_QUOTE_AGE_SECONDS
+
+                    # P0-2: support Tradier's actual timestamp fields.
+                    # Tradier quote dictionary uses epoch-millisecond fields:
+                    #   trade_date  — timestamp of the last trade (pairs with last)
+                    #   bid_date    — timestamp of the current bid (pairs with bid)
+                    #   ask_date    — timestamp of the current ask (pairs with ask)
+                    # Generic fallbacks for other brokers: timestamp, quote_time, etc.
+                    # Price must be paired with its corresponding timestamp so we
+                    # never validate freshness using ask_date then return a stale last.
+                    _last_px  = _safe_float(raw_dict.get("last"), 0.0)
+                    _bid_px   = _safe_float(raw_dict.get("bid"),  0.0)
+                    _ask_px   = _safe_float(raw_dict.get("ask"),  0.0)
+
+                    _trade_dt = _parse_epoch_ms(raw_dict.get("trade_date"))
+                    _bid_dt   = _parse_epoch_ms(raw_dict.get("bid_date"))
+                    _ask_dt   = _parse_epoch_ms(raw_dict.get("ask_date"))
+
+                    # Generic timestamp fallback (non-Tradier brokers)
+                    _generic_raw = (
+                        raw_dict.get("timestamp") or raw_dict.get("quote_time")
                         or raw_dict.get("trade_time") or raw_dict.get("time")
                         or raw_dict.get("updated_at")
                     )
-                    if _qt_raw is not None:
+                    _generic_dt = None
+                    if _generic_raw is not None:
                         try:
-                            if isinstance(_qt_raw, (int, float)):
-                                # epoch seconds or ms
-                                _ep = float(_qt_raw)
-                                if _ep > 1e10:
-                                    _ep /= 1000.0
-                                _qt_dt = datetime.fromtimestamp(_ep, tz=timezone.utc)
+                            if isinstance(_generic_raw, (int, float)):
+                                _generic_dt = _parse_epoch_ms(_generic_raw)
                             else:
-                                _qt_str = str(_qt_raw).strip()
-                                if _qt_str.endswith("Z"):
-                                    _qt_str = _qt_str[:-1] + "+00:00"
-                                _qt_dt = datetime.fromisoformat(_qt_str)
-                                if _qt_dt.tzinfo is None:
-                                    _qt_dt = _qt_dt.replace(tzinfo=timezone.utc)
-                                else:
-                                    _qt_dt = _qt_dt.astimezone(timezone.utc)
-                            _age_sec = (now_utc_ts - _qt_dt).total_seconds()
-                            if _age_sec > _MAX_QUOTE_AGE_SECONDS or _age_sec < -5:
-                                log.warning(
-                                    "LIVE_RECOVERY_QUOTE_STALE client_id=%s symbol=%s "
-                                    "quote_age_sec=%.1f max=%d — skipping terminalization",
-                                    self.client_id, symbol, _age_sec, _MAX_QUOTE_AGE_SECONDS,
-                                )
-                                return None  # fail closed — cannot prove freshness
-                        except Exception as _ts_err:
-                            log.warning(
-                                "LIVE_RECOVERY_QUOTE_TIMESTAMP_PARSE_FAILED client_id=%s symbol=%s "
-                                "error=%s — failing closed",
-                                self.client_id, symbol, _ts_err,
-                            )
-                            return None  # fail closed — cannot prove freshness
-                    else:
-                        # No timestamp in response — fail closed for terminalization
-                        log.warning(
-                            "LIVE_RECOVERY_QUOTE_NO_TIMESTAMP client_id=%s symbol=%s "
-                            "method=%s — refusing to terminalize without fresh evidence",
-                            self.client_id, symbol, method_name,
-                        )
-                        return None
+                                _s = str(_generic_raw).strip()
+                                if _s.endswith("Z"):
+                                    _s = _s[:-1] + "+00:00"
+                                _gdt = datetime.fromisoformat(_s)
+                                if _gdt.tzinfo is None:
+                                    _gdt = _gdt.replace(tzinfo=timezone.utc)
+                                _generic_dt = _gdt.astimezone(timezone.utc)
+                        except Exception:
+                            pass
 
-                    if isinstance(raw, dict):
-                        vals = [
-                            raw.get("last"), raw.get("mark"), raw.get("mid"),
-                            raw.get("price"), raw.get("ask"), raw.get("bid"),
-                        ]
-                    else:
-                        vals = [
-                            getattr(raw, "last", None), getattr(raw, "mark", None),
-                            getattr(raw, "mid", None), getattr(raw, "price", None),
-                            getattr(raw, "ask", None), getattr(raw, "bid", None),
-                        ]
-                    for val in vals:
-                        px = _safe_float(val, 0.0)
-                        if px > 0:
-                            return px
+                    # Prefer `last` paired with its trade_date timestamp
+                    if _last_px > 0 and _ts_age_ok(_trade_dt):
+                        return _last_px
+
+                    # Bid/ask midpoint paired with the freshest bid/ask timestamp
+                    if _bid_px > 0 and _ask_px > 0:
+                        _ba_dt = max(
+                            (dt for dt in (_bid_dt, _ask_dt) if dt is not None),
+                            default=None,
+                        )
+                        if _ts_age_ok(_ba_dt):
+                            return (_bid_px + _ask_px) / 2.0
+
+                    # Generic-timestamp path (non-Tradier brokers)
+                    if _ts_age_ok(_generic_dt):
+                        for attr in ("last", "mark", "mid", "price", "ask", "bid"):
+                            px = _safe_float(raw_dict.get(attr) if isinstance(raw, dict)
+                                             else getattr(raw, attr, None), 0.0)
+                            if px > 0:
+                                return px
+
+                    # No valid price+timestamp pair found
+                    log.warning(
+                        "LIVE_RECOVERY_QUOTE_NO_VALID_TIMESTAMP client_id=%s symbol=%s "
+                        "method=%s trade_date=%s bid_date=%s ask_date=%s generic=%s "
+                        "— refusing to terminalize without fresh evidence",
+                        self.client_id, symbol, method_name,
+                        raw_dict.get("trade_date"), raw_dict.get("bid_date"),
+                        raw_dict.get("ask_date"), _generic_raw,
+                    )
+                    return None
                 return None
 
             def _payload_dict(row) -> dict:
@@ -2863,8 +2895,16 @@ class APStartupRecovery:
                                        else (_ap_row[0] if _ap_row else "")) or "").lower()
                             if _ds == "rejected":
                                 return "skip", {"reason": "ap_signals_rejected"}
-                    except Exception:
-                        pass  # fail-open: let classify continue if join fails
+                    except Exception as _policy_err:
+                        # P0-5: fail closed — if authoritative policy truth
+                        # cannot be read, do not restore a potentially
+                        # policy-rejected signal as a LIVE trade.
+                        log.error(
+                            "LIVE_RECOVERY_POLICY_TRUTH_UNAVAILABLE "
+                            "client_id=%s signal_id=%s error=%s — skipping",
+                            self.client_id, signal_id, _policy_err,
+                        )
+                        return "skip", {"reason": "LIVE_RECOVERY_POLICY_TRUTH_UNAVAILABLE"}
                 if not signal_id or not canonical_signal_id:
                     return "skip", {"reason": "missing_canonical_signal_identity"}
                 if not symbol or direction not in {"CALL", "PUT"} or trigger <= 0:
@@ -2894,13 +2934,13 @@ class APStartupRecovery:
                 }
                 return ("missed" if crossed else "eligible"), diag
 
-            def _mark_missed(row_id, diag: dict) -> bool:
-                # Atomically terminalize to REJECTED so:
-                # (a) dashboard readers do not see it as an active opportunity;
-                # (b) the next startup recovery skips it (status != WATCHING);
-                # (c) _load_candidates already filters last_error LIKE
-                #     'LIVE_RECOVERY_MISSED_TRIGGER%' as a belt-and-suspenders
-                #     guard for any row that was not yet moved out of WATCHING.
+            def _mark_missed(row_id, diag: dict, signal_id_: str, canonical_signal_id_: str) -> bool:
+                # Atomically terminalize to REJECTED. Includes the same NOT EXISTS
+                # LIVE order fence as _restore() — a concurrent worker could have
+                # created a CREATED/PENDING_TRIGGER order between _classify() and
+                # this write; without the fence, we would REJECT the queue row
+                # while a valid watcher-owned order now exists, leaving the order
+                # stranded with a mislabeled queue row.
                 with conn() as c:
                     c.execute(
                         """
@@ -2912,9 +2952,23 @@ class APStartupRecovery:
                         WHERE id = %s
                           AND client_id = %s
                           AND status = 'WATCHING'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM orders
+                            WHERE orders.client_id = trade_queue.client_id
+                              AND orders.kind = 'ENTRY'
+                              AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
+                              AND orders.status NOT IN (
+                                    'REJECTED','CANCELED','CANCELLED','EXPIRED',
+                                    'ERROR','DONE','ARCHIVED'
+                              )
+                              AND (
+                                    orders.signal_id = %s
+                                 OR (%s <> '' AND orders.canonical_signal_id = %s)
+                              )
+                          )
                         """,
                         (json.dumps({"live_recovery_outcome": "LIVE_RECOVERY_MISSED_TRIGGER", **diag}, default=str),
-                         row_id, self.client_id),
+                         row_id, self.client_id, signal_id_, canonical_signal_id_, canonical_signal_id_),
                     )
                     return int(getattr(c, "rowcount", 0) or 0) == 1
 
@@ -2975,7 +3029,9 @@ class APStartupRecovery:
                         restored += 1
                     continue
                 if outcome == "missed":
-                    run_with_retry(lambda row_id=row_id, diag=diag: _mark_missed(row_id, diag))
+                    _ms_id = diag.get("signal_id", "")
+                    _mc_id = diag.get("canonical_signal_id", "")
+                    run_with_retry(lambda row_id=row_id, diag=diag, _ms=_ms_id, _mc=_mc_id: _mark_missed(row_id, diag, _ms, _mc))
                     log.warning(
                         "LIVE_RECOVERY_MISSED_TRIGGER client_id=%s signal_id=%s canonical_signal_id=%s "
                         "symbol=%s direction=%s trigger=%.4f current=%.4f reason=ownership_absent_at_trigger",

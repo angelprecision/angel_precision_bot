@@ -134,7 +134,16 @@ def test_live_recovery_uses_classifier_and_missed_trigger_outcome():
     assert "LIVE_RECOVERY_MISSED_TRIGGER" in src
     assert "ownership_absent_at_trigger" in src
     assert "LOWER(COALESCE(payload->>'execution_mode','')) = 'live'" in src
-    assert "created_ts >= %s" in src and "created_ts < %s" in src
+    assert "created_ts >= %s" in src, "LIVE candidate query must have a lookback cutoff"
+    # B1 amendment: the upper midnight boundary (created_ts < %s) was intentionally
+    # removed so prior-evening scanner signals (e.g. WMT/QCOM PUTs created the
+    # evening before for the following trading session) are included. The single
+    # cutoff_utc parameter (48h lookback) replaces the midnight-to-midnight window.
+    assert "created_ts < %s" not in src, (
+        "Upper midnight boundary must NOT exist — prior-evening signals would be excluded"
+    )
+    # Belt-and-suspenders: already-terminalized rows are excluded by last_error filter
+    assert "LIVE_RECOVERY_MISSED_TRIGGER" in src, "Must exclude already-terminalized missed rows"
     assert "build_canonical_signal_id" in src
 
 
