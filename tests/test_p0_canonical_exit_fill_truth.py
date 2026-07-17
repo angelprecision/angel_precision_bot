@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+import os
+from pathlib import Path
 import threading
 from unittest.mock import MagicMock
 
@@ -15,6 +17,8 @@ from ap.exit_fill_truth_guard import (
     _failure_reason,
     _finish_reconciliation_attempt,
     _is_partial_result,
+    _select_canonical_proof_row,
+    _update_canonical_proof_row,
     _reconciliation_marker_retryable,
     _reconcile_exit_fill,
     _run_reconciliation_attempt,
@@ -336,6 +340,339 @@ def test_zero_row_position_update_stops_before_order_or_proof_mutation(monkeypat
     with pytest.raises(PositionUpdateCardinalityError, match="POSITION_UPDATE_ZERO_ROWS"):
         _reconcile_exit_fill(_exit_order(), {})
     assert isinstance(finished.call_args.kwargs["error"], PositionUpdateCardinalityError)
+
+
+def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    captured = {}
+
+    class _Result:
+        rowcount = 1
+
+    class _Connection:
+        def execute(self, *_args, **_kwargs):
+            return _Result()
+
+    @contextmanager
+    def _conn():
+        yield _Connection()
+
+    def _update(_c, table, updates, _where, _params):
+        assert table == "positions"
+        captured.update(updates)
+        return 1
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_finish_reconciliation_attempt", lambda *_a, **_k: None)
+    monkeypatch.setattr(guard, "_resolve_position", lambda *_: {
+        "id": "position-1",
+        "client_id": "jason@example.com",
+        "contract": "SPY260717C00600000",
+        "qty": 4,
+        "avg_fill": 1.00,
+    })
+    monkeypatch.setattr(guard, "_load_exit_fills", lambda *_: [{
+        "local_order_id": "exit-local-1",
+        "broker_order_id": "broker-exit-1",
+        "filled_qty": 2,
+        "fill_price": 1.50,
+        "filled_ts": "2026-07-17T16:00:00Z",
+    }])
+    monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
+    monkeypatch.setattr(guard, "_table_columns", lambda *_: {
+        "contracts_exited", "quantity_remaining", "exit_price", "realized_pnl",
+        "realized_pnl_pct", "exit_in_flight", "pending_exit_qty",
+        "pending_exit_local_order_id", "pending_exit_broker_order_id", "updated_at",
+    })
+    monkeypatch.setattr(guard, "_dynamic_update", _update)
+    result = _run_reconciliation_attempt(
+        _exit_order(
+            status="EXIT_PARTIAL_FILL",
+            qty=4,
+            filled_qty=2,
+            fill_price=1.50,
+        ),
+        {
+            "status": "PARTIAL_FILL",
+            "filled_qty": 2,
+            "fill_price": 1.50,
+            "broker_order_id": "broker-exit-1",
+        },
+        attempt_count=1,
+    )
+    assert captured["exit_in_flight"] is True
+    assert captured["pending_exit_qty"] == 2
+    assert captured["pending_exit_local_order_id"] == "exit-local-1"
+    assert captured["pending_exit_broker_order_id"] == "broker-exit-1"
+    assert result["exit_ownership"] == {
+        "exit_in_flight": True,
+        "pending_exit_local_order_id": "exit-local-1",
+        "pending_exit_broker_order_id": "broker-exit-1",
+        "pending_exit_qty": 2,
+    }
+
+
+def test_exact_originating_entry_proof_identity_wins_over_position_fallback() -> None:
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _Connection:
+        def execute(self, sql, params):
+            if "local_order_id=%s" in sql:
+                assert params == ("jason@example.com", "entry-local-1")
+                return _Result([{
+                    "id": "proof-exact",
+                    "local_order_id": "entry-local-1",
+                    "position_id": None,
+                }])
+            raise AssertionError("position fallback must not run after exact ENTRY identity")
+
+    row, quarantine = _select_canonical_proof_row(
+        _Connection(),
+        proof_columns={"id", "client_email", "local_order_id", "position_id"},
+        client_id="jason@example.com",
+        position_id="position-1",
+        entry_local_order_id="entry-local-1",
+    )
+    assert row["id"] == "proof-exact"
+    assert quarantine is None
+
+
+def test_duplicate_position_proofs_are_quarantined_with_every_candidate_id() -> None:
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _Connection:
+        def execute(self, sql, _params):
+            if "local_order_id=%s" in sql:
+                return _Result([])
+            assert "position_id::text=%s" in sql
+            return _Result([
+                {"id": "proof-a", "local_order_id": None, "position_id": "position-1"},
+                {"id": "proof-b", "local_order_id": None, "position_id": "position-1"},
+            ])
+
+    row, quarantine = _select_canonical_proof_row(
+        _Connection(),
+        proof_columns={"id", "client_email", "local_order_id", "position_id"},
+        client_id="jason@example.com",
+        position_id="position-1",
+        entry_local_order_id="entry-local-missing",
+    )
+    assert row is None
+    assert quarantine["status"] == "QUARANTINED"
+    assert quarantine["reason_code"] == "PROOF_IDENTITY_AMBIGUOUS"
+    assert quarantine["candidate_proof_ids"] == ["proof-a", "proof-b"]
+
+
+def test_canonical_proof_update_uses_exact_primary_key_and_client(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    update = MagicMock(return_value=1)
+    monkeypatch.setattr(
+        guard,
+        "_select_canonical_proof_row",
+        lambda *_args, **_kwargs: ({"id": "proof-exact"}, None),
+    )
+    monkeypatch.setattr(guard, "_dynamic_update", update)
+    changed, diagnostic = _update_canonical_proof_row(
+        object(),
+        proof_columns={"id", "client_email", "local_order_id", "position_id"},
+        client_id="jason@example.com",
+        position_id="position-1",
+        entry_local_order_id="entry-local-1",
+        proof_updates={"win": True},
+    )
+    assert changed == 1
+    assert diagnostic["status"] == "RECONCILED"
+    assert diagnostic["proof_id"] == "proof-exact"
+    assert update.call_args.args[3] == "id::text=%s AND client_email=%s"
+    assert update.call_args.args[4] == ("proof-exact", "jason@example.com")
+
+
+def test_proof_quarantine_retains_durable_position_reconciliation(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = {}
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({"status": "IN_PROGRESS", "attempt_count": 3}, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_write_marker",
+        lambda _c, _client, _local, marker: written.update(marker),
+    )
+    _finish_reconciliation_attempt(
+        _exit_order(),
+        {},
+        attempt_count=3,
+        reconciled_position_id="position-1",
+        proof_reconciliation={
+            "status": "QUARANTINED",
+            "reason_code": "PROOF_IDENTITY_AMBIGUOUS",
+            "error": "multiple proof rows match canonical position",
+            "candidate_proof_ids": ["proof-a", "proof-b"],
+            "rows_updated": 0,
+        },
+    )
+    assert written["status"] == "QUARANTINED"
+    assert written["reason_code"] == "PROOF_IDENTITY_AMBIGUOUS"
+    assert written["position_id"] == "position-1"
+    assert written["position_reconciled"] is True
+    assert written["reconciled_at"] == ""
+    assert written["candidate_proof_ids"] == ["proof-a", "proof-b"]
+
+
+def test_successful_proof_retry_resolves_prior_proof_quarantine(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = {}
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({
+            "status": "IN_PROGRESS",
+            "reason_code": "RECONCILIATION_RETRY_CLAIMED",
+            "candidate_proof_ids": ["proof-a", "proof-b"],
+            "attempt_count": 4,
+        }, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_write_marker",
+        lambda _c, _client, _local, marker: written.update(marker),
+    )
+    _finish_reconciliation_attempt(
+        _exit_order(),
+        {},
+        attempt_count=4,
+        reconciled_position_id="position-1",
+        proof_reconciliation={
+            "status": "RECONCILED",
+            "reason_code": "CANONICAL_EXIT_PROOF_RECONCILED",
+            "error": "",
+            "proof_id": "proof-final",
+            "candidate_proof_ids": [],
+            "rows_updated": 1,
+        },
+    )
+    assert written["status"] == "RECONCILED"
+    assert written["reason_code"] == "CANONICAL_EXIT_FILL_RECONCILED"
+    assert written["candidate_proof_ids"] == []
+    assert written["proof_reconciliation"]["proof_id"] == "proof-final"
+    assert written["reconciled_at"]
+
+
+def test_pending_exit_ownership_migration_is_idempotent_on_postgres() -> None:
+    test_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not test_url or "test" not in test_url.lower():
+        pytest.skip("PostgreSQL test database is unavailable")
+    psycopg2 = pytest.importorskip("psycopg2")
+    migration = Path(
+        "migrations/20260717_positions_pending_exit_ownership.sql"
+    ).read_text()
+    db = psycopg2.connect(test_url)
+    db.autocommit = True
+    try:
+        with db.cursor() as cursor:
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS public.positions "
+                "(id TEXT PRIMARY KEY, exit_in_flight BOOLEAN DEFAULT FALSE)"
+            )
+            cursor.execute(migration)
+            cursor.execute(migration)
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema='public' AND table_name='positions' "
+                "AND column_name = ANY(%s) ORDER BY column_name",
+                ([
+                    "pending_exit_qty",
+                    "pending_exit_local_order_id",
+                    "pending_exit_broker_order_id",
+                    "pending_exit_action",
+                    "pending_exit_reason",
+                ],),
+            )
+            assert [row[0] for row in cursor.fetchall()] == [
+                "pending_exit_action",
+                "pending_exit_broker_order_id",
+                "pending_exit_local_order_id",
+                "pending_exit_qty",
+                "pending_exit_reason",
+            ]
+    finally:
+        db.close()
+
+
+def test_postgres_duplicate_proofs_are_not_mutated_by_production_sql() -> None:
+    test_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not test_url or "test" not in test_url.lower():
+        pytest.skip("PostgreSQL test database is unavailable")
+    psycopg2 = pytest.importorskip("psycopg2")
+    extras = pytest.importorskip("psycopg2.extras")
+    db = psycopg2.connect(test_url)
+    db.autocommit = True
+    try:
+        with db.cursor(cursor_factory=extras.RealDictCursor) as cursor:
+            cursor.execute("DROP SCHEMA IF EXISTS pr360_proof_test CASCADE")
+            cursor.execute("CREATE SCHEMA pr360_proof_test")
+            cursor.execute("SET search_path TO pr360_proof_test, public")
+            cursor.execute(
+                "CREATE TABLE proof_trades ("
+                "id TEXT PRIMARY KEY, client_email TEXT NOT NULL, "
+                "position_id TEXT, local_order_id TEXT, win BOOLEAN)"
+            )
+            cursor.execute(
+                "INSERT INTO proof_trades "
+                "(id, client_email, position_id, local_order_id, win) VALUES "
+                "('proof-a','jason@example.com','position-1',NULL,FALSE),"
+                "('proof-b','jason@example.com','position-1',NULL,FALSE)"
+            )
+            changed, diagnostic = _update_canonical_proof_row(
+                cursor,
+                proof_columns={
+                    "id", "client_email", "position_id", "local_order_id", "win"
+                },
+                client_id="jason@example.com",
+                position_id="position-1",
+                entry_local_order_id="entry-local-missing",
+                proof_updates={"win": True},
+            )
+            assert changed == 0
+            assert diagnostic["reason_code"] == "PROOF_IDENTITY_AMBIGUOUS"
+            assert diagnostic["candidate_proof_ids"] == ["proof-a", "proof-b"]
+            cursor.execute("SELECT count(*) AS count FROM proof_trades WHERE win IS TRUE")
+            assert cursor.fetchone()["count"] == 0
+    finally:
+        with db.cursor() as cleanup:
+            cleanup.execute("DROP SCHEMA IF EXISTS pr360_proof_test CASCADE")
+        db.close()
 
 
 def test_retry_uses_stored_fill_and_is_idempotent(monkeypatch) -> None:

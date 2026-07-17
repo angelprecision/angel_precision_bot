@@ -295,6 +295,154 @@ def _dynamic_update(c, table: str, updates: dict[str, Any], where_sql: str, para
     return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
 
+def _proof_quarantine(
+    reason_code: str,
+    *,
+    candidate_proof_ids: Iterable[Any] = (),
+    error: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": "QUARANTINED",
+        "reason_code": str(reason_code),
+        "error": str(error),
+        "candidate_proof_ids": [
+            str(value) for value in candidate_proof_ids if str(value or "").strip()
+        ],
+        "rows_updated": 0,
+    }
+
+
+def _select_canonical_proof_row(
+    c,
+    *,
+    proof_columns: set[str],
+    client_id: str,
+    position_id: str,
+    entry_local_order_id: str,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Lock exactly one originating proof row or return a durable quarantine."""
+    if not {"id", "client_email"}.issubset(proof_columns):
+        return None, _proof_quarantine(
+            "PROOF_IDENTITY_UNRESOLVED",
+            error="proof_trades.id/client_email unavailable",
+        )
+
+    def _rows(where_sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+        selected = c.execute(
+            "SELECT id, local_order_id, position_id FROM proof_trades WHERE "
+            + where_sql
+            + " ORDER BY id FOR UPDATE",
+            params,
+        ).fetchall()
+        return [dict(row) for row in selected]
+
+    entry_local_order_id = str(entry_local_order_id or "").strip()
+    if entry_local_order_id and "local_order_id" in proof_columns:
+        local_matches = _rows(
+            "client_email=%s AND local_order_id=%s",
+            (client_id, entry_local_order_id),
+        )
+        if len(local_matches) == 1:
+            return local_matches[0], None
+        if len(local_matches) > 1:
+            return None, _proof_quarantine(
+                "PROOF_IDENTITY_AMBIGUOUS",
+                candidate_proof_ids=(row.get("id") for row in local_matches),
+                error="multiple proof rows match originating ENTRY local_order_id",
+            )
+
+    if "position_id" not in proof_columns:
+        return None, _proof_quarantine(
+            "PROOF_IDENTITY_UNRESOLVED",
+            error="proof_trades.position_id unavailable",
+        )
+    position_matches = _rows(
+        "client_email=%s AND position_id::text=%s",
+        (client_id, position_id),
+    )
+    if len(position_matches) == 1:
+        return position_matches[0], None
+    reason_code = (
+        "PROOF_IDENTITY_AMBIGUOUS"
+        if position_matches
+        else "PROOF_IDENTITY_UNRESOLVED"
+    )
+    return None, _proof_quarantine(
+        reason_code,
+        candidate_proof_ids=(row.get("id") for row in position_matches),
+        error=(
+            "multiple proof rows match canonical position"
+            if position_matches
+            else "no proof row matches originating ENTRY or canonical position"
+        ),
+    )
+
+
+def _update_canonical_proof_row(
+    c,
+    *,
+    proof_columns: set[str],
+    client_id: str,
+    position_id: str,
+    entry_local_order_id: str,
+    proof_updates: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    proof_row, quarantine = _select_canonical_proof_row(
+        c,
+        proof_columns=proof_columns,
+        client_id=client_id,
+        position_id=position_id,
+        entry_local_order_id=entry_local_order_id,
+    )
+    if quarantine is not None:
+        log.critical(
+            "[%s] EXIT_PROOF_RECONCILIATION_QUARANTINED position=%s entry_order=%s "
+            "reason=%s candidates=%s",
+            client_id,
+            position_id,
+            entry_local_order_id,
+            quarantine.get("reason_code"),
+            quarantine.get("candidate_proof_ids"),
+        )
+        return 0, quarantine
+
+    proof_id = str((proof_row or {}).get("id") or "").strip()
+    changed = _dynamic_update(
+        c,
+        "proof_trades",
+        proof_updates,
+        "id::text=%s AND client_email=%s",
+        (proof_id, client_id),
+    )
+    if changed != 1:
+        reason_code = (
+            "PROOF_UPDATE_ZERO_ROWS"
+            if changed == 0
+            else "PROOF_UPDATE_MULTIPLE_ROWS"
+        )
+        quarantine = _proof_quarantine(
+            reason_code,
+            candidate_proof_ids=[proof_id],
+            error=f"canonical proof update affected {changed} rows",
+        )
+        log.critical(
+            "[%s] EXIT_PROOF_UPDATE_CARDINALITY_QUARANTINED position=%s proof=%s rows=%s",
+            client_id,
+            position_id,
+            proof_id,
+            changed,
+        )
+        return 0, quarantine
+    return 1, {
+        "status": "RECONCILED",
+        "reason_code": "CANONICAL_EXIT_PROOF_RECONCILED",
+        "error": "",
+        "proof_id": proof_id,
+        "candidate_proof_ids": [],
+        "rows_updated": 1,
+    }
+
+
 def _reconciliation_order_identity(order: dict) -> tuple[str, str]:
     return (
         str(order.get("client_id") or "").strip(),
@@ -464,6 +612,7 @@ def _finish_reconciliation_attempt(
     *,
     attempt_count: int,
     reconciled_position_id: str = "",
+    proof_reconciliation: dict[str, Any] | None = None,
     error: Exception | None = None,
 ) -> None:
     client_id, local_order_id = _reconciliation_order_identity(order)
@@ -484,16 +633,37 @@ def _finish_reconciliation_attempt(
                 return
             preserved_attempts = attempt_count
             if error is None:
+                proof_diagnostic = dict(proof_reconciliation or {})
+                proof_quarantined = (
+                    str(proof_diagnostic.get("status") or "").upper()
+                    == "QUARANTINED"
+                )
+                now = datetime.now(timezone.utc).isoformat()
                 marker = {
                     **previous,
                     **_diagnostic_context(order, result),
-                    "status": "RECONCILED",
-                    "reason_code": "CANONICAL_EXIT_FILL_RECONCILED",
-                    "error": "",
+                    "status": "QUARANTINED" if proof_quarantined else "RECONCILED",
+                    "reason_code": (
+                        str(proof_diagnostic.get("reason_code") or "PROOF_IDENTITY_UNRESOLVED")
+                        if proof_quarantined
+                        else "CANONICAL_EXIT_FILL_RECONCILED"
+                    ),
+                    "error": (
+                        str(proof_diagnostic.get("error") or "")
+                        if proof_quarantined
+                        else ""
+                    ),
                     "position_id": str(reconciled_position_id or ""),
+                    "position_reconciled": True,
                     "candidate_position_ids": [],
+                    "candidate_proof_ids": list(
+                        proof_diagnostic.get("candidate_proof_ids") or []
+                    ),
+                    "proof_reconciliation": proof_diagnostic,
                     "attempt_count": preserved_attempts,
-                    "reconciled_at": datetime.now(timezone.utc).isoformat(),
+                    "position_reconciled_at": now,
+                    "reconciled_at": "" if proof_quarantined else now,
+                    "last_attempt_at": now,
                 }
             else:
                 status, reason_code, candidates = _failure_reason(error)
@@ -621,6 +791,7 @@ def _run_reconciliation_attempt(
 
             proof_updated = 0
             eligible = False
+            proof_reconciliation: dict[str, Any] | None = None
             if projection.closed:
                 proof_columns = _table_columns(c, "proof_trades")
                 eligible = official_live_eligibility(
@@ -668,12 +839,16 @@ def _run_reconciliation_attempt(
                     if key in proof_columns
                 }
                 entry_local_id = str(entry_order.get("local_order_id") or "")
-                where_sql = "(position_id::text=%s OR (%s<>'' AND local_order_id=%s))"
-                where_params: tuple[Any, ...] = (position_id, entry_local_id, entry_local_id)
-                if "client_email" in proof_columns:
-                    where_sql = "client_email=%s AND " + where_sql
-                    where_params = (client_id,) + where_params
-                proof_updated = _dynamic_update(c, "proof_trades", proof_updates, where_sql, where_params)
+                proof_updated, proof_reconciliation = _update_canonical_proof_row(
+                    c,
+                    proof_columns=proof_columns,
+                    client_id=client_id,
+                    position_id=position_id,
+                    entry_local_order_id=entry_local_id,
+                    proof_updates=proof_updates,
+                )
+                if proof_updated != 1:
+                    eligible = False
 
             return {
                 "position_id": position_id,
@@ -689,6 +864,7 @@ def _run_reconciliation_attempt(
                 },
                 "execution_mode": mode,
                 "proof_rows_updated": proof_updated,
+                "proof_reconciliation": proof_reconciliation,
                 "official_live_performance_eligible": eligible,
             }
 
@@ -707,6 +883,7 @@ def _run_reconciliation_attempt(
         result,
         attempt_count=attempt_count,
         reconciled_position_id=str(reconciled.get("position_id") or ""),
+        proof_reconciliation=reconciled.get("proof_reconciliation"),
     )
     return reconciled
 
