@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from ap import db
 from ap.logger import get_logger
-from ap.proof_taxonomy_guard import classify_performance_taxonomy
+from ap import proof_taxonomy_guard
 
 log = get_logger("ap.proof_taxonomy_fill_bridge")
 
@@ -19,10 +19,17 @@ _PATCHED_ATTR = "_AP_PROOF_TAXONOMY_FILL_BRIDGE_PATCHED"
 _ORIGINAL_ATTR = "_AP_PROOF_TAXONOMY_FILL_BRIDGE_ORIGINAL"
 
 
-def _stamp_reconciled_taxonomy(*, client_id: str, position_id: str, stamp: dict[str, Any]) -> int:
+def _stamp_reconciled_taxonomy(
+    *,
+    client_id: str,
+    position_id: str,
+    local_order_id: str,
+    stamp: dict[str, Any],
+) -> int:
     client_id = str(client_id or "").strip()
     position_id = str(position_id or "").strip()
-    if not client_id or not position_id:
+    local_order_id = str(local_order_id or "").strip()
+    if not client_id or (not position_id and not local_order_id):
         return 0
 
     def _update() -> int:
@@ -38,10 +45,50 @@ def _stamp_reconciled_taxonomy(*, client_id: str, position_id: str, stamp: dict[
             if not updates:
                 return 0
             set_sql = ", ".join(f"{key}=%s" for key in updates)
+            if local_order_id and "local_order_id" in columns:
+                rows = c.execute(
+                    "SELECT id FROM proof_trades WHERE client_email=%s AND local_order_id=%s "
+                    "ORDER BY id LIMIT 2",
+                    (client_id, local_order_id),
+                ).fetchall()
+                ids = [str(dict(row).get("id") or "").strip() for row in rows]
+                ids = [value for value in ids if value]
+                if len(ids) == 1:
+                    cur = c.execute(
+                        f"UPDATE proof_trades SET {set_sql} WHERE id::text=%s AND client_email=%s",
+                        tuple(updates.values()) + (ids[0], client_id),
+                    )
+                    return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+                if len(ids) > 1:
+                    log.critical(
+                        "post-fill proof taxonomy exact ENTRY ambiguous client=%s entry_order=%s rows=%s",
+                        client_id,
+                        local_order_id,
+                        ids,
+                    )
+                    return 0
+
+            if not position_id or "position_id" not in columns:
+                return 0
+            rows = c.execute(
+                "SELECT id FROM proof_trades WHERE client_email=%s AND position_id::text=%s "
+                "ORDER BY id LIMIT 2",
+                (client_id, position_id),
+            ).fetchall()
+            ids = [str(dict(row).get("id") or "").strip() for row in rows]
+            ids = [value for value in ids if value]
+            if len(ids) != 1:
+                if len(ids) > 1:
+                    log.critical(
+                        "post-fill proof taxonomy position ambiguous client=%s position=%s rows=%s",
+                        client_id,
+                        position_id,
+                        ids,
+                    )
+                return 0
             cur = c.execute(
-                f"UPDATE proof_trades SET {set_sql} "
-                "WHERE client_email=%s AND position_id::text=%s",
-                tuple(updates.values()) + (client_id, position_id),
+                f"UPDATE proof_trades SET {set_sql} WHERE id::text=%s AND client_email=%s",
+                tuple(updates.values()) + (ids[0], client_id),
             )
             return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
@@ -63,21 +110,30 @@ def wrap_exit_fill_reconcile(original: Callable[[dict, dict], dict]) -> Callable
         if not isinstance(reconciled, dict):
             return reconciled
 
-        base = {
-            "execution_mode": str(reconciled.get("execution_mode") or "unknown").lower(),
-            "official_live_performance_eligible": bool(
-                reconciled.get("official_live_performance_eligible")
-            ),
-        }
-        taxonomy = classify_performance_taxonomy(base)
         client_id = str(order.get("client_id") or "").strip()
         position_id = str(reconciled.get("position_id") or "").strip()
-        updated = _stamp_reconciled_taxonomy(
+        identity = proof_taxonomy_guard.resolve_originating_entry_identity(
             client_id=client_id,
             position_id=position_id,
-            stamp=taxonomy,
+            supplied_local_order_id=str(reconciled.get("local_order_id") or "").strip(),
         )
-        reconciled.update(taxonomy)
+        if identity is None:
+            log.critical(
+                "post-fill proof taxonomy skipped: originating ENTRY unresolved client=%s position=%s",
+                client_id,
+                position_id,
+            )
+            reconciled["proof_taxonomy_rows_updated"] = 0
+            return reconciled
+
+        stamp = proof_taxonomy_guard._lifecycle_proof_stamp(identity)
+        updated = _stamp_reconciled_taxonomy(
+            client_id=client_id,
+            position_id=str(stamp.get("position_id") or position_id),
+            local_order_id=str(stamp.get("local_order_id") or identity.local_order_id),
+            stamp=stamp,
+        )
+        reconciled.update(stamp)
         reconciled["proof_taxonomy_rows_updated"] = updated
         return reconciled
 
