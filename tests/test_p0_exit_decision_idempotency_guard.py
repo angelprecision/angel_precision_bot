@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import ap.exit_decision_idempotency_guard as guard
@@ -89,6 +90,95 @@ def test_ledger_records_one_decision_per_fingerprint_window() -> None:
         decision,
         now_monotonic=100.0 + guard._ACTION_LEDGER_TTL + 0.01,
     ) is True
+
+
+def test_durable_generation_key_uses_terminal_orders_and_remaining_qty(monkeypatch) -> None:
+    class Cursor:
+        def execute(self, sql, params):
+            assert "COUNT(DISTINCT local_order_id)" in sql
+            assert params[0:2] == ("client@example.com", "position-1")
+            return self
+
+        def fetchone(self):
+            return {"terminal_exit_count": 2}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(guard, "conn", lambda: Cursor())
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+
+    assert guard._durable_exit_generation(_pos(quantity_remaining=3), "client@example.com") == (
+        "client@example.com|position-1|3|3",
+        3,
+    )
+
+
+def test_durable_generation_claim_is_atomic(monkeypatch) -> None:
+    captured = {}
+
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params):
+            captured["sql"] = sql
+            captured["params"] = params
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(guard, "conn", lambda: Cursor())
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+
+    assert guard._claim_durable_decision_generation(
+        generation_key="client|position|3|1",
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+    ) is True
+    assert "ON CONFLICT (generation_key) DO NOTHING" in captured["sql"]
+
+
+def test_ledger_wrapper_suppresses_duplicate_durable_generation(monkeypatch) -> None:
+    _reset_guard_caches()
+    calls = []
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda pos, client_id: ("client|position|3|1", 1),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: False,
+    )
+    wrapped = guard.wrap_ledger(
+        lambda pos, decision, client_id="": calls.append((pos, decision, client_id))
+    )
+
+    assert wrapped(_pos(), _decision(), client_id="client@example.com") is None
+    assert calls == []
+
+
+def test_durable_claim_migration_is_locked_to_internal_roles() -> None:
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "20260717_exit_decision_generation_claims.sql"
+    ).read_text()
+
+    assert "generation_key       TEXT PRIMARY KEY" in migration
+    assert "ENABLE ROW LEVEL SECURITY" in migration
+    assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM anon, authenticated" in migration
 
 
 def test_ledger_suppresses_closed_zero_and_inflight_positions() -> None:

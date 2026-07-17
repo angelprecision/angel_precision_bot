@@ -56,6 +56,9 @@ _HOLD_LEDGER_TTL = float(os.getenv("EXIT_DECISION_LEDGER_HOLD_DEDUPE_SECONDS", "
 _LEDGER_CACHE_MAX = int(os.getenv("EXIT_DECISION_LEDGER_DEDUPE_CACHE_MAX", "4096"))
 _EXTERNAL_PRECHECK_TTL = float(os.getenv("EXIT_DECISION_EXTERNAL_PRECHECK_SECONDS", "30"))
 _PRECHECK_CACHE_MAX = int(os.getenv("EXIT_DECISION_PRECHECK_CACHE_MAX", "4096"))
+_TERMINAL_EXIT_STATUSES = (
+    "EXIT_FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "ERROR",
+)
 
 _LEDGER_LOCK = threading.Lock()
 _LEDGER_LAST_WRITTEN: dict[tuple[str, ...], float] = {}
@@ -106,6 +109,73 @@ def _decision_should_act(decision: Any) -> bool:
     if value is not None:
         return bool(value)
     return str(getattr(decision, "action", "") or "").upper() in {"CLOSE_ALL", "SCALE_OUT"}
+
+
+def _durable_exit_generation(pos: Any, client_id: str) -> tuple[str, int] | None:
+    """Resolve the durable generation from terminal EXIT order history.
+
+    Generation advances only after the prior broker-owned EXIT order reaches a
+    terminal state.  Combined with remaining quantity, this produces the audit
+    contract: client + real position + remaining qty + exit generation.
+    """
+    client_id = str(client_id or getattr(pos, "client_id", "") or "").strip()
+    position_id = str(getattr(pos, "position_id", "") or "").strip()
+    remaining_qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
+    if (
+        not client_id
+        or not position_id
+        or position_id.lower().startswith("broker-repair-")
+        or remaining_qty <= 0
+    ):
+        return None
+
+    def _read_generation() -> int:
+        with conn() as c:
+            row = c.execute(
+                "SELECT COUNT(DISTINCT local_order_id) AS terminal_exit_count "
+                "FROM orders WHERE client_id=%s AND position_id::text=%s "
+                "AND kind='EXIT' AND status IN %s",
+                (client_id, position_id, _TERMINAL_EXIT_STATUSES),
+            ).fetchone()
+            row = dict(row) if row else {}
+            return max(0, _int(row.get("terminal_exit_count"), 0) or 0) + 1
+
+    generation = int(run_with_retry(_read_generation) or 1)
+    key = f"{client_id}|{position_id}|{remaining_qty}|{generation}"
+    return key, generation
+
+
+def _claim_durable_decision_generation(
+    *,
+    generation_key: str,
+    client_id: str,
+    position_id: str,
+    remaining_qty: int,
+    exit_generation: int,
+    decision: Any,
+) -> bool:
+    """Atomically claim one actionable decision for this durable generation."""
+    def _claim() -> bool:
+        with conn() as c:
+            cur = c.execute(
+                "INSERT INTO exit_decision_generation_claims ("
+                "generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (generation_key) DO NOTHING",
+                (
+                    generation_key,
+                    client_id,
+                    position_id,
+                    remaining_qty,
+                    exit_generation,
+                    str(getattr(decision, "action", "") or ""),
+                    str(getattr(decision, "reason_code", "") or ""),
+                ),
+            )
+            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0) == 1
+
+    return bool(run_with_retry(_claim))
 
 
 def should_write_ledger(
@@ -196,13 +266,16 @@ def _terminal_position_snapshot(pos: Any, engine: Any) -> dict | None:
                     "FROM positions WHERE client_id=%s AND id::text=%s LIMIT 1",
                     (client_id, position_id),
                 ).fetchone()
-            if not row and contract:
-                row = c.execute(
+            if not row and contract and (
+                not position_id or position_id.lower().startswith("broker-repair-")
+            ):
+                rows = c.execute(
                     "SELECT id, status, qty, quantity_remaining, contract, client_id "
                     "FROM positions WHERE client_id=%s AND UPPER(contract)=UPPER(%s) "
-                    "ORDER BY COALESCE(entry_ts, created_at) DESC LIMIT 1",
+                    "ORDER BY COALESCE(entry_ts, created_at) DESC LIMIT 2",
                     (client_id, contract),
-                ).fetchone()
+                ).fetchall()
+                row = rows[0] if len(rows) == 1 else None
             return dict(row) if row else None
 
     try:
@@ -283,6 +356,39 @@ def wrap_ledger(original: Callable[..., Any]) -> Callable[..., Any]:
     def guarded(pos, decision, *, client_id: str = ""):
         if not should_write_ledger(pos, decision, client_id=client_id):
             return None
+        if _decision_should_act(decision):
+            resolved_client = str(
+                client_id or getattr(pos, "client_id", "") or ""
+            ).strip()
+            try:
+                durable = _durable_exit_generation(pos, resolved_client)
+                if durable is not None:
+                    generation_key, generation = durable
+                    claimed = _claim_durable_decision_generation(
+                        generation_key=generation_key,
+                        client_id=resolved_client,
+                        position_id=str(getattr(pos, "position_id", "") or ""),
+                        remaining_qty=_int(getattr(pos, "quantity_remaining", 0), 0) or 0,
+                        exit_generation=generation,
+                        decision=decision,
+                    )
+                    if not claimed:
+                        log.info(
+                            "[%s] EXIT_DECISION_GENERATION_ALREADY_CLAIMED key=%s",
+                            getattr(pos, "ticker", ""),
+                            generation_key,
+                        )
+                        return None
+            except Exception as exc:
+                # Ledger/diagnostic failure must never block a protective EXIT.
+                # The process-local cache still bounds noise until the database
+                # migration is restored.
+                log.critical(
+                    "[%s] EXIT_DECISION_GENERATION_CLAIM_UNAVAILABLE position=%s error=%s",
+                    getattr(pos, "ticker", ""),
+                    getattr(pos, "position_id", ""),
+                    exc,
+                )
         return original(pos, decision, client_id=client_id)
 
     return guarded

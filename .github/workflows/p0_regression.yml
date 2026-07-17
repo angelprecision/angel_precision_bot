@@ -80,6 +80,7 @@ jobs:
             tests/test_p0_unknown_execution_mode_fail_closed.py \
             tests/test_p0_live_executable_bid_pnl.py \
             tests/test_p0_canonical_exit_fill_truth.py \
+            tests/test_p0_exit_decision_idempotency_guard.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes
 
