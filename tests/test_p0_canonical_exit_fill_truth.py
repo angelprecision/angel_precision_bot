@@ -25,6 +25,7 @@ from ap.exit_fill_truth_guard import (
     _run_reconciliation_attempt,
     official_live_eligibility,
     project_position_from_exit_fills,
+    reconcile_confirmed_exit_fill,
     retry_exit_fill_reconciliation,
     retry_pending_exit_fill_reconciliations,
 )
@@ -104,6 +105,24 @@ def test_rows_without_positive_broker_fill_are_not_counted() -> None:
                 {"filled_qty": 1, "fill_price": None},
             ],
         )
+
+
+def test_public_confirmed_exit_fill_entrypoint_delegates_to_canonical_reducer(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    order = {"local_order_id": "exit-1"}
+    result = {"status": "EXIT_FILLED"}
+    delegated = {"position_id": "position-1"}
+    observed = {}
+
+    def _delegate(arg_order, arg_result):
+        observed["order"] = arg_order
+        observed["result"] = arg_result
+        return delegated
+
+    monkeypatch.setattr(guard, "_reconcile_exit_fill", _delegate)
+    assert reconcile_confirmed_exit_fill(order, result) == delegated
+    assert observed == {"order": order, "result": result}
 
 
 def test_partial_result_detection_uses_normalized_or_broker_status() -> None:
@@ -960,9 +979,10 @@ def test_startup_recovery_runs_client_scoped_exit_retry_before_position_and_exit
     recovery.client_id = "jason@example.com"
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: events.append("deferred")
+    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: events.append("downtime_exit_fills")
     recovery._recover_positions = lambda _result: events.append("positions")
     recovery._verify_pending_entries = lambda _result: events.append("entries")
-    recovery._reattach_exit_protections = lambda _result: events.append("exits")
+    recovery._reattach_live_exit_protections = lambda _result: events.append("exits")
     original_retry = recovery._retry_canonical_exit_fill_reconciliations
 
     def _retry(result):
@@ -974,6 +994,8 @@ def test_startup_recovery_runs_client_scoped_exit_retry_before_position_and_exit
     recovery._reseed_dedup = lambda _result: events.append("dedup")
 
     result = recovery.run(include_watcher_reseed=False)
+    assert events.index("exit_fill_retry") < events.index("downtime_exit_fills")
+    assert events.index("downtime_exit_fills") < events.index("positions")
     assert events.index("exit_fill_retry") < events.index("positions")
     assert events.index("exit_fill_retry") < events.index("exits")
     assert events.count("exit_fill_retry") == 1
@@ -998,6 +1020,7 @@ def test_startup_recovery_retries_canonical_exit_fill_before_loading_stale_runti
     recovery.mc = SimpleNamespace(_position_count=0)
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: None
+    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: state.__setitem__("position_closed", True)
     recovery._verify_pending_entries = lambda _result: None
     recovery._reseed_dedup = lambda _result: None
     recovery._recover_positions = lambda result: (
@@ -1013,7 +1036,7 @@ def test_startup_recovery_retries_canonical_exit_fill_before_loading_stale_runti
             recovery.mc._position_count + (0 if state["position_closed"] else 1),
         ),
     )
-    recovery._reattach_exit_protections = lambda result: (
+    recovery._reattach_live_exit_protections = lambda result: (
         state.__setitem__("manual_resubmission", not state["position_closed"]),
         result.__setitem__(
             "exits_reattached",
@@ -1108,9 +1131,10 @@ def test_startup_exit_retry_discovery_failure_is_diagnostic_not_fatal(monkeypatc
     recovery.client_id = "jason@example.com"
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: None
+    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: None
     recovery._recover_positions = lambda _result: None
     recovery._verify_pending_entries = lambda _result: None
-    recovery._reattach_exit_protections = lambda _result: None
+    recovery._reattach_live_exit_protections = lambda _result: None
     recovery._recompute_buying_power = lambda _result: None
     recovery._reseed_dedup = lambda _result: None
 

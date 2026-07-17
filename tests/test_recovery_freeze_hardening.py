@@ -24,7 +24,9 @@ def _fake_reconciler_module():
 
 def _fake_db_for_orders(orders):
     mod = types.ModuleType("ap.db")
-    mod.get_open_orders_for_reconcile = lambda client_id=None: orders
+    mod.get_open_orders_for_reconcile = (
+        lambda client_id=None, execution_mode=None: orders
+    )
     mod.run_with_retry = lambda fn, *args, **kwargs: fn()
     return mod
 
@@ -205,10 +207,100 @@ def test_recovery_does_not_transition_exit_filled_with_missing_fill_truth():
             "ap_reconciler": _fake_reconciler_module(),
         },
     ):
-        rec._reattach_exit_protections(result)
+        rec._recover_exit_fills_that_occurred_during_downtime(result)
 
     rec.osm.transition.assert_not_called()
     assert any("RECOVERY_EXIT_FILL_TRUTH_MISSING" in err for err in result["errors"])
+    assert result["exits_reattached"] == 0
+
+
+def test_recovery_routes_downtime_exit_fill_through_canonical_reducer():
+    rec, _ = _make_recovery()
+    rec.broker.get_order.return_value = {
+        "status": "filled",
+        "exec_quantity": "2",
+        "avg_fill_price": "1.75",
+    }
+    rec.osm.transition.return_value = True
+    reconcile = MagicMock(return_value={"position_id": "pos-1"})
+    result = {"errors": [], "exits_reattached": 0}
+
+    rows = iter([
+        {
+            "local_order_id": "exit-2",
+            "broker_order_id": "broker-exit-2",
+            "status": "EXIT_ACKNOWLEDGED",
+            "position_id": "pos-1",
+        },
+        {
+            "client_id": rec.client_id,
+            "local_order_id": "exit-2",
+            "broker_order_id": "broker-exit-2",
+            "status": "EXIT_FILLED",
+            "filled_qty": 2,
+            "fill_price": 1.75,
+            "filled_ts": "2026-07-17T12:00:00+00:00",
+            "kind": "EXIT",
+        },
+    ])
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchone(self):
+            return next(rows)
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [
+        {"id": "pos-1", "underlying": "SPY", "status": "CLOSING"}
+    ]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    fake_db.conn = fake_conn
+
+    fake_guard = types.ModuleType("ap.exit_fill_truth_guard")
+    fake_guard.reconcile_confirmed_exit_fill = reconcile
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+            "ap.exit_fill_truth_guard": fake_guard,
+        },
+    ):
+        rec._recover_exit_fills_that_occurred_during_downtime(result)
+
+    rec.osm.transition.assert_called_once_with(
+        "exit-2",
+        "EXIT_FILLED",
+        filled_qty=2,
+        fill_price=1.75,
+    )
+    reconcile.assert_called_once_with(
+        {
+            "client_id": rec.client_id,
+            "local_order_id": "exit-2",
+            "broker_order_id": "broker-exit-2",
+            "status": "EXIT_FILLED",
+            "filled_qty": 2,
+            "fill_price": 1.75,
+            "filled_ts": "2026-07-17T12:00:00+00:00",
+            "kind": "EXIT",
+        },
+        {
+            "status": "EXIT_FILLED",
+            "broker_order_id": "broker-exit-2",
+            "filled_qty": 2,
+            "fill_price": 1.75,
+            "filled_ts": "2026-07-17T12:00:00+00:00",
+        },
+    )
+    assert result["errors"] == []
     assert result["exits_reattached"] == 0
 
 

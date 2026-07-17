@@ -897,6 +897,15 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
     )
 
 
+def reconcile_confirmed_exit_fill(order: dict, result: dict) -> dict:
+    """Reconcile one already broker-confirmed EXIT fill.
+
+    This function has no broker adapter and cannot submit or cancel orders.
+    It delegates to the one canonical EXIT-fill reducer.
+    """
+    return _reconcile_exit_fill(order, result)
+
+
 def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> dict | None:
     """Retry durable post-fill accounting without broker submit/cancel authority."""
     client_id = str(client_id or "").strip()
