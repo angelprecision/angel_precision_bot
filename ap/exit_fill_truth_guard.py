@@ -596,6 +596,15 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
             return {
                 "position_id": position_id,
                 "projection": projection,
+                "exit_ownership": {
+                    key: position_updates.get(key)
+                    for key in (
+                        "exit_in_flight",
+                        "pending_exit_local_order_id",
+                        "pending_exit_broker_order_id",
+                        "pending_exit_qty",
+                    )
+                },
                 "execution_mode": mode,
                 "proof_rows_updated": proof_updated,
                 "official_live_performance_eligible": eligible,
