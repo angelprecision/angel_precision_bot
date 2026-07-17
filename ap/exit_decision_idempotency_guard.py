@@ -15,8 +15,9 @@ This guard adds three narrow protections without changing exit policy:
 * rate-limited decision-ledger writes so a persistent failure remains visible
   without inserting the same row every eight seconds.
 
-DB or broker-truth failures fail open for exits: risk-reducing behavior is never
-blocked merely because diagnostics are unavailable.
+Broker-truth failures fail open for exits. Durable-claim infrastructure failures
+fail closed in LIVE so separate processes cannot double-submit; PAPER may
+continue fail-open with a loud diagnostic.
 """
 from __future__ import annotations
 
@@ -165,6 +166,20 @@ def _decision_should_act(decision: Any) -> bool:
     if value is not None:
         return bool(value)
     return str(getattr(decision, "action", "") or "").upper() in {"CLOSE_ALL", "SCALE_OUT"}
+
+
+def _execution_mode(engine: Any, pos: Any) -> str:
+    return str(
+        getattr(getattr(engine, "master_control", None), "mode", "")
+        or getattr(pos, "execution_mode", "")
+        or ""
+    ).strip().upper()
+
+
+def _durable_claim_outage_blocks_submit(engine: Any, pos: Any) -> bool:
+    if _execution_mode(engine, pos) != "LIVE":
+        return False
+    return getattr(engine, "order_state_machine", None) is not None or getattr(engine, "osm", None) is not None
 
 
 def _durable_exit_generation(pos: Any, client_id: str) -> tuple[str, int] | None:
@@ -699,15 +714,19 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 try:
                     durable = _durable_exit_generation(pos, resolved_client)
                 except Exception as exc:
+                    mode = _execution_mode(self, pos)
                     log.critical(
-                        "[%s] EXIT_DECISION_GENERATION_READ_UNAVAILABLE client_id=%s position_id=%s action=%s reason_code=%s error=%s",
+                        "[%s] EXIT_DECISION_GENERATION_READ_UNAVAILABLE mode=%s client_id=%s position_id=%s action=%s reason_code=%s error=%s",
                         getattr(pos, "ticker", ""),
+                        mode,
                         resolved_client,
                         position_id,
                         getattr(decision, "action", ""),
                         getattr(decision, "reason_code", ""),
                         exc,
                     )
+                    if _durable_claim_outage_blocks_submit(self, pos):
+                        return False
                     durable = None
                 if durable is not None:
                     generation_key, exit_generation = durable
@@ -721,9 +740,11 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             decision=decision,
                         )
                     except Exception as exc:
+                        mode = _execution_mode(self, pos)
                         log.critical(
-                            "[%s] EXIT_DECISION_GENERATION_CLAIM_FAILED client_id=%s position_id=%s key=%s qty_remaining=%s exit_generation=%s action=%s reason_code=%s error=%s",
+                            "[%s] EXIT_DECISION_GENERATION_CLAIM_FAILED mode=%s client_id=%s position_id=%s key=%s qty_remaining=%s exit_generation=%s action=%s reason_code=%s error=%s",
                             getattr(pos, "ticker", ""),
+                            mode,
                             resolved_client,
                             position_id,
                             generation_key,
@@ -733,6 +754,8 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             getattr(decision, "reason_code", ""),
                             exc,
                         )
+                        if _durable_claim_outage_blocks_submit(self, pos):
+                            return False
                         generation_key = ""
                         exit_generation = 0
                         claim = {"claimed": True}

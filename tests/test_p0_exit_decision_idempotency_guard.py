@@ -270,7 +270,7 @@ def _identity_from_result(result):
     }
 
 
-def _make_submit_engine(pos, *, callback, active_order=None):
+def _make_submit_engine(pos, *, callback, active_order=None, mode="LIVE"):
     engine = SimpleNamespace(
         _lock=threading.RLock(),
         client_id=pos.client_id,
@@ -278,6 +278,7 @@ def _make_submit_engine(pos, *, callback, active_order=None):
         osm=None,
         on_exit=callback,
         on_scale=callback,
+        master_control=SimpleNamespace(mode=mode),
     )
     engine._extract_exit_order_identity = _identity_from_result
     return engine
@@ -420,8 +421,11 @@ def test_durable_claim_migration_is_locked_to_internal_roles() -> None:
     ).read_text()
     assert "generation_key       TEXT PRIMARY KEY" in migration
     assert "claim_state          TEXT NOT NULL DEFAULT 'CLAIMED'" in migration
+    assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')" in migration
+    assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated')" in migration
     assert "ENABLE ROW LEVEL SECURITY" in migration
-    assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM anon, authenticated" in migration
+    assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM anon;" in migration
+    assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM authenticated;" in migration
 
 
 def test_ledger_suppresses_closed_zero_and_inflight_positions() -> None:
@@ -741,7 +745,7 @@ def test_submit_wrapper_does_not_depend_on_ledger_for_duplicate_suppression(gene
     assert callback_count == 1
 
 
-def test_submit_wrapper_generation_read_failure_fails_open(monkeypatch) -> None:
+def test_submit_wrapper_generation_read_failure_blocks_live_submit(monkeypatch) -> None:
     callback = MagicMock(return_value={
         "ok": True,
         "accepted": True,
@@ -756,11 +760,11 @@ def test_submit_wrapper_generation_read_failure_fails_open(monkeypatch) -> None:
     )
     wrapped = guard.wrap_submit(_invoke_submit_callback)
     pos = _pos()
-    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is True
-    assert callback.call_count == 1
+    assert wrapped(_make_submit_engine(pos, callback=callback, mode="LIVE"), pos, _decision()) is False
+    assert callback.call_count == 0
 
 
-def test_submit_wrapper_claim_acquisition_failure_fails_open(monkeypatch) -> None:
+def test_submit_wrapper_generation_read_failure_may_fail_open_in_paper(monkeypatch) -> None:
     callback = MagicMock(return_value={
         "ok": True,
         "accepted": True,
@@ -771,12 +775,12 @@ def test_submit_wrapper_claim_acquisition_failure_fails_open(monkeypatch) -> Non
     monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
     monkeypatch.setattr(
         guard,
-        "_claim_durable_decision_generation",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("claim unavailable")),
+        "_durable_exit_generation",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("db unavailable")),
     )
     wrapped = guard.wrap_submit(_invoke_submit_callback)
     pos = _pos()
-    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is True
+    assert wrapped(_make_submit_engine(pos, callback=callback, mode="PAPER"), pos, _decision()) is True
     assert callback.call_count == 1
 
 
@@ -932,6 +936,48 @@ def test_client_runner_source_wires_order_state_machine_into_exit_engine() -> No
     source = (Path(__file__).resolve().parents[1] / "client_runner.py").read_text()
     assert "exit_eng.order_state_machine = self.order_state_machine" in source
     assert "exit_eng.osm = self.order_state_machine" in source
+
+
+def test_submit_wrapper_claim_acquisition_failure_blocks_live_cross_process_submit(monkeypatch) -> None:
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-live",
+        "broker_order_id": "exit-broker-live",
+    })
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("claim unavailable")),
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    first_pos = _pos()
+    second_pos = _pos()
+    assert wrapped(_make_submit_engine(first_pos, callback=callback, mode="LIVE"), first_pos, _decision()) is False
+    assert wrapped(_make_submit_engine(second_pos, callback=callback, mode="LIVE"), second_pos, _decision()) is False
+    assert callback.call_count == 0
+
+
+def test_submit_wrapper_claim_acquisition_failure_may_fail_open_in_paper(monkeypatch) -> None:
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-paper",
+        "broker_order_id": "exit-broker-paper",
+    })
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("claim unavailable")),
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos(execution_mode="PAPER")
+    assert wrapped(_make_submit_engine(pos, callback=callback, mode="PAPER"), pos, _decision()) is True
+    assert callback.call_count == 1
 
 
 def test_submit_wrapper_blocks_when_claim_already_exists(generation_claims_table, monkeypatch) -> None:
