@@ -17,7 +17,8 @@ This guard adds three narrow protections without changing exit policy:
 
 Broker-truth failures fail open for exits. Durable-claim infrastructure failures
 fail closed in LIVE so separate processes cannot double-submit; PAPER may
-continue fail-open with a loud diagnostic.
+continue fail-open with a loud diagnostic. Stale unresolved claims are promoted
+to AMBIGUOUS rather than reclaimed by age alone.
 """
 from __future__ import annotations
 
@@ -58,6 +59,7 @@ _CLAIM_STATE_CLAIMED = "CLAIMED"
 _CLAIM_STATE_BROKER_OWNED = "BROKER_OWNED"
 _CLAIM_STATE_RELEASED_NO_SUBMIT = "RELEASED_NO_SUBMIT"
 _CLAIM_STATE_AMBIGUOUS = "AMBIGUOUS"
+_STALE_CLAIM_RECONCILIATION_REQUIRED = "STALE_CLAIM_RECONCILIATION_REQUIRED"
 _CONCLUSIVE_NO_SUBMIT_STATUSES = {"ERROR", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}
 _CONCLUSIVE_PRE_SUBMIT_FAILURE_MARKERS = (
     "PRE_SUBMIT_VALIDATION_FAILED",
@@ -240,11 +242,7 @@ def _claim_durable_decision_generation(
                 "decision_action=%s, "
                 "decision_reason_code=%s, "
                 "claim_state=%s, "
-                "claimed_at=NOW(), "
-                "released_at=NULL, "
-                "local_order_id=NULL, "
-                "broker_order_id=NULL, "
-                "last_error=NULL "
+                "last_error=%s "
                 "WHERE generation_key=%s AND claim_state=%s "
                 "AND claimed_at <= NOW() - (%s * INTERVAL '1 second') "
                 "RETURNING generation_key, client_id, position_id, remaining_qty, "
@@ -257,23 +255,24 @@ def _claim_durable_decision_generation(
                     exit_generation,
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
-                    _CLAIM_STATE_CLAIMED,
+                    _CLAIM_STATE_AMBIGUOUS,
+                    _STALE_CLAIM_RECONCILIATION_REQUIRED,
                     generation_key,
                     _CLAIM_STATE_CLAIMED,
                     _CLAIM_LEASE_SECONDS,
                 ),
             ).fetchone()
             if row:
-                claimed = dict(row)
-                claimed["claimed"] = True
+                stale = dict(row)
+                stale["claimed"] = False
                 log.critical(
-                    "EXIT_DECISION_STALE_CLAIM_RECLAIMED client=%s position=%s generation_key=%s lease_seconds=%s",
+                    "EXIT_DECISION_STALE_CLAIM_AMBIGUOUS client=%s position=%s generation_key=%s lease_seconds=%s",
                     client_id,
                     position_id,
                     generation_key,
                     _CLAIM_LEASE_SECONDS,
                 )
-                return claimed
+                return stale
 
             row = c.execute(
                 "UPDATE exit_decision_generation_claims SET "

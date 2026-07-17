@@ -107,6 +107,7 @@ class _FakeClaimConnection:
                     decision_action,
                     decision_reason_code,
                     update_state,
+                    last_error,
                     generation_key,
                     existing_state,
                     lease_seconds,
@@ -128,11 +129,11 @@ class _FakeClaimConnection:
                         "decision_action": decision_action,
                         "decision_reason_code": decision_reason_code,
                         "claim_state": update_state,
-                        "local_order_id": None,
-                        "broker_order_id": None,
-                        "last_error": None,
-                        "claimed_at": time.time(),
-                        "released_at": None,
+                        "local_order_id": existing.get("local_order_id"),
+                        "broker_order_id": existing.get("broker_order_id"),
+                        "last_error": last_error,
+                        "claimed_at": existing.get("claimed_at"),
+                        "released_at": existing.get("released_at"),
                     }
                     self.store[generation_key] = row
                     self._row = dict(row)
@@ -378,27 +379,34 @@ def test_durable_generation_claim_is_atomic(monkeypatch) -> None:
     captured = {}
 
     class Cursor:
+        def __init__(self):
+            self._row = None
+
         def execute(self, sql, params):
             captured["sql"] = sql
             captured["params"] = params
+            if "claimed_at <= NOW() - (%s * INTERVAL '1 second')" in sql:
+                self._row = None
+            else:
+                self._row = {
+                    "generation_key": "client|position|3|1",
+                    "client_id": "client",
+                    "position_id": "position",
+                    "remaining_qty": 3,
+                    "exit_generation": 1,
+                    "decision_action": "SCALE_OUT",
+                    "decision_reason_code": "TP_SCALE_OUT",
+                    "claim_state": guard._CLAIM_STATE_CLAIMED,
+                    "local_order_id": None,
+                    "broker_order_id": None,
+                    "last_error": None,
+                    "claimed_at": None,
+                    "released_at": None,
+                }
             return self
 
         def fetchone(self):
-            return {
-                "generation_key": "client|position|3|1",
-                "client_id": "client",
-                "position_id": "position",
-                "remaining_qty": 3,
-                "exit_generation": 1,
-                "decision_action": "SCALE_OUT",
-                "decision_reason_code": "TP_SCALE_OUT",
-                "claim_state": guard._CLAIM_STATE_CLAIMED,
-                "local_order_id": None,
-                "broker_order_id": None,
-                "last_error": None,
-                "claimed_at": None,
-                "released_at": None,
-            }
+            return self._row
 
         def __enter__(self):
             return self
@@ -447,7 +455,7 @@ def test_durable_generation_claim_does_not_reclaim_existing_claimed_row(
     assert second["claim_state"] == guard._CLAIM_STATE_CLAIMED
 
 
-def test_durable_generation_claim_reclaims_stale_existing_claimed_row(
+def test_durable_generation_claim_marks_stale_existing_claimed_row_ambiguous(
     generation_claims_table,
     monkeypatch,
 ) -> None:
@@ -481,8 +489,45 @@ def test_durable_generation_claim_reclaims_stale_existing_claimed_row(
         exit_generation=1,
         decision=_decision(),
     )
-    assert reclaimed["claimed"] is True
-    assert reclaimed["claim_state"] == guard._CLAIM_STATE_CLAIMED
+    assert reclaimed["claimed"] is False
+    assert reclaimed["claim_state"] == guard._CLAIM_STATE_AMBIGUOUS
+    assert reclaimed["last_error"] == guard._STALE_CLAIM_RECONCILIATION_REQUIRED
+
+
+def test_submit_wrapper_blocks_stale_claimed_generation_without_resubmit(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    callback = MagicMock()
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    first = guard._claim_durable_decision_generation(
+        generation_key="client|position|3|1",
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+    )
+    assert first["claimed"] is True
+
+    if _FAKE_CLAIMS_STORE is not None:
+        _FAKE_CLAIMS_STORE["client|position|3|1"]["claimed_at"] = time.time() - (guard._CLAIM_LEASE_SECONDS + 5.0)
+    else:
+        with conn() as c:
+            c.execute(
+                "UPDATE exit_decision_generation_claims "
+                "SET claimed_at = NOW() - (%s * INTERVAL '1 second') "
+                "WHERE generation_key=%s",
+                (guard._CLAIM_LEASE_SECONDS + 5.0, "client|position|3|1"),
+            )
+
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is False
+    assert callback.call_count == 0
+    rows = _claim_rows()
+    assert rows[0]["claim_state"] == guard._CLAIM_STATE_AMBIGUOUS
+    assert rows[0]["last_error"] == guard._STALE_CLAIM_RECONCILIATION_REQUIRED
 
 
 def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> None:
