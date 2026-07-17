@@ -18,6 +18,7 @@ from ap.exit_fill_truth_guard import (
     _failure_reason,
     _finish_reconciliation_attempt,
     _is_partial_result,
+    _load_exit_fills,
     _select_canonical_proof_row,
     _update_canonical_proof_row,
     _reconciliation_marker_retryable,
@@ -139,6 +140,114 @@ def test_fill_loader_never_sweeps_unrelated_synthetic_orders() -> None:
     assert "local_order_id=%s" in source
     assert "position_id IS NULL" not in source
     assert "broker-repair-%%" not in source
+
+
+def test_fill_loader_includes_exact_current_partial_row_with_null_filled_ts_only_for_matching_local_id() -> None:
+    class _Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    exit_rows = [
+        {
+            "local_order_id": "exit-current",
+            "broker_order_id": "broker-current",
+            "position_id": "position-1",
+            "filled_qty": 2,
+            "fill_price": 1.50,
+            "filled_ts": None,
+            "status": "EXIT_PARTIAL_FILL",
+            "contract": "SPY260717C00600000",
+            "client_id": "jason@example.com",
+            "kind": "EXIT",
+            "created_ts": "2026-07-17T16:01:00Z",
+        },
+        {
+            "local_order_id": "exit-unrelated",
+            "broker_order_id": "broker-unrelated",
+            "position_id": "position-1",
+            "filled_qty": 1,
+            "fill_price": 1.60,
+            "filled_ts": None,
+            "status": "EXIT_PARTIAL_FILL",
+            "contract": "SPY260717C00600000",
+            "client_id": "jason@example.com",
+            "kind": "EXIT",
+            "created_ts": "2026-07-17T16:02:00Z",
+        },
+    ]
+
+    class _Connection:
+        def execute(self, sql, params):
+            assert "OR (%s <> '' AND local_order_id=%s)" in sql
+            assert "ORDER BY filled_ts ASC NULLS LAST, created_ts ASC" in sql
+            (
+                client_id,
+                contract,
+                statuses,
+                entry_ts,
+                _entry_ts_again,
+                current_local_id,
+                current_local_id_again,
+                position_id,
+                local_id_match_gate,
+                local_id_match_again,
+            ) = params
+            assert current_local_id == current_local_id_again == "exit-current"
+            assert local_id_match_gate == local_id_match_again == "exit-current"
+            filtered = []
+            for row in exit_rows:
+                if row["client_id"] != client_id or row["kind"] != "EXIT":
+                    continue
+                if str(row["contract"]).upper() != str(contract).upper():
+                    continue
+                if row["status"] not in statuses:
+                    continue
+                if int(row["filled_qty"] or 0) <= 0 or row["fill_price"] is None:
+                    continue
+                timestamp_ok = entry_ts is None or (
+                    row["filled_ts"] is not None and row["filled_ts"] >= entry_ts
+                )
+                exact_current_ok = bool(current_local_id) and row["local_order_id"] == current_local_id
+                if not (timestamp_ok or exact_current_ok):
+                    continue
+                identity_ok = (
+                    str(row["position_id"]) == str(position_id)
+                    or (bool(local_id_match_gate) and row["local_order_id"] == local_id_match_gate)
+                )
+                if identity_ok:
+                    filtered.append({
+                        key: row[key]
+                        for key in (
+                            "local_order_id",
+                            "broker_order_id",
+                            "position_id",
+                            "filled_qty",
+                            "fill_price",
+                            "filled_ts",
+                            "status",
+                        )
+                    })
+            filtered.sort(key=lambda row: ((row["filled_ts"] is None), row["filled_ts"], row["local_order_id"]))
+            return _Result(filtered)
+
+    rows = _load_exit_fills(
+        _Connection(),
+        {
+            "id": "position-1",
+            "contract": "SPY260717C00600000",
+            "entry_ts": "2026-07-17T15:59:00Z",
+        },
+        _exit_order(
+            local_order_id="exit-current",
+            position_id="position-1",
+            contract="SPY260717C00600000",
+            status="EXIT_PARTIAL_FILL",
+        ),
+    )
+    assert [row["local_order_id"] for row in rows] == ["exit-current"]
 
 
 def test_partial_exit_path_invokes_canonical_sync() -> None:
@@ -432,6 +541,132 @@ def test_partial_fill_projects_exact_durable_exit_ownership(monkeypatch) -> None
         "pending_exit_broker_order_id": "broker-exit-1",
         "pending_exit_qty": 2,
     }
+
+
+def test_partial_fill_with_null_filled_ts_is_reconciled_from_exact_current_local_order(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    position_updates_seen = []
+
+    class _Result:
+        rowcount = 1
+
+        def __init__(self, rows=None, row=None):
+            self._rows = rows or []
+            self._row = row
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._row
+
+    class _Connection:
+        def execute(self, sql, params=None):
+            params = params or ()
+            if "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status" in sql:
+                assert "OR (%s <> '' AND local_order_id=%s)" in sql
+                return _Result(rows=[
+                    {
+                        "local_order_id": "exit-current",
+                        "broker_order_id": "broker-current",
+                        "position_id": "position-1",
+                        "filled_qty": 2,
+                        "fill_price": 1.50,
+                        "filled_ts": None,
+                        "status": "EXIT_PARTIAL_FILL",
+                    }
+                ])
+            if "UPDATE orders SET position_id=%s, updated_ts=NOW() WHERE client_id=%s AND local_order_id IN %s" in sql:
+                assert params[2] == ("exit-current",)
+                return _Result()
+            if "UPDATE orders SET position_id=%s, updated_ts=NOW() WHERE client_id=%s AND local_order_id=%s" in sql:
+                raise AssertionError("entry order position rewrite should not run when entry order is missing")
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    @contextmanager
+    def _conn():
+        yield _Connection()
+
+    def _update(_c, table, updates, _where, _params):
+        assert table == "positions"
+        position_updates_seen.append(dict(updates))
+        return 1
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_finish_reconciliation_attempt", lambda *_a, **_k: None)
+    monkeypatch.setattr(guard, "_resolve_position", lambda *_: {
+        "id": "position-1",
+        "client_id": "jason@example.com",
+        "contract": "SPY260717C00600000",
+        "qty": 4,
+        "avg_fill": 1.00,
+        "entry_ts": "2026-07-17T15:59:00Z",
+        "status": "OPEN",
+    })
+    monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
+    monkeypatch.setattr(guard, "_table_columns", lambda _c, table: (
+        {
+            "contracts_exited",
+            "quantity_remaining",
+            "exit_price",
+            "realized_pnl",
+            "realized_pnl_pct",
+            "exit_in_flight",
+            "pending_exit_qty",
+            "pending_exit_local_order_id",
+            "pending_exit_broker_order_id",
+            "updated_at",
+            "status",
+            "exit_ts",
+        }
+        if table == "positions"
+        else set()
+    ))
+    monkeypatch.setattr(guard, "_dynamic_update", _update)
+
+    order = _exit_order(
+        local_order_id="exit-current",
+        broker_order_id="broker-current",
+        position_id="position-1",
+        contract="SPY260717C00600000",
+        status="EXIT_PARTIAL_FILL",
+        qty=4,
+        filled_qty=2,
+        fill_price=1.50,
+        filled_ts=None,
+    )
+    result_payload = {
+        "status": "EXIT_PARTIAL_FILL",
+        "filled_qty": 2,
+        "fill_price": 1.50,
+        "broker_order_id": "broker-current",
+        "filled_ts": None,
+    }
+
+    first = _run_reconciliation_attempt(order, result_payload, attempt_count=1)
+    second = _run_reconciliation_attempt(order, result_payload, attempt_count=1)
+
+    assert len(position_updates_seen) == 2
+    for updates in position_updates_seen:
+        assert updates["contracts_exited"] == 2
+        assert updates["quantity_remaining"] == 2
+        assert updates["realized_pnl"] == pytest.approx(100.0)
+        assert updates["realized_pnl_pct"] == pytest.approx(50.0)
+        assert "status" not in updates
+        assert updates["exit_in_flight"] is True
+        assert updates["pending_exit_local_order_id"] == "exit-current"
+        assert updates["pending_exit_broker_order_id"] == "broker-current"
+        assert updates["pending_exit_qty"] == 2
+    assert first["projection"].remaining_qty == 2
+    assert first["projection"].exited_qty == 2
+    assert first["projection"].realized_pnl == pytest.approx(100.0)
+    assert first["proof_rows_updated"] == 0
+    assert first["proof_reconciliation"] is None
+    assert first["exit_ownership"]["pending_exit_local_order_id"] == "exit-current"
+    assert second["projection"].remaining_qty == 2
+    assert second["projection"].exited_qty == 2
 
 
 def test_exact_originating_entry_proof_identity_wins_over_position_fallback() -> None:

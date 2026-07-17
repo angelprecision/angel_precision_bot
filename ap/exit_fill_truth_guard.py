@@ -231,11 +231,12 @@ def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
         "SELECT local_order_id, broker_order_id, position_id, filled_qty, fill_price, filled_ts, status "
         "FROM orders WHERE client_id=%s AND kind='EXIT' AND UPPER(contract)=UPPER(%s) "
         "AND status IN %s AND COALESCE(filled_qty,0)>0 AND fill_price IS NOT NULL "
-        "AND (%s IS NULL OR filled_ts >= %s) "
+        "AND (%s IS NULL OR filled_ts >= %s OR (%s <> '' AND local_order_id=%s)) "
         "AND (position_id::text=%s OR (%s<>'' AND local_order_id=%s)) "
-        "ORDER BY filled_ts ASC, created_ts ASC",
+        "ORDER BY filled_ts ASC NULLS LAST, created_ts ASC",
         (
             client_id, contract, _EXIT_FILL_STATUSES, entry_ts, entry_ts,
+            current_local_order_id, current_local_order_id,
             position_id, current_local_order_id, current_local_order_id,
         ),
     ).fetchall()
