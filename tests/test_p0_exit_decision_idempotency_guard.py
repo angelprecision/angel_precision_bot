@@ -30,6 +30,7 @@ def _pos(**overrides):
         "client_id": "client@example.com",
         "ticker": "SPY",
         "option_symbol": "SPY260716P00751000",
+        "side": "PUT",
         "quantity_remaining": 3,
         "closed": False,
         "exit_in_flight": False,
@@ -78,10 +79,39 @@ class _FakeEngine:
 
 class _FakeOSM:
     def __init__(self, active_order=None):
-        self.active_order = active_order
+        self.active_order = dict(active_order) if isinstance(active_order, dict) else active_order
+        self.active_orders_by_position = {}
+        if isinstance(self.active_order, dict):
+            self.active_orders_by_position[str(self.active_order.get("position_id") or "")] = self.active_order
 
     def get_active_exit_order(self, position_id):
-        return self.active_order
+        position_key = str(position_id or "")
+        return self.active_orders_by_position.get(position_key)
+
+    def create_exit_order(self, **kwargs):
+        local_order_id = str(kwargs.get("local_order_id") or "exit-local-created")
+        self.active_order = {
+            "local_order_id": local_order_id,
+            "broker_order_id": "",
+            "status": "EXIT_REQUESTED",
+            "position_id": kwargs.get("position_id"),
+            "qty": kwargs.get("qty"),
+            "meta": {},
+        }
+        self.active_orders_by_position[str(kwargs.get("position_id") or "")] = self.active_order
+        return local_order_id
+
+    def update_order_meta(self, local_order_id, patch):
+        if isinstance(self.active_order, dict) and self.active_order.get("local_order_id") == local_order_id:
+            meta = dict(self.active_order.get("meta") or {})
+            meta.update(dict(patch or {}))
+            self.active_order["meta"] = meta
+        for order in self.active_orders_by_position.values():
+            if isinstance(order, dict) and order.get("local_order_id") == local_order_id:
+                meta = dict(order.get("meta") or {})
+                meta.update(dict(patch or {}))
+                order["meta"] = meta
+        return True
 
 
 class _FakeClaimConnection:
@@ -208,16 +238,27 @@ class _FakeClaimConnection:
             else:
                 self._row = None
         elif sql.startswith("UPDATE exit_decision_generation_claims SET last_error="):
-            token, generation_key, claim_state, like_pattern = params
+            token, generation_key, claim_state, required_pattern, reconciling_pattern, lease_seconds = params
             row = self.store.get(generation_key)
             last_error = str((row or {}).get("last_error") or "")
-            prefix = str(like_pattern).rstrip("%")
+            required_prefix = str(required_pattern).rstrip("%")
+            reconciling_prefix = str(reconciling_pattern).rstrip("%")
+            claimed_at = (row or {}).get("claimed_at")
             if (
                 row is not None
                 and row.get("claim_state") == claim_state
-                and (not last_error or last_error.startswith(prefix))
+                and (
+                    not last_error
+                    or last_error.startswith(required_prefix)
+                    or (
+                        last_error.startswith(reconciling_prefix)
+                        and claimed_at is not None
+                        and float(claimed_at) <= (time.time() - float(lease_seconds))
+                    )
+                )
             ):
                 row["last_error"] = token
+                row["claimed_at"] = time.time()
                 self._row = dict(row)
             else:
                 self._row = None
@@ -360,6 +401,9 @@ def _identity_from_result(result):
 
 
 def _make_submit_engine(pos, *, callback, active_order=None, mode="LIVE"):
+    if isinstance(active_order, dict) and not active_order.get("position_id"):
+        active_order = dict(active_order)
+        active_order["position_id"] = pos.position_id
     engine = SimpleNamespace(
         _lock=threading.RLock(),
         client_id=pos.client_id,
@@ -627,7 +671,7 @@ def test_stale_claim_reconciliation_releases_no_submit_and_allows_retry(
         "qty": 3,
         "broker_order_id": "",
         "submitted_ts": None,
-        "meta": {},
+        "meta": {"exit_generation_claim": 1},
     }))
 
     reconciled = guard.reconcile_stale_exit_generation_claim(key, osm=osm)
@@ -675,6 +719,7 @@ def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_c
                     "meta": {
                         "submit_intent_at": "2026-07-17T12:00:00+00:00",
                         "broker_submit_key": "exit-local-1",
+                        "exit_generation_claim": 1,
                     },
                 },
                 {
@@ -689,6 +734,7 @@ def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_c
                     "meta": {
                         "submit_intent_at": "2026-07-17T12:00:00+00:00",
                         "broker_submit_key": "exit-local-1",
+                        "exit_generation_claim": 1,
                     },
                 },
             ]),
@@ -746,6 +792,7 @@ def test_stale_claim_reconciliation_routes_confirmed_fill_once(
                     "meta": {
                         "submit_intent_at": "2026-07-17T12:00:00+00:00",
                         "broker_submit_key": "exit-local-fill",
+                        "exit_generation_claim": 1,
                     },
                 },
                 {
@@ -763,6 +810,7 @@ def test_stale_claim_reconciliation_routes_confirmed_fill_once(
                     "meta": {
                         "submit_intent_at": "2026-07-17T12:00:00+00:00",
                         "broker_submit_key": "exit-local-fill",
+                        "exit_generation_claim": 1,
                     },
                 },
             ]),
@@ -809,6 +857,7 @@ def test_stale_claim_reconciliation_keeps_ambiguous_when_truth_unavailable(
                 "meta": {
                     "submit_intent_at": "2026-07-17T12:00:00+00:00",
                     "broker_submit_key": "exit-local-1",
+                    "exit_generation_claim": 1,
                 },
             }),
         ),
@@ -868,7 +917,7 @@ def test_stale_claim_reconciliation_race_allows_one_terminal_transition(monkeypa
         "qty": 3,
         "broker_order_id": "",
         "submitted_ts": None,
-        "meta": {},
+        "meta": {"exit_generation_claim": 1},
     }))
 
     first = guard.reconcile_stale_exit_generation_claim(key, osm=osm)
@@ -876,6 +925,32 @@ def test_stale_claim_reconciliation_race_allows_one_terminal_transition(monkeypa
     assert first["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
     assert second["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
     assert len(finish_calls) == 1
+
+
+def test_submit_wrapper_precreates_exact_local_exit_identity(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    captured = {}
+    original_claim = guard._claim_durable_decision_generation
+
+    def _claim_proxy(**kwargs):
+        captured.update(kwargs)
+        return original_claim(**kwargs)
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", _claim_proxy)
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    callback = MagicMock(return_value=False)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    wrapped(engine, pos, _decision())
+
+    assert captured["local_order_id"]
+    assert pos.pending_exit_local_order_id == captured["local_order_id"]
+    assert engine.order_state_machine.active_order["local_order_id"] == captured["local_order_id"]
+    assert engine.order_state_machine.active_order["meta"]["exit_generation_claim"] == 1
 
 
 def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> None:

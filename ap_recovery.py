@@ -971,7 +971,13 @@ class APStartupRecovery:
                     FROM exit_decision_generation_claims
                     WHERE client_id=%s
                       AND claim_state='AMBIGUOUS'
-                      AND COALESCE(last_error,'') LIKE 'STALE_CLAIM_RECONCILIATION_REQUIRED%%'
+                      AND (
+                            COALESCE(last_error,'') LIKE 'STALE_CLAIM_RECONCILIATION_REQUIRED%%'
+                         OR (
+                                COALESCE(last_error,'') LIKE 'STALE_CLAIM_RECONCILING:%%'
+                            AND claimed_at <= NOW() - (300 * INTERVAL '1 second')
+                         )
+                      )
                     ORDER BY claimed_at ASC
                     """,
                     (self.client_id,),

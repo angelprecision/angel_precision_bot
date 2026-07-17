@@ -7616,6 +7616,7 @@ class APExecutionCore:
                 limit_price = _exit_limit,  # None = market order for IMMEDIATE exits
                 signal_id   = _sig_id or None,
                 order_type  = "market" if _exit_limit is None else "limit",
+                local_order_id=str(getattr(pos, "pending_exit_local_order_id", "") or "") or None,
             )
             if exit_res["ok"]:
                 log.info(
