@@ -465,10 +465,11 @@ class APStartupRecovery:
             result["exit_fill_reconciliations_failed"] += 1
 
         try:
-            self._recover_exit_fills_that_occurred_during_downtime(result)
+            live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
         except Exception as e:
             log.error("[%s] Exit fill downtime recovery error: %s", self.client_id, e)
             result["errors"].append(f"exit_fill_downtime: {e}")
+            live_exit_orders = []
 
         try:
             self._recover_positions(result)
@@ -483,7 +484,7 @@ class APStartupRecovery:
             result["errors"].append(f"entries: {e}")
 
         try:
-            self._reattach_live_exit_protections(result)
+            self._reattach_live_exit_protections(result, live_exit_orders)
         except Exception as e:
             log.error("[%s] Exit reattachment error: %s", self.client_id, e)
             result["errors"].append(f"exits: {e}")
@@ -850,14 +851,16 @@ class APStartupRecovery:
         row = run_with_retry(_load)
         return dict(row) if row else None
 
-    def _recover_exit_fills_that_occurred_during_downtime(self, result: dict) -> None:
+    def _recover_exit_fills_that_occurred_during_downtime(self, result: dict) -> list[dict]:
         """Route broker-confirmed downtime EXIT fills through the canonical reducer."""
         if self._execution_mode() is None:
             result.setdefault("errors", []).append("recovery_unknown_execution_mode")
-            return
+            return []
         closings = self._load_closing_positions()
         if not closings:
-            return
+            return []
+
+        live_exit_orders: list[dict] = []
 
         for pos in closings:
             pos_id     = pos.get("id")
@@ -976,6 +979,8 @@ class APStartupRecovery:
                     result.setdefault("errors", []).append(
                         f"exit_fill_downtime_reconcile:{local_id}:{e}"
                     )
+                if persisted_status == "EXIT_PARTIAL_FILL":
+                    live_exit_orders.append(persisted_order)
                 continue
 
             if broker_status in BROKER_TERMINAL:
@@ -1004,66 +1009,42 @@ class APStartupRecovery:
                     result["exits_reattached"] += 1
                 except Exception as e:
                     log.error("[%s] RECOVERY: exit revert failed: %s", self.client_id, e)
+                continue
+
+            live_exit_orders.append(exit_order)
+
+        return live_exit_orders
 
     # ──────────────────────────────────────────────────────────────────────────
     # 4. Live exit protection reattachment
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _reattach_live_exit_protections(self, result: dict):
-        """Reattach only EXIT orders that remain live after broker-truth recovery."""
+    def _reattach_live_exit_protections(self, result: dict, live_exit_orders: list[dict]):
+        """Reattach only EXIT orders already proven live by the downtime pass."""
         if self._execution_mode() is None:
             result.setdefault("errors", []).append("recovery_unknown_execution_mode")
             return
-        closings = self._load_closing_positions()
-        if not closings:
+        if not live_exit_orders:
             return
 
-        for pos in closings:
-            pos_id     = pos.get("id")
-            underlying = pos.get("underlying") or pos.get("ticker", "?")
-
-            try:
-                exit_order = self._load_active_exit_order_for_position(pos_id)
-            except Exception as e:
-                log.error("[%s] RECOVERY: exit order lookup failed for pos %s: %s",
-                          self.client_id, pos_id, e)
-                continue
-
-            if not exit_order:
-                log.error(
-                    "[%s] RECOVERY: CLOSING position %s (%s) has NO active exit order — "
-                    "exit must be re-submitted manually",
-                    self.client_id, pos_id, underlying,
-                )
-                continue
-
-            broker_oid = exit_order.get("broker_order_id")
-            local_id   = exit_order.get("local_order_id")
-
-            if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
-                log.warning(
-                    "[%s] RECOVERY: exit order %s for pos %s has no broker_order_id",
-                    self.client_id, local_id, pos_id,
-                )
-                continue
-
-            try:
-                broker_raw    = self.broker.get_order(broker_oid) or {}
-                broker_status = str(broker_raw.get("status") or "").lower()
-            except Exception as e:
-                log.warning("[%s] RECOVERY: broker exit order check failed: %s",
-                            self.client_id, e)
-                continue
-
-            from ap_reconciler import BROKER_FILLED, BROKER_TERMINAL
-
-            if broker_status in BROKER_FILLED or broker_status in BROKER_TERMINAL:
-                continue
+        for exit_order in live_exit_orders:
+            pos_id = exit_order.get("position_id")
+            local_id = exit_order.get("local_order_id")
+            underlying = (
+                exit_order.get("underlying")
+                or exit_order.get("ticker")
+                or exit_order.get("contract")
+                or "?"
+            )
 
             log.info(
-                "[%s] RECOVERY: exit order still live at broker | "
-                "pos=%s %s | broker_status=%s",
-                self.client_id, pos_id, underlying, broker_status,
+                "[%s] RECOVERY: reattaching live exit protection | "
+                "pos=%s %s | order=%s status=%s",
+                self.client_id,
+                pos_id,
+                underlying,
+                local_id,
+                exit_order.get("status"),
             )
             result["exits_reattached"] += 1
 
@@ -1086,8 +1067,8 @@ class APStartupRecovery:
 
     def _reattach_exit_protections(self, result: dict):
         """Compatibility wrapper for callers that still use the legacy name."""
-        self._recover_exit_fills_that_occurred_during_downtime(result)
-        self._reattach_live_exit_protections(result)
+        live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
+        self._reattach_live_exit_protections(result, live_exit_orders)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 5. Buying power reservation

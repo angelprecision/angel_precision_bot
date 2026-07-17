@@ -979,10 +979,10 @@ def test_startup_recovery_runs_client_scoped_exit_retry_before_position_and_exit
     recovery.client_id = "jason@example.com"
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: events.append("deferred")
-    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: events.append("downtime_exit_fills")
+    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: (events.append("downtime_exit_fills") or [])
     recovery._recover_positions = lambda _result: events.append("positions")
     recovery._verify_pending_entries = lambda _result: events.append("entries")
-    recovery._reattach_live_exit_protections = lambda _result: events.append("exits")
+    recovery._reattach_live_exit_protections = lambda _result, _live_exit_orders: events.append("exits")
     original_retry = recovery._retry_canonical_exit_fill_reconciliations
 
     def _retry(result):
@@ -1020,7 +1020,7 @@ def test_startup_recovery_retries_canonical_exit_fill_before_loading_stale_runti
     recovery.mc = SimpleNamespace(_position_count=0)
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: None
-    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: state.__setitem__("position_closed", True)
+    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: (state.__setitem__("position_closed", True) or [])
     recovery._verify_pending_entries = lambda _result: None
     recovery._reseed_dedup = lambda _result: None
     recovery._recover_positions = lambda result: (
@@ -1036,7 +1036,7 @@ def test_startup_recovery_retries_canonical_exit_fill_before_loading_stale_runti
             recovery.mc._position_count + (0 if state["position_closed"] else 1),
         ),
     )
-    recovery._reattach_live_exit_protections = lambda result: (
+    recovery._reattach_live_exit_protections = lambda result, _live_exit_orders: (
         state.__setitem__("manual_resubmission", not state["position_closed"]),
         result.__setitem__(
             "exits_reattached",
@@ -1131,10 +1131,10 @@ def test_startup_exit_retry_discovery_failure_is_diagnostic_not_fatal(monkeypatc
     recovery.client_id = "jason@example.com"
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: None
-    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: None
+    recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: []
     recovery._recover_positions = lambda _result: None
     recovery._verify_pending_entries = lambda _result: None
-    recovery._reattach_live_exit_protections = lambda _result: None
+    recovery._reattach_live_exit_protections = lambda _result, _live_exit_orders: None
     recovery._recompute_buying_power = lambda _result: None
     recovery._reseed_dedup = lambda _result: None
 
