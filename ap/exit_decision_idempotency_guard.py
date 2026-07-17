@@ -21,6 +21,7 @@ blocked merely because diagnostics are unavailable.
 from __future__ import annotations
 
 import os
+import math
 import threading
 import time
 from typing import Any, Callable
@@ -51,11 +52,53 @@ _TERMINAL_POSITION_STATUSES = {
     "CANCELED",
     "CANCELLED",
 }
-_ACTION_LEDGER_TTL = float(os.getenv("EXIT_DECISION_LEDGER_ACTION_DEDUPE_SECONDS", "60"))
-_HOLD_LEDGER_TTL = float(os.getenv("EXIT_DECISION_LEDGER_HOLD_DEDUPE_SECONDS", "300"))
-_LEDGER_CACHE_MAX = int(os.getenv("EXIT_DECISION_LEDGER_DEDUPE_CACHE_MAX", "4096"))
-_EXTERNAL_PRECHECK_TTL = float(os.getenv("EXIT_DECISION_EXTERNAL_PRECHECK_SECONDS", "30"))
-_PRECHECK_CACHE_MAX = int(os.getenv("EXIT_DECISION_PRECHECK_CACHE_MAX", "4096"))
+def _bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        log.error("invalid %s=%r; using conservative default=%s", name, raw, default)
+        return default
+    if not math.isfinite(value) or value < 0:
+        log.error("unsafe %s=%r; using conservative default=%s", name, raw, default)
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        log.error("invalid %s=%r; using conservative default=%s", name, raw, default)
+        return default
+    if value < 0:
+        log.error("unsafe %s=%r; using conservative default=%s", name, raw, default)
+        return default
+    return min(max(value, minimum), maximum)
+
+
+# Documented deployment bounds: TTLs are at least one second and at most one
+# day; caches retain at least 128 entries and never exceed 100k entries.
+_ACTION_LEDGER_TTL = _bounded_float_env(
+    "EXIT_DECISION_LEDGER_ACTION_DEDUPE_SECONDS", 60.0, 1.0, 86400.0
+)
+_HOLD_LEDGER_TTL = _bounded_float_env(
+    "EXIT_DECISION_LEDGER_HOLD_DEDUPE_SECONDS", 300.0, 1.0, 86400.0
+)
+_LEDGER_CACHE_MAX = _bounded_int_env(
+    "EXIT_DECISION_LEDGER_DEDUPE_CACHE_MAX", 4096, 128, 100000
+)
+_EXTERNAL_PRECHECK_TTL = _bounded_float_env(
+    "EXIT_DECISION_EXTERNAL_PRECHECK_SECONDS", 30.0, 1.0, 86400.0
+)
+_PRECHECK_CACHE_MAX = _bounded_int_env(
+    "EXIT_DECISION_PRECHECK_CACHE_MAX", 4096, 128, 100000
+)
 _TERMINAL_EXIT_STATUSES = (
     "EXIT_FILLED", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "ERROR",
 )

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import importlib
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 
 import ap.exit_decision_idempotency_guard as guard
+import ap.trade_lifecycle_guards as lifecycle_guards
 
 
 def _reset_guard_caches() -> None:
@@ -308,3 +313,127 @@ def test_precheck_preserves_exit_when_broker_truth_is_unavailable(monkeypatch) -
     assert pos.closed is False
     assert pos.quantity_remaining == 3
     assert engine.active_positions() == [pos]
+
+
+@pytest.mark.parametrize(
+    ("name", "bad_value", "attribute", "expected"),
+    [
+        ("EXIT_DECISION_LEDGER_ACTION_DEDUPE_SECONDS", "bad", "_ACTION_LEDGER_TTL", 60.0),
+        ("EXIT_DECISION_LEDGER_HOLD_DEDUPE_SECONDS", "nan", "_HOLD_LEDGER_TTL", 300.0),
+        ("EXIT_DECISION_LEDGER_DEDUPE_CACHE_MAX", "-1", "_LEDGER_CACHE_MAX", 4096),
+        ("EXIT_DECISION_EXTERNAL_PRECHECK_SECONDS", "inf", "_EXTERNAL_PRECHECK_TTL", 30.0),
+        ("EXIT_DECISION_PRECHECK_CACHE_MAX", "1.2", "_PRECHECK_CACHE_MAX", 4096),
+    ],
+)
+def test_malformed_environment_imports_safely_with_bounded_fallback(
+    monkeypatch, name, bad_value, attribute, expected
+) -> None:
+    monkeypatch.setenv(name, bad_value)
+    reloaded = importlib.reload(guard)
+    assert getattr(reloaded, attribute) == expected
+    monkeypatch.delenv(name, raising=False)
+    importlib.reload(guard)
+
+
+def test_valid_environment_values_are_clamped(monkeypatch) -> None:
+    monkeypatch.setenv("EXIT_DECISION_LEDGER_ACTION_DEDUPE_SECONDS", "999999")
+    monkeypatch.setenv("EXIT_DECISION_PRECHECK_CACHE_MAX", "999999")
+    reloaded = importlib.reload(guard)
+    assert reloaded._ACTION_LEDGER_TTL == 86400.0
+    assert reloaded._PRECHECK_CACHE_MAX == 100000
+    monkeypatch.delenv("EXIT_DECISION_LEDGER_ACTION_DEDUPE_SECONDS")
+    monkeypatch.delenv("EXIT_DECISION_PRECHECK_CACHE_MAX")
+    importlib.reload(guard)
+
+
+def test_installed_guard_manifest_reports_exact_names(monkeypatch) -> None:
+    installed = []
+    module = SimpleNamespace(install=lambda: installed.append("canonical"))
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "_GUARDS",
+        (("canonical_exit_fill_truth", "ap.fake_guard", "install", True),),
+    )
+    monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: module)
+    manifest = lifecycle_guards.install_trade_lifecycle_guards()
+    assert list(manifest) == ["canonical_exit_fill_truth"]
+    assert manifest["canonical_exit_fill_truth"]["status"] == "installed"
+    assert installed == ["canonical"]
+
+
+def test_live_preflight_fails_when_generation_claim_migration_absent(monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "install_trade_lifecycle_guards",
+        lambda: {"canonical_exit_fill_truth": {
+            "status": "installed", "required_when_present": True,
+        }},
+    )
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: False)
+    ok, diagnostic = lifecycle_guards.lifecycle_guard_preflight("live")
+    assert ok is False
+    assert diagnostic["generation_claims_table_exists"] is False
+
+
+def test_client_runner_live_preflight_blocks_entries_before_broker_auth(monkeypatch) -> None:
+    from client_runner import ClientRunner
+
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "lifecycle_guard_preflight",
+        lambda _mode: (False, {
+            "missing_required_guards": ["proof_taxonomy"],
+            "generation_claims_table_exists": False,
+        }),
+    )
+    runner = SimpleNamespace(
+        email="client@example.com", mode="LIVE", account_id="account-1"
+    )
+    broker = SimpleNamespace(get_account_equity=MagicMock(return_value=1000.0))
+    ok, reason = ClientRunner._run_live_preflight(runner, broker)
+    assert ok is False
+    assert reason.startswith("lifecycle_guard_preflight_failed:")
+    assert broker.get_account_equity.call_count == 0
+
+
+def test_live_preflight_fails_when_required_guard_installation_failed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "install_trade_lifecycle_guards",
+        lambda: {"canonical_exit_fill_truth": {
+            "status": "installation_failed", "required_when_present": True,
+        }},
+    )
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: True)
+    ok, diagnostic = lifecycle_guards.lifecycle_guard_preflight("live")
+    assert ok is False
+    assert diagnostic["missing_required_guards"] == ["canonical_exit_fill_truth"]
+
+
+def test_paper_remains_available_with_guard_diagnostics(monkeypatch) -> None:
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "install_trade_lifecycle_guards",
+        lambda: {"canonical_exit_fill_truth": {
+            "status": "installation_failed", "required_when_present": True,
+        }},
+    )
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: False)
+    ok, diagnostic = lifecycle_guards.lifecycle_guard_preflight("paper")
+    assert ok is True
+    assert diagnostic["missing_required_guards"] == ["canonical_exit_fill_truth"]
+
+
+def test_durable_claim_infrastructure_failure_does_not_suppress_protective_exit(monkeypatch) -> None:
+    _reset_guard_caches()
+    calls = []
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
+    wrapped = guard.wrap_ledger(
+        lambda pos, decision, client_id="": calls.append((pos, decision)) or "written"
+    )
+    assert wrapped(_pos(), _decision(), client_id="client@example.com") == "written"
+    assert len(calls) == 1

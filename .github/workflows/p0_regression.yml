@@ -38,6 +38,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install pytest requests psycopg2-binary python-dotenv cryptography
 
+      - name: Apply exit decision generation migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d intelligence_test \
+            -f migrations/20260717_exit_decision_generation_claims.sql
+          psql -h localhost -U postgres -d intelligence_test \
+            -tAc "SELECT to_regclass('public.exit_decision_generation_claims') IS NOT NULL" \
+            | grep -qx t
+
       - name: Run P0 plus cohesion tests
         env:
           DATABASE_URL: "postgresql://test:test@localhost/test"
