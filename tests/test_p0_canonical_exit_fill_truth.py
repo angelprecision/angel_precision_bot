@@ -890,6 +890,180 @@ def test_batch_recovery_discovers_stale_but_not_fresh_in_progress(monkeypatch) -
     )
 
 
+def test_batch_recovery_reports_proof_quarantine_as_unresolved(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    now = datetime.now(timezone.utc)
+    row = {
+        "client_id": "jason@example.com",
+        "local_order_id": "exit-local-1",
+        "meta": {"exit_fill_reconciliation": {
+            "status": "QUARANTINED",
+            "last_attempt_at": (now - timedelta(minutes=10)).isoformat(),
+        }},
+    }
+
+    class _Cursor:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchall(self):
+            return [row]
+
+    @contextmanager
+    def _conn():
+        yield _Cursor()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "retry_exit_fill_reconciliation",
+        lambda **_kwargs: {
+            "position_id": "position-1",
+            "proof_reconciliation": {
+                "status": "QUARANTINED",
+                "reason_code": "PROOF_IDENTITY_AMBIGUOUS",
+            },
+        },
+    )
+    outcomes = retry_pending_exit_fill_reconciliations(
+        client_id="jason@example.com",
+        limit=100,
+    )
+    assert outcomes == [{
+        "client_id": "jason@example.com",
+        "local_order_id": "exit-local-1",
+        "status": "QUARANTINED",
+        "reconciled": False,
+        "result": {
+            "position_id": "position-1",
+            "proof_reconciliation": {
+                "status": "QUARANTINED",
+                "reason_code": "PROOF_IDENTITY_AMBIGUOUS",
+            },
+        },
+    }]
+
+
+def test_startup_recovery_runs_client_scoped_exit_retry_once_after_reattachment(
+    monkeypatch,
+) -> None:
+    import ap.exit_fill_truth_guard as guard
+    from ap_recovery import APStartupRecovery
+
+    events = []
+    scan = MagicMock(return_value=[])
+    monkeypatch.setattr(guard, "retry_pending_exit_fill_reconciliations", scan)
+    recovery = APStartupRecovery.__new__(APStartupRecovery)
+    recovery.client_id = "jason@example.com"
+    recovery._execution_mode = lambda: "live"
+    recovery._recover_deferred_breach_lifecycles = lambda _result: events.append("deferred")
+    recovery._recover_positions = lambda _result: events.append("positions")
+    recovery._verify_pending_entries = lambda _result: events.append("entries")
+    recovery._reattach_exit_protections = lambda _result: events.append("exits")
+    original_retry = recovery._retry_canonical_exit_fill_reconciliations
+
+    def _retry(result):
+        events.append("exit_fill_retry")
+        return original_retry(result)
+
+    recovery._retry_canonical_exit_fill_reconciliations = _retry
+    recovery._recompute_buying_power = lambda _result: events.append("buying_power")
+    recovery._reseed_dedup = lambda _result: events.append("dedup")
+
+    result = recovery.run(include_watcher_reseed=False)
+    assert events.index("exits") < events.index("exit_fill_retry")
+    assert events.count("exit_fill_retry") == 1
+    scan.assert_called_once_with(client_id="jason@example.com", limit=100)
+    assert result["exit_fill_reconciliations_attempted"] == 0
+    assert result["errors"] == []
+
+
+def test_startup_exit_retry_records_resolved_quarantined_failed_and_claimed(
+    monkeypatch,
+) -> None:
+    import ap.exit_fill_truth_guard as guard
+    from ap_recovery import APStartupRecovery
+
+    monkeypatch.setattr(
+        guard,
+        "retry_pending_exit_fill_reconciliations",
+        lambda **_kwargs: [
+            {
+                "local_order_id": "exit-ok",
+                "status": "RECONCILED",
+                "reconciled": True,
+                "result": {"position_id": "position-1"},
+            },
+            {
+                "local_order_id": "exit-quarantined",
+                "status": "QUARANTINED",
+                "reconciled": False,
+                "result": {"proof_reconciliation": {
+                    "reason_code": "PROOF_IDENTITY_AMBIGUOUS",
+                }},
+            },
+            {
+                "local_order_id": "exit-failed",
+                "status": "FAILED",
+                "reconciled": False,
+                "error": "db down",
+            },
+            {
+                "local_order_id": "exit-claimed",
+                "status": "NOT_CLAIMED",
+                "reconciled": False,
+                "result": None,
+            },
+        ],
+    )
+    recovery = APStartupRecovery.__new__(APStartupRecovery)
+    recovery.client_id = "jason@example.com"
+    result = {
+        "exit_fill_reconciliations_attempted": 0,
+        "exit_fill_reconciliations_reconciled": 0,
+        "exit_fill_reconciliations_quarantined": 0,
+        "exit_fill_reconciliations_failed": 0,
+        "exit_fill_reconciliations_skipped": 0,
+        "errors": [],
+    }
+    recovery._retry_canonical_exit_fill_reconciliations(result)
+    assert result["exit_fill_reconciliations_attempted"] == 4
+    assert result["exit_fill_reconciliations_reconciled"] == 1
+    assert result["exit_fill_reconciliations_quarantined"] == 1
+    assert result["exit_fill_reconciliations_failed"] == 1
+    assert result["exit_fill_reconciliations_skipped"] == 1
+    assert result["errors"] == [
+        "exit_fill_reconciliation_unresolved:exit-quarantined:PROOF_IDENTITY_AMBIGUOUS",
+        "exit_fill_reconciliation_failed:exit-failed:db down",
+    ]
+
+
+def test_startup_exit_retry_discovery_failure_is_diagnostic_not_fatal(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+    from ap_recovery import APStartupRecovery
+
+    monkeypatch.setattr(
+        guard,
+        "retry_pending_exit_fill_reconciliations",
+        MagicMock(side_effect=RuntimeError("catalog unavailable")),
+    )
+    recovery = APStartupRecovery.__new__(APStartupRecovery)
+    recovery.client_id = "jason@example.com"
+    recovery._execution_mode = lambda: "live"
+    recovery._recover_deferred_breach_lifecycles = lambda _result: None
+    recovery._recover_positions = lambda _result: None
+    recovery._verify_pending_entries = lambda _result: None
+    recovery._reattach_exit_protections = lambda _result: None
+    recovery._recompute_buying_power = lambda _result: None
+    recovery._reseed_dedup = lambda _result: None
+
+    result = recovery.run(include_watcher_reseed=False)
+    assert result["exit_fill_reconciliations_failed"] == 1
+    assert result["errors"] == ["exit_fill_reconciliation: catalog unavailable"]
+
+
 def test_successful_stale_recovery_finishes_reconciled(monkeypatch) -> None:
     import ap.exit_fill_truth_guard as guard
 

@@ -431,6 +431,11 @@ class APStartupRecovery:
             "dedup_seeded":        0,
             "watchers_requeued":   0,
             "deferred_lifecycles_recovered": 0,
+            "exit_fill_reconciliations_attempted": 0,
+            "exit_fill_reconciliations_reconciled": 0,
+            "exit_fill_reconciliations_quarantined": 0,
+            "exit_fill_reconciliations_failed": 0,
+            "exit_fill_reconciliations_skipped": 0,
             "errors":              [],
         }
 
@@ -466,6 +471,18 @@ class APStartupRecovery:
             result["errors"].append(f"exits: {e}")
 
         try:
+            self._retry_canonical_exit_fill_reconciliations(result)
+        except Exception as e:
+            log.critical(
+                "[%s] Canonical EXIT-fill retry discovery failed: %s",
+                self.client_id,
+                e,
+                exc_info=True,
+            )
+            result["errors"].append(f"exit_fill_reconciliation: {e}")
+            result["exit_fill_reconciliations_failed"] += 1
+
+        try:
             self._recompute_buying_power(result)
         except Exception as e:
             log.error("[%s] Buying power recompute error: %s", self.client_id, e)
@@ -486,7 +503,9 @@ class APStartupRecovery:
 
         log.info(
             "[%s] Recovery complete | positions=%d entries_verified=%d "
-            "entries_corrected=%d exits=%d dedup=%d watchers_requeued=%d buying_power=$%.2f errors=%d",
+            "entries_corrected=%d exits=%d dedup=%d watchers_requeued=%d buying_power=$%.2f "
+            "exit_fill_attempted=%d exit_fill_reconciled=%d exit_fill_quarantined=%d "
+            "exit_fill_failed=%d exit_fill_skipped=%d errors=%d",
             self.client_id,
             result["positions_recovered"],
             result["entries_verified"],
@@ -495,9 +514,73 @@ class APStartupRecovery:
             result["dedup_seeded"],
             result["watchers_requeued"],
             result["buying_power_reserved"],
+            result["exit_fill_reconciliations_attempted"],
+            result["exit_fill_reconciliations_reconciled"],
+            result["exit_fill_reconciliations_quarantined"],
+            result["exit_fill_reconciliations_failed"],
+            result["exit_fill_reconciliations_skipped"],
             len(result["errors"]),
         )
         return result
+
+    def _retry_canonical_exit_fill_reconciliations(self, result: dict) -> None:
+        """Run the bounded, client-scoped accounting retry pass once at startup.
+
+        This pass consumes only durable broker-confirmed fill state. It owns no
+        broker adapter and cannot submit or cancel orders.
+        """
+        from ap.exit_fill_truth_guard import retry_pending_exit_fill_reconciliations
+
+        outcomes = retry_pending_exit_fill_reconciliations(
+            client_id=self.client_id,
+            limit=100,
+        )
+        result["exit_fill_reconciliations_attempted"] += len(outcomes)
+        for outcome in outcomes:
+            local_order_id = str(outcome.get("local_order_id") or "")
+            status = str(outcome.get("status") or "").strip().upper()
+            if bool(outcome.get("reconciled")):
+                result["exit_fill_reconciliations_reconciled"] += 1
+                continue
+            if status == "NOT_CLAIMED":
+                result["exit_fill_reconciliations_skipped"] += 1
+                log.info(
+                    "[%s] STARTUP_EXIT_FILL_RECONCILIATION_ALREADY_CLAIMED order=%s",
+                    self.client_id,
+                    local_order_id,
+                )
+                continue
+            if status == "QUARANTINED":
+                result["exit_fill_reconciliations_quarantined"] += 1
+                diagnostic = (outcome.get("result") or {}).get("proof_reconciliation") or {}
+                reason = str(
+                    diagnostic.get("reason_code")
+                    or status
+                    or "EXIT_FILL_RECONCILIATION_UNRESOLVED"
+                )
+                log.critical(
+                    "[%s] STARTUP_EXIT_FILL_RECONCILIATION_UNRESOLVED "
+                    "order=%s status=%s reason=%s",
+                    self.client_id,
+                    local_order_id,
+                    status,
+                    reason,
+                )
+                result["errors"].append(
+                    f"exit_fill_reconciliation_unresolved:{local_order_id}:{reason}"
+                )
+                continue
+            result["exit_fill_reconciliations_failed"] += 1
+            error = str(outcome.get("error") or "unknown retry failure")
+            log.critical(
+                "[%s] STARTUP_EXIT_FILL_RECONCILIATION_FAILED order=%s error=%s",
+                self.client_id,
+                local_order_id,
+                error,
+            )
+            result["errors"].append(
+                f"exit_fill_reconciliation_failed:{local_order_id}:{error}"
+            )
 
     def recover_deferred_lifecycles(self) -> dict:
         """Lightweight runtime pass for durable deferred-breach ownership."""

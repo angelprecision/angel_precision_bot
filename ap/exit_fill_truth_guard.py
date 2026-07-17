@@ -1004,16 +1004,28 @@ def retry_pending_exit_fill_reconciliations(
                 client_id=row_client,
                 local_order_id=row_local,
             )
+            proof_status = str(
+                ((reconciled or {}).get("proof_reconciliation") or {}).get("status")
+                or ""
+            ).strip().upper()
+            resolved = reconciled is not None and proof_status != "QUARANTINED"
             outcomes.append({
                 "client_id": row_client,
                 "local_order_id": row_local,
-                "reconciled": reconciled is not None,
+                "status": (
+                    "RECONCILED"
+                    if resolved
+                    else "QUARANTINED" if proof_status == "QUARANTINED"
+                    else "NOT_CLAIMED"
+                ),
+                "reconciled": resolved,
                 "result": reconciled,
             })
         except Exception as exc:
             outcomes.append({
                 "client_id": row_client,
                 "local_order_id": row_local,
+                "status": "FAILED",
                 "reconciled": False,
                 "error": str(exc),
             })
