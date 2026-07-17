@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 from typing import Any, Iterable
 
 from ap.db import conn, run_with_retry
@@ -35,6 +36,26 @@ _PARTIAL_RESULT_STATUSES = {
 
 class LifecycleProjectionError(ValueError):
     """Broker fill rows cannot describe exactly one valid position lifecycle."""
+
+
+class ReconciliationIdentityError(LifecycleProjectionError):
+    def __init__(self, reason_code: str, candidate_position_ids: Iterable[Any] = ()) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.candidate_position_ids = [
+            str(value) for value in candidate_position_ids if str(value or "").strip()
+        ]
+
+
+class PositionUpdateCardinalityError(LifecycleProjectionError):
+    def __init__(self, row_count: int) -> None:
+        self.row_count = int(row_count)
+        reason = (
+            "POSITION_UPDATE_ZERO_ROWS"
+            if self.row_count == 0
+            else "POSITION_UPDATE_MULTIPLE_ROWS"
+        )
+        super().__init__(reason)
 
 
 @dataclass(frozen=True)
@@ -156,7 +177,7 @@ def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
     contract = str(order.get("contract") or order.get("symbol") or "").strip().upper()
     requested_id = str(order.get("position_id") or "").strip()
     if not client_id or not contract:
-        return None
+        raise ReconciliationIdentityError("CANONICAL_POSITION_UNRESOLVED")
 
     if requested_id and not _synthetic_position_id(requested_id):
         row = c.execute(
@@ -171,7 +192,7 @@ def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
         # A supplied real position identity is authoritative.  Missing or
         # contract-mismatched identity is corruption, not permission to guess
         # from another same-contract lifecycle.
-        return None
+        raise ReconciliationIdentityError("CANONICAL_POSITION_UNRESOLVED")
 
     # Synthetic/null identity is recoverable only when the broker fill can be
     # bound to exactly one contemporaneous lifecycle.  Never choose the newest
@@ -189,7 +210,14 @@ def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
         (client_id, contract, fill_ts, tuple(_TERMINAL_POSITION_STATUSES), fill_ts),
     ).fetchall()
     candidates = [dict(row) for row in rows]
-    return candidates[0] if len(candidates) == 1 else None
+    if len(candidates) == 1:
+        return candidates[0]
+    candidate_ids = [candidate.get("id") for candidate in candidates]
+    if candidates:
+        raise ReconciliationIdentityError(
+            "CANONICAL_POSITION_AMBIGUOUS", candidate_ids
+        )
+    raise ReconciliationIdentityError("CANONICAL_POSITION_UNRESOLVED")
 
 
 def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
@@ -266,6 +294,147 @@ def _dynamic_update(c, table: str, updates: dict[str, Any], where_sql: str, para
     return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
 
+def _reconciliation_order_identity(order: dict) -> tuple[str, str]:
+    return (
+        str(order.get("client_id") or "").strip(),
+        str(order.get("local_order_id") or "").strip(),
+    )
+
+
+def _diagnostic_context(order: dict, result: dict) -> dict[str, Any]:
+    return {
+        "client_id": str(order.get("client_id") or ""),
+        "execution_mode": str(order.get("execution_mode") or "unknown").lower(),
+        "contract": str(order.get("contract") or order.get("symbol") or "").upper(),
+        "supplied_position_id": str(order.get("position_id") or ""),
+        "local_order_id": str(order.get("local_order_id") or ""),
+        "broker_order_id": str(
+            result.get("broker_order_id") or order.get("broker_order_id") or ""
+        ),
+        "filled_qty": _int(result.get("filled_qty"), _int(order.get("filled_qty"))),
+        "fill_price": _float(result.get("fill_price"), _float(order.get("fill_price"))),
+        "filled_ts": str(result.get("filled_ts") or order.get("filled_ts") or ""),
+        "recorded_by": "canonical_exit_fill_reconciler",
+    }
+
+
+def _read_marker(c, client_id: str, local_order_id: str) -> tuple[dict, str]:
+    row = c.execute(
+        "SELECT meta, status FROM orders WHERE client_id=%s AND local_order_id=%s "
+        "AND kind='EXIT' LIMIT 1 FOR UPDATE",
+        (client_id, local_order_id),
+    ).fetchone()
+    if not row:
+        raise LifecycleProjectionError("EXIT_ORDER_IDENTITY_UNRESOLVED")
+    data = dict(row)
+    meta = data.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    marker = dict(meta.get("exit_fill_reconciliation") or {}) if isinstance(meta, dict) else {}
+    return marker, str(data.get("status") or "")
+
+
+def _write_marker(c, client_id: str, local_order_id: str, marker: dict) -> None:
+    cur = c.execute(
+        "UPDATE orders SET meta=COALESCE(meta,'{}'::jsonb) || "
+        "jsonb_build_object('exit_fill_reconciliation', %s::jsonb), updated_ts=NOW() "
+        "WHERE client_id=%s AND local_order_id=%s AND kind='EXIT'",
+        (json.dumps(marker, default=str), client_id, local_order_id),
+    )
+    changed = int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+    if changed != 1:
+        raise LifecycleProjectionError("EXIT_RECONCILIATION_MARKER_WRITE_FAILED")
+
+
+def _begin_reconciliation_attempt(order: dict, result: dict) -> int:
+    client_id, local_order_id = _reconciliation_order_identity(order)
+    if not client_id or not local_order_id:
+        raise LifecycleProjectionError("EXIT_ORDER_IDENTITY_UNRESOLVED")
+
+    def _tx() -> int:
+        with conn() as c:
+            previous, _ = _read_marker(c, client_id, local_order_id)
+            attempt_count = max(0, _int(previous.get("attempt_count"))) + 1
+            marker = {
+                **previous,
+                **_diagnostic_context(order, result),
+                "status": "IN_PROGRESS",
+                "reason_code": "RECONCILIATION_ATTEMPT_STARTED",
+                "error": "",
+                "candidate_position_ids": list(previous.get("candidate_position_ids") or []),
+                "attempt_count": attempt_count,
+                "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _write_marker(c, client_id, local_order_id, marker)
+            return attempt_count
+
+    return int(run_with_retry(_tx))
+
+
+def _failure_reason(exc: Exception) -> tuple[str, str, list[str]]:
+    candidates = list(getattr(exc, "candidate_position_ids", []) or [])
+    if isinstance(exc, ReconciliationIdentityError):
+        return "QUARANTINED", exc.reason_code, candidates
+    if isinstance(exc, PositionUpdateCardinalityError):
+        status = "RETRY_REQUIRED" if exc.row_count == 0 else "QUARANTINED"
+        return status, str(exc), candidates
+    if isinstance(exc, LifecycleProjectionError):
+        text = str(exc).upper()
+        if text.startswith("EXIT_OVERFILL"):
+            return "QUARANTINED", "EXIT_OVERFILL", candidates
+        if text == "NO_POSITIVE_EXIT_FILLS":
+            return "QUARANTINED", "NO_POSITIVE_EXIT_FILLS", candidates
+        if "ENTRY" in text and "UNRESOLVED" in text:
+            return "QUARANTINED", "ENTRY_IDENTITY_UNRESOLVED", candidates
+    return "RETRY_REQUIRED", "RECONCILIATION_SQL_FAILURE", candidates
+
+
+def _finish_reconciliation_attempt(
+    order: dict,
+    result: dict,
+    *,
+    attempt_count: int,
+    reconciled_position_id: str = "",
+    error: Exception | None = None,
+) -> None:
+    client_id, local_order_id = _reconciliation_order_identity(order)
+
+    def _tx() -> None:
+        with conn() as c:
+            previous, _ = _read_marker(c, client_id, local_order_id)
+            preserved_attempts = max(attempt_count, _int(previous.get("attempt_count")))
+            if error is None:
+                marker = {
+                    **previous,
+                    **_diagnostic_context(order, result),
+                    "status": "RECONCILED",
+                    "reason_code": "CANONICAL_EXIT_FILL_RECONCILED",
+                    "error": "",
+                    "position_id": str(reconciled_position_id or ""),
+                    "candidate_position_ids": [],
+                    "attempt_count": preserved_attempts,
+                    "reconciled_at": datetime.now(timezone.utc).isoformat(),
+                }
+            else:
+                status, reason_code, candidates = _failure_reason(error)
+                marker = {
+                    **previous,
+                    **_diagnostic_context(order, result),
+                    "status": status,
+                    "reason_code": reason_code,
+                    "error": str(error),
+                    "candidate_position_ids": candidates,
+                    "attempt_count": preserved_attempts,
+                    "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+                }
+            _write_marker(c, client_id, local_order_id, marker)
+
+    run_with_retry(_tx)
+
+
 def _reconcile_exit_fill(order: dict, result: dict) -> dict:
     client_id = str(order.get("client_id") or "").strip()
     fill_ts = result.get("filled_ts") or order.get("filled_ts") or datetime.now(timezone.utc)
@@ -274,7 +443,7 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
         with conn() as c:
             position = _resolve_position(c, order, fill_ts)
             if not position:
-                raise LifecycleProjectionError("canonical_position_unresolved_or_ambiguous")
+                raise ReconciliationIdentityError("CANONICAL_POSITION_UNRESOLVED")
             position_id = str(position.get("id") or "").strip()
             if not position_id:
                 raise LifecycleProjectionError("canonical_position_id_missing")
@@ -342,7 +511,15 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                 }.items()
                 if key in position_columns
             }
-            _dynamic_update(c, "positions", position_updates, "client_id=%s AND id::text=%s", (client_id, position_id))
+            position_rows_updated = _dynamic_update(
+                c,
+                "positions",
+                position_updates,
+                "client_id=%s AND id::text=%s",
+                (client_id, position_id),
+            )
+            if position_rows_updated != 1:
+                raise PositionUpdateCardinalityError(position_rows_updated)
 
             local_ids = [str(row.get("local_order_id") or "").strip() for row in fills]
             local_ids = [value for value in local_ids if value]
@@ -424,7 +601,68 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                 "official_live_performance_eligible": eligible,
             }
 
-    return run_with_retry(_tx)
+    attempt_count = _begin_reconciliation_attempt(order, result)
+    try:
+        reconciled = run_with_retry(_tx)
+    except Exception as exc:
+        _finish_reconciliation_attempt(
+            order,
+            result,
+            attempt_count=attempt_count,
+            error=exc,
+        )
+        raise
+    _finish_reconciliation_attempt(
+        order,
+        result,
+        attempt_count=attempt_count,
+        reconciled_position_id=str(reconciled.get("position_id") or ""),
+    )
+    return reconciled
+
+
+def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> dict | None:
+    """Retry durable post-fill accounting without broker submit/cancel authority."""
+    client_id = str(client_id or "").strip()
+    local_order_id = str(local_order_id or "").strip()
+    if not client_id or not local_order_id:
+        return None
+
+    def _load() -> dict | None:
+        with conn() as c:
+            row = c.execute(
+                "SELECT * FROM orders WHERE client_id=%s AND local_order_id=%s "
+                "AND kind='EXIT' AND status IN ('EXIT_FILLED','EXIT_PARTIAL_FILL') LIMIT 1",
+                (client_id, local_order_id),
+            ).fetchone()
+            return dict(row) if row else None
+
+    order = run_with_retry(_load)
+    if not order:
+        return None
+    meta = order.get("meta") or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            meta = {}
+    marker = dict(meta.get("exit_fill_reconciliation") or {}) if isinstance(meta, dict) else {}
+    status = str(marker.get("status") or "").upper()
+    if status == "RECONCILED":
+        return {
+            "position_id": str(marker.get("position_id") or ""),
+            "already_reconciled": True,
+        }
+    if status not in {"RETRY_REQUIRED", "QUARANTINED"}:
+        return None
+    result = {
+        "status": order.get("status"),
+        "broker_order_id": order.get("broker_order_id"),
+        "filled_qty": order.get("filled_qty"),
+        "fill_price": order.get("fill_price"),
+        "filled_ts": order.get("filled_ts"),
+    }
+    return _reconcile_exit_fill(order, result)
 
 
 def install_exit_fill_truth_guard() -> None:

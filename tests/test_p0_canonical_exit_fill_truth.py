@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from unittest.mock import MagicMock
+
 import pytest
 
 from ap.exit_fill_truth_guard import (
     LifecycleProjectionError,
+    PositionUpdateCardinalityError,
+    ReconciliationIdentityError,
+    _failure_reason,
+    _finish_reconciliation_attempt,
     _is_partial_result,
+    _reconcile_exit_fill,
     official_live_eligibility,
     project_position_from_exit_fills,
+    retry_exit_fill_reconciliation,
 )
 
 
@@ -148,3 +157,225 @@ def test_official_live_proof_requires_complete_broker_lifecycle(
         exit_broker_order_id=exit_id,
         all_exit_fills_broker_backed=all_exit_fills_broker_backed,
     ) is expected
+
+
+def _exit_order(**overrides) -> dict:
+    row = {
+        "client_id": "jason@example.com",
+        "execution_mode": "live",
+        "local_order_id": "exit-local-1",
+        "broker_order_id": "broker-exit-1",
+        "position_id": "position-1",
+        "contract": "SPY260717C00600000",
+        "status": "EXIT_FILLED",
+        "qty": 1,
+        "filled_qty": 1,
+        "fill_price": 1.35,
+        "filled_ts": "2026-07-16T18:40:51Z",
+        "meta": {},
+    }
+    row.update(overrides)
+    return row
+
+
+def test_reconciliation_exception_routes_to_durable_retry_required(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    finished = MagicMock()
+    monkeypatch.setattr(guard, "_begin_reconciliation_attempt", lambda *_: 1)
+    monkeypatch.setattr(guard, "_finish_reconciliation_attempt", finished)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: (_ for _ in ()).throw(RuntimeError("db down")))
+
+    with pytest.raises(RuntimeError, match="db down"):
+        _reconcile_exit_fill(_exit_order(), {})
+
+    error = finished.call_args.kwargs["error"]
+    assert _failure_reason(error)[:2] == ("RETRY_REQUIRED", "RECONCILIATION_SQL_FAILURE")
+    assert finished.call_args.kwargs["attempt_count"] == 1
+
+
+def test_ambiguous_position_routes_to_durable_quarantine() -> None:
+    error = ReconciliationIdentityError(
+        "CANONICAL_POSITION_AMBIGUOUS", ["position-a", "position-b"]
+    )
+    assert _failure_reason(error) == (
+        "QUARANTINED",
+        "CANONICAL_POSITION_AMBIGUOUS",
+        ["position-a", "position-b"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_reason"),
+    [
+        (RuntimeError("db down"), "RETRY_REQUIRED", "RECONCILIATION_SQL_FAILURE"),
+        (
+            ReconciliationIdentityError(
+                "CANONICAL_POSITION_AMBIGUOUS", ["position-a", "position-b"]
+            ),
+            "QUARANTINED",
+            "CANONICAL_POSITION_AMBIGUOUS",
+        ),
+    ],
+)
+def test_failure_marker_is_durably_written(
+    monkeypatch, error, expected_status, expected_reason
+) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = {}
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_read_marker", lambda *_: ({"attempt_count": 1}, "EXIT_FILLED"))
+    monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: written.update(marker))
+
+    _finish_reconciliation_attempt(
+        _exit_order(), {}, attempt_count=1, error=error
+    )
+    assert written["status"] == expected_status
+    assert written["reason_code"] == expected_reason
+    assert written["attempt_count"] == 1
+    assert written["recorded_by"] == "canonical_exit_fill_reconciler"
+    if expected_reason == "CANONICAL_POSITION_AMBIGUOUS":
+        assert written["candidate_position_ids"] == ["position-a", "position-b"]
+
+
+def test_successful_retry_resolves_durable_marker_without_resetting_attempts(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = {}
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({"status": "RETRY_REQUIRED", "attempt_count": 3}, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: written.update(marker))
+
+    _finish_reconciliation_attempt(
+        _exit_order(), {}, attempt_count=4, reconciled_position_id="position-1"
+    )
+    assert written["status"] == "RECONCILED"
+    assert written["position_id"] == "position-1"
+    assert written["attempt_count"] == 4
+    assert written["candidate_position_ids"] == []
+    assert written["reconciled_at"]
+
+
+def test_zero_row_position_update_stops_before_order_or_proof_mutation(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    class _Connection:
+        def execute(self, *_args, **_kwargs):
+            raise AssertionError("order relink or proof mutation must not execute")
+
+    @contextmanager
+    def _conn():
+        yield _Connection()
+
+    finished = MagicMock()
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_begin_reconciliation_attempt", lambda *_: 1)
+    monkeypatch.setattr(guard, "_finish_reconciliation_attempt", finished)
+    monkeypatch.setattr(guard, "_resolve_position", lambda *_: {
+        "id": "position-1", "client_id": "jason@example.com",
+        "contract": "SPY260717C00600000", "qty": 1, "avg_fill": 1.27,
+    })
+    monkeypatch.setattr(guard, "_load_exit_fills", lambda *_: [{
+        "local_order_id": "exit-local-1", "broker_order_id": "broker-exit-1",
+        "filled_qty": 1, "fill_price": 1.35, "filled_ts": "2026-07-16T18:40:51Z",
+    }])
+    monkeypatch.setattr(guard, "_load_entry_order", lambda *_: {})
+    monkeypatch.setattr(guard, "_table_columns", lambda *_: {
+        "contracts_exited", "quantity_remaining", "exit_price", "realized_pnl",
+        "realized_pnl_pct", "status", "exit_ts", "updated_at",
+    })
+    monkeypatch.setattr(guard, "_dynamic_update", lambda *_args, **_kwargs: 0)
+
+    with pytest.raises(PositionUpdateCardinalityError, match="POSITION_UPDATE_ZERO_ROWS"):
+        _reconcile_exit_fill(_exit_order(), {})
+    assert isinstance(finished.call_args.kwargs["error"], PositionUpdateCardinalityError)
+
+
+def test_retry_uses_stored_fill_and_is_idempotent(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    rows = [
+        _exit_order(meta={"exit_fill_reconciliation": {"status": "RETRY_REQUIRED"}}),
+        _exit_order(meta={"exit_fill_reconciliation": {
+            "status": "RECONCILED", "position_id": "position-1",
+        }}),
+    ]
+    reconcile = MagicMock(return_value={"position_id": "position-1"})
+
+    class _Cursor:
+        def __init__(self, row):
+            self.row = row
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return self.row
+
+    @contextmanager
+    def _conn():
+        yield _Cursor(rows.pop(0))
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_reconcile_exit_fill", reconcile)
+
+    first = retry_exit_fill_reconciliation(
+        client_id="jason@example.com", local_order_id="exit-local-1"
+    )
+    second = retry_exit_fill_reconciliation(
+        client_id="jason@example.com", local_order_id="exit-local-1"
+    )
+    assert first == {"position_id": "position-1"}
+    assert second == {"position_id": "position-1", "already_reconciled": True}
+    reconcile.assert_called_once()
+    stored_result = reconcile.call_args.args[1]
+    assert stored_result["status"] == "EXIT_FILLED"
+    assert stored_result["broker_order_id"] == "broker-exit-1"
+
+
+def test_retry_path_preserves_broker_confirmed_order_status(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    observed = {}
+    monkeypatch.setattr(guard, "_begin_reconciliation_attempt", lambda *_: 2)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: {
+        "position_id": "position-1", "projection": object()
+    })
+    monkeypatch.setattr(
+        guard,
+        "_finish_reconciliation_attempt",
+        lambda order, *_args, **_kwargs: observed.update(status=order["status"]),
+    )
+    _reconcile_exit_fill(_exit_order(status="EXIT_FILLED"), {})
+    assert observed["status"] == "EXIT_FILLED"
+
+
+def test_partial_and_final_fills_share_canonical_reducer(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    calls = []
+    monkeypatch.setattr(guard, "_begin_reconciliation_attempt", lambda *_: 1)
+    monkeypatch.setattr(guard, "_finish_reconciliation_attempt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: calls.append(fn) or {
+        "position_id": "position-1", "projection": object()
+    })
+    _reconcile_exit_fill(_exit_order(status="EXIT_PARTIAL_FILL"), {"status": "PARTIAL_FILL"})
+    _reconcile_exit_fill(_exit_order(status="EXIT_FILLED"), {"status": "FILLED"})
+    assert len(calls) == 2
