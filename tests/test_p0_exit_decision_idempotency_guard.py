@@ -1207,6 +1207,22 @@ def test_submit_wrapper_retires_reserved_exit_row_when_claim_meta_persist_fails_
     assert pos.pending_exit_local_order_id == ""
 
 
+def test_submit_wrapper_retires_reserved_exit_row_when_claim_meta_persist_returns_false_in_live(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=MagicMock(), mode="LIVE")
+
+    engine.order_state_machine.update_order_meta = lambda local_order_id, patch: False
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert engine.order_state_machine.active_order["last_error"] == "EXIT_DECISION_LOCAL_EXIT_META_PERSIST_FAILED"
+    assert pos.pending_exit_local_order_id == ""
+
+
 def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
     generation_claims_table,
     monkeypatch,

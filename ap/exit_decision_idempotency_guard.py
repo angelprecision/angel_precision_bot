@@ -298,10 +298,17 @@ def _ensure_local_exit_intent_row(
     update_meta = getattr(osm, "update_order_meta", None)
     if callable(update_meta):
         try:
-            update_meta(local_order_id, {
+            persisted = update_meta(local_order_id, {
                 "exit_generation_claim_key": generation_key,
                 "exit_generation_claim": int(exit_generation),
             })
+            if persisted is False:
+                _retire_local_exit_intent_after_no_submit(
+                    engine,
+                    local_order_id,
+                    error_text="EXIT_DECISION_LOCAL_EXIT_META_PERSIST_FAILED",
+                )
+                return ""
         except Exception:
             _retire_local_exit_intent_after_no_submit(
                 engine,
