@@ -812,25 +812,119 @@ class APStartupRecovery:
             lambda: list_positions(client_id=self.client_id, status="CLOSING")
         ) or []
 
-    def _load_active_exit_order_for_position(self, position_id: str) -> dict | None:
+    def _resolve_active_exit_order_for_position(
+        self,
+        position: dict,
+        result: dict,
+    ) -> dict | None:
         from ap.db import conn, run_with_retry
 
-        def _get_exit_order(pid=position_id):
-            with conn() as c:
-                c.execute(
-                    """
-                    SELECT *
-                    FROM orders
-                    WHERE client_id=%s AND position_id=%s AND kind='EXIT'
-                      AND status NOT IN ('EXIT_FILLED','REJECTED','CANCELED','EXPIRED','ERROR')
-                    ORDER BY created_ts DESC LIMIT 1
-                    """,
-                    (self.client_id, pid),
-                )
-                return c.fetchone()
+        pos_id = position.get("id")
+        underlying = position.get("underlying") or position.get("ticker", "?")
+        pending_local_id = str(position.get("pending_exit_local_order_id") or "").strip()
+        pending_broker_id = str(position.get("pending_exit_broker_order_id") or "").strip()
 
-        row = run_with_retry(_get_exit_order)
-        return dict(row) if row else None
+        if pending_local_id:
+            def _by_local(local_id=pending_local_id):
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM orders
+                        WHERE client_id=%s
+                          AND local_order_id=%s
+                          AND kind='EXIT'
+                        LIMIT 2
+                        """,
+                        (self.client_id, local_id),
+                    )
+                    return c.fetchall()
+
+            rows = [dict(row) for row in (run_with_retry(_by_local) or [])]
+            if not rows:
+                msg = (
+                    "RECOVERY_PENDING_EXIT_LOCAL_ID_UNRESOLVED "
+                    f"client={self.client_id} pos={pos_id} underlying={underlying} "
+                    f"pending_local_order_id={pending_local_id}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            if len(rows) > 1:
+                candidates = [
+                    f"{str(row.get('local_order_id') or '')}/{str(row.get('broker_order_id') or '')}"
+                    for row in rows
+                ]
+                msg = (
+                    "RECOVERY_PENDING_EXIT_LOCAL_ID_AMBIGUOUS "
+                    f"client={self.client_id} pos={pos_id} underlying={underlying} "
+                    f"pending_local_order_id={pending_local_id} candidates={candidates}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            selected = rows[0]
+        else:
+            def _by_position(pid=pos_id):
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM orders
+                        WHERE client_id=%s
+                          AND position_id=%s
+                          AND kind='EXIT'
+                          AND status NOT IN (
+                              'EXIT_FILLED',
+                              'REJECTED',
+                              'CANCELED',
+                              'CANCELLED',
+                              'EXPIRED',
+                              'ERROR'
+                          )
+                        ORDER BY created_ts DESC
+                        LIMIT 2
+                        """,
+                        (self.client_id, pid),
+                    )
+                    return c.fetchall()
+
+            rows = [dict(row) for row in (run_with_retry(_by_position) or [])]
+            if not rows:
+                msg = (
+                    f"RECOVERY_CLOSING_POSITION_WITHOUT_ACTIVE_EXIT "
+                    f"pos={pos_id} underlying={underlying}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            if len(rows) > 1:
+                candidates = [
+                    f"{str(row.get('local_order_id') or '')}/{str(row.get('broker_order_id') or '')}"
+                    for row in rows
+                ]
+                msg = (
+                    "RECOVERY_ACTIVE_EXIT_IDENTITY_AMBIGUOUS "
+                    f"client={self.client_id} pos={pos_id} underlying={underlying} "
+                    f"candidates={candidates}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            selected = rows[0]
+
+        selected_broker_id = str(selected.get("broker_order_id") or "").strip()
+        if pending_broker_id and pending_broker_id != selected_broker_id:
+            msg = (
+                "RECOVERY_PENDING_EXIT_BROKER_ID_MISMATCH "
+                f"client={self.client_id} pos={pos_id} pending_local_order_id={pending_local_id} "
+                f"expected_broker_order_id={pending_broker_id} "
+                f"selected_broker_order_id={selected_broker_id}"
+            )
+            log.critical("[%s] %s", self.client_id, msg)
+            result.setdefault("errors", []).append(msg)
+            return None
+        return selected
 
     def _load_persisted_exit_order(self, local_order_id: str) -> dict | None:
         from ap.db import conn, run_with_retry
@@ -866,19 +960,13 @@ class APStartupRecovery:
             pos_id     = pos.get("id")
             underlying = pos.get("underlying") or pos.get("ticker", "?")
             try:
-                exit_order = self._load_active_exit_order_for_position(pos_id)
+                exit_order = self._resolve_active_exit_order_for_position(pos, result)
             except Exception as e:
                 log.error("[%s] RECOVERY: exit order lookup failed for pos %s: %s",
                           self.client_id, pos_id, e)
                 continue
 
             if not exit_order:
-                msg = (
-                    f"RECOVERY_CLOSING_POSITION_WITHOUT_ACTIVE_EXIT "
-                    f"pos={pos_id} underlying={underlying}"
-                )
-                log.critical("[%s] %s", self.client_id, msg)
-                result.setdefault("errors", []).append(msg)
                 continue
 
             broker_oid = exit_order.get("broker_order_id")

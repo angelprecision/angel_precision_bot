@@ -182,12 +182,12 @@ def test_recovery_does_not_transition_exit_filled_with_missing_fill_truth():
         def execute(self, *args, **kwargs):
             return self
 
-        def fetchone(self):
-            return {
+        def fetchall(self):
+            return [{
                 "local_order_id": "exit-1",
                 "broker_order_id": "broker-exit-1",
                 "status": "EXIT_ACKNOWLEDGED",
-            }
+            }]
 
     @contextmanager
     def fake_conn():
@@ -249,6 +249,9 @@ def test_recovery_routes_downtime_exit_fill_through_canonical_reducer():
         def execute(self, *args, **kwargs):
             return self
 
+        def fetchall(self):
+            return [next(rows)]
+
         def fetchone(self):
             return next(rows)
 
@@ -306,6 +309,255 @@ def test_recovery_routes_downtime_exit_fill_through_canonical_reducer():
     assert live_exit_orders == []
 
 
+def test_recovery_pending_local_identity_wins_over_newer_unrelated_exit():
+    rec, _ = _make_recovery()
+    rec.broker.get_order.return_value = {"status": "open"}
+    rec.exit_engine = MagicMock()
+    reconcile = MagicMock()
+    result = {"errors": [], "exits_reattached": 0}
+
+    position = {
+        "id": "pos-owned",
+        "underlying": "SPY",
+        "status": "CLOSING",
+        "pending_exit_local_order_id": "exit-owned",
+        "pending_exit_broker_order_id": "broker-owned",
+    }
+    owned_order = {
+        "client_id": rec.client_id,
+        "local_order_id": "exit-owned",
+        "broker_order_id": "broker-owned",
+        "status": "EXIT_ACKNOWLEDGED",
+        "position_id": "pos-owned",
+        "contract": "SPY260626C00500000",
+    }
+
+    class FakeConn:
+        def __init__(self):
+            self.params = None
+
+        def execute(self, _sql, params=()):
+            self.params = params
+            return self
+
+        def fetchall(self):
+            if self.params == (rec.client_id, "exit-owned"):
+                return [owned_order]
+            raise AssertionError(f"unexpected params {self.params}")
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [position]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    fake_db.conn = fake_conn
+
+    fake_guard = types.ModuleType("ap.exit_fill_truth_guard")
+    fake_guard.reconcile_confirmed_exit_fill = reconcile
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+            "ap.exit_fill_truth_guard": fake_guard,
+        },
+    ):
+        live_exit_orders = rec._recover_exit_fills_that_occurred_during_downtime(result)
+        rec._reattach_live_exit_protections(result, live_exit_orders)
+
+    rec.broker.get_order.assert_called_once_with("broker-owned")
+    reconcile.assert_not_called()
+    rec.exit_engine.seed_from_db.assert_called_once()
+    assert live_exit_orders == [owned_order]
+    assert result["errors"] == []
+
+
+def test_recovery_multiple_fallback_active_exits_fail_closed():
+    rec, _ = _make_recovery()
+    rec.exit_engine = MagicMock()
+    rec.osm.transition.return_value = True
+    result = {"errors": [], "exits_reattached": 0}
+
+    rows = [
+        {
+            "local_order_id": "exit-a",
+            "broker_order_id": "broker-a",
+            "status": "EXIT_ACKNOWLEDGED",
+            "position_id": "pos-ambiguous",
+            "contract": "SPY260626C00500000",
+        },
+        {
+            "local_order_id": "exit-b",
+            "broker_order_id": "broker-b",
+            "status": "EXIT_SUBMITTED",
+            "position_id": "pos-ambiguous",
+            "contract": "SPY260626C00500000",
+        },
+    ]
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return rows
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [
+        {"id": "pos-ambiguous", "underlying": "SPY", "status": "CLOSING"}
+    ]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    fake_db.conn = fake_conn
+
+    reconcile = MagicMock()
+    fake_guard = types.ModuleType("ap.exit_fill_truth_guard")
+    fake_guard.reconcile_confirmed_exit_fill = reconcile
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+            "ap.exit_fill_truth_guard": fake_guard,
+        },
+    ):
+        live_exit_orders = rec._recover_exit_fills_that_occurred_during_downtime(result)
+        rec._reattach_live_exit_protections(result, live_exit_orders)
+
+    assert live_exit_orders == []
+    rec.broker.get_order.assert_not_called()
+    rec.osm.transition.assert_not_called()
+    reconcile.assert_not_called()
+    rec.exit_engine.seed_from_db.assert_not_called()
+    assert any("RECOVERY_ACTIVE_EXIT_IDENTITY_AMBIGUOUS" in err for err in result["errors"])
+
+
+def test_recovery_pending_broker_id_mismatch_fails_closed():
+    rec, _ = _make_recovery()
+    rec.exit_engine = MagicMock()
+    result = {"errors": [], "exits_reattached": 0}
+
+    order = {
+        "client_id": rec.client_id,
+        "local_order_id": "exit-owned",
+        "broker_order_id": "broker-actual",
+        "status": "EXIT_ACKNOWLEDGED",
+        "position_id": "pos-mismatch",
+        "contract": "SPY260626C00500000",
+    }
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return [order]
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [
+        {
+            "id": "pos-mismatch",
+            "underlying": "SPY",
+            "status": "CLOSING",
+            "pending_exit_local_order_id": "exit-owned",
+            "pending_exit_broker_order_id": "broker-expected",
+        }
+    ]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    fake_db.conn = fake_conn
+
+    reconcile = MagicMock()
+    fake_guard = types.ModuleType("ap.exit_fill_truth_guard")
+    fake_guard.reconcile_confirmed_exit_fill = reconcile
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+            "ap.exit_fill_truth_guard": fake_guard,
+        },
+    ):
+        live_exit_orders = rec._recover_exit_fills_that_occurred_during_downtime(result)
+        rec._reattach_live_exit_protections(result, live_exit_orders)
+
+    assert live_exit_orders == []
+    rec.broker.get_order.assert_not_called()
+    rec.osm.transition.assert_not_called()
+    reconcile.assert_not_called()
+    rec.exit_engine.seed_from_db.assert_not_called()
+    assert any("RECOVERY_PENDING_EXIT_BROKER_ID_MISMATCH" in err for err in result["errors"])
+
+
+def test_recovery_missing_authoritative_pending_local_id_fails_closed():
+    rec, _ = _make_recovery()
+    rec.exit_engine = MagicMock()
+    result = {"errors": [], "exits_reattached": 0}
+
+    class FakeConn:
+        def __init__(self):
+            self.params = None
+
+        def execute(self, _sql, params=()):
+            self.params = params
+            return self
+
+        def fetchall(self):
+            if self.params == (rec.client_id, "exit-missing"):
+                return []
+            raise AssertionError(f"unexpected params {self.params}")
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [
+        {
+            "id": "pos-missing-owned",
+            "underlying": "SPY",
+            "status": "CLOSING",
+            "pending_exit_local_order_id": "exit-missing",
+            "pending_exit_broker_order_id": "broker-missing",
+        }
+    ]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    fake_db.conn = fake_conn
+
+    reconcile = MagicMock()
+    fake_guard = types.ModuleType("ap.exit_fill_truth_guard")
+    fake_guard.reconcile_confirmed_exit_fill = reconcile
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+            "ap.exit_fill_truth_guard": fake_guard,
+        },
+    ):
+        live_exit_orders = rec._recover_exit_fills_that_occurred_during_downtime(result)
+        rec._reattach_live_exit_protections(result, live_exit_orders)
+
+    assert live_exit_orders == []
+    rec.broker.get_order.assert_not_called()
+    rec.osm.transition.assert_not_called()
+    reconcile.assert_not_called()
+    rec.exit_engine.seed_from_db.assert_not_called()
+    assert any("RECOVERY_PENDING_EXIT_LOCAL_ID_UNRESOLVED" in err for err in result["errors"])
+
+
 def test_recovery_reports_closing_position_without_active_exit():
     rec, _ = _make_recovery()
     rec.exit_engine = MagicMock()
@@ -320,6 +572,9 @@ def test_recovery_reports_closing_position_without_active_exit():
     class FakeConn:
         def execute(self, *args, **kwargs):
             return self
+
+        def fetchall(self):
+            return []
 
         def fetchone(self):
             return None
@@ -387,6 +642,9 @@ def test_recovery_reattaches_partial_downtime_exit_after_canonical_reconcile():
         def execute(self, *args, **kwargs):
             return self
 
+        def fetchall(self):
+            return [next(rows)]
+
         def fetchone(self):
             return next(rows)
 
@@ -447,8 +705,8 @@ def test_recovery_reattaches_active_exit_without_canonical_reconcile():
         def execute(self, *args, **kwargs):
             return self
 
-        def fetchone(self):
-            return next(rows)
+        def fetchall(self):
+            return [next(rows)]
 
     @contextmanager
     def fake_conn():
@@ -479,6 +737,61 @@ def test_recovery_reattaches_active_exit_without_canonical_reconcile():
     reconcile.assert_not_called()
     rec.broker.get_order.assert_called_once_with("broker-exit-4")
     rec.exit_engine.seed_from_db.assert_called_once()
+    assert result["exits_reattached"] == 1
+
+
+def test_recovery_single_fallback_active_exit_remains_supported():
+    rec, _ = _make_recovery()
+    rec.broker.get_order.return_value = {"status": "open"}
+    rec.exit_engine = MagicMock()
+    result = {"errors": [], "exits_reattached": 0}
+
+    order = {
+        "local_order_id": "exit-fallback",
+        "broker_order_id": "broker-fallback",
+        "status": "EXIT_ACKNOWLEDGED",
+        "position_id": "pos-fallback",
+        "contract": "QQQ260626P00400000",
+    }
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return [order]
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [
+        {"id": "pos-fallback", "underlying": "QQQ", "status": "CLOSING"}
+    ]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+    fake_db.conn = fake_conn
+
+    reconcile = MagicMock()
+    fake_guard = types.ModuleType("ap.exit_fill_truth_guard")
+    fake_guard.reconcile_confirmed_exit_fill = reconcile
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+            "ap.exit_fill_truth_guard": fake_guard,
+        },
+    ):
+        live_exit_orders = rec._recover_exit_fills_that_occurred_during_downtime(result)
+        rec._reattach_live_exit_protections(result, live_exit_orders)
+
+    assert live_exit_orders == [order]
+    rec.broker.get_order.assert_called_once_with("broker-fallback")
+    reconcile.assert_not_called()
+    rec.exit_engine.seed_from_db.assert_called_once()
+    assert result["errors"] == []
     assert result["exits_reattached"] == 1
 
 
@@ -519,6 +832,9 @@ def test_recovery_does_not_reattach_full_downtime_exit_after_canonical_reconcile
     class FakeConn:
         def execute(self, *args, **kwargs):
             return self
+
+        def fetchall(self):
+            return [next(rows)]
 
         def fetchone(self):
             return next(rows)
