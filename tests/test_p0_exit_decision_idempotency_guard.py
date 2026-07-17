@@ -1262,6 +1262,97 @@ def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
     assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
 
 
+def test_submit_wrapper_claim_loser_retires_distinct_reserved_exit_intent(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: {
+            "claimed": False,
+            "claim_state": guard._CLAIM_STATE_CLAIMED,
+            "local_order_id": "exit-local-winning",
+        },
+    )
+    callback = MagicMock()
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert callback.call_count == 0
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert engine.order_state_machine.active_order["last_error"] == "EXIT_DECISION_GENERATION_DUPLICATE_SUPPRESSED"
+
+
+def test_submit_wrapper_claim_loser_keeps_shared_reserved_exit_intent(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    callback = MagicMock()
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
+
+    reserved_local_id = "exit-local-shared"
+    engine.order_state_machine.active_order = {
+        "local_order_id": reserved_local_id,
+        "broker_order_id": "",
+        "status": "EXIT_REQUESTED",
+        "position_id": pos.position_id,
+        "meta": {},
+    }
+    engine.order_state_machine.active_orders_by_position[pos.position_id] = engine.order_state_machine.active_order
+
+    def same_claim(**kwargs):
+        engine.order_state_machine.active_order["local_order_id"] = reserved_local_id
+        pos.pending_exit_local_order_id = reserved_local_id
+        return {
+            "claimed": False,
+            "claim_state": guard._CLAIM_STATE_CLAIMED,
+            "local_order_id": reserved_local_id,
+        }
+
+    monkeypatch.setattr(guard, "_ensure_local_exit_intent_row", lambda *args, **kwargs: reserved_local_id)
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", same_claim)
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert callback.call_count == 0
+    assert engine.order_state_machine.active_order["status"] == "EXIT_REQUESTED"
+
+
+def test_submit_wrapper_claim_loser_cleanup_refuses_after_submit_evidence(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    callback = MagicMock()
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
+
+    def losing_claim(**kwargs):
+        engine.order_state_machine.active_order["submitted_ts"] = "2026-07-17T22:00:00+00:00"
+        meta = dict(engine.order_state_machine.active_order.get("meta") or {})
+        meta["submit_intent_at"] = "2026-07-17T21:59:59+00:00"
+        engine.order_state_machine.active_order["meta"] = meta
+        return {
+            "claimed": False,
+            "claim_state": guard._CLAIM_STATE_CLAIMED,
+            "local_order_id": "exit-local-winning",
+        }
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", losing_claim)
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert callback.call_count == 0
+    assert engine.order_state_machine.active_order["status"] == "EXIT_REQUESTED"
+    assert engine.order_state_machine.active_order["submitted_ts"] == "2026-07-17T22:00:00+00:00"
+
+
 def test_engine_reserved_exit_request_predicate_allows_exact_reserved_row() -> None:
     from ap_exit_engine import _is_reserved_local_exit_submit_intent
 

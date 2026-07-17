@@ -836,7 +836,15 @@ def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, 
         return
     status = str(order.get("status") or "").strip().upper()
     broker_order_id = str(order.get("broker_order_id") or "").strip()
-    if status != "EXIT_REQUESTED" or broker_order_id:
+    order_meta = _claim_meta_dict(order)
+    if (
+        status != "EXIT_REQUESTED"
+        or broker_order_id
+        or order.get("submitted_ts")
+        or str(order_meta.get("submit_intent_at") or "").strip()
+        or bool(order_meta.get("split_brain_quarantine"))
+        or bool(order_meta.get("reconciliation_required"))
+    ):
         return
     try:
         transition(local_order_id, "ERROR", last_error=error_text or "NO_POST_ATTEMPTED")
@@ -1298,6 +1306,14 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         exit_generation = 0
                         claim = {"claimed": True}
                     if not claim.get("claimed"):
+                        winning_local_id = str(claim.get("local_order_id") or "").strip()
+                        reserved_local_id = str(local_order_id or "").strip()
+                        if reserved_local_id and winning_local_id != reserved_local_id:
+                            _retire_local_exit_intent_after_no_submit(
+                                self,
+                                reserved_local_id,
+                                error_text="EXIT_DECISION_GENERATION_DUPLICATE_SUPPRESSED",
+                            )
                         log.critical(
                             "[%s] EXIT_DECISION_GENERATION_DUPLICATE_SUPPRESSED client_id=%s position_id=%s key=%s qty_remaining=%s exit_generation=%s action=%s reason_code=%s existing_state=%s",
                             getattr(pos, "ticker", ""),
