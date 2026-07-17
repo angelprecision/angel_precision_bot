@@ -96,7 +96,40 @@ class _FakeClaimConnection:
 
     def execute(self, sql, params=()):
         sql = " ".join(str(sql).split())
-        if sql.startswith("INSERT INTO exit_decision_generation_claims"):
+        if sql.startswith("UPDATE exit_decision_generation_claims SET client_id="):
+            (
+                client_id,
+                position_id,
+                remaining_qty,
+                exit_generation,
+                decision_action,
+                decision_reason_code,
+                update_state,
+                generation_key,
+                released_state,
+            ) = params
+            existing = self.store.get(generation_key)
+            if existing is not None and existing.get("claim_state") == released_state:
+                row = {
+                    "generation_key": generation_key,
+                    "client_id": client_id,
+                    "position_id": position_id,
+                    "remaining_qty": remaining_qty,
+                    "exit_generation": exit_generation,
+                    "decision_action": decision_action,
+                    "decision_reason_code": decision_reason_code,
+                    "claim_state": update_state,
+                    "local_order_id": None,
+                    "broker_order_id": None,
+                    "last_error": None,
+                    "claimed_at": None,
+                    "released_at": None,
+                }
+                self.store[generation_key] = row
+                self._row = dict(row)
+            else:
+                self._row = None
+        elif sql.startswith("INSERT INTO exit_decision_generation_claims"):
             (
                 generation_key,
                 client_id,
@@ -106,11 +139,9 @@ class _FakeClaimConnection:
                 decision_action,
                 decision_reason_code,
                 inserted_state,
-                update_state,
-                released_state,
             ) = params
             existing = self.store.get(generation_key)
-            if existing is None or existing.get("claim_state") == released_state:
+            if existing is None:
                 row = {
                     "generation_key": generation_key,
                     "client_id": client_id,
@@ -119,7 +150,7 @@ class _FakeClaimConnection:
                     "exit_generation": exit_generation,
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
-                    "claim_state": update_state if existing else inserted_state,
+                    "claim_state": inserted_state,
                     "local_order_id": None,
                     "broker_order_id": None,
                     "last_error": None,
@@ -344,8 +375,33 @@ def test_durable_generation_claim_is_atomic(monkeypatch) -> None:
         decision=_decision(),
     )
     assert claimed["claimed"] is True
-    assert "claim_state" in captured["sql"]
-    assert "WHERE exit_decision_generation_claims.claim_state=%s" in captured["sql"]
+    assert "ON CONFLICT (generation_key) DO NOTHING" in captured["sql"] or "UPDATE exit_decision_generation_claims SET" in captured["sql"]
+
+
+def test_durable_generation_claim_does_not_reclaim_existing_claimed_row(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    first = guard._claim_durable_decision_generation(
+        generation_key="client|position|3|1",
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+    )
+    second = guard._claim_durable_decision_generation(
+        generation_key="client|position|3|1",
+        client_id="client",
+        position_id="position",
+        remaining_qty=3,
+        exit_generation=1,
+        decision=_decision(),
+    )
+    assert first["claimed"] is True
+    assert second["claimed"] is False
+    assert second["claim_state"] == guard._CLAIM_STATE_CLAIMED
 
 
 def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> None:
@@ -685,6 +741,45 @@ def test_submit_wrapper_does_not_depend_on_ledger_for_duplicate_suppression(gene
     assert callback_count == 1
 
 
+def test_submit_wrapper_generation_read_failure_fails_open(monkeypatch) -> None:
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-open",
+        "broker_order_id": "exit-broker-open",
+    })
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is True
+    assert callback.call_count == 1
+
+
+def test_submit_wrapper_claim_acquisition_failure_fails_open(monkeypatch) -> None:
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-open",
+        "broker_order_id": "exit-broker-open",
+    })
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("claim unavailable")),
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is True
+    assert callback.call_count == 1
+
+
 def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     generation_claims_table, monkeypatch
 ) -> None:
@@ -807,16 +902,51 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     ]
 
 
-def test_submit_wrapper_blocks_when_claim_acquisition_fails(monkeypatch) -> None:
-    callback = MagicMock()
+def test_submit_wrapper_post_submit_claim_update_failure_does_not_raise(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-safe",
+        "broker_order_id": "exit-broker-safe",
+    })
     monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
     monkeypatch.setattr(
         guard,
-        "_claim_durable_decision_generation",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")),
+        "_update_durable_decision_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("post-submit write failed")),
     )
     wrapped = guard.wrap_submit(_invoke_submit_callback)
     pos = _pos()
+    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is True
+    assert callback.call_count == 1
+    replay_pos = _pos()
+    assert wrapped(_make_submit_engine(replay_pos, callback=callback), replay_pos, _decision()) is False
+    assert callback.call_count == 1
+
+
+def test_client_runner_source_wires_order_state_machine_into_exit_engine() -> None:
+    source = (Path(__file__).resolve().parents[1] / "client_runner.py").read_text()
+    assert "exit_eng.order_state_machine = self.order_state_machine" in source
+    assert "exit_eng.osm = self.order_state_machine" in source
+
+
+def test_submit_wrapper_blocks_when_claim_already_exists(generation_claims_table, monkeypatch) -> None:
+    callback = MagicMock()
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos()
+    first_engine = _make_submit_engine(_pos(), callback=MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-claimed",
+        "broker_order_id": "exit-broker-claimed",
+    }))
+    assert wrapped(first_engine, _pos(), _decision()) is True
     assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is False
     assert callback.call_count == 0
 

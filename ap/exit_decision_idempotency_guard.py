@@ -214,25 +214,47 @@ def _claim_durable_decision_generation(
     def _claim() -> dict:
         with conn() as c:
             row = c.execute(
-                "INSERT INTO exit_decision_generation_claims ("
-                "generation_key, client_id, position_id, remaining_qty, "
-                "exit_generation, decision_action, decision_reason_code, "
-                "claim_state, claimed_at, released_at, local_order_id, broker_order_id, last_error"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,NULL,NULL,NULL) "
-                "ON CONFLICT (generation_key) DO UPDATE SET "
-                "client_id=EXCLUDED.client_id, "
-                "position_id=EXCLUDED.position_id, "
-                "remaining_qty=EXCLUDED.remaining_qty, "
-                "exit_generation=EXCLUDED.exit_generation, "
-                "decision_action=EXCLUDED.decision_action, "
-                "decision_reason_code=EXCLUDED.decision_reason_code, "
+                "UPDATE exit_decision_generation_claims SET "
+                "client_id=%s, "
+                "position_id=%s, "
+                "remaining_qty=%s, "
+                "exit_generation=%s, "
+                "decision_action=%s, "
+                "decision_reason_code=%s, "
                 "claim_state=%s, "
                 "claimed_at=NOW(), "
                 "released_at=NULL, "
                 "local_order_id=NULL, "
                 "broker_order_id=NULL, "
                 "last_error=NULL "
-                "WHERE exit_decision_generation_claims.claim_state=%s "
+                "WHERE generation_key=%s AND claim_state=%s "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at",
+                (
+                    client_id,
+                    position_id,
+                    remaining_qty,
+                    exit_generation,
+                    str(getattr(decision, "action", "") or ""),
+                    str(getattr(decision, "reason_code", "") or ""),
+                    _CLAIM_STATE_CLAIMED,
+                    generation_key,
+                    _CLAIM_STATE_RELEASED_NO_SUBMIT,
+                ),
+            ).fetchone()
+            if row:
+                claimed = dict(row)
+                claimed["claimed"] = True
+                return claimed
+
+            row = c.execute(
+                "INSERT INTO exit_decision_generation_claims ("
+                "generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, "
+                "claim_state, claimed_at, released_at, local_order_id, broker_order_id, last_error"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,NULL,NULL,NULL) "
+                "ON CONFLICT (generation_key) DO NOTHING "
                 "RETURNING generation_key, client_id, position_id, remaining_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
@@ -245,8 +267,6 @@ def _claim_durable_decision_generation(
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
                     _CLAIM_STATE_CLAIMED,
-                    _CLAIM_STATE_CLAIMED,
-                    _CLAIM_STATE_RELEASED_NO_SUBMIT,
                 ),
             ).fetchone()
             if row:
@@ -676,7 +696,19 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             generation_key = ""
             exit_generation = 0
             if _decision_should_act(decision):
-                durable = _durable_exit_generation(pos, resolved_client)
+                try:
+                    durable = _durable_exit_generation(pos, resolved_client)
+                except Exception as exc:
+                    log.critical(
+                        "[%s] EXIT_DECISION_GENERATION_READ_UNAVAILABLE client_id=%s position_id=%s action=%s reason_code=%s error=%s",
+                        getattr(pos, "ticker", ""),
+                        resolved_client,
+                        position_id,
+                        getattr(decision, "action", ""),
+                        getattr(decision, "reason_code", ""),
+                        exc,
+                    )
+                    durable = None
                 if durable is not None:
                     generation_key, exit_generation = durable
                     try:
@@ -701,7 +733,9 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             getattr(decision, "reason_code", ""),
                             exc,
                         )
-                        return False
+                        generation_key = ""
+                        exit_generation = 0
+                        claim = {"claimed": True}
                     if not claim.get("claimed"):
                         log.critical(
                             "[%s] EXIT_DECISION_GENERATION_DUPLICATE_SUPPRESSED client_id=%s position_id=%s key=%s qty_remaining=%s exit_generation=%s action=%s reason_code=%s existing_state=%s",
@@ -775,13 +809,25 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     callback_trace,
                     callback_returned,
                 )
-                _update_durable_decision_generation(
-                    generation_key,
-                    claim_state=claim_state,
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_order_id,
-                    error_text=error_text,
-                )
+                try:
+                    _update_durable_decision_generation(
+                        generation_key,
+                        claim_state=claim_state,
+                        local_order_id=local_order_id,
+                        broker_order_id=broker_order_id,
+                        error_text=error_text,
+                    )
+                except Exception as exc:
+                    log.critical(
+                        "[%s] EXIT_DECISION_GENERATION_POST_SUBMIT_UPDATE_FAILED client_id=%s position_id=%s key=%s claim_state=%s callback_returned=%s error=%s",
+                        getattr(pos, "ticker", ""),
+                        resolved_client,
+                        position_id,
+                        generation_key,
+                        claim_state,
+                        callback_returned,
+                        exc,
+                    )
             return callback_returned
         finally:
             with self._lock:

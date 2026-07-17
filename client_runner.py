@@ -2521,6 +2521,8 @@ class ClientRunner(threading.Thread):
             self._mark_failed("exit_engine_missing")
             self.stopped.set()
             return
+        exit_eng.order_state_machine = self.order_state_machine
+        exit_eng.osm = self.order_state_machine
 
         # PR D / FIX-2 (BUG-CR-4): wire kill_switch_fn to read the explicit
         # self.kill_switch_active flag. The old lambda
