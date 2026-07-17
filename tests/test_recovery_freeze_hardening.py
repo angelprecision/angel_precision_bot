@@ -306,6 +306,49 @@ def test_recovery_routes_downtime_exit_fill_through_canonical_reducer():
     assert live_exit_orders == []
 
 
+def test_recovery_reports_closing_position_without_active_exit():
+    rec, _ = _make_recovery()
+    rec.exit_engine = MagicMock()
+    result = {"errors": [], "exits_reattached": 0}
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.list_positions = lambda client_id=None, status=None: [
+        {"id": "pos-missing", "underlying": "SPY", "status": "CLOSING"}
+    ]
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+
+    class FakeConn:
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchone(self):
+            return None
+
+    @contextmanager
+    def fake_conn():
+        yield FakeConn()
+
+    fake_db.conn = fake_conn
+
+    with patch.dict(
+        sys.modules,
+        {
+            "ap.db": fake_db,
+            "ap_reconciler": _fake_reconciler_module(),
+        },
+    ):
+        live_exit_orders = rec._recover_exit_fills_that_occurred_during_downtime(result)
+
+    assert live_exit_orders == []
+    rec.broker.get_order.assert_not_called()
+    rec.exit_engine.seed_from_db.assert_not_called()
+    assert any(
+        "RECOVERY_CLOSING_POSITION_WITHOUT_ACTIVE_EXIT pos=pos-missing underlying=SPY"
+        in err
+        for err in result["errors"]
+    )
+
+
 def test_recovery_reattaches_partial_downtime_exit_after_canonical_reconcile():
     rec, _ = _make_recovery()
     rec.broker.get_order.return_value = {

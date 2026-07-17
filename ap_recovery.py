@@ -873,6 +873,12 @@ class APStartupRecovery:
                 continue
 
             if not exit_order:
+                msg = (
+                    f"RECOVERY_CLOSING_POSITION_WITHOUT_ACTIVE_EXIT "
+                    f"pos={pos_id} underlying={underlying}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
                 continue
 
             broker_oid = exit_order.get("broker_order_id")
