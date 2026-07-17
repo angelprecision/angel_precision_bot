@@ -48,12 +48,23 @@ SET performance_taxonomy = CASE
         WHEN LOWER(COALESCE(execution_mode, '')) = 'paper'
             THEN 'paper_execution_excluded_from_live_learning'
         ELSE 'execution_mode_or_originating_entry_identity_unknown'
+    END,
+    quote_domain_consistent = CASE
+        WHEN official_live_performance_eligible IS TRUE
+          AND LOWER(COALESCE(execution_mode, '')) = 'live'
+            THEN TRUE
+        WHEN LOWER(COALESCE(execution_mode, '')) IN ('live', 'paper')
+            THEN FALSE
+        ELSE NULL
     END
 WHERE performance_taxonomy = 'UNKNOWN_QUARANTINED'
    OR performance_taxonomy IS NULL;
 
-CREATE INDEX IF NOT EXISTS idx_proof_trades_training_eligible_closed
-    ON proof_trades (training_eligible, closed_at DESC);
+-- Match the exact Kelly-history existence probe without indexing every
+-- quarantined/PAPER row behind a low-selectivity boolean prefix.
+CREATE INDEX IF NOT EXISTS idx_proof_trades_live_training_position
+    ON proof_trades (client_email, position_id)
+    WHERE training_eligible IS TRUE;
 
 CREATE INDEX IF NOT EXISTS idx_proof_trades_performance_taxonomy_closed
     ON proof_trades (performance_taxonomy, closed_at DESC);

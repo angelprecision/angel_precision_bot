@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import ap.proof_taxonomy_guard as guard
@@ -30,12 +31,14 @@ def test_taxonomy_only_official_live_is_training_eligible() -> None:
     )
     assert official["performance_taxonomy"] == "LIVE_OFFICIAL"
     assert official["training_eligible"] is True
+    assert official["quote_domain_consistent"] is True
 
     live_unreconciled = guard.classify_performance_taxonomy(
         {"execution_mode": "live", "official_live_performance_eligible": False}
     )
     assert live_unreconciled["performance_taxonomy"] == "LIVE_UNRECONCILED"
     assert live_unreconciled["training_eligible"] is False
+    assert live_unreconciled["quote_domain_consistent"] is False
 
     paper = guard.classify_performance_taxonomy(
         {"execution_mode": "paper", "official_live_performance_eligible": False}
@@ -47,6 +50,18 @@ def test_taxonomy_only_official_live_is_training_eligible() -> None:
     unknown = guard.classify_performance_taxonomy({"execution_mode": "unknown"})
     assert unknown["performance_taxonomy"] == "UNKNOWN_QUARANTINED"
     assert unknown["training_eligible"] is False
+
+
+def test_taxonomy_migration_uses_exact_partial_training_index() -> None:
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "migrations"
+        / "20260716_proof_performance_taxonomy.sql"
+    ).read_text()
+
+    assert "ON proof_trades (client_email, position_id)" in migration
+    assert "WHERE training_eligible IS TRUE" in migration
+    assert "quote_domain_consistent = CASE" in migration
 
 
 def test_proof_writer_uses_originating_entry_mode_not_explicit_live(monkeypatch) -> None:

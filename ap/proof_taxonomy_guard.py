@@ -190,14 +190,14 @@ def classify_performance_taxonomy(row: dict[str, Any]) -> dict[str, Any]:
             "performance_taxonomy": "LIVE_OFFICIAL",
             "training_eligible": True,
             "taxonomy_reason": "tradier_exit_proof_lock_passed",
-            "quote_domain_consistent": row.get("quote_domain_consistent"),
+            "quote_domain_consistent": True,
         }
     if mode == "live":
         return {
             "performance_taxonomy": "LIVE_UNRECONCILED",
             "training_eligible": False,
             "taxonomy_reason": "live_row_missing_complete_broker_proof",
-            "quote_domain_consistent": row.get("quote_domain_consistent"),
+            "quote_domain_consistent": False,
         }
     if mode == "paper":
         return {
