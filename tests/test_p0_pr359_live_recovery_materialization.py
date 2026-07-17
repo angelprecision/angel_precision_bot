@@ -2,14 +2,23 @@
 tests/test_p0_pr359_live_recovery_materialization.py
 
 PR #359 — LIVE watcher ownership and deferred materialization.
-7 HARD HOLD blockers:
-  B1  48h lookback, not midnight-calendar (prior-evening WMT/QCOM included)
+
+Regression coverage:
+  B1  LIVE candidate window uses prior-trading-session identity, not a
+      rolling hour count (Friday→Monday and holiday-weekend safe)
   B2  LIVE_RECOVERY_MISSED_TRIGGER -> REJECTED (not WATCHING)
   B3  Ownerless CREATED LIVE orders block; PAPER orders do not
   B4  _restore UPDATE contains NOT EXISTS fence (TOCTOU prevention)
   B5  intel_rejected: risk_veto prefix is terminal policy skip
   B6  Stale/no-timestamp quotes fail closed
   B7  WMT/QCOM/C incident replays through real classifier
+  Session gate:
+    • sig_date must equal prior trading session (ET) OR today (ET)
+    • naive/malformed timestamps fail closed (no calendar guessing)
+    • NYSE calendar unavailable → LIVE recovery skipped entirely
+  Legacy canonical CAS:
+    • empty durable canonical is atomically re-proven and backfilled in
+      the SAME UPDATE inside claim_deferred_materialization()
 """
 from __future__ import annotations
 
@@ -55,13 +64,17 @@ def _no_ts_quote(price):
 def _q_row(*, symbol, direction, trigger, signal_id="sig-001",
            last_error=None, execution_mode="live", row_id=1, created_hours_ago=12,
            signal_date=None):
-    # signal_date in the payload is the session-gate anchor.  Default to today
-    # UTC (== today ET during business hours) so existing tests pass the
-    # _classify() session check (sig_date == today_et_date) without needing to
-    # mock the NYSE calendar.  Tests that exercise session-boundary behaviour
-    # pass an explicit signal_date string (ISO date, e.g. "2026-07-10").
-    from datetime import date as _date
-    _sig_date_str = signal_date if signal_date is not None else _date.today().isoformat()
+    # signal_date in the payload is the session-gate anchor.  Default to
+    # today (ET calendar) so existing tests pass the _classify() session
+    # check (sig_date == today_et_date) without needing to mock the NYSE
+    # calendar.  Tests that exercise session-boundary behaviour pass an
+    # explicit signal_date string (ISO date, e.g. "2026-07-10").
+    # Never use _date.today() — it uses the runner's local timezone which
+    # can diverge from Eastern time near midnight boundaries.
+    _sig_date_str = (
+        signal_date if signal_date is not None
+        else datetime.now(ET).date().isoformat()
+    )
     return {
         "id": row_id,
         "client_id": "jasoncosby1@gmail.com",
@@ -125,8 +138,14 @@ def _run_recovery(*, tq_rows, broker, client_id="jasoncosby1@gmail.com",
     fdb.conn = _Conn
     fdb.run_with_retry = lambda fn, *a, **k: fn()
 
+    # Install a mock NYSE calendar so LIVE recovery doesn't fail-closed
+    # on the calendar gate.  Individual boundary tests override this via
+    # patch("ap_recovery._prior_trading_session_date_et", ...).
+    _fake_flatline = types.ModuleType("ap.flatline_alarm")
+    _fake_flatline.is_trading_day = lambda d: d.weekday() < 5
+
     with patch("ap_recovery.os.getenv", return_value="48"), \
-         patch.dict(sys.modules, {"ap.db": fdb}):
+         patch.dict(sys.modules, {"ap.db": fdb, "ap.flatline_alarm": _fake_flatline}):
         rec._reseed_watchers({})
     return sqls, updates
 
@@ -717,68 +736,6 @@ def test_p0_mark_missed_fence_has_fill_evidence_or():
     assert "filled_ts" in body.lower(), "_mark_missed NOT EXISTS must check filled_ts"
 
 
-def _skip_old_test_b1_mark_missed_blocked():
-    """Replaced by test_b1_mark_missed_sql_contains_fill_predicate."""
-    import ap_recovery as _r, types as _t
-
-    mark_sqls: list[tuple] = []
-
-    class _C:
-        def __init__(self):
-            self.rowcount = 0  # UPDATE returns 0 when NOT EXISTS blocks
-            self._u = ""
-
-        def execute(self, sql, params=()):
-            norm = " ".join(str(sql).split())
-            self._u = norm.upper()
-            if "UPDATE" in self._u:
-                mark_sqls.append((norm, tuple(params)))
-
-        def fetchall(self):
-            if "FROM TRADE_QUEUE" in self._u or "WATCHING" in self._u:
-                return [_q_row(symbol="WMT", direction="CALL", trigger=55.0)]
-            if "FROM ORDERS" in self._u:
-                return [{
-                    "id": "ord-race", "kind": "ENTRY", "execution_mode": "live",
-                    "status": "CANCELED", "signal_id": "sig-001",
-                    "canonical_signal_id": "canonical-sig-001",
-                    "filled_qty": 1, "filled_ts": "2026-07-17T09:35:00Z",
-                }]
-            return []
-
-        def fetchone(self):
-            rows = self.fetchall()
-            return rows[0] if rows else None
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-
-    class _Conn:
-        def __enter__(self): return _C()
-        def __exit__(self, *_): pass
-
-    rec = object.__new__(_r.APStartupRecovery)
-    rec.client_id = "jasoncosby1@gmail.com"
-    rec.mc = SimpleNamespace(mode="LIVE")
-    rec.entry_watcher = None
-    rec.broker = _fresh_quote(58.0)
-
-    fdb = _t.ModuleType("ap.db")
-    fdb.conn = _Conn
-    fdb.run_with_retry = lambda fn, *a, **k: fn()
-
-    with patch("ap_recovery.os.getenv", return_value="48"), \
-         patch.dict(sys.modules, {"ap.db": fdb}):
-        rec._reseed_watchers({})
-
-    missed = [(s, p) for s, p in mark_sqls if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
-    assert missed, "Expected _mark_missed UPDATE to be attempted"
-    mark_sql = missed[0][0].upper()
-    assert "FILLED_QTY" in mark_sql, (
-        "_mark_missed SQL must include filled_qty predicate. "
-        f"SQL: {missed[0][0][:400]}"
-    )
-
-
 # Intended-session enforcement tests ─────────────────────────────────────────
 
 def test_intended_session_prior_trading_session_helpers_exist():
@@ -798,9 +755,9 @@ def test_intended_session_prior_trading_session_helpers_exist():
 def test_intended_session_friday_signal_accepted_on_monday():
     """Signal from prior Friday evening session must be eligible on Monday morning.
 
-    The old 28h rolling window excluded this row (~63h ago). The new
-    prior-trading-session gate admits it because signal_date == Friday ==
-    _prior_session_date on Monday.
+    A rolling hour-count window (e.g. 28h) would exclude a ~63h-old Friday
+    signal.  The prior-trading-session gate admits it because signal_date ==
+    Friday == _prior_session_date on Monday.
     """
     from datetime import date as _date
     FRIDAY = _date(2026, 7, 10)   # prior trading session
@@ -895,15 +852,13 @@ def test_b1_mark_missed_sql_contains_fill_predicate():
     )
 
 
-# Intended-session enforcement tests ─────────────────────────────────────────
-
 def test_intended_session_holiday_weekend_signal_accepted():
     """Signal from Thursday (last trading day before 3-day holiday) must be
     eligible on the following Tuesday morning.
 
-    The old 28h window would exclude Thursday signals on Tuesday (~86h gap).
-    The prior-session gate admits them because signal_date == Thursday ==
-    _prior_session_date on the post-holiday Tuesday.
+    A rolling hour-count window would exclude Thursday signals on Tuesday
+    (~86h gap).  The prior-session gate admits them because signal_date ==
+    Thursday == _prior_session_date on the post-holiday Tuesday.
     """
     from datetime import date as _date
     # July 4th 2026 falls on Saturday; no holiday but use a plausible 3-day weekend
@@ -926,7 +881,7 @@ def test_intended_session_holiday_weekend_signal_accepted():
 def test_intended_session_previous_completed_session_rejected():
     """Signal from a session TWO trading days ago must be rejected.
 
-    The old 28h window could admit two-sessions-back signals on a normal
+    A rolling 28h window could admit two-sessions-back signals on a normal
     weekday (Wed 09:15 − 28h = Mon 05:15 → all of Tuesday).  The session
     gate explicitly rejects any signal_date that is neither the prior session
     nor today.
@@ -1015,3 +970,455 @@ def test_intended_session_missing_signal_date_fails_closed():
         "Row with no extractable signal date must be skipped (session_unprovable). "
         f"Got restore={len(restore)} missed={len(missed)}."
     )
+
+
+# Signal-date timezone normalization ─────────────────────────────────────────
+
+def test_signal_date_utc_timestamp_converted_to_et_boundary():
+    """created_at="2026-07-15T00:30:00Z" is Tue 2026-07-14 20:30 ET.
+    Helper must return date(2026,7,14), NOT date(2026,7,15)."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date as _date
+    got = _signal_date_from_payload_or_row(
+        {"created_at": "2026-07-15T00:30:00Z"},
+        {"created_ts": None},
+    )
+    assert got == _date(2026, 7, 14), (
+        f"Expected Tue 2026-07-14 (ET) for UTC 2026-07-15T00:30:00Z, got {got}"
+    )
+
+
+def test_signal_date_utc_timestamp_after_et_midnight():
+    """created_at="2026-07-15T04:30:00Z" is Wed 2026-07-15 00:30 ET.
+    Helper must return date(2026,7,15)."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date as _date
+    got = _signal_date_from_payload_or_row(
+        {"created_at": "2026-07-15T04:30:00Z"},
+        {"created_ts": None},
+    )
+    assert got == _date(2026, 7, 15), (
+        f"Expected Wed 2026-07-15 (ET) for UTC 2026-07-15T04:30:00Z, got {got}"
+    )
+
+
+def test_signal_date_offset_timestamp_parses_correctly():
+    """Timestamp with -04:00 offset must round-trip via ET conversion."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date as _date
+    # 2026-07-14T21:00:00-04:00 → Tue 2026-07-14 21:00 ET
+    got = _signal_date_from_payload_or_row(
+        {"created_at": "2026-07-14T21:00:00-04:00"},
+        {"created_ts": None},
+    )
+    assert got == _date(2026, 7, 14), (
+        f"Expected 2026-07-14 for -04:00 offset timestamp, got {got}"
+    )
+
+
+def test_signal_date_naive_timestamp_fails_closed():
+    """Naive timestamp (no tzinfo) must return None — cannot prove ET date."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    got = _signal_date_from_payload_or_row(
+        {"created_at": "2026-07-15T00:30:00"},
+        {"created_ts": None},
+    )
+    assert got is None, f"Naive timestamp must fail closed, got {got}"
+
+
+def test_signal_date_only_field_returns_date():
+    """Date-only signal_date field returns the ET calendar date as-is."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date as _date
+    got = _signal_date_from_payload_or_row(
+        {"signal_date": "2026-07-15"},
+        {"created_ts": None},
+    )
+    assert got == _date(2026, 7, 15)
+
+
+def test_signal_date_generated_at_supported():
+    """generated_at field (production signal model) must be parsed as ET."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date as _date
+    got = _signal_date_from_payload_or_row(
+        {"generated_at": "2026-07-15T00:30:00Z"},
+        {"created_ts": None},
+    )
+    assert got == _date(2026, 7, 14), (
+        f"Expected 2026-07-14 ET for UTC generated_at, got {got}"
+    )
+
+
+def test_signal_date_bar_date_supported():
+    """signal_bar_date (date-only) must be recognized."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date as _date
+    got = _signal_date_from_payload_or_row(
+        {"signal_bar_date": "2026-07-11"},
+        {"created_ts": None},
+    )
+    assert got == _date(2026, 7, 11)
+
+
+def test_signal_date_malformed_fails_closed():
+    """Garbage timestamp must return None, not raise."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    got = _signal_date_from_payload_or_row(
+        {"created_at": "not-a-date"},
+        {"created_ts": None},
+    )
+    assert got is None
+
+
+def test_tuesday_2030_et_signal_rejected_on_thursday_recovery():
+    """A Tuesday 20:30 ET signal (Wed 00:30 UTC) must be rejected during
+    Thursday morning recovery: signal_date == Tuesday, prior_session ==
+    Wednesday, today == Thursday → session_out_of_window."""
+    from datetime import date as _date
+    TUESDAY = _date(2026, 7, 14)
+    WEDNESDAY = _date(2026, 7, 15)
+    THURSDAY = _date(2026, 7, 16)
+    # created_at is UTC — 00:30Z = Tue 20:30 ET
+    row = _q_row(symbol="F", direction="CALL", trigger=15.0,
+                 signal_date=None, created_hours_ago=40)
+    row["payload"].pop("signal_date")
+    row["payload"]["created_at"] = "2026-07-15T00:30:00Z"
+
+    with patch("ap_recovery._prior_trading_session_date_et", return_value=WEDNESDAY), \
+         patch("ap_recovery._prior_trading_session_cutoff_utc",
+               return_value=datetime(2026, 7, 15, 4, 0, tzinfo=timezone.utc).isoformat()), \
+         patch("ap_recovery.datetime") as _dt:
+        _dt.now.return_value = datetime(2026, 7, 16, 9, 15, tzinfo=ET)
+        _dt.side_effect = lambda *a, **k: datetime(*a, **k)
+        _, updates = _run_recovery(tq_rows=[row], broker=_fresh_quote(14.5))
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    missed  = [(s, p) for s, p in updates if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert not restore and not missed, (
+        "Tuesday 20:30 ET signal must be rejected on Thursday recovery "
+        "(signal_date=Tuesday, prior_session=Wednesday, today=Thursday). "
+        f"Got restore={len(restore)} missed={len(missed)}."
+    )
+
+
+def test_wednesday_2030_et_signal_accepted_on_thursday_recovery():
+    """A Wednesday 20:30 ET signal (Thu 00:30 UTC) must be accepted on
+    Thursday morning: signal_date == Wednesday == prior_session."""
+    from datetime import date as _date
+    WEDNESDAY = _date(2026, 7, 15)
+    row = _q_row(symbol="F", direction="PUT", trigger=15.0,
+                 signal_date=None, created_hours_ago=12)
+    row["payload"].pop("signal_date")
+    row["payload"]["created_at"] = "2026-07-16T00:30:00Z"
+    with patch("ap_recovery._prior_trading_session_date_et", return_value=WEDNESDAY), \
+         patch("ap_recovery._prior_trading_session_cutoff_utc",
+               return_value=datetime(2026, 7, 15, 4, 0, tzinfo=timezone.utc).isoformat()):
+        _, updates = _run_recovery(tq_rows=[row], broker=_fresh_quote(15.5))
+    restore = [(s, p) for s, p in updates if "status = 'NEW'" in s]
+    assert restore, (
+        "Wednesday 20:30 ET signal must be accepted on Thursday recovery "
+        "(signal_date=Wednesday == prior_session)."
+    )
+
+
+# Calendar fail-closed tests ─────────────────────────────────────────────────
+
+def test_live_recovery_calendar_import_failure_skips_all():
+    """When ap.flatline_alarm is unimportable, LIVE recovery must return zero
+    with no queue mutation, no quote lookup, no order lookup."""
+    import ap_recovery as _r
+    sqls = []
+    updates = []
+    broker = MagicMock()
+
+    class _C:
+        def __init__(self): self.rowcount = 1; self._u = ""
+        def execute(self, sql, params=()):
+            norm = " ".join(str(sql).split())
+            sqls.append((norm, tuple(params)))
+            self._u = norm.upper()
+            if "UPDATE" in self._u:
+                updates.append((norm, tuple(params)))
+        def fetchall(self): return []
+        def fetchone(self): return None
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = "jasoncosby1@gmail.com"
+    rec.mc = SimpleNamespace(mode="LIVE")
+    rec.entry_watcher = None
+    rec.broker = broker
+
+    fdb = types.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    # No ap.flatline_alarm module installed → import fails inside helper.
+    # Also blank out any cached import so the helper truly re-imports.
+    with patch.dict(sys.modules, {"ap.db": fdb, "ap.flatline_alarm": None}), \
+         patch("ap_recovery.os.getenv", return_value="48"):
+        rec._reseed_watchers({})
+
+    assert not updates, (
+        "Calendar unavailable — no UPDATE must be attempted. "
+        f"Got {len(updates)} updates."
+    )
+    assert not broker.get_quote.called, (
+        "Calendar unavailable — must not call broker.get_quote. "
+        f"Called {broker.get_quote.call_count} times."
+    )
+    # No SELECT from trade_queue at all — helper returned 0 before SQL fired
+    tq_selects = [s for s, _ in sqls if "FROM TRADE_QUEUE" in s.upper()]
+    assert not tq_selects, (
+        "Calendar unavailable — must not SELECT from trade_queue. "
+        f"Got {len(tq_selects)} selects."
+    )
+
+
+def test_live_recovery_calendar_raises_skips_all():
+    """When is_trading_day raises, LIVE recovery must fail closed."""
+    import ap_recovery as _r
+    updates = []
+
+    class _C:
+        def __init__(self): self.rowcount = 1; self._u = ""
+        def execute(self, sql, params=()):
+            norm = " ".join(str(sql).split())
+            self._u = norm.upper()
+            if "UPDATE" in self._u:
+                updates.append((norm, tuple(params)))
+        def fetchall(self): return []
+        def fetchone(self): return None
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = "jasoncosby1@gmail.com"
+    rec.mc = SimpleNamespace(mode="LIVE")
+    rec.entry_watcher = None
+    rec.broker = MagicMock()
+
+    fdb = types.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    def _raise(d): raise RuntimeError("calendar service down")
+    fake_flatline = types.ModuleType("ap.flatline_alarm")
+    fake_flatline.is_trading_day = _raise
+
+    with patch.dict(sys.modules, {"ap.db": fdb, "ap.flatline_alarm": fake_flatline}), \
+         patch("ap_recovery.os.getenv", return_value="48"):
+        rec._reseed_watchers({})
+
+    assert not updates, "is_trading_day raised — must not mutate queue"
+
+
+def test_prior_trading_session_normal_weekday_resolves_yesterday():
+    """On a normal Wednesday, prior session must be Tuesday."""
+    import ap_recovery as _r
+    from datetime import date as _date
+    fake_flatline = types.ModuleType("ap.flatline_alarm")
+    fake_flatline.is_trading_day = lambda d: d.weekday() < 5
+    now_et = datetime(2026, 7, 15, 9, 15, tzinfo=ET)  # Wed
+    with patch.dict(sys.modules, {"ap.flatline_alarm": fake_flatline}):
+        got = _r._prior_trading_session_date_et(now_et)
+    assert got == _date(2026, 7, 14), f"Wed prior session must be Tue, got {got}"
+
+
+def test_prior_trading_session_post_holiday_walks_back_through_calendar():
+    """On the Tuesday after a 4-day holiday closure (Fri closed, Mon closed),
+    prior session must resolve to the Thursday before."""
+    import ap_recovery as _r
+    from datetime import date as _date
+    # Fri 2026-07-03 (Independence Day observed) + Mon 2026-07-06 (hypothetical)
+    closed = {_date(2026, 7, 3), _date(2026, 7, 4), _date(2026, 7, 5), _date(2026, 7, 6)}
+    fake_flatline = types.ModuleType("ap.flatline_alarm")
+    fake_flatline.is_trading_day = lambda d: d.weekday() < 5 and d not in closed
+    now_et = datetime(2026, 7, 7, 9, 15, tzinfo=ET)  # Tue
+    with patch.dict(sys.modules, {"ap.flatline_alarm": fake_flatline}):
+        got = _r._prior_trading_session_date_et(now_et)
+    assert got == _date(2026, 7, 2), (
+        f"Post-holiday Tue prior session must be Thu 2026-07-02, got {got}"
+    )
+
+
+def test_prior_trading_session_14_day_guard_fails_closed():
+    """If is_trading_day returns False for 14+ days, helper returns None."""
+    import ap_recovery as _r
+    fake_flatline = types.ModuleType("ap.flatline_alarm")
+    fake_flatline.is_trading_day = lambda d: False
+    now_et = datetime(2026, 7, 15, 9, 15, tzinfo=ET)
+    with patch.dict(sys.modules, {"ap.flatline_alarm": fake_flatline}):
+        got = _r._prior_trading_session_date_et(now_et)
+    assert got is None, f"14-day guard must fail closed, got {got}"
+
+
+# Legacy canonical CAS tests (real OSM SQL) ──────────────────────────────────
+
+def test_osm_legacy_empty_canonical_backfill_in_atomic_update():
+    """Real OSM SQL must contain the atomic backfill clause when
+    allow_legacy_empty_canonical=True. Empty durable canonical is proven
+    inside the same UPDATE that stamps the resolved canonical."""
+    import types as _t
+    from ap.order_state_machine import APOrderStateMachine
+
+    captured = {}
+
+    class _C:
+        def __init__(self): self.rowcount = 1
+        def execute(self, sql, params=()):
+            captured["sql"] = " ".join(str(sql).split())
+            captured["params"] = tuple(params)
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    fdb = _t.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch.dict(sys.modules, {"ap.db": fdb}), \
+         patch("ap.order_state_machine.conn", _Conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **k: fn()):
+        osm = APOrderStateMachine("jasoncosby1@gmail.com")
+        ok = osm.claim_deferred_materialization(
+            "loc-legacy-1",
+            owner="watcher-a",
+            new_generation=1,
+            lease_until="2026-07-17T10:00:00Z",
+            trigger_crossed_at="2026-07-17T09:35:00Z",
+            trigger_price=100.0,
+            observed_underlying_price=100.5,
+            signal_id="sig-legacy-1",
+            execution_mode="live",
+            canonical_signal_id="canonical-sig-legacy-1",
+            allow_legacy_empty_canonical=True,
+        )
+    assert ok, "Claim must succeed against a fake cursor that returns rowcount=1"
+
+    sql = captured.get("sql", "")
+    assert "COALESCE(canonical_signal_id, '') = ''" in sql, (
+        "Legacy path SQL must atomically require empty canonical. SQL: "
+        f"{sql[:600]}"
+    )
+    assert "canonical_signal_id = %s" in sql and "SET" in sql, (
+        "Legacy path SQL must atomically backfill canonical in same UPDATE. "
+        f"SQL: {sql[:600]}"
+    )
+    # canonical_signal_id must appear in SET (backfill) — check position
+    set_idx = sql.upper().find("SET ")
+    where_idx = sql.upper().find("WHERE ")
+    set_slice = sql[set_idx:where_idx]
+    assert "canonical_signal_id = %s" in set_slice, (
+        "Backfill must be in the SET clause. SET slice: " + set_slice[:400]
+    )
+
+
+def test_osm_normal_row_requires_exact_canonical_match():
+    """Normal path (allow_legacy_empty_canonical=False, default) must retain
+    the strict canonical_signal_id = %s predicate."""
+    import types as _t
+    from ap.order_state_machine import APOrderStateMachine
+
+    captured = {}
+
+    class _C:
+        def __init__(self): self.rowcount = 1
+        def execute(self, sql, params=()):
+            captured["sql"] = " ".join(str(sql).split())
+            captured["params"] = tuple(params)
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    fdb = _t.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch.dict(sys.modules, {"ap.db": fdb}), \
+         patch("ap.order_state_machine.conn", _Conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **k: fn()):
+        osm = APOrderStateMachine("jasoncosby1@gmail.com")
+        osm.claim_deferred_materialization(
+            "loc-modern-1",
+            owner="watcher-b",
+            new_generation=1,
+            lease_until="2026-07-17T10:00:00Z",
+            trigger_crossed_at="2026-07-17T09:35:00Z",
+            trigger_price=100.0,
+            observed_underlying_price=100.5,
+            signal_id="sig-modern-1",
+            execution_mode="live",
+            canonical_signal_id="canonical-sig-modern-1",
+        )
+
+    sql = captured.get("sql", "")
+    # Normal path: strict equality predicate, NOT the empty-coalesce clause
+    assert "canonical_signal_id = %s" in sql, "Normal path requires exact canonical match"
+    where_idx = sql.upper().find("WHERE ")
+    where_slice = sql[where_idx:]
+    assert "canonical_signal_id = %s" in where_slice, (
+        "Normal path canonical predicate must be in WHERE clause"
+    )
+    assert "COALESCE(canonical_signal_id, '') = ''" not in sql, (
+        "Normal path must NOT contain the empty-canonical predicate"
+    )
+
+
+def test_osm_legacy_empty_canonical_only_matches_empty_rows():
+    """The empty-canonical CAS predicate must be `COALESCE(canonical_signal_id, '') = ''`
+    exactly — this atomically ensures a concurrent worker that stamped canonical
+    between our read and our claim causes the UPDATE to affect 0 rows."""
+    import types as _t
+    from ap.order_state_machine import APOrderStateMachine
+
+    captured = {}
+
+    class _C:
+        def __init__(self): self.rowcount = 0
+        def execute(self, sql, params=()):
+            captured["sql"] = " ".join(str(sql).split())
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    with patch("ap.order_state_machine.conn", _Conn), \
+         patch("ap.order_state_machine.run_with_retry", lambda fn, *a, **k: fn()):
+        osm = APOrderStateMachine("jasoncosby1@gmail.com")
+        ok = osm.claim_deferred_materialization(
+            "loc-race-1",
+            owner="watcher-c",
+            new_generation=1,
+            lease_until="2026-07-17T10:00:00Z",
+            trigger_crossed_at="2026-07-17T09:35:00Z",
+            trigger_price=100.0,
+            observed_underlying_price=100.5,
+            signal_id="sig-race-1",
+            execution_mode="live",
+            canonical_signal_id="canonical-sig-race-1",
+            allow_legacy_empty_canonical=True,
+        )
+    assert ok is False, "rowcount=0 must return False (concurrent claim lost)"
+    sql = captured["sql"]
+    assert "COALESCE(canonical_signal_id, '') = ''" in sql

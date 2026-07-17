@@ -3917,21 +3917,33 @@ class APExecutionCore:
                             )
                             or ""
                         ).strip()
-                        _identity_ok = (
+                        # ── Identity gate (PR #359 amendment) ─────────────
+                        # Signal_id, client, and mode must ALWAYS match.
+                        # Canonical handling is split:
+                        #   • Modern row (durable canonical present) → must
+                        #     exactly equal the resolved canonical.  The
+                        #     atomic CAS enforces this via `canonical_signal_id
+                        #     = %s`.
+                        #   • Legacy row (durable canonical NULL/empty) → the
+                        #     python-level identity is proven; the atomic CAS
+                        #     re-verifies COALESCE(canonical_signal_id,'') = ''
+                        #     AND atomically backfills the resolved canonical
+                        #     in the same UPDATE.  This closes the race where
+                        #     a concurrent worker could stamp canonical
+                        #     between our read and our claim.
+                        _identity_core_ok = (
                             bool(_canonical_signal_id)
                             and bool(_expected_source_signal_id)
-                            # canonical_signal_id is only enforced when the durable row
-                            # already carries it.  Rows written before the field existed
-                            # have an empty durable_canonical_id and must not be blocked
-                            # solely on that basis — signal_id + client + mode alignment
-                            # is sufficient identity proof for legacy rows.
-                            and (
-                                not _durable_canonical_id
-                                or _durable_canonical_id == _canonical_signal_id
-                            )
                             and _durable_signal_id == _expected_source_signal_id
                             and _durable_client_id == str(_breach_client_id or "").strip().lower()
                             and _durable_exec_mode == str(_mat_exec_mode or "").strip().lower()
+                        )
+                        _is_legacy_empty_canonical = (
+                            _identity_core_ok and not _durable_canonical_id
+                        )
+                        _identity_ok = _identity_core_ok and (
+                            _is_legacy_empty_canonical
+                            or _durable_canonical_id == _canonical_signal_id
                         )
                         if not _identity_ok:
                             log.critical(
@@ -3964,6 +3976,9 @@ class APExecutionCore:
                             expected_order_status="PENDING_TRIGGER",
                             expected_materialization_status="WAITING_FOR_TRIGGER",
                             expected_lifecycle_state="",
+                            # Legacy path: the durable row's canonical is empty;
+                            # the CAS will atomically re-prove empty and backfill.
+                            allow_legacy_empty_canonical=_is_legacy_empty_canonical,
                         ))
                     except Exception as _mat_claim_exc:
                         log.critical(

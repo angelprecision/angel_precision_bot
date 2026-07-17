@@ -2102,6 +2102,7 @@ class APOrderStateMachine:
         expected_order_status: str = "PENDING_TRIGGER",
         expected_materialization_status: str | None = None,
         expected_lifecycle_state: str | None = None,
+        allow_legacy_empty_canonical: bool = False,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -2208,9 +2209,26 @@ class APOrderStateMachine:
                     "COALESCE(meta->>'submit_intent_at','') = ''",
                 ]
                 _claim_params: list = [_expected_order_status]
+                # ── Two-mode canonical identity CAS ──────────────────────
+                # (a) Normal path: durable canonical must equal the resolved
+                #     canonical for the claim to succeed.
+                # (b) Legacy path (allow_legacy_empty_canonical=True): the
+                #     durable canonical must be atomically proven NULL/empty,
+                #     and the resolved canonical is backfilled inside the
+                #     same UPDATE — never a two-step read+update. This is
+                #     only allowed after the caller has proven identity via
+                #     signal_id + client_id + execution_mode + kind +
+                #     PENDING_TRIGGER + no broker + no submit_intent_at.
+                _canonical_backfill_set = ""
                 if _canonical:
-                    _claim_predicates.append("canonical_signal_id = %s")
-                    _claim_params.append(_canonical)
+                    if allow_legacy_empty_canonical:
+                        _claim_predicates.append(
+                            "COALESCE(canonical_signal_id, '') = ''"
+                        )
+                        _canonical_backfill_set = ", canonical_signal_id = %s"
+                    else:
+                        _claim_predicates.append("canonical_signal_id = %s")
+                        _claim_params.append(_canonical)
                 if expected_materialization_status:
                     _claim_predicates.append(
                         "COALESCE(meta->>'materialization_status','') IN ('', %s)"
@@ -2231,7 +2249,7 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb""" + _canonical_backfill_set + """,
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -2249,7 +2267,9 @@ class APOrderStateMachine:
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                     """ + _attempt_predicate,
                     (
-                        _patch_json, local_order_id, self.client_id,
+                        _patch_json,
+                        *([_canonical] if (_canonical and allow_legacy_empty_canonical) else []),
+                        local_order_id, self.client_id,
                         *_claim_params, _signal_id, _mode, _now, _expected_previous_generation,
                         *_attempt_params,
                     ),
