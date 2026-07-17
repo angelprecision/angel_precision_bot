@@ -2141,6 +2141,17 @@ class APOrderStateMachine:
         _canonical = str(canonical_signal_id or "").strip()
         _expected_order_status = str(expected_order_status or "PENDING_TRIGGER").strip().upper()
 
+        if not _canonical:
+            log.error(
+                "[%s] claim_deferred_materialization blocked: "
+                "missing canonical identity order=%s signal_id=%s mode=%s",
+                self.client_id,
+                local_order_id,
+                _signal_id,
+                _mode,
+            )
+            return False
+
         # ── §3: resolve the target new generation ────────────────────
         # new_generation takes precedence when both are supplied.
         _candidate = new_generation if new_generation is not None else generation

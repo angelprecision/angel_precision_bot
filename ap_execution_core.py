@@ -2356,6 +2356,20 @@ class APExecutionCore:
         signal_id = str(row.get("signal_id") or meta.get("signal_id") or "").strip()
         if not signal_id:
             return _term("RETRY_MISSING_SIGNAL_ID", status="ERROR")
+        expected_canonical_signal_id = str(
+            build_canonical_signal_id(signal_id) or ""
+        ).strip()
+        if not expected_canonical_signal_id:
+            return _term("RETRY_MISSING_EXPECTED_CANONICAL_ID", status="ERROR")
+        durable_canonical_signal_id = str(
+            row.get("canonical_signal_id") or ""
+        ).strip()
+        if (
+            durable_canonical_signal_id
+            and durable_canonical_signal_id != expected_canonical_signal_id
+        ):
+            return _term("RETRY_CANONICAL_IDENTITY_MISMATCH", status="ERROR")
+        allow_legacy_empty_canonical = not durable_canonical_signal_id
 
         # plan_id: required for plan reconstruction.
         plan_id = str(row.get("plan_id") or meta.get("plan_id") or "").strip()
@@ -2524,6 +2538,8 @@ class APExecutionCore:
                 signal_id=signal_id,
                 execution_mode=row_mode,
                 retry_attempt=_expected_attempt,
+                canonical_signal_id=expected_canonical_signal_id,
+                allow_legacy_empty_canonical=allow_legacy_empty_canonical,
             ))
         except Exception as exc:
             log.error("[%s] resume_deferred_materialization_retry claim_failed "
@@ -3897,18 +3913,19 @@ class APExecutionCore:
                             or _signal_payload_for_identity.get("signal_id", "")
                             or ""
                         ).strip()
-                        _durable_canonical_id = ""
+                        _durable_canonical_signal_id = ""
                         _durable_signal_id = ""
                         _durable_client_id = ""
                         _durable_exec_mode = ""
                         if isinstance(_durable_row, dict):
-                            _durable_canonical_id = str(_durable_row.get("canonical_signal_id") or "").strip()
+                            _durable_canonical_signal_id = str(
+                                _durable_row.get("canonical_signal_id") or ""
+                            ).strip()
                             _durable_signal_id = str(_durable_row.get("signal_id") or "").strip()
                             _durable_client_id = str(_durable_row.get("client_id") or "").strip().lower()
                             _durable_exec_mode = str(_durable_row.get("execution_mode") or "").strip().lower()
-                        _canonical_signal_id = str(
-                            _durable_canonical_id
-                            or getattr(approved_plan, "canonical_signal_id", "")
+                        _expected_canonical_signal_id = str(
+                            getattr(approved_plan, "canonical_signal_id", "")
                             or _plan_meta_for_identity.get("canonical_signal_id", "")
                             or _signal_payload_for_identity.get("canonical_signal_id", "")
                             or build_canonical_signal_id(
@@ -3932,18 +3949,18 @@ class APExecutionCore:
                         #     a concurrent worker could stamp canonical
                         #     between our read and our claim.
                         _identity_core_ok = (
-                            bool(_canonical_signal_id)
-                            and bool(_expected_source_signal_id)
+                            bool(_expected_source_signal_id)
+                            and bool(_expected_canonical_signal_id)
                             and _durable_signal_id == _expected_source_signal_id
                             and _durable_client_id == str(_breach_client_id or "").strip().lower()
                             and _durable_exec_mode == str(_mat_exec_mode or "").strip().lower()
                         )
                         _is_legacy_empty_canonical = (
-                            _identity_core_ok and not _durable_canonical_id
+                            _identity_core_ok and not _durable_canonical_signal_id
                         )
                         _identity_ok = _identity_core_ok and (
                             _is_legacy_empty_canonical
-                            or _durable_canonical_id == _canonical_signal_id
+                            or _durable_canonical_signal_id == _expected_canonical_signal_id
                         )
                         if not _identity_ok:
                             log.critical(
@@ -3953,7 +3970,7 @@ class APExecutionCore:
                                 "durable_mode=%s expected_mode=%s — selector and broker blocked",
                                 ticker, queue_local_order_id,
                                 _durable_signal_id, _expected_source_signal_id,
-                                _durable_canonical_id, _canonical_signal_id,
+                                _durable_canonical_signal_id, _expected_canonical_signal_id,
                                 _durable_client_id, str(_breach_client_id or "").strip().lower(),
                                 _durable_exec_mode, str(_mat_exec_mode or "").strip().lower(),
                             )
@@ -3972,7 +3989,7 @@ class APExecutionCore:
                             observed_underlying_price=_observed_underlying,
                             signal_id=_expected_source_signal_id,
                             execution_mode=_mat_exec_mode,
-                            canonical_signal_id=_canonical_signal_id,
+                            canonical_signal_id=_expected_canonical_signal_id,
                             expected_order_status="PENDING_TRIGGER",
                             expected_materialization_status="WAITING_FOR_TRIGGER",
                             expected_lifecycle_state="",
@@ -4024,7 +4041,9 @@ class APExecutionCore:
                             and _claim_lease_live
                             and _claim_client == str(_breach_client_id or "").strip().lower()
                             and _claim_mode == str(_mat_exec_mode or "").strip().lower()
-                            and _claim_canonical == str(_canonical_signal_id or "").strip()
+                            and _claim_canonical == str(
+                                _expected_canonical_signal_id or ""
+                            ).strip()
                         )
                         if _already_owned:
                             log.info(

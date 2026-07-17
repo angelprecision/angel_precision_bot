@@ -23,6 +23,7 @@ Regression coverage:
 from __future__ import annotations
 
 import json
+import importlib.util
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -100,6 +101,57 @@ def _run_recovery(*, tq_rows, broker, client_id="jasoncosby1@gmail.com",
     sqls = []
     updates = []
 
+    def _order_blocks_live_recovery(order, params):
+        meta = order.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        terminal = {
+            "REJECTED", "CANCELED", "CANCELLED", "EXPIRED",
+            "ERROR", "DONE", "ARCHIVED",
+        }
+        last_error = str(order.get("last_error") or "").upper()
+        recovery_reason = str(meta.get("recovery_reason_code") or "").upper()
+        evidence = bool(
+            int(order.get("filled_qty") or 0) > 0
+            or order.get("filled_ts") is not None
+            or str(order.get("broker_order_id") or "").strip()
+            or order.get("submitted_ts") is not None
+            or str(meta.get("submit_intent_at") or "").strip()
+            or str(meta.get("broker_submit_key") or "").strip()
+            or str(meta.get("current_owner") or "").startswith("broker_submit:")
+            or str(meta.get("lifecycle_state") or "").upper() in {"SUBMITTING", "SUBMITTED"}
+            or meta.get("reconciliation_required") is True
+            or meta.get("split_brain_quarantine") is True
+            or last_error.startswith("SPLIT_BRAIN:")
+            or "BROKER_AMBIGUOUS_" in last_error
+            or "BROKER_ACCEPTED_MISSING_ID_RECONCILIATION_REQUIRED" in last_error
+            or "BROKER_IDENTITY_UNPROVEN" in last_error
+            or recovery_reason.startswith("RECONCILE_")
+            or recovery_reason == "RECOVERY_SUBMIT_INTENT_REQUIRES_RECONCILIATION"
+            or str(order.get("status") or "").upper() not in terminal
+        )
+        expected_signal = str(params[1] if len(params) > 1 else "")
+        expected_canonical = str(params[2] if len(params) > 2 else "")
+        identity_match = (
+            str(order.get("signal_id") or "") == expected_signal
+            or (
+                bool(expected_canonical)
+                and str(order.get("canonical_signal_id") or "") == expected_canonical
+            )
+        )
+        return bool(
+            str(order.get("client_id") or "") == str(params[0] if params else "")
+            and str(order.get("kind") or "").upper() == "ENTRY"
+            and str(order.get("execution_mode") or "").lower() == "live"
+            and identity_match
+            and evidence
+        )
+
     class _C:
         def __init__(self):
             self.rowcount = 1
@@ -108,13 +160,17 @@ def _run_recovery(*, tq_rows, broker, client_id="jasoncosby1@gmail.com",
             norm = " ".join(str(sql).split())
             sqls.append((norm, tuple(params)))
             self._u = norm.upper()
+            self._params = tuple(params)
             if "UPDATE" in self._u:
                 updates.append((norm, tuple(params)))
         def fetchall(self):
             if "FROM TRADE_QUEUE" in self._u or ("SELECT" in self._u and "WATCHING" in self._u):
                 return list(tq_rows)
             if "FROM ORDERS" in self._u:
-                return list(orders_rows or [])
+                return [
+                    row for row in list(orders_rows or [])
+                    if _order_blocks_live_recovery(row, self._params)
+                ]
             if "FROM AP_SIGNALS" in self._u:
                 return list(ap_signals_rows or [])
             return []
@@ -195,14 +251,16 @@ def test_b3_order_check_filters_execution_mode():
     assert "execution_mode" in body.lower(), "Must filter by execution_mode"
 
 
-def test_b3_no_ownership_predicate_required():
+def test_b3_canonical_broker_evidence_predicate_is_required():
     import inspect, ap_recovery as _r
     src = inspect.getsource(_r)
     s = src.find("def _active_entry_order_exists(")
     e = src.find("\n            def ", s + 1)
     body = src[s:e]
-    assert "status NOT IN" in body, "Must use status NOT IN (terminal states)"
-    assert "COALESCE(broker_order_id" not in body, "Must not require broker_order_id"
+    assert "_LIVE_ENTRY_BROKER_EVIDENCE_SQL" in body
+    predicate = _r._LIVE_ENTRY_BROKER_EVIDENCE_SQL
+    assert "NOT IN" in predicate
+    assert "COALESCE(orders.broker_order_id" in predicate
 
 
 # B4 ─────────────────────────────────────────────────────────────────────────
@@ -311,8 +369,18 @@ def test_b7_c_put_intel_rejected_no_quote():
 
 # B1 fill-evidence behavioral tests ──────────────────────────────────────────
 
-def _order_row(*, status, filled_qty=0, filled_ts=None, signal_id="sig-001",
-               execution_mode="live"):
+def _order_row(
+    *,
+    status,
+    filled_qty=0,
+    filled_ts=None,
+    signal_id="sig-001",
+    execution_mode="live",
+    broker_order_id=None,
+    submitted_ts=None,
+    meta=None,
+    last_error=None,
+):
     """Minimal orders-table row for fill-evidence tests."""
     return {
         "id": "ord-1",
@@ -324,8 +392,10 @@ def _order_row(*, status, filled_qty=0, filled_ts=None, signal_id="sig-001",
         "canonical_signal_id": f"canonical-{signal_id}",
         "filled_qty": filled_qty,
         "filled_ts": filled_ts,
-        "broker_order_id": None,
-        "submitted_ts": None,
+        "broker_order_id": broker_order_id,
+        "submitted_ts": submitted_ts,
+        "meta": dict(meta or {}),
+        "last_error": last_error,
     }
 
 
@@ -377,11 +447,7 @@ def test_b1_clean_rejected_sql_structure():
     """Source inspection: REJECTED must be in status NOT IN list so clean rejections
     are excluded from the exists-check without needing fill evidence."""
     import inspect, ap_recovery as _r
-    src = inspect.getsource(_r)
-    fn_s = src.find("def _active_entry_order_exists(")
-    fn_e = src.find("\n            def ", fn_s + 1)
-    body = src[fn_s:fn_e]
-    assert "'REJECTED'" in body, "REJECTED must be in status NOT IN exclusion list"
+    assert "'REJECTED'" in _r._LIVE_ENTRY_BROKER_EVIDENCE_SQL
 
 
 def test_b1_no_matching_order_allows_restore():
@@ -394,6 +460,95 @@ def test_b1_no_matching_order_allows_restore():
         "When no blocking order exists, eligible row must be restored. "
         f"Got {len(restore)} restore update(s)."
     )
+
+
+@pytest.mark.parametrize(
+    "order",
+    [
+        _order_row(status="ERROR", broker_order_id="broker-1"),
+        _order_row(status="REJECTED", submitted_ts="2026-07-17T09:35:00Z"),
+        _order_row(status="ERROR", meta={"submit_intent_at": "2026-07-17T09:35:00Z"}),
+        _order_row(status="ERROR", meta={"reconciliation_required": True}),
+        _order_row(status="ERROR", meta={"split_brain_quarantine": True}),
+        _order_row(status="ERROR", last_error="ENTRY_BROKER_IDENTITY_UNPROVEN"),
+        _order_row(status="CANCELED", filled_qty=1, filled_ts="2026-07-17T09:35:00Z"),
+    ],
+    ids=[
+        "error_with_broker_id",
+        "rejected_with_submitted_ts",
+        "terminal_with_submit_intent",
+        "reconciliation_required",
+        "split_brain",
+        "unknown_or_unproven_broker_identity",
+        "partial_fill_then_canceled",
+    ],
+)
+def test_live_broker_evidence_blocks_queue_restoration(order):
+    row = _q_row(symbol="WMT", direction="PUT", trigger=60.5)
+    _, updates = _run_recovery_with_orders(
+        [row],
+        broker=_fresh_quote(62.0),
+        orders_rows=[order],
+    )
+
+    assert not [(sql, params) for sql, params in updates if "status = 'NEW'" in sql]
+
+
+def test_live_broker_evidence_blocks_missed_trigger_terminalization():
+    row = _q_row(symbol="QCOM", direction="PUT", trigger=175.0)
+    order = _order_row(status="ERROR", meta={"reconciliation_required": True})
+    _, updates = _run_recovery_with_orders(
+        [row],
+        broker=_fresh_quote(170.0),
+        orders_rows=[order],
+    )
+
+    assert not [
+        (sql, params)
+        for sql, params in updates
+        if "LIVE_RECOVERY_MISSED_TRIGGER" in sql
+    ]
+
+
+def test_clean_terminal_order_without_broker_evidence_does_not_block_restore():
+    row = _q_row(symbol="WMT", direction="PUT", trigger=60.5)
+    clean_terminal = _order_row(status="REJECTED")
+    _, updates = _run_recovery_with_orders(
+        [row],
+        broker=_fresh_quote(62.0),
+        orders_rows=[clean_terminal],
+    )
+
+    assert [(sql, params) for sql, params in updates if "status = 'NEW'" in sql]
+
+
+def test_restore_and_mark_missed_expand_the_same_broker_evidence_predicate():
+    eligible = _q_row(symbol="WMT", direction="PUT", trigger=60.5)
+    crossed = _q_row(symbol="QCOM", direction="PUT", trigger=175.0)
+    eligible_sqls, _ = _run_recovery(tq_rows=[eligible], broker=_fresh_quote(62.0))
+    crossed_sqls, _ = _run_recovery(tq_rows=[crossed], broker=_fresh_quote(170.0))
+
+    restore_sql = next(sql for sql, _ in eligible_sqls if "SET status = 'NEW'" in sql)
+    missed_sql = next(
+        sql for sql, _ in crossed_sqls
+        if "LIVE_RECOVERY_MISSED_TRIGGER" in sql and "UPDATE" in sql.upper()
+    )
+    required_fragments = (
+        "COALESCE(orders.filled_qty, 0) > 0",
+        "COALESCE(orders.broker_order_id, '') <> ''",
+        "orders.submitted_ts IS NOT NULL",
+        "meta->>'submit_intent_at'",
+        "meta->>'reconciliation_required'",
+        "meta->>'split_brain_quarantine'",
+        "SPLIT_BRAIN:",
+        "BROKER_IDENTITY_UNPROVEN",
+        "recovery_reason_code",
+    )
+    for fragment in required_fragments:
+        assert fragment in restore_sql
+        assert fragment in missed_sql
+    assert "_LIVE_ENTRY_BROKER_EVIDENCE_SQL" not in restore_sql
+    assert "_LIVE_ENTRY_BROKER_EVIDENCE_SQL" not in missed_sql
 
 
 def test_b1_paper_order_excluded_by_execution_mode_sql():
@@ -533,13 +688,140 @@ def test_reeval_suffixed_source_claim_uses_canonical_order_identity(monkeypatch)
     assert patch_data["signal_id"].endswith(":f4dc44")
     assert "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72" in params
 
-def test_genuinely_different_opportunity_cannot_claim(monkeypatch):
-    sink = _patch_osm_db(monkeypatch, rowcount=0)
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_osm_missing_canonical_fails_before_database_access(monkeypatch, legacy):
+    import ap.order_state_machine as osm_mod
     from ap.order_state_machine import APOrderStateMachine
+
+    database_access = MagicMock(side_effect=AssertionError("database must not be touched"))
+    retry_access = MagicMock(side_effect=AssertionError("retry wrapper must not be touched"))
+    monkeypatch.setattr(osm_mod, "conn", database_access)
+    monkeypatch.setattr(osm_mod, "run_with_retry", retry_access)
     osm = APOrderStateMachine("jasoncosby1@gmail.com")
+
     assert osm.claim_deferred_materialization(
-        "nke-oid", **_claim_kwargs(canonical_signal_id="DIFFERENT:canonical"),
+        "nke-oid",
+        **_claim_kwargs(
+            canonical_signal_id="",
+            allow_legacy_empty_canonical=legacy,
+        ),
     ) is False
+    assert database_access.call_count == 0
+    assert retry_access.call_count == 0
+
+def _run_execution_core_identity_case(
+    monkeypatch,
+    *,
+    durable_canonical: str,
+    expected_canonical: str,
+    force_builder_empty: bool = False,
+):
+    seam4_path = _REPO / "tests" / "test_p0_seam4_e2e_deferred_lifecycle.py"
+    spec = importlib.util.spec_from_file_location("_pr359_seam4_helpers", seam4_path)
+    assert spec is not None and spec.loader is not None
+    seam4 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(seam4)
+
+    osm = seam4._StatefulOSM()
+    osm.row["canonical_signal_id"] = durable_canonical
+    claim = MagicMock(return_value=False)
+    broker_submit = MagicMock(return_value={"ok": False})
+    osm.claim_deferred_materialization = claim
+    osm.submit_existing_entry = broker_submit
+
+    selector = seam4._Selector()
+    broker = seam4._Broker()
+    broker.place_order = MagicMock()
+    core = seam4._build_core(osm, broker, selector)
+    plan = seam4._approved_plan()
+    plan.canonical_signal_id = expected_canonical
+    plan.metadata = dict(plan.metadata)
+    if expected_canonical:
+        plan.metadata["canonical_signal_id"] = expected_canonical
+    else:
+        plan.metadata.pop("canonical_signal_id", None)
+
+    crossed_at = datetime.now(timezone.utc)
+    watched = SimpleNamespace(
+        signal={
+            "signal_id": seam4.SIGNAL_ID,
+            "local_order_id": seam4.LOCAL_ORDER_ID,
+            "client_id": seam4.CLIENT_ID,
+            "execution_mode": "live",
+            "_approved_plan": plan,
+        },
+        ticker="SPY",
+        trigger_price=600.0,
+        trigger_crossed_at=crossed_at,
+        last_quote_ask=600.22,
+        last_quote_bid=600.20,
+    )
+    monkeypatch.setenv("INTELLIGENCE_EVIDENCE_ENABLED", "0")
+    if force_builder_empty:
+        monkeypatch.setattr("ap_execution_core.build_canonical_signal_id", lambda *a, **k: "")
+
+    result = core._on_entry_trigger(watched)
+    return result, claim, selector, broker_submit, broker
+
+
+def test_execution_core_modern_canonical_mismatch_blocks_every_downstream_call(monkeypatch):
+    result, claim, selector, broker_submit, broker = _run_execution_core_identity_case(
+        monkeypatch,
+        durable_canonical="CANONICAL-B",
+        expected_canonical="CANONICAL-A",
+    )
+
+    assert result["reason_code"] == "MATERIALIZATION_IDENTITY_MISMATCH"
+    assert claim.call_count == 0
+    assert selector.calls == 0
+    assert broker_submit.call_count == 0
+    assert broker.place_order.call_count == 0
+
+
+def test_execution_core_modern_canonical_exact_match_attempts_strict_claim(monkeypatch):
+    _, claim, selector, broker_submit, broker = _run_execution_core_identity_case(
+        monkeypatch,
+        durable_canonical="CANONICAL-A",
+        expected_canonical="CANONICAL-A",
+    )
+
+    claim.assert_called_once()
+    assert claim.call_args.kwargs["canonical_signal_id"] == "CANONICAL-A"
+    assert claim.call_args.kwargs["allow_legacy_empty_canonical"] is False
+    assert selector.calls == 0
+    assert broker_submit.call_count == 0
+    assert broker.place_order.call_count == 0
+
+
+def test_execution_core_legacy_empty_canonical_backfills_independent_expected_value(monkeypatch):
+    _, claim, selector, broker_submit, broker = _run_execution_core_identity_case(
+        monkeypatch,
+        durable_canonical="",
+        expected_canonical="CANONICAL-A",
+    )
+
+    claim.assert_called_once()
+    assert claim.call_args.kwargs["canonical_signal_id"] == "CANONICAL-A"
+    assert claim.call_args.kwargs["allow_legacy_empty_canonical"] is True
+    assert selector.calls == 0
+    assert broker_submit.call_count == 0
+    assert broker.place_order.call_count == 0
+
+
+def test_execution_core_missing_expected_canonical_fails_closed(monkeypatch):
+    result, claim, selector, broker_submit, broker = _run_execution_core_identity_case(
+        monkeypatch,
+        durable_canonical="",
+        expected_canonical="",
+        force_builder_empty=True,
+    )
+
+    assert result["reason_code"] == "MATERIALIZATION_IDENTITY_MISMATCH"
+    assert claim.call_count == 0
+    assert selector.calls == 0
+    assert broker_submit.call_count == 0
+    assert broker.place_order.call_count == 0
 
 
 # P0-1: NULL last_error rows are candidates ──────────────────────────────────
@@ -638,11 +920,8 @@ def test_p0_3_mark_missed_contains_not_exists_fence():
 
 def test_p0_4_filled_qty_zero_required():
     import inspect, ap_recovery as _r
-    src = inspect.getsource(_r)
-    fn_s = src.find("def _active_entry_order_exists(")
-    fn_e = src.find("\n            def ", fn_s + 1)
-    body = src[fn_s:fn_e]
-    assert "filled_qty" in body.lower() or "filled_ts" in body.lower(), (
+    predicate = _r._LIVE_ENTRY_BROKER_EVIDENCE_SQL.lower()
+    assert "filled_qty" in predicate or "filled_ts" in predicate, (
         "Order check must block rows with filled_qty > 0 or filled_ts IS NOT NULL"
     )
 
@@ -650,14 +929,11 @@ def test_p0_4_filled_qty_zero_required():
 def test_p0_4_filled_not_in_terminal_exclusions():
     """FILLED must NOT be in the terminal-exclusion list; it must be blocked separately."""
     import inspect, ap_recovery as _r
-    src = inspect.getsource(_r)
-    fn_s = src.find("def _active_entry_order_exists(")
-    fn_e = src.find("\n            def ", fn_s + 1)
-    body = src[fn_s:fn_e]
+    predicate = _r._LIVE_ENTRY_BROKER_EVIDENCE_SQL.lower()
     # FILLED is now handled by filled_qty/filled_ts predicate, NOT in the status NOT IN list
     # (having it in both is also acceptable; the key is it blocks)
     # Verify either approach is present
-    blocks_filled = ("'FILLED'" in body or "filled_qty" in body.lower() or "filled_ts" in body.lower())
+    blocks_filled = ("'filled'" in predicate or "filled_qty" in predicate or "filled_ts" in predicate)
     assert blocks_filled, "FILLED entries must block LIVE recovery"
 
 
@@ -729,11 +1005,10 @@ def test_p0_mark_missed_fence_has_fill_evidence_or():
     fn_e = s.find("\n            def ", fn_s + 1)
     body = s[fn_s:fn_e]
     assert "NOT EXISTS" in body, "_mark_missed must have NOT EXISTS fence"
-    assert "filled_qty" in body.lower(), (
-        "_mark_missed NOT EXISTS must check filled_qty — "
-        "CANCELED+filled_qty>0 must block REJECTED transition"
-    )
-    assert "filled_ts" in body.lower(), "_mark_missed NOT EXISTS must check filled_ts"
+    assert "_LIVE_ENTRY_BROKER_EVIDENCE_SQL" in body
+    predicate = _r._LIVE_ENTRY_BROKER_EVIDENCE_SQL.lower()
+    assert "filled_qty" in predicate
+    assert "filled_ts" in predicate
 
 
 # Intended-session enforcement tests ─────────────────────────────────────────
@@ -773,20 +1048,6 @@ def test_intended_session_friday_signal_accepted_on_monday():
         "Friday-evening signal (63h ago) must be eligible on Monday morning. "
         "Prior-session gate admits signal_date=Friday when prior_session=Friday."
     )
-
-
-# _mark_missed fill-evidence race test ────────────────────────────────────────
-
-def test_p0_mark_missed_fence_has_fill_evidence_or():
-    import inspect, ap_recovery as _r
-    s = inspect.getsource(_r)
-    fn_s = s.find("def _mark_missed(row_id, diag:")
-    fn_e = s.find("\n            def ", fn_s + 1)
-    body = s[fn_s:fn_e]
-    assert "NOT EXISTS" in body
-    assert "filled_qty" in body.lower(), "_mark_missed NOT EXISTS must check filled_qty"
-    assert "filled_ts" in body.lower(), "_mark_missed NOT EXISTS must check filled_ts"
-
 
 
 def test_b1_mark_missed_sql_contains_fill_predicate():

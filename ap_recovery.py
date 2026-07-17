@@ -196,6 +196,33 @@ def _normalize_execution_mode(value) -> str | None:
     return mode if mode in _VALID_EXECUTION_MODES else None
 
 
+# One canonical predicate for LIVE recovery ownership checks. A terminal-looking
+# order is clean only when every broker/fill/reconciliation signal is absent.
+_LIVE_ENTRY_BROKER_EVIDENCE_SQL = """(
+       COALESCE(orders.filled_qty, 0) > 0
+    OR orders.filled_ts IS NOT NULL
+    OR COALESCE(orders.broker_order_id, '') <> ''
+    OR orders.submitted_ts IS NOT NULL
+    OR COALESCE(orders.meta->>'submit_intent_at', '') <> ''
+    OR COALESCE(orders.meta->>'broker_submit_key', '') <> ''
+    OR COALESCE(orders.meta->>'current_owner', '') LIKE 'broker_submit:%%'
+    OR UPPER(COALESCE(orders.meta->>'lifecycle_state', '')) IN ('SUBMITTING', 'SUBMITTED')
+    OR LOWER(COALESCE(orders.meta->>'reconciliation_required', '')) IN ('1', 'true', 'yes', 'on')
+    OR LOWER(COALESCE(orders.meta->>'split_brain_quarantine', '')) IN ('1', 'true', 'yes', 'on')
+    OR COALESCE(orders.last_error, '') LIKE 'SPLIT_BRAIN:%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_AMBIGUOUS_%%RECONCILIATION_REQUIRED%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_ACCEPTED_MISSING_ID_RECONCILIATION_REQUIRED%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_IDENTITY_UNPROVEN%%'
+    OR UPPER(COALESCE(orders.meta->>'recovery_reason_code', '')) LIKE 'RECONCILE_%%'
+    OR UPPER(COALESCE(orders.meta->>'recovery_reason_code', '')) =
+       'RECOVERY_SUBMIT_INTENT_REQUIRES_RECONCILIATION'
+    OR UPPER(COALESCE(orders.status, '')) NOT IN (
+        'REJECTED', 'CANCELED', 'CANCELLED', 'EXPIRED',
+        'ERROR', 'DONE', 'ARCHIVED'
+    )
+)"""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Prior-trading-session helpers (LIVE recovery session gate — Blocker 1)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2856,20 +2883,13 @@ class APStartupRecovery:
                 # OR ...) gate incorrectly let ownerless CREATED rows through.
                 with conn() as c:
                     c.execute(
-                        """
+                        f"""
                         SELECT 1
                         FROM orders
                         WHERE client_id = %s
                           AND kind = 'ENTRY'
                           AND LOWER(COALESCE(execution_mode,'')) = 'live'
-                          AND (
-                                COALESCE(filled_qty, 0) > 0
-                             OR filled_ts IS NOT NULL
-                             OR status NOT IN (
-                                    'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                    'ERROR','DONE','ARCHIVED'
-                                )
-                          )
+                          AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
                           AND (
                                 signal_id = %s
                              OR (%s <> '' AND canonical_signal_id = %s)
@@ -3130,11 +3150,11 @@ class APStartupRecovery:
                 # stranded with a mislabeled queue row.
                 with conn() as c:
                     c.execute(
-                        """
+                        f"""
                         UPDATE trade_queue
                         SET status     = 'REJECTED',
                             last_error = 'LIVE_RECOVERY_MISSED_TRIGGER:ownership_absent_at_trigger',
-                            payload    = COALESCE(payload, '{}'::jsonb) || %s::jsonb,
+                            payload    = COALESCE(payload, '{{}}'::jsonb) || %s::jsonb,
                             finished_ts = NOW()
                         WHERE id = %s
                           AND client_id = %s
@@ -3144,14 +3164,7 @@ class APStartupRecovery:
                             WHERE orders.client_id = trade_queue.client_id
                               AND orders.kind = 'ENTRY'
                               AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
-                              AND (
-                                    COALESCE(orders.filled_qty, 0) > 0
-                                 OR orders.filled_ts IS NOT NULL
-                                 OR orders.status NOT IN (
-                                        'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                        'ERROR','DONE','ARCHIVED'
-                                    )
-                              )
+                              AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
                               AND (
                                     orders.signal_id = %s
                                  OR (%s <> '' AND orders.canonical_signal_id = %s)
@@ -3177,10 +3190,10 @@ class APStartupRecovery:
                 }
                 with conn() as c:
                     c.execute(
-                        """
+                        f"""
                         UPDATE trade_queue
                         SET status = 'NEW',
-                            payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb,
+                            payload = COALESCE(payload, '{{}}'::jsonb) || %s::jsonb,
                             started_ts = NULL,
                             finished_ts = NULL,
                             last_error = NULL
@@ -3192,14 +3205,7 @@ class APStartupRecovery:
                             WHERE orders.client_id = trade_queue.client_id
                               AND orders.kind = 'ENTRY'
                               AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
-                              AND (
-                                    COALESCE(orders.filled_qty, 0) > 0
-                                 OR orders.filled_ts IS NOT NULL
-                                 OR orders.status NOT IN (
-                                        'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                        'ERROR','DONE','ARCHIVED'
-                                    )
-                              )
+                              AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
                               AND (
                                     orders.signal_id = %s
                                  OR (%s <> '' AND orders.canonical_signal_id = %s)
