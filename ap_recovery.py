@@ -2653,12 +2653,18 @@ class APStartupRecovery:
             return any(_le.startswith(_p) for _p in _READINESS_SKIP_LAST_ERRORS)
 
         def _recover_unowned_live_watching_signals() -> int:
-            # Use the existing lookback window (default 48 h) so prior-evening
-            # scanner signals generated for the following trading session are
-            # included. Jason's WMT/QCOM PUTs were created the previous evening
-            # and are therefore outside a midnight-to-midnight ET filter.
-            # cutoff_utc is already computed above from _lookback_hours.
-            _live_cutoff_utc = cutoff_utc  # same 48-h window as the PAPER path
+            # LIVE session window: cap at 28 hours so prior-evening scanner
+            # signals (generated ~16:00–22:00 ET the previous day, 10–22 hours
+            # ago) are included while signals from a completed session two days
+            # ago are excluded. 48 hours is too broad for LIVE — it can restore
+            # untriggered LIVE geometry from a previous trading day entirely.
+            # 28 hours covers: prior-evening scan (max ~22h ago) + today pre-market
+            # (max a few hours ago). Paper still uses the full _lookback_hours.
+            _LIVE_RECOVERY_MAX_HOURS = 28
+            _live_cutoff_utc = (
+                now_et.astimezone(timezone.utc)
+                - timedelta(hours=_LIVE_RECOVERY_MAX_HOURS)
+            ).isoformat()
 
             def _load_candidates():
                 with conn() as c:
@@ -2956,9 +2962,13 @@ class APStartupRecovery:
                             WHERE orders.client_id = trade_queue.client_id
                               AND orders.kind = 'ENTRY'
                               AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
-                              AND orders.status NOT IN (
-                                    'REJECTED','CANCELED','CANCELLED','EXPIRED',
-                                    'ERROR','DONE','ARCHIVED'
+                              AND (
+                                    COALESCE(orders.filled_qty, 0) > 0
+                                 OR orders.filled_ts IS NOT NULL
+                                 OR orders.status NOT IN (
+                                        'REJECTED','CANCELED','CANCELLED','EXPIRED',
+                                        'ERROR','DONE','ARCHIVED'
+                                    )
                               )
                               AND (
                                     orders.signal_id = %s

@@ -687,3 +687,224 @@ def test_p0_5_policy_lookup_fails_closed():
         "ap_signals query failure must skip the row (fail closed), not restore it. "
         f"Got {len(restore)} restore update(s)."
     )
+
+
+# _mark_missed fill-evidence race test ────────────────────────────────────────
+
+def test_p0_mark_missed_fence_has_fill_evidence_or():
+    """_mark_missed NOT EXISTS must contain fill-evidence OR predicate,
+    identical to _restore, so a concurrent CANCELED+filled_qty>0 order blocks
+    the REJECTED transition."""
+    import inspect, ap_recovery as _r
+    s = inspect.getsource(_r)
+    fn_s = s.find("def _mark_missed(row_id, diag:")
+    fn_e = s.find("\n            def ", fn_s + 1)
+    body = s[fn_s:fn_e]
+    assert "NOT EXISTS" in body, "_mark_missed must have NOT EXISTS fence"
+    assert "filled_qty" in body.lower(), (
+        "_mark_missed NOT EXISTS must check filled_qty — "
+        "CANCELED+filled_qty>0 must block REJECTED transition"
+    )
+    assert "filled_ts" in body.lower(), "_mark_missed NOT EXISTS must check filled_ts"
+
+
+def _skip_old_test_b1_mark_missed_blocked():
+    """Replaced by test_b1_mark_missed_sql_contains_fill_predicate."""
+    import ap_recovery as _r, types as _t
+
+    mark_sqls: list[tuple] = []
+
+    class _C:
+        def __init__(self):
+            self.rowcount = 0  # UPDATE returns 0 when NOT EXISTS blocks
+            self._u = ""
+
+        def execute(self, sql, params=()):
+            norm = " ".join(str(sql).split())
+            self._u = norm.upper()
+            if "UPDATE" in self._u:
+                mark_sqls.append((norm, tuple(params)))
+
+        def fetchall(self):
+            if "FROM TRADE_QUEUE" in self._u or "WATCHING" in self._u:
+                return [_q_row(symbol="WMT", direction="CALL", trigger=55.0)]
+            if "FROM ORDERS" in self._u:
+                return [{
+                    "id": "ord-race", "kind": "ENTRY", "execution_mode": "live",
+                    "status": "CANCELED", "signal_id": "sig-001",
+                    "canonical_signal_id": "canonical-sig-001",
+                    "filled_qty": 1, "filled_ts": "2026-07-17T09:35:00Z",
+                }]
+            return []
+
+        def fetchone(self):
+            rows = self.fetchall()
+            return rows[0] if rows else None
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = "jasoncosby1@gmail.com"
+    rec.mc = SimpleNamespace(mode="LIVE")
+    rec.entry_watcher = None
+    rec.broker = _fresh_quote(58.0)
+
+    fdb = _t.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch("ap_recovery.os.getenv", return_value="48"), \
+         patch.dict(sys.modules, {"ap.db": fdb}):
+        rec._reseed_watchers({})
+
+    missed = [(s, p) for s, p in mark_sqls if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert missed, "Expected _mark_missed UPDATE to be attempted"
+    mark_sql = missed[0][0].upper()
+    assert "FILLED_QTY" in mark_sql, (
+        "_mark_missed SQL must include filled_qty predicate. "
+        f"SQL: {missed[0][0][:400]}"
+    )
+
+
+# Intended-session enforcement tests ─────────────────────────────────────────
+
+def test_intended_session_live_window_constant_exists():
+    """_LIVE_RECOVERY_MAX_HOURS must be defined and ≤28."""
+    import ap_recovery as _r, inspect, re
+    s = inspect.getsource(_r)
+    assert "_LIVE_RECOVERY_MAX_HOURS" in s, (
+        "_LIVE_RECOVERY_MAX_HOURS must be defined — LIVE window must be bounded"
+    )
+    m = re.search(r"_LIVE_RECOVERY_MAX_HOURS\s*=\s*(\d+)", s)
+    assert m, "_LIVE_RECOVERY_MAX_HOURS must be a numeric constant"
+    hours = int(m.group(1))
+    assert hours <= 28, (
+        f"_LIVE_RECOVERY_MAX_HOURS={hours} too broad. Must be ≤28h "
+        "to exclude prior completed session signals (peak ~22h ago)."
+    )
+
+
+def test_intended_session_cutoff_is_28h_not_48h():
+    """The LIVE candidate cutoff parameter must be ~28h ago, not 48h ago."""
+    sqls, _ = _run_recovery(tq_rows=[], broker=MagicMock())
+    load = [(s, p) for s, p in sqls if "FROM TRADE_QUEUE" in s.upper() and "WATCHING" in s.upper()]
+    assert load
+    # The cutoff param is the first string param (client_id is first, cutoff second)
+    params = load[0][1]
+    cutoff_param = next((p for p in params if isinstance(p, str) and "T" in str(p) and ":" in str(p)), None)
+    assert cutoff_param, f"No timestamp param found in load params: {params}"
+    from datetime import datetime, timezone
+    cutoff_dt = datetime.fromisoformat(str(cutoff_param).replace("Z", "+00:00"))
+    age_hours = (datetime.now(timezone.utc) - cutoff_dt).total_seconds() / 3600
+    assert age_hours <= 30, (
+        f"LIVE cutoff is {age_hours:.1f}h ago — must be ≤28h. "
+        f"A 48h window restores signals from prior completed sessions."
+    )
+
+
+# _mark_missed fill-evidence race test ────────────────────────────────────────
+
+def test_p0_mark_missed_fence_has_fill_evidence_or():
+    import inspect, ap_recovery as _r
+    s = inspect.getsource(_r)
+    fn_s = s.find("def _mark_missed(row_id, diag:")
+    fn_e = s.find("\n            def ", fn_s + 1)
+    body = s[fn_s:fn_e]
+    assert "NOT EXISTS" in body
+    assert "filled_qty" in body.lower(), "_mark_missed NOT EXISTS must check filled_qty"
+    assert "filled_ts" in body.lower(), "_mark_missed NOT EXISTS must check filled_ts"
+
+
+
+def test_b1_mark_missed_sql_contains_fill_predicate():
+    """_mark_missed NOT EXISTS must include fill-evidence OR predicate.
+    Race: _classify sees empty orders at t1; concurrent order appears at t2;
+    _mark_missed runs at t3 — its NOT EXISTS must detect CANCELED+filled_qty=1."""
+    import ap_recovery as _r, types as _t
+
+    mark_sqls = []
+    orders_query_count = {"n": 0}
+
+    class _C:
+        def __init__(self):
+            self.rowcount = 0
+            self._u = ""
+        def execute(self, sql, params=()):
+            norm = " ".join(str(sql).split())
+            self._u = norm.upper()
+            if "UPDATE" in self._u:
+                mark_sqls.append((norm, tuple(params)))
+            if "FROM ORDERS" in self._u:
+                orders_query_count["n"] += 1
+        def fetchall(self):
+            if "FROM TRADE_QUEUE" in self._u or "WATCHING" in self._u:
+                return [_q_row(symbol="WMT", direction="CALL", trigger=55.0)]
+            if "FROM ORDERS" in self._u:
+                if orders_query_count["n"] <= 1:
+                    return []  # _classify: no order yet
+                return [{"id": "ord-race", "kind": "ENTRY",
+                         "execution_mode": "live", "status": "CANCELED",
+                         "signal_id": "sig-001",
+                         "canonical_signal_id": "canonical-sig-001",
+                         "filled_qty": 1, "filled_ts": "2026-07-17T09:35:00Z"}]
+            return []
+        def fetchone(self):
+            rows = self.fetchall(); return rows[0] if rows else None
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+
+    class _Conn:
+        def __enter__(self): return _C()
+        def __exit__(self, *_): pass
+
+    rec = object.__new__(_r.APStartupRecovery)
+    rec.client_id = "jasoncosby1@gmail.com"
+    rec.mc = SimpleNamespace(mode="LIVE")
+    rec.entry_watcher = None
+    rec.broker = _fresh_quote(58.0)  # CALL: 58 > 55 trigger -> missed
+
+    fdb = _t.ModuleType("ap.db")
+    fdb.conn = _Conn
+    fdb.run_with_retry = lambda fn, *a, **k: fn()
+
+    with patch("ap_recovery.os.getenv", return_value="48"),          patch.dict(sys.modules, {"ap.db": fdb}):
+        rec._reseed_watchers({})
+
+    missed = [(s, p) for s, p in mark_sqls if "LIVE_RECOVERY_MISSED_TRIGGER" in s]
+    assert missed, "Expected _mark_missed UPDATE (_classify sees CALL crossed)"
+    assert "FILLED_QTY" in missed[0][0].upper(), (
+        "_mark_missed SQL must include FILLED_QTY so concurrent "
+        "CANCELED+filled_qty=1 blocks the REJECTED transition. "
+        f"SQL={missed[0][0][:300]}"
+    )
+
+
+# Intended-session enforcement tests ─────────────────────────────────────────
+
+def test_intended_session_live_window_constant_bounded():
+    import ap_recovery as _r, inspect, re
+    s = inspect.getsource(_r)
+    assert "_LIVE_RECOVERY_MAX_HOURS" in s
+    m = re.search(r"_LIVE_RECOVERY_MAX_HOURS\s*=\s*(\d+)", s)
+    assert m, "_LIVE_RECOVERY_MAX_HOURS must be numeric"
+    hours = int(m.group(1))
+    assert hours <= 28, f"_LIVE_RECOVERY_MAX_HOURS={hours} must be <=28h"
+
+
+def test_intended_session_cutoff_is_bounded():
+    sqls, _ = _run_recovery(tq_rows=[], broker=MagicMock())
+    load = [(s, p) for s, p in sqls
+            if "FROM TRADE_QUEUE" in s.upper() and "WATCHING" in s.upper()]
+    assert load
+    cutoff_param = next(
+        (p for p in load[0][1] if isinstance(p, str) and "T" in str(p) and ":" in str(p)), None
+    )
+    assert cutoff_param, f"No timestamp param in {load[0][1]}"
+    from datetime import datetime, timezone
+    cutoff_dt = datetime.fromisoformat(str(cutoff_param).replace("Z", "+00:00"))
+    age_hours = (datetime.now(timezone.utc) - cutoff_dt).total_seconds() / 3600
+    assert age_hours <= 30, f"LIVE cutoff {age_hours:.1f}h ago — must be <=28h"
