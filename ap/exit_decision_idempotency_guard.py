@@ -58,6 +58,11 @@ _CLAIM_STATE_BROKER_OWNED = "BROKER_OWNED"
 _CLAIM_STATE_RELEASED_NO_SUBMIT = "RELEASED_NO_SUBMIT"
 _CLAIM_STATE_AMBIGUOUS = "AMBIGUOUS"
 _CONCLUSIVE_NO_SUBMIT_STATUSES = {"ERROR", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}
+_CONCLUSIVE_PRE_SUBMIT_FAILURE_MARKERS = (
+    "PRE_SUBMIT_VALIDATION_FAILED",
+    "PRE_BROKER_CALLBACK_REJECTED",
+    "NO_POST_ATTEMPTED",
+)
 
 
 def _bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -381,11 +386,13 @@ def _classify_submit_claim_outcome(
             return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
 
     accepted = identity.get("accepted")
+    if error_text.startswith("broker_conn_error:"):
+        return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
+    if any(error_text.startswith(marker) for marker in _CONCLUSIVE_PRE_SUBMIT_FAILURE_MARKERS):
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
     if raw_status in _CONCLUSIVE_NO_SUBMIT_STATUSES:
         return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
     if accepted is False:
-        return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
-    if error_text.startswith("broker_conn_error:"):
         return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
     if callback_returned:
         return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
@@ -725,6 +732,11 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 "error": "",
             }
             if callable(original_callback):
+                callback_lock = getattr(self, "_ap_exit_submit_callback_lock", None)
+                if callback_lock is None:
+                    callback_lock = threading.Lock()
+                    self._ap_exit_submit_callback_lock = callback_lock
+
                 def traced_callback(*cb_args, **cb_kwargs):
                     callback_trace["entered"] = True
                     try:
@@ -746,13 +758,14 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             callback_trace["identity"] = {}
                     return result
 
-                setattr(self, callback_attr, traced_callback)
-
-            try:
+                with callback_lock:
+                    setattr(self, callback_attr, traced_callback)
+                    try:
+                        callback_returned = bool(original(self, pos, decision, *args, **kwargs))
+                    finally:
+                        setattr(self, callback_attr, original_callback)
+            else:
                 callback_returned = bool(original(self, pos, decision, *args, **kwargs))
-            finally:
-                if callable(original_callback):
-                    setattr(self, callback_attr, original_callback)
 
             if generation_key:
                 claim_state, local_order_id, broker_order_id, error_text = _classify_submit_claim_outcome(

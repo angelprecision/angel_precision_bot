@@ -484,7 +484,7 @@ def test_submit_wrapper_restart_durability_blocks_fresh_engine(generation_claims
 
 def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generation_claims_table, monkeypatch) -> None:
     responses = iter([
-        {"ok": False, "accepted": False, "status": "ERROR", "error": "broker_http_400:bad request"},
+        {"ok": False, "accepted": False, "status": "ERROR", "error": "NO_POST_ATTEMPTED:validation_failed"},
         {"ok": True, "accepted": True, "status": "EXIT_SUBMITTED", "local_order_id": "exit-local-2", "broker_order_id": "exit-broker-2"},
     ])
     callback_count = 0
@@ -510,6 +510,34 @@ def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generati
     assert wrapped(_make_submit_engine(retry_pos, callback=callback), retry_pos, _decision()) is True
     assert callback_count == 2
     assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+
+
+def test_submit_wrapper_treats_broker_conn_error_as_ambiguous(generation_claims_table, monkeypatch) -> None:
+    callback_count = 0
+
+    def callback(pos, decision):
+        nonlocal callback_count
+        callback_count += 1
+        return {
+            "ok": False,
+            "accepted": False,
+            "status": "ERROR",
+            "error": "broker_conn_error:socket reset",
+        }
+
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    wrapped = guard.wrap_submit(
+        lambda engine, pos, decision: bool(
+            (engine.on_scale if str(decision.action).upper() == "SCALE_OUT" else engine.on_exit)(pos, decision).get("ok")
+        )
+    )
+    first_pos = _pos()
+
+    assert wrapped(_make_submit_engine(first_pos, callback=callback), first_pos, _decision()) is False
+    replay_pos = _pos()
+    assert wrapped(_make_submit_engine(replay_pos, callback=callback), replay_pos, _decision()) is False
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_AMBIGUOUS
+    assert callback_count == 1
 
 
 def test_submit_wrapper_keeps_claim_on_ambiguous_submit_failure(generation_claims_table, monkeypatch) -> None:
@@ -655,6 +683,76 @@ def test_submit_wrapper_does_not_depend_on_ledger_for_duplicate_suppression(gene
     second_pos = _pos()
     assert wrapped(_make_submit_engine(second_pos, callback=callback), second_pos, _decision()) is False
     assert callback_count == 1
+
+
+def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
+    generation_claims_table, monkeypatch
+) -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    callback_count = 0
+    callback_count_lock = threading.Lock()
+
+    def callback(pos, decision):
+        nonlocal callback_count
+        with callback_count_lock:
+            callback_count += 1
+            index = callback_count
+        if index == 1:
+            entered.set()
+            assert release.wait(timeout=2.0)
+        pos.exit_in_flight = True
+        pos.pending_exit_local_order_id = f"exit-local-{pos.position_id}"
+        pos.pending_exit_broker_order_id = f"exit-broker-{pos.position_id}"
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "EXIT_SUBMITTED",
+            "local_order_id": f"exit-local-{pos.position_id}",
+            "broker_order_id": f"exit-broker-{pos.position_id}",
+        }
+
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda pos, *_: (f"client|{pos.position_id}|3|1", 1),
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    engine = _make_submit_engine(_pos(position_id="position-anchor"), callback=callback)
+    pos_a = _pos(position_id="position-a")
+    pos_b = _pos(position_id="position-b")
+    results = []
+
+    thread_a = threading.Thread(target=lambda: results.append(("a", wrapped(engine, pos_a, _decision()))))
+    thread_b = threading.Thread(target=lambda: results.append(("b", wrapped(engine, pos_b, _decision()))))
+    thread_a.start()
+    assert entered.wait(timeout=2.0)
+    thread_b.start()
+    release.set()
+    thread_a.join(timeout=2.0)
+    thread_b.join(timeout=2.0)
+
+    assert thread_a.is_alive() is False
+    assert thread_b.is_alive() is False
+    assert sorted(results) == [("a", True), ("b", True)]
+    assert callback_count == 2
+    rows = _claim_rows()
+    assert rows == [
+        {
+            "generation_key": "client|position-a|3|1",
+            "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+            "local_order_id": "exit-local-position-a",
+            "broker_order_id": "exit-broker-position-a",
+            "last_error": None,
+        },
+        {
+            "generation_key": "client|position-b|3|1",
+            "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+            "local_order_id": "exit-local-position-b",
+            "broker_order_id": "exit-broker-position-b",
+            "last_error": None,
+        },
+    ]
 
 
 def test_submit_wrapper_blocks_when_claim_acquisition_fails(monkeypatch) -> None:
