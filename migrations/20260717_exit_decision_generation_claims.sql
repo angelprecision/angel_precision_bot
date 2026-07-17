@@ -11,8 +11,28 @@ CREATE TABLE IF NOT EXISTS exit_decision_generation_claims (
     exit_generation      BIGINT NOT NULL CHECK (exit_generation > 0),
     decision_action      TEXT,
     decision_reason_code TEXT,
+    claim_state          TEXT NOT NULL DEFAULT 'CLAIMED',
+    local_order_id       TEXT,
+    broker_order_id      TEXT,
+    last_error           TEXT,
+    released_at          TIMESTAMPTZ,
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE exit_decision_generation_claims
+    ADD COLUMN IF NOT EXISTS claim_state TEXT NOT NULL DEFAULT 'CLAIMED';
+ALTER TABLE exit_decision_generation_claims
+    ADD COLUMN IF NOT EXISTS local_order_id TEXT;
+ALTER TABLE exit_decision_generation_claims
+    ADD COLUMN IF NOT EXISTS broker_order_id TEXT;
+ALTER TABLE exit_decision_generation_claims
+    ADD COLUMN IF NOT EXISTS last_error TEXT;
+ALTER TABLE exit_decision_generation_claims
+    ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
+
+UPDATE exit_decision_generation_claims
+SET claim_state = COALESCE(NULLIF(claim_state, ''), 'CLAIMED')
+WHERE claim_state IS NULL OR claim_state = '';
 
 CREATE INDEX IF NOT EXISTS idx_exit_decision_generation_position
     ON exit_decision_generation_claims

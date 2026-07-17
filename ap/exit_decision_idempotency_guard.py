@@ -52,6 +52,14 @@ _TERMINAL_POSITION_STATUSES = {
     "CANCELED",
     "CANCELLED",
 }
+
+_CLAIM_STATE_CLAIMED = "CLAIMED"
+_CLAIM_STATE_BROKER_OWNED = "BROKER_OWNED"
+_CLAIM_STATE_RELEASED_NO_SUBMIT = "RELEASED_NO_SUBMIT"
+_CLAIM_STATE_AMBIGUOUS = "AMBIGUOUS"
+_CONCLUSIVE_NO_SUBMIT_STATUSES = {"ERROR", "REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}
+
+
 def _bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
     raw = os.getenv(name)
     if raw is None:
@@ -196,16 +204,33 @@ def _claim_durable_decision_generation(
     remaining_qty: int,
     exit_generation: int,
     decision: Any,
-) -> bool:
+) -> dict:
     """Atomically claim one actionable decision for this durable generation."""
-    def _claim() -> bool:
+    def _claim() -> dict:
         with conn() as c:
-            cur = c.execute(
+            row = c.execute(
                 "INSERT INTO exit_decision_generation_claims ("
                 "generation_key, client_id, position_id, remaining_qty, "
-                "exit_generation, decision_action, decision_reason_code"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (generation_key) DO NOTHING",
+                "exit_generation, decision_action, decision_reason_code, "
+                "claim_state, claimed_at, released_at, local_order_id, broker_order_id, last_error"
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,NULL,NULL,NULL) "
+                "ON CONFLICT (generation_key) DO UPDATE SET "
+                "client_id=EXCLUDED.client_id, "
+                "position_id=EXCLUDED.position_id, "
+                "remaining_qty=EXCLUDED.remaining_qty, "
+                "exit_generation=EXCLUDED.exit_generation, "
+                "decision_action=EXCLUDED.decision_action, "
+                "decision_reason_code=EXCLUDED.decision_reason_code, "
+                "claim_state=%s, "
+                "claimed_at=NOW(), "
+                "released_at=NULL, "
+                "local_order_id=NULL, "
+                "broker_order_id=NULL, "
+                "last_error=NULL "
+                "WHERE exit_decision_generation_claims.claim_state=%s "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
                     generation_key,
                     client_id,
@@ -214,11 +239,157 @@ def _claim_durable_decision_generation(
                     exit_generation,
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
+                    _CLAIM_STATE_CLAIMED,
+                    _CLAIM_STATE_CLAIMED,
+                    _CLAIM_STATE_RELEASED_NO_SUBMIT,
+                ),
+            ).fetchone()
+            if row:
+                claimed = dict(row)
+                claimed["claimed"] = True
+                return claimed
+
+            row = c.execute(
+                "SELECT generation_key, client_id, position_id, remaining_qty, "
+                "exit_generation, decision_action, decision_reason_code, claim_state, "
+                "local_order_id, broker_order_id, last_error, claimed_at, released_at "
+                "FROM exit_decision_generation_claims WHERE generation_key=%s LIMIT 1",
+                (generation_key,),
+            ).fetchone()
+            existing = dict(row) if row else {"generation_key": generation_key}
+            existing["claimed"] = False
+            return existing
+
+    return dict(run_with_retry(_claim) or {"generation_key": generation_key, "claimed": False})
+
+
+def _update_durable_decision_generation(
+    generation_key: str,
+    *,
+    claim_state: str,
+    local_order_id: str = "",
+    broker_order_id: str = "",
+    error_text: str = "",
+) -> None:
+    def _update() -> None:
+        with conn() as c:
+            c.execute(
+                "UPDATE exit_decision_generation_claims "
+                "SET claim_state=%s, "
+                "released_at=CASE WHEN %s=%s THEN NOW() ELSE released_at END, "
+                "local_order_id=CASE WHEN %s<>'' THEN %s ELSE local_order_id END, "
+                "broker_order_id=CASE WHEN %s<>'' THEN %s ELSE broker_order_id END, "
+                "last_error=CASE WHEN %s<>'' THEN %s ELSE NULL END "
+                "WHERE generation_key=%s",
+                (
+                    claim_state,
+                    claim_state,
+                    _CLAIM_STATE_RELEASED_NO_SUBMIT,
+                    local_order_id,
+                    local_order_id,
+                    broker_order_id,
+                    broker_order_id,
+                    error_text,
+                    error_text,
+                    generation_key,
                 ),
             )
-            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0) == 1
 
-    return bool(run_with_retry(_claim))
+    run_with_retry(_update)
+
+
+def _extract_callback_trace_identity(callback_trace: dict) -> dict:
+    identity = dict(callback_trace.get("identity") or {})
+    result = callback_trace.get("result")
+    if not isinstance(result, dict):
+        return identity
+
+    for source_key, target_key in (
+        ("local_order_id", "local_order_id"),
+        ("exit_local_order_id", "local_order_id"),
+        ("broker_order_id", "broker_order_id"),
+        ("order_id", "broker_order_id"),
+        ("id", "broker_order_id"),
+    ):
+        value = result.get(source_key)
+        if value is not None and not identity.get(target_key):
+            identity[target_key] = str(value)
+    if "accepted" not in identity and "accepted" in result:
+        identity["accepted"] = bool(result.get("accepted"))
+    if not identity.get("raw_status"):
+        raw_status = result.get("status") or result.get("raw_status") or result.get("state")
+        if raw_status is not None:
+            identity["raw_status"] = str(raw_status)
+    return identity
+
+
+def _classify_submit_claim_outcome(
+    engine: Any,
+    pos: Any,
+    callback_trace: dict,
+    callback_returned: bool,
+) -> tuple[str, str, str, str]:
+    position_id = str(getattr(pos, "position_id", "") or "")
+    try:
+        active_order = _active_exit_order(engine, position_id)
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_DECISION_GENERATION_POST_SUBMIT_LOOKUP_FAILED position=%s error=%s",
+            getattr(pos, "ticker", ""),
+            position_id,
+            exc,
+        )
+        active_order = None
+
+    identity = _extract_callback_trace_identity(callback_trace)
+    local_order_id = str(
+        identity.get("local_order_id")
+        or getattr(pos, "pending_exit_local_order_id", "")
+        or (active_order or {}).get("local_order_id")
+        or ""
+    ).strip()
+    broker_order_id = str(
+        identity.get("broker_order_id")
+        or getattr(pos, "pending_exit_broker_order_id", "")
+        or (active_order or {}).get("broker_order_id")
+        or ""
+    ).strip()
+    raw_status = str(identity.get("raw_status") or callback_trace.get("status") or "").strip().upper()
+    error_text = str(callback_trace.get("error") or "")
+    if not error_text and callback_trace.get("exception") is not None:
+        error_text = str(callback_trace["exception"])
+
+    if active_exit_order_blocks(active_order):
+        return _CLAIM_STATE_BROKER_OWNED, local_order_id, broker_order_id, error_text
+    if broker_order_id or (raw_status == "EXIT_SUBMITTED" and local_order_id):
+        return _CLAIM_STATE_BROKER_OWNED, local_order_id, broker_order_id, error_text
+    if bool(getattr(pos, "exit_in_flight", False)) and (local_order_id or broker_order_id):
+        return _CLAIM_STATE_BROKER_OWNED, local_order_id, broker_order_id, error_text
+
+    if not callback_trace.get("entered"):
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
+    if callback_trace.get("exception") is not None:
+        return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
+    if error_text.startswith("BROKER_AMBIGUOUS_"):
+        return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
+
+    result = callback_trace.get("result")
+    if isinstance(result, dict):
+        if result.get("reconciliation_required") or result.get("split_brain"):
+            return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
+        if bool(result.get("identity_quarantine")) and raw_status not in {"", "EXIT_SUBMITTED"}:
+            return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
+
+    accepted = identity.get("accepted")
+    if raw_status in _CONCLUSIVE_NO_SUBMIT_STATUSES:
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
+    if accepted is False:
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
+    if error_text.startswith("broker_conn_error:"):
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
+    if callback_returned:
+        return _CLAIM_STATE_AMBIGUOUS, local_order_id, broker_order_id, error_text
+    return _CLAIM_STATE_RELEASED_NO_SUBMIT, local_order_id, broker_order_id, error_text
 
 
 def should_write_ledger(
@@ -399,39 +570,6 @@ def wrap_ledger(original: Callable[..., Any]) -> Callable[..., Any]:
     def guarded(pos, decision, *, client_id: str = ""):
         if not should_write_ledger(pos, decision, client_id=client_id):
             return None
-        if _decision_should_act(decision):
-            resolved_client = str(
-                client_id or getattr(pos, "client_id", "") or ""
-            ).strip()
-            try:
-                durable = _durable_exit_generation(pos, resolved_client)
-                if durable is not None:
-                    generation_key, generation = durable
-                    claimed = _claim_durable_decision_generation(
-                        generation_key=generation_key,
-                        client_id=resolved_client,
-                        position_id=str(getattr(pos, "position_id", "") or ""),
-                        remaining_qty=_int(getattr(pos, "quantity_remaining", 0), 0) or 0,
-                        exit_generation=generation,
-                        decision=decision,
-                    )
-                    if not claimed:
-                        log.info(
-                            "[%s] EXIT_DECISION_GENERATION_ALREADY_CLAIMED key=%s",
-                            getattr(pos, "ticker", ""),
-                            generation_key,
-                        )
-                        return None
-            except Exception as exc:
-                # Ledger/diagnostic failure must never block a protective EXIT.
-                # The process-local cache still bounds noise until the database
-                # migration is restored.
-                log.critical(
-                    "[%s] EXIT_DECISION_GENERATION_CLAIM_UNAVAILABLE position=%s error=%s",
-                    getattr(pos, "ticker", ""),
-                    getattr(pos, "position_id", ""),
-                    exc,
-                )
         return original(pos, decision, client_id=client_id)
 
     return guarded
@@ -478,6 +616,14 @@ def wrap_precheck(original: Callable[..., bool]) -> Callable[..., bool]:
 def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
     def guarded(self, pos, decision, *args, **kwargs) -> bool:
         key = _position_key(pos)
+        resolved_client = str(
+            getattr(pos, "client_id", "")
+            or getattr(self, "client_id", "")
+            or getattr(self, "_email", "")
+            or ""
+        ).strip()
+        position_id = str(getattr(pos, "position_id", "") or "")
+        remaining_qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
         with self._lock:
             claims = getattr(self, "_ap_exit_submit_claims", None)
             if claims is None:
@@ -495,7 +641,134 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             claims.add(key)
 
         try:
-            return bool(original(self, pos, decision, *args, **kwargs))
+            try:
+                active_order = _active_exit_order(self, position_id)
+            except Exception as exc:
+                log.warning(
+                    "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_LOOKUP_FAILED position=%s error=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                    exc,
+                )
+                active_order = None
+            if active_exit_order_blocks(active_order):
+                try:
+                    _mark_active_exit_owned(self, pos, active_order)
+                except Exception as exc:
+                    log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
+                log.warning(
+                    "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_BLOCKED position=%s local_order_id=%s broker_order_id=%s status=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                    active_order.get("local_order_id"),
+                    active_order.get("broker_order_id"),
+                    active_order.get("status"),
+                )
+                return False
+
+            generation_key = ""
+            exit_generation = 0
+            if _decision_should_act(decision):
+                durable = _durable_exit_generation(pos, resolved_client)
+                if durable is not None:
+                    generation_key, exit_generation = durable
+                    try:
+                        claim = _claim_durable_decision_generation(
+                            generation_key=generation_key,
+                            client_id=resolved_client,
+                            position_id=position_id,
+                            remaining_qty=remaining_qty,
+                            exit_generation=exit_generation,
+                            decision=decision,
+                        )
+                    except Exception as exc:
+                        log.critical(
+                            "[%s] EXIT_DECISION_GENERATION_CLAIM_FAILED client_id=%s position_id=%s key=%s qty_remaining=%s exit_generation=%s action=%s reason_code=%s error=%s",
+                            getattr(pos, "ticker", ""),
+                            resolved_client,
+                            position_id,
+                            generation_key,
+                            remaining_qty,
+                            exit_generation,
+                            getattr(decision, "action", ""),
+                            getattr(decision, "reason_code", ""),
+                            exc,
+                        )
+                        return False
+                    if not claim.get("claimed"):
+                        log.critical(
+                            "[%s] EXIT_DECISION_GENERATION_DUPLICATE_SUPPRESSED client_id=%s position_id=%s key=%s qty_remaining=%s exit_generation=%s action=%s reason_code=%s existing_state=%s",
+                            getattr(pos, "ticker", ""),
+                            resolved_client,
+                            position_id,
+                            generation_key,
+                            remaining_qty,
+                            exit_generation,
+                            getattr(decision, "action", ""),
+                            getattr(decision, "reason_code", ""),
+                            claim.get("claim_state", ""),
+                        )
+                        return False
+
+            callback_attr = (
+                "on_scale"
+                if str(getattr(decision, "action", "") or "").upper() == "SCALE_OUT"
+                else "on_exit"
+            )
+            original_callback = getattr(self, callback_attr, None)
+            callback_trace = {
+                "entered": False,
+                "result": None,
+                "exception": None,
+                "identity": {},
+                "status": "",
+                "error": "",
+            }
+            if callable(original_callback):
+                def traced_callback(*cb_args, **cb_kwargs):
+                    callback_trace["entered"] = True
+                    try:
+                        result = original_callback(*cb_args, **cb_kwargs)
+                    except Exception as exc:
+                        callback_trace["exception"] = exc
+                        raise
+                    callback_trace["result"] = result
+                    if isinstance(result, dict):
+                        callback_trace["status"] = str(
+                            result.get("status") or result.get("raw_status") or result.get("state") or ""
+                        )
+                        callback_trace["error"] = str(result.get("error") or "")
+                    extractor = getattr(self, "_extract_exit_order_identity", None)
+                    if callable(extractor):
+                        try:
+                            callback_trace["identity"] = extractor(result) or {}
+                        except Exception:
+                            callback_trace["identity"] = {}
+                    return result
+
+                setattr(self, callback_attr, traced_callback)
+
+            try:
+                callback_returned = bool(original(self, pos, decision, *args, **kwargs))
+            finally:
+                if callable(original_callback):
+                    setattr(self, callback_attr, original_callback)
+
+            if generation_key:
+                claim_state, local_order_id, broker_order_id, error_text = _classify_submit_claim_outcome(
+                    self,
+                    pos,
+                    callback_trace,
+                    callback_returned,
+                )
+                _update_durable_decision_generation(
+                    generation_key,
+                    claim_state=claim_state,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    error_text=error_text,
+                )
+            return callback_returned
         finally:
             with self._lock:
                 claims = getattr(self, "_ap_exit_submit_claims", None)
