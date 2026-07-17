@@ -106,14 +106,20 @@ def project_position_from_exit_fills(position: dict, fills: Iterable[dict]) -> L
 
 
 def official_live_eligibility(
-    *, execution_mode: str, closed: bool, entry_broker_order_id: str, exit_broker_order_id: str
+    *,
+    execution_mode: str,
+    closed: bool,
+    entry_broker_order_id: str,
+    exit_broker_order_id: str,
+    all_exit_fills_broker_backed: bool,
 ) -> bool:
-    """Official proof requires a fully closed LIVE lifecycle with both broker IDs."""
+    """Official proof requires a fully closed LIVE lifecycle with every broker ID."""
     return bool(
         str(execution_mode or "").strip().lower() == "live"
         and closed
         and str(entry_broker_order_id or "").strip()
         and str(exit_broker_order_id or "").strip()
+        and all_exit_fills_broker_backed
     )
 
 
@@ -129,6 +135,10 @@ def _table_columns(c, table_name: str) -> set[str]:
 def _position_id_is_synthetic(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return not text or text.startswith("broker-repair-")
+
+
+def _position_entry_key(row: dict) -> str:
+    return str(row.get("entry_ts") or row.get("created_at") or "")
 
 
 def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
@@ -148,8 +158,10 @@ def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
             if str(resolved.get("contract") or "").strip().upper() == contract:
                 return resolved
 
-    # Exact client + OCC contract, then choose the most recent position opened no
-    # later than the broker fill. Two rows are loaded so ambiguity is visible.
+    # Exact client + OCC contract, anchored before the broker exit fill. The
+    # newest matching lifecycle is authoritative even if the exit engine marked
+    # it CLOSED milliseconds before fill-monitor projection. Loading two rows
+    # lets us fail closed when their timestamps are indistinguishable.
     rows = c.execute(
         "SELECT * FROM positions "
         "WHERE client_id=%s AND UPPER(contract)=UPPER(%s) "
@@ -168,7 +180,12 @@ def _resolve_position(c, order: dict, fill_ts: Any) -> dict | None:
         if str(row.get("status") or "").upper() not in _TERMINAL_POSITION_STATUSES
         and _int(row.get("quantity_remaining"), _int(row.get("qty"))) > 0
     ]
-    return active[0] if len(active) == 1 else None
+    if len(active) == 1:
+        return active[0]
+
+    if _position_entry_key(candidates[0]) and _position_entry_key(candidates[0]) != _position_entry_key(candidates[1]):
+        return candidates[0]
+    return None
 
 
 def _load_exit_fills(c, position: dict, order: dict) -> list[dict]:
@@ -200,13 +217,30 @@ def _load_entry_order(c, position: dict, order: dict) -> dict:
         ).fetchone()
         if row:
             return dict(row)
+
     row = c.execute(
-        "SELECT * FROM orders WHERE client_id=%s AND kind='ENTRY' "
-        "AND (position_id::text=%s OR (UPPER(contract)=UPPER(%s) AND status='FILLED')) "
-        "ORDER BY CASE WHEN position_id::text=%s THEN 0 ELSE 1 END, filled_ts DESC NULLS LAST LIMIT 1",
-        (client_id, position_id, position.get("contract"), position_id),
+        "SELECT * FROM orders WHERE client_id=%s AND kind='ENTRY' AND position_id::text=%s "
+        "ORDER BY filled_ts DESC NULLS LAST LIMIT 1",
+        (client_id, position_id),
     ).fetchone()
-    return dict(row) if row else {}
+    if row:
+        return dict(row)
+
+    # Last-resort repair is time-bounded and ambiguity-intolerant. Never attach
+    # the latest same-contract entry without proving it belongs to this position.
+    entry_ts = position.get("entry_ts") or position.get("created_at")
+    contract = str(position.get("contract") or order.get("contract") or "").strip().upper()
+    if not entry_ts or not contract:
+        return {}
+    rows = c.execute(
+        "SELECT * FROM orders WHERE client_id=%s AND kind='ENTRY' AND status='FILLED' "
+        "AND UPPER(contract)=UPPER(%s) "
+        "AND filled_ts BETWEEN %s - INTERVAL '10 minutes' AND %s + INTERVAL '10 minutes' "
+        "ORDER BY ABS(EXTRACT(EPOCH FROM (filled_ts - %s))) ASC LIMIT 2",
+        (client_id, contract, entry_ts, entry_ts, entry_ts),
+    ).fetchall()
+    candidates = [dict(candidate) for candidate in rows]
+    return candidates[0] if len(candidates) == 1 else {}
 
 
 def _dynamic_update(c, table: str, updates: dict[str, Any], where_sql: str, where_params: tuple[Any, ...]) -> int:
@@ -237,8 +271,13 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
             entry_order = _load_entry_order(c, position, order)
             entry_broker_id = str(entry_order.get("broker_order_id") or position.get("broker_order_id") or "").strip()
             exit_broker_ids = [str(row.get("broker_order_id") or "").strip() for row in fills]
-            exit_broker_ids = [value for value in exit_broker_ids if value]
-            final_exit_broker_id = exit_broker_ids[-1] if exit_broker_ids else str(order.get("broker_order_id") or "")
+            all_exit_fills_broker_backed = bool(fills) and all(exit_broker_ids)
+            nonempty_exit_broker_ids = [value for value in exit_broker_ids if value]
+            final_exit_broker_id = (
+                nonempty_exit_broker_ids[-1]
+                if nonempty_exit_broker_ids
+                else str(order.get("broker_order_id") or "").strip()
+            )
             execution_mode = str(
                 position.get("execution_mode") or entry_order.get("execution_mode") or order.get("execution_mode") or "unknown"
             ).strip().lower()
@@ -268,12 +307,13 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                 key: value for key, value in desired_position_updates.items() if key in position_columns
             }
             _dynamic_update(
-                c, "positions", position_updates,
+                c,
+                "positions",
+                position_updates,
                 "client_id=%s AND id::text=%s",
                 (client_id, canonical_position_id),
             )
 
-            # Relink only broker-confirmed EXIT rows from this position window.
             local_ids = [str(row.get("local_order_id") or "").strip() for row in fills]
             local_ids = [value for value in local_ids if value]
             if local_ids:
@@ -292,32 +332,51 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                     (canonical_position_id, client_id, entry_order.get("local_order_id")),
                 )
 
-            proof_columns = _table_columns(c, "proof_trades")
-            eligible = official_live_eligibility(
-                execution_mode=execution_mode,
-                closed=projection.closed,
-                entry_broker_order_id=entry_broker_id,
-                exit_broker_order_id=final_exit_broker_id,
-            )
-            desired_proof_updates = {
-                "position_id": canonical_position_id,
-                "execution_mode": execution_mode if execution_mode in {"live", "paper"} else "unknown",
-                "signal_id": signal_id or None,
-                "entry_broker_order_id": entry_broker_id or None,
-                "exit_broker_order_id": final_exit_broker_id or None,
-                "exit_option_price": projection.weighted_exit_price,
-                "exit_fill_price": projection.weighted_exit_price,
-                "option_pnl_pct": projection.realized_pnl_pct,
-                "win": projection.realized_pnl > 0,
-                "broker_reconciled": bool(projection.closed and entry_broker_id and final_exit_broker_id),
-                "official_live_performance_eligible": eligible,
-            }
-            proof_updates = {key: value for key, value in desired_proof_updates.items() if key in proof_columns}
-            proof_updated = _dynamic_update(
-                c, "proof_trades", proof_updates,
-                "position_id::text=%s OR (%s<>'' AND local_order_id=%s)",
-                (canonical_position_id, str(entry_order.get("local_order_id") or ""), str(entry_order.get("local_order_id") or "")),
-            )
+            proof_updated = 0
+            eligible = False
+            if projection.closed:
+                proof_columns = _table_columns(c, "proof_trades")
+                eligible = official_live_eligibility(
+                    execution_mode=execution_mode,
+                    closed=True,
+                    entry_broker_order_id=entry_broker_id,
+                    exit_broker_order_id=final_exit_broker_id,
+                    all_exit_fills_broker_backed=all_exit_fills_broker_backed,
+                )
+                desired_proof_updates = {
+                    "position_id": canonical_position_id,
+                    "execution_mode": execution_mode if execution_mode in {"live", "paper"} else "unknown",
+                    "signal_id": signal_id or None,
+                    "entry_broker_order_id": entry_broker_id or None,
+                    "exit_broker_order_id": final_exit_broker_id or None,
+                    "exit_broker_order_ids": nonempty_exit_broker_ids or None,
+                    "exit_option_price": projection.weighted_exit_price,
+                    "exit_fill_price": projection.weighted_exit_price,
+                    "option_pnl_pct": projection.realized_pnl_pct,
+                    "win": projection.realized_pnl > 0,
+                    "broker_reconciled": bool(entry_broker_id and all_exit_fills_broker_backed),
+                    "official_live_performance_eligible": eligible,
+                }
+                proof_updates = {
+                    key: value for key, value in desired_proof_updates.items() if key in proof_columns
+                }
+                entry_local_id = str(entry_order.get("local_order_id") or "")
+                where_sql = "(position_id::text=%s OR (%s<>'' AND local_order_id=%s))"
+                where_params: tuple[Any, ...] = (
+                    canonical_position_id,
+                    entry_local_id,
+                    entry_local_id,
+                )
+                if "client_email" in proof_columns:
+                    where_sql = "client_email=%s AND " + where_sql
+                    where_params = (client_id,) + where_params
+                proof_updated = _dynamic_update(
+                    c,
+                    "proof_trades",
+                    proof_updates,
+                    where_sql,
+                    where_params,
+                )
 
             return {
                 "position_id": canonical_position_id,
@@ -325,6 +384,7 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                 "execution_mode": execution_mode,
                 "entry_broker_order_id": entry_broker_id,
                 "exit_broker_order_id": final_exit_broker_id,
+                "all_exit_fills_broker_backed": all_exit_fills_broker_backed,
                 "proof_rows_updated": proof_updated,
                 "official_live_performance_eligible": eligible,
             }
@@ -359,6 +419,7 @@ def install_exit_fill_truth_guard() -> None:
             )
             try:
                 from ap.exit_price_sync import sync_exit_price_to_dashboard
+
                 sync_exit_price_to_dashboard(
                     position_id=str(reconciled.get("position_id") or ""),
                     exit_avg_fill=projection.weighted_exit_price,
@@ -373,9 +434,12 @@ def install_exit_fill_truth_guard() -> None:
             # complete; never guess a position by ticker and overwrite another trade.
             log.critical(
                 "[%s] CANONICAL_EXIT_FILL_RECONCILE_FAILED order=%s broker=%s position=%s contract=%s error=%s",
-                order.get("client_id"), order.get("local_order_id"),
-                order.get("broker_order_id"), order.get("position_id"),
-                order.get("contract") or order.get("symbol"), exc,
+                order.get("client_id"),
+                order.get("local_order_id"),
+                order.get("broker_order_id"),
+                order.get("position_id"),
+                order.get("contract") or order.get("symbol"),
+                exc,
                 exc_info=True,
             )
             return None
