@@ -23,6 +23,13 @@ _PATCHED_ATTR = "_AP_ONE_CONTRACT_EXIT_GUARD_PATCHED"
 _ORIGINAL_ATTR = "_AP_ONE_CONTRACT_EXIT_GUARD_ORIGINAL"
 
 
+def _enabled() -> bool:
+    """Require an explicit rollout decision for this LIVE exit-policy change."""
+    return str(
+        os.getenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "0")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value) if value is not None else default
@@ -80,6 +87,8 @@ def wrap_evaluate_exit(
 ) -> Callable[..., Any]:
     def guarded(pos, now_et=None):
         decision = original(pos, now_et=now_et)
+        if not _enabled():
+            return decision
         try:
             decision_code = classify_decision(decision)
         except Exception:

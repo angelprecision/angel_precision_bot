@@ -115,7 +115,8 @@ def test_stop_target_and_eod_decisions_are_never_suppressed() -> None:
         ) is False
 
 
-def test_wrapper_converts_only_jason_shape_to_hold() -> None:
+def test_wrapper_converts_only_jason_shape_to_hold(monkeypatch) -> None:
+    monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
     wrapped = guard.wrap_evaluate_exit(
         lambda pos, now_et=None: _touched_stop(),
         exit_decision_cls=Decision,
@@ -129,7 +130,8 @@ def test_wrapper_converts_only_jason_shape_to_hold() -> None:
     assert "waiting for +12% runner arm" in result.reason
 
 
-def test_wrapper_preserves_original_stop_object() -> None:
+def test_wrapper_preserves_original_stop_object(monkeypatch) -> None:
+    monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
     stop = Decision(
         action="CLOSE_ALL",
         quantity=1,
@@ -147,7 +149,8 @@ def test_wrapper_preserves_original_stop_object() -> None:
     assert wrapped(_pos()) is stop
 
 
-def test_wrapper_preserves_touched_profit_close_at_breakeven() -> None:
+def test_wrapper_preserves_touched_profit_close_at_breakeven(monkeypatch) -> None:
+    monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
     close = _touched_stop(pnl=0.0)
     wrapped = guard.wrap_evaluate_exit(
         lambda pos, now_et=None: close,
@@ -156,6 +159,19 @@ def test_wrapper_preserves_touched_profit_close_at_breakeven() -> None:
     )
 
     assert wrapped(_pos(option_pnl_pct=0.0)) is close
+
+
+def test_live_policy_change_is_default_off(monkeypatch) -> None:
+    monkeypatch.delenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", raising=False)
+    close = _touched_stop()
+    wrapped = guard.wrap_evaluate_exit(
+        lambda pos, now_et=None: close,
+        exit_decision_cls=Decision,
+        classify_decision=lambda decision: decision.reason_code,
+    )
+
+    assert guard._enabled() is False
+    assert wrapped(_pos()) is close
 
 
 def test_runner_arm_env_is_bounded(monkeypatch) -> None:
