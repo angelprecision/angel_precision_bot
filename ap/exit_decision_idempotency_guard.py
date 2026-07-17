@@ -732,10 +732,11 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 "error": "",
             }
             if callable(original_callback):
-                callback_lock = getattr(self, "_ap_exit_submit_callback_lock", None)
-                if callback_lock is None:
-                    callback_lock = threading.Lock()
-                    self._ap_exit_submit_callback_lock = callback_lock
+                with self._lock:
+                    callback_lock = getattr(self, "_ap_exit_submit_callback_lock", None)
+                    if callback_lock is None:
+                        callback_lock = threading.Lock()
+                        self._ap_exit_submit_callback_lock = callback_lock
 
                 def traced_callback(*cb_args, **cb_kwargs):
                     callback_trace["entered"] = True

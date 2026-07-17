@@ -688,10 +688,43 @@ def test_submit_wrapper_does_not_depend_on_ledger_for_duplicate_suppression(gene
 def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     generation_claims_table, monkeypatch
 ) -> None:
-    entered = threading.Event()
-    release = threading.Event()
+    real_thread_lock = threading.Lock
+
+    class RecordingLock:
+        def __init__(self):
+            self._lock = real_thread_lock()
+            self.entered = 0
+            self.max_active = 0
+            self.active = 0
+            self.enter_positions = []
+            self._guard = real_thread_lock()
+
+        def acquire(self, *args, **kwargs):
+            return self._lock.acquire(*args, **kwargs)
+
+        def release(self):
+            return self._lock.release()
+
+        def __enter__(self):
+            self._lock.acquire()
+            with self._guard:
+                self.active += 1
+                self.entered += 1
+                self.max_active = max(self.max_active, self.active)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            with self._guard:
+                self.active -= 1
+            self._lock.release()
+            return False
+
+    lock_created = threading.Event()
+    callback_release = threading.Event()
+    first_callback_entered = threading.Event()
     callback_count = 0
     callback_count_lock = threading.Lock()
+    lock_ids = []
 
     def callback(pos, decision):
         nonlocal callback_count
@@ -699,8 +732,8 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
             callback_count += 1
             index = callback_count
         if index == 1:
-            entered.set()
-            assert release.wait(timeout=2.0)
+            first_callback_entered.set()
+            assert callback_release.wait(timeout=2.0)
         pos.exit_in_flight = True
         pos.pending_exit_local_order_id = f"exit-local-{pos.position_id}"
         pos.pending_exit_broker_order_id = f"exit-broker-{pos.position_id}"
@@ -717,23 +750,42 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
         "_durable_exit_generation",
         lambda pos, *_: (f"client|{pos.position_id}|3|1", 1),
     )
+    created_locks = []
+
+    def fake_thread_lock():
+        lock = RecordingLock()
+        created_locks.append(lock)
+        lock_created.set()
+        return lock
+
+    monkeypatch.setattr(guard.threading, "Lock", fake_thread_lock)
     wrapped = guard.wrap_submit(_invoke_submit_callback)
     engine = _make_submit_engine(_pos(position_id="position-anchor"), callback=callback)
     pos_a = _pos(position_id="position-a")
     pos_b = _pos(position_id="position-b")
     results = []
 
-    thread_a = threading.Thread(target=lambda: results.append(("a", wrapped(engine, pos_a, _decision()))))
-    thread_b = threading.Thread(target=lambda: results.append(("b", wrapped(engine, pos_b, _decision()))))
+    def run_submit(label, pos):
+        results.append((label, wrapped(engine, pos, _decision())))
+        lock_ids.append(id(engine._ap_exit_submit_callback_lock))
+
+    thread_a = threading.Thread(target=lambda: run_submit("a", pos_a))
+    thread_b = threading.Thread(target=lambda: run_submit("b", pos_b))
     thread_a.start()
-    assert entered.wait(timeout=2.0)
+    assert lock_created.wait(timeout=2.0)
     thread_b.start()
-    release.set()
+    assert first_callback_entered.wait(timeout=2.0)
+    callback_release.set()
     thread_a.join(timeout=2.0)
     thread_b.join(timeout=2.0)
 
     assert thread_a.is_alive() is False
     assert thread_b.is_alive() is False
+    assert len(set(lock_ids)) == 1
+    callback_lock = engine._ap_exit_submit_callback_lock
+    assert callback_lock in created_locks
+    assert callback_lock.entered == 2
+    assert callback_lock.max_active == 1
     assert sorted(results) == [("a", True), ("b", True)]
     assert callback_count == 2
     rows = _claim_rows()
