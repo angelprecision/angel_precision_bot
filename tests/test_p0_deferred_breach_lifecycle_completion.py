@@ -66,6 +66,7 @@ def _claim_kwargs():
         "observed_underlying_price": 100.2,
         "signal_id": "sig-1",
         "execution_mode": "LIVE",
+        "canonical_signal_id": "sig-1",
     }
 
 

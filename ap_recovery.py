@@ -196,6 +196,178 @@ def _normalize_execution_mode(value) -> str | None:
     return mode if mode in _VALID_EXECUTION_MODES else None
 
 
+# One canonical predicate for LIVE recovery ownership checks. A terminal-looking
+# order is clean only when every broker/fill/reconciliation signal is absent.
+_LIVE_ENTRY_BROKER_EVIDENCE_SQL = """(
+       COALESCE(orders.filled_qty, 0) > 0
+    OR orders.filled_ts IS NOT NULL
+    OR COALESCE(orders.broker_order_id, '') <> ''
+    OR orders.submitted_ts IS NOT NULL
+    OR COALESCE(orders.meta->>'submit_intent_at', '') <> ''
+    OR COALESCE(orders.meta->>'broker_submit_key', '') <> ''
+    OR COALESCE(orders.meta->>'current_owner', '') LIKE 'broker_submit:%%'
+    OR UPPER(COALESCE(orders.meta->>'lifecycle_state', '')) IN ('SUBMITTING', 'SUBMITTED')
+    OR LOWER(COALESCE(orders.meta->>'reconciliation_required', '')) IN ('1', 'true', 'yes', 'on')
+    OR LOWER(COALESCE(orders.meta->>'split_brain_quarantine', '')) IN ('1', 'true', 'yes', 'on')
+    OR COALESCE(orders.last_error, '') LIKE 'SPLIT_BRAIN:%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_AMBIGUOUS_%%RECONCILIATION_REQUIRED%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_ACCEPTED_MISSING_ID_RECONCILIATION_REQUIRED%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_IDENTITY_UNPROVEN%%'
+    OR UPPER(COALESCE(orders.meta->>'recovery_reason_code', '')) LIKE 'RECONCILE_%%'
+    OR UPPER(COALESCE(orders.meta->>'recovery_reason_code', '')) =
+       'RECOVERY_SUBMIT_INTENT_REQUIRES_RECONCILIATION'
+    OR UPPER(COALESCE(orders.status, '')) NOT IN (
+        'REJECTED', 'CANCELED', 'CANCELLED', 'EXPIRED',
+        'ERROR', 'DONE', 'ARCHIVED'
+    )
+)"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prior-trading-session helpers (LIVE recovery session gate — Blocker 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _prior_trading_session_date_et(now_et) -> "Optional[date]":
+    """Return the prior NYSE trading session date relative to *now_et* (ET),
+    or ``None`` when the canonical calendar cannot be consulted.
+
+    Walks back at least one calendar day and skips weekends AND NYSE
+    full-closure holidays via ``ap.flatline_alarm.is_trading_day``.
+
+    LIVE recovery treats calendar uncertainty as a hard failure.  Returning
+    ``None`` here (import error, calendar lookup raises, or 14-day guard
+    exhaustion) causes the LIVE recovery pass to skip entirely — no queue
+    mutation, no quote lookup, no broker path.  The prior weekday-only
+    fallback is deliberately removed: a fabricated session date around a
+    holiday could either restore a stale signal or reject a valid one.
+    """
+    from datetime import date as _date
+    d = now_et.date() - timedelta(days=1)
+    try:
+        from ap.flatline_alarm import is_trading_day as _td
+    except Exception:
+        return None
+    try:
+        guard = 0
+        while not _td(d):
+            if guard >= 14:
+                return None
+            d -= timedelta(days=1)
+            guard += 1
+        return d
+    except Exception:
+        return None
+
+
+def _prior_trading_session_cutoff_utc(now_et) -> "Optional[str]":
+    """UTC ISO timestamp of the start of the prior-trading-session ET day,
+    or ``None`` when the canonical calendar cannot resolve a prior session.
+
+    Used as the SQL lower-bound ``created_ts >= %s`` for LIVE recovery
+    candidate selection.  Handles weekends and NYSE holidays via the
+    canonical calendar.  Returns ``None`` when the calendar is unavailable
+    or the prior session cannot be proven — LIVE recovery MUST fail closed
+    in that case (skip all mutation).
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _ET_TZ = _ZI("America/New_York")
+    prior_session = _prior_trading_session_date_et(now_et)
+    if prior_session is None:
+        return None
+    try:
+        session_start_et = datetime(
+            prior_session.year, prior_session.month, prior_session.day,
+            0, 0, 0, tzinfo=_ET_TZ,
+        )
+        return session_start_et.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _signal_date_from_payload_or_row(payload: dict, row: dict) -> "Optional[date]":
+    """Extract the signal generation date (ET calendar) for the session gate.
+
+    Separates two payload field categories:
+
+    * **Date-only fields** — treated as ET calendar dates as-is:
+        - ``signal_date``
+        - ``date``
+        - ``signal_bar_date``
+
+    * **Timestamp fields** — parsed as timezone-aware datetimes and converted
+      to America/New_York before the date is extracted:
+        - ``created_at``
+        - ``timestamp_iso``
+        - ``generated_at``
+
+    A **naive** timestamp (no ``tzinfo``) fails closed and returns ``None`` —
+    a signal-generation timestamp with no timezone cannot be safely converted
+    to an ET session, so the caller must skip the row.
+
+    Fallback: ``trade_queue.created_ts`` is used only when no payload field
+    yields a date; it is always parsed as timezone-aware (UTC-assumed if naive
+    since the DB column is stamped by the app with an aware value; DB drivers
+    return aware datetimes for TIMESTAMPTZ) and converted to ET.
+
+    Returns ``None`` when no date can be reliably extracted. Callers MUST
+    treat ``None`` as "session unprovable" and skip the row.
+
+    Boundary example:
+        ``created_at="2026-07-15T00:30:00Z"`` (Wed 00:30 UTC == Tue 20:30 ET)
+        → returns ``date(2026, 7, 14)`` — the ET session date.
+    """
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo as _ZI
+    _ET_TZ = _ZI("America/New_York")
+
+    # 1. Date-only fields — direct ISO date parse
+    for key in ("signal_date", "date", "signal_bar_date"):
+        val = payload.get(key)
+        if not val:
+            continue
+        try:
+            return _date.fromisoformat(str(val).strip()[:10])
+        except (ValueError, TypeError):
+            continue
+
+    # 2. Timestamp fields — parse as aware datetime, convert to ET, take date
+    for key in ("created_at", "timestamp_iso", "generated_at"):
+        val = payload.get(key)
+        if not val:
+            continue
+        try:
+            s = str(val).strip()
+            # Accept trailing Z as UTC per ISO 8601
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            continue
+        if parsed.tzinfo is None:
+            # Naive timestamp — cannot prove ET calendar date; fail closed
+            return None
+        return parsed.astimezone(_ET_TZ).date()
+
+    # 3. Fallback: trade_queue.created_ts column
+    created_raw = row.get("created_ts")
+    if created_raw is None:
+        return None
+    try:
+        if isinstance(created_raw, datetime):
+            ts = created_raw
+        else:
+            s = str(created_raw).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            ts = datetime.fromisoformat(s)
+        if ts.tzinfo is None:
+            # DB rows should be TIMESTAMPTZ (aware); if we get naive, fail closed
+            return None
+        return ts.astimezone(_ET_TZ).date()
+    except Exception:
+        return None
+
+
 def _resolve_side_from_order_or_meta(order: dict, meta: dict | None = None) -> tuple[str | None, str]:
     """Resolve strategy side without ever defaulting missing direction to CALL."""
     meta = meta or {}
@@ -2592,16 +2764,16 @@ class APStartupRecovery:
                 )
                 return c.fetchall()
 
-        # ── PR #143 regression fix: LIVE never replays WATCHING rows ─────
-        # The _reset() block above resets WATCHING → NEW and tags rows with
-        # payload.recovery_rescue=true. PR #143 used this for paper-mode
-        # immediate-entry recovery. On 2026-06-16 Jason's LIVE pod replayed
-        # 23 WATCHING rows through MC/contract_selector with current (post-
-        # trigger) market data. The selector's earnings/IV/chain gates
-        # rejected all 23 with contract_selection:no_contract_found. Zero
-        # live trades. LIVE must NEVER replay stale signals through the
-        # selector — it can only reattach watcher ownership to current-
-        # session WATCHING/PENDING_TRIGGER rows.
+        # ── PR #143 regression fix: LIVE never blind-replays WATCHING rows ─
+        # The _reset() block above is PAPER-only. It resets WATCHING → NEW and
+        # tags payload.recovery_rescue=true so PAPER recovery can immediately
+        # promote safe rows. LIVE recovery must not use that broad UPDATE:
+        # each WATCHING row is first loaded read-only, scoped to today's ET
+        # session, checked for exact client/mode/identity/geometry, checked
+        # for active ENTRY orders and broker/submission/fill truth, then either
+        # restored through the normal breach-only queue path or durably marked
+        # LIVE_RECOVERY_MISSED_TRIGGER if the trigger crossed while ownership
+        # was absent.
         #
         # Detection: read mc.mode (canonical mode source per execution_core
         # PR-B / FIX-3). Default to PAPER on lookup failure to preserve PR
@@ -2652,17 +2824,444 @@ class APStartupRecovery:
                 return False
             return any(_le.startswith(_p) for _p in _READINESS_SKIP_LAST_ERRORS)
 
+        def _recover_unowned_live_watching_signals() -> int:
+            # ── LIVE session window: prior trading session identity ─────────
+            # The correct fence is the canonical NYSE prior trading session:
+            #   • cutoff = start of prior trading session day in ET → UTC
+            #   • Monday after Friday: cutoff = Friday 00:00 ET (~63h back)
+            #   • Post-holiday Monday: cutoff = Thursday 00:00 ET (~86h back)
+            #   • Normal Wednesday: cutoff = Tuesday 00:00 ET (~33h back)
+            #
+            # The SQL cutoff is the OUTER fence — it widens the candidate set
+            # to cover holiday weekends.  The BINDING session gate lives in
+            # _classify() below: it checks that the signal's actual generation
+            # date (ET, from payload or created_ts) exactly equals the prior
+            # trading session date OR today's ET date (premarket).  Rows from
+            # a session two or more sessions back are excluded there.
+            #
+            # LIVE recovery FAILS CLOSED when the canonical NYSE calendar is
+            # unavailable — no queue mutation, no quote lookup, no broker
+            # path.  A guessed session date could either restore a stale
+            # signal or reject a valid one; neither is acceptable for LIVE.
+            _prior_session_date = _prior_trading_session_date_et(now_et)
+            _live_cutoff_utc = _prior_trading_session_cutoff_utc(now_et)
+            if _prior_session_date is None or _live_cutoff_utc is None:
+                log.error(
+                    "LIVE_RECOVERY_SESSION_CALENDAR_UNAVAILABLE client_id=%s — recovery skipped",
+                    self.client_id,
+                )
+                return 0
+            _today_et_date = now_et.date()
+
+            def _load_candidates():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT id, client_id, signal_id, status, payload, created_ts,
+                               started_ts, finished_ts, last_error
+                        FROM trade_queue
+                        WHERE client_id = %s
+                          AND status = 'WATCHING'
+                          AND created_ts >= %s
+                          AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
+                          AND (
+                last_error IS NULL
+             OR last_error NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
+          )
+                        ORDER BY created_ts ASC
+                        """,
+                        (self.client_id, _live_cutoff_utc),
+                    )
+                    return c.fetchall()
+
+            def _active_entry_order_exists(signal_id: str, canonical_signal_id: str) -> bool:
+                # Blocker 3 fix: (a) filter by execution_mode='live' so a PAPER
+                # order for the same signal does not block LIVE recovery;
+                # (b) any nonterminal ENTRY order blocks recovery — including
+                # ownerless CREATED rows (no broker_order_id, no submitted_ts).
+                # The previous AND (broker_order_id<>'' OR submitted_ts IS NOT NULL
+                # OR ...) gate incorrectly let ownerless CREATED rows through.
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        SELECT 1
+                        FROM orders
+                        WHERE client_id = %s
+                          AND kind = 'ENTRY'
+                          AND LOWER(COALESCE(execution_mode,'')) = 'live'
+                          AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                          AND (
+                                signal_id = %s
+                             OR (%s <> '' AND canonical_signal_id = %s)
+                          )
+                        LIMIT 1
+                        """,
+                        (self.client_id, signal_id, canonical_signal_id, canonical_signal_id),
+                    )
+                    return c.fetchone() is not None
+
+            # Maximum age of a quote we will accept for missed-trigger
+            # classification. 120 seconds covers the gap between pod restart
+            # and the first market-data refresh cycle while rejecting stale
+            # prior-close prices that would incorrectly terminalize signals.
+            _MAX_QUOTE_AGE_SECONDS = 120
+
+            def _current_underlying(symbol: str):
+                # Blocker 6: quote freshness required for LIVE terminalization.
+                # A stale prior-close `last` (e.g. yesterday's 4pm price) could
+                # classify a valid morning opportunity as already-triggered and
+                # permanently miss it. We require a timestamp in the broker
+                # response and reject quotes older than _MAX_QUOTE_AGE_SECONDS.
+                # If freshness cannot be proven, return None (classify as
+                # QUOTE_UNAVAILABLE_OR_STALE — fail closed, do not terminalize).
+                broker = self.broker
+                now_utc_ts = datetime.now(timezone.utc)
+                for method_name in ("get_quote", "quote"):
+                    method = getattr(broker, method_name, None)
+                    if not callable(method):
+                        continue
+                    try:
+                        raw = method(symbol)
+                    except Exception as exc:
+                        log.warning(
+                            "LIVE_RECOVERY_QUOTE_UNAVAILABLE client_id=%s symbol=%s method=%s error=%s",
+                            self.client_id, symbol, method_name, exc,
+                        )
+                        continue
+                    raw_dict = raw if isinstance(raw, dict) else (vars(raw) if hasattr(raw, "__dict__") else {})
+
+                    def _parse_epoch_ms(val):
+                        """Parse Tradier epoch-millisecond or epoch-second timestamps."""
+                        if val is None:
+                            return None
+                        try:
+                            ep = float(val)
+                            if ep > 1e10:  # milliseconds
+                                ep /= 1000.0
+                            dt = datetime.fromtimestamp(ep, tz=timezone.utc)
+                            return dt
+                        except Exception:
+                            return None
+
+                    def _ts_age_ok(dt):
+                        if dt is None:
+                            return False
+                        age = (now_utc_ts - dt).total_seconds()
+                        return -5 <= age <= _MAX_QUOTE_AGE_SECONDS
+
+                    # P0-2: support Tradier's actual timestamp fields.
+                    # Tradier quote dictionary uses epoch-millisecond fields:
+                    #   trade_date  — timestamp of the last trade (pairs with last)
+                    #   bid_date    — timestamp of the current bid (pairs with bid)
+                    #   ask_date    — timestamp of the current ask (pairs with ask)
+                    # Generic fallbacks for other brokers: timestamp, quote_time, etc.
+                    # Price must be paired with its corresponding timestamp so we
+                    # never validate freshness using ask_date then return a stale last.
+                    _last_px  = _safe_float(raw_dict.get("last"), 0.0)
+                    _bid_px   = _safe_float(raw_dict.get("bid"),  0.0)
+                    _ask_px   = _safe_float(raw_dict.get("ask"),  0.0)
+
+                    _trade_dt = _parse_epoch_ms(raw_dict.get("trade_date"))
+                    _bid_dt   = _parse_epoch_ms(raw_dict.get("bid_date"))
+                    _ask_dt   = _parse_epoch_ms(raw_dict.get("ask_date"))
+
+                    # Generic timestamp fallback (non-Tradier brokers)
+                    _generic_raw = (
+                        raw_dict.get("timestamp") or raw_dict.get("quote_time")
+                        or raw_dict.get("trade_time") or raw_dict.get("time")
+                        or raw_dict.get("updated_at")
+                    )
+                    _generic_dt = None
+                    if _generic_raw is not None:
+                        try:
+                            if isinstance(_generic_raw, (int, float)):
+                                _generic_dt = _parse_epoch_ms(_generic_raw)
+                            else:
+                                _s = str(_generic_raw).strip()
+                                if _s.endswith("Z"):
+                                    _s = _s[:-1] + "+00:00"
+                                _gdt = datetime.fromisoformat(_s)
+                                if _gdt.tzinfo is None:
+                                    _gdt = _gdt.replace(tzinfo=timezone.utc)
+                                _generic_dt = _gdt.astimezone(timezone.utc)
+                        except Exception:
+                            pass
+
+                    # Prefer `last` paired with its trade_date timestamp
+                    if _last_px > 0 and _ts_age_ok(_trade_dt):
+                        return _last_px
+
+                    # Bid/ask midpoint: BOTH timestamps must independently be fresh.
+                    # Using max() would accept a fresh ask + stale bid, permitting
+                    # a stale price component to influence classification.
+                    if _bid_px > 0 and _ask_px > 0 and _ts_age_ok(_bid_dt) and _ts_age_ok(_ask_dt):
+                        return (_bid_px + _ask_px) / 2.0
+
+                    # Generic-timestamp path (non-Tradier brokers)
+                    if _ts_age_ok(_generic_dt):
+                        for attr in ("last", "mark", "mid", "price", "ask", "bid"):
+                            px = _safe_float(raw_dict.get(attr) if isinstance(raw, dict)
+                                             else getattr(raw, attr, None), 0.0)
+                            if px > 0:
+                                return px
+
+                    # No valid price+timestamp pair found
+                    log.warning(
+                        "LIVE_RECOVERY_QUOTE_NO_VALID_TIMESTAMP client_id=%s symbol=%s "
+                        "method=%s trade_date=%s bid_date=%s ask_date=%s generic=%s "
+                        "— refusing to terminalize without fresh evidence",
+                        self.client_id, symbol, method_name,
+                        raw_dict.get("trade_date"), raw_dict.get("bid_date"),
+                        raw_dict.get("ask_date"), _generic_raw,
+                    )
+                    return None
+                return None
+
+            def _payload_dict(row) -> dict:
+                payload = row.get("payload") if isinstance(row, dict) else None
+                if isinstance(payload, dict):
+                    return dict(payload)
+                if isinstance(payload, str):
+                    try:
+                        parsed = json.loads(payload)
+                        return parsed if isinstance(parsed, dict) else {}
+                    except Exception:
+                        return {}
+                return {}
+
+            def _classify(row) -> tuple[str, dict]:
+                row = dict(row or {})
+                payload = _payload_dict(row)
+                signal_id = str(row.get("signal_id") or payload.get("signal_id") or "").strip()
+                canonical_signal_id = str(payload.get("canonical_signal_id") or "").strip()
+                if not canonical_signal_id:
+                    try:
+                        from ap_canonical_signal import build_canonical_signal_id
+                        canonical_signal_id = build_canonical_signal_id(signal_id, payload)
+                    except Exception:
+                        canonical_signal_id = ""
+                symbol = str(
+                    payload.get("ticker") or payload.get("symbol") or payload.get("underlying") or ""
+                ).strip().upper()
+                direction = str(payload.get("direction") or payload.get("side") or "").strip().upper()
+                trigger = _safe_float(
+                    payload.get("trigger_price")
+                    or payload.get("entry_price")
+                    or payload.get("trigger")
+                    or payload.get("entry"),
+                    0.0,
+                )
+                last_error = row.get("last_error")
+                if _last_error_is_readiness_skip(last_error):
+                    return "skip", {"reason": "terminal_readiness_classification"}
+                # Blocker 5: production intel rejection reasons are shaped like
+                # "intel_rejected: risk_veto: PUT blocked — SPY in BULL trend".
+                # The old prefixes only caught POLICY_/RISK_VETO/POLICY_BLOCKED.
+                # Also check the ap_signals authoritative decision for this row's
+                # signal_id — if decision_status is 'rejected' the row is terminal.
+                _le_upper = str(last_error or "").upper()
+                if _le_upper.startswith(("POLICY_", "RISK_VETO", "POLICY_BLOCKED", "INTEL_REJECTED")):
+                    return "skip", {"reason": "terminal_policy_classification"}
+                # Check authoritative ap_signals decision (join on signal_id)
+                if signal_id:
+                    try:
+                        with conn() as _c:
+                            _c.execute(
+                                """
+                                SELECT decision_status FROM ap_signals
+                                WHERE signal_id = %s AND client_email = %s
+                                LIMIT 1
+                                """,
+                                (signal_id, self.client_id),
+                            )
+                            _ap_row = _c.fetchone()
+                        if _ap_row:
+                            _ds = str((_ap_row.get("decision_status") if isinstance(_ap_row, dict)
+                                       else (_ap_row[0] if _ap_row else "")) or "").lower()
+                            if _ds == "rejected":
+                                return "skip", {"reason": "ap_signals_rejected"}
+                    except Exception as _policy_err:
+                        # P0-5: fail closed — if authoritative policy truth
+                        # cannot be read, do not restore a potentially
+                        # policy-rejected signal as a LIVE trade.
+                        log.error(
+                            "LIVE_RECOVERY_POLICY_TRUTH_UNAVAILABLE "
+                            "client_id=%s signal_id=%s error=%s — skipping",
+                            self.client_id, signal_id, _policy_err,
+                        )
+                        return "skip", {"reason": "LIVE_RECOVERY_POLICY_TRUTH_UNAVAILABLE"}
+                if not signal_id or not canonical_signal_id:
+                    return "skip", {"reason": "missing_canonical_signal_identity"}
+                if not symbol or direction not in {"CALL", "PUT"} or trigger <= 0:
+                    return "skip", {"reason": "invalid_symbol_direction_or_trigger"}
+                # ── Session-identity gate (Blocker 1) ─────────────────────
+                # Only restore signals generated during the prior trading
+                # session OR explicitly today (premarket).  This blocks:
+                #   • Completed-prior-session rows on a normal weekday
+                #     (e.g. a Tuesday signal seen on Friday — two sessions
+                #     past — is now explicitly rejected rather than allowed
+                #     through by the old 28h window).
+                # And admits:
+                #   • Friday-evening scanner signals on Monday morning
+                #   • Holiday-weekend scanner signals post-holiday
+                # Fail closed: if the generation date cannot be extracted,
+                # skip the row (do not restore, do not terminalize).
+                _sig_date = _signal_date_from_payload_or_row(payload, row)
+                if _sig_date is None:
+                    return "skip", {"reason": "session_unprovable_no_date"}
+                if _sig_date != _prior_session_date and _sig_date != _today_et_date:
+                    return "skip", {
+                        "reason": "session_out_of_window",
+                        "signal_date": _sig_date.isoformat(),
+                        "prior_session": _prior_session_date.isoformat(),
+                        "today_et": _today_et_date.isoformat(),
+                    }
+                if _active_entry_order_exists(signal_id, canonical_signal_id):
+                    return "skip", {"reason": "active_entry_order_exists"}
+                current = _current_underlying(symbol)
+                if current is None:
+                    return "skip", {"reason": "current_underlying_unavailable"}
+                crossed = (
+                    current >= trigger if direction == "CALL"
+                    else current <= trigger
+                )
+                diag = {
+                    "client_id": self.client_id,
+                    "execution_mode": "live",
+                    "signal_id": signal_id,
+                    "canonical_signal_id": canonical_signal_id,
+                    "symbol": symbol,
+                    "direction": direction,
+                    "trigger_price": trigger,
+                    "current_underlying": current,
+                    "trigger_crossed_at": payload.get("trigger_crossed_at") or "",
+                    "recovery_timestamp": datetime.now(timezone.utc).isoformat(),
+                    "source_queue_row": row.get("id"),
+                    "reason": "ownership_absent_at_trigger" if crossed else "eligible_untriggered",
+                }
+                return ("missed" if crossed else "eligible"), diag
+
+            def _mark_missed(row_id, diag: dict, signal_id_: str, canonical_signal_id_: str) -> bool:
+                # Atomically terminalize to REJECTED. Includes the same NOT EXISTS
+                # LIVE order fence as _restore() — a concurrent worker could have
+                # created a CREATED/PENDING_TRIGGER order between _classify() and
+                # this write; without the fence, we would REJECT the queue row
+                # while a valid watcher-owned order now exists, leaving the order
+                # stranded with a mislabeled queue row.
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        UPDATE trade_queue
+                        SET status     = 'REJECTED',
+                            last_error = 'LIVE_RECOVERY_MISSED_TRIGGER:ownership_absent_at_trigger',
+                            payload    = COALESCE(payload, '{{}}'::jsonb) || %s::jsonb,
+                            finished_ts = NOW()
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status = 'WATCHING'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM orders
+                            WHERE orders.client_id = trade_queue.client_id
+                              AND orders.kind = 'ENTRY'
+                              AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
+                              AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                              AND (
+                                    orders.signal_id = %s
+                                 OR (%s <> '' AND orders.canonical_signal_id = %s)
+                              )
+                          )
+                        """,
+                        (json.dumps({"live_recovery_outcome": "LIVE_RECOVERY_MISSED_TRIGGER", **diag}, default=str),
+                         row_id, self.client_id, signal_id_, canonical_signal_id_, canonical_signal_id_),
+                    )
+                    return int(getattr(c, "rowcount", 0) or 0) == 1
+
+            def _restore(row_id, diag: dict, signal_id_: str, canonical_signal_id_: str) -> bool:
+                # Blocker 4 fix: the final UPDATE must atomically verify no LIVE
+                # ENTRY order exists. Without this predicate a concurrent worker
+                # that creates an order between _classify() and _restore() would
+                # produce a duplicate-owner race. The NOT EXISTS re-checks the
+                # same identity predicate used in _active_entry_order_exists.
+                marker = {
+                    "live_recovery_outcome": "LIVE_RECOVERY_WATCHER_RESTORED",
+                    "live_recovery_breach_only": True,
+                    "live_recovery_restored_at": datetime.now(timezone.utc).isoformat(),
+                    "canonical_signal_id": diag.get("canonical_signal_id"),
+                }
+                with conn() as c:
+                    c.execute(
+                        f"""
+                        UPDATE trade_queue
+                        SET status = 'NEW',
+                            payload = COALESCE(payload, '{{}}'::jsonb) || %s::jsonb,
+                            started_ts = NULL,
+                            finished_ts = NULL,
+                            last_error = NULL
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND status = 'WATCHING'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM orders
+                            WHERE orders.client_id = trade_queue.client_id
+                              AND orders.kind = 'ENTRY'
+                              AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
+                              AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                              AND (
+                                    orders.signal_id = %s
+                                 OR (%s <> '' AND orders.canonical_signal_id = %s)
+                              )
+                          )
+                        """,
+                        (json.dumps(marker, default=str), row_id, self.client_id,
+                         signal_id_, canonical_signal_id_, canonical_signal_id_),
+                    )
+                    return int(getattr(c, "rowcount", 0) or 0) == 1
+
+            restored = 0
+            rows = run_with_retry(_load_candidates) or []
+            for row in rows:
+                row = dict(row or {})
+                row_id = row.get("id")
+                outcome, diag = _classify(row)
+                if outcome == "eligible":
+                    _sig_id = diag.get("signal_id", "")
+                    _can_id = diag.get("canonical_signal_id", "")
+                    if run_with_retry(lambda row_id=row_id, diag=diag, _sig=_sig_id, _can=_can_id: _restore(row_id, diag, _sig, _can)):
+                        restored += 1
+                    continue
+                if outcome == "missed":
+                    _ms_id = diag.get("signal_id", "")
+                    _mc_id = diag.get("canonical_signal_id", "")
+                    run_with_retry(lambda row_id=row_id, diag=diag, _ms=_ms_id, _mc=_mc_id: _mark_missed(row_id, diag, _ms, _mc))
+                    log.warning(
+                        "LIVE_RECOVERY_MISSED_TRIGGER client_id=%s signal_id=%s canonical_signal_id=%s "
+                        "symbol=%s direction=%s trigger=%.4f current=%.4f reason=ownership_absent_at_trigger",
+                        self.client_id,
+                        diag.get("signal_id"),
+                        diag.get("canonical_signal_id"),
+                        diag.get("symbol"),
+                        diag.get("direction"),
+                        float(diag.get("trigger_price") or 0),
+                        float(diag.get("current_underlying") or 0),
+                    )
+                    continue
+                log.info(
+                    "LIVE_RECOVERY_WATCHING_SKIP client_id=%s signal_id=%s reason=%s",
+                    self.client_id,
+                    row.get("signal_id"),
+                    diag.get("reason"),
+                )
+            return restored
+
         if _is_live:
-            # Audit-required log; emitted before any DB write so it's
-            # visible even if downstream paths fail.
+            # LIVE recovery only restores rows that passed the classifier
+            # above. It never writes the PAPER immediate-promotion marker.
             log.warning(
-                "LIVE_RECOVERY_REPLAY_SKIPPED client_id=%s mode=%s "
-                "reason=live_no_replay_policy lookback_hours=%d cutoff=%s "
-                "| WATCHING rows are NOT reset for LIVE clients; only "
-                "orphaned PENDING_TRIGGER watcher reattachment will run",
-                self.client_id, _mc_mode, _lookback_hours, cutoff_utc[:19],
+                "LIVE_RECOVERY_CLASSIFIED_RESEED client_id=%s mode=%s "
+                "session_date_et=%s | loading WATCHING rows before mutation",
+                self.client_id, _mc_mode, now_et.date().isoformat(),
             )
-            count = 0  # No WATCHING rows reset for LIVE.
+            count = int(run_with_retry(_recover_unowned_live_watching_signals) or 0)
         else:
             count = run_with_retry(_reset) or 0
         rearmed = 0
@@ -2837,7 +3436,7 @@ class APStartupRecovery:
         result["already_verified_owner_rows"] = int(already_verified_owner_rows or 0)
         result["watchers_requeued"] = count + rearmed
         log.info(
-            "[%s] RECOVERY: %d WATCHING signals reset to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
+            "[%s] RECOVERY: %d WATCHING signals restored to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
             "for watcher reseed (lookback=%dh cutoff=%s)",
             self.client_id, count, rearmed, _lookback_hours, cutoff_utc[:19],
         )

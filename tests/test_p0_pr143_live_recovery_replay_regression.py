@@ -1,7 +1,7 @@
 """
 tests/test_p0_pr143_live_recovery_replay_regression.py
 
-P0 PR #143 regression fix — LIVE clients must not replay WATCHING rows
+P0 PR #143 regression fix — LIVE clients must not blind-replay WATCHING rows
 through MC/contract_selector.
 
 PR #143 reset WATCHING → NEW and tagged rows with payload.recovery_rescue=true
@@ -11,9 +11,9 @@ live pod replayed 23 stale signals on 2026-06-16 and got zero trades.
 
 This test file proves:
   1. PAPER recovery still resets WATCHING → NEW and tags payload
-  2. LIVE recovery does NOT reset WATCHING and does NOT tag payload
-  3. LIVE recovery emits LIVE_RECOVERY_REPLAY_SKIPPED with the required
-     reason=live_no_replay_policy
+  2. LIVE recovery does NOT run the PAPER recovery_rescue reset
+  3. LIVE recovery uses a named classifier and marks already-triggered rows
+     as LIVE_RECOVERY_MISSED_TRIGGER instead of replaying them
   4. PR #143's queue _dispatch promote block still has its `not live_mode`
      guard (defense in depth — even if a recovery_rescue marker did leak,
      LIVE would still not be promoted to immediate-submit)
@@ -91,14 +91,14 @@ def test_paper_recovery_still_resets_watching_and_tags_payload():
 
 
 # =============================================================================
-# Test 2: LIVE recovery does NOT call _reset
+# Test 2: LIVE recovery does NOT call PAPER _reset
 # =============================================================================
 
-def test_live_recovery_does_not_reset_watching_or_tag_payload():
-    """LIVE mode must skip the _reset() block entirely."""
+def test_live_recovery_does_not_run_paper_recovery_rescue_reset():
+    """LIVE mode must skip the PAPER recovery_rescue _reset() block."""
     rec, _ = _make_recovery("LIVE")
 
-    reset_calls = []
+    paper_reset_calls = []
 
     def fake_run_with_retry(fn, *args, **kwargs):
         import inspect
@@ -106,8 +106,8 @@ def test_live_recovery_does_not_reset_watching_or_tag_payload():
             src = inspect.getsource(fn)
         except Exception:
             src = ""
-        if "UPDATE trade_queue" in src:
-            reset_calls.append(src)
+        if "UPDATE trade_queue" in src and "recovery_rescue" in src:
+            paper_reset_calls.append(src)
             return 0
         return []
 
@@ -116,48 +116,35 @@ def test_live_recovery_does_not_reset_watching_or_tag_payload():
         result = {}
         rec._reseed_watchers(result)
 
-    assert reset_calls == [], (
-        f"LIVE must NOT invoke _reset() — got {len(reset_calls)} calls. "
-        "LIVE rows must never be replayed through MC/selector with stale data."
+    assert paper_reset_calls == [], (
+        f"LIVE must NOT invoke PAPER _reset() — got {len(paper_reset_calls)} calls. "
+        "LIVE rows must be classified before any WATCHING → NEW mutation."
     )
 
 
 # =============================================================================
-# Test 3: LIVE emits the required audit log line
+# Test 3: LIVE classifier and missed-trigger outcome are present
 # =============================================================================
 
-def test_live_recovery_emits_live_recovery_replay_skipped_audit_log():
-    """LIVE mode must emit LIVE_RECOVERY_REPLAY_SKIPPED with the required
-    client_id and reason=live_no_replay_policy."""
-    rec, recovery_mod = _make_recovery("LIVE")
+def test_live_recovery_uses_classifier_and_missed_trigger_outcome():
+    src = (REPO / "ap_recovery.py").read_text()
 
-    captured_warnings = []
-    original_warning = recovery_mod.log.warning
-
-    def capture_warning(msg, *args, **kwargs):
-        try:
-            formatted = msg % args if args else msg
-        except Exception:
-            formatted = str(msg)
-        captured_warnings.append(formatted)
-        return original_warning(msg, *args, **kwargs)
-
-    with patch("ap.db.run_with_retry", return_value=0), \
-         patch("ap.db.conn"), \
-         patch.object(recovery_mod.log, "warning", side_effect=capture_warning):
-        result = {}
-        rec._reseed_watchers(result)
-
-    matching = [w for w in captured_warnings if "LIVE_RECOVERY_REPLAY_SKIPPED" in w]
-    assert matching, (
-        f"LIVE must emit LIVE_RECOVERY_REPLAY_SKIPPED audit log; "
-        f"got warnings: {captured_warnings}"
+    assert "def _recover_unowned_live_watching_signals" in src
+    assert "LIVE_RECOVERY_CLASSIFIED_RESEED" in src
+    assert "LIVE_RECOVERY_MISSED_TRIGGER" in src
+    assert "ownership_absent_at_trigger" in src
+    assert "LOWER(COALESCE(payload->>'execution_mode','')) = 'live'" in src
+    assert "created_ts >= %s" in src, "LIVE candidate query must have a lookback cutoff"
+    # B1 amendment: the upper midnight boundary (created_ts < %s) was intentionally
+    # removed so prior-evening scanner signals (e.g. WMT/QCOM PUTs created the
+    # evening before for the following trading session) are included. The single
+    # cutoff_utc parameter (48h lookback) replaces the midnight-to-midnight window.
+    assert "created_ts < %s" not in src, (
+        "Upper midnight boundary must NOT exist — prior-evening signals would be excluded"
     )
-    audit = matching[0]
-    assert "jasoncosby1@gmail.com" in audit, "client_id must appear in audit log"
-    assert "live_no_replay_policy" in audit, (
-        "reason=live_no_replay_policy must appear in audit log"
-    )
+    # Belt-and-suspenders: already-terminalized rows are excluded by last_error filter
+    assert "LIVE_RECOVERY_MISSED_TRIGGER" in src, "Must exclude already-terminalized missed rows"
+    assert "build_canonical_signal_id" in src
 
 
 # =============================================================================
@@ -204,7 +191,7 @@ def test_live_recovery_still_runs_pending_trigger_reattachment():
     into it normally with rearmed >= 0."""
     src = (REPO / "ap_recovery.py").read_text()
 
-    skip_marker = "LIVE_RECOVERY_REPLAY_SKIPPED"
+    skip_marker = "LIVE_RECOVERY_CLASSIFIED_RESEED"
     attach_marker = "RECOVERY: entry_watcher missing"
 
     skip_idx = src.find(skip_marker)

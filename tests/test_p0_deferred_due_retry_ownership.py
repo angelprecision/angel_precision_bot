@@ -71,6 +71,7 @@ def _row(
         "client_id": client_id,
         "execution_mode": execution_mode,
         "signal_id": SIGNAL_ID,
+        "canonical_signal_id": SIGNAL_ID,
         "plan_id": "plan-due-retry-1",
         "kind": "ENTRY",
         "status": "PENDING_TRIGGER",
@@ -1587,6 +1588,7 @@ def test_blocker4_claim_writes_canonical_retry_attempt():
             observed_underlying_price=130.05,
             signal_id=SIGNAL_ID,
             execution_mode="paper",
+            canonical_signal_id=SIGNAL_ID,
             retry_attempt=2,
         )
 
