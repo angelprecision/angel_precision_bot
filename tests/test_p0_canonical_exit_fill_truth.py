@@ -1214,6 +1214,7 @@ def test_startup_recovery_runs_client_scoped_exit_retry_before_position_and_exit
     recovery.client_id = "jason@example.com"
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: events.append("deferred")
+    recovery._reconcile_stale_exit_generation_claims = lambda _result: events.append("stale_exit_claims")
     recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: (events.append("downtime_exit_fills") or [])
     recovery._recover_positions = lambda _result: events.append("positions")
     recovery._verify_pending_entries = lambda _result: events.append("entries")
@@ -1230,6 +1231,7 @@ def test_startup_recovery_runs_client_scoped_exit_retry_before_position_and_exit
 
     result = recovery.run(include_watcher_reseed=False)
     assert events.index("exit_fill_retry") < events.index("downtime_exit_fills")
+    assert events.index("stale_exit_claims") < events.index("downtime_exit_fills")
     assert events.index("downtime_exit_fills") < events.index("positions")
     assert events.index("exit_fill_retry") < events.index("positions")
     assert events.index("exit_fill_retry") < events.index("exits")
@@ -1255,6 +1257,7 @@ def test_startup_recovery_retries_canonical_exit_fill_before_loading_stale_runti
     recovery.mc = SimpleNamespace(_position_count=0)
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: None
+    recovery._reconcile_stale_exit_generation_claims = lambda _result: None
     recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: (state.__setitem__("position_closed", True) or [])
     recovery._verify_pending_entries = lambda _result: None
     recovery._reseed_dedup = lambda _result: None
@@ -1366,6 +1369,7 @@ def test_startup_exit_retry_discovery_failure_is_diagnostic_not_fatal(monkeypatc
     recovery.client_id = "jason@example.com"
     recovery._execution_mode = lambda: "live"
     recovery._recover_deferred_breach_lifecycles = lambda _result: None
+    recovery._reconcile_stale_exit_generation_claims = lambda _result: None
     recovery._recover_exit_fills_that_occurred_during_downtime = lambda _result: []
     recovery._recover_positions = lambda _result: None
     recovery._verify_pending_entries = lambda _result: None

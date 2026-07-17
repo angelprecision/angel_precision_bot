@@ -1707,6 +1707,44 @@ class APOrderStateMachine:
             )
             return False
 
+    def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
+        """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
+        error_text = str(last_error or "NO_POST_ATTEMPTED")
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET status=%s, last_error=%s, updated_ts=NOW() "
+                    "WHERE local_order_id=%s "
+                    "  AND client_id=%s "
+                    "  AND kind='EXIT' "
+                    "  AND status=%s "
+                    "  AND COALESCE(broker_order_id,'')='' "
+                    "  AND submitted_ts IS NULL "
+                    "  AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL "
+                    "  AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
+                    "  AND COALESCE((meta->>'reconciliation_required')::boolean, false)=false",
+                    (
+                        OrderStatus.ERROR,
+                        error_text,
+                        local_order_id,
+                        self.client_id,
+                        OrderStatus.EXIT_REQUESTED,
+                    ),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retire_unsubmitted_exit_intent failed for local_order_id=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def claim_deferred_broker_ready_submit(
         self,
         local_order_id: str,
@@ -4393,6 +4431,7 @@ class APOrderStateMachine:
         signal_id=None,
         order_type: str = "limit",
         execution_mode: str | None = None,
+        local_order_id: str | None = None,
     ) -> dict:
         if not execution_mode:
             try:
@@ -4401,28 +4440,32 @@ class APOrderStateMachine:
             except Exception:
                 execution_mode = None
 
+        reserved_local_id = str(local_order_id or "").strip()
         existing = self._get_active_exit_order(position_id)
         if existing:
             existing  = dict(existing)
-            error_msg = (f"active_exit_already_exists:"
-                         f"{existing.get('local_order_id')}:{existing.get('status')}")
-            log.critical(
-                "[%s] submit_exit BLOCKED -- active exit already exists | "
-                "pos=%s existing=%s status=%s broker=%s",
-                self.client_id, position_id,
-                existing.get("local_order_id"), existing.get("status"),
-                existing.get("broker_order_id"),
+            if reserved_local_id and str(existing.get("local_order_id") or "").strip() == reserved_local_id:
+                local_id = reserved_local_id
+            else:
+                error_msg = (f"active_exit_already_exists:"
+                             f"{existing.get('local_order_id')}:{existing.get('status')}")
+                log.critical(
+                    "[%s] submit_exit BLOCKED -- active exit already exists | "
+                    "pos=%s existing=%s status=%s broker=%s",
+                    self.client_id, position_id,
+                    existing.get("local_order_id"), existing.get("status"),
+                    existing.get("broker_order_id"),
+                )
+                return {"ok": False, "local_order_id": existing.get("local_order_id"),
+                        "broker_order_id": existing.get("broker_order_id"),
+                        "status": existing.get("status"), "error": error_msg}
+        else:
+            local_id = self.create_exit_order(
+                position_id=position_id, contract=contract, symbol=symbol,
+                direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id,
+                limit_price=limit_price, local_order_id=reserved_local_id or None,
+                execution_mode=execution_mode,
             )
-            return {"ok": False, "local_order_id": existing.get("local_order_id"),
-                    "broker_order_id": existing.get("broker_order_id"),
-                    "status": existing.get("status"), "error": error_msg}
-
-        local_id = self.create_exit_order(
-            position_id=position_id, contract=contract, symbol=symbol,
-            direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id,
-            limit_price=limit_price,
-            execution_mode=execution_mode,
-        )
         requested_qty = int(qty or 0)
         broker_truth = resolve_exit_broker_truth(
             broker=broker,

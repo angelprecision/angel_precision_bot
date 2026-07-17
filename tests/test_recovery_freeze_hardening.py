@@ -50,6 +50,40 @@ def test_recovery_normalizes_client_id():
     assert rec.client_id == "trader@example.com"
 
 
+def test_recovery_reconciles_stale_exit_claims_in_startup_pass():
+    rec, ap_recovery = _make_recovery()
+    reconciled = MagicMock(return_value={"claim_state": "RELEASED_NO_SUBMIT"})
+
+    class _ClaimCursor:
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchall(self):
+            return [{"generation_key": "client|position|3|1"}]
+
+    @contextmanager
+    def _conn():
+        yield _ClaimCursor()
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.conn = _conn
+    fake_db.run_with_retry = lambda fn, *args, **kwargs: fn()
+
+    fake_guard = types.ModuleType("ap.exit_decision_idempotency_guard")
+    fake_guard.reconcile_stale_exit_generation_claim = reconciled
+
+    result = {"stale_exit_claims_reconciled": 0}
+    with patch.dict(sys.modules, {"ap.db": fake_db, "ap.exit_decision_idempotency_guard": fake_guard}):
+        rec._reconcile_stale_exit_generation_claims(result)
+
+    reconciled.assert_called_once_with(
+        "client|position|3|1",
+        execution_core=rec.execution_core,
+        osm=rec.osm,
+    )
+    assert result["stale_exit_claims_reconciled"] == 1
+
+
 def test_recovery_does_not_transition_entry_filled_with_zero_qty():
     rec, _ = _make_recovery()
     rec.broker.get_order.return_value = {

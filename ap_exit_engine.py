@@ -1417,6 +1417,24 @@ def _active_exit_blocks_resubmit(order: dict | None) -> bool:
     }
 
 
+def _is_reserved_local_exit_submit_intent(pos: Any, order: dict | None) -> bool:
+    """Allow the exact pre-submit reserved EXIT row to flow into the callback once."""
+    if not order:
+        return False
+    status = str(order.get("status") or "").upper()
+    if status != "EXIT_REQUESTED":
+        return False
+    active_local_order_id = str(order.get("local_order_id") or "").strip()
+    pending_local_order_id = str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
+    if not active_local_order_id or active_local_order_id != pending_local_order_id:
+        return False
+    if str(order.get("broker_order_id") or "").strip():
+        return False
+    if bool(getattr(pos, "exit_in_flight", False)):
+        return False
+    return True
+
+
 def _classify_exit_decision(decision: "ExitDecision") -> str:
     explicit_code = (getattr(decision, "reason_code", "") or "").upper().strip()
     if explicit_code:
@@ -6213,7 +6231,7 @@ class APExitEngine:
                         _active_exit = _osm._get_active_exit_order(position_id)
                     elif hasattr(_osm, "get_active_exit_order"):
                         _active_exit = _osm.get_active_exit_order(position_id)
-                if _active_exit_blocks_resubmit(_active_exit):
+                if _active_exit_blocks_resubmit(_active_exit) and not _is_reserved_local_exit_submit_intent(pos, _active_exit):
                     log.warning(
                         "[%s] EXIT RESUBMIT BLOCKED | pos=%s | existing_order=%s | status=%s | broker=%s",
                         ticker, position_id,

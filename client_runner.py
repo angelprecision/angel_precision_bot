@@ -790,6 +790,17 @@ class ClientRunner(threading.Thread):
         if not str(self.account_id or "").strip():
             return _fail("missing_account_id")
 
+        try:
+            from ap.trade_lifecycle_guards import lifecycle_guard_preflight
+            _guards_ok, _guards = lifecycle_guard_preflight("live")
+        except Exception as _exc:
+            return _fail(f"lifecycle_guard_preflight_unavailable:{type(_exc).__name__}")
+        if not _guards_ok:
+            _missing = ",".join(_guards.get("missing_required_guards") or [])
+            if not _guards.get("generation_claims_table_exists"):
+                _missing = f"{_missing},exit_decision_generation_claims_migration".strip(",")
+            return _fail(f"lifecycle_guard_preflight_failed:{_missing}")
+
         # 4–5. Broker auth round-trip + funded account.
         try:
             if not hasattr(broker, "get_account_equity"):
@@ -2510,6 +2521,8 @@ class ClientRunner(threading.Thread):
             self._mark_failed("exit_engine_missing")
             self.stopped.set()
             return
+        exit_eng.order_state_machine = self.order_state_machine
+        exit_eng.osm = self.order_state_machine
 
         # PR D / FIX-2 (BUG-CR-4): wire kill_switch_fn to read the explicit
         # self.kill_switch_active flag. The old lambda
