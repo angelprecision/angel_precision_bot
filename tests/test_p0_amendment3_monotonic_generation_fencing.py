@@ -81,6 +81,7 @@ def _claim_kwargs(**overrides):
         "observed_underlying_price": 100.2,
         "signal_id": "sig-1",
         "execution_mode": "live",
+        "canonical_signal_id": "sig-1",
     }
     base.update(overrides)
     return base
