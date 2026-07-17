@@ -234,6 +234,21 @@ def _claim_local_order_id(pos: Any) -> str:
     return str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
 
 
+def _is_exact_reserved_exit_intent(pos: Any, active_order: dict | None) -> bool:
+    if not isinstance(active_order, dict):
+        return False
+    if str(active_order.get("status") or "").strip().upper() != "EXIT_REQUESTED":
+        return False
+    active_local_order_id = str(active_order.get("local_order_id") or "").strip()
+    if not active_local_order_id or active_local_order_id != _claim_local_order_id(pos):
+        return False
+    if str(active_order.get("broker_order_id") or "").strip():
+        return False
+    if bool(getattr(pos, "exit_in_flight", False)):
+        return False
+    return True
+
+
 def _ensure_local_exit_intent_row(
     engine: Any,
     pos: Any,
@@ -786,6 +801,34 @@ def _update_durable_decision_generation(
     run_with_retry(_update)
 
 
+def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, error_text: str = "") -> None:
+    """Retire one reserved EXIT_REQUESTED row after conclusive no-submit proof."""
+    local_order_id = str(local_order_id or "").strip()
+    if not local_order_id:
+        return
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    if osm is None:
+        return
+    get_order = getattr(osm, "get_order", None)
+    transition = getattr(osm, "transition", None)
+    if not callable(get_order) or not callable(transition):
+        return
+    try:
+        order = get_order(local_order_id)
+    except Exception:
+        return
+    if not isinstance(order, dict):
+        return
+    status = str(order.get("status") or "").strip().upper()
+    broker_order_id = str(order.get("broker_order_id") or "").strip()
+    if status != "EXIT_REQUESTED" or broker_order_id:
+        return
+    try:
+        transition(local_order_id, "ERROR", last_error=error_text or "NO_POST_ATTEMPTED")
+    except Exception:
+        return
+
+
 def _extract_callback_trace_identity(callback_trace: dict) -> dict:
     identity = dict(callback_trace.get("identity") or {})
     result = callback_trace.get("result")
@@ -1094,7 +1137,7 @@ def wrap_precheck(original: Callable[..., bool]) -> Callable[..., bool]:
             except Exception as exc:
                 log.debug("early active-exit lookup unavailable position=%s error=%s", position_id, exc)
                 active_order = None
-            if active_exit_order_blocks(active_order):
+            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(pos, active_order):
                 try:
                     _mark_active_exit_owned(self, pos, active_order)
                 except Exception as exc:
@@ -1151,7 +1194,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     exc,
                 )
                 active_order = None
-            if active_exit_order_blocks(active_order):
+            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(pos, active_order):
                 try:
                     _mark_active_exit_owned(self, pos, active_order)
                 except Exception as exc:
@@ -1325,6 +1368,12 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         claim_state,
                         callback_returned,
                         exc,
+                    )
+                if claim_state == _CLAIM_STATE_RELEASED_NO_SUBMIT:
+                    _retire_local_exit_intent_after_no_submit(
+                        self,
+                        local_order_id,
+                        error_text=error_text,
                     )
             return callback_returned
         finally:

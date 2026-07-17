@@ -101,6 +101,14 @@ class _FakeOSM:
         self.active_orders_by_position[str(kwargs.get("position_id") or "")] = self.active_order
         return local_order_id
 
+    def get_order(self, local_order_id):
+        if isinstance(self.active_order, dict) and self.active_order.get("local_order_id") == local_order_id:
+            return dict(self.active_order)
+        for order in self.active_orders_by_position.values():
+            if isinstance(order, dict) and order.get("local_order_id") == local_order_id:
+                return dict(order)
+        return None
+
     def update_order_meta(self, local_order_id, patch):
         if isinstance(self.active_order, dict) and self.active_order.get("local_order_id") == local_order_id:
             meta = dict(self.active_order.get("meta") or {})
@@ -111,6 +119,22 @@ class _FakeOSM:
                 meta = dict(order.get("meta") or {})
                 meta.update(dict(patch or {}))
                 order["meta"] = meta
+        return True
+
+    def transition(self, local_order_id, new_status, **kwargs):
+        order = None
+        if isinstance(self.active_order, dict) and self.active_order.get("local_order_id") == local_order_id:
+            order = self.active_order
+        if order is None:
+            for candidate in self.active_orders_by_position.values():
+                if isinstance(candidate, dict) and candidate.get("local_order_id") == local_order_id:
+                    order = candidate
+                    break
+        if order is None:
+            return False
+        order["status"] = new_status
+        if "last_error" in kwargs:
+            order["last_error"] = kwargs.get("last_error")
         return True
 
 
@@ -1110,14 +1134,104 @@ def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generati
     monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
     wrapped = guard.wrap_submit(lambda engine, pos, decision: bool((engine.on_scale if str(decision.action).upper() == "SCALE_OUT" else engine.on_exit)(pos, decision).get("ok")))
     pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
 
-    assert wrapped(_make_submit_engine(pos, callback=callback), pos, _decision()) is False
+    assert wrapped(engine, pos, _decision()) is False
     assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert pos.pending_exit_local_order_id
+    assert engine.order_state_machine.active_order["local_order_id"] == pos.pending_exit_local_order_id
 
     retry_pos = _pos()
     assert wrapped(_make_submit_engine(retry_pos, callback=callback), retry_pos, _decision()) is True
     assert callback_count == 2
     assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+
+
+def test_submit_wrapper_retires_reserved_exit_row_after_conclusive_pre_submit_failure(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    def callback(pos, decision):
+        return {
+            "ok": False,
+            "accepted": False,
+            "status": "ERROR",
+            "error": "NO_POST_ATTEMPTED:validation_failed",
+        }
+
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    wrapped = guard.wrap_submit(
+        lambda engine, pos, decision: bool(
+            (engine.on_scale if str(decision.action).upper() == "SCALE_OUT" else engine.on_exit)(pos, decision).get("ok")
+        )
+    )
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert engine.order_state_machine.active_order["last_error"] == "NO_POST_ATTEMPTED:validation_failed"
+
+
+def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    callback_count = 0
+
+    def callback(pos, decision):
+        nonlocal callback_count
+        callback_count += 1
+        pos.exit_in_flight = True
+        pos.pending_exit_local_order_id = "exit-local-reserved"
+        pos.pending_exit_broker_order_id = "exit-broker-1"
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "EXIT_SUBMITTED",
+            "local_order_id": "exit-local-reserved",
+            "broker_order_id": "exit-broker-1",
+        }
+
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    pos = _pos(pending_exit_local_order_id="exit-local-reserved")
+    engine = _make_submit_engine(
+        pos,
+        callback=callback,
+        active_order={
+            "status": "EXIT_REQUESTED",
+            "local_order_id": "exit-local-reserved",
+            "broker_order_id": "",
+            "position_id": pos.position_id,
+        },
+    )
+
+    assert wrapped(engine, pos, _decision()) is True
+    assert callback_count == 1
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+
+
+def test_engine_reserved_exit_request_predicate_allows_exact_reserved_row() -> None:
+    from ap_exit_engine import _is_reserved_local_exit_submit_intent
+
+    pos = _pos(pending_exit_local_order_id="exit-local-reserved", exit_in_flight=False)
+    assert _is_reserved_local_exit_submit_intent(
+        pos,
+        {
+            "status": "EXIT_REQUESTED",
+            "local_order_id": "exit-local-reserved",
+            "broker_order_id": "",
+        },
+    ) is True
+    assert _is_reserved_local_exit_submit_intent(
+        pos,
+        {
+            "status": "EXIT_SUBMITTED",
+            "local_order_id": "exit-local-reserved",
+            "broker_order_id": "",
+        },
+    ) is False
 
 
 def test_submit_wrapper_treats_broker_conn_error_as_ambiguous(generation_claims_table, monkeypatch) -> None:
