@@ -21,11 +21,18 @@ def install_deferred_materialization_persistence_guard() -> None:
     install_guard()
 
 
+def install_trade_lifecycle_safety_guards() -> None:
+    from .trade_lifecycle_guards import install_trade_lifecycle_guards
+
+    install_trade_lifecycle_guards()
+
+
 def install_entry_safety_guards() -> None:
     installers = (
         install_entry_metadata_safety_guards,
         install_underlying_confirmation_safety_guard,
         install_deferred_materialization_persistence_guard,
+        install_trade_lifecycle_safety_guards,
     )
     for installer in installers:
         try:

@@ -431,6 +431,11 @@ class APStartupRecovery:
             "dedup_seeded":        0,
             "watchers_requeued":   0,
             "deferred_lifecycles_recovered": 0,
+            "exit_fill_reconciliations_attempted": 0,
+            "exit_fill_reconciliations_reconciled": 0,
+            "exit_fill_reconciliations_quarantined": 0,
+            "exit_fill_reconciliations_failed": 0,
+            "exit_fill_reconciliations_skipped": 0,
             "errors":              [],
         }
 
@@ -448,6 +453,25 @@ class APStartupRecovery:
             result["errors"].append(f"deferred_lifecycle: {e}")
 
         try:
+            self._retry_canonical_exit_fill_reconciliations(result)
+        except Exception as e:
+            log.critical(
+                "[%s] Canonical EXIT-fill retry discovery failed: %s",
+                self.client_id,
+                e,
+                exc_info=True,
+            )
+            result["errors"].append(f"exit_fill_reconciliation: {e}")
+            result["exit_fill_reconciliations_failed"] += 1
+
+        try:
+            live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
+        except Exception as e:
+            log.error("[%s] Exit fill downtime recovery error: %s", self.client_id, e)
+            result["errors"].append(f"exit_fill_downtime: {e}")
+            live_exit_orders = []
+
+        try:
             self._recover_positions(result)
         except Exception as e:
             log.error("[%s] Position recovery error: %s", self.client_id, e)
@@ -460,7 +484,7 @@ class APStartupRecovery:
             result["errors"].append(f"entries: {e}")
 
         try:
-            self._reattach_exit_protections(result)
+            self._reattach_live_exit_protections(result, live_exit_orders)
         except Exception as e:
             log.error("[%s] Exit reattachment error: %s", self.client_id, e)
             result["errors"].append(f"exits: {e}")
@@ -486,7 +510,9 @@ class APStartupRecovery:
 
         log.info(
             "[%s] Recovery complete | positions=%d entries_verified=%d "
-            "entries_corrected=%d exits=%d dedup=%d watchers_requeued=%d buying_power=$%.2f errors=%d",
+            "entries_corrected=%d exits=%d dedup=%d watchers_requeued=%d buying_power=$%.2f "
+            "exit_fill_attempted=%d exit_fill_reconciled=%d exit_fill_quarantined=%d "
+            "exit_fill_failed=%d exit_fill_skipped=%d errors=%d",
             self.client_id,
             result["positions_recovered"],
             result["entries_verified"],
@@ -495,9 +521,78 @@ class APStartupRecovery:
             result["dedup_seeded"],
             result["watchers_requeued"],
             result["buying_power_reserved"],
+            result["exit_fill_reconciliations_attempted"],
+            result["exit_fill_reconciliations_reconciled"],
+            result["exit_fill_reconciliations_quarantined"],
+            result["exit_fill_reconciliations_failed"],
+            result["exit_fill_reconciliations_skipped"],
             len(result["errors"]),
         )
         return result
+
+    def _retry_canonical_exit_fill_reconciliations(self, result: dict) -> None:
+        """Run the bounded, client-scoped accounting retry pass once at startup.
+
+        This pass consumes only durable broker-confirmed fill state. It owns no
+        broker adapter and cannot submit or cancel orders.
+        """
+        from ap.exit_fill_truth_guard import retry_pending_exit_fill_reconciliations
+
+        outcomes = retry_pending_exit_fill_reconciliations(
+            client_id=self.client_id,
+            limit=100,
+        )
+        result["exit_fill_reconciliations_attempted"] += len(outcomes)
+        for outcome in outcomes:
+            local_order_id = str(outcome.get("local_order_id") or "")
+            status = str(outcome.get("status") or "").strip().upper()
+            if bool(outcome.get("reconciled")):
+                result["exit_fill_reconciliations_reconciled"] += 1
+                continue
+            if status == "NOT_CLAIMED":
+                result["exit_fill_reconciliations_skipped"] += 1
+                log.info(
+                    "[%s] STARTUP_EXIT_FILL_RECONCILIATION_ALREADY_CLAIMED order=%s",
+                    self.client_id,
+                    local_order_id,
+                )
+                continue
+            if status == "QUARANTINED":
+                result["exit_fill_reconciliations_quarantined"] += 1
+                outcome_result = outcome.get("result") or {}
+                diagnostic = (
+                    outcome_result.get("proof_reconciliation")
+                    or outcome_result
+                    or {}
+                )
+                reason = str(
+                    diagnostic.get("reason_code")
+                    or status
+                    or "EXIT_FILL_RECONCILIATION_UNRESOLVED"
+                )
+                log.critical(
+                    "[%s] STARTUP_EXIT_FILL_RECONCILIATION_UNRESOLVED "
+                    "order=%s status=%s reason=%s",
+                    self.client_id,
+                    local_order_id,
+                    status,
+                    reason,
+                )
+                result["errors"].append(
+                    f"exit_fill_reconciliation_unresolved:{local_order_id}:{reason}"
+                )
+                continue
+            result["exit_fill_reconciliations_failed"] += 1
+            error = str(outcome.get("error") or "unknown retry failure")
+            log.critical(
+                "[%s] STARTUP_EXIT_FILL_RECONCILIATION_FAILED order=%s error=%s",
+                self.client_id,
+                local_order_id,
+                error,
+            )
+            result["errors"].append(
+                f"exit_fill_reconciliation_failed:{local_order_id}:{error}"
+            )
 
     def recover_deferred_lifecycles(self) -> dict:
         """Lightweight runtime pass for durable deferred-breach ownership."""
@@ -707,64 +802,175 @@ class APStartupRecovery:
                         log.error("[%s] RECOVERY: OSM terminal transition failed: %s", self.client_id, e)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 3. Exit protection reattachment
+    # 3. EXIT fill downtime recovery
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _reattach_exit_protections(self, result: dict):
-        """
-        For every CLOSING position, verify the exit order is still live at
-        broker. If the exit filled while we were down, advance the position.
-        If exit canceled/expired, revert position to OPEN.
-        """
+    def _load_closing_positions(self) -> list[dict]:
+        from ap.db import list_positions, run_with_retry
+
+        return run_with_retry(
+            lambda: list_positions(client_id=self.client_id, status="CLOSING")
+        ) or []
+
+    def _resolve_active_exit_order_for_position(
+        self,
+        position: dict,
+        result: dict,
+    ) -> dict | None:
+        from ap.db import conn, run_with_retry
+
+        pos_id = position.get("id")
+        underlying = position.get("underlying") or position.get("ticker", "?")
+        pending_local_id = str(position.get("pending_exit_local_order_id") or "").strip()
+        pending_broker_id = str(position.get("pending_exit_broker_order_id") or "").strip()
+
+        if pending_local_id:
+            def _by_local(local_id=pending_local_id):
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM orders
+                        WHERE client_id=%s
+                          AND local_order_id=%s
+                          AND kind='EXIT'
+                        LIMIT 2
+                        """,
+                        (self.client_id, local_id),
+                    )
+                    return c.fetchall()
+
+            rows = [dict(row) for row in (run_with_retry(_by_local) or [])]
+            if not rows:
+                msg = (
+                    "RECOVERY_PENDING_EXIT_LOCAL_ID_UNRESOLVED "
+                    f"client={self.client_id} pos={pos_id} underlying={underlying} "
+                    f"pending_local_order_id={pending_local_id}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            if len(rows) > 1:
+                candidates = [
+                    f"{str(row.get('local_order_id') or '')}/{str(row.get('broker_order_id') or '')}"
+                    for row in rows
+                ]
+                msg = (
+                    "RECOVERY_PENDING_EXIT_LOCAL_ID_AMBIGUOUS "
+                    f"client={self.client_id} pos={pos_id} underlying={underlying} "
+                    f"pending_local_order_id={pending_local_id} candidates={candidates}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            selected = rows[0]
+        else:
+            def _by_position(pid=pos_id):
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM orders
+                        WHERE client_id=%s
+                          AND position_id=%s
+                          AND kind='EXIT'
+                          AND status NOT IN (
+                              'EXIT_FILLED',
+                              'REJECTED',
+                              'CANCELED',
+                              'CANCELLED',
+                              'EXPIRED',
+                              'ERROR'
+                          )
+                        ORDER BY created_ts DESC
+                        LIMIT 2
+                        """,
+                        (self.client_id, pid),
+                    )
+                    return c.fetchall()
+
+            rows = [dict(row) for row in (run_with_retry(_by_position) or [])]
+            if not rows:
+                msg = (
+                    f"RECOVERY_CLOSING_POSITION_WITHOUT_ACTIVE_EXIT "
+                    f"pos={pos_id} underlying={underlying}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            if len(rows) > 1:
+                candidates = [
+                    f"{str(row.get('local_order_id') or '')}/{str(row.get('broker_order_id') or '')}"
+                    for row in rows
+                ]
+                msg = (
+                    "RECOVERY_ACTIVE_EXIT_IDENTITY_AMBIGUOUS "
+                    f"client={self.client_id} pos={pos_id} underlying={underlying} "
+                    f"candidates={candidates}"
+                )
+                log.critical("[%s] %s", self.client_id, msg)
+                result.setdefault("errors", []).append(msg)
+                return None
+            selected = rows[0]
+
+        selected_broker_id = str(selected.get("broker_order_id") or "").strip()
+        if pending_broker_id and pending_broker_id != selected_broker_id:
+            msg = (
+                "RECOVERY_PENDING_EXIT_BROKER_ID_MISMATCH "
+                f"client={self.client_id} pos={pos_id} pending_local_order_id={pending_local_id} "
+                f"expected_broker_order_id={pending_broker_id} "
+                f"selected_broker_order_id={selected_broker_id}"
+            )
+            log.critical("[%s] %s", self.client_id, msg)
+            result.setdefault("errors", []).append(msg)
+            return None
+        return selected
+
+    def _load_persisted_exit_order(self, local_order_id: str) -> dict | None:
+        from ap.db import conn, run_with_retry
+
+        def _load(local_id=local_order_id):
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT *
+                    FROM orders
+                    WHERE client_id=%s AND local_order_id=%s AND kind='EXIT'
+                    LIMIT 1
+                    """,
+                    (self.client_id, local_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_load)
+        return dict(row) if row else None
+
+    def _recover_exit_fills_that_occurred_during_downtime(self, result: dict) -> list[dict]:
+        """Route broker-confirmed downtime EXIT fills through the canonical reducer."""
         if self._execution_mode() is None:
             result.setdefault("errors", []).append("recovery_unknown_execution_mode")
-            return
-        from ap.db import list_positions, run_with_retry, conn
-
-        closings = run_with_retry(
-            lambda: list_positions(client_id=self.client_id, status="CLOSING")
-        )
+            return []
+        closings = self._load_closing_positions()
         if not closings:
-            return
+            return []
+
+        live_exit_orders: list[dict] = []
 
         for pos in closings:
             pos_id     = pos.get("id")
             underlying = pos.get("underlying") or pos.get("ticker", "?")
-
-            # Find the active exit order for this position
-            def _get_exit_order(pid=pos_id):
-                with conn() as c:
-                    c.execute(
-                        """
-                        SELECT local_order_id, broker_order_id, status
-                        FROM orders
-                        WHERE client_id=%s AND position_id=%s AND kind='EXIT'
-                          AND status NOT IN ('EXIT_FILLED','REJECTED','CANCELED','EXPIRED','ERROR')
-                        ORDER BY created_ts DESC LIMIT 1
-                        """,
-                        (self.client_id, pid),
-                    )
-                    return c.fetchone()
-
             try:
-                exit_order = run_with_retry(_get_exit_order)
+                exit_order = self._resolve_active_exit_order_for_position(pos, result)
             except Exception as e:
                 log.error("[%s] RECOVERY: exit order lookup failed for pos %s: %s",
                           self.client_id, pos_id, e)
                 continue
 
             if not exit_order:
-                # CLOSING position with no exit order — needs manual exit
-                log.error(
-                    "[%s] RECOVERY: CLOSING position %s (%s) has NO active exit order — "
-                    "exit must be re-submitted manually",
-                    self.client_id, pos_id, underlying,
-                )
                 continue
 
             broker_oid = exit_order.get("broker_order_id")
             local_id   = exit_order.get("local_order_id")
-            db_status  = exit_order.get("status", "")
 
             if not broker_oid or broker_oid in ("N/A", "PENDING", ""):
                 log.warning(
@@ -783,9 +989,9 @@ class APStartupRecovery:
                 continue
 
             from ap_reconciler import BROKER_FILLED, BROKER_TERMINAL, BROKER_TO_OSM
+            from ap.exit_fill_truth_guard import reconcile_confirmed_exit_fill
 
             if broker_status in BROKER_FILLED:
-                # Exit actually filled while we were down — close the position
                 filled_qty = _extract_explicit_fill_qty(broker_raw)
                 avg_fill   = _extract_avg_fill_price(broker_raw)
                 if not filled_qty or filled_qty <= 0 or not avg_fill or avg_fill <= 0:
@@ -808,30 +1014,78 @@ class APStartupRecovery:
                     continue
 
                 try:
+                    exit_status = (
+                        "EXIT_PARTIAL_FILL"
+                        if broker_status == "partially_filled"
+                        else "EXIT_FILLED"
+                    )
                     self.osm.transition(
-                        local_id, "EXIT_FILLED",
+                        local_id,
+                        exit_status,
                         filled_qty=filled_qty,
                         fill_price=avg_fill,
                     )
-                    log.info(
-                        "[%s] RECOVERY: exit filled during downtime | pos=%s %s | "
-                        "qty=%d avg=$%.2f",
-                        self.client_id, pos_id, underlying, filled_qty, avg_fill,
-                    )
-                    result["exits_reattached"] += 1
                 except Exception as e:
-                    log.error("[%s] RECOVERY: EXIT_FILLED transition failed: %s",
-                              self.client_id, e)
+                    log.error("[%s] RECOVERY: %s transition failed: %s",
+                              self.client_id, broker_status.upper(), e)
+                    continue
 
-            elif broker_status in BROKER_TERMINAL:
-                # Exit canceled — revert position to OPEN so it can be re-exited
+                persisted_order = self._load_persisted_exit_order(local_id)
+                persisted_status = str((persisted_order or {}).get("status") or "").upper()
+                if persisted_status not in {"EXIT_FILLED", "EXIT_PARTIAL_FILL"}:
+                    msg = (
+                        f"RECOVERY_EXIT_FILL_PERSISTED_STATUS_INVALID local={local_id} "
+                        f"pos={pos_id} status={persisted_status or 'MISSING'}"
+                    )
+                    log.critical("[%s] %s", self.client_id, msg)
+                    result.setdefault("errors", []).append(msg)
+                    continue
+
+                canonical_result = {
+                    "status": persisted_order["status"],
+                    "broker_order_id": persisted_order["broker_order_id"],
+                    "filled_qty": persisted_order["filled_qty"],
+                    "fill_price": persisted_order["fill_price"],
+                    "filled_ts": persisted_order["filled_ts"],
+                }
+                try:
+                    reconcile_confirmed_exit_fill(persisted_order, canonical_result)
+                    log.info(
+                        "[%s] RECOVERY: exit reconciled during downtime | pos=%s %s | "
+                        "qty=%d avg=$%.2f status=%s",
+                        self.client_id,
+                        pos_id,
+                        underlying,
+                        filled_qty,
+                        avg_fill,
+                        persisted_status,
+                    )
+                except Exception as e:
+                    log.critical(
+                        "[%s] STARTUP_EXIT_FILL_CANONICAL_RECONCILIATION_FAILED "
+                        "pos=%s order=%s status=%s error=%s",
+                        self.client_id,
+                        pos_id,
+                        local_id,
+                        persisted_status,
+                        e,
+                    )
+                    result.setdefault("errors", []).append(
+                        f"exit_fill_downtime_reconcile:{local_id}:{e}"
+                    )
+                if persisted_status == "EXIT_PARTIAL_FILL":
+                    live_exit_orders.append(persisted_order)
+                continue
+
+            if broker_status in BROKER_TERMINAL:
                 try:
                     self.osm.transition(
                         local_id, BROKER_TO_OSM.get(broker_status, "CANCELED"),
                         last_error=f"recovery: broker_status={broker_status}",
                     )
                     # Revert position
-                    from ap.db import conn as _conn
+                    from ap.db import conn as _conn, run_with_retry
+
                     def _revert(pid=pos_id):
                         with _conn() as c:
                             c.execute(
@@ -839,6 +1093,7 @@ class APStartupRecovery:
                                 "updated_ts=NOW() WHERE id=%s AND client_id=%s",
                                 (pid, self.client_id),
                             )
+
                     run_with_retry(_revert)
                     log.warning(
                         "[%s] RECOVERY: exit was canceled during downtime | "
@@ -848,34 +1103,69 @@ class APStartupRecovery:
                     result["exits_reattached"] += 1
                 except Exception as e:
                     log.error("[%s] RECOVERY: exit revert failed: %s", self.client_id, e)
-            else:
-                # Exit is still live at broker — reattach to exit engine if available
-                log.info(
-                    "[%s] RECOVERY: exit order still live at broker | "
-                    "pos=%s %s | broker_status=%s",
-                    self.client_id, pos_id, underlying, broker_status,
-                )
-                result["exits_reattached"] += 1
+                continue
 
-                if self.exit_engine:
-                    try:
-                        if hasattr(self.exit_engine, "seed_from_db"):
-                            # Idempotent global seed; safe to call again on startup.
-                            self.exit_engine.seed_from_db()
-                        elif hasattr(self.exit_engine, "mark_exit_in_flight"):
-                            self.exit_engine.mark_exit_in_flight(
-                                position_id=pos_id,
-                                reason="recovery: exit order live at broker",
-                            )
-                    except Exception as e:
-                        log.error(
-                            "[%s] RECOVERY: failed to reattach exit protection for pos %s: %s",
-                            self.client_id, pos_id, e,
-                        )
-                        result.setdefault("errors", []).append(f"exits_reattach:{pos_id}:{e}")
+            live_exit_orders.append(exit_order)
+
+        return live_exit_orders
 
     # ──────────────────────────────────────────────────────────────────────────
-    # 4. Buying power reservation
+    # 4. Live exit protection reattachment
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _reattach_live_exit_protections(self, result: dict, live_exit_orders: list[dict]):
+        """Reattach only EXIT orders already proven live by the downtime pass."""
+        if self._execution_mode() is None:
+            result.setdefault("errors", []).append("recovery_unknown_execution_mode")
+            return
+        if not live_exit_orders:
+            return
+
+        for exit_order in live_exit_orders:
+            pos_id = exit_order.get("position_id")
+            local_id = exit_order.get("local_order_id")
+            underlying = (
+                exit_order.get("underlying")
+                or exit_order.get("ticker")
+                or exit_order.get("contract")
+                or "?"
+            )
+
+            log.info(
+                "[%s] RECOVERY: reattaching live exit protection | "
+                "pos=%s %s | order=%s status=%s",
+                self.client_id,
+                pos_id,
+                underlying,
+                local_id,
+                exit_order.get("status"),
+            )
+            result["exits_reattached"] += 1
+
+            if self.exit_engine:
+                try:
+                    if hasattr(self.exit_engine, "seed_from_db"):
+                        # Idempotent global seed; safe to call again on startup.
+                        self.exit_engine.seed_from_db()
+                    elif hasattr(self.exit_engine, "mark_exit_in_flight"):
+                        self.exit_engine.mark_exit_in_flight(
+                            position_id=pos_id,
+                            reason="recovery: exit order live at broker",
+                        )
+                except Exception as e:
+                    log.error(
+                        "[%s] RECOVERY: failed to reattach exit protection for pos %s: %s",
+                        self.client_id, pos_id, e,
+                    )
+                    result.setdefault("errors", []).append(f"exits_reattach:{pos_id}:{e}")
+
+    def _reattach_exit_protections(self, result: dict):
+        """Compatibility wrapper for callers that still use the legacy name."""
+        live_exit_orders = self._recover_exit_fills_that_occurred_during_downtime(result)
+        self._reattach_live_exit_protections(result, live_exit_orders)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 5. Buying power reservation
     # ──────────────────────────────────────────────────────────────────────────
 
     def _recompute_buying_power(self, result: dict):
