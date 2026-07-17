@@ -1707,6 +1707,44 @@ class APOrderStateMachine:
             )
             return False
 
+    def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
+        """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
+        error_text = str(last_error or "NO_POST_ATTEMPTED")
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET status=%s, last_error=%s, updated_ts=NOW() "
+                    "WHERE local_order_id=%s "
+                    "  AND client_id=%s "
+                    "  AND kind='EXIT' "
+                    "  AND status=%s "
+                    "  AND COALESCE(broker_order_id,'')='' "
+                    "  AND submitted_ts IS NULL "
+                    "  AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL "
+                    "  AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
+                    "  AND COALESCE((meta->>'reconciliation_required')::boolean, false)=false",
+                    (
+                        OrderStatus.ERROR,
+                        error_text,
+                        local_order_id,
+                        self.client_id,
+                        OrderStatus.EXIT_REQUESTED,
+                    ),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retire_unsubmitted_exit_intent failed for local_order_id=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def claim_deferred_broker_ready_submit(
         self,
         local_order_id: str,

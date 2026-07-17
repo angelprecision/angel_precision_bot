@@ -137,6 +137,31 @@ class _FakeOSM:
             order["last_error"] = kwargs.get("last_error")
         return True
 
+    def retire_unsubmitted_exit_intent(self, local_order_id, *, last_error):
+        order = None
+        if isinstance(self.active_order, dict) and self.active_order.get("local_order_id") == local_order_id:
+            order = self.active_order
+        if order is None:
+            for candidate in self.active_orders_by_position.values():
+                if isinstance(candidate, dict) and candidate.get("local_order_id") == local_order_id:
+                    order = candidate
+                    break
+        if order is None:
+            return False
+        meta = dict(order.get("meta") or {})
+        if (
+            str(order.get("status") or "").upper() != "EXIT_REQUESTED"
+            or str(order.get("broker_order_id") or "").strip()
+            or order.get("submitted_ts")
+            or str(meta.get("submit_intent_at") or "").strip()
+            or bool(meta.get("split_brain_quarantine"))
+            or bool(meta.get("reconciliation_required"))
+        ):
+            return False
+        order["status"] = "ERROR"
+        order["last_error"] = last_error
+        return True
+
 
 class _FakeClaimConnection:
     def __init__(self, store: dict[str, dict]):
@@ -1349,6 +1374,32 @@ def test_submit_wrapper_claim_loser_cleanup_refuses_after_submit_evidence(
 
     assert wrapped(engine, pos, _decision()) is False
     assert callback.call_count == 0
+    assert engine.order_state_machine.active_order["status"] == "EXIT_REQUESTED"
+    assert engine.order_state_machine.active_order["submitted_ts"] == "2026-07-17T22:00:00+00:00"
+
+
+def test_retire_local_exit_intent_after_no_submit_uses_atomic_osm_retire() -> None:
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=MagicMock(), mode="LIVE")
+    local_order_id = engine.order_state_machine.create_exit_order(
+        position_id=pos.position_id,
+        contract=pos.option_symbol,
+        symbol=pos.ticker,
+        direction=pos.side,
+        qty=pos.quantity_remaining,
+        local_order_id="exit-local-atomic",
+    )
+    engine.order_state_machine.active_order["submitted_ts"] = "2026-07-17T22:00:00+00:00"
+    meta = dict(engine.order_state_machine.active_order.get("meta") or {})
+    meta["submit_intent_at"] = "2026-07-17T21:59:59+00:00"
+    engine.order_state_machine.active_order["meta"] = meta
+
+    guard._retire_local_exit_intent_after_no_submit(
+        engine,
+        local_order_id,
+        error_text="EXIT_DECISION_GENERATION_DUPLICATE_SUPPRESSED",
+    )
+
     assert engine.order_state_machine.active_order["status"] == "EXIT_REQUESTED"
     assert engine.order_state_machine.active_order["submitted_ts"] == "2026-07-17T22:00:00+00:00"
 

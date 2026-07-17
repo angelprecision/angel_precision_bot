@@ -824,30 +824,11 @@ def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, 
     osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
     if osm is None:
         return
-    get_order = getattr(osm, "get_order", None)
-    transition = getattr(osm, "transition", None)
-    if not callable(get_order) or not callable(transition):
+    retire_intent = getattr(osm, "retire_unsubmitted_exit_intent", None)
+    if not callable(retire_intent):
         return
     try:
-        order = get_order(local_order_id)
-    except Exception:
-        return
-    if not isinstance(order, dict):
-        return
-    status = str(order.get("status") or "").strip().upper()
-    broker_order_id = str(order.get("broker_order_id") or "").strip()
-    order_meta = _claim_meta_dict(order)
-    if (
-        status != "EXIT_REQUESTED"
-        or broker_order_id
-        or order.get("submitted_ts")
-        or str(order_meta.get("submit_intent_at") or "").strip()
-        or bool(order_meta.get("split_brain_quarantine"))
-        or bool(order_meta.get("reconciliation_required"))
-    ):
-        return
-    try:
-        transition(local_order_id, "ERROR", last_error=error_text or "NO_POST_ATTEMPTED")
+        retire_intent(local_order_id, last_error=error_text or "NO_POST_ATTEMPTED")
     except Exception:
         return
 
