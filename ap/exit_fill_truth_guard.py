@@ -7,7 +7,7 @@ or cancels orders; it runs only after OSM has accepted an EXIT fill.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any, Iterable
 
@@ -32,6 +32,7 @@ _EXIT_FILL_STATUSES = ("EXIT_FILLED", "EXIT_PARTIAL_FILL")
 _PARTIAL_RESULT_STATUSES = {
     "PARTIAL_FILL", "PARTIALLY_FILLED", "PARTIAL", "EXIT_PARTIAL_FILL",
 }
+_RECONCILIATION_STALE_ATTEMPT_LEASE = timedelta(minutes=5)
 
 
 class LifecycleProjectionError(ValueError):
@@ -374,6 +375,71 @@ def _begin_reconciliation_attempt(order: dict, result: dict) -> int:
     return int(run_with_retry(_tx))
 
 
+def _parse_marker_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _reconciliation_marker_retryable(
+    marker: dict,
+    now: datetime,
+    *,
+    stale_attempt_lease: timedelta = _RECONCILIATION_STALE_ATTEMPT_LEASE,
+) -> bool:
+    status = str((marker or {}).get("status") or "").strip().upper()
+    if status in {"RETRY_REQUIRED", "QUARANTINED"}:
+        return True
+    if status != "IN_PROGRESS":
+        return False
+    last_attempt_at = _parse_marker_timestamp((marker or {}).get("last_attempt_at"))
+    if last_attempt_at is None:
+        return True
+    now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return now_utc.astimezone(timezone.utc) - last_attempt_at >= stale_attempt_lease
+
+
+def _claim_reconciliation_retry(
+    order: dict,
+    result: dict,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    """Atomically reclaim one retryable marker under the order row lock."""
+    client_id, local_order_id = _reconciliation_order_identity(order)
+    if not client_id or not local_order_id:
+        return None
+    claimed_at = now or datetime.now(timezone.utc)
+
+    def _tx() -> int | None:
+        with conn() as c:
+            previous, _ = _read_marker(c, client_id, local_order_id)
+            if not _reconciliation_marker_retryable(previous, claimed_at):
+                return None
+            attempt_count = max(0, _int(previous.get("attempt_count"))) + 1
+            marker = {
+                **previous,
+                **_diagnostic_context(order, result),
+                "status": "IN_PROGRESS",
+                "reason_code": "RECONCILIATION_RETRY_CLAIMED",
+                "error": "",
+                "attempt_count": attempt_count,
+                "last_attempt_at": claimed_at.astimezone(timezone.utc).isoformat(),
+            }
+            _write_marker(c, client_id, local_order_id, marker)
+            return attempt_count
+
+    claimed = run_with_retry(_tx)
+    return int(claimed) if claimed is not None else None
+
+
 def _failure_reason(exc: Exception) -> tuple[str, str, list[str]]:
     candidates = list(getattr(exc, "candidate_position_ids", []) or [])
     if isinstance(exc, ReconciliationIdentityError):
@@ -405,7 +471,18 @@ def _finish_reconciliation_attempt(
     def _tx() -> None:
         with conn() as c:
             previous, _ = _read_marker(c, client_id, local_order_id)
-            preserved_attempts = max(attempt_count, _int(previous.get("attempt_count")))
+            durable_attempt = _int(previous.get("attempt_count"))
+            if durable_attempt != attempt_count:
+                log.critical(
+                    "[%s] EXIT_RECONCILIATION_STALE_FINISH_BLOCKED order=%s "
+                    "worker_attempt=%s durable_attempt=%s",
+                    client_id,
+                    local_order_id,
+                    attempt_count,
+                    durable_attempt,
+                )
+                return
+            preserved_attempts = attempt_count
             if error is None:
                 marker = {
                     **previous,
@@ -435,7 +512,12 @@ def _finish_reconciliation_attempt(
     run_with_retry(_tx)
 
 
-def _reconcile_exit_fill(order: dict, result: dict) -> dict:
+def _run_reconciliation_attempt(
+    order: dict,
+    result: dict,
+    *,
+    attempt_count: int,
+) -> dict:
     client_id = str(order.get("client_id") or "").strip()
     fill_ts = result.get("filled_ts") or order.get("filled_ts") or datetime.now(timezone.utc)
 
@@ -610,7 +692,6 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
                 "official_live_performance_eligible": eligible,
             }
 
-    attempt_count = _begin_reconciliation_attempt(order, result)
     try:
         reconciled = run_with_retry(_tx)
     except Exception as exc:
@@ -628,6 +709,15 @@ def _reconcile_exit_fill(order: dict, result: dict) -> dict:
         reconciled_position_id=str(reconciled.get("position_id") or ""),
     )
     return reconciled
+
+
+def _reconcile_exit_fill(order: dict, result: dict) -> dict:
+    attempt_count = _begin_reconciliation_attempt(order, result)
+    return _run_reconciliation_attempt(
+        order,
+        result,
+        attempt_count=attempt_count,
+    )
 
 
 def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> dict | None:
@@ -662,8 +752,6 @@ def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> di
             "position_id": str(marker.get("position_id") or ""),
             "already_reconciled": True,
         }
-    if status not in {"RETRY_REQUIRED", "QUARANTINED"}:
-        return None
     result = {
         "status": order.get("status"),
         "broker_order_id": order.get("broker_order_id"),
@@ -671,7 +759,88 @@ def retry_exit_fill_reconciliation(*, client_id: str, local_order_id: str) -> di
         "fill_price": order.get("fill_price"),
         "filled_ts": order.get("filled_ts"),
     }
-    return _reconcile_exit_fill(order, result)
+    attempt_count = _claim_reconciliation_retry(order, result)
+    if attempt_count is None:
+        return None
+    return _run_reconciliation_attempt(
+        order,
+        result,
+        attempt_count=attempt_count,
+    )
+
+
+def retry_pending_exit_fill_reconciliations(
+    *,
+    client_id: str | None = None,
+    limit: int = 100,
+) -> list[dict]:
+    """Discover and retry stranded broker-confirmed EXIT accounting work."""
+    normalized_client = str(client_id or "").strip()
+    try:
+        bounded_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        bounded_limit = 100
+    fetch_limit = min(500, max(bounded_limit, bounded_limit * 4))
+
+    def _load_candidates() -> list[dict]:
+        with conn() as c:
+            client_sql = " AND client_id=%s" if normalized_client else ""
+            params: list[Any] = []
+            if normalized_client:
+                params.append(normalized_client)
+            params.append(fetch_limit)
+            rows = c.execute(
+                "SELECT client_id, local_order_id, meta FROM orders "
+                "WHERE kind='EXIT' "
+                "AND status IN ('EXIT_FILLED','EXIT_PARTIAL_FILL') "
+                "AND UPPER(COALESCE(meta->'exit_fill_reconciliation'->>'status','')) "
+                "IN ('RETRY_REQUIRED','QUARANTINED','IN_PROGRESS')"
+                + client_sql
+                + " ORDER BY COALESCE(meta->'exit_fill_reconciliation'->>'last_attempt_at','') ASC "
+                "LIMIT %s",
+                tuple(params),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    now = datetime.now(timezone.utc)
+    candidates = run_with_retry(_load_candidates)
+    retryable: list[dict] = []
+    for row in candidates:
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        marker = dict(meta.get("exit_fill_reconciliation") or {}) if isinstance(meta, dict) else {}
+        if _reconciliation_marker_retryable(marker, now):
+            retryable.append(row)
+        if len(retryable) >= bounded_limit:
+            break
+
+    outcomes: list[dict] = []
+    for row in retryable:
+        row_client = str(row.get("client_id") or "")
+        row_local = str(row.get("local_order_id") or "")
+        try:
+            reconciled = retry_exit_fill_reconciliation(
+                client_id=row_client,
+                local_order_id=row_local,
+            )
+            outcomes.append({
+                "client_id": row_client,
+                "local_order_id": row_local,
+                "reconciled": reconciled is not None,
+                "result": reconciled,
+            })
+        except Exception as exc:
+            outcomes.append({
+                "client_id": row_client,
+                "local_order_id": row_local,
+                "reconciled": False,
+                "error": str(exc),
+            })
+    return outcomes
 
 
 def install_exit_fill_truth_guard() -> None:

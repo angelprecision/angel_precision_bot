@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,13 +11,17 @@ from ap.exit_fill_truth_guard import (
     LifecycleProjectionError,
     PositionUpdateCardinalityError,
     ReconciliationIdentityError,
+    _claim_reconciliation_retry,
     _failure_reason,
     _finish_reconciliation_attempt,
     _is_partial_result,
+    _reconciliation_marker_retryable,
     _reconcile_exit_fill,
+    _run_reconciliation_attempt,
     official_live_eligibility,
     project_position_from_exit_fills,
     retry_exit_fill_reconciliation,
+    retry_pending_exit_fill_reconciliations,
 )
 
 
@@ -259,7 +265,7 @@ def test_successful_retry_resolves_durable_marker_without_resetting_attempts(mon
     monkeypatch.setattr(
         guard,
         "_read_marker",
-        lambda *_: ({"status": "RETRY_REQUIRED", "attempt_count": 3}, "EXIT_FILLED"),
+        lambda *_: ({"status": "IN_PROGRESS", "attempt_count": 4}, "EXIT_FILLED"),
     )
     monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: written.update(marker))
 
@@ -271,6 +277,29 @@ def test_successful_retry_resolves_durable_marker_without_resetting_attempts(mon
     assert written["attempt_count"] == 4
     assert written["candidate_position_ids"] == []
     assert written["reconciled_at"]
+
+
+def test_stale_worker_cannot_finish_over_newer_retry_claim(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = MagicMock()
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({"status": "IN_PROGRESS", "attempt_count": 3}, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(guard, "_write_marker", written)
+    _finish_reconciliation_attempt(
+        _exit_order(), {}, attempt_count=2, reconciled_position_id="position-1"
+    )
+    assert written.call_count == 0
 
 
 def test_zero_row_position_update_stops_before_order_or_proof_mutation(monkeypatch) -> None:
@@ -334,7 +363,8 @@ def test_retry_uses_stored_fill_and_is_idempotent(monkeypatch) -> None:
 
     monkeypatch.setattr(guard, "conn", _conn)
     monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
-    monkeypatch.setattr(guard, "_reconcile_exit_fill", reconcile)
+    monkeypatch.setattr(guard, "_claim_reconciliation_retry", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(guard, "_run_reconciliation_attempt", reconcile)
 
     first = retry_exit_fill_reconciliation(
         client_id="jason@example.com", local_order_id="exit-local-1"
@@ -348,6 +378,7 @@ def test_retry_uses_stored_fill_and_is_idempotent(monkeypatch) -> None:
     stored_result = reconcile.call_args.args[1]
     assert stored_result["status"] == "EXIT_FILLED"
     assert stored_result["broker_order_id"] == "broker-exit-1"
+    assert reconcile.call_args.kwargs["attempt_count"] == 2
 
 
 def test_retry_path_preserves_broker_confirmed_order_status(monkeypatch) -> None:
@@ -379,3 +410,241 @@ def test_partial_and_final_fills_share_canonical_reducer(monkeypatch) -> None:
     _reconcile_exit_fill(_exit_order(status="EXIT_PARTIAL_FILL"), {"status": "PARTIAL_FILL"})
     _reconcile_exit_fill(_exit_order(status="EXIT_FILLED"), {"status": "FILLED"})
     assert len(calls) == 2
+
+
+def test_fresh_in_progress_is_not_reclaimed() -> None:
+    now = datetime.now(timezone.utc)
+    marker = {"status": "IN_PROGRESS", "last_attempt_at": (now - timedelta(minutes=1)).isoformat()}
+    assert _reconciliation_marker_retryable(marker, now) is False
+
+
+def test_stale_in_progress_is_retryable_after_restart() -> None:
+    now = datetime.now(timezone.utc)
+    marker = {"status": "IN_PROGRESS", "last_attempt_at": (now - timedelta(minutes=6)).isoformat()}
+    assert _reconciliation_marker_retryable(marker, now) is True
+
+
+def test_crash_after_begin_does_not_permanently_strand_marker() -> None:
+    now = datetime.now(timezone.utc)
+    committed_before_crash = {
+        "status": "IN_PROGRESS",
+        "attempt_count": 1,
+        "last_attempt_at": (now - timedelta(minutes=10)).isoformat(),
+    }
+    assert _reconciliation_marker_retryable(committed_before_crash, now) is True
+
+
+def test_stale_retry_claim_increments_durable_attempt_count(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    now = datetime.now(timezone.utc)
+    written = {}
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({
+            "status": "IN_PROGRESS",
+            "attempt_count": 4,
+            "last_attempt_at": (now - timedelta(minutes=6)).isoformat(),
+        }, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: written.update(marker))
+
+    claimed = _claim_reconciliation_retry(_exit_order(), {}, now=now)
+    assert claimed == 5
+    assert written["status"] == "IN_PROGRESS"
+    assert written["reason_code"] == "RECONCILIATION_RETRY_CLAIMED"
+    assert written["attempt_count"] == 5
+    assert written["last_attempt_at"] == now.isoformat()
+
+
+def test_two_recovery_workers_cannot_claim_same_stale_attempt(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    now = datetime.now(timezone.utc)
+    lock = threading.Lock()
+    state = {
+        "marker": {
+            "status": "IN_PROGRESS",
+            "attempt_count": 1,
+            "last_attempt_at": (now - timedelta(minutes=6)).isoformat(),
+        }
+    }
+
+    @contextmanager
+    def _conn():
+        with lock:
+            yield object()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_read_marker", lambda *_: (dict(state["marker"]), "EXIT_FILLED"))
+    monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: state.update(marker=dict(marker)))
+
+    claims = []
+    threads = [
+        threading.Thread(
+            target=lambda: claims.append(
+                _claim_reconciliation_retry(_exit_order(), {}, now=now)
+            )
+        )
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert sorted(value for value in claims if value is not None) == [2]
+    assert claims.count(None) == 1
+    assert state["marker"]["attempt_count"] == 2
+
+
+def test_batch_recovery_discovers_stale_but_not_fresh_in_progress(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    now = datetime.now(timezone.utc)
+    rows = [
+        {
+            "client_id": "fresh@example.com",
+            "local_order_id": "fresh-exit",
+            "meta": {"exit_fill_reconciliation": {
+                "status": "IN_PROGRESS",
+                "last_attempt_at": (now - timedelta(minutes=1)).isoformat(),
+            }},
+        },
+        {
+            "client_id": "stale@example.com",
+            "local_order_id": "stale-exit",
+            "meta": {"exit_fill_reconciliation": {
+                "status": "IN_PROGRESS",
+                "last_attempt_at": (now - timedelta(minutes=10)).isoformat(),
+            }},
+        },
+    ]
+
+    class _Cursor:
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchall(self):
+            return rows
+
+    @contextmanager
+    def _conn():
+        yield _Cursor()
+
+    retry = MagicMock(return_value={"position_id": "position-1"})
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "retry_exit_fill_reconciliation", retry)
+    outcomes = retry_pending_exit_fill_reconciliations(limit=10)
+    assert [item["local_order_id"] for item in outcomes] == ["stale-exit"]
+    retry.assert_called_once_with(
+        client_id="stale@example.com", local_order_id="stale-exit"
+    )
+
+
+def test_successful_stale_recovery_finishes_reconciled(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = {}
+    calls = 0
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    def _retry(fn):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"position_id": "position-1", "projection": object()}
+        return fn()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", _retry)
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({"status": "IN_PROGRESS", "attempt_count": 2}, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: written.update(marker))
+    result = _run_reconciliation_attempt(_exit_order(), {}, attempt_count=2)
+    assert result["position_id"] == "position-1"
+    assert written["status"] == "RECONCILED"
+    assert written["attempt_count"] == 2
+
+
+def test_ambiguous_stale_recovery_returns_to_quarantine(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+
+    written = {}
+    calls = 0
+
+    @contextmanager
+    def _conn():
+        yield object()
+
+    def _retry(fn):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ReconciliationIdentityError(
+                "CANONICAL_POSITION_AMBIGUOUS", ["position-a", "position-b"]
+            )
+        return fn()
+
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", _retry)
+    monkeypatch.setattr(
+        guard,
+        "_read_marker",
+        lambda *_: ({"status": "IN_PROGRESS", "attempt_count": 2}, "EXIT_FILLED"),
+    )
+    monkeypatch.setattr(guard, "_write_marker", lambda _c, _client, _local, marker: written.update(marker))
+    with pytest.raises(ReconciliationIdentityError):
+        _run_reconciliation_attempt(_exit_order(), {}, attempt_count=2)
+    assert written["status"] == "QUARANTINED"
+    assert written["reason_code"] == "CANONICAL_POSITION_AMBIGUOUS"
+    assert written["candidate_position_ids"] == ["position-a", "position-b"]
+
+
+def test_retry_never_calls_broker_submit_or_cancel(monkeypatch) -> None:
+    import ap.exit_fill_truth_guard as guard
+    from ap.brokers.tradier import TradierBroker
+
+    order = _exit_order(meta={"exit_fill_reconciliation": {"status": "RETRY_REQUIRED"}})
+
+    class _Cursor:
+        def execute(self, *_args, **_kwargs):
+            return self
+        def fetchone(self):
+            return order
+
+    @contextmanager
+    def _conn():
+        yield _Cursor()
+
+    place = MagicMock(side_effect=AssertionError("broker POST forbidden"))
+    cancel = MagicMock(side_effect=AssertionError("broker cancel forbidden"))
+    monkeypatch.setattr(TradierBroker, "place_order", place)
+    monkeypatch.setattr(TradierBroker, "cancel_order", cancel)
+    monkeypatch.setattr(guard, "conn", _conn)
+    monkeypatch.setattr(guard, "run_with_retry", lambda fn: fn())
+    monkeypatch.setattr(guard, "_claim_reconciliation_retry", lambda *_args, **_kwargs: 2)
+    monkeypatch.setattr(
+        guard,
+        "_run_reconciliation_attempt",
+        lambda *_args, **_kwargs: {"position_id": "position-1"},
+    )
+    assert retry_exit_fill_reconciliation(
+        client_id="jason@example.com", local_order_id="exit-local-1"
+    ) == {"position_id": "position-1"}
+    assert place.call_count == 0
+    assert cancel.call_count == 0
