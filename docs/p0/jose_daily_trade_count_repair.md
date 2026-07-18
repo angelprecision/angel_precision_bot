@@ -1,10 +1,12 @@
 # Jose daily trade-count repair
 
-This is an explicit operator procedure. Runtime code does not rewrite
-`client_state`. Run the read-only verification first and do not substitute a
-different client without separate evidence of the same corruption.
+**Scope:** Jose Vasquez — PAPER account only.
+This procedure must not be run for Jason, Tradefluence, or any LIVE account
+without a separate evidence review and dedicated runbook.
 
-## 1. Recompute from broker-confirmed ENTRY fills
+---
+
+## 1. Recompute from broker-confirmed PAPER ENTRY fills
 
 ```sql
 WITH session_bounds AS (
@@ -16,11 +18,11 @@ WITH session_bounds AS (
 ), filled_entries AS (
   SELECT CASE
     WHEN coalesce(broker_order_id, '') <> '' THEN 'broker:' || broker_order_id
-    WHEN coalesce(local_order_id, '') <> '' THEN 'local:' || local_order_id
+    WHEN coalesce(local_order_id,  '') <> '' THEN 'local:'  || local_order_id
   END AS canonical_entry_identity
   FROM orders, session_bounds
   WHERE client_id = 'jose.vasquez4011@gmail.com'
-    AND lower(coalesce(execution_mode, '')) = 'live'
+    AND lower(coalesce(execution_mode, '')) = 'paper'
     AND upper(coalesce(kind, '')) = 'ENTRY'
     AND coalesce(filled_qty, 0) > 0
     AND upper(coalesce(status, '')) IN
@@ -33,40 +35,61 @@ FROM filled_entries
 WHERE canonical_entry_identity IS NOT NULL;
 ```
 
-Record the returned value and the current Eastern session date. Do not use
-positions, proof rows, contracts, or quantities as the count.
+Record the returned value and the current Eastern session date.
+Do not use positions, proof rows, contracts, or quantities as the count.
 
-## 2. Preview the exact client-state correction
+---
+
+## 2. Preview the exact PAPER client-state row
 
 ```sql
 SELECT client_id, mode, day_key, trades_taken_today, updated_at
 FROM client_state
-WHERE client_id = 'jose.vasquez4011@gmail.com';
+WHERE client_id = 'jose.vasquez4011@gmail.com'
+  AND lower(coalesce(mode, '')) = 'paper';
 ```
 
-Confirm this returns exactly one Jose row. Jason and Tradefluence must not
-appear in either the predicate or result.
+**This must return exactly one row.**
+If it returns zero rows, stop — do not proceed to step 3.
+If it returns more than one row, stop — escalate before any write.
+Jason and Tradefluence must not appear in the result.
+
+---
 
 ## 3. Apply only after operator approval
 
-Replace `<verified_count>` with the result from step 1.
+Replace `<verified_count>` with the integer from step 1.
 
 ```sql
 BEGIN;
 
 UPDATE client_state
 SET trades_taken_today = <verified_count>,
-    day_key = to_char(now() AT TIME ZONE 'America/New_York', 'YYYY-MM-DD'),
-    updated_at = now()
-WHERE client_id = 'jose.vasquez4011@gmail.com';
-
-SELECT client_id, mode, day_key, trades_taken_today, updated_at
-FROM client_state
-WHERE client_id = 'jose.vasquez4011@gmail.com';
-
--- COMMIT only after the SELECT proves the exact Jose row and expected count.
--- Otherwise execute ROLLBACK.
+    day_key            = to_char(now() AT TIME ZONE 'America/New_York', 'YYYY-MM-DD'),
+    updated_at         = now()
+WHERE client_id = 'jose.vasquez4011@gmail.com'
+  AND lower(coalesce(mode, '')) = 'paper'
+RETURNING client_id, mode, day_key, trades_taken_today, updated_at;
 ```
 
-This procedure does not update positions, orders, proof trades, official
-performance history, Jason, or Tradefluence.
+**Required outcome:** the `RETURNING` clause must emit exactly one row showing
+Jose's client_id, `mode = paper`, today's `day_key`, and the expected count.
+
+* If `RETURNING` emits zero rows → `ROLLBACK` immediately. The WHERE predicate
+  did not match. Do not commit.
+* If `RETURNING` emits more than one row → `ROLLBACK` immediately. Multiple
+  mode rows exist for Jose. Do not commit.
+* If `RETURNING` emits exactly one row with the expected values → `COMMIT`.
+
+---
+
+## Prohibition
+
+This SQL must not be executed for:
+- Any `execution_mode = 'live'` or `mode = 'live'` predicate for Jose
+- Jason's client_id (`jason@...`)
+- Tradefluence's client_id (`tradefluencehq@...`)
+- Any client other than `jose.vasquez4011@gmail.com`
+
+A separate evidence review and dedicated runbook is required before this
+procedure may be adapted for any other client or mode.

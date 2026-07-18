@@ -71,7 +71,7 @@ def database():
         connection.close()
 
 
-def _count(database, *, client="jose@example.com", mode="live"):
+def _count(database, *, client="jose@example.com", mode="paper"):
     connection, cursor_factory = database
     with connection.cursor(cursor_factory=cursor_factory) as cursor:
         return _broker_confirmed_entry_trades_today(
@@ -88,7 +88,7 @@ def _order(
     identity: str,
     *,
     client="jose@example.com",
-    mode="live",
+    mode="paper",
     kind="ENTRY",
     status="FILLED",
     qty=1,
@@ -160,7 +160,7 @@ def test_duplicate_callbacks_entry_exit_and_multicontract_count_one(database):
 
 
 def test_client_mode_session_and_unfilled_isolation(database):
-    _order(database, "live-current", broker_id="live-current")
+    _order(database, "live-current", mode="live", broker_id="live-current")
     _order(database, "paper-current", mode="paper", broker_id="paper-current")
     _order(
         database,
@@ -247,3 +247,43 @@ def test_snapshot_wires_trade_limit_to_broker_confirmed_query():
     assert "_broker_confirmed_entry_trades_today(" in source
     assert '"trades_today":       int(trade_count["trades_today"])' in source
     assert "broker_confirmed_entry_trade_count_unavailable" in source
+
+
+def test_jose_paper_production_shape_counts_paper_fills_only(database):
+    """Explicit production-shaped Jose PAPER test.
+
+    Jose is a PAPER client.  The helper defaults (mode='paper') now reflect
+    that shape.  This test also inserts a LIVE order under the same client to
+    confirm the PAPER count is never contaminated by LIVE rows — the exact
+    failure mode that allowed the runbook's 'live' predicate to survive CI
+    when the helper previously defaulted to 'live'.
+    """
+    # Two PAPER ENTRY fills for Jose — distinct broker identities.
+    _order(database, "jose-paper-fill-1", broker_id="jose-paper-broker-1", local_id="jose-paper-local-1")
+    _order(database, "jose-paper-fill-2", broker_id="jose-paper-broker-2", local_id="jose-paper-local-2",
+           contract="QQQ260717C00500000")
+
+    # One LIVE ENTRY fill under the same client — must never appear in the PAPER count.
+    _order(database, "jose-live-fill-1", mode="live", broker_id="jose-live-broker-1",
+           local_id="jose-live-local-1")
+
+    paper_result = _count(database, mode="paper")
+    live_result  = _count(database, mode="live")
+
+    # PAPER count sees only the two PAPER fills.
+    assert paper_result["trades_today"] == 2, (
+        f"Jose PAPER count must be 2; got {paper_result}"
+    )
+    # PAPER count must report the stray LIVE order as wrong-mode.
+    assert paper_result["wrong_mode_fills_ignored"] == 1, (
+        f"Jose PAPER count must ignore 1 LIVE fill; got {paper_result}"
+    )
+
+    # LIVE count sees only the one LIVE fill.
+    assert live_result["trades_today"] == 1, (
+        f"Jose LIVE count must be 1; got {live_result}"
+    )
+    # LIVE count must report both PAPER orders as wrong-mode.
+    assert live_result["wrong_mode_fills_ignored"] == 2, (
+        f"Jose LIVE count must ignore 2 PAPER fills; got {live_result}"
+    )
