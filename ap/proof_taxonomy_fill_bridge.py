@@ -1,0 +1,151 @@
+"""Converge post-fill proof repair with performance taxonomy.
+
+Proof insertion and fill reconciliation can occur in either order. This wrapper
+runs after canonical EXIT fill reconciliation and stamps taxonomy on any proof
+row that already exists. If proof is inserted later, proof_taxonomy_guard's
+writer wrapper performs the same classification.
+"""
+from __future__ import annotations
+
+from typing import Any, Callable
+
+from ap import db
+from ap.logger import get_logger
+from ap import proof_taxonomy_guard
+
+log = get_logger("ap.proof_taxonomy_fill_bridge")
+
+_PATCHED_ATTR = "_AP_PROOF_TAXONOMY_FILL_BRIDGE_PATCHED"
+_ORIGINAL_ATTR = "_AP_PROOF_TAXONOMY_FILL_BRIDGE_ORIGINAL"
+
+
+def _stamp_reconciled_taxonomy(
+    *,
+    client_id: str,
+    position_id: str,
+    local_order_id: str,
+    stamp: dict[str, Any],
+) -> int:
+    client_id = str(client_id or "").strip()
+    position_id = str(position_id or "").strip()
+    local_order_id = str(local_order_id or "").strip()
+    if not client_id or (not position_id and not local_order_id):
+        return 0
+
+    def _update() -> int:
+        with db.conn() as c:
+            columns = {
+                str(dict(row).get("column_name") or "")
+                for row in c.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name='proof_trades'"
+                ).fetchall()
+            }
+            updates = {key: value for key, value in stamp.items() if key in columns}
+            if not updates:
+                return 0
+            set_sql = ", ".join(f"{key}=%s" for key in updates)
+            if local_order_id and "local_order_id" in columns:
+                rows = c.execute(
+                    "SELECT id FROM proof_trades WHERE client_email=%s AND local_order_id=%s "
+                    "ORDER BY id LIMIT 2",
+                    (client_id, local_order_id),
+                ).fetchall()
+                ids = [str(dict(row).get("id") or "").strip() for row in rows]
+                ids = [value for value in ids if value]
+                if len(ids) == 1:
+                    cur = c.execute(
+                        f"UPDATE proof_trades SET {set_sql} WHERE id::text=%s AND client_email=%s",
+                        tuple(updates.values()) + (ids[0], client_id),
+                    )
+                    return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+                if len(ids) > 1:
+                    log.critical(
+                        "post-fill proof taxonomy exact ENTRY ambiguous client=%s entry_order=%s rows=%s",
+                        client_id,
+                        local_order_id,
+                        ids,
+                    )
+                    return 0
+
+            if not position_id or "position_id" not in columns:
+                return 0
+            rows = c.execute(
+                "SELECT id FROM proof_trades WHERE client_email=%s AND position_id::text=%s "
+                "ORDER BY id LIMIT 2",
+                (client_id, position_id),
+            ).fetchall()
+            ids = [str(dict(row).get("id") or "").strip() for row in rows]
+            ids = [value for value in ids if value]
+            if len(ids) != 1:
+                if len(ids) > 1:
+                    log.critical(
+                        "post-fill proof taxonomy position ambiguous client=%s position=%s rows=%s",
+                        client_id,
+                        position_id,
+                        ids,
+                    )
+                return 0
+            cur = c.execute(
+                f"UPDATE proof_trades SET {set_sql} WHERE id::text=%s AND client_email=%s",
+                tuple(updates.values()) + (ids[0], client_id),
+            )
+            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+    try:
+        return int(db.run_with_retry(_update) or 0)
+    except Exception as exc:
+        log.critical(
+            "post-fill proof taxonomy convergence failed client=%s position=%s error=%s",
+            client_id,
+            position_id,
+            exc,
+        )
+        return 0
+
+
+def wrap_exit_fill_reconcile(original: Callable[[dict, dict], dict]) -> Callable[[dict, dict], dict]:
+    def guarded(order: dict, result: dict) -> dict:
+        reconciled = original(order, result)
+        if not isinstance(reconciled, dict):
+            return reconciled
+
+        client_id = str(order.get("client_id") or "").strip()
+        position_id = str(reconciled.get("position_id") or "").strip()
+        identity = proof_taxonomy_guard.resolve_originating_entry_identity(
+            client_id=client_id,
+            position_id=position_id,
+            supplied_local_order_id=str(reconciled.get("local_order_id") or "").strip(),
+        )
+        if identity is None:
+            log.critical(
+                "post-fill proof taxonomy skipped: originating ENTRY unresolved client=%s position=%s",
+                client_id,
+                position_id,
+            )
+            reconciled["proof_taxonomy_rows_updated"] = 0
+            return reconciled
+
+        stamp = proof_taxonomy_guard._lifecycle_proof_stamp(identity)
+        updated = _stamp_reconciled_taxonomy(
+            client_id=client_id,
+            position_id=str(stamp.get("position_id") or position_id),
+            local_order_id=str(stamp.get("local_order_id") or identity.local_order_id),
+            stamp=stamp,
+        )
+        reconciled.update(stamp)
+        reconciled["proof_taxonomy_rows_updated"] = updated
+        return reconciled
+
+    return guarded
+
+
+def install_proof_taxonomy_fill_bridge() -> None:
+    from ap import exit_fill_truth_guard
+
+    if getattr(exit_fill_truth_guard, _PATCHED_ATTR, False):
+        return
+    original = exit_fill_truth_guard._reconcile_exit_fill
+    setattr(exit_fill_truth_guard, _ORIGINAL_ATTR, original)
+    exit_fill_truth_guard._reconcile_exit_fill = wrap_exit_fill_reconcile(original)
+    setattr(exit_fill_truth_guard, _PATCHED_ATTR, True)

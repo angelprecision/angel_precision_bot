@@ -17,6 +17,7 @@ _GUARDS: tuple[tuple[str, str, str, bool], ...] = (
     ("canonical_exit_fill_truth", "ap.exit_fill_truth_guard", "install_exit_fill_truth_guard", True),
     ("exit_decision_idempotency", "ap.exit_decision_idempotency_guard", "install_exit_decision_idempotency_guard", True),
     ("proof_taxonomy", "ap.proof_taxonomy_guard", "install_proof_taxonomy_guard", True),
+    ("proof_taxonomy_fill_bridge", "ap.proof_taxonomy_fill_bridge", "install_proof_taxonomy_fill_bridge", True),
     ("one_contract_policy", "ap.one_contract_exit_guard", "install_one_contract_exit_guard", False),
     ("partial_exit_ownership", "ap.partial_exit_ownership_guard", "install_partial_exit_ownership_guard", True),
     ("ambiguous_position_resolution", "ap.exit_position_ambiguity_guard", "install_exit_position_ambiguity_guard", True),
