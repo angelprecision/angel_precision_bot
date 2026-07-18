@@ -98,7 +98,7 @@ def test_t2a_no_matching_order_fabricates(monkeypatch):
     assert ident.attributed is False
     assert ident.pattern == "BROKER_IMPORT"
     assert ident.signal_id.startswith("reconciled:SPY260717P00550000:")
-    assert len(ident.signal_id.split(":")[-1]) == 8   # uuid8, byte-compatible
+    assert len(ident.signal_id.split(":")[-1]) == 24  # stable fingerprint
     assert ident.attribution_source == "fabricated"
 
 

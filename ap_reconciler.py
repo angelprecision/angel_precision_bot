@@ -3464,6 +3464,7 @@ class APBrokerReconciler:
         if not IMPORT_MISSING_BROKER_POSITIONS:
             return
 
+        contracts_present_before_poll = set(db_contracts)
         for bp in broker_positions:
             contract = self._broker_position_contract(bp)
             if not contract:
@@ -3473,7 +3474,67 @@ class APBrokerReconciler:
             if qty <= 0:
                 continue
 
-            if contract in db_contracts:
+            from zoneinfo import ZoneInfo as _ZoneInfo
+            expiration = self._occ_expiry(contract)
+            session_date = datetime.now(_ZoneInfo("America/New_York")).date()
+            if expiration is not None and expiration < session_date:
+                existing = self._find_db_position_by_contract(contract)
+                existing_id = str((existing or {}).get("id") or "")
+                if existing_id and self.pm is not None:
+                    try:
+                        self.pm.close_expired_position(
+                            position_id=existing_id,
+                            reason="expired_contract_broker_import_quarantine",
+                            exit_reason="expired_contract",
+                            close_source="expired_contract_cleanup",
+                            close_confidence="SYSTEM",
+                        )
+                    except Exception as exc:
+                        summary.setdefault("errors", []).append(
+                            "expired_broker_import_existing_close_failed"
+                        )
+                        log.error(
+                            "[%s] expired broker import existing close failed "
+                            "contract=%s position_id=%s error=%s",
+                            self.client_id, contract, existing_id, exc,
+                        )
+
+                cost_basis = self._safe_float(bp.get("cost_basis"), 0.0)
+                reason_code = "BROKER_IMPORT_EXPIRED_CONTRACT_QUARANTINED"
+                summary["positions_quarantined"] = int(
+                    summary.get("positions_quarantined", 0)
+                ) + 1
+                self._record_reconciler_rejection(
+                    signal_id=f"reconciled:{contract}:expired-quarantine",
+                    ticker=self._norm_underlying(
+                        self._broker_position_underlying(bp) or contract
+                    ),
+                    category_name="DATA",
+                    severity_name="WARNING",
+                    reason_code=reason_code,
+                    human_reason=(
+                        "broker reported an unmatched contract expired before the "
+                        "current Eastern session; import was quarantined"
+                    ),
+                    execution_mode=self.execution_mode,
+                    contract=contract,
+                    expiration=expiration.isoformat(),
+                    broker_quantity=qty,
+                    broker_cost_basis=cost_basis,
+                    existing_position_id=existing_id,
+                    broker_mutation="none",
+                )
+                self._alert(
+                    f"{reason_code} | client={self.client_id} "
+                    f"execution_mode={self.execution_mode or 'unknown'} "
+                    f"contract={contract} expiration={expiration.isoformat()} "
+                    f"broker_qty={qty} broker_cost_basis={cost_basis:.8f} "
+                    f"existing_position_id={existing_id or 'none'}"
+                )
+                db_contracts.add(contract)
+                continue
+
+            if contract in contracts_present_before_poll:
                 continue
 
             underlying      = self._broker_position_underlying(bp)
@@ -3503,10 +3564,43 @@ class APBrokerReconciler:
 
             side = self._broker_position_side(bp)
 
-            # Double-check DB directly in case another thread imported it.
-            existing = self._find_db_position_by_contract(contract)
-            if existing:
-                self._seed_exit_engine_from_position(existing)
+            from ap.attribution_integrity import import_identity
+            import_ident = import_identity(
+                contract=contract,
+                client_id=self.client_id,
+                execution_mode=self.execution_mode or "",
+                broker_position=bp,
+                broker_quantity=qty,
+                broker_cost_basis=self._safe_float(bp.get("cost_basis"), 0.0),
+                price_untrusted=price_untrusted,
+            )
+            if not import_ident.identity_valid:
+                summary["positions_alerted"] += 1
+                self._record_reconciler_rejection(
+                    signal_id=import_ident.signal_id,
+                    ticker=self._norm_underlying(underlying or contract),
+                    category_name="DATA",
+                    severity_name="CRITICAL",
+                    reason_code="BROKER_IMPORT_IDENTITY_UNPROVEN",
+                    human_reason=import_ident.identity_reason,
+                    execution_mode=self.execution_mode,
+                    contract=contract,
+                    broker_quantity=qty,
+                    broker_cost_basis=self._safe_float(bp.get("cost_basis"), 0.0),
+                )
+                continue
+
+            historical = self._find_db_position_by_import_identity(
+                import_ident.plan_id,
+                execution_mode=self.execution_mode or "",
+            )
+            if historical:
+                if str(historical.get("status") or "").upper() in DB_OPEN_POSITION_STATUSES:
+                    self._seed_exit_engine_from_position(historical)
+                summary["positions_import_idempotent"] = int(
+                    summary.get("positions_import_idempotent", 0)
+                ) + 1
+                db_contracts.add(contract)
                 continue
 
             pos_id = self._create_imported_position(
@@ -3518,6 +3612,7 @@ class APBrokerReconciler:
                 broker_position=bp,
                 underlying_entry=underlying_entry,
                 price_untrusted=price_untrusted,
+                import_identity_record=import_ident,
             )
 
             if not pos_id:
@@ -3596,6 +3691,7 @@ class APBrokerReconciler:
         broker_position: dict,
         underlying_entry: float = 0.0,
         price_untrusted: bool = False,
+        import_identity_record=None,
     ) -> Optional[str]:
         """
         Create an OPEN DB row for a broker-open position missing from DB.
@@ -3617,11 +3713,23 @@ class APBrokerReconciler:
         # RECONCILED, plan_id keeps the 'reconciled:' prefix).
         from ap.attribution_integrity import import_identity
 
-        _ident = import_identity(
+        _ident = import_identity_record or import_identity(
             contract=contract,
             client_id=self.client_id,
+            execution_mode=self.execution_mode or "",
+            broker_position=broker_position,
+            broker_quantity=qty,
+            broker_cost_basis=self._safe_float(
+                (broker_position or {}).get("cost_basis"), 0.0
+            ),
             price_untrusted=price_untrusted,
         )
+        if not _ident.identity_valid:
+            log.error(
+                "[%s] BROKER_IMPORT_IDENTITY_UNPROVEN contract=%s reason=%s",
+                self.client_id, contract, _ident.identity_reason,
+            )
+            return None
         imported_plan_id   = _ident.plan_id
         imported_signal_id = _ident.signal_id
         imported_pattern   = _ident.pattern
@@ -3641,6 +3749,8 @@ class APBrokerReconciler:
                     pattern=imported_pattern,
                     stop_underlying=None,
                     target_underlying=None,
+                    execution_mode=self.execution_mode,
+                    historical_plan_idempotency=True,
                 )
                 if pos_id:
                     # FIX-3: backfill underlying_entry after PM creates the row, since
@@ -3673,16 +3783,37 @@ class APBrokerReconciler:
             def _insert_full():
                 with conn() as c:
                     c.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                        (f"broker-import:{self.client_id}:{self.execution_mode}:{imported_plan_id}",),
+                    )
+                    c.execute(
+                        """
+                        SELECT id FROM positions
+                        WHERE client_id=%s
+                          AND LOWER(COALESCE(execution_mode,''))=%s
+                          AND plan_id=%s
+                        ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
+                        LIMIT 2
+                        """,
+                        (self.client_id, self.execution_mode, imported_plan_id),
+                    )
+                    existing = c.fetchall() or []
+                    if len(existing) == 1:
+                        return str(existing[0]["id"])
+                    if len(existing) > 1:
+                        raise RuntimeError("broker_import_identity_ambiguous")
+                    c.execute(
                         """
                         INSERT INTO positions (
                             id, client_id, underlying, contract, direction, qty, avg_fill,
                             entry_ts, status, plan_id, signal_id, pattern, tier, close_source,
-                            close_confidence, underlying_entry
+                            close_confidence, underlying_entry, execution_mode
                         ) VALUES (
                             %s,%s,%s,%s,%s,%s,%s,
-                            %s,'OPEN',%s,%s,%s,'RECONCILED',%s,%s,%s
+                            %s,'OPEN',%s,%s,%s,'RECONCILED',%s,%s,%s,%s
                         )
-                        ON CONFLICT (id) DO NOTHING
+                        ON CONFLICT DO NOTHING
+                        RETURNING id
                         """,
                         (
                             pos_id,
@@ -3699,83 +3830,23 @@ class APBrokerReconciler:
                             "RECONCILER_IMPORT",
                             "BROKER_OPEN_PRICE_UNTRUSTED" if price_untrusted else "BROKER_OPEN",
                             float(underlying_entry) if underlying_entry > 0 else None,
+                            self.execution_mode,
                         ),
                     )
+                    inserted = c.fetchone()
+                    if not inserted:
+                        raise RuntimeError("broker_import_insert_returned_no_identity")
+                    return str(inserted["id"])
 
             try:
-                run_with_retry(_insert_full)
-                return pos_id
+                return str(run_with_retry(_insert_full))
             except Exception as full_err:
                 log.warning(
-                    "[%s] full imported position insert failed for %s: %s — trying minimal schema",
+                    "[%s] exact-mode imported position insert failed for %s: %s — failing closed",
                     self.client_id, contract, full_err,
                 )
+                return None
 
-            # Minimal schema fallback: broadest possible compatibility.
-            # FIX-3: attempt to include underlying_entry; if the column does not exist
-            # in this schema version the except block retries without it.
-            def _insert_with_ue():
-                with conn() as c:
-                    c.execute(
-                        """
-                        INSERT INTO positions (
-                            id, client_id, underlying, contract, direction, qty, avg_fill,
-                            entry_ts, status, underlying_entry
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'OPEN',%s)
-                        ON CONFLICT (id) DO NOTHING
-                        """,
-                        (
-                            pos_id,
-                            self.client_id,
-                            self._norm_underlying(underlying or contract),
-                            contract,
-                            side,
-                            int(qty),
-                            float(entry_px),
-                            now_iso,
-                            float(underlying_entry) if underlying_entry > 0 else None,
-                        ),
-                    )
-
-            try:
-                run_with_retry(_insert_with_ue)
-                return pos_id
-            except Exception as _e:
-                # column may not exist — fall through to bare minimal
-                log.debug("reconciler_insert_with_ue_failed_falling_back: %s", _e)
-
-            def _insert_minimal():
-                with conn() as c:
-                    c.execute(
-                        """
-                        INSERT INTO positions (
-                            id, client_id, underlying, contract, direction, qty, avg_fill,
-                            entry_ts, status
-                        ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'OPEN')
-                        ON CONFLICT (id) DO NOTHING
-                        """,
-                        (
-                            pos_id,
-                            self.client_id,
-                            self._norm_underlying(underlying or contract),
-                            contract,
-                            side,
-                            int(qty),
-                            float(entry_px),
-                            now_iso,
-                        ),
-                    )
-
-            run_with_retry(_insert_minimal)
-            # FIX-3: even on bare minimal insert, attempt a follow-up UPDATE for
-            # underlying_entry so restarts don't run on untrusted zero.
-            if underlying_entry > 0:
-                try:
-                    self._backfill_position_underlying_entry(pos_id, underlying_entry)
-                except Exception as _e:
-                    # non-fatal; exit engine seeding still carries the value
-                    log.debug("reconciler_backfill_underlying_failed: %s", _e)
-            return pos_id
         except Exception as sql_err:
             log.error("[%s] SQL import failed for broker position %s: %s",
                       self.client_id, contract, sql_err)
@@ -3785,9 +3856,8 @@ class APBrokerReconciler:
         """
         Persist underlying_entry to an existing DB position row.
 
-        FIX-3 support method: called after pm.open_position (which does not accept
-        underlying_entry as a parameter) and after minimal-schema SQL inserts that
-        may lack the column in the INSERT column list.
+        FIX-3 support method retained for existing callers that need to repair
+        underlying entry truth after position creation.
         """
         if not pos_id or underlying_entry <= 0:
             return
@@ -3834,6 +3904,47 @@ class APBrokerReconciler:
         except Exception as e:
             log.debug("[%s] find DB position by contract failed for %s: %s",
                       self.client_id, contract, e)
+            return None
+
+    def _find_db_position_by_import_identity(
+        self, plan_id: str, *, execution_mode: str
+    ) -> Optional[dict]:
+        """Find a synthetic import lifecycle across active and terminal rows."""
+        normalized_mode = _normalize_execution_mode(execution_mode)
+        if not plan_id or normalized_mode is None:
+            return None
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _fetch():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM positions
+                        WHERE client_id=%s
+                          AND LOWER(COALESCE(execution_mode,''))=%s
+                          AND plan_id=%s
+                        ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
+                        LIMIT 2
+                        """,
+                        (self.client_id, normalized_mode, plan_id),
+                    )
+                    rows = c.fetchall() or []
+                    if len(rows) > 1:
+                        log.critical(
+                            "[%s] BROKER_IMPORT_IDENTITY_AMBIGUOUS plan_id=%s rows=%d",
+                            self.client_id, plan_id, len(rows),
+                        )
+                        return None
+                    return dict(rows[0]) if rows else None
+
+            return run_with_retry(_fetch)
+        except Exception as exc:
+            log.error(
+                "[%s] broker import identity lookup failed plan_id=%s error=%s",
+                self.client_id, plan_id, exc,
+            )
             return None
 
     def _find_db_position_by_id(self, pos_id: str) -> Optional[dict]:
