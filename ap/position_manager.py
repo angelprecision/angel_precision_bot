@@ -154,6 +154,109 @@ _WATCHER_ENTRY_STATUSES = (
     "SELECTED",
     "RETRY_ELIGIBLE",
 )
+
+_BROKER_CONFIRMED_ENTRY_FILL_STATUSES = (
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+    "FILLED",
+)
+
+
+def _broker_confirmed_entry_trades_today(
+    cursor,
+    *,
+    client_id: str,
+    execution_mode: str,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> dict[str, int | str]:
+    """Count distinct broker-confirmed economic ENTRY fills for one session.
+
+    Broker order identity is authoritative when present. An exact local ENTRY
+    order id is the fallback only after durable fill quantity, state, and time
+    are proven. Position rows never contribute to the count.
+    """
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"paper", "live"}:
+        raise ValueError(f"invalid_trade_count_execution_mode:{execution_mode}")
+
+    cursor.execute(
+        """
+        WITH filled_entries AS (
+            SELECT
+                execution_mode,
+                CASE
+                    WHEN COALESCE(broker_order_id,'') <> ''
+                        THEN 'broker:' || broker_order_id
+                    WHEN COALESCE(local_order_id,'') <> ''
+                        THEN 'local:' || local_order_id
+                    ELSE NULL
+                END AS canonical_entry_identity
+            FROM orders
+            WHERE client_id=%s
+              AND UPPER(COALESCE(kind,''))='ENTRY'
+              AND COALESCE(filled_qty,0) > 0
+              AND UPPER(COALESCE(status,'')) = ANY(%s)
+              AND filled_ts >= %s
+              AND filled_ts < %s
+        )
+        SELECT
+            COUNT(DISTINCT canonical_entry_identity) FILTER (
+                WHERE LOWER(COALESCE(execution_mode,''))=%s
+                  AND canonical_entry_identity IS NOT NULL
+            ) AS trades_today,
+            COUNT(*) FILTER (
+                WHERE execution_mode IS NULL OR BTRIM(execution_mode)=''
+            ) AS null_mode_fills_ignored,
+            COUNT(*) FILTER (
+                WHERE execution_mode IS NOT NULL
+                  AND BTRIM(execution_mode)<>''
+                  AND LOWER(execution_mode)<>%s
+            ) AS wrong_mode_fills_ignored,
+            COUNT(*) FILTER (
+                WHERE canonical_entry_identity IS NULL
+            ) AS missing_identity_fills_ignored
+        FROM filled_entries
+        """,
+        (
+            client_id,
+            list(_BROKER_CONFIRMED_ENTRY_FILL_STATUSES),
+            start_utc,
+            end_utc,
+            mode,
+            mode,
+        ),
+    )
+    row = cursor.fetchone() or {}
+
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM positions
+        WHERE client_id=%s
+          AND entry_ts >= %s
+          AND entry_ts < %s
+          AND (
+              plan_id LIKE 'reconciled:%%'
+              OR close_source='expired_contract_cleanup'
+          )
+        """,
+        (client_id, start_utc, end_utc),
+    )
+    position_row = cursor.fetchone() or {}
+    return {
+        "trades_today": int(row.get("trades_today") or 0),
+        "trades_today_source": "broker_confirmed_entry_orders",
+        "synthetic_position_rows_ignored": int(position_row.get("n") or 0),
+        "null_mode_fills_ignored": int(row.get("null_mode_fills_ignored") or 0),
+        "wrong_mode_fills_ignored": int(row.get("wrong_mode_fills_ignored") or 0),
+        "missing_identity_fills_ignored": int(
+            row.get("missing_identity_fills_ignored") or 0
+        ),
+        "trade_count_query_status": "ok",
+    }
+
+
 _PENDING_EXIT_STATUSES = (
     "EXIT_REQUESTED",
     "EXIT_SUBMITTED",
@@ -2370,6 +2473,10 @@ class APPositionManager:
                 except Exception as e:
                     log.debug("[%s] snapshot isolation not set; using conn default: %s", self.client_id, e)
 
+                _snap_mode = str(mode or "").strip().lower()
+                if _snap_mode not in {"paper", "live"}:
+                    raise ValueError(f"snapshot_execution_mode_required:{mode}")
+
                 c.execute(
                     """
                     SELECT *
@@ -2421,7 +2528,6 @@ class APPositionManager:
                 c.execute(
                     """
                     SELECT
-                        COUNT(*) FILTER (WHERE entry_ts >= %s AND entry_ts < %s) AS trades_today,
                         COALESCE(SUM(realized_pnl) FILTER (
                             WHERE entry_ts >= %s AND entry_ts < %s
                               AND status IN ('CLOSED','STOPPED','TAKEN_PROFIT','EXPIRED')
@@ -2432,10 +2538,30 @@ class APPositionManager:
                     FROM positions
                     WHERE client_id=%s
                     """,
-                    (start_utc, end_utc, start_utc, end_utc, self.client_id),
+                    (start_utc, end_utc, self.client_id),
                 )
                 summary = c.fetchone() or {}
                 position_capital_deployed = float(summary.get("capital_deployed") or 0.0)
+
+                try:
+                    trade_count = _broker_confirmed_entry_trades_today(
+                        c,
+                        client_id=self.client_id,
+                        execution_mode=_snap_mode,
+                        start_utc=start_utc,
+                        end_utc=end_utc,
+                    )
+                except Exception as trade_count_error:
+                    log.critical(
+                        "[%s] TRADE_COUNT_QUERY_FAILED source=broker_confirmed_entry_orders "
+                        "execution_mode=%s error=%s",
+                        self.client_id,
+                        _snap_mode,
+                        trade_count_error,
+                    )
+                    raise RuntimeError(
+                        "broker_confirmed_entry_trade_count_unavailable"
+                    ) from trade_count_error
 
                 # PR: sizing-bootstrap-fix
                 # total_trades = durable count of confirmed broker fills for
@@ -2479,7 +2605,6 @@ class APPositionManager:
                 # null-mode orphans and wrong-mode fills never block active slots.
                 # Fail-closed: if mode is unknown, exclude null-mode rows only
                 # (IS NOT NULL) rather than counting everything.
-                _snap_mode = (mode or "").strip().lower() or None
                 _mode_predicate = (
                     "LOWER(COALESCE(execution_mode, '')) = LOWER(%s)"
                     if _snap_mode
@@ -2778,7 +2903,21 @@ class APPositionManager:
                     "missing_position_rows":         missing_position_rows,
                     "watcher_count":      watcher_count,
                     "pending_exits":      pending_exits,
-                    "trades_today":       int(summary.get("trades_today") or 0),
+                    "trades_today":       int(trade_count["trades_today"]),
+                    "trades_today_source": trade_count["trades_today_source"],
+                    "synthetic_position_rows_ignored": int(
+                        trade_count["synthetic_position_rows_ignored"]
+                    ),
+                    "null_mode_fills_ignored": int(
+                        trade_count["null_mode_fills_ignored"]
+                    ),
+                    "wrong_mode_fills_ignored": int(
+                        trade_count["wrong_mode_fills_ignored"]
+                    ),
+                    "missing_identity_fills_ignored": int(
+                        trade_count["missing_identity_fills_ignored"]
+                    ),
+                    "trade_count_query_status": trade_count["trade_count_query_status"],
                     "realized_pnl_today": float(summary.get("realized_pnl_today") or 0),
                     # PR: sizing-bootstrap-fix — propagate the durable
                     # fill count up to master_control. See SELECT above for

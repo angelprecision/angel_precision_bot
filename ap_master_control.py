@@ -2248,6 +2248,14 @@ class APMasterControl:
                 f"unreconciled_puts={snap.get('filled_unreconciled_puts',0)} "
                 f"real_puts={_real_puts}/{self.max_puts}",
             )
+        if snap.get("trade_count_query_status") != "ok":
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "blocked_risk",
+                "broker_confirmed_entry_trade_count_unavailable",
+            )
         if snap["trades_today"] >= self.max_trades_today:
             return self._block(signal_id, ticker, client_id, "blocked_risk", f"max_trades_today ({snap['trades_today']}/{self.max_trades_today})")
         # PR E FIX-3: daily-loss check uses the snapshot value (local
@@ -3286,6 +3294,12 @@ class APMasterControl:
             "watcher_count":  0,
             "pending_exits":  0,
             "trades_today": 0,
+            "trades_today_source": "unavailable",
+            "synthetic_position_rows_ignored": 0,
+            "null_mode_fills_ignored": 0,
+            "wrong_mode_fills_ignored": 0,
+            "missing_identity_fills_ignored": 0,
+            "trade_count_query_status": "unavailable",
             "realized_pnl_today": 0.0,
             "total_trades": 0,
             "open_positions": [],
@@ -3345,6 +3359,12 @@ class APMasterControl:
                 snap.setdefault("watcher_count",  0)
                 snap.setdefault("pending_exits",  0)
                 snap.setdefault("trades_today", 0)
+                snap.setdefault("trades_today_source", "unavailable")
+                snap.setdefault("synthetic_position_rows_ignored", 0)
+                snap.setdefault("null_mode_fills_ignored", 0)
+                snap.setdefault("wrong_mode_fills_ignored", 0)
+                snap.setdefault("missing_identity_fills_ignored", 0)
+                snap.setdefault("trade_count_query_status", "unavailable")
                 snap.setdefault("realized_pnl_today", 0.0)
                 snap.setdefault("total_trades", 0)
                 snap.setdefault("open_positions", [])
