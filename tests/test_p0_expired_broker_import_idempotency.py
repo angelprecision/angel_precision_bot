@@ -265,3 +265,132 @@ def test_existing_expired_row_is_closed_without_replacement(production_db):
         status, close_source = cursor.fetchone()
     assert status == "EXPIRED"
     assert close_source == "expired_contract_cleanup"
+
+
+# ---------------------------------------------------------------------------
+# Amendment tests for PR #369 blocking defect:
+# _find_db_positions_for_expired_cleanup must filter by execution_mode and
+# detect duplicate-cardinality before mutating any row.
+# ---------------------------------------------------------------------------
+
+def _insert_position(cursor, pos_id, client_id, execution_mode, contract, status, now):
+    cursor.execute(
+        "INSERT INTO positions "
+        "(id,client_id,execution_mode,plan_id,signal_id,underlying,contract,direction,qty,"
+        "quantity_remaining,avg_fill,status,entry_ts,created_at,updated_at) "
+        "VALUES (%s,%s,%s,'plan','sig','SPY',%s,'PUT',4,4,0.61,%s,%s,%s,%s)",
+        (pos_id, client_id, execution_mode, contract, status, now, now, now),
+    )
+
+
+def test_cross_mode_paper_live_same_contract_live_reconciler_closes_live_only(production_db):
+    """A LIVE reconciler must close the LIVE row and never touch the PAPER row."""
+    diagnostics: list[dict] = []
+    reconciler = _reconciler("jose@example.com", "live", diagnostics)
+    contract = "SPY260716P00751000"
+    now = datetime.now(timezone.utc)
+    with production_db.cursor() as cursor:
+        _insert_position(cursor, "live-row", "jose@example.com", "live", contract, "OPEN", now)
+        _insert_position(cursor, "paper-row", "jose@example.com", "paper", contract, "OPEN", now)
+
+    _poll(reconciler, [_broker_position(contract)])
+
+    with production_db.cursor() as cursor:
+        cursor.execute("SELECT id, status FROM positions ORDER BY id")
+        rows = {r[0]: r[1] for r in cursor.fetchall()}
+
+    assert rows["live-row"] == "EXPIRED", "LIVE row must be closed by LIVE reconciler"
+    assert rows["paper-row"] == "OPEN", "PAPER row must be untouched by LIVE reconciler"
+
+
+def test_cross_mode_paper_live_same_contract_paper_reconciler_closes_paper_only(production_db):
+    """A PAPER reconciler must close the PAPER row and never touch the LIVE row."""
+    diagnostics: list[dict] = []
+    reconciler = _reconciler("jose@example.com", "paper", diagnostics)
+    contract = "SPY260716P00751000"
+    now = datetime.now(timezone.utc)
+    with production_db.cursor() as cursor:
+        _insert_position(cursor, "live-row2", "jose@example.com", "live", contract, "OPEN", now)
+        _insert_position(cursor, "paper-row2", "jose@example.com", "paper", contract, "OPEN", now)
+
+    _poll(reconciler, [_broker_position(contract)])
+
+    with production_db.cursor() as cursor:
+        cursor.execute("SELECT id, status FROM positions ORDER BY id")
+        rows = {r[0]: r[1] for r in cursor.fetchall()}
+
+    assert rows["paper-row2"] == "EXPIRED", "PAPER row must be closed by PAPER reconciler"
+    assert rows["live-row2"] == "OPEN", "LIVE row must be untouched by PAPER reconciler"
+
+
+def test_duplicate_same_mode_rows_triggers_ambiguous_closes_none(production_db):
+    """Two active LIVE rows for the same contract must emit AMBIGUOUS and close neither."""
+    alerts: list[str] = []
+    errors: list[str] = []
+    diagnostics: list[dict] = []
+    reconciler = _reconciler("jose@example.com", "live", diagnostics)
+    reconciler._alert = lambda msg: alerts.append(msg)
+
+    contract = "SPY260716P00751000"
+    now = datetime.now(timezone.utc)
+    with production_db.cursor() as cursor:
+        _insert_position(cursor, "dup-a", "jose@example.com", "live", contract, "OPEN", now)
+        _insert_position(cursor, "dup-b", "jose@example.com", "live", contract, "OPEN", now)
+
+    summary = _poll(reconciler, [_broker_position(contract)])
+
+    with production_db.cursor() as cursor:
+        cursor.execute("SELECT id, status FROM positions ORDER BY id")
+        rows = {r[0]: r[1] for r in cursor.fetchall()}
+
+    assert rows["dup-a"] == "OPEN", "First duplicate must NOT be closed when ambiguous"
+    assert rows["dup-b"] == "OPEN", "Second duplicate must NOT be closed when ambiguous"
+    assert any("AMBIGUOUS" in a for a in alerts), "Must emit AMBIGUOUS alert"
+    assert any(
+        "expired_broker_import_position_ambiguous" in (summary.get("errors") or [])
+    ), "Must record ambiguous error in summary"
+
+
+def test_exact_mode_active_plus_terminal_history_closes_only_active(production_db):
+    """One active LIVE row plus a terminal (EXPIRED) history row: close only the active row."""
+    diagnostics: list[dict] = []
+    reconciler = _reconciler("jose@example.com", "live", diagnostics)
+    contract = "SPY260716P00751000"
+    now = datetime.now(timezone.utc)
+    with production_db.cursor() as cursor:
+        _insert_position(cursor, "active-row", "jose@example.com", "live", contract, "OPEN", now)
+        _insert_position(cursor, "hist-row", "jose@example.com", "live", contract, "EXPIRED", now)
+
+    _poll(reconciler, [_broker_position(contract)])
+
+    with production_db.cursor() as cursor:
+        cursor.execute("SELECT id, status FROM positions ORDER BY id")
+        rows = {r[0]: r[1] for r in cursor.fetchall()}
+
+    assert rows["active-row"] == "EXPIRED", "Active row must be closed"
+    assert rows["hist-row"] == "EXPIRED", "Terminal history row must remain unchanged"
+    assert _count(production_db) == 2
+
+
+def test_zero_same_mode_candidates_no_mutation(production_db):
+    """No active rows in the reconciler's mode: quarantine only, zero DB mutations."""
+    diagnostics: list[dict] = []
+    reconciler = _reconciler("jose@example.com", "live", diagnostics)
+    contract = "SPY260716P00751000"
+    now = datetime.now(timezone.utc)
+    # Insert a PAPER row — must never be touched by LIVE reconciler
+    with production_db.cursor() as cursor:
+        _insert_position(cursor, "paper-only", "jose@example.com", "paper", contract, "OPEN", now)
+
+    _poll(reconciler, [_broker_position(contract)])
+
+    with production_db.cursor() as cursor:
+        cursor.execute("SELECT status FROM positions WHERE id='paper-only'")
+        (status,) = cursor.fetchone()
+
+    assert status == "OPEN", "PAPER row must be untouched when LIVE reconciler finds zero candidates"
+    # Quarantine rejection must still be emitted
+    assert any(
+        d.get("reason_code") == "BROKER_IMPORT_EXPIRED_CONTRACT_QUARANTINED"
+        for d in diagnostics
+    ), "Quarantine diagnostic must be emitted even when no DB row is closed"

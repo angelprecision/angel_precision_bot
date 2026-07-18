@@ -3478,26 +3478,54 @@ class APBrokerReconciler:
             expiration = self._occ_expiry(contract)
             session_date = datetime.now(_ZoneInfo("America/New_York")).date()
             if expiration is not None and expiration < session_date:
-                existing = self._find_db_position_by_contract(contract)
-                existing_id = str((existing or {}).get("id") or "")
-                if existing_id and self.pm is not None:
-                    try:
-                        self.pm.close_expired_position(
-                            position_id=existing_id,
-                            reason="expired_contract_broker_import_quarantine",
-                            exit_reason="expired_contract",
-                            close_source="expired_contract_cleanup",
-                            close_confidence="SYSTEM",
-                        )
-                    except Exception as exc:
-                        summary.setdefault("errors", []).append(
-                            "expired_broker_import_existing_close_failed"
-                        )
-                        log.error(
-                            "[%s] expired broker import existing close failed "
-                            "contract=%s position_id=%s error=%s",
-                            self.client_id, contract, existing_id, exc,
-                        )
+                # --- exact-mode lookup: LIMIT 2 to detect ambiguity --------
+                expired_candidates = self._find_db_positions_for_expired_cleanup(
+                    contract, self.execution_mode
+                )
+                existing_id: str = ""
+                if len(expired_candidates) == 1:
+                    # Exactly one same-mode active row — safe to close.
+                    existing_id = str(expired_candidates[0].get("id") or "")
+                    if existing_id and self.pm is not None:
+                        try:
+                            self.pm.close_expired_position(
+                                position_id=existing_id,
+                                reason="expired_contract_broker_import_quarantine",
+                                exit_reason="expired_contract",
+                                close_source="expired_contract_cleanup",
+                                close_confidence="SYSTEM",
+                            )
+                        except Exception as exc:
+                            summary.setdefault("errors", []).append(
+                                "expired_broker_import_existing_close_failed"
+                            )
+                            log.error(
+                                "[%s] expired broker import existing close failed "
+                                "contract=%s position_id=%s error=%s",
+                                self.client_id, contract, existing_id, exc,
+                            )
+                elif len(expired_candidates) >= 2:
+                    # Duplicate active rows in the same mode — ambiguity detected.
+                    # Closing an arbitrary row would worsen the incident family this
+                    # PR repairs.  Emit a dedicated code and close nothing.
+                    ambiguous_ids = [str(r.get("id") or "") for r in expired_candidates]
+                    log.error(
+                        "[%s] EXPIRED_BROKER_IMPORT_POSITION_AMBIGUOUS "
+                        "contract=%s execution_mode=%s candidate_ids=%s",
+                        self.client_id, contract, self.execution_mode, ambiguous_ids,
+                    )
+                    self._alert(
+                        f"EXPIRED_BROKER_IMPORT_POSITION_AMBIGUOUS | "
+                        f"client={self.client_id} "
+                        f"execution_mode={self.execution_mode or 'unknown'} "
+                        f"contract={contract} candidate_ids={ambiguous_ids}"
+                    )
+                    summary.setdefault("errors", []).append(
+                        "expired_broker_import_position_ambiguous"
+                    )
+                    existing_id = ""  # no mutation when ambiguous
+                # len == 0: no same-mode active row; nothing to close.
+                # ---------------------------------------------------------------------------
 
                 cost_basis = self._safe_float(bp.get("cost_basis"), 0.0)
                 reason_code = "BROKER_IMPORT_EXPIRED_CONTRACT_QUARANTINED"
@@ -3905,6 +3933,57 @@ class APBrokerReconciler:
             log.debug("[%s] find DB position by contract failed for %s: %s",
                       self.client_id, contract, e)
             return None
+
+    def _find_db_positions_for_expired_cleanup(
+        self, contract: str, execution_mode: str | None
+    ) -> list[dict]:
+        """Exact-mode lookup used exclusively by the expired broker-import cleanup path.
+
+        Returns at most 2 rows so the caller can distinguish:
+          - 0 rows  → nothing to close; quarantine the observation only
+          - 1 row   → close that exact position ID
+          - 2 rows  → EXPIRED_BROKER_IMPORT_POSITION_AMBIGUOUS; close nothing
+
+        Filters on exact client_id, normalised contract, normalised execution_mode,
+        and active status set.  Never falls back to a mode-agnostic search.
+        """
+        contract = self._norm_contract(contract)
+        normalized_mode = _normalize_execution_mode(execution_mode)
+        if not contract or normalized_mode is None:
+            return []
+        try:
+            from ap.db import conn, run_with_retry
+
+            def _fetch() -> list[dict]:
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT *
+                        FROM positions
+                        WHERE client_id=%s
+                          AND LOWER(COALESCE(execution_mode,''))=%s
+                          AND UPPER(contract)=%s
+                          AND status = ANY(%s)
+                        ORDER BY entry_ts DESC NULLS LAST
+                        LIMIT 2
+                        """,
+                        (
+                            self.client_id,
+                            normalized_mode,
+                            contract,
+                            list(DB_OPEN_POSITION_STATUSES),
+                        ),
+                    )
+                    rows = c.fetchall()
+                    return [dict(r) for r in rows]
+
+            return run_with_retry(_fetch)
+        except Exception as e:
+            log.debug(
+                "[%s] _find_db_positions_for_expired_cleanup failed contract=%s mode=%s: %s",
+                self.client_id, contract, execution_mode, e,
+            )
+            return []
 
     def _find_db_position_by_import_identity(
         self, plan_id: str, *, execution_mode: str
