@@ -1,22 +1,26 @@
 """Verify durable ownership while an EXIT broker order is partially filled.
 
-The canonical fill projection intentionally recomputes position quantities from
-broker fills. A partially filled EXIT order, however, is still broker-owned and
-must keep ``exit_in_flight`` plus its local/broker IDs durable until that order
-fills, cancels, rejects, or expires.
+The canonical fill projection recomputes position quantities from broker fills.
+A partially filled EXIT order is still broker-owned and must keep
+``exit_in_flight`` plus its local/broker IDs durable until that order reaches
+a terminal state.
 
 The canonical reconciler writes those fields in its existing transaction.
 This guard verifies that result without a second write.
 
-Two canonical entry paths exist — both are covered:
+Architecture — single wrap point
+─────────────────────────────────
+Both production entry paths call the same leaf:
 
-    _reconcile_exit_fill(order, result)              <- fill monitor / direct
-    retry_exit_fill_reconciliation(...)              <- startup retry path
+    _reconcile_exit_fill(order, result)
+        → _run_reconciliation_attempt(order, result, *, attempt_count)
 
-Both delegate to ``_run_reconciliation_attempt``.  The shared
-``verify_partial_exit_ownership()`` function is called after either path
-returns, ensuring the invariant is checked regardless of which entry point
-was used.
+    retry_exit_fill_reconciliation(*, client_id, local_order_id)
+        → _run_reconciliation_attempt(order, result, *, attempt_count)
+
+Wrapping ``_run_reconciliation_attempt`` covers both paths with one wrapper
+and receives the original ``order`` and ``result`` dicts directly — no
+reconstruction from the return value, no proxy, no missing fields.
 
 This module performs zero database writes and zero broker calls.
 """
@@ -28,20 +32,11 @@ from ap.logger import get_logger
 
 log = get_logger("ap.partial_exit_ownership_guard")
 
-_PATCHED_ATTR        = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_PATCHED"
-_ORIGINAL_ATTR       = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_ORIGINAL"
-_RETRY_PATCHED_ATTR  = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_RETRY_PATCHED"
-_RETRY_ORIGINAL_ATTR = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_RETRY_ORIGINAL"
+_PATCHED_ATTR  = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_PATCHED"
+_ORIGINAL_ATTR = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_ORIGINAL"
 
-
-def _int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value) if value is not None else default
-    except (TypeError, ValueError):
-        return default
-
-
-# ── Finding 1: delegate to the canonical predicate — no parallel taxonomy ─────
+# Removed _RETRY_PATCHED_ATTR / _RETRY_ORIGINAL_ATTR: the retry path is now
+# covered by wrapping _run_reconciliation_attempt, not the outer retry function.
 
 _PARTIAL_STATUSES = {
     "PARTIAL_FILL",
@@ -51,17 +46,25 @@ _PARTIAL_STATUSES = {
 }
 
 
+def _int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError):
+        return default
+
+
 def is_partial_exit_result(order: dict[str, Any], result: dict[str, Any]) -> bool:
-    """Return True iff the canonical reducer considers this an active partial EXIT.
+    """Return True iff this is an active partial EXIT.
 
     Status resolution mirrors the canonical predicate in
     ``exit_fill_truth_guard._is_partial_result`` exactly:
 
         result["status"] → result["state"] → order["status"]
 
+    Resolved inline to avoid importing ``exit_fill_truth_guard`` at call time
+    (which pulls in ``ap.db`` and requires DATABASE_URL during tests).
     ``order["state"]`` is not checked because the canonical predicate does not
-    check it.  Resolving inline here avoids importing ``exit_fill_truth_guard``
-    at call time, which would pull in ``ap.db`` and require DATABASE_URL.
+    check it.
     """
     status = str(
         result.get("status")
@@ -72,8 +75,6 @@ def is_partial_exit_result(order: dict[str, Any], result: dict[str, Any]) -> boo
     return status in _PARTIAL_STATUSES
 
 
-# ── Shared verification function (Finding 2) ──────────────────────────────────
-
 def partial_exit_ownership_fields(
     order: dict[str, Any], result: dict[str, Any]
 ) -> dict[str, Any]:
@@ -82,9 +83,9 @@ def partial_exit_ownership_fields(
     ``pending_exit_qty`` is the unfilled remainder on THIS order only:
         remaining = max(0, ordered_qty - cumulative_filled_qty)
     """
-    ordered_qty  = max(0, _int(order.get("qty")))
-    filled_qty   = max(0, _int(result.get("filled_qty"), _int(order.get("filled_qty"))))
-    remaining    = max(0, ordered_qty - filled_qty)
+    ordered_qty = max(0, _int(order.get("qty")))
+    filled_qty  = max(0, _int(result.get("filled_qty"), _int(order.get("filled_qty"))))
+    remaining   = max(0, ordered_qty - filled_qty)
     return {
         "exit_in_flight": True,
         "pending_exit_local_order_id":  str(order.get("local_order_id") or "").strip() or None,
@@ -102,31 +103,30 @@ def verify_partial_exit_ownership(
 ) -> dict[str, Any]:
     """Verification-only: inspect the canonical reconciliation result.
 
-    Called after either canonical reconciliation entry point returns.  May:
+    Called after ``_run_reconciliation_attempt`` returns, covering both
+    the direct fill-monitor path and the startup retry path.
+
+    May only:
     - inspect order/result/reconciled fields
     - compute expected ownership fields
     - set ``partial_exit_ownership_verified`` diagnostic metadata
     - emit critical log on invariant failure
 
     Must never:
-    - open a database connection
-    - execute SQL
+    - open a database connection or execute SQL
     - update positions, orders, proof_trades, queues, or signals
-    - make a broker call
-    - submit or cancel orders
+    - make a broker call, submit or cancel orders
     - reopen a closed position
-    - become a second EXIT-fill reducer
+    - become a second EXIT-fill reducer or mutation authority
     """
     if not isinstance(reconciled, dict):
         return reconciled
 
-    # Only verify when the canonical reducer considered this an active partial.
     if not is_partial_exit_result(order, result):
         return reconciled
 
     projection = reconciled.get("projection")
     if bool(getattr(projection, "closed", False)):
-        # Closed projection: ownership was already released canonically.
         return reconciled
 
     client_id   = str(order.get("client_id") or "").strip()
@@ -143,100 +143,51 @@ def verify_partial_exit_ownership(
         log.critical(
             "[%s] PARTIAL_EXIT_OWNERSHIP_INVARIANT_FAILED position=%s local_order=%s "
             "expected=%s reconciled=%s",
-            client_id,
-            position_id,
-            order.get("local_order_id"),
-            expected,
-            persisted,
+            client_id, position_id, order.get("local_order_id"),
+            expected, persisted,
         )
     else:
         log.info(
             "[%s] PARTIAL_EXIT_OWNERSHIP_PRESERVED position=%s local_order=%s "
             "broker_order=%s remaining_on_order=%s",
-            client_id,
-            position_id,
-            order.get("local_order_id"),
+            client_id, position_id, order.get("local_order_id"),
             result.get("broker_order_id") or order.get("broker_order_id"),
             expected.get("pending_exit_qty"),
         )
     return reconciled
 
 
-# ── Wrappers ──────────────────────────────────────────────────────────────────
+def wrap_run_reconciliation_attempt(
+    original: Callable[..., dict],
+) -> Callable[..., dict]:
+    """Wrap ``_run_reconciliation_attempt`` — the shared leaf of both paths.
 
-def wrap_exit_fill_reconcile(
-    original: Callable[[dict, dict], dict],
-) -> Callable[[dict, dict], dict]:
-    """Wrap ``_reconcile_exit_fill`` — the fill-monitor / direct entry path."""
+    ``_reconcile_exit_fill`` and ``retry_exit_fill_reconciliation`` both call
+    this function with the original ``order`` and ``result`` dicts as positional
+    arguments, so verification always has the real fields available.
 
-    def guarded(order: dict, result: dict) -> dict:
-        reconciled = original(order, result)
+    This replaces the previous approach of wrapping ``_reconcile_exit_fill`` and
+    ``retry_exit_fill_reconciliation`` separately, which required reconstructing
+    order/result from the return dict — fields the retry return does not contain.
+    """
+    def guarded(order: dict, result: dict, *, attempt_count: int) -> dict:
+        reconciled = original(order, result, attempt_count=attempt_count)
         return verify_partial_exit_ownership(order, result, reconciled)
 
     return guarded
 
 
-def wrap_retry_exit_fill_reconciliation(
-    original: Callable[..., dict | None],
-) -> Callable[..., dict | None]:
-    """Wrap ``retry_exit_fill_reconciliation`` — the startup retry entry path.
-
-    ``retry_exit_fill_reconciliation`` calls ``_run_reconciliation_attempt``
-    directly, bypassing ``_reconcile_exit_fill``.  Without this wrapper the
-    verification guard would never run on that path.
-
-    The wrapper reconstructs the ``order`` and ``result`` dicts from the
-    return value so verification can compare expected vs recorded ownership.
-    When the retry returns ``None`` or ``{"already_reconciled": True}`` there
-    is no active partial fill to verify, so the value is returned unchanged.
-    """
-
-    def guarded(*, client_id: str, local_order_id: str) -> dict | None:
-        reconciled = original(client_id=client_id, local_order_id=local_order_id)
-
-        if not isinstance(reconciled, dict):
-            return reconciled
-        if reconciled.get("already_reconciled"):
-            return reconciled
-
-        # Reconstruct a minimal order/result from what the retry path returns.
-        # The retry builds its own result dict from the stored order row; the
-        # reconciled dict contains enough information for the predicate check.
-        order_proxy: dict[str, Any] = {
-            "client_id":        client_id,
-            "local_order_id":   local_order_id,
-            "status":           reconciled.get("status"),
-            "broker_order_id":  reconciled.get("broker_order_id"),
-            "filled_qty":       reconciled.get("filled_qty"),
-            "qty":              reconciled.get("qty"),
-        }
-        result_proxy: dict[str, Any] = {
-            "status":           reconciled.get("status"),
-            "state":            reconciled.get("state"),
-            "broker_order_id":  reconciled.get("broker_order_id"),
-            "filled_qty":       reconciled.get("filled_qty"),
-        }
-        return verify_partial_exit_ownership(order_proxy, result_proxy, reconciled)
-
-    return guarded
-
-
-# ── Installer ─────────────────────────────────────────────────────────────────
-
 def install_partial_exit_ownership_guard() -> None:
-    """Patch both canonical EXIT-fill entry paths.  Idempotent."""
+    """Patch ``_run_reconciliation_attempt`` — single point covering both paths.
+
+    Idempotent; a second call is a no-op.
+    """
     from ap import exit_fill_truth_guard
 
-    if not getattr(exit_fill_truth_guard, _PATCHED_ATTR, False):
-        original = exit_fill_truth_guard._reconcile_exit_fill
-        setattr(exit_fill_truth_guard, _ORIGINAL_ATTR, original)
-        exit_fill_truth_guard._reconcile_exit_fill = wrap_exit_fill_reconcile(original)
-        setattr(exit_fill_truth_guard, _PATCHED_ATTR, True)
+    if getattr(exit_fill_truth_guard, _PATCHED_ATTR, False):
+        return
 
-    if not getattr(exit_fill_truth_guard, _RETRY_PATCHED_ATTR, False):
-        retry_original = exit_fill_truth_guard.retry_exit_fill_reconciliation
-        setattr(exit_fill_truth_guard, _RETRY_ORIGINAL_ATTR, retry_original)
-        exit_fill_truth_guard.retry_exit_fill_reconciliation = (
-            wrap_retry_exit_fill_reconciliation(retry_original)
-        )
-        setattr(exit_fill_truth_guard, _RETRY_PATCHED_ATTR, True)
+    original = exit_fill_truth_guard._run_reconciliation_attempt
+    setattr(exit_fill_truth_guard, _ORIGINAL_ATTR, original)
+    exit_fill_truth_guard._run_reconciliation_attempt = wrap_run_reconciliation_attempt(original)
+    setattr(exit_fill_truth_guard, _PATCHED_ATTR, True)
