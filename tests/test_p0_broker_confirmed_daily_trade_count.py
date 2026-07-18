@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import os
 import inspect
+import re
 from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
 from ap.position_manager import APPositionManager, _broker_confirmed_entry_trades_today
+from ap_master_control import APMasterControl
 
 
 START = datetime(2026, 7, 17, 4, 0, tzinfo=timezone.utc)
@@ -247,3 +251,184 @@ def test_snapshot_wires_trade_limit_to_broker_confirmed_query():
     assert "_broker_confirmed_entry_trades_today(" in source
     assert '"trades_today":       int(trade_count["trades_today"])' in source
     assert "broker_confirmed_entry_trade_count_unavailable" in source
+
+
+def _signal(**overrides):
+    signal = {
+        "signal_id": "trade-count-signal",
+        "canonical_signal_id": "trade-count-signal",
+        "client_id": "jose@example.com",
+        "ticker": "AAPL",
+        "symbol": "AAPL",
+        "side": "CALL",
+        "direction": "CALL",
+        "timeframe": "1d",
+        "pattern": "2-3",
+        "score": 95.0,
+        "entry_trigger": 200.0,
+        "target_price": 205.0,
+        "stop_price": 197.5,
+    }
+    signal.update(overrides)
+    return signal
+
+
+def _snapshot(**overrides):
+    snapshot = {
+        "_snapshot_ok": True,
+        "_snapshot_ts": "2026-07-17T14:00:00Z",
+        "_snapshot_age_sec": 0.0,
+        "open_count": 0,
+        "open_positions": [],
+        "closing_positions": [],
+        "calls_open": 0,
+        "puts_open": 0,
+        "filled_unreconciled_calls": 0,
+        "filled_unreconciled_puts": 0,
+        "pending_entries": 0,
+        "pending_entry_capital": 0.0,
+        "capital_deployed": 0.0,
+        "realized_pnl_today": 0.0,
+        "trades_today": 0,
+        "total_trades": 0,
+        "watcher_count": 0,
+        "entry_attempt_lock_count": 0,
+        "ticker_open_counts": {},
+        "ticker_pending_counts": {},
+        "symbol_trades": {},
+    }
+    snapshot.update(overrides)
+    return snapshot
+
+
+def _master_for_snapshot(snapshot: dict, *, max_trades_today: int = 10):
+    with patch.object(APMasterControl, "_seed_dedup_from_db", return_value=None):
+        control = APMasterControl(
+            mode="paper",
+            client_id="jose@example.com",
+            score_floor=60.0,
+            context_floor=0.0,
+            account_equity=100_000.0,
+            max_capital_pct=0.40,
+            max_position_pct=0.40,
+            max_total_capital_pct=0.90,
+            max_sector_pct=1.0,
+            max_ticker_pct=1.0,
+            max_positions=20,
+            max_calls=20,
+            max_puts=20,
+            max_trades_today=max_trades_today,
+            require_snapshot_freshness_live=False,
+            pending_capital_fail_closed_live=False,
+        )
+    control._get_snapshot = MagicMock(return_value=snapshot)
+    control._has_durable_duplicate_signal = MagicMock(return_value=(False, "", ""))
+    control._pending_capital_from_snapshot_or_db = MagicMock(return_value=0.0)
+    control._sector_capital_deployed = MagicMock(return_value=0.0)
+    control._ticker_capital_deployed = MagicMock(return_value=0.0)
+    control._run_intelligence = MagicMock(return_value={
+        "approved": True,
+        "score": 0.0,
+        "contracts": 1,
+        "reasoning": "observe-only unavailable",
+        "_available": False,
+    })
+    control._run_final_quality_gates = MagicMock(return_value=None)
+    control._persist_dedup = MagicMock(return_value=None)
+    control._emit_trade_dossier = MagicMock()
+    control._log_capital_utilization = MagicMock()
+    control._alert_degraded = MagicMock()
+    control._store_update = MagicMock()
+    control.feedback = None
+    control.sizer = None
+    control.pm = None
+    return control
+
+
+def test_legacy_snapshot_trade_count_without_proven_status_blocks():
+    control = _master_for_snapshot(_snapshot(trades_today=1))
+
+    decision = control.evaluate(_signal(), client_id="jose@example.com")
+
+    assert decision.ok is False
+    assert decision.stage == "blocked_risk"
+    assert decision.reason == "broker_confirmed_entry_trade_count_unavailable"
+
+
+def test_explicit_ok_snapshot_reaches_max_trade_comparison():
+    control = _master_for_snapshot(
+        _snapshot(
+            trades_today=2,
+            trades_today_source="broker_confirmed_entry_orders",
+            trade_count_query_status="ok",
+        ),
+        max_trades_today=2,
+    )
+
+    decision = control.evaluate(_signal(), client_id="jose@example.com")
+
+    assert decision.ok is False
+    assert decision.stage == "blocked_risk"
+    assert decision.reason == "max_trades_today (2/2)"
+
+
+def _jose_runbook() -> str:
+    return (Path(__file__).resolve().parents[1] / "docs/p0/jose_daily_trade_count_repair.md").read_text()
+
+
+def _sql_statements(text: str) -> list[str]:
+    return re.findall(r"```sql\n(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+
+
+def test_jose_runbook_recomputes_paper_orders_only():
+    text = _jose_runbook()
+
+    assert "AND lower(coalesce(execution_mode, '')) = 'paper'" in text
+    assert "AND lower(coalesce(execution_mode, '')) = 'live'" not in text
+
+
+def test_jose_runbook_client_state_statements_are_client_and_mode_fenced():
+    text = _jose_runbook()
+    client_state_statements = [
+        statement
+        for block in _sql_statements(text)
+        for statement in block.split(";")
+        if re.search(r"\b(?:FROM|UPDATE)\s+client_state\b", statement, flags=re.IGNORECASE)
+    ]
+
+    assert client_state_statements
+    for statement in client_state_statements:
+        normalized = re.sub(r"\s+", " ", statement.lower())
+        assert "client_id = 'jose.vasquez4011@gmail.com'" in normalized
+        assert "lower(mode) = 'paper'" in normalized
+
+
+def test_jose_runbook_has_no_client_only_update_and_returns_exact_row():
+    text = _jose_runbook()
+    updates = [
+        statement
+        for block in _sql_statements(text)
+        for statement in block.split(";")
+        if re.search(r"\bUPDATE\s+client_state\b", statement, flags=re.IGNORECASE)
+    ]
+
+    assert len(updates) == 1
+    update = re.sub(r"\s+", " ", updates[0].lower())
+    assert "where client_id = 'jose.vasquez4011@gmail.com' and lower(mode) = 'paper'" in update
+    assert "returning client_id, mode, day_key, trades_taken_today, updated_at" in update
+    assert "exactly one row" in text
+    assert "rollback" in text.lower()
+
+
+def test_jose_runbook_mutation_predicates_exclude_jason_and_tradefluence():
+    text = _jose_runbook()
+    mutation_statements = [
+        statement.lower()
+        for block in _sql_statements(text)
+        for statement in block.split(";")
+        if re.search(r"\bUPDATE\s+client_state\b", statement, flags=re.IGNORECASE)
+    ]
+
+    assert mutation_statements
+    assert all("jason" not in statement for statement in mutation_statements)
+    assert all("tradefluence" not in statement for statement in mutation_statements)

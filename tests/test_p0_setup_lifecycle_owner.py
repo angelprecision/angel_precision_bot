@@ -62,6 +62,8 @@ def _snapshot():
         "capital_deployed": 0.0,
         "realized_pnl_today": 0.0,
         "trades_today": 0,
+        "trades_today_source": "broker_confirmed_entry_orders",
+        "trade_count_query_status": "ok",
         "total_trades": 25,
         "daily_trades": 0,
         "intraday_trades": 0,

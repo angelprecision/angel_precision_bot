@@ -20,7 +20,7 @@ WITH session_bounds AS (
   END AS canonical_entry_identity
   FROM orders, session_bounds
   WHERE client_id = 'jose.vasquez4011@gmail.com'
-    AND lower(coalesce(execution_mode, '')) = 'live'
+    AND lower(coalesce(execution_mode, '')) = 'paper'
     AND upper(coalesce(kind, '')) = 'ENTRY'
     AND coalesce(filled_qty, 0) > 0
     AND upper(coalesce(status, '')) IN
@@ -41,10 +41,11 @@ positions, proof rows, contracts, or quantities as the count.
 ```sql
 SELECT client_id, mode, day_key, trades_taken_today, updated_at
 FROM client_state
-WHERE client_id = 'jose.vasquez4011@gmail.com';
+WHERE client_id = 'jose.vasquez4011@gmail.com'
+  AND lower(mode) = 'paper';
 ```
 
-Confirm this returns exactly one Jose row. Jason and Tradefluence must not
+Confirm this returns exactly one Jose PAPER row. Jason and Tradefluence must not
 appear in either the predicate or result.
 
 ## 3. Apply only after operator approval
@@ -58,13 +59,15 @@ UPDATE client_state
 SET trades_taken_today = <verified_count>,
     day_key = to_char(now() AT TIME ZONE 'America/New_York', 'YYYY-MM-DD'),
     updated_at = now()
-WHERE client_id = 'jose.vasquez4011@gmail.com';
+WHERE client_id = 'jose.vasquez4011@gmail.com'
+  AND lower(mode) = 'paper'
+RETURNING client_id, mode, day_key, trades_taken_today, updated_at;
 
-SELECT client_id, mode, day_key, trades_taken_today, updated_at
-FROM client_state
-WHERE client_id = 'jose.vasquez4011@gmail.com';
-
--- COMMIT only after the SELECT proves the exact Jose row and expected count.
+-- COMMIT only if UPDATE ... RETURNING returns exactly one row with:
+--   client_id = 'jose.vasquez4011@gmail.com'
+--   mode = 'paper'
+--   day_key = the expected Eastern session date
+--   trades_taken_today = <verified_count>
 -- Otherwise execute ROLLBACK.
 ```
 
