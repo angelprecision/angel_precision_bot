@@ -247,3 +247,46 @@ def test_snapshot_wires_trade_limit_to_broker_confirmed_query():
     assert "_broker_confirmed_entry_trades_today(" in source
     assert '"trades_today":       int(trade_count["trades_today"])' in source
     assert "broker_confirmed_entry_trade_count_unavailable" in source
+
+
+# ---------------------------------------------------------------------------
+# Amendment test — production-shaped Jose PAPER case
+# Incident evidence identifies Jose's rows as PAPER.  Prior helpers defaulted
+# to mode='live', which allowed the runbook's wrong-mode predicate to survive
+# CI undetected.
+# ---------------------------------------------------------------------------
+
+def test_jose_paper_production_shaped_count(database):
+    """
+    Jose's real account is PAPER.  Filled PAPER ENTRY orders must count.
+    LIVE orders for the same client and session must not contribute.
+    This is the production-shaped case the runbook step 1 query must match.
+    """
+    # Two PAPER fills — should count as 2 distinct trades
+    _order(database, "jose-paper-a", mode="paper", broker_id="jose-broker-a",
+           local_id="jose-local-a")
+    _order(database, "jose-paper-b", mode="paper", broker_id="jose-broker-b",
+           local_id="jose-local-b")
+    # Duplicate callback for jose-paper-a — must not double-count
+    _order(database, "jose-paper-a-dup", mode="paper", broker_id="jose-broker-a",
+           local_id="jose-local-a-dup")
+    # LIVE order for same client — must not count toward PAPER total
+    _order(database, "jose-live-a", mode="live", broker_id="jose-live-broker-a",
+           local_id="jose-live-local-a")
+    # Unfilled PAPER ENTRY — must not count
+    _order(database, "jose-paper-unfilled", mode="paper", broker_id="jose-broker-unfilled",
+           local_id="jose-local-unfilled", qty=0, status="PENDING")
+    # EXIT order for PAPER — must not count
+    _order(database, "jose-paper-exit", mode="paper", broker_id="jose-broker-exit",
+           local_id="jose-local-exit", kind="EXIT")
+
+    paper_result = _count(database, mode="paper")
+    live_result = _count(database, mode="live")
+
+    assert paper_result["trades_today"] == 2, (
+        f"Expected 2 Jose PAPER trades, got {paper_result['trades_today']}. "
+        "Runbook step 1 must query execution_mode='paper', not 'live'."
+    )
+    assert live_result["trades_today"] == 1, (
+        f"Expected 1 Jose LIVE trade (isolated), got {live_result['trades_today']}"
+    )
