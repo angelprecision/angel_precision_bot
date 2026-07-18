@@ -93,6 +93,7 @@ jobs:
             tests/test_p0_exit_decision_idempotency_guard.py \
             tests/test_p0_proof_entry_identity_and_taxonomy.py \
             tests/test_p0_proof_taxonomy_fill_bridge.py \
+            tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes
 
