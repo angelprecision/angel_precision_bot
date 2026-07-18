@@ -74,6 +74,13 @@ def _normalize_position_side(side) -> str:
     return normalized
 
 
+def _normalize_proof_side(side) -> Optional[str]:
+    try:
+        return _normalize_position_side(side)
+    except Exception:
+        return None
+
+
 class PositionStatus:
     OPEN = "OPEN"
     CLOSING = "CLOSING"
@@ -479,15 +486,15 @@ class APPositionManager:
             with conn() as c:
                 if position_id:
                     c.execute(
-                        "SELECT 1 FROM proof_trades WHERE position_id=%s LIMIT 1",
-                        (position_id,),
+                        "SELECT 1 FROM proof_trades WHERE client_email=%s AND position_id=%s LIMIT 1",
+                        (self.client_id, position_id),
                     )
                     if c.fetchone():
                         return True
                 if local_order_id:
                     c.execute(
-                        "SELECT 1 FROM proof_trades WHERE local_order_id=%s LIMIT 1",
-                        (local_order_id,),
+                        "SELECT 1 FROM proof_trades WHERE client_email=%s AND local_order_id=%s LIMIT 1",
+                        (self.client_id, local_order_id),
                     )
                     if c.fetchone():
                         return True
@@ -498,6 +505,159 @@ class APPositionManager:
         except Exception as exc:
             log.error("[%s] proof row existence check failed: %s", self.client_id, exc)
             return None
+
+    def _load_signal_side(self, signal_id: str) -> Optional[str]:
+        canonical_signal_id = str(signal_id or "").strip()
+        if not canonical_signal_id:
+            return None
+        try:
+            from ap_signal_store import canonical_signal_id as _canon_signal_id
+            canonical_signal_id = str(_canon_signal_id(canonical_signal_id) or "").strip()
+        except Exception:
+            canonical_signal_id = str(signal_id or "").strip()
+        if not canonical_signal_id:
+            return None
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    """
+                    SELECT side, signal_payload
+                    FROM ap_signals
+                    WHERE signal_id::text=%s
+                      AND client_email=%s
+                    LIMIT 2
+                    """,
+                    (canonical_signal_id, self.client_id),
+                )
+                return c.fetchall()
+
+        try:
+            rows = list(run_with_retry(_fn) or [])
+        except Exception as exc:
+            log.error(
+                "[%s] signal side lookup failed | signal_id=%s err=%s",
+                self.client_id,
+                canonical_signal_id,
+                exc,
+            )
+            return None
+
+        if len(rows) != 1:
+            if len(rows) > 1:
+                log.critical(
+                    "[%s] TERMINAL_CLOSE_SIGNAL_IDENTITY_AMBIGUOUS signal_id=%s rows=%s",
+                    self.client_id,
+                    canonical_signal_id,
+                    len(rows),
+                )
+            return None
+
+        row = dict(rows[0] or {})
+        payload = row.get("signal_payload")
+        if isinstance(payload, str):
+            try:
+                import json as _json
+                payload = _json.loads(payload)
+            except Exception:
+                payload = None
+        return _normalize_proof_side(
+            row.get("side")
+            or (payload or {}).get("side")
+            or (payload or {}).get("direction")
+        )
+
+    def _resolve_terminal_proof_identity(
+        self,
+        *,
+        position_id: str,
+        local_order_id: str,
+        side: str,
+    ) -> dict:
+        from ap.db import get_order_by_id
+
+        entry_local_order_id = str(local_order_id or "").strip()
+        entry_order = None
+        if entry_local_order_id:
+            try:
+                entry_order = get_order_by_id(entry_local_order_id, client_id=self.client_id)
+            except Exception as exc:
+                log.error(
+                    "[%s] terminal proof entry-order lookup failed | local_order_id=%s err=%s",
+                    self.client_id,
+                    entry_local_order_id,
+                    exc,
+                )
+
+        entry_meta = (entry_order or {}).get("meta")
+        if isinstance(entry_meta, str):
+            try:
+                import json as _json
+                entry_meta = _json.loads(entry_meta)
+            except Exception:
+                entry_meta = None
+        if not isinstance(entry_meta, dict):
+            entry_meta = {}
+
+        signal_side = self._load_signal_side(str((entry_order or {}).get("signal_id") or ""))
+        order_side = _normalize_proof_side(
+            (entry_order or {}).get("direction")
+            or (entry_order or {}).get("side")
+            or entry_meta.get("direction")
+            or entry_meta.get("side")
+        )
+        position_side = _normalize_proof_side(side)
+
+        candidates = [
+            ("position", position_side),
+            ("entry_order", order_side),
+            ("signal", signal_side),
+        ]
+        concrete = [(src, value) for src, value in candidates if value in {"CALL", "PUT"}]
+        distinct_sides = {value for _, value in concrete}
+        if len(distinct_sides) > 1:
+            log.critical(
+                "[%s] TERMINAL_CLOSE_SIDE_AMBIGUOUS pos=%s local_order_id=%s candidates=%s",
+                self.client_id,
+                position_id,
+                entry_local_order_id,
+                concrete,
+            )
+            resolved_side = "UNKNOWN_QUARANTINED"
+            side_quarantined = True
+        elif concrete:
+            resolved_side = concrete[0][1]
+            side_quarantined = False
+        else:
+            log.critical(
+                "[%s] TERMINAL_CLOSE_SIDE_MISSING pos=%s local_order_id=%s",
+                self.client_id,
+                position_id,
+                entry_local_order_id,
+            )
+            resolved_side = "UNKNOWN_QUARANTINED"
+            side_quarantined = True
+
+        resolved_mode = str((entry_order or {}).get("execution_mode") or "").strip().lower()
+        if resolved_mode not in {"live", "paper"}:
+            resolved_mode = str(entry_meta.get("execution_mode") or "").strip().lower()
+        if resolved_mode not in {"live", "paper"}:
+            if entry_local_order_id:
+                log.critical(
+                    "[%s] TERMINAL_CLOSE_EXECUTION_MODE_UNPROVEN pos=%s local_order_id=%s",
+                    self.client_id,
+                    position_id,
+                    entry_local_order_id,
+                )
+            resolved_mode = "unknown"
+
+        return {
+            "entry_local_order_id": entry_local_order_id,
+            "entry_order": entry_order or {},
+            "resolved_side": resolved_side,
+            "side_quarantined": side_quarantined,
+            "resolved_execution_mode": resolved_mode,
+        }
 
     def _claim_recent_broker_repair_proof(
         self,
@@ -513,6 +673,52 @@ class APPositionManager:
 
         def _fn():
             with conn() as c:
+                if local_order_id:
+                    c.execute(
+                        """
+                        SELECT id, local_order_id
+                        FROM proof_trades
+                        WHERE client_email=%s
+                          AND position_id=%s
+                          AND closed_at BETWEEN (%s::timestamptz - INTERVAL '15 minutes')
+                                            AND (%s::timestamptz + INTERVAL '15 minutes')
+                          AND (COALESCE(local_order_id, '') = '' OR local_order_id = %s)
+                        ORDER BY ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) ASC
+                        LIMIT 2
+                        """,
+                        (
+                            self.client_id,
+                            repair_position_id,
+                            closed_at,
+                            closed_at,
+                            local_order_id,
+                            closed_at,
+                        ),
+                    )
+                else:
+                    c.execute(
+                        """
+                        SELECT id, local_order_id
+                        FROM proof_trades
+                        WHERE client_email=%s
+                          AND position_id=%s
+                          AND closed_at BETWEEN (%s::timestamptz - INTERVAL '15 minutes')
+                                            AND (%s::timestamptz + INTERVAL '15 minutes')
+                        ORDER BY ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) ASC
+                        LIMIT 2
+                        """,
+                        (
+                            self.client_id,
+                            repair_position_id,
+                            closed_at,
+                            closed_at,
+                            closed_at,
+                        ),
+                    )
+                candidates = c.fetchall() or []
+                if len(candidates) != 1:
+                    return {"claimed": False, "candidate_count": len(candidates)}
+                candidate = dict(candidates[0] or {})
                 c.execute(
                     """
                     UPDATE proof_trades
@@ -522,38 +728,45 @@ class APPositionManager:
                                THEN %s
                                ELSE local_order_id
                            END
-                     WHERE id = (
-                         SELECT id
-                           FROM proof_trades
-                          WHERE client_email = %s
-                            AND position_id = %s
-                            AND closed_at BETWEEN (%s::timestamptz - INTERVAL '15 minutes')
-                                              AND (%s::timestamptz + INTERVAL '15 minutes')
-                          ORDER BY ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) ASC
-                          LIMIT 1
-                     )
+                     WHERE id = %s
+                       AND client_email = %s
+                       AND position_id = %s
                     RETURNING id
                     """,
                     (
                         position_id,
                         local_order_id,
                         local_order_id,
+                        candidate.get("id"),
                         self.client_id,
                         repair_position_id,
-                        closed_at,
-                        closed_at,
-                        closed_at,
                     ),
                 )
-                row = c.fetchone() or {}
-                return bool(row.get("id"))
+                rows = c.fetchall() or []
+                return {
+                    "claimed": len(rows) == 1,
+                    "candidate_count": len(candidates),
+                    "updated_count": len(rows),
+                }
 
         try:
-            claimed = bool(run_with_retry(_fn))
+            outcome = dict(run_with_retry(_fn) or {})
         except Exception as exc:
             log.warning(
                 "[%s] broker repair proof claim failed | pos=%s contract=%s err=%s",
                 self.client_id, position_id, contract, exc,
+            )
+            return False
+
+        claimed = bool(outcome.get("claimed"))
+        if not claimed:
+            log.critical(
+                "[%s] BROKER_REPAIR_PROOF_QUARANTINED pos=%s contract=%s candidate_count=%s updated_count=%s",
+                self.client_id,
+                position_id,
+                contract,
+                outcome.get("candidate_count"),
+                outcome.get("updated_count"),
             )
             return False
 
@@ -582,29 +795,16 @@ class APPositionManager:
         setup_status: str,
         execution_mode: str = "",
         exit_fill_price: Optional[float] = None,
+        synthetic_entry: bool = False,
     ) -> bool:
-        resolved_mode = str(execution_mode or "").strip().lower()
-        if resolved_mode not in {"live", "paper"}:
-            try:
-                from ap.db import get_order_by_id
-                order = get_order_by_id(local_order_id) if local_order_id else None
-            except Exception as exc:
-                log.debug("[%s] execution_mode lookup failed for %s: %s", self.client_id, local_order_id, exc)
-                order = None
-            if order:
-                resolved_mode = str(order.get("execution_mode") or "").strip().lower()
-                if resolved_mode not in {"live", "paper"}:
-                    meta = order.get("meta")
-                    if isinstance(meta, str):
-                        try:
-                            import json as _json
-                            meta = _json.loads(meta)
-                        except Exception:
-                            meta = None
-                    if isinstance(meta, dict):
-                        resolved_mode = str(meta.get("execution_mode") or "").strip().lower()
-        if resolved_mode not in {"live", "paper"}:
-            resolved_mode = "unknown"
+        identity = self._resolve_terminal_proof_identity(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            side=side,
+        )
+        resolved_mode = str(identity.get("resolved_execution_mode") or "unknown")
+        resolved_side = str(identity.get("resolved_side") or "UNKNOWN_QUARANTINED")
+        quarantined = bool(identity.get("side_quarantined")) or resolved_mode not in {"live", "paper"}
 
         try:
             from ap.queue import _get_sb_client
@@ -641,7 +841,7 @@ class APPositionManager:
             result = proof.log_trade(
                 ticker=underlying or contract,
                 pattern="",
-                side=side or "CALL",
+                side=resolved_side,
                 timeframe="1d",
                 score=0,
                 tier="A",
@@ -661,7 +861,7 @@ class APPositionManager:
                 chain_grade="",
                 opened_at=datetime.fromisoformat(str(opened_at)),
                 closed_at=datetime.fromisoformat(str(closed_at)),
-                synthetic_entry=False,
+                synthetic_entry=bool(synthetic_entry or quarantined),
                 position_id=position_id or "",
                 local_order_id=local_order_id or "",
                 execution_mode=resolved_mode,
@@ -707,9 +907,15 @@ class APPositionManager:
         allow_fallback_insert: bool,
         missing_reason_code: str,
     ) -> bool:
-        proof_exists = self._proof_row_exists(
+        identity = self._resolve_terminal_proof_identity(
             position_id=position_id,
             local_order_id=local_order_id,
+            side=side,
+        )
+        entry_local_order_id = str(identity.get("entry_local_order_id") or local_order_id or "")
+        proof_exists = self._proof_row_exists(
+            position_id=position_id,
+            local_order_id=entry_local_order_id,
         )
         if proof_exists is True:
             return True
@@ -717,7 +923,7 @@ class APPositionManager:
         if proof_exists is None:
             log.critical(
                 "[%s] TERMINAL_CLOSE_PROOF_UNVERIFIED pos=%s local_order_id=%s source=%s",
-                self.client_id, position_id, local_order_id, setup_status,
+                self.client_id, position_id, entry_local_order_id, setup_status,
             )
             return False
 
@@ -725,7 +931,7 @@ class APPositionManager:
             position_id=position_id,
             contract=contract,
             closed_at=closed_at,
-            local_order_id=local_order_id,
+            local_order_id=entry_local_order_id,
         )
         if claimed:
             return True
@@ -739,10 +945,10 @@ class APPositionManager:
 
         persisted = self._write_missing_terminal_proof(
             position_id=position_id,
-            local_order_id=local_order_id,
+            local_order_id=entry_local_order_id,
             contract=contract,
             underlying=underlying,
-            side=side,
+            side=str(identity.get("resolved_side") or side),
             opened_at=opened_at,
             closed_at=closed_at,
             entry_option_price=entry_option_price,
@@ -751,8 +957,9 @@ class APPositionManager:
             exit_reason=exit_reason,
             option_pnl_pct=option_pnl_pct,
             setup_status=setup_status,
-            execution_mode=execution_mode,
+            execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or "unknown"),
             exit_fill_price=exit_fill_price,
+            synthetic_entry=bool(identity.get("side_quarantined")) or str(identity.get("resolved_execution_mode") or "") not in {"live", "paper"},
         )
         if persisted:
             log.info(
@@ -1644,7 +1851,7 @@ class APPositionManager:
                     "opened_at": str(pos.get("entry_ts") or now_utc_iso()),
                     "closed_at": str(ts),
                     "entry_option_price": avg_fill,
-                    "local_order_id": str(local_order_id or pos.get("local_order_id") or ""),
+                    "local_order_id": str(pos.get("local_order_id") or local_order_id or ""),
                 }
 
         ok, detail = run_with_retry(_fn)

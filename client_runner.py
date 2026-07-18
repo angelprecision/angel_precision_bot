@@ -1912,7 +1912,7 @@ class ClientRunner(threading.Thread):
                                     setup_status="manual_client_close",
                                     execution_mode="",
                                     exit_fill_price=None,
-                                    allow_fallback_insert=True,
+                                    allow_fallback_insert=False,
                                     missing_reason_code="MANUAL_CLOSE_PROOF_UNCLAIMED",
                                 )
                                 if not ensured:
