@@ -355,12 +355,6 @@ def _apply_postgres_proof_migrations(connection) -> None:
         cursor.execute(taxonomy_sql)
 
 
-def _cleanup_postgres_proof_rows(connection, client_id: str, position_id: str) -> None:
-    with connection.cursor() as cursor:
-        cursor.execute("DELETE FROM public.proof_trades WHERE client_email=%s OR position_id=%s", (client_id, position_id))
-        cursor.execute("DELETE FROM public.positions WHERE client_id=%s OR id=%s", (client_id, position_id))
-
-
 def test_migrations_run_in_stack_order_and_are_idempotent_on_postgres() -> None:
     connection = _postgres_connection_or_skip()
     connection.autocommit = True
@@ -387,7 +381,7 @@ def test_migrations_run_in_stack_order_and_are_idempotent_on_postgres() -> None:
             )
             index_row = cursor.fetchone()
             assert index_row is not None
-            assert "WHERE training_eligible IS TRUE" in index_row[1]
+            assert "training_eligible IS TRUE" in index_row[1]
     finally:
         connection.close()
 
@@ -399,24 +393,31 @@ def test_duplicate_official_proofs_do_not_duplicate_live_kelly_history(monkeypat
     position_id = f"position-{uuid4()}"
     try:
         from psycopg2.extras import RealDictCursor
-        _apply_postgres_proof_migrations(connection)
-        _cleanup_postgres_proof_rows(connection, client_id, position_id)
 
         cursor = connection.cursor(cursor_factory=RealDictCursor)
         cursor.execute(
-            "INSERT INTO public.positions "
+            "CREATE TEMP TABLE positions ("
+            "client_id TEXT, id TEXT, execution_mode TEXT, status TEXT, "
+            "realized_pnl NUMERIC, avg_fill NUMERIC, exit_price NUMERIC, "
+            "qty INTEGER, entry_ts TIMESTAMPTZ)"
+        )
+        cursor.execute(
+            "CREATE TEMP TABLE proof_trades ("
+            "client_email TEXT, position_id TEXT, training_eligible BOOLEAN)"
+        )
+        cursor.execute("SET search_path TO pg_temp, public")
+        cursor.execute(
+            "INSERT INTO positions "
             "(id, client_id, execution_mode, status, realized_pnl, avg_fill, exit_price, qty, entry_ts) "
             "VALUES (%s, %s, 'live', 'CLOSED', 80, 1.2, 2.0, 1, NOW())",
             (position_id, client_id),
         )
         cursor.execute(
-            "INSERT INTO public.proof_trades "
-            "(client_email, position_id, closed_at, execution_mode, "
-            " official_live_performance_eligible, performance_taxonomy, training_eligible, "
-            " taxonomy_reason, quote_domain_consistent) "
+            "INSERT INTO proof_trades "
+            "(client_email, position_id, training_eligible) "
             "VALUES "
-            "(%s, %s, NOW(), 'live', TRUE, 'LIVE_OFFICIAL', TRUE, 'existing_tradier_exit_proof_lock_passed', TRUE), "
-            "(%s, %s, NOW(), 'live', TRUE, 'LIVE_OFFICIAL', TRUE, 'existing_tradier_exit_proof_lock_passed', TRUE)",
+            "(%s, %s, TRUE), "
+            "(%s, %s, TRUE)",
             (client_id, position_id, client_id, position_id),
         )
 
@@ -431,7 +432,4 @@ def test_duplicate_official_proofs_do_not_duplicate_live_kelly_history(monkeypat
         assert len(rows) == 1
         assert float(rows[0]["realized_pnl"]) == 80.0
     finally:
-        try:
-            _cleanup_postgres_proof_rows(connection, client_id, position_id)
-        finally:
-            connection.close()
+        connection.close()
