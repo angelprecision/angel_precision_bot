@@ -6,7 +6,7 @@ PR #357 amendment — Reconciler proof persistence regression tests.
 Covers the seven required scenarios:
   1. Persistent full close — one proof_trades row with correct fields
   2. Originating order mode wins over explicit reconciler mode
-  3. Reconciler mode fallback when originating order mode is unknown
+  3. Unknown originating order mode remains quarantined as unknown
   4. Missing Supabase client — operator-visible error, no crash, no false success
   5. Idempotency — exactly one row inserted on repeated passes
   6. P&L units — percentage points, never decimal fractions
@@ -25,6 +25,28 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
+
+
+def _entry_identity(
+    *,
+    client_id: str = "jasoncosby1@gmail.com",
+    position_id: str = "position-1",
+    local_order_id: str = "live-order-1",
+    execution_mode: str = "live",
+) -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        client_id=client_id,
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id="broker-entry-1",
+        execution_mode=execution_mode,
+        signal_id="signal-1",
+        canonical_signal_id="signal-1",
+        filled_qty=2,
+        fill_price=1.0,
+        filled_ts="2026-07-18T15:00:00+00:00",
+        synthetic_entry=False,
+    )
 
 
 # =============================================================================
@@ -301,7 +323,10 @@ class TestPersistentFullClose:
             supabase_client=sb,
         )
 
-        with patch("ap_proof_logger._resolve_entry_execution_mode", return_value="live"):
+        with patch(
+            "ap.proof_taxonomy_guard.resolve_originating_entry_identity",
+            return_value=_entry_identity(),
+        ):
             _run_full_close_proof(
                 rec,
                 entry_px=1.00,
@@ -358,27 +383,27 @@ class TestOriginatingOrderModeWins:
 
 
 # =============================================================================
-# Test 3 — Reconciler mode fallback when origin is unknown
+# Test 3 — Unknown origin remains quarantined
 # =============================================================================
 
 class TestReconcilerModeFallback:
-    def test_explicit_live_used_when_origin_unknown(self):
-        """Origin returns unknown/empty → explicit reconciler mode is used."""
+    def test_explicit_live_not_used_when_origin_unknown(self):
+        """Unresolved historical origin remains unknown; runtime mode cannot promote it."""
         sb = _InsertCapture()
         rec = _make_reconciler(execution_mode="live", supabase_client=sb)
 
-        with patch("ap_proof_logger._resolve_entry_execution_mode", return_value="unknown"):
+        with patch("ap.proof_taxonomy_guard.resolve_originating_entry_identity", return_value=None):
             _run_full_close_proof(rec)
 
         assert len(sb.inserts) == 1
-        assert sb.inserts[0]["execution_mode"] == "live"
+        assert sb.inserts[0]["execution_mode"] == "unknown"
 
     def test_both_missing_gives_unknown(self):
         """Both origin and explicit are invalid → persist unknown. Never guess live."""
         sb = _InsertCapture()
         rec = _make_reconciler(execution_mode="", supabase_client=sb)
 
-        with patch("ap_proof_logger._resolve_entry_execution_mode", return_value=""):
+        with patch("ap.proof_taxonomy_guard.resolve_originating_entry_identity", return_value=None):
             _run_full_close_proof(rec)
 
         assert len(sb.inserts) == 1
@@ -590,8 +615,18 @@ class TestProofLoggerModePrecedence:
         """Helper: call log_trade and return the persisted execution_mode."""
         from ap_proof_logger import APProofLogger
         proof = APProofLogger(supabase_client=sb, client_email="test@x.com", mode="paper")
+        identity = (
+            _entry_identity(
+                client_id="test@x.com",
+                position_id="",
+                local_order_id="order-1",
+                execution_mode=origin_mode,
+            )
+            if origin_mode in {"live", "paper"}
+            else None
+        )
 
-        with patch("ap_proof_logger._resolve_entry_execution_mode", return_value=origin_mode):
+        with patch("ap.proof_taxonomy_guard.resolve_originating_entry_identity", return_value=identity):
             proof.log_trade(
                 ticker="TSLA", pattern="", side="CALL", timeframe="1d",
                 score=80, tier="A", context_score=80, setup_status="test",
@@ -615,10 +650,10 @@ class TestProofLoggerModePrecedence:
             _InsertCapture(), origin_mode="paper", explicit_mode="live"
         ) == "paper"
 
-    def test_unknown_origin_falls_back_to_explicit_live(self):
+    def test_unknown_origin_does_not_fall_back_to_explicit_live(self):
         assert self._call_log_trade(
             _InsertCapture(), origin_mode="unknown", explicit_mode="live"
-        ) == "live"
+        ) == "unknown"
 
     def test_both_invalid_gives_unknown(self):
         assert self._call_log_trade(

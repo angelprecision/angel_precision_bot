@@ -81,6 +81,10 @@ def _normalize_proof_side(side) -> Optional[str]:
         return None
 
 
+def _normalize_proof_contract(contract) -> str:
+    return str(contract or "").strip().upper().replace(" ", "")
+
+
 class PositionStatus:
     OPEN = "OPEN"
     CLOSING = "CLOSING"
@@ -482,6 +486,12 @@ class APPositionManager:
         self._position_columns()
 
     def _proof_row_exists(self, *, position_id: str = "", local_order_id: str = "") -> Optional[bool]:
+        state = self._proof_row_binding_state(position_id=position_id, local_order_id=local_order_id)
+        if state is None:
+            return None
+        return state in {"bound_position", "local_order_only"}
+
+    def _proof_row_binding_state(self, *, position_id: str = "", local_order_id: str = "") -> Optional[str | bool]:
         def _fn():
             with conn() as c:
                 if position_id:
@@ -490,18 +500,18 @@ class APPositionManager:
                         (self.client_id, position_id),
                     )
                     if c.fetchone():
-                        return True
+                        return "bound_position"
                 if local_order_id:
                     c.execute(
                         "SELECT 1 FROM proof_trades WHERE client_email=%s AND local_order_id=%s LIMIT 1",
                         (self.client_id, local_order_id),
                     )
                     if c.fetchone():
-                        return True
+                        return "local_order_only"
                 return False
 
         try:
-            return bool(run_with_retry(_fn))
+            return run_with_retry(_fn)
         except Exception as exc:
             log.error("[%s] proof row existence check failed: %s", self.client_id, exc)
             return None
@@ -567,6 +577,83 @@ class APPositionManager:
             or (payload or {}).get("direction")
         )
 
+    def _resolve_terminal_strategy_metadata(self, entry_order: dict) -> dict:
+        entry_order = entry_order if isinstance(entry_order, dict) else {}
+        entry_meta = entry_order.get("meta")
+        if isinstance(entry_meta, str):
+            try:
+                import json as _json
+                entry_meta = _json.loads(entry_meta)
+            except Exception:
+                entry_meta = None
+        if not isinstance(entry_meta, dict):
+            entry_meta = {}
+
+        def _first_text(*values) -> str:
+            for value in values:
+                text = str(value or "").strip()
+                if text:
+                    return text
+            return ""
+
+        def _first_float(*values) -> float:
+            for value in values:
+                try:
+                    return float(value)
+                except Exception:
+                    continue
+            return 0.0
+
+        pattern = _first_text(
+            entry_order.get("pattern"),
+            entry_order.get("setup_pattern"),
+            entry_meta.get("pattern"),
+            entry_meta.get("setup_pattern"),
+        )
+        timeframe = _first_text(
+            entry_order.get("timeframe"),
+            entry_order.get("tf"),
+            entry_meta.get("timeframe"),
+            entry_meta.get("tf"),
+        )
+        tier = _first_text(
+            entry_order.get("tier"),
+            entry_order.get("setup_tier"),
+            entry_meta.get("tier"),
+            entry_meta.get("setup_tier"),
+        )
+        score = _first_float(
+            entry_order.get("score"),
+            entry_order.get("setup_score"),
+            entry_meta.get("score"),
+            entry_meta.get("setup_score"),
+        )
+        context_score = _first_float(
+            entry_order.get("context_score"),
+            entry_order.get("ctx_score"),
+            entry_meta.get("context_score"),
+            entry_meta.get("ctx_score"),
+        )
+
+        if pattern and timeframe and tier and score > 0:
+            return {
+                "pattern": pattern,
+                "timeframe": timeframe,
+                "score": score,
+                "tier": tier,
+                "context_score": context_score,
+                "metadata_quarantined": False,
+            }
+
+        return {
+            "pattern": "UNKNOWN_QUARANTINED",
+            "timeframe": "unknown",
+            "score": 0.0,
+            "tier": "UNKNOWN_QUARANTINED",
+            "context_score": 0.0,
+            "metadata_quarantined": True,
+        }
+
     def _resolve_terminal_proof_identity(
         self,
         *,
@@ -576,8 +663,10 @@ class APPositionManager:
     ) -> dict:
         from ap.db import get_order_by_id
 
-        entry_local_order_id = str(local_order_id or "").strip()
+        candidate_local_order_id = str(local_order_id or "").strip()
+        entry_local_order_id = candidate_local_order_id
         entry_order = None
+        invalid_origin = False
         if entry_local_order_id:
             try:
                 entry_order = get_order_by_id(entry_local_order_id, client_id=self.client_id)
@@ -588,6 +677,17 @@ class APPositionManager:
                     entry_local_order_id,
                     exc,
                 )
+            if not entry_order or str(entry_order.get("kind") or "").upper() != "ENTRY":
+                log.critical(
+                    "[%s] TERMINAL_CLOSE_ENTRY_IDENTITY_INVALID pos=%s local_order_id=%s kind=%s",
+                    self.client_id,
+                    position_id,
+                    entry_local_order_id,
+                    str((entry_order or {}).get("kind") or "missing"),
+                )
+                entry_order = None
+                entry_local_order_id = ""
+                invalid_origin = True
 
         entry_meta = (entry_order or {}).get("meta")
         if isinstance(entry_meta, str):
@@ -654,6 +754,7 @@ class APPositionManager:
         return {
             "entry_local_order_id": entry_local_order_id,
             "entry_order": entry_order or {},
+            "invalid_origin": invalid_origin,
             "resolved_side": resolved_side,
             "side_quarantined": side_quarantined,
             "resolved_execution_mode": resolved_mode,
@@ -666,55 +767,74 @@ class APPositionManager:
         contract: str,
         closed_at: str,
         local_order_id: str = "",
+        execution_mode: str = "",
+        side: str = "",
+        contracts: int = 0,
+        entry_option_price: float = 0.0,
     ) -> bool:
-        repair_position_id = f"broker-repair-{self.client_id}-{contract}"
-        if not position_id or not contract or not closed_at:
+        normalized_contract = _normalize_proof_contract(contract)
+        repair_position_id = f"broker-repair-{self.client_id}-{normalized_contract}"
+        entry_local_order_id = str(local_order_id or "").strip()
+        resolved_mode = str(execution_mode or "").strip().lower()
+        resolved_side = _normalize_proof_side(side)
+        try:
+            expected_contracts = int(contracts or 0)
+        except Exception:
+            expected_contracts = 0
+        try:
+            expected_entry_price = float(entry_option_price or 0)
+        except Exception:
+            expected_entry_price = 0.0
+
+        if (
+            not position_id
+            or not normalized_contract
+            or not closed_at
+            or not entry_local_order_id
+            or resolved_mode not in {"live", "paper"}
+            or resolved_side not in {"CALL", "PUT"}
+        ):
+            log.critical(
+                "[%s] BROKER_REPAIR_PROOF_QUARANTINED pos=%s contract=%s reason=missing_lifecycle_identity",
+                self.client_id, position_id, normalized_contract,
+            )
             return False
 
         def _fn():
             with conn() as c:
-                if local_order_id:
-                    c.execute(
-                        """
-                        SELECT id, local_order_id
-                        FROM proof_trades
-                        WHERE client_email=%s
-                          AND position_id=%s
-                          AND closed_at BETWEEN (%s::timestamptz - INTERVAL '15 minutes')
-                                            AND (%s::timestamptz + INTERVAL '15 minutes')
-                          AND (COALESCE(local_order_id, '') = '' OR local_order_id = %s)
-                        ORDER BY ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) ASC
-                        LIMIT 2
-                        """,
-                        (
-                            self.client_id,
-                            repair_position_id,
-                            closed_at,
-                            closed_at,
-                            local_order_id,
-                            closed_at,
-                        ),
-                    )
-                else:
-                    c.execute(
-                        """
-                        SELECT id, local_order_id
-                        FROM proof_trades
-                        WHERE client_email=%s
-                          AND position_id=%s
-                          AND closed_at BETWEEN (%s::timestamptz - INTERVAL '15 minutes')
-                                            AND (%s::timestamptz + INTERVAL '15 minutes')
-                        ORDER BY ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) ASC
-                        LIMIT 2
-                        """,
-                        (
-                            self.client_id,
-                            repair_position_id,
-                            closed_at,
-                            closed_at,
-                            closed_at,
-                        ),
-                    )
+                c.execute(
+                    """
+                    SELECT id
+                    FROM proof_trades
+                    WHERE client_email = %s
+                      AND position_id = %s
+                      AND local_order_id = %s
+                      AND LOWER(COALESCE(NULLIF(BTRIM(execution_mode), ''), NULLIF(BTRIM(mode), ''), '')) = %s
+                      AND UPPER(COALESCE(side, '')) = %s
+                      AND (
+                            %s <= 0
+                         OR COALESCE(contracts, %s) = %s
+                      )
+                      AND (
+                            %s <= 0
+                         OR COALESCE(entry_option_price, 0) <= 0
+                         OR ABS(COALESCE(entry_option_price, 0) - %s) < 0.0001
+                      )
+                    LIMIT 2
+                    """,
+                    (
+                        self.client_id,
+                        repair_position_id,
+                        entry_local_order_id,
+                        resolved_mode,
+                        resolved_side,
+                        expected_contracts,
+                        expected_contracts,
+                        expected_contracts,
+                        expected_entry_price,
+                        expected_entry_price,
+                    ),
+                )
                 candidates = c.fetchall() or []
                 if len(candidates) != 1:
                     return {"claimed": False, "candidate_count": len(candidates)}
@@ -731,15 +851,35 @@ class APPositionManager:
                      WHERE id = %s
                        AND client_email = %s
                        AND position_id = %s
+                       AND local_order_id = %s
+                       AND LOWER(COALESCE(NULLIF(BTRIM(execution_mode), ''), NULLIF(BTRIM(mode), ''), '')) = %s
+                       AND UPPER(COALESCE(side, '')) = %s
+                       AND (
+                             %s <= 0
+                          OR COALESCE(contracts, %s) = %s
+                       )
+                       AND (
+                             %s <= 0
+                          OR COALESCE(entry_option_price, 0) <= 0
+                          OR ABS(COALESCE(entry_option_price, 0) - %s) < 0.0001
+                       )
                     RETURNING id
                     """,
                     (
                         position_id,
-                        local_order_id,
-                        local_order_id,
+                        entry_local_order_id,
+                        entry_local_order_id,
                         candidate.get("id"),
                         self.client_id,
                         repair_position_id,
+                        entry_local_order_id,
+                        resolved_mode,
+                        resolved_side,
+                        expected_contracts,
+                        expected_contracts,
+                        expected_contracts,
+                        expected_entry_price,
+                        expected_entry_price,
                     ),
                 )
                 rows = c.fetchall() or []
@@ -802,9 +942,27 @@ class APPositionManager:
             local_order_id=local_order_id,
             side=side,
         )
+        if identity.get("invalid_origin"):
+            log.critical(
+                "[%s] TERMINAL_CLOSE_PROOF_ORIGIN_INVALID pos=%s local_order_id=%s source=%s",
+                self.client_id, position_id, local_order_id, setup_status,
+            )
+            return False
         resolved_mode = str(identity.get("resolved_execution_mode") or "unknown")
         resolved_side = str(identity.get("resolved_side") or "UNKNOWN_QUARANTINED")
-        quarantined = bool(identity.get("side_quarantined")) or resolved_mode not in {"live", "paper"}
+        strategy = self._resolve_terminal_strategy_metadata(dict(identity.get("entry_order") or {}))
+        quarantined = (
+            bool(identity.get("side_quarantined"))
+            or resolved_mode not in {"live", "paper"}
+            or bool(strategy.get("metadata_quarantined"))
+        )
+        proof_setup_status = str(setup_status or "")
+        if strategy.get("metadata_quarantined"):
+            log.critical(
+                "[%s] TERMINAL_CLOSE_STRATEGY_METADATA_QUARANTINED pos=%s local_order_id=%s",
+                self.client_id, position_id, local_order_id,
+            )
+            proof_setup_status = f"{proof_setup_status}|TERMINAL_METADATA_QUARANTINED"
 
         try:
             from ap.queue import _get_sb_client
@@ -840,13 +998,13 @@ class APPositionManager:
             )
             result = proof.log_trade(
                 ticker=underlying or contract,
-                pattern="",
+                pattern=strategy["pattern"],
                 side=resolved_side,
-                timeframe="1d",
-                score=0,
-                tier="A",
-                context_score=0,
-                setup_status=setup_status,
+                timeframe=strategy["timeframe"],
+                score=float(strategy["score"]),
+                tier=strategy["tier"],
+                context_score=float(strategy["context_score"]),
+                setup_status=proof_setup_status,
                 entry_trigger=float(entry_option_price or 0),
                 entry_option_price=float(entry_option_price or 0),
                 exit_option_price=float(exit_option_price or 0),
@@ -912,15 +1070,25 @@ class APPositionManager:
             local_order_id=local_order_id,
             side=side,
         )
-        entry_local_order_id = str(identity.get("entry_local_order_id") or local_order_id or "")
-        proof_exists = self._proof_row_exists(
+        entry_local_order_id = str(identity.get("entry_local_order_id") or "")
+        if identity.get("invalid_origin"):
+            log.critical(
+                "[%s] TERMINAL_CLOSE_PROOF_ORIGIN_INVALID pos=%s local_order_id=%s source=%s",
+                self.client_id, position_id, local_order_id, setup_status,
+            )
+            proof_exists = self._proof_row_exists(position_id=position_id)
+            if proof_exists is True:
+                return True
+            return False
+
+        proof_state = self._proof_row_binding_state(
             position_id=position_id,
             local_order_id=entry_local_order_id,
         )
-        if proof_exists is True:
+        if proof_state == "bound_position":
             return True
 
-        if proof_exists is None:
+        if proof_state is None:
             log.critical(
                 "[%s] TERMINAL_CLOSE_PROOF_UNVERIFIED pos=%s local_order_id=%s source=%s",
                 self.client_id, position_id, entry_local_order_id, setup_status,
@@ -932,9 +1100,20 @@ class APPositionManager:
             contract=contract,
             closed_at=closed_at,
             local_order_id=entry_local_order_id,
+            execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or ""),
+            side=str(identity.get("resolved_side") or side or ""),
+            contracts=contracts,
+            entry_option_price=entry_option_price,
         )
         if claimed:
             return True
+
+        if proof_state == "local_order_only":
+            log.critical(
+                "[%s] TERMINAL_CLOSE_PROOF_REPAIR_BIND_FAILED pos=%s local_order_id=%s source=%s",
+                self.client_id, position_id, entry_local_order_id, setup_status,
+            )
+            return False
 
         if not allow_fallback_insert:
             log.critical(
@@ -1851,7 +2030,8 @@ class APPositionManager:
                     "opened_at": str(pos.get("entry_ts") or now_utc_iso()),
                     "closed_at": str(ts),
                     "entry_option_price": avg_fill,
-                    "local_order_id": str(pos.get("local_order_id") or local_order_id or ""),
+                    "local_order_id": str(pos.get("local_order_id") or ""),
+                    "exit_local_order_id": str(local_order_id or ""),
                 }
 
         ok, detail = run_with_retry(_fn)
@@ -1876,45 +2056,80 @@ class APPositionManager:
                 if not is_win and abs(dollar_pnl) < BREAKEVEN_DOLLAR and abs(pnl_pct) < BREAKEVEN_PCT:
                     is_win = True  # breakeven — count as win for rate calculation
 
+                entry_local_order_id = str(detail.get("local_order_id") or "")
+
                 def _proof_update():
                     with conn() as c:
                         c.execute(
-                            """UPDATE proof_trades
+                            """
+                            SELECT id
+                            FROM proof_trades
+                            WHERE client_email = %s
+                              AND system_version = 'v2'
+                              AND synthetic_entry = FALSE
+                              AND (
+                                (position_id = %s AND %s <> '')
+                                OR (local_order_id = %s AND %s <> '')
+                              )
+                            LIMIT 2
+                            """,
+                            (
+                                self.client_id,
+                                position_id,
+                                position_id,
+                                entry_local_order_id,
+                                entry_local_order_id,
+                            ),
+                        )
+                        candidates = c.fetchall() or []
+                        if len(candidates) != 1:
+                            return {"updated": False, "candidate_count": len(candidates)}
+                        c.execute(
+                            """
+                            UPDATE proof_trades
                                SET exit_option_price = %s,
                                    option_pnl_pct    = %s,
                                    win               = %s,
                                    exit_reason       = CASE
                                      WHEN exit_reason IS NULL OR exit_reason = ''
                                      THEN %s ELSE exit_reason END
-                               WHERE id = (
-                                 SELECT id FROM proof_trades
-                                 WHERE client_email  = %s
-                                   AND system_version = 'v2'
-                                   AND synthetic_entry = FALSE
-                                   AND (
-                                     (position_id = %s AND %s IS NOT NULL AND %s != '')
-                                     OR (
-                                       position_id IS NULL
-                                       AND closed_at >= NOW() - INTERVAL '2 hours'
-                                     )
-                                   )
-                                 ORDER BY closed_at DESC
-                                 LIMIT 1
-                               )""",
+                             WHERE id = %s
+                               AND client_email = %s
+                            RETURNING id
+                            """,
                             (
                                 round(exit_px, 4),
                                 round(pnl_pct, 2),
                                 is_win,
                                 exit_reason,
+                                candidates[0].get("id"),
                                 self.client_id,
-                                position_id, position_id, position_id,
                             ),
                         )
-                run_with_retry(_proof_update)
-                log.info(
-                    "[%s] proof_trades updated with broker fill | pos=%s exit=$%.2f pnl=%.1f%% win=%s",
-                    self.client_id, position_id, exit_px, pnl_pct, is_win,
-                )
+                        updated = c.fetchall() or []
+                        return {
+                            "updated": len(updated) == 1,
+                            "candidate_count": len(candidates),
+                            "updated_count": len(updated),
+                        }
+
+                proof_update = run_with_retry(_proof_update) or {}
+                if proof_update.get("updated"):
+                    log.info(
+                        "[%s] proof_trades updated with broker fill | pos=%s entry_order=%s "
+                        "exit=$%.2f pnl=%.1f%% win=%s",
+                        self.client_id, position_id, entry_local_order_id, exit_px, pnl_pct, is_win,
+                    )
+                else:
+                    log.critical(
+                        "[%s] PROOF_FILL_REPAIR_CARDINALITY_BLOCKED pos=%s entry_order=%s "
+                        "candidate_count=%s updated_count=%s",
+                        self.client_id,
+                        position_id,
+                        entry_local_order_id,
+                        proof_update.get("candidate_count"),
+                        proof_update.get("updated_count"),
+                    )
             except Exception as _proof_err:
                 log.warning(
                     "[%s] proof_trades fill repair failed (non-fatal): %s",
