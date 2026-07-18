@@ -56,8 +56,8 @@
 
 from __future__ import annotations
 
-import time
-import uuid
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -78,6 +78,9 @@ class ImportIdentity:
     attribution_source: str          # recovered | recovered_price_untrusted | fabricated
     matched_order_id: Optional[str] = None
     matched_order_status: Optional[str] = None
+    durable_fingerprint: str = ""
+    identity_valid: bool = True
+    identity_reason: str = ""
 
     def to_log(self) -> str:
         return (
@@ -206,11 +209,25 @@ def import_identity(
     *,
     contract: str,
     client_id: str,
+    execution_mode: str = "unknown",
+    broker_position: Optional[dict[str, Any]] = None,
+    broker_quantity: int = 0,
+    broker_cost_basis: float = 0.0,
     price_untrusted: bool = False,
     lookback_days: int = LOOKBACK_DAYS_DEFAULT,
 ) -> ImportIdentity:
-    """Single authority for imported-position identity. Never raises."""
-    plan_id = f"{FABRICATED_PREFIX}{contract}:{int(time.time())}"
+    """Single authority for stable imported-position identity. Never raises.
+
+    The fingerprint deliberately excludes poll time.  It prefers durable broker
+    lot/order identity when the broker exposes one, then uses the exact
+    client/mode/contract/economic snapshot and recovered ENTRY lineage.  That
+    makes identical reconciliation polls idempotent without collapsing two
+    broker lots that carry distinct durable identifiers.
+    """
+    normalized_client = str(client_id or "").strip().lower()
+    normalized_mode = str(execution_mode or "").strip().lower()
+    normalized_contract = str(contract or "").strip().upper()
+    broker_position = dict(broker_position or {})
 
     try:
         lineage = recover_lineage(
@@ -218,6 +235,52 @@ def import_identity(
         )
     except Exception:  # defense in depth; recover_lineage already never raises
         lineage = None
+
+    durable_broker_id = ""
+    for key in (
+        "broker_order_id", "order_id", "position_id", "positionId",
+        "lot_id", "lotId", "id",
+    ):
+        value = str(broker_position.get(key) or "").strip()
+        if value:
+            durable_broker_id = f"{key}:{value}"
+            break
+
+    try:
+        normalized_qty = int(broker_quantity or broker_position.get("quantity") or 0)
+    except (TypeError, ValueError):
+        normalized_qty = 0
+    try:
+        normalized_cost = round(float(
+            broker_cost_basis or broker_position.get("cost_basis") or 0.0
+        ), 8)
+    except (TypeError, ValueError):
+        normalized_cost = 0.0
+
+    canonical = {
+        "client_id": normalized_client,
+        "execution_mode": normalized_mode,
+        "contract": normalized_contract,
+        "broker_quantity": normalized_qty,
+        "broker_cost_basis": normalized_cost,
+        "durable_broker_id": durable_broker_id,
+        "entry_order_id": str((lineage or {}).get("order_id") or ""),
+        "signal_id": str((lineage or {}).get("signal_id") or ""),
+    }
+    missing = [
+        name for name, value in (
+            ("client_id", normalized_client),
+            ("execution_mode", normalized_mode if normalized_mode in {"paper", "live"} else ""),
+            ("contract", normalized_contract),
+            ("broker_quantity", normalized_qty if normalized_qty > 0 else 0),
+        ) if not value
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:24]
+    plan_id = f"{FABRICATED_PREFIX}{normalized_contract}:{fingerprint}"
+    identity_valid = not missing
+    identity_reason = "" if identity_valid else f"missing_durable_identity:{','.join(missing)}"
 
     if lineage:
         ident = ImportIdentity(
@@ -230,14 +293,20 @@ def import_identity(
             ),
             matched_order_id=lineage.get("order_id"),
             matched_order_status=lineage.get("order_status"),
+            durable_fingerprint=fingerprint,
+            identity_valid=identity_valid,
+            identity_reason=identity_reason,
         )
     else:
         ident = ImportIdentity(
             plan_id=plan_id,
-            signal_id=f"{FABRICATED_PREFIX}{contract}:{uuid.uuid4().hex[:8]}",
+            signal_id=f"{FABRICATED_PREFIX}{normalized_contract}:{fingerprint}",
             pattern="BROKER_IMPORT_PRICE_UNTRUSTED" if price_untrusted else "BROKER_IMPORT",
             attributed=False,
             attribution_source="fabricated",
+            durable_fingerprint=fingerprint,
+            identity_valid=identity_valid,
+            identity_reason=identity_reason,
         )
     log.info("attribution_integrity: import identity %s/%s → %s",
              client_id, contract, ident.to_log())

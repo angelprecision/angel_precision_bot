@@ -1616,6 +1616,8 @@ class APPositionManager:
         target_underlying: Optional[float] = None,
         local_order_id: Optional[str] = None,
         broker_order_id: Optional[str] = None,
+        execution_mode: Optional[str] = None,
+        historical_plan_idempotency: bool = False,
     ) -> str:
         """
         Atomically insert a new OPEN position and return position_id.
@@ -1640,9 +1642,14 @@ class APPositionManager:
         # defense before persisting the row to the positions truth layer.
         _side = _normalize_position_side(side)
 
+        _execution_mode = str(execution_mode or "").strip().lower()
+        if execution_mode is not None and _execution_mode not in {"paper", "live"}:
+            raise ValueError(f"invalid_or_missing_position_execution_mode:{execution_mode}")
+
         has_local_col = self._has_position_column("local_order_id")
         has_broker_col = self._has_position_column("broker_order_id")
         has_underlying_entry_col = self._has_position_column("underlying_entry")
+        has_execution_mode_col = self._has_position_column("execution_mode")
 
         position_id = str(uuid.uuid4())
         ts = now_utc_iso()
@@ -1695,6 +1702,9 @@ class APPositionManager:
         if broker_order_id and has_broker_col:
             columns.append("broker_order_id")
             values.append(broker_order_id)
+        if _execution_mode and has_execution_mode_col:
+            columns.append("execution_mode")
+            values.append(_execution_mode)
 
         placeholders = ",".join(["%s"] * len(columns))
         col_sql = ", ".join(columns)
@@ -1734,21 +1744,30 @@ class APPositionManager:
             # Active-only business fallback: plan/signal should not permanently
             # block future re-entries after terminal close.
             if plan_id:
+                status_clause = "" if historical_plan_idempotency else "AND status IN ('OPEN','CLOSING')"
+                mode_clause = (
+                    "AND LOWER(COALESCE(execution_mode,''))=%s"
+                    if _execution_mode and has_execution_mode_col else ""
+                )
                 c.execute(
-                    """
+                    f"""
                     SELECT * FROM positions
                     WHERE client_id=%s AND plan_id=%s
-                      AND status IN ('OPEN','CLOSING')
+                      {status_clause}
+                      {mode_clause}
                     ORDER BY entry_ts DESC NULLS LAST, created_at DESC NULLS LAST
                     LIMIT 1
                     """,
-                    (self.client_id, plan_id),
+                    (self.client_id, plan_id, *([_execution_mode] if mode_clause else [])),
                 )
                 row = c.fetchone()
                 if row:
                     return row
 
-            if signal_id:
+            # Deterministic broker-import plan IDs are the economic lifecycle
+            # identity. Two legitimate broker lots may share one recovered
+            # scanner signal, so signal_id must not collapse them.
+            if signal_id and not historical_plan_idempotency:
                 c.execute(
                     """
                     SELECT * FROM positions
