@@ -285,6 +285,27 @@ def test_stronger_direction_flip_uses_same_proof_invariant(cancel_result, expect
         assert_retained(watcher, existing, old)
 
 
+def test_stronger_same_side_false_cancel_retains_owner_and_blocks_replacement():
+    old = signal(signal_id="old", local_order_id="old-lo", side="CALL", score=70)
+    new = signal(signal_id="new", local_order_id="new-lo", side="CALL", score=95)
+    osm = FakeOSM(
+        {"old-lo": row_for(old), "new-lo": row_for(new)},
+        cancel_results={"old-lo": False},
+    )
+    watcher = AuditWatcher(DummyBroker(), order_state_machine=osm)
+    existing = seed(watcher, old)
+
+    assert watcher.add_signal(dict(new)) is False
+    assert_retained(watcher, existing, old)
+    assert "new" not in watcher._dedup_set
+    assert osm.rows["old-lo"]["status"] == "PENDING_TRIGGER"
+    assert any(
+        payload.get("reason_code") == "conflict_cancel_unproven"
+        and "cancel_returned_false_row_pending" in str(payload.get("raw_reason"))
+        for _, payload in watcher.audits
+    )
+
+
 def test_rearm_only_and_higher_timeframe_tie_use_proven_cancellation():
     old = signal(
         signal_id="old", local_order_id="old-lo", side="PUT", score=80, timeframe="15m"

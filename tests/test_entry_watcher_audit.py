@@ -421,22 +421,16 @@ class TestBugEw2EntryTriggerParse:
 # ══════════════════════════════════════════════════════════════════
 
 class TestLastRejectReasonLock:
-    def test_all_reject_reason_writes_are_inside_lock(self):
-        """Every self._last_reject_reason assignment in add_signal()
-        must occur inside the `with self._lock:` block.
-        """
+    def test_reject_reason_is_invocation_local_during_serialized_admission(self):
+        """Conflict I/O stays outside the registry lock without diagnostic races."""
         src = inspect.getsource(APEntryWatcher.add_signal)
-        # Find the `with self._lock:` block boundaries
-        lock_match = re.search(r"with\s+self\._lock\s*:", src)
-        assert lock_match, "add_signal must have a `with self._lock:` block"
-        lock_start = lock_match.end()
-        # Locate every self._last_reject_reason = ... line
-        for m in re.finditer(r"self\._last_reject_reason\s*=", src):
-            assert m.start() >= lock_start, (
-                f"self._last_reject_reason assignment at offset {m.start()} "
-                f"occurs BEFORE `with self._lock:` (at {lock_start}). "
-                f"Move it inside the lock block to avoid concurrent-call race."
-            )
+        assert "with self._watch_admission_gate:" in src
+        assert "self._last_reject_reason =" not in src
+
+        setter = inspect.getsource(APEntryWatcher._last_reject_reason.fset)
+        assert "_CALL_RESULT.get()" in setter
+        assert "call.reason_code = reason" in setter
+        assert "self._shared_last_reject_reason = reason" in setter
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -309,6 +309,15 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 and str(item.side).upper().strip() != side
             ]
 
+    def _same_side(self, ticker: str, side: str) -> list:
+        with self._lock:
+            return [
+                item for item in self._pending
+                if (item.is_active or getattr(item, "rearm_mode", False))
+                and str(item.ticker).upper().strip() == ticker
+                and str(item.side).upper().strip() == side
+            ]
+
     def _block(self, signal: dict, watched, reason: str, detail: str, proof=None) -> bool:
         old = getattr(watched, "signal", None) or {}
         meta = {
@@ -404,6 +413,23 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     signal, remaining[0], "conflict_cancel_unproven",
                     "conflict_cancel_unproven:opposite_reappeared_before_admission",
                 )
+            dedup_key = str(self._dedup_key_for_signal(signal) or "").strip()
+            with self._lock:
+                dedup_seen = bool(dedup_key and dedup_key in self._dedup_set)
+            if dedup_seen:
+                return super().add_signal(signal)
+            same_side = self._same_side(ticker, side)
+            if same_side:
+                best = max(same_side, key=lambda item: float(item.score or 0))
+                if float(signal.get("score") or 0) <= float(best.score or 0):
+                    return self._block(
+                        signal,
+                        best,
+                        "same_side_block",
+                        "same_side_block:existing_watcher_score_wins",
+                    )
+                if not self._prove_remove_all(signal, same_side, "same_side_replace_watcher_cancel"):
+                    return False
             return super().add_signal(signal)
 
     def watch(
