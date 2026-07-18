@@ -421,9 +421,20 @@ def test_duplicate_official_proofs_do_not_duplicate_live_kelly_history(monkeypat
             (client_id, position_id, client_id, position_id),
         )
 
+        class ExecuteReturningCursor:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def execute(self, *args, **kwargs):
+                self._wrapped.execute(*args, **kwargs)
+                return self
+
+            def fetchall(self):
+                return self._wrapped.fetchall()
+
         @contextmanager
         def same_connection():
-            yield cursor
+            yield ExecuteReturningCursor(cursor)
 
         monkeypatch.setattr(guard.db, "conn", same_connection)
         monkeypatch.setattr(guard.db, "run_with_retry", lambda fn: fn())
