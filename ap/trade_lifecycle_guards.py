@@ -29,6 +29,38 @@ _LAST_INSTALLATION_MANIFEST: dict[str, dict[str, str | bool]] = {}
 def install_trade_lifecycle_guards() -> dict[str, dict[str, str | bool]]:
     """Install present guards and return exact deployment attestation."""
     manifest: dict[str, dict[str, str | bool]] = {}
+    # Schema attestation FIRST: guards fence money paths with SQL that
+    # assumes specific tables/columns. Record the schema truth alongside the
+    # guard truth so the deployment manifest states both. Non-raising here
+    # regardless of mode (guard install must never crash `import ap`); the
+    # LIVE fail-closed enforcement lives in client_runner._run_live_preflight.
+    try:
+        from ap.schema_attestation import attest_schema
+
+        _schema_report = attest_schema(strict=False)
+        manifest["_schema_attestation"] = {
+            "name": "_schema_attestation",
+            "module": "ap.schema_attestation",
+            "installer": "attest_schema",
+            "required_when_present": True,
+            "status": "ok" if _schema_report.get("ok") else "failed",
+            "detail": str({
+                "missing_tables": _schema_report.get("missing_tables"),
+                "missing_columns": _schema_report.get("missing_columns"),
+                "skipped": _schema_report.get("skipped"),
+                "error": _schema_report.get("error"),
+            }),
+        }
+    except Exception as exc:  # pragma: no cover — attestation must not break import
+        manifest["_schema_attestation"] = {
+            "name": "_schema_attestation",
+            "module": "ap.schema_attestation",
+            "installer": "attest_schema",
+            "required_when_present": True,
+            "status": "attestation_error",
+            "detail": str(exc),
+        }
+        log.error("schema attestation errored during guard install: %s", exc)
     for guard_name, module_name, installer_name, required in _GUARDS:
         record: dict[str, str | bool] = {
             "name": guard_name,

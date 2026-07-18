@@ -102,6 +102,7 @@ jobs:
             tests/test_p0_reconciler_proof_persistence.py \
             tests/test_p0_expired_broker_import_idempotency.py \
             tests/test_p0_broker_confirmed_daily_trade_count.py \
+            tests/test_p0_schema_attestation_and_migration_runner.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes
