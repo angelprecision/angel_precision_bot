@@ -346,7 +346,7 @@ def test_duplicate_same_mode_rows_triggers_ambiguous_closes_none(production_db):
     assert rows["dup-a"] == "OPEN", "First duplicate must NOT be closed when ambiguous"
     assert rows["dup-b"] == "OPEN", "Second duplicate must NOT be closed when ambiguous"
     assert any("AMBIGUOUS" in a for a in alerts), "Must emit AMBIGUOUS alert"
-    assert any(
+    assert (
         "expired_broker_import_position_ambiguous" in (summary.get("errors") or [])
     ), "Must record ambiguous error in summary"
 
