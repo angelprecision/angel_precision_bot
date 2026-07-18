@@ -38,12 +38,8 @@ _ORIGINAL_ATTR = "_AP_PARTIAL_EXIT_OWNERSHIP_GUARD_ORIGINAL"
 # Removed _RETRY_PATCHED_ATTR / _RETRY_ORIGINAL_ATTR: the retry path is now
 # covered by wrapping _run_reconciliation_attempt, not the outer retry function.
 
-_PARTIAL_STATUSES = {
-    "PARTIAL_FILL",
-    "PARTIALLY_FILLED",
-    "PARTIAL",
-    "EXIT_PARTIAL_FILL",
-}
+# _PARTIAL_STATUSES removed — delegated to ap.exit_fill_truth_guard._is_partial_result
+# to prevent the two classification sets drifting independently over time.
 
 
 def _int(value: Any, default: int = 0) -> int:
@@ -56,23 +52,19 @@ def _int(value: Any, default: int = 0) -> int:
 def is_partial_exit_result(order: dict[str, Any], result: dict[str, Any]) -> bool:
     """Return True iff this is an active partial EXIT.
 
-    Status resolution mirrors the canonical predicate in
-    ``exit_fill_truth_guard._is_partial_result`` exactly:
+    Delegates to the canonical predicate in
+    ``exit_fill_truth_guard._is_partial_result`` so this guard and the
+    reducer always use the same classification logic and cannot drift apart.
 
+    Status resolution (inherited from canonical):
         result["status"] → result["state"] → order["status"]
 
-    Resolved inline to avoid importing ``exit_fill_truth_guard`` at call time
-    (which pulls in ``ap.db`` and requires DATABASE_URL during tests).
     ``order["state"]`` is not checked because the canonical predicate does not
-    check it.
+    check it.  The import is placed inside the function to avoid module-level
+    coupling with ``exit_fill_truth_guard`` (which pulls in ``ap.db``).
     """
-    status = str(
-        result.get("status")
-        or result.get("state")
-        or order.get("status")
-        or ""
-    ).strip().upper()
-    return status in _PARTIAL_STATUSES
+    from ap.exit_fill_truth_guard import _is_partial_result
+    return _is_partial_result(order, result)
 
 
 def partial_exit_ownership_fields(

@@ -102,7 +102,11 @@ def _reconciled(
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestIsPartialExitResult:
-    """Status resolution: result.status → result.state → order.status."""
+    """Status resolution: result.status → result.state → order.status.
+
+    is_partial_exit_result delegates to exit_fill_truth_guard._is_partial_result,
+    so every assertion here also verifies parity with the canonical predicate.
+    """
 
     def test_result_status_triggers(self) -> None:
         assert is_partial_exit_result(_order(), _result(status="PARTIAL_FILL")) is True
@@ -134,6 +138,48 @@ class TestIsPartialExitResult:
     ])
     def test_terminal_statuses_excluded(self, status: str) -> None:
         assert is_partial_exit_result(_order(), _result(status=status)) is False
+
+    def test_guard_result_equals_canonical_across_all_statuses(self) -> None:
+        """Guard is mathematically identical to the canonical predicate.
+
+        Checks every supported partial status and every terminal status
+        against both is_partial_exit_result and _is_partial_result directly.
+        Any divergence here means the two classification paths have drifted.
+        """
+        from ap.exit_fill_truth_guard import _is_partial_result
+
+        probes = [
+            # (result_status, result_state, order_status)
+            ("PARTIAL_FILL",      None,                None),
+            ("PARTIALLY_FILLED",  None,                None),
+            ("PARTIAL",           None,                None),
+            ("EXIT_PARTIAL_FILL", None,                None),
+            (None,                "PARTIALLY_FILLED",  None),
+            (None,                None,                "PARTIAL_FILL"),
+            (None,                None,                "EXIT_PARTIAL_FILL"),
+            ("FILLED",            None,                None),
+            ("EXIT_FILLED",       None,                None),
+            ("CANCELED",          None,                None),
+            ("REJECTED",          None,                None),
+            ("",                  None,                None),
+            (None,                None,                None),
+        ]
+        for r_status, r_state, o_status in probes:
+            result: dict[str, Any] = {}
+            if r_status is not None:
+                result["status"] = r_status
+            if r_state is not None:
+                result["state"] = r_state
+            order: dict[str, Any] = {}
+            if o_status is not None:
+                order["status"] = o_status
+
+            guard_answer    = is_partial_exit_result(order, result)
+            canonical_answer = _is_partial_result(order, result)
+            assert guard_answer == canonical_answer, (
+                f"Divergence: r_status={r_status!r} r_state={r_state!r} "
+                f"o_status={o_status!r} → guard={guard_answer} canonical={canonical_answer}"
+            )
 
     # ── Regressions ───────────────────────────────────────────────────────────
 
@@ -409,6 +455,61 @@ class TestRetryPath:
         src = open(g.__file__).read()
         for forbidden in ("broker.submit", "broker.cancel"):
             assert forbidden not in src
+
+    def test_verify_handles_production_shaped_reconciled_return(self) -> None:
+        """Regression: verify_partial_exit_ownership must run correctly when
+        reconciled contains ONLY position_id, projection, and exit_ownership.
+
+        This is the exact shape _run_reconciliation_attempt returns on both
+        paths.  Prior to the wrap-at-the-leaf approach, callers that
+        reconstructed status/qty/filled_qty from the return dict saw empty
+        values, causing is_partial_exit_result to return False and silently
+        skip ownership verification on the retry path.
+
+        This test proves the guard reads status and qty from order/result
+        (not from reconciled), so the verifier runs regardless of what the
+        return dict contains.
+        """
+        # order and result exactly as retry_exit_fill_reconciliation passes them
+        order = {
+            "client_id":       "test@client.com",
+            "local_order_id":  "exit-prod-001",
+            "broker_order_id": "BR-PROD-001",
+            "status":          "EXIT_PARTIAL_FILL",   # DB order row field
+            "filled_qty":      3,
+            "qty":             5,
+        }
+        result = {
+            # built from order fields by retry_exit_fill_reconciliation
+            "status":          order["status"],
+            "broker_order_id": order["broker_order_id"],
+            "filled_qty":      order["filled_qty"],
+        }
+        # Production-shaped _run_reconciliation_attempt return:
+        # no "status", no "qty", no "filled_qty" — only the three canonical keys.
+        reconciled = {
+            "position_id": "pos-prod-001",
+            "projection":  SimpleNamespace(closed=False),
+            "exit_ownership": {
+                "exit_in_flight": True,
+                "pending_exit_local_order_id":  "exit-prod-001",
+                "pending_exit_broker_order_id": "BR-PROD-001",
+                "pending_exit_qty": 2,           # 5 − 3
+            },
+        }
+        # Sanity: confirm reconciled really lacks the fields that broke the old path
+        assert "status"     not in reconciled
+        assert "qty"        not in reconciled
+        assert "filled_qty" not in reconciled
+
+        out = verify_partial_exit_ownership(order, result, reconciled)
+
+        assert "partial_exit_ownership_verified" in out, (
+            "Verifier must run even when reconciled has no status/qty/filled_qty. "
+            "If this fails the guard is incorrectly reading status from reconciled "
+            "instead of from the order/result parameters."
+        )
+        assert out["partial_exit_ownership_verified"] is True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
