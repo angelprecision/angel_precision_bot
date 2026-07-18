@@ -617,3 +617,109 @@ def test_broker_repair_unresolved_mode_not_suppressed() -> None:
         assert guard.should_hold_early_green_one_contract(
             pos, _touched_stop(), decision_code="TOUCHED_PROFIT_STOP", runner_arm_pct=arm
         ) is False, f"mode={mode!r} must not suppress"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 17. No deployment or environment file enables the flag (default-off attestation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_flag_absent_from_render_config() -> None:
+    """Requirement 17: LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED must not
+    appear in render.yaml or any environment file. Enabling it is a separate
+    operational rollout decision, not part of this PR install."""
+    import pathlib
+    import re
+
+    repo_root = pathlib.Path(__file__).parent.parent
+    candidate_files = list(repo_root.glob("render.yaml")) + \
+                      list(repo_root.glob("render.yml")) + \
+                      list(repo_root.glob(".env")) + \
+                      list(repo_root.glob(".env.*")) + \
+                      list(repo_root.glob("*.env"))
+
+    pattern = re.compile(
+        r"LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED\s*=\s*(?!0\b|false|False|FALSE|\"0\"|'0')"
+    )
+    for f in candidate_files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        m = pattern.search(text)
+        assert m is None, (
+            f"{f.name} enables LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED "
+            f"(found {m.group()!r}); enabling the flag must be a separate "
+            "operational rollout decision, not part of this PR"
+        )
+
+
+def test_flag_absent_from_github_workflow() -> None:
+    """Requirement 17: the flag must not be set to a truthy value in CI config."""
+    import pathlib
+    import re
+
+    workflows_dir = pathlib.Path(__file__).parent.parent / ".github" / "workflows"
+    if not workflows_dir.exists():
+        return
+
+    pattern = re.compile(
+        r"LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED\s*[:=]\s*(?!0\b|false|\"0\"|'0'|\"false\"|'false')\S"
+    )
+    for f in workflows_dir.glob("*.yml"):
+        text = f.read_text(encoding="utf-8", errors="ignore")
+        m = pattern.search(text)
+        assert m is None, (
+            f"{f.name} enables LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED "
+            f"in CI (found {m.group()!r}); this PR installs default-off only"
+        )
+
+
+def test_one_contract_guard_listed_in_lifecycle_guards_as_not_required() -> None:
+    """Lifecycle wiring: one_contract_policy must be registered with required=False.
+
+    The guard is installed by ``install_trade_lifecycle_guards()`` but because
+    the feature flag is off, it never changes live exit behaviour until
+    LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED is explicitly set.
+    ``required=False`` means the preflight check does not block deployment
+    if the module is absent on a branch where this PR hasn't merged yet.
+    """
+    import importlib
+    import types
+
+    # Read ap/trade_lifecycle_guards.py as source to avoid triggering ap.db
+    # which requires DATABASE_URL at import time.
+    import pathlib, ast
+
+    guards_src = (
+        pathlib.Path(__file__).parent.parent / "ap" / "trade_lifecycle_guards.py"
+    ).read_text(encoding="utf-8")
+
+    # Extract _GUARDS via AST — no module execution needed.
+    tree = ast.parse(guards_src)
+    guards_value = None
+    for node in ast.walk(tree):
+        # _GUARDS may be a plain Assign or an AnnAssign (annotated assignment)
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "_GUARDS":
+                    guards_value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "_GUARDS":
+                guards_value = node.value
+
+    assert guards_value is not None, "_GUARDS not found in trade_lifecycle_guards.py"
+    elts = guards_value.elts  # type: ignore[attr-defined]
+    guard_map: dict[str, bool] = {}
+    for elt in elts:
+        if isinstance(elt, ast.Tuple) and len(elt.elts) == 4:
+            name_node, _, _, required_node = elt.elts
+            if isinstance(name_node, ast.Constant) and isinstance(required_node, ast.Constant):
+                guard_map[name_node.value] = bool(required_node.value)
+
+    assert "one_contract_policy" in guard_map, (
+        "one_contract_policy must be registered in ap.trade_lifecycle_guards._GUARDS"
+    )
+    assert guard_map["one_contract_policy"] is False, (
+        "one_contract_policy must be registered with required=False "
+        "so that deployment is never blocked while the flag is disabled"
+    )
