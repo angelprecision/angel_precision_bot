@@ -377,6 +377,9 @@ def wrap_log_trade(original: Callable[..., dict]) -> Callable[..., dict]:
         bound.apply_defaults()
         supplied_local_id = str(bound.arguments.get("local_order_id") or "").strip()
         position_id = str(bound.arguments.get("position_id") or "").strip()
+        metadata_quarantined = "TERMINAL_METADATA_QUARANTINED" in str(
+            bound.arguments.get("setup_status") or ""
+        )
         identity = resolve_originating_entry_identity(
             client_id=str(getattr(self, "email", "") or ""),
             position_id=position_id,
@@ -387,13 +390,28 @@ def wrap_log_trade(original: Callable[..., dict]) -> Callable[..., dict]:
             bound.arguments["local_order_id"] = identity.local_order_id
             bound.arguments["position_id"] = identity.position_id or position_id
             bound.arguments["execution_mode"] = identity.execution_mode
-            bound.arguments["synthetic_entry"] = identity.synthetic_entry
+            bound.arguments["synthetic_entry"] = bool(
+                bound.arguments.get("synthetic_entry")
+                or identity.synthetic_entry
+                or metadata_quarantined
+            )
         elif supplied_local_id or position_id:
             bound.arguments["local_order_id"] = ""
             bound.arguments["execution_mode"] = "unknown"
 
         result = original(*bound.args, **bound.kwargs)
         stamp = _lifecycle_proof_stamp(identity)
+        if metadata_quarantined:
+            stamp.update(
+                {
+                    "synthetic_entry": True,
+                    "official_live_performance_eligible": False,
+                    "performance_taxonomy": "UNKNOWN_QUARANTINED",
+                    "training_eligible": False,
+                    "taxonomy_reason": "terminal_fallback_strategy_metadata_unproven",
+                    "quote_domain_consistent": False,
+                }
+            )
         result.update(stamp)
         _persist_stamp(self, result, stamp)
         return result

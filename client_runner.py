@@ -1856,7 +1856,7 @@ class ClientRunner(threading.Thread):
             def _get_open():
                 with conn() as c:
                     c.execute(
-                        "SELECT id, contract, underlying, avg_fill, qty "
+                        "SELECT id, contract, underlying, avg_fill, qty, side, local_order_id, entry_ts "
                         "FROM positions WHERE client_id=%s AND status='OPEN'",
                         (self.email,)
                     )
@@ -1892,6 +1892,40 @@ class ClientRunner(threading.Thread):
                                     (ts, ts, pid)
                                 )
                         run_with_retry(_close)
+
+                        try:
+                            pm = getattr(self, "position_manager", None)
+                            if pm and hasattr(pm, "_ensure_terminal_close_proof"):
+                                ensured = pm._ensure_terminal_close_proof(
+                                    position_id=str(pos_id),
+                                    contract=contract,
+                                    local_order_id=str(pos.get("local_order_id") or ""),
+                                    underlying=str(pos.get("underlying") or contract),
+                                    side=str(pos.get("side") or ""),
+                                    opened_at=str(pos.get("entry_ts") or now_iso),
+                                    closed_at=now_iso,
+                                    entry_option_price=float(pos.get("avg_fill") or 0),
+                                    exit_option_price=float(pos.get("avg_fill") or 0),
+                                    contracts=int(pos.get("qty") or 1),
+                                    exit_reason="MANUAL_CLIENT_CLOSE_UNVERIFIED",
+                                    option_pnl_pct=0.0,
+                                    setup_status="manual_client_close",
+                                    execution_mode="",
+                                    exit_fill_price=None,
+                                    allow_fallback_insert=False,
+                                    missing_reason_code="MANUAL_CLOSE_PROOF_UNCLAIMED",
+                                )
+                                if not ensured:
+                                    logger.error(
+                                        "[%s] MANUAL_CLOSE_PROOF_UNCLAIMED pos=%s contract=%s "
+                                        "closed_at=%s — position closed but no repair proof row bound",
+                                        self.email, pos_id, contract, now_iso,
+                                    )
+                        except Exception as proof_err:
+                            logger.error(
+                                "[%s] MANUAL_CLOSE_PROOF_BIND_FAILED pos=%s contract=%s err=%s",
+                                self.email, pos_id, contract, proof_err,
+                            )
 
                         # Also notify exit engine to remove this position
                         core = getattr(self, "core", None)

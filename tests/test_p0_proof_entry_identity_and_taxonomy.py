@@ -128,6 +128,231 @@ def test_proof_writer_uses_originating_entry_mode_not_explicit_live(monkeypatch)
     assert result["training_eligible"] is False
 
 
+def test_resolved_identity_cannot_clear_caller_synthetic_entry(monkeypatch) -> None:
+    captured = {}
+
+    def original(
+        self,
+        ticker,
+        *,
+        position_id="",
+        local_order_id="",
+        execution_mode="",
+        synthetic_entry=False,
+    ):
+        captured.update(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            execution_mode=execution_mode,
+            synthetic_entry=synthetic_entry,
+        )
+        return {"_proof_persisted": True, "synthetic_entry": synthetic_entry}
+
+    monkeypatch.setattr(
+        guard,
+        "resolve_originating_entry_identity",
+        lambda **kwargs: _identity(execution_mode="live", synthetic_entry=False),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_lifecycle_proof_stamp",
+        lambda identity: {
+            "position_id": identity.position_id,
+            "local_order_id": identity.local_order_id,
+            "execution_mode": identity.execution_mode,
+            "performance_taxonomy": "LIVE_UNRECONCILED",
+            "training_eligible": False,
+        },
+    )
+    monkeypatch.setattr(guard, "_persist_stamp", lambda *args, **kwargs: None)
+
+    result = guard.wrap_log_trade(original)(
+        SimpleNamespace(email="client@example.com"),
+        "SPY",
+        position_id="position-1",
+        local_order_id="entry-order-1",
+        execution_mode="live",
+        synthetic_entry=True,
+    )
+
+    assert captured["execution_mode"] == "live"
+    assert captured["synthetic_entry"] is True
+    assert result["synthetic_entry"] is True
+
+
+def test_terminal_metadata_quarantine_reaches_original_logger(monkeypatch) -> None:
+    captured = {}
+
+    def original(
+        self,
+        ticker,
+        *,
+        position_id="",
+        local_order_id="",
+        setup_status="",
+        execution_mode="",
+        synthetic_entry=False,
+    ):
+        captured.update(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            setup_status=setup_status,
+            execution_mode=execution_mode,
+            synthetic_entry=synthetic_entry,
+        )
+        return {
+            "_proof_persisted": True,
+            "position_id": position_id,
+            "local_order_id": local_order_id,
+            "setup_status": setup_status,
+            "execution_mode": execution_mode,
+            "synthetic_entry": synthetic_entry,
+        }
+
+    monkeypatch.setattr(
+        guard,
+        "resolve_originating_entry_identity",
+        lambda **kwargs: _identity(execution_mode="live", synthetic_entry=False),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_lifecycle_proof_stamp",
+        lambda identity: {
+            "position_id": identity.position_id,
+            "local_order_id": identity.local_order_id,
+            "execution_mode": identity.execution_mode,
+            "official_live_performance_eligible": True,
+            "performance_taxonomy": "LIVE_OFFICIAL",
+            "training_eligible": True,
+        },
+    )
+    monkeypatch.setattr(guard, "_persist_stamp", lambda *args, **kwargs: None)
+
+    result = guard.wrap_log_trade(original)(
+        SimpleNamespace(email="client@example.com"),
+        "SPY",
+        position_id="position-1",
+        local_order_id="entry-order-1",
+        setup_status="broker_exit_fill|TERMINAL_METADATA_QUARANTINED",
+        execution_mode="live",
+        synthetic_entry=False,
+    )
+
+    assert captured["synthetic_entry"] is True
+    assert result["synthetic_entry"] is True
+    assert result["official_live_performance_eligible"] is False
+    assert result["training_eligible"] is False
+
+
+def test_initial_payload_stays_synthetic_when_stamp_persist_is_noop(monkeypatch) -> None:
+    inserted = {}
+
+    def original(
+        self,
+        ticker,
+        *,
+        position_id="",
+        local_order_id="",
+        setup_status="",
+        execution_mode="",
+        synthetic_entry=False,
+    ):
+        inserted.update(
+            ticker=ticker,
+            position_id=position_id,
+            local_order_id=local_order_id,
+            setup_status=setup_status,
+            execution_mode=execution_mode,
+            synthetic_entry=synthetic_entry,
+        )
+        return {"_proof_persisted": True, **inserted}
+
+    monkeypatch.setattr(
+        guard,
+        "resolve_originating_entry_identity",
+        lambda **kwargs: _identity(execution_mode="live", synthetic_entry=False),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_lifecycle_proof_stamp",
+        lambda identity: {
+            "position_id": identity.position_id,
+            "local_order_id": identity.local_order_id,
+            "execution_mode": identity.execution_mode,
+            "official_live_performance_eligible": True,
+            "performance_taxonomy": "LIVE_OFFICIAL",
+            "training_eligible": True,
+        },
+    )
+    monkeypatch.setattr(guard, "_persist_stamp", lambda *args, **kwargs: None)
+
+    guard.wrap_log_trade(original)(
+        SimpleNamespace(email="client@example.com"),
+        "SPY",
+        position_id="position-1",
+        local_order_id="entry-order-1",
+        setup_status="broker_exit_fill|TERMINAL_METADATA_QUARANTINED",
+        execution_mode="live",
+        synthetic_entry=True,
+    )
+
+    assert inserted["synthetic_entry"] is True
+    assert inserted["setup_status"].endswith("TERMINAL_METADATA_QUARANTINED")
+
+
+def test_fully_attributed_entry_remains_non_synthetic(monkeypatch) -> None:
+    captured = {}
+
+    def original(
+        self,
+        ticker,
+        *,
+        position_id="",
+        local_order_id="",
+        execution_mode="",
+        synthetic_entry=False,
+    ):
+        captured.update(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            execution_mode=execution_mode,
+            synthetic_entry=synthetic_entry,
+        )
+        return {"_proof_persisted": True, "synthetic_entry": synthetic_entry}
+
+    monkeypatch.setattr(
+        guard,
+        "resolve_originating_entry_identity",
+        lambda **kwargs: _identity(execution_mode="live", synthetic_entry=False),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_lifecycle_proof_stamp",
+        lambda identity: {
+            "position_id": identity.position_id,
+            "local_order_id": identity.local_order_id,
+            "execution_mode": identity.execution_mode,
+            "official_live_performance_eligible": True,
+            "performance_taxonomy": "LIVE_OFFICIAL",
+            "training_eligible": True,
+        },
+    )
+    monkeypatch.setattr(guard, "_persist_stamp", lambda *args, **kwargs: None)
+
+    result = guard.wrap_log_trade(original)(
+        SimpleNamespace(email="client@example.com"),
+        "SPY",
+        position_id="position-1",
+        local_order_id="entry-order-1",
+        execution_mode="live",
+        synthetic_entry=False,
+    )
+
+    assert captured["synthetic_entry"] is False
+    assert result["synthetic_entry"] is False
+    assert result["performance_taxonomy"] == "LIVE_OFFICIAL"
+
+
 def test_unresolved_supplied_order_cannot_become_live_proof(monkeypatch) -> None:
     captured = {}
 
