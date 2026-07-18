@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -310,60 +311,113 @@ def _postgres_connection_or_skip():
     psycopg2 = pytest.importorskip("psycopg2")
     url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL")
     if not url:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail("INTELLIGENCE_POSTGRES_TEST_URL is required in GitHub Actions")
         pytest.skip("PostgreSQL integration URL unavailable")
     try:
         return psycopg2.connect(url)
     except Exception as exc:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail(f"PostgreSQL integration unavailable: {exc}")
         pytest.skip(f"PostgreSQL integration unavailable: {exc}")
+
+
+def _apply_postgres_proof_migrations(connection) -> None:
+    root = Path(__file__).resolve().parents[1]
+    generation_sql = (root / "migrations" / "20260717_exit_decision_generation_claims.sql").read_text()
+    taxonomy_sql = (root / "migrations" / "20260716_proof_performance_taxonomy.sql").read_text()
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS public.proof_trades ("
+            "id BIGSERIAL PRIMARY KEY, "
+            "client_email TEXT, "
+            "position_id TEXT, "
+            "closed_at TIMESTAMPTZ)"
+        )
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS public.positions ("
+            "id TEXT PRIMARY KEY, "
+            "client_id TEXT, "
+            "execution_mode TEXT, "
+            "status TEXT, "
+            "realized_pnl NUMERIC, "
+            "avg_fill NUMERIC, "
+            "exit_price NUMERIC, "
+            "qty INTEGER, "
+            "entry_ts TIMESTAMPTZ)"
+        )
+        cursor.execute(generation_sql)
+        cursor.execute(
+            "SELECT to_regclass('public.exit_decision_generation_claims') IS NOT NULL"
+        )
+        assert cursor.fetchone()[0] is True
+        cursor.execute(taxonomy_sql)
+        cursor.execute(taxonomy_sql)
+
+
+def _cleanup_postgres_proof_rows(connection, client_id: str, position_id: str) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM public.proof_trades WHERE client_email=%s OR position_id=%s", (client_id, position_id))
+        cursor.execute("DELETE FROM public.positions WHERE client_id=%s OR id=%s", (client_id, position_id))
 
 
 def test_migrations_run_in_stack_order_and_are_idempotent_on_postgres() -> None:
     connection = _postgres_connection_or_skip()
     connection.autocommit = True
     try:
+        _apply_postgres_proof_migrations(connection)
         with connection.cursor() as cursor:
-            cursor.execute("SET search_path TO pg_temp, public")
-            cursor.execute(
-                "CREATE TEMP TABLE proof_trades ("
-                "client_email TEXT, position_id TEXT, closed_at TIMESTAMPTZ)"
-            )
-            root = Path(__file__).resolve().parents[1]
-            generation_sql = (root / "migrations" / "20260717_exit_decision_generation_claims.sql").read_text()
-            taxonomy_sql = (root / "migrations" / "20260716_proof_performance_taxonomy.sql").read_text()
-            cursor.execute(generation_sql)
-            cursor.execute(taxonomy_sql)
-            cursor.execute(taxonomy_sql)
             cursor.execute(
                 "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema LIKE 'pg_temp_%%' AND table_name='proof_trades'"
+                "WHERE table_schema='public' AND table_name='proof_trades'"
             )
             columns = {row[0] for row in cursor.fetchall()}
-            assert {"performance_taxonomy", "training_eligible"} <= columns
+            assert {
+                "execution_mode",
+                "official_live_performance_eligible",
+                "performance_taxonomy",
+                "training_eligible",
+                "taxonomy_reason",
+                "quote_domain_consistent",
+            } <= columns
+            cursor.execute(
+                "SELECT indexname, indexdef FROM pg_indexes "
+                "WHERE schemaname='public' AND tablename='proof_trades' "
+                "AND indexname='idx_proof_trades_live_training_position'"
+            )
+            index_row = cursor.fetchone()
+            assert index_row is not None
+            assert "WHERE training_eligible IS TRUE" in index_row[1]
     finally:
         connection.close()
 
 
 def test_duplicate_official_proofs_do_not_duplicate_live_kelly_history(monkeypatch) -> None:
     connection = _postgres_connection_or_skip()
+    connection.autocommit = True
+    client_id = f"live-proof-{uuid4()}@example.com"
+    position_id = f"position-{uuid4()}"
     try:
         from psycopg2.extras import RealDictCursor
+        _apply_postgres_proof_migrations(connection)
+        _cleanup_postgres_proof_rows(connection, client_id, position_id)
+
         cursor = connection.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SET search_path TO pg_temp, public")
         cursor.execute(
-            "CREATE TEMP TABLE positions (client_id TEXT, id TEXT, execution_mode TEXT, "
-            "status TEXT, realized_pnl NUMERIC, avg_fill NUMERIC, exit_price NUMERIC, qty INTEGER)"
+            "INSERT INTO public.positions "
+            "(id, client_id, execution_mode, status, realized_pnl, avg_fill, exit_price, qty, entry_ts) "
+            "VALUES (%s, %s, 'live', 'CLOSED', 80, 1.2, 2.0, 1, NOW())",
+            (position_id, client_id),
         )
         cursor.execute(
-            "CREATE TEMP TABLE proof_trades (client_email TEXT, position_id TEXT, training_eligible BOOLEAN)"
-        )
-        cursor.execute(
-            "INSERT INTO positions VALUES "
-            "('live@example.com','position-1','live','CLOSED',80,1.2,2.0,1)"
-        )
-        cursor.execute(
-            "INSERT INTO proof_trades VALUES "
-            "('live@example.com','position-1',true),"
-            "('live@example.com','position-1',true)"
+            "INSERT INTO public.proof_trades "
+            "(client_email, position_id, closed_at, execution_mode, "
+            " official_live_performance_eligible, performance_taxonomy, training_eligible, "
+            " taxonomy_reason, quote_domain_consistent) "
+            "VALUES "
+            "(%s, %s, NOW(), 'live', TRUE, 'LIVE_OFFICIAL', TRUE, 'existing_tradier_exit_proof_lock_passed', TRUE), "
+            "(%s, %s, NOW(), 'live', TRUE, 'LIVE_OFFICIAL', TRUE, 'existing_tradier_exit_proof_lock_passed', TRUE)",
+            (client_id, position_id, client_id, position_id),
         )
 
         @contextmanager
@@ -373,8 +427,11 @@ def test_duplicate_official_proofs_do_not_duplicate_live_kelly_history(monkeypat
         monkeypatch.setattr(guard.db, "conn", same_connection)
         monkeypatch.setattr(guard.db, "run_with_retry", lambda fn: fn())
         wrapped = guard.wrap_fetch_history(lambda *_: [])
-        rows = wrapped(SimpleNamespace(execution_mode="live"), "live@example.com")
+        rows = wrapped(SimpleNamespace(execution_mode="live"), client_id)
         assert len(rows) == 1
         assert float(rows[0]["realized_pnl"]) == 80.0
     finally:
-        connection.close()
+        try:
+            _cleanup_postgres_proof_rows(connection, client_id, position_id)
+        finally:
+            connection.close()
