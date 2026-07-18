@@ -28,6 +28,32 @@ import ap_exit_engine as engine_module
 from ap_exit_engine import ExitDecision, _classify_exit_decision, _effective_thresholds
 
 
+# ── Dynamic OCC date strings (date-stable across CI calendar days) ─────────────
+# _TEST_TODAY is captured once at import time using the production trading-day
+# timezone (America/New_York) so tests behave identically to the live bot and
+# are immune to midnight rollovers during test collection.
+from datetime import datetime as _datetime_cls, timedelta as _timedelta
+from zoneinfo import ZoneInfo as _ZoneInfo
+
+_TEST_TODAY = _datetime_cls.now(_ZoneInfo("America/New_York")).date()
+
+def _expiry(days: int) -> str:
+    """Return a YYMMDD OCC expiry date string relative to today in ET."""
+    return (_TEST_TODAY + _timedelta(days=days)).strftime("%y%m%d")
+
+_D_0DTE = _expiry(0)   # 0DTE  → arm 0.20 (index) or 0.22 (equity)
+_D_1DTE = _expiry(1)   # 1DTE  → arm 0.25
+_D_2DTE = _expiry(2)   # 2DTE  → arm 0.25
+_D_STD  = _expiry(14)  # standard (14d) → arm 0.12
+
+_SPY_0DTE  = f"SPY{_D_0DTE}C00600000"
+_AAPL_0DTE = f"AAPL{_D_0DTE}C00200000"
+_SPY_1DTE  = f"SPY{_D_1DTE}C00600000"
+_AAPL_2DTE = f"AAPL{_D_2DTE}C00200000"
+_SPY_STD   = f"SPY{_D_STD}C00600000"
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Position factories using real option symbols so _effective_thresholds resolves
 # the canonical DTE/instrument threshold, not a test-hard-coded value.
@@ -36,7 +62,7 @@ from ap_exit_engine import ExitDecision, _classify_exit_decision, _effective_thr
 def _pos(
     *,
     execution_mode: str = "live",
-    option_symbol: str = "SPY260717C00600000",  # 0DTE SPY → arm=0.20
+    option_symbol: str = _SPY_0DTE,  # 0DTE SPY → arm=0.20
     ticker: str = "SPY",
     quantity_remaining: int = 1,
     scale_outs_done: int = 0,
@@ -81,7 +107,7 @@ def _resolved_arm(pos: SimpleNamespace) -> float:
 
 def test_spy_0dte_peak_14_pct_holds_with_canonical_20pct_arm() -> None:
     """Requirement 1: SPY 0DTE → canonical arm +20%; peak +14% → HOLD."""
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY",
                peak_pnl_pct=0.14, max_profit_seen=0.14, option_pnl_pct=0.05)
     arm = _resolved_arm(pos)
     assert arm == pytest.approx(0.20), f"Expected 0DTE SPY arm=0.20, got {arm}"
@@ -92,7 +118,7 @@ def test_spy_0dte_peak_14_pct_holds_with_canonical_20pct_arm() -> None:
 
 def test_spy_0dte_canonical_arm_is_exactly_20_pct() -> None:
     """Regression: canonical threshold resolver must return 0.20 for 0DTE SPY."""
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY")
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY")
     hard, arm, lock = _effective_thresholds(pos)
     assert arm == pytest.approx(0.20)
     assert hard == pytest.approx(-0.18)
@@ -104,7 +130,7 @@ def test_spy_0dte_canonical_arm_is_exactly_20_pct() -> None:
 
 def test_equity_0dte_below_22pct_holds() -> None:
     """Requirement 2: AAPL 0DTE → canonical arm +22%; peak +18% → HOLD."""
-    pos = _pos(option_symbol="AAPL260717C00200000", ticker="AAPL",
+    pos = _pos(option_symbol=_AAPL_0DTE, ticker="AAPL",
                peak_pnl_pct=0.18, max_profit_seen=0.18, option_pnl_pct=0.06)
     arm = _resolved_arm(pos)
     assert arm == pytest.approx(0.22), f"Expected 0DTE equity arm=0.22, got {arm}"
@@ -119,7 +145,7 @@ def test_equity_0dte_below_22pct_holds() -> None:
 
 def test_one_dte_spy_below_25pct_holds() -> None:
     """Requirement 3: SPY 1DTE → canonical arm +25%; peak +20% → HOLD."""
-    pos = _pos(option_symbol="SPY260718C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_1DTE, ticker="SPY",
                peak_pnl_pct=0.20, max_profit_seen=0.20, option_pnl_pct=0.07)
     arm = _resolved_arm(pos)
     assert arm == pytest.approx(0.25), f"Expected 1DTE arm=0.25, got {arm}"
@@ -130,7 +156,7 @@ def test_one_dte_spy_below_25pct_holds() -> None:
 
 def test_two_dte_equity_below_25pct_holds() -> None:
     """Requirement 3 (DTE=2): canonical arm +25%; peak +18% → HOLD."""
-    pos = _pos(option_symbol="AAPL260719C00200000", ticker="AAPL",
+    pos = _pos(option_symbol=_AAPL_2DTE, ticker="AAPL",
                peak_pnl_pct=0.18, max_profit_seen=0.18, option_pnl_pct=0.05)
     arm = _resolved_arm(pos)
     assert arm == pytest.approx(0.25)
@@ -145,7 +171,7 @@ def test_two_dte_equity_below_25pct_holds() -> None:
 
 def test_standard_dte_at_12pct_preserves_original() -> None:
     """Requirement 4: standard DTE arm=0.12; peak at/above 0.12 → no hold."""
-    pos = _pos(option_symbol="SPY260731C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_STD, ticker="SPY",
                peak_pnl_pct=0.12, max_profit_seen=0.12, option_pnl_pct=0.04)
     arm = _resolved_arm(pos)
     assert arm == pytest.approx(0.12)
@@ -159,10 +185,10 @@ def test_standard_dte_at_12pct_preserves_original() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("symbol,ticker,expected_arm", [
-    ("SPY260717C00600000", "SPY",  0.20),   # 0DTE index
-    ("AAPL260717C00200000", "AAPL", 0.22),  # 0DTE equity
-    ("SPY260718C00600000", "SPY",  0.25),   # 1DTE
-    ("SPY260731C00600000", "SPY",  0.12),   # standard
+    (_SPY_0DTE, "SPY",  0.20),   # 0DTE index
+    (_AAPL_0DTE, "AAPL", 0.22),  # 0DTE equity
+    (_SPY_1DTE, "SPY",  0.25),   # 1DTE
+    (_SPY_STD, "SPY",  0.12),   # standard
 ])
 def test_exact_boundary_preserves_original(symbol: str, ticker: str, expected_arm: float) -> None:
     """Requirement 5: peak exactly at the canonical arm → NOT held (runner fires)."""
@@ -220,7 +246,7 @@ def _never_suppress_decisions() -> list[tuple[str, ExitDecision]]:
 @pytest.mark.parametrize("label,decision", _never_suppress_decisions())
 def test_non_targeted_decisions_never_suppressed(label: str, decision: ExitDecision) -> None:
     """Requirement 6: non-TOUCHED_PROFIT_STOP decisions pass through untouched."""
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY",
                peak_pnl_pct=0.10, max_profit_seen=0.10, option_pnl_pct=0.05)
     arm = _resolved_arm(pos)
     assert not guard.should_hold_early_green_one_contract(
@@ -232,7 +258,7 @@ def test_non_targeted_decisions_never_suppressed(label: str, decision: ExitDecis
 
 def test_paper_mode_never_suppressed() -> None:
     """Requirement 6: PAPER mode → original decision unchanged."""
-    pos = _pos(execution_mode="paper", option_symbol="SPY260717C00600000",
+    pos = _pos(execution_mode="paper", option_symbol=_SPY_0DTE,
                peak_pnl_pct=0.10, option_pnl_pct=0.05)
     arm = _resolved_arm(pos)
     assert guard.should_hold_early_green_one_contract(
@@ -304,8 +330,8 @@ def test_uses_real_exit_decision_class() -> None:
 
 def test_real_resolver_used_not_hardcoded_values() -> None:
     """Requirement 8: _resolved_arm() calls the real _effective_thresholds."""
-    spy_0dte = _pos(option_symbol="SPY260717C00600000", ticker="SPY")
-    spy_std  = _pos(option_symbol="SPY260731C00600000", ticker="SPY")
+    spy_0dte = _pos(option_symbol=_SPY_0DTE, ticker="SPY")
+    spy_std  = _pos(option_symbol=_SPY_STD, ticker="SPY")
     arm_0dte = _resolved_arm(spy_0dte)
     arm_std  = _resolved_arm(spy_std)
     assert arm_0dte != arm_std, "Threshold resolver must return DTE-dependent values"
@@ -350,7 +376,7 @@ def test_replacement_hold_classified_as_hold(monkeypatch: pytest.MonkeyPatch) ->
     """Requirement 9: suppressed decision becomes ExitDecision with action=HOLD."""
     monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
 
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY",
                peak_pnl_pct=0.14, option_pnl_pct=0.05)
     original = _touched_stop()
 
@@ -376,7 +402,7 @@ def test_replacement_hold_classified_as_hold(monkeypatch: pytest.MonkeyPatch) ->
 def test_replacement_hold_is_real_exit_decision_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     """Requirement 9: the replacement is a real ExitDecision, not a stub."""
     monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY",
                peak_pnl_pct=0.14, option_pnl_pct=0.05)
     wrapped = guard.wrap_evaluate_exit(
         lambda p, now_et=None: _touched_stop(),
@@ -408,7 +434,7 @@ def test_disabled_flag_returns_original_object(
     else:
         monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", value)
 
-    pos = _pos(option_symbol="SPY260717C00600000", peak_pnl_pct=0.14, option_pnl_pct=0.05)
+    pos = _pos(option_symbol=_SPY_0DTE, peak_pnl_pct=0.14, option_pnl_pct=0.05)
     original = _touched_stop()
 
     wrapped = guard.wrap_evaluate_exit(
@@ -447,7 +473,7 @@ def test_wrapper_with_canonical_threshold_holds_spy_0dte(monkeypatch: pytest.Mon
     """Integration: wrapper resolves canonical 0DTE SPY arm and holds pre-runner."""
     monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
 
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY",
                peak_pnl_pct=0.14, option_pnl_pct=0.05)
     original = _touched_stop()
 
@@ -469,7 +495,7 @@ def test_wrapper_with_canonical_threshold_holds_spy_0dte(monkeypatch: pytest.Mon
 def test_wrapper_preserves_hard_stop_object_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enabled guard must pass hard-stop through as the exact original object."""
     monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY")
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY")
     hard_stop = ExitDecision(
         action="CLOSE_ALL", quantity=1,
         reason="HARD STOP HIT", urgency="IMMEDIATE",
@@ -487,7 +513,7 @@ def test_wrapper_preserves_hard_stop_object_when_enabled(monkeypatch: pytest.Mon
 def test_wrapper_preserves_touched_stop_at_standard_arm(monkeypatch: pytest.MonkeyPatch) -> None:
     """Requirement 4 (integration): standard DTE peak at arm → original returned."""
     monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
-    pos = _pos(option_symbol="SPY260731C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_STD, ticker="SPY",
                peak_pnl_pct=0.12, option_pnl_pct=0.04)
     original = _touched_stop()
     wrapped = guard.wrap_evaluate_exit(
@@ -502,7 +528,7 @@ def test_wrapper_preserves_touched_stop_at_standard_arm(monkeypatch: pytest.Monk
 def test_wrapper_preserves_touched_stop_at_breakeven(monkeypatch: pytest.MonkeyPatch) -> None:
     """Enabled guard: breakeven touched-stop → original object unchanged."""
     monkeypatch.setenv("LIVE_SINGLE_CONTRACT_RUNNER_PRECEDENCE_ENABLED", "1")
-    pos = _pos(option_symbol="SPY260717C00600000", ticker="SPY",
+    pos = _pos(option_symbol=_SPY_0DTE, ticker="SPY",
                peak_pnl_pct=0.10, option_pnl_pct=0.0)
     original = _touched_stop(pnl=0.0)
     wrapped = guard.wrap_evaluate_exit(
