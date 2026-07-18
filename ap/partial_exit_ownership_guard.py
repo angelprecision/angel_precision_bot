@@ -43,21 +43,33 @@ def _int(value: Any, default: int = 0) -> int:
 
 # ── Finding 1: delegate to the canonical predicate — no parallel taxonomy ─────
 
+_PARTIAL_STATUSES = {
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+    "PARTIAL",
+    "EXIT_PARTIAL_FILL",
+}
+
+
 def is_partial_exit_result(order: dict[str, Any], result: dict[str, Any]) -> bool:
     """Return True iff the canonical reducer considers this an active partial EXIT.
 
-    Delegates to ``exit_fill_truth_guard._is_partial_result(order, result)``
-    — the exact same predicate the reducer itself uses — so verification runs
-    under identical conditions.  Sources checked (in canonical priority order):
+    Status resolution mirrors the canonical predicate in
+    ``exit_fill_truth_guard._is_partial_result`` exactly:
 
-        result["status"]  →  result["state"]  →  order["status"]
+        result["status"] → result["state"] → order["status"]
 
     ``order["state"]`` is not checked because the canonical predicate does not
-    check it.  Tests confirm this boundary explicitly so any future canonical
-    extension automatically propagates here.
+    check it.  Resolving inline here avoids importing ``exit_fill_truth_guard``
+    at call time, which would pull in ``ap.db`` and require DATABASE_URL.
     """
-    from ap.exit_fill_truth_guard import _is_partial_result  # canonical predicate
-    return _is_partial_result(order, result)
+    status = str(
+        result.get("status")
+        or result.get("state")
+        or order.get("status")
+        or ""
+    ).strip().upper()
+    return status in _PARTIAL_STATUSES
 
 
 # ── Shared verification function (Finding 2) ──────────────────────────────────

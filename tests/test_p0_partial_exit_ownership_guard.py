@@ -172,6 +172,52 @@ class TestCanonicalPredicateDelegation:
             "parallel taxonomy that differs from exit_fill_truth_guard._is_partial_result"
         )
 
+
+    # ── Regression: result.state positive ─────────────────────────────────────
+
+    def test_result_state_partially_filled_verifies_ownership(self) -> None:
+        """Regression: result uses state='PARTIALLY_FILLED' with no status key.
+
+        The canonical resolver falls through result.status (absent) →
+        result.state → PARTIALLY_FILLED → active partial.
+        The verification wrapper must confirm ownership fields match.
+        """
+        order = _order(qty=5, filled_qty=0,
+                       local_order_id="exit-r1", broker_order_id="BR-R1")
+        result = {"state": "PARTIALLY_FILLED", "broker_order_id": "BR-R1", "filled_qty": 2}
+        reconciled = {
+            "position_id": "pos-r1",
+            "projection":  SimpleNamespace(closed=False),
+            "exit_ownership": {
+                "exit_in_flight": True,
+                "pending_exit_local_order_id":  "exit-r1",
+                "pending_exit_broker_order_id": "BR-R1",
+                "pending_exit_qty": 3,
+            },
+        }
+        out = verify_partial_exit_ownership(order, result, reconciled)
+        assert out["partial_exit_ownership_verified"] is True
+
+    # ── Regression: neither partial status nor partial state ───────────────────
+
+    def test_no_partial_status_or_state_skips_verifier(self) -> None:
+        """Regression: result has neither partial status nor partial state.
+
+        The ownership verifier must not run; partial_exit_ownership_verified
+        must be absent from the returned dict.
+        """
+        order      = _order()
+        result     = {"status": "FILLED", "broker_order_id": "BR-001", "filled_qty": 5}
+        reconciled = {
+            "position_id": "pos-002",
+            "projection":  SimpleNamespace(closed=False),
+            "exit_ownership": None,
+        }
+        out = verify_partial_exit_ownership(order, result, reconciled)
+        assert "partial_exit_ownership_verified" not in out, (
+            "Verifier must not set partial_exit_ownership_verified when result "
+            "has no partial status or state"
+        )
     @pytest.mark.parametrize("status", [
         "PARTIAL_FILL", "PARTIALLY_FILLED", "PARTIAL", "EXIT_PARTIAL_FILL",
     ])
