@@ -98,6 +98,7 @@ jobs:
             tests/test_p0_terminal_close_proof_binding.py \
             tests/test_p1_expired_contract_db_close_repair.py \
             tests/test_p0_reconciler_proof_persistence.py \
+            tests/test_p0_schema_attestation_and_migration_runner.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes
