@@ -801,6 +801,19 @@ class ClientRunner(threading.Thread):
                 _missing = f"{_missing},exit_decision_generation_claims_migration".strip(",")
             return _fail(f"lifecycle_guard_preflight_failed:{_missing}")
 
+        # Schema attestation (2026-07-18 audit): a LIVE runner must not start
+        # against a database missing tables/columns its installed guards
+        # reference. Missing schema previously caused silent LIVE exit
+        # suppression (exit_decision_generation_claims absent → every
+        # actionable exit decision returned False). Strict here: mismatch or
+        # unverifiable schema fails preflight exactly like bad credentials.
+        try:
+            from ap.schema_attestation import attest_schema
+
+            attest_schema(strict=True)
+        except Exception as _schema_exc:
+            return _fail(f"schema_attestation:{_schema_exc}")
+
         # 4–5. Broker auth round-trip + funded account.
         try:
             if not hasattr(broker, "get_account_equity"):
