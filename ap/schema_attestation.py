@@ -215,6 +215,21 @@ def attest_schema(
             "migrations (see ap/migration_runner.py) before trading.",
             report["mode"], strict_effective, detail,
         )
+        # Page a human. Guarded: alerting must never change attestation
+        # behavior (strict LIVE still raises below; a refused startup is
+        # its own page via preflight failure).
+        try:
+            from ap.critical_alerts import alert_critical
+
+            alert_critical(
+                "SCHEMA_ATTESTATION_FAILED",
+                f"mode={report['mode']} strict={strict_effective} {detail} — "
+                "deployed code requires schema the database does not have; "
+                "apply pending migrations before trading.",
+                dedup_key=str(report["mode"]),
+            )
+        except Exception:
+            pass
         if strict_effective:
             raise SchemaAttestationError(f"Schema attestation failed: {detail}")
     else:
