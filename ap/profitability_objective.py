@@ -259,8 +259,11 @@ def opportunity_mapping_from_intelligence_score(
         if session_date is not None
         else observed_at.astimezone(_MARKET_TZ).date()
     )
+    from ap.intelligence_score import score_envelope_integrity_valid
+
     policy_score = score.get("policy_score")
-    valid = bool(score.get("score_valid"))
+    integrity_valid = score_envelope_integrity_valid(score)
+    valid = bool(score.get("score_valid") and integrity_valid)
     normalized_score = _finite_number(
         policy_score if valid and policy_score is not None else 0.0,
         "intelligence_score.policy_score",
@@ -271,6 +274,8 @@ def opportunity_mapping_from_intelligence_score(
         "raw_profile_score": score.get("raw_profile_score"),
         "raw_profile_score_max": score.get("raw_profile_score_max"),
         "score_valid": valid,
+        "score_integrity_valid": integrity_valid,
+        "score_integrity_hash": score.get("score_integrity_hash"),
         "evidence_coverage": score.get("evidence_coverage"),
         "unavailable_components": list(score.get("unavailable_components") or []),
         "invalid_reasons": list(score.get("invalid_reasons") or []),

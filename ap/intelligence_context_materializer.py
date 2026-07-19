@@ -404,7 +404,6 @@ def recover_missing_intelligence_jobs(
                 FROM trade_queue q
                 WHERE q.client_id=%s
                   AND upper(COALESCE(q.payload->>'execution_mode', q.payload->>'mode', %s))=%s
-                  AND q.status NOT IN ('REJECTED','ERROR','CANCELED','CANCELLED','EXPIRED')
                   AND NOT EXISTS (
                     SELECT 1 FROM ap_intelligence_jobs j
                     WHERE j.client_id=q.client_id

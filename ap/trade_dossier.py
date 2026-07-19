@@ -14,6 +14,7 @@ from ap.parse_utils import first_float, first_present, safe_float, safe_int, saf
 log = logging.getLogger("ap.trade_dossier")
 
 SCHEMA_VERSION = os.getenv("TRADE_DOSSIER_SCHEMA_VERSION", "v1")
+INTELLIGENCE_REVIEW_VERSION = "trade_dossier_intelligence_review_v1"
 ENABLE_TRADE_DOSSIER = os.getenv("ENABLE_TRADE_DOSSIER", "true").lower() == "true"
 TRADE_DOSSIER_REPORT_ONLY = os.getenv("TRADE_DOSSIER_REPORT_ONLY", "true").lower() == "true"
 MAX_DOSSIER_JSON_BYTES = int(os.getenv("TRADE_DOSSIER_MAX_JSON_BYTES", "120000"))
@@ -477,6 +478,8 @@ def _intelligence_score_for_dossier(
             canonical_signal_id=canonical,
             client_id=client_id,
             execution_mode=execution_mode,
+            ticker=str(identity.get("ticker") or ""),
+            side=identity.get("direction"),
         ):
             return dict(candidate)
 
@@ -505,12 +508,61 @@ def _intelligence_score_for_dossier(
     )
 
 
+def build_intelligence_review(score: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Create an operator-readable review without changing trade behavior."""
+
+    item = score if isinstance(score, Mapping) else {}
+    valid = bool(item.get("score_valid"))
+    rankable = bool(item.get("eligible_for_ranking"))
+    invalid = sorted({str(v) for v in (item.get("invalid_reasons") or []) if v})
+    blocks = sorted({str(v) for v in (item.get("block_recommendations") or []) if v})
+    unavailable = sorted({str(v) for v in (item.get("unavailable_components") or []) if v})
+    warnings = sorted({str(v) for v in (item.get("warnings") or []) if v})
+
+    if not item:
+        verdict, primary_risk = "SCORE_MISSING", "canonical_intelligence_score_missing"
+    elif not valid:
+        verdict = "SCORE_INVALID"
+        primary_risk = (invalid or unavailable or ["canonical_intelligence_score_invalid"])[0]
+    elif not rankable:
+        verdict = "VALID_NOT_RANKABLE"
+        primary_risk = (blocks or ["ranking_eligibility_false"])[0]
+    else:
+        verdict = "RANKABLE"
+        primary_risk = (warnings or [None])[0]
+
+    return {
+        "review_version": INTELLIGENCE_REVIEW_VERSION,
+        "verdict": verdict,
+        "score_valid": valid,
+        "eligible_for_ranking": rankable,
+        "policy_score": item.get("policy_score") if valid else None,
+        "policy_version": item.get("policy_version"),
+        "score_version": item.get("score_version"),
+        "score_config_hash": item.get("score_config_hash"),
+        "profile_version": item.get("profile_version"),
+        "evidence_coverage": item.get("evidence_coverage"),
+        "scored_at": item.get("scored_at"),
+        "data_as_of": item.get("data_as_of"),
+        "source": item.get("source"),
+        "primary_risk": primary_risk,
+        "invalid_reasons": invalid,
+        "block_recommendations": blocks,
+        "unavailable_components": unavailable,
+        "warnings": warnings,
+        "observe_only": True,
+        "affected_eligibility": False,
+    }
+
+
 def _latest_pretrigger_intelligence_score(
     conn: Any,
     *,
     canonical_signal_id: str,
     client_id: str,
     execution_mode: str,
+    ticker: str | None = None,
+    side: str | None = None,
 ) -> dict[str, Any] | None:
     """Best-effort read of the already-durable score; never blocks dossier writes."""
 
@@ -541,6 +593,8 @@ def _latest_pretrigger_intelligence_score(
             canonical_signal_id=canonical_signal_id,
             client_id=client_id,
             execution_mode=execution_mode,
+            ticker=ticker,
+            side=side,
         ):
             conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             return dict(score)
@@ -585,6 +639,7 @@ def build_trade_dossier(signal: dict, *, client_id: str, execution_mode: str, de
         case = _case_score(levels, daily, trend, market, sector, options, hist, failure, unavailable)
         review = _summary(identity, levels, daily, failure, strength, case)
         intelligence_score = _intelligence_score_for_dossier(sig, ctx, identity)
+        intelligence_review = build_intelligence_review(intelligence_score)
         decision_snapshot = {
             "master_control_decision": ctx.get("master_control_decision"),
             "decision_reason": ctx.get("decision_reason"),
@@ -606,6 +661,7 @@ def build_trade_dossier(signal: dict, *, client_id: str, execution_mode: str, de
             "strength_profile": strength,
             "case_score": case,
             "intelligence_score": intelligence_score,
+            "intelligence_review": intelligence_review,
             "review_summary": review,
             "decision_snapshot": decision_snapshot,
             "raw_signal": _compact_signal(sig),
@@ -725,9 +781,9 @@ def persist_trade_dossier(conn, dossier: dict) -> bool:
         return False
 
 
-def build_and_persist_trade_dossier(conn, signal: dict, *, client_id: str, execution_mode: str, decision_context: dict | None = None) -> None:
+def build_and_persist_trade_dossier(conn, signal: dict, *, client_id: str, execution_mode: str, decision_context: dict | None = None) -> bool:
     if not ENABLE_TRADE_DOSSIER:
-        return None
+        return False
     try:
         ctx = dict(decision_context or {})
         signal_id = safe_str((signal or {}).get("signal_id"), "")
@@ -737,6 +793,8 @@ def build_and_persist_trade_dossier(conn, signal: dict, *, client_id: str, execu
             canonical_signal_id=canonical,
             client_id=client_id,
             execution_mode=execution_mode,
+            ticker=str((signal or {}).get("ticker") or (signal or {}).get("symbol") or ""),
+            side=(signal or {}).get("side") or (signal or {}).get("direction"),
         )
         if persisted_score is not None:
             ctx["intelligence_score"] = persisted_score
@@ -746,7 +804,201 @@ def build_and_persist_trade_dossier(conn, signal: dict, *, client_id: str, execu
             execution_mode=execution_mode,
             decision_context=ctx,
         )
-        persist_trade_dossier(conn, dossier)
+        return persist_trade_dossier(conn, dossier)
     except Exception as exc:
         log.warning("trade_dossier_write_failed client_id=%s execution_mode=%s err=%s", client_id, execution_mode, exc)
-    return None
+    return False
+
+
+def reconcile_trade_dossier_intelligence_score(
+    conn: Any,
+    *,
+    canonical_signal_id: str,
+    client_id: str,
+    execution_mode: str,
+    intelligence_score: Mapping[str, Any],
+    snapshot_id: str = "",
+) -> dict[str, Any]:
+    """Replace an early fallback with the durable PRETRIGGER score.
+
+    The update is identity-bound, report-only, and does not touch admission,
+    order, position, proof, or broker state.
+    """
+
+    try:
+        conn.execute(
+            """
+            SELECT dossier_id, ticker, direction, dossier
+            FROM trade_dossiers
+            WHERE canonical_signal_id=%s
+              AND client_id=%s
+              AND lower(execution_mode)=lower(%s)
+              AND schema_version=%s
+            LIMIT 1
+            """,
+            (canonical_signal_id, client_id, execution_mode, SCHEMA_VERSION),
+        )
+        row = conn.fetchone()
+        if not row:
+            return {"ok": True, "updated": False, "reason": "dossier_not_found"}
+        get = row.get if isinstance(row, Mapping) else None
+        ticker = str(get("ticker") if get else row[1] or "")
+        side = get("direction") if get else row[2]
+        from ap.intelligence_score import score_matches_identity
+        if not score_matches_identity(
+            intelligence_score,
+            canonical_signal_id=canonical_signal_id,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            ticker=ticker,
+            side=side,
+        ):
+            return {"ok": False, "updated": False, "reason": "score_identity_or_integrity_mismatch"}
+        dossier_id = str(get("dossier_id") if get else row[0])
+        payload = get("dossier") if get else row[3]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        dossier_json = dict(payload) if isinstance(payload, Mapping) else {}
+        dossier_json["intelligence_score"] = dict(intelligence_score)
+        dossier_json["intelligence_review"] = build_intelligence_review(intelligence_score)
+        dossier_json["intelligence_reconciliation"] = {
+            "snapshot_id": str(snapshot_id or ""),
+            "reconciled_at": _now_iso(),
+            "source": "durable_pretrigger_snapshot",
+            "observe_only": True,
+            "affected_eligibility": False,
+        }
+        dossier_json = _enforce_size_cap(dossier_json)
+        conn.execute(
+            """
+            UPDATE trade_dossiers
+            SET dossier=%s::jsonb, updated_at=now()
+            WHERE dossier_id=%s
+              AND canonical_signal_id=%s
+              AND client_id=%s
+              AND lower(execution_mode)=lower(%s)
+            """,
+            (
+                json.dumps(dossier_json, default=str),
+                dossier_id,
+                canonical_signal_id,
+                client_id,
+                execution_mode,
+            ),
+        )
+        return {"ok": True, "updated": getattr(conn, "rowcount", 1) == 1, "dossier_id": dossier_id}
+    except Exception as exc:
+        log.warning(
+            "trade_dossier_intelligence_reconciliation_failed canonical_signal_id=%s client_id=%s execution_mode=%s err=%s",
+            canonical_signal_id,
+            client_id,
+            execution_mode,
+            exc,
+        )
+        return {"ok": False, "updated": False, "reason": str(exc)[:500]}
+
+
+def reconcile_pretrigger_snapshot_best_effort(
+    snapshot_kwargs: Mapping[str, Any],
+    *,
+    snapshot_id: str = "",
+) -> dict[str, Any]:
+    """Wire a completed PRETRIGGER snapshot back into an existing dossier."""
+
+    if str(snapshot_kwargs.get("phase") or "").upper() != "PRETRIGGER":
+        return {"ok": True, "updated": False, "reason": "not_pretrigger"}
+    if os.getenv("INTELLIGENCE_CONTEXT_STORE_BACKEND", "").lower() == "memory":
+        return {"ok": True, "updated": False, "reason": "memory_backend"}
+    payload = snapshot_kwargs.get("payload")
+    score = payload.get("intelligence_score") if isinstance(payload, Mapping) else None
+    if not isinstance(score, Mapping):
+        return {"ok": False, "updated": False, "reason": "intelligence_score_missing"}
+    try:
+        from ap.db import conn
+        with conn() as cursor:
+            return reconcile_trade_dossier_intelligence_score(
+                cursor,
+                canonical_signal_id=str(snapshot_kwargs.get("canonical_signal_id") or ""),
+                client_id=str(snapshot_kwargs.get("client_id") or ""),
+                execution_mode=str(snapshot_kwargs.get("execution_mode") or ""),
+                intelligence_score=score,
+                snapshot_id=snapshot_id,
+            )
+    except Exception as exc:
+        log.warning("trade_dossier_pretrigger_reconciliation_unavailable: %s", exc)
+        return {"ok": False, "updated": False, "reason": str(exc)[:500]}
+
+
+def reconcile_trade_dossier_backlog_best_effort(
+    *,
+    client_id: str,
+    execution_mode: str,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Repair existing dossiers from their latest durable PRETRIGGER snapshot."""
+
+    if os.getenv("INTELLIGENCE_CONTEXT_STORE_BACKEND", "").lower() == "memory":
+        return {"ok": True, "candidates": 0, "updated": 0, "reason": "memory_backend"}
+    bounded_limit = max(1, min(int(limit or 50), 200))
+    try:
+        from ap.db import conn
+        from ap.intelligence_score import INTELLIGENCE_SCORE_VERSION
+        with conn() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                  td.canonical_signal_id,
+                  td.client_id,
+                  td.execution_mode,
+                  snap.id AS snapshot_id,
+                  snap.payload
+                FROM trade_dossiers td
+                JOIN LATERAL (
+                  SELECT id, payload
+                  FROM ap_intelligence_snapshots s
+                  WHERE s.canonical_signal_id=td.canonical_signal_id
+                    AND s.client_id=td.client_id
+                    AND lower(s.execution_mode)=lower(td.execution_mode)
+                    AND s.phase='PRETRIGGER'
+                  ORDER BY s.created_at DESC
+                  LIMIT 1
+                ) snap ON TRUE
+                WHERE td.client_id=%s
+                  AND lower(td.execution_mode)=lower(%s)
+                  AND (
+                    COALESCE(td.dossier #>> '{intelligence_score,score_version}', '') <> %s
+                    OR COALESCE(td.dossier #>> '{intelligence_score,score_integrity_hash}', '')
+                       IS DISTINCT FROM
+                       COALESCE(snap.payload #>> '{intelligence_score,score_integrity_hash}', '')
+                  )
+                ORDER BY td.created_at ASC
+                LIMIT %s
+                """,
+                (client_id, execution_mode, INTELLIGENCE_SCORE_VERSION, bounded_limit),
+            )
+            rows = list(cursor.fetchall() or [])
+            updated = 0
+            failed = 0
+            for row in rows:
+                get = row.get if isinstance(row, Mapping) else None
+                payload = get("payload") if get else row[4]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                score = payload.get("intelligence_score") if isinstance(payload, Mapping) else None
+                if not isinstance(score, Mapping):
+                    failed += 1
+                    continue
+                result = reconcile_trade_dossier_intelligence_score(
+                    cursor,
+                    canonical_signal_id=str(get("canonical_signal_id") if get else row[0]),
+                    client_id=str(get("client_id") if get else row[1]),
+                    execution_mode=str(get("execution_mode") if get else row[2]),
+                    intelligence_score=score,
+                    snapshot_id=str(get("snapshot_id") if get else row[3]),
+                )
+                updated += int(bool(result.get("updated")))
+                failed += int(not result.get("ok"))
+            return {"ok": failed == 0, "candidates": len(rows), "updated": updated, "failed": failed}
+    except Exception as exc:
+        log.warning("trade_dossier_intelligence_backlog_reconciliation_unavailable: %s", exc)
+        return {"ok": False, "candidates": 0, "updated": 0, "reason": str(exc)[:500]}

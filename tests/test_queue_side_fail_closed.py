@@ -205,6 +205,63 @@ def test_enqueue_normalizes_explicit_bullish_alias(monkeypatch):
     assert payload["direction"] == "CALL"
 
 
+def test_enqueue_stamps_identity_mode_and_submits_pretrigger_once(monkeypatch):
+    captured = {}
+    handoffs = []
+    monkeypatch.setattr(queue, "_conn", lambda: (lambda: _FakeConn(captured)))
+    monkeypatch.setattr(queue, "_run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(
+        "ap.intelligence_context_handoff.enqueue_pretrigger_context_best_effort",
+        lambda signal, **kwargs: handoffs.append((signal, kwargs)) or {"ok": True, "accepted": True},
+    )
+
+    inserted = queue.enqueue_signal(
+        {
+            "ticker": "SPY",
+            "signal_id": "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72:abc123",
+            "side": "CALL",
+        },
+        client_id="client-a",
+        execution_mode="PAPER",
+    )
+
+    payload = json.loads(captured["params"][2])
+    assert inserted is True
+    assert payload["canonical_signal_id"] == "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
+    assert payload["execution_mode"] == "paper"
+    assert len(handoffs) == 1
+    assert handoffs[0][1] == {
+        "client_id": "client-a",
+        "execution_mode": "PAPER",
+        "canonical_signal_id": "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72",
+    }
+
+
+def test_duplicate_queue_insert_does_not_submit_intelligence(monkeypatch):
+    captured = {}
+    fake = _FakeConn(captured)
+    fake.cursor.rowcount = 0
+    monkeypatch.setattr(queue, "_conn", lambda: (lambda: fake))
+    monkeypatch.setattr(queue, "_run_with_retry", lambda fn, *a, **k: fn())
+    monkeypatch.setattr(
+        "ap.intelligence_context_handoff.enqueue_pretrigger_context_best_effort",
+        lambda *_args, **_kwargs: pytest.fail("duplicate submitted intelligence"),
+    )
+
+    assert queue.enqueue_signal(
+        {"ticker": "SPY", "signal_id": "dup-1", "side": "CALL"},
+        client_id="client-a",
+        execution_mode="PAPER",
+    ) is False
+
+
+def test_dispatch_no_longer_creates_duplicate_pretrigger_handoff():
+    source = (__import__("pathlib").Path(queue.__file__)).read_text()
+    dispatch = source[source.index("def _dispatch"):source.index("def worker_loop")]
+
+    assert "enqueue_pretrigger_context_best_effort" not in dispatch
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Piece 2 — _dispatch fail-closed BEFORE Master Control
 # ─────────────────────────────────────────────────────────────────────────────

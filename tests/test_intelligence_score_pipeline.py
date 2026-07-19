@@ -11,15 +11,21 @@ from ap.intelligence_context_materializer import build_intelligence_context_payl
 from ap.intelligence_score import (
     INTELLIGENCE_SCORE_VERSION,
     build_intelligence_score,
+    score_envelope_integrity_valid,
     score_policy_version,
 )
+from ap.position_score_profile import PROFILE_VERSION
 from ap.profitability_objective import (
     load_opportunities,
     opportunity_mapping_from_intelligence_snapshot,
     opportunity_mapping_from_trade_dossier,
     select_frozen_policy_candidates,
 )
-from ap.trade_dossier import build_and_persist_trade_dossier, build_trade_dossier
+from ap.trade_dossier import (
+    build_and_persist_trade_dossier,
+    build_trade_dossier,
+    reconcile_trade_dossier_intelligence_score,
+)
 from ap.trigger_geometry import score_trigger_geometry
 from scripts.profitability_objective_report import _read_jsonl
 
@@ -57,21 +63,31 @@ def _valid_profile(raw_score=96.0):
         "contract_execution_quality": 10.0,
         "historical_feedback": 5.0,
     }
+    components = {
+        name: {
+            "name": name,
+            "score": max_score * 0.75,
+            "max_score": max_score,
+            "status": "diagnostic_only" if name == "historical_feedback" else "ok",
+        }
+        for name, max_score in maxima.items()
+    }
+    base_score = sum(
+        component["score"]
+        for name, component in components.items()
+        if name != "historical_feedback"
+    )
     return {
-        "profile_version": "position_score_profile_v1_observe_only",
+        "profile_version": PROFILE_VERSION,
         "total_score": raw_score,
-        "components": {
-            name: {
-                "name": name,
-                "score": max_score * 0.8,
-                "max_score": max_score,
-                "status": "ok",
-            }
-            for name, max_score in maxima.items()
-        },
+        "base_score": base_score,
+        "bonus_score": max(0.0, raw_score - base_score),
+        "penalty_score": max(0.0, base_score - raw_score),
+        "components": components,
         "block_recommendations": [],
         "warnings": [],
         "observe_only": True,
+        "diagnostics": {"rank_excluded_components": ["historical_feedback"]},
     }
 
 
@@ -100,6 +116,8 @@ def test_canonical_score_has_explicit_0_to_100_scale_and_lineage():
     assert score["policy_version"] == score_policy_version()
     assert len(score["score_config_hash"]) == 16
     assert len(score["input_hash"]) == 64
+    assert len(score["score_integrity_hash"]) == 64
+    assert score_envelope_integrity_valid(score) is True
     assert score["observe_only"] is True
     assert score["affected_eligibility"] is False
 
@@ -120,6 +138,52 @@ def test_missing_required_evidence_is_retained_but_never_rankable():
     assert score["policy_score"] is None
     assert score["eligible_for_ranking"] is False
     assert "required_component_unavailable:trigger_geometry" in score["invalid_reasons"]
+
+
+def test_component_omission_cannot_shrink_coverage_denominator():
+    profile = _valid_profile()
+    del profile["components"]["sector_context"]
+    score = build_intelligence_score(
+        profile,
+        signal=_signal(),
+        client_id="account-a",
+        execution_mode="PAPER",
+        scored_at=SCORED_AT,
+        data_as_of=SCORED_AT,
+        source="test",
+    )
+
+    assert score["score_valid"] is False
+    assert "component_missing:sector_context" in score["invalid_reasons"]
+    assert score["total_component_weight"] == pytest.approx(113.0)
+
+
+def test_score_envelope_tampering_invalidates_ranking_input():
+    score = _score()
+    score["policy_score"] = 100.0
+
+    row = opportunity_mapping_from_intelligence_snapshot(
+        {"payload": {"intelligence_score": score}}
+    )
+
+    assert score_envelope_integrity_valid(score) is False
+    assert row["eligible"] is False
+    assert row["features"]["score_integrity_valid"] is False
+
+
+def test_stale_point_in_time_evidence_is_fail_closed():
+    score = build_intelligence_score(
+        _valid_profile(),
+        signal=_signal(),
+        client_id="account-a",
+        execution_mode="PAPER",
+        scored_at=SCORED_AT,
+        data_as_of="2026-07-14T14:20:00+00:00",
+        source="test",
+    )
+
+    assert score["score_valid"] is False
+    assert "data_as_of_stale" in score["invalid_reasons"]
 
 
 def test_evaluation_keeps_raw_compatibility_and_attaches_canonical_score():
@@ -165,6 +229,9 @@ def test_context_materializer_stamps_score_inside_durable_snapshot_payload():
     with patch(
         "ap.intelligence_context_materializer.collect_point_in_time_context",
         return_value=point_in_time,
+    ), patch(
+        "ap.intelligence_context_materializer._now_iso",
+        return_value=SCORED_AT,
     ), patch(
         "ap.position_score_profile.build_position_score_profile",
         return_value=_valid_profile(96.0),
@@ -260,6 +327,48 @@ def test_dossier_writer_reads_matching_durable_pretrigger_score():
         )
 
     assert captured["dossier"]["dossier"]["intelligence_score"] == score
+
+
+def test_durable_pretrigger_score_reconciles_existing_dossier_review():
+    score = _score(102.0)
+
+    class _Conn:
+        rowcount = 1
+
+        def __init__(self):
+            self.calls = []
+            self._row = {
+                "dossier_id": "00000000-0000-0000-0000-000000000001",
+                "ticker": "SPY",
+                "direction": "CALL",
+                "dossier": {"intelligence_score": {"score_version": "old"}},
+            }
+
+        def execute(self, sql, params=None):
+            self.calls.append((sql, params))
+
+        def fetchone(self):
+            return self._row
+
+    conn = _Conn()
+    result = reconcile_trade_dossier_intelligence_score(
+        conn,
+        canonical_signal_id="canon-score-1",
+        client_id="account-a",
+        execution_mode="PAPER",
+        intelligence_score=score,
+        snapshot_id="snapshot-1",
+    )
+
+    update_params = next(
+        params for sql, params in conn.calls
+        if "UPDATE trade_dossiers" in str(sql)
+    )
+    reconciled = json.loads(update_params[0])
+    assert result["updated"] is True
+    assert reconciled["intelligence_score"] == score
+    assert reconciled["intelligence_review"]["verdict"] == "RANKABLE"
+    assert reconciled["intelligence_reconciliation"]["snapshot_id"] == "snapshot-1"
 
 
 def test_failed_snapshot_lookup_rolls_back_savepoint_before_dossier_write():

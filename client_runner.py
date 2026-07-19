@@ -3752,8 +3752,8 @@ def route_signal_to_all_clients(signal: dict):
         # the durable queue and the runner processes it once entries_allowed
         # recovers. Signals are only truly dropped if the runner is dead,
         # stopping, or in a hard-failed state.
-        active_emails = [
-            email
+        active_scopes = {
+            email: str(getattr(runner, "mode", "") or "").strip().upper()
             for email, runner in _active_runners.items()
             if (
                 runner.is_alive()
@@ -3761,7 +3761,8 @@ def route_signal_to_all_clients(signal: dict):
                 and not runner.stopping.is_set()
                 and not runner.failed.is_set()
             )
-        ]
+        }
+        active_emails = list(active_scopes)
         # Log a warning (not a drop) if entries are temporarily blocked
         for email, runner in _active_runners.items():
             if (
@@ -3788,7 +3789,7 @@ def route_signal_to_all_clients(signal: dict):
             _canonical_sid = signal.get("canonical_signal_id") or signal_id
             try:
                 from ap_canonical_signal import build_canonical_signal_id as _bcsid
-                _canonical_sid = _bcsid(signal) or _canonical_sid
+                _canonical_sid = _bcsid(signal_id, signal) or _canonical_sid
             except Exception:
                 pass
             create_opportunities(
@@ -3860,7 +3861,15 @@ def route_signal_to_all_clients(signal: dict):
     enqueued = 0
     for email in active_emails:
         try:
-            ok = enqueue_signal(signal, client_id=email, idempotency_key=f"{signal_id}:{email}")
+            enqueue_mode = active_scopes.get(email) or str(
+                os.getenv("BOT_MODE") or os.getenv("MODE") or ""
+            ).strip().upper()
+            ok = enqueue_signal(
+                signal,
+                client_id=email,
+                idempotency_key=f"{signal_id}:{email}",
+                execution_mode=enqueue_mode,
+            )
             if ok:
                 enqueued += 1
                 logger.info("Signal %s [%s] -> queued for %s", signal_id, ticker, email)

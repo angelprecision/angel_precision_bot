@@ -162,7 +162,7 @@ def test_position_profile_observe_only_shape_and_no_signal_mutation():
     }
     profile = build_position_score_profile(signal, context)
     assert signal == before
-    assert profile["profile_version"] == "position_score_profile_v1_observe_only"
+    assert profile["profile_version"] == "position_score_profile_v2_observe_only"
     assert profile["diagnostics"]["observe_only"] is True
     assert profile["diagnostics"]["live_behavior_changed"] is False
     assert "fair_value_gap" in profile["components"]

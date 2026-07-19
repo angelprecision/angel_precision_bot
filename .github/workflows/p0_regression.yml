@@ -48,6 +48,18 @@ jobs:
             -tAc "SELECT to_regclass('public.exit_decision_generation_claims') IS NOT NULL" \
             | grep -qx t
 
+      - name: Apply intelligence population and frozen-ranking migrations
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -d intelligence_test -v ON_ERROR_STOP=1 \
+            -f migrations/20260712_intelligence_context_snapshots.sql
+          psql -h localhost -U postgres -d intelligence_test -v ON_ERROR_STOP=1 \
+            -f migrations/20260719_intelligence_daily_rankings.sql
+          psql -h localhost -U postgres -d intelligence_test \
+            -tAc "SELECT to_regclass('public.ap_daily_opportunity_rankings') IS NOT NULL" \
+            | grep -qx t
+
       - name: Validate positions execution-mode migration
         env:
           PGPASSWORD: postgres
@@ -92,8 +104,13 @@ jobs:
             tests/test_p1_selector_identity_assertion_mode_fallback.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
+            tests/test_p0_intelligence_context_snapshots.py \
             tests/test_intelligence_score_pipeline.py \
+            tests/test_intelligence_daily_rankings.py \
+            tests/test_intelligence_daily_rankings_postgres.py \
             tests/test_profitability_objective.py \
+            tests/test_position_score_profile.py \
+            tests/test_queue_side_fail_closed.py \
             tests/test_p0_pending_trigger_restart_recovery.py \
             tests/test_entry_watcher_audit.py \
             tests/test_p0_watcher_invalidation_ownership.py \

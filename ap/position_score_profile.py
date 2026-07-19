@@ -12,7 +12,8 @@ from ap.trigger_geometry import score_remaining_opportunity, score_trigger_geome
 from ap.volume_confirmation import score_volume_confirmation
 from ap.vwap_context import score_vwap_context
 
-PROFILE_VERSION = "position_score_profile_v1_observe_only"
+PROFILE_VERSION = "position_score_profile_v2_observe_only"
+RANK_EXCLUDED_COMPONENTS = ("historical_feedback",)
 
 _UPSTREAM_MAX_SCORES = {
     "sector_context": 5.0,
@@ -143,7 +144,13 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
     components["historical_feedback"] = historical
     missing.extend(historical.details.get("missing_data", []))
 
-    base = sum(c.score for c in components.values())
+    # Historical aggregates are useful context, but without immutable
+    # point-in-time lineage they can include results learned after this signal.
+    # Keep the diagnostic visible while excluding it from every ranking value.
+    base = sum(
+        c.score for name, c in components.items()
+        if name not in RANK_EXCLUDED_COMPONENTS
+    )
     bonus, bonus_reasons = _bonus_points(htf, fvg, opportunity, volume)
     penalty, penalty_reasons = _penalties(blocks, missing, contract, context_provided=context_provided)
     total = clamp(base + bonus - penalty, 0, 120)
@@ -154,7 +161,15 @@ def build_position_score_profile(signal: dict[str, Any], market_context: dict[st
         for c in components.values()
         for w in (c.details.get("warnings") or [])
     ))
-    diagnostics.update({"side": side, "bonus_reasons": bonus_reasons, "penalty_reasons": penalty_reasons, "component_total_before_bonus_penalty": round(base, 2), "market_context_keys": sorted(ctx.keys()), "context_provided": context_provided})
+    diagnostics.update({
+        "side": side,
+        "bonus_reasons": bonus_reasons,
+        "penalty_reasons": penalty_reasons,
+        "component_total_before_bonus_penalty": round(base, 2),
+        "rank_excluded_components": list(RANK_EXCLUDED_COMPONENTS),
+        "market_context_keys": sorted(ctx.keys()),
+        "context_provided": context_provided,
+    })
     return PositionScoreProfile(
         PROFILE_VERSION, total, base, bonus, penalty,
         grade_from_score(total),
@@ -188,19 +203,40 @@ def _score_scanner_quality(sig):
 
 
 def _score_price_stacking(sig, ctx, htf, fvg):
-    trigger = _f(sig.get("trigger_price") or sig.get("entry_price") or (sig.get("trigger") or {}).get("entry"))
+    raw_trigger = sig.get("trigger")
+    scalar_trigger = raw_trigger if not isinstance(raw_trigger, dict) else None
+    trigger_payload = raw_trigger if isinstance(raw_trigger, dict) else {}
+    trigger = _f(
+        sig.get("trigger_price")
+        or scalar_trigger
+        or trigger_payload.get("entry")
+        or sig.get("underlying_entry_price")
+        or sig.get("entry_price")
+    )
     if trigger is None:
         return _c("price_stacking", 0, CONFIG.price_stacking_max_points, "missing_data", "trigger missing", {"missing_data": ["trigger_price"], "warnings": []})
     matched = []
+    seen_prices: set[float] = set()
+    ignored_geometry_levels: list[str] = []
     for name, raw in (ctx.get("levels") or sig.get("levels") or {}).items():
+        normalized_name = str(name).strip().lower().replace("-", "_").replace(" ", "_")
+        if any(token in normalized_name for token in ("entry", "trigger", "stop", "target")):
+            ignored_geometry_levels.append(str(name))
+            continue
         for value in raw if isinstance(raw, list) else [raw]:
             px = _f(value)
             dist = abs(px - trigger) / abs(trigger) * 100 if px is not None and trigger else None
-            if dist is not None and dist <= CONFIG.price_stacking_tolerance_pct:
+            price_key = round(px, 6) if px is not None else None
+            if (
+                dist is not None
+                and dist <= CONFIG.price_stacking_tolerance_pct
+                and price_key not in seen_prices
+            ):
+                seen_prices.add(price_key)
                 matched.append({"name": str(name), "price": px, "distance_pct": round(dist, 4)})
     aligned = htf.get("aligned_timeframes", []) or []
     fvg_aligned = bool((fvg.get("diagnostics") or {}).get("aligned_support_or_resistance"))
-    return _c("price_stacking", len(matched) * 2 + len(aligned) + (2 if fvg_aligned else 0), CONFIG.price_stacking_max_points, reason=f"{len(matched)} nearby levels, {len(aligned)} aligned tfs", details={"matched_levels": matched, "aligned_timeframes": aligned, "fvg_aligned": fvg_aligned, "warnings": []})
+    return _c("price_stacking", len(matched) * 2 + len(aligned) + (2 if fvg_aligned else 0), CONFIG.price_stacking_max_points, reason=f"{len(matched)} nearby levels, {len(aligned)} aligned tfs", details={"matched_levels": matched, "ignored_geometry_levels": sorted(set(ignored_geometry_levels)), "aligned_timeframes": aligned, "fvg_aligned": fvg_aligned, "warnings": []})
 
 
 def _score_contract_execution_quality(sig):
@@ -223,11 +259,17 @@ def _score_contract_execution_quality(sig):
 
 def _score_historical_feedback(sig):
     win, n, avg = _f(sig.get("win_rate") or sig.get("historical_win_rate")), _f(sig.get("sample_size") or sig.get("historical_sample_size") or sig.get("n")), _f(sig.get("avg_opt_ret") or sig.get("avg_option_return"))
+    lineage = {
+        "data_as_of": sig.get("historical_data_as_of"),
+        "policy_version": sig.get("historical_policy_version"),
+        "rank_excluded": True,
+        "rank_exclusion_reason": "historical_feedback_not_point_in_time_safe",
+    }
     missing = [k for k, v in (("win_rate", win), ("sample_size", n)) if v is None]
     if win is None or n is None or n < 5:
-        return _c("historical_feedback", 0, 5, "missing_data", "history missing or sample small", {"missing_data": missing, "win_rate": win, "sample_size": n, "avg_option_return": avg, "warnings": []})
+        return _c("historical_feedback", 0, 5, "diagnostic_only", "history missing or sample small", {"missing_data": missing, "win_rate": win, "sample_size": n, "avg_option_return": avg, "warnings": [], **lineage})
     pts = (3 if win >= 0.75 else 2 if win >= 0.60 else 1 if win >= 0.50 else 0) + (2 if avg is not None and avg >= 0.15 else 1 if avg is not None and avg >= 0.05 else 1 if avg is None and n >= 20 else 0)
-    return _c("historical_feedback", pts, 5, reason="historical feedback", details={"win_rate": win, "sample_size": n, "avg_option_return": avg, "warnings": []})
+    return _c("historical_feedback", pts, 5, "diagnostic_only", "historical feedback (rank excluded)", {"win_rate": win, "sample_size": n, "avg_option_return": avg, "warnings": [], **lineage})
 
 
 def _bonus_points(htf, fvg, opportunity, volume):

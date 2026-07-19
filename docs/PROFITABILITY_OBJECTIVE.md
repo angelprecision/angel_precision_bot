@@ -1,7 +1,8 @@
 # Profitability objective and evidence contract
 
-The target is a daily, per-account selection policy that chooses at most the
-best 5-7 eligible opportunities from the scanner stream and aims for:
+The target is a daily, per-account selection policy that presents at most the
+best 10 eligible opportunities from the scanner stream, evaluates at most the
+top seven, and aims for:
 
 - observed win rate of at least 80%;
 - average losing trade no worse than 12%;
@@ -55,15 +56,24 @@ case-quality grade and not the scanner's raw score. The score contract is:
 
 - detailed position-profile output remains on its diagnostic 0-120 scale;
 - `policy_score` is normalized to a strict 0-100 scale;
+- `policy_score` is an ordering score, not a predicted win probability;
+- the exact component set, each component maximum, profile arithmetic, and
+  point-in-time freshness are validated before the score can rank;
 - the formula, raw denominator, evidence threshold, and required components
   are versioned and hashed into `policy_version`;
+- the coverage denominator is fixed across all ranking components, so missing
+  components cannot improve coverage by shrinking the denominator;
+- generic historical feedback remains visible as diagnostic context but is
+  excluded from base score, coverage, and ranking because it is not guaranteed
+  to have immutable point-in-time lineage;
 - scanner quality, trigger geometry, and remaining opportunity must be
   available, and weighted component coverage must be at least 70%;
 - invalid or under-covered scores remain in the source population with
   `eligible=false` and `policy_score=0` when converted for evaluation;
 - block recommendations make a score ineligible for research ranking;
 - every score carries account/mode/opportunity identity, `scored_at`,
-  `data_as_of`, input hash, config hash, source, and git commit.
+  `data_as_of`, input hash, config hash, source, git commit, and an integrity
+  hash over the final score envelope.
 
 The queue's existing observe-only PRETRIGGER intelligence handoff creates this
 score inside each durable intelligence snapshot. That is the population path
@@ -71,6 +81,46 @@ for measuring the scanner stream. Trade dossiers reuse the matching durable
 score when it is already available; their fallback score is marked with its
 own source and remains fail-closed if evidence is incomplete. None of these
 fields participate in production admission or broker behavior.
+
+## Connected daily feed and outcome ledger
+
+`ap.intelligence_daily_rankings` freezes a deterministic selection after the
+configured daily cutoff (10:30 America/New_York by default). It stores one
+immutable ranking run per client, execution mode, session date, and policy.
+The feed contains no more than 10 opportunities; only ranks 1-7 are marked as
+the profitability evaluation cohort. Every selected row references the exact
+PRETRIGGER snapshot and includes its score/input integrity hashes and dossier-
+style intelligence review.
+
+Apply both database migrations before enabling the feed:
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f migrations/20260712_intelligence_context_snapshots.sql
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -f migrations/20260719_intelligence_daily_rankings.sql
+```
+
+Runtime settings:
+
+- `INTELLIGENCE_CONTEXT_WORKER_ENABLED=1` (default) captures the source
+  population;
+- `INTELLIGENCE_DAILY_RANKING_ENABLED=1` (default) enables automatic freeze;
+- `INTELLIGENCE_DAILY_FREEZE_ET=10:30` controls the daily cutoff;
+- `INTELLIGENCE_DAILY_MIN_SOURCE_COUNT=10` prevents an early partial freeze,
+  while `INTELLIGENCE_DAILY_HARD_FREEZE_ET=11:00` permits an underfilled day
+  but still requires at least one captured source opportunity;
+- `INTELLIGENCE_POLICY_FROZEN_AT` should be the reviewed policy release time.
+
+Authenticated clients read `GET /intelligence/daily-feed` and
+`GET /intelligence/daily-performance`. Admins can explicitly freeze or repair
+outcomes through `POST /intelligence/admin/freeze-daily` and
+`POST /intelligence/admin/reconcile-outcomes`.
+
+Official performance rows are appended only by joining a selected LIVE signal
+through its originating `orders.local_order_id` to a `proof_trades` row already
+classified `LIVE_OFFICIAL` and `training_eligible=true`. PAPER and
+counterfactual observations never enter the official target metrics.
 
 ## Promotion verdicts
 
@@ -132,7 +182,7 @@ can be explicit:
 python3 scripts/profitability_objective_report.py \
   --source pretrigger_snapshot_export.jsonl \
   --source-format intelligence-snapshot \
-  --policy-version intelligence_policy_score_v1_observe_only:<config-hash> \
+  --policy-version intelligence_policy_score_v2_observe_only:<config-hash> \
   --policy-frozen-at 2026-07-13T20:00:00+00:00
 ```
 

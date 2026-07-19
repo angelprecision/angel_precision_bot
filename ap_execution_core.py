@@ -1835,6 +1835,7 @@ class APExecutionCore:
                 signal,
                 client_id=self.email or "default",
                 idempotency_key=f"{signal_id}:{self.email or 'default'}",
+                execution_mode=self.mode,
             )
             log.info(
                 "[%s] receive_signal routed to production queue | inserted=%s",
