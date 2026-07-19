@@ -397,7 +397,19 @@ def _map_result(result: dict, fallback_score: float) -> dict:
                 "risk_detail":       risk,
             }
 
-        # Hard block or genuine skip — block as before
+        # Only bridge-proven hard-risk skips may emit status="SKIP".
+        # Any non-hard skip must fail open through LOW_CONFIDENCE so the
+        # canonical admission policy never treats ambiguous skip text as
+        # execution-authoritative.
+        if not _is_hard_block:
+            return _block_gate(
+                status="LOW_CONFIDENCE",
+                score=score,
+                reasoning=f"intel_skip_non_authoritative: {reasoning[:160]}",
+                risk_detail=risk,
+            )
+
+        # Hard block or explicit risk skip — block as authoritative SKIP
         if allow_collect:
             return _collect_gate(
                 status="SKIP_OVERRIDE",

@@ -30,7 +30,7 @@ Producer/authority table (traced 2026-07-18):
   intelligence_bridge             | approved    | yes       | authoritative through this policy
   intelligence_bridge (SKIP)      | intel_status| yes (hard)| INTEL_AUTHORITATIVE_VETO_SKIP_HARD
   intelligence_bridge (RISK_VETO) | intel_status| yes       | INTEL_AUTHORITATIVE_VETO_RISK
-  intelligence_bridge (LOW_CONF)  | intel_status| yes       | INTEL_AUTHORITATIVE_VETO_LOW_CONFIDENCE
+  intelligence_bridge (LOW_CONF)  | intel_status| no        | INTEL_LOW_DATA_QUALITY_FAIL_OPEN
   intelligence_bridge (TIMEOUT)   | intel_status| no        | INTEL_UNAVAILABLE_FAIL_OPEN
   intelligence_bridge (ERROR)     | intel_status| no        | INTEL_ERROR_FAIL_OPEN
   intelligence_bridge (UNAVAIL.)  | intel_status| no        | INTEL_UNAVAILABLE_FAIL_OPEN
@@ -42,12 +42,14 @@ Producer/authority table (traced 2026-07-18):
   Hard-block phrases include "risk manager", "risk veto", "hard risk",
   "capital", "buying power", "auth", "scanner signal is neutral",
   "neutral direction", "contract quality failed".  When matched, the
-  bridge emits intel_status="SKIP" which maps to
-  INTEL_AUTHORITATIVE_VETO_SKIP_HARD.  Any skip not matching these
-  phrases uses the scanner-approved fallback (approved=True).
+  bridge emits intel_status="SKIP" only when _is_hard_block is true,
+  which maps to INTEL_AUTHORITATIVE_VETO_SKIP_HARD. Non-hard skip,
+  low-confidence, malformed-confidence, and incomplete-data outcomes
+  route through LOW_CONFIDENCE → INTEL_LOW_DATA_QUALITY_FAIL_OPEN or
+  the scanner-approved fallback (approved=True).
   The 222 SPY-trend vetoes observed in production are therefore either:
     (a) hard-block skips → INTEL_AUTHORITATIVE_VETO_SKIP_HARD; or
-    (b) scanner-approved fallbacks → INTEL_AUTHORITATIVE_APPROVED.
+    (b) fail-open LOW_CONFIDENCE / scanner-approved fallbacks.
   No free-text pass-through creates authority.
 
 Policy version: 1.0
@@ -76,8 +78,6 @@ INTEL_SCANNER_APPROVED_OBSERVE   = "INTEL_SCANNER_APPROVED_OBSERVE_ONLY"
 # Adding a new authoritative veto requires an explicit PR to this allowlist.
 INTEL_AUTHORITATIVE_VETO_RISK            = "INTEL_AUTHORITATIVE_VETO_RISK"
 INTEL_AUTHORITATIVE_VETO_SKIP_HARD       = "INTEL_AUTHORITATIVE_VETO_SKIP_HARD"
-INTEL_AUTHORITATIVE_VETO_LOW_CONFIDENCE  = "INTEL_AUTHORITATIVE_VETO_LOW_CONFIDENCE"
-
 # Fail-open codes — infrastructure / unknown / data issues never block
 INTEL_UNAVAILABLE_FAIL_OPEN      = "INTEL_UNAVAILABLE_FAIL_OPEN"
 INTEL_ERROR_FAIL_OPEN            = "INTEL_ERROR_FAIL_OPEN"
@@ -95,16 +95,16 @@ INTEL_OBSERVE_ONLY_MODE = "INTEL_OBSERVE_ONLY_MODE"
 # Derived from intelligence_bridge._block_gate() call sites (2026-07-18 trace).
 # ---------------------------------------------------------------------------
 _AUTHORITATIVE_VETO_STATUS_MAP: dict[str, str] = {
-    "RISK_VETO":      INTEL_AUTHORITATIVE_VETO_RISK,
-    "SKIP":           INTEL_AUTHORITATIVE_VETO_SKIP_HARD,
-    "LOW_CONFIDENCE": INTEL_AUTHORITATIVE_VETO_LOW_CONFIDENCE,
+    "RISK_VETO": INTEL_AUTHORITATIVE_VETO_RISK,
+    "SKIP":      INTEL_AUTHORITATIVE_VETO_SKIP_HARD,
 }
 
 # Bridge statuses that explicitly signal infrastructure issues → fail open
 _FAIL_OPEN_STATUS_MAP: dict[str, str] = {
-    "UNAVAILABLE": INTEL_UNAVAILABLE_FAIL_OPEN,
-    "TIMEOUT":     INTEL_UNAVAILABLE_FAIL_OPEN,
-    "ERROR":       INTEL_ERROR_FAIL_OPEN,
+    "LOW_CONFIDENCE": INTEL_LOW_DATA_QUALITY_FAIL_OPEN,
+    "UNAVAILABLE":    INTEL_UNAVAILABLE_FAIL_OPEN,
+    "TIMEOUT":        INTEL_UNAVAILABLE_FAIL_OPEN,
+    "ERROR":          INTEL_ERROR_FAIL_OPEN,
 }
 
 
@@ -301,6 +301,22 @@ def adjudicate_intelligence_result(
             raw_status=raw_status,
             policy_version=POLICY_VERSION,
             diagnostics={**base_diag, "raw_status": raw_status, "available": False},
+        )
+
+    # ── Explicit low-data-quality / low-confidence → fail open ────────────
+    fail_open_code = _FAIL_OPEN_STATUS_MAP.get(raw_status)
+    if fail_open_code == INTEL_LOW_DATA_QUALITY_FAIL_OPEN:
+        return IntelligenceAdmissionVerdict(
+            allowed=True,
+            authoritative=False,
+            reason_code=fail_open_code,
+            reasoning=reasoning or "low-confidence intelligence result — fail open",
+            source=source,
+            confidence=confidence,
+            data_quality="low_data_quality",
+            raw_status=raw_status,
+            policy_version=POLICY_VERSION,
+            diagnostics={**base_diag, "raw_status": raw_status, "available": True},
         )
 
     # ── approved=True ──────────────────────────────────────────────────────

@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -43,6 +44,20 @@ import pytest
 # ---------------------------------------------------------------------------
 sys.path.insert(0, ".")
 import ap.intelligence_admission_policy as iap
+import importlib.util as _ilu
+
+_REPO = Path(__file__).resolve().parents[1]
+
+
+def _load(rel: str):
+    spec = _ilu.spec_from_file_location("_mod", _REPO / rel)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ib = _load("intelligence_bridge.py")
+_map_result = _ib._map_result
 
 # Convenience aliases
 adjudicate = iap.adjudicate_intelligence_result
@@ -58,10 +73,11 @@ def _signal(ticker="SPY", side="CALL", signal_id="sig-001"):
 
 def _bridge_result(
     *,
-    approved: bool,
+    approved: bool | None,
     intel_status: str,
     reasoning: str = "test reasoning",
-    score: float = 72.0,
+    score: Any = 72.0,
+    confidence: Any = None,
     available: bool = True,
     contracts: int = 1,
 ) -> dict:
@@ -70,6 +86,7 @@ def _bridge_result(
         "intel_status": intel_status,
         "reasoning":    reasoning,
         "score":        score,
+        "confidence":   confidence,
         "_available":   available,
         "contracts":    contracts,
     }
@@ -82,7 +99,6 @@ def _bridge_result(
 @pytest.mark.parametrize("raw_status,expected_code", [
     ("RISK_VETO",      iap.INTEL_AUTHORITATIVE_VETO_RISK),
     ("SKIP",           iap.INTEL_AUTHORITATIVE_VETO_SKIP_HARD),
-    ("LOW_CONFIDENCE", iap.INTEL_AUTHORITATIVE_VETO_LOW_CONFIDENCE),
 ])
 def test_authoritative_veto_blocks(raw_status, expected_code):
     """Req 1 & 10: known authoritative statuses produce allowed=False."""
@@ -91,6 +107,13 @@ def test_authoritative_veto_blocks(raw_status, expected_code):
     assert not verdict.allowed
     assert verdict.authoritative
     assert verdict.reason_code == expected_code
+
+
+def test_authoritative_veto_status_allowlist_is_exact():
+    assert iap._AUTHORITATIVE_VETO_STATUS_MAP == {
+        "RISK_VETO": iap.INTEL_AUTHORITATIVE_VETO_RISK,
+        "SKIP": iap.INTEL_AUTHORITATIVE_VETO_SKIP_HARD,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +233,40 @@ def test_scanner_approved_observe_only_is_not_a_veto():
     assert verdict.reason_code == iap.INTEL_SCANNER_APPROVED_OBSERVE
 
 
+@pytest.mark.parametrize(
+    "approved,score,confidence,expected_code",
+    [
+        (False, 22.0, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
+        (True, 22.0, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
+        (None, 22.0, None, iap.INTEL_MALFORMED_FAIL_OPEN),
+        (False, None, "bad-confidence", iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
+        (False, None, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
+    ],
+)
+@pytest.mark.parametrize("mode", ["LIVE", "PAPER"])
+def test_low_confidence_fail_opens_across_shapes(approved, score, confidence, expected_code, mode):
+    result = _bridge_result(
+        approved=approved,
+        intel_status="LOW_CONFIDENCE",
+        score=score,
+        confidence=confidence,
+        reasoning="low confidence due to incomplete intelligence data",
+    )
+    verdict = adjudicate(result, signal=_signal(), execution_mode=mode)
+    assert verdict.allowed
+    assert not verdict.authoritative
+    assert verdict.reason_code == expected_code
+
+
+def test_low_confidence_observe_only_mode_still_never_blocks():
+    result = _bridge_result(approved=False, intel_status="LOW_CONFIDENCE", score=18.0)
+    with patch.dict(os.environ, {"INTELLIGENCE_ADMISSION_MODE": "observe_only"}):
+        verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+    assert verdict.allowed
+    assert not verdict.authoritative
+    assert verdict.reason_code == iap.INTEL_OBSERVE_ONLY_MODE
+
+
 def test_approved_false_with_no_status_fails_open():
     """Req 8: approved=False with empty intel_status fails open."""
     result = {"approved": False, "intel_status": "", "_available": True, "reasoning": "low data"}
@@ -289,6 +346,74 @@ def test_paper_and_live_use_same_taxonomy(mode, monkeypatch):
     verdict = adjudicate(result, signal=_signal(), execution_mode=mode)
     assert not verdict.allowed
     assert verdict.reason_code == iap.INTEL_AUTHORITATIVE_VETO_SKIP_HARD
+
+
+def test_bridge_hard_risk_skip_is_the_only_authoritative_skip_path(monkeypatch):
+    monkeypatch.setattr(_ib, "_INTEL_IS_LIVE", True)
+    result = {
+        "ticker": "SPY",
+        "action": "skip",
+        "score": 30.0,
+        "confidence": 0.0,
+        "contracts": 1,
+        "reasoning": "Scanner signal is neutral — no directional setup",
+        "risk_detail": {"approved": True, "reason": "approved"},
+        "signal_breakdown": {},
+    }
+    gate = _map_result(result, fallback_score=70.0)
+    gate["_available"] = True
+    assert gate["approved"] is False
+    assert gate["intel_status"] == "SKIP"
+
+    verdict = adjudicate(gate, signal=_signal(), execution_mode="LIVE")
+    assert not verdict.allowed
+    assert verdict.authoritative
+    assert verdict.reason_code == iap.INTEL_AUTHORITATIVE_VETO_SKIP_HARD
+
+
+def test_bridge_non_hard_skip_cannot_accidentally_become_authoritative(monkeypatch):
+    monkeypatch.setattr(_ib, "_INTEL_IS_LIVE", True)
+    result = {
+        "ticker": "AAPL",
+        "action": "skip",
+        "score": 28.0,
+        "confidence": 0.0,
+        "contracts": 1,
+        "reasoning": "skip: mixed evidence and low confidence",
+        "risk_detail": {"approved": True, "reason": "approved"},
+        "signal_breakdown": {
+            "fundamentals": {"signal": "bullish", "confidence": 80.0},
+        },
+    }
+    gate = _map_result(result, fallback_score=65.0)
+    gate["_available"] = True
+    assert gate["approved"] is False
+    assert gate["intel_status"] == "LOW_CONFIDENCE"
+
+    verdict = adjudicate(gate, signal=_signal(), execution_mode="LIVE")
+    assert verdict.allowed
+    assert not verdict.authoritative
+    assert verdict.reason_code == iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN
+
+
+@pytest.mark.parametrize(
+    "reasoning",
+    [
+        "skip due to low confidence",
+        "neutral setup but unsupported status",
+        "low confidence scanner note",
+    ],
+)
+def test_free_text_skip_or_low_confidence_words_cannot_create_authority(reasoning):
+    result = _bridge_result(
+        approved=False,
+        intel_status="UNSUPPORTED_STATUS",
+        reasoning=reasoning,
+    )
+    verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+    assert verdict.allowed
+    assert not verdict.authoritative
+    assert verdict.reason_code == iap.INTEL_UNKNOWN_REASON_FAIL_OPEN
 
 
 # ---------------------------------------------------------------------------
@@ -431,7 +556,7 @@ def test_observe_only_evaluation_result_cannot_veto():
     # Authoritative vetoes
     ("RISK_VETO",      False, iap.INTEL_AUTHORITATIVE_VETO_RISK),
     ("SKIP",           False, iap.INTEL_AUTHORITATIVE_VETO_SKIP_HARD),
-    ("LOW_CONFIDENCE", False, iap.INTEL_AUTHORITATIVE_VETO_LOW_CONFIDENCE),
+    ("LOW_CONFIDENCE", True, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
     # Approvals
     ("APPROVED",       True,  iap.INTEL_AUTHORITATIVE_APPROVED),
     ("SCANNER_APPROVED_INTEL_OBSERVE_ONLY", True, iap.INTEL_SCANNER_APPROVED_OBSERVE),
@@ -452,8 +577,10 @@ def test_all_bridge_statuses_map_deterministically(raw_status, expected_allowed,
     if raw_status in ("UNAVAILABLE", "TIMEOUT", "ERROR"):
         result = {"approved": True, "intel_status": raw_status,
                   "_available": False, "reasoning": "infra"}
-    elif raw_status in ("RISK_VETO", "SKIP", "LOW_CONFIDENCE"):
+    elif raw_status in ("RISK_VETO", "SKIP"):
         result = _bridge_result(approved=False, intel_status=raw_status)
+    elif raw_status == "LOW_CONFIDENCE":
+        result = _bridge_result(approved=False, intel_status=raw_status, score=18.0)
     else:
         result = _bridge_result(approved=True, intel_status=raw_status)
 
@@ -473,7 +600,7 @@ def test_all_bridge_statuses_map_deterministically(raw_status, expected_allowed,
 def test_block_meta_reason_code_is_stable_not_free_text():
     """Req 25: as_block_meta() always returns a stable reason code."""
     # Simulate master control calling _store_update with the reason_code.
-    for raw_status in ("RISK_VETO", "SKIP", "LOW_CONFIDENCE"):
+    for raw_status in ("RISK_VETO", "SKIP"):
         result = _bridge_result(
             approved=False,
             intel_status=raw_status,
@@ -491,3 +618,16 @@ def test_block_meta_reason_code_is_stable_not_free_text():
             f"Expected stable veto code for {raw_status}, got {meta['intel_reason_code']!r}"
         )
         assert "free text" not in meta["intel_reason_code"]
+
+
+def test_low_confidence_block_meta_uses_fail_open_reason_code():
+    result = _bridge_result(
+        approved=False,
+        intel_status="LOW_CONFIDENCE",
+        reasoning="low confidence due to incomplete evidence",
+        score=20.0,
+    )
+    verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+    meta = verdict.as_block_meta()
+    assert meta["intel_reason_code"] == iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN
+    assert meta["intel_authoritative"] is False
