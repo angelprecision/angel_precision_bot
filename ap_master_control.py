@@ -2579,13 +2579,32 @@ class APMasterControl:
             tier = "C"
 
         intel = self._run_intelligence(signal)
-        intel_score = float(intel.get("score", 0))
-        intel_approve = intel.get("approved", True)
-        intel_reason = intel.get("reasoning", "")
-        intel_avail = intel.get("_available", False)
-        if intel_avail and not intel_approve:
-            self._store_update(signal_id, "rejected", f"intel_blocked: {intel_reason[:100]}")
-            return self._block(signal_id, ticker, client_id, "blocked_intel", f"intel_rejected: {intel_reason[:80]}")
+        intel_score  = float(intel.get("score", 0))
+        intel_approve = intel.get("approved", True)   # kept for downstream sizing/metadata
+        intel_reason  = intel.get("reasoning", "")
+        intel_avail   = intel.get("_available", False)
+
+        # ── Canonical intelligence admission gate ─────────────────────────
+        # ap_master_control must not independently interpret approved,
+        # intel_status, or free-text reasoning.  adjudicate_intelligence_result
+        # is the single authority: only INTEL_AUTHORITATIVE_VETO_* codes block.
+        # Infrastructure failure, missing data, and unknown statuses fail open.
+        from ap.intelligence_admission_policy import (  # late import — module-load safe
+            adjudicate_intelligence_result as _adjudicate_intel,
+        )
+        _intel_verdict = _adjudicate_intel(
+            intel,
+            signal=signal,
+            execution_mode="LIVE" if not self.paper else "PAPER",
+        )
+        if not _intel_verdict.allowed:
+            self._store_update(signal_id, "rejected", _intel_verdict.reason_code)
+            return self._block(
+                signal_id, ticker, client_id,
+                "blocked_intel",
+                _intel_verdict.reason_code,
+                meta=_intel_verdict.as_block_meta(),
+            )
 
         # ── PR-72: Quality Mode gate ──────────────────────────────────────
         # Runs AFTER score-floor and intel gate so we operate on the final
