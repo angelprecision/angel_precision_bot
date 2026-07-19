@@ -17,8 +17,10 @@ Paper behavior is unchanged.
 
 import pathlib
 import re
+from types import SimpleNamespace
 
 import ap_execution_core as ec
+import ap_entry_confirmation as confirmation
 
 SRC = pathlib.Path(ec.__file__).with_suffix(".py").read_text()
 
@@ -41,40 +43,57 @@ def test_bypass_is_logged_critical():
     assert m, "env bypass must log at CRITICAL"
 
 
-# ── LIVE forces confirmation_required into the plan ─────────────────────────
+# ── LIVE requirement is independent of plan mutation ────────────────────────
 
-def test_live_forces_required_flag_before_check():
-    block = re.search(
-        r"_plan_meta_for_confirm = getattr\(approved_plan, \"metadata\", \{\}\) or \{\}(.*?)_confirm_result = check_entry_confirmation",
-        SRC, re.S,
-    ).group(1)
-    assert '_plan_meta_for_confirm["confirmation_required"] = True' in block
-    assert "_is_live_submit" in block
-    assert "_live_confirmation_required()" in block
+def test_live_without_metadata_is_required_without_mutation():
+    plan = SimpleNamespace(metadata={})
+    result = confirmation.resolve_entry_confirmation_requirement(
+        plan, execution_mode="live", live_default_required=True
+    )
+    assert result.required is True
+    assert result.source == "live_default_required"
+    assert plan.metadata == {}
 
 
-def test_paper_path_does_not_force_the_flag():
-    """The forcing is gated on _is_live_submit — paper metadata untouched."""
-    block = re.search(
-        r"(_is_live_submit = str\(.*?)_confirm_result = check_entry_confirmation",
-        SRC, re.S,
-    ).group(1)
-    force_idx = block.index('_plan_meta_for_confirm["confirmation_required"] = True')
-    gate_idx = block.index("if _is_live_submit:")
-    assert gate_idx < force_idx
+def test_paper_without_request_is_not_required_and_not_mutated():
+    plan = SimpleNamespace(metadata={})
+    result = confirmation.resolve_entry_confirmation_requirement(
+        plan, execution_mode="paper", live_default_required=True
+    )
+    assert result.required is False
+    assert plan.metadata == {}
 
 
 # ── Unknown result shape blocks in LIVE with explicit reason ─────────────────
 
-def test_none_result_raises_into_fail_closed_path():
-    assert 'live_confirmation_error:none_result' in SRC
-    m = re.search(
-        r"if _is_live_submit and \(\s*\n\s*_confirm_result is None or not hasattr\(_confirm_result, \"passed\"\)",
-        SRC,
+def test_none_result_blocks_real_live_path(monkeypatch):
+    from tests.test_execution_core_entry_confirmation import _run_entry_trigger
+
+    monkeypatch.setattr(confirmation, "check_entry_confirmation", lambda **kwargs: None)
+    result = _run_entry_trigger(
+        monkeypatch, mode="off", execution_mode="live", confirmation_required=True
     )
-    assert m
-    # It must raise INTO the existing fail-closed except (which terminalizes).
-    assert 'raise RuntimeError("live_confirmation_error:none_result")' in SRC
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1", reason="entry_confirm_error:live_confirmation_error:none_result"
+    )
+
+
+def test_malformed_result_blocks_real_live_path(monkeypatch):
+    from tests.test_execution_core_entry_confirmation import _run_entry_trigger
+
+    monkeypatch.setattr(
+        confirmation,
+        "check_entry_confirmation",
+        lambda **kwargs: SimpleNamespace(passed=None),
+    )
+    result = _run_entry_trigger(
+        monkeypatch, mode="off", execution_mode="live", confirmation_required=True
+    )
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1", reason="entry_confirm_error:live_confirmation_error:malformed_result"
+    )
 
 
 def test_outer_except_still_fails_closed():
@@ -92,7 +111,8 @@ def test_outer_except_still_fails_closed():
 def test_import_error_blocks_in_live_without_plan_flag():
     block = re.search(r"except ImportError:(.*?)except Exception as _ec_err:", SRC, re.S).group(1)
     assert "_live_needs_confirm_imp" in block
-    assert 'if _live_needs_confirm_imp or _hcqg_imp.get("confirmation_required"):' in block
+    assert "_top_required_imp" in block
+    assert "_nested_required_imp" in block
     assert "NO BROKER SUBMIT" in block
 
 
@@ -104,7 +124,20 @@ def test_import_error_paper_skip_preserved():
 # ── passed=False still terminalizes; only passed=True proceeds ───────────────
 
 def test_failed_confirmation_still_blocks():
-    assert "if not _confirm_result.passed:" in SRC
+    result = confirmation.check_entry_confirmation(
+        plan={"metadata": {}},
+        direction="CALL",
+        trigger_price=100.0,
+        live_bid=1.0,
+        live_ask=1.02,
+        live_quote_age_ms=11_000,
+        underlying_last=101.0,
+        decision_option_price=1.0,
+        execution_mode="live",
+        live_default_required=True,
+    )
+    assert result.passed is False
+    assert result.fail_reason == "entry_confirm_failed_stale_quote"
     # observe-only daily continuation carve-out is explicitly configured and
     # unchanged by this PR (documented; enforce-default is PR #230's scope).
     assert "_observe_only_daily_continuation" in SRC

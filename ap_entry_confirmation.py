@@ -22,10 +22,10 @@ wider thresholds if configured.
 
 WHEN confirmation_required IS NOT SET
 --------------------------------------
-Legacy quote confirmation is a no-op when confirmation_required is
-absent. Daily continuation still runs according to
-ENABLE_DAILY_CONTINUATION_MODE and is diagnostic-only in observe
-mode.
+LIVE remains default-required from runner-owned execution context. PAPER
+keeps the legacy no-op unless confirmation is explicitly requested. Daily
+continuation still follows ENABLE_DAILY_CONTINUATION_MODE and remains
+diagnostic-only in observe mode.
 
 ENV FLAGS (hot-read per call)
 ------------------------------
@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import os
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
@@ -59,6 +60,39 @@ def _env_enabled(key: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+_TRUE_CONFIRMATION_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_CONFIRMATION_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def parse_confirmation_bool(value: Any) -> bool | None:
+    """Strict bool parser shared by confirmation guards.
+
+    ``None`` means malformed or absent. Normal Python string truthiness is
+    deliberately forbidden at this broker-safety boundary.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        if numeric == 1.0:
+            return True
+        if numeric == 0.0:
+            return False
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_CONFIRMATION_VALUES:
+            return True
+        if normalized in _FALSE_CONFIRMATION_VALUES:
+            return False
+    return None
 
 
 def _daily_continuation_mode() -> str:
@@ -92,6 +126,104 @@ def _tier_confirm_seconds(score: Optional[float], tier: Optional[str],
 
 
 # ── Result ────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ConfirmationRequirement:
+    required: bool
+    source: str
+    execution_mode: str
+    top_level_present: bool
+    nested_present: bool
+    top_level_value: bool | None
+    nested_value: bool | None
+    conflict: bool
+    malformed: bool
+    live_default_required: bool
+
+
+def resolve_entry_confirmation_requirement(
+    plan: Any,
+    *,
+    execution_mode: str = "",
+    live_default_required: bool | None = None,
+) -> ConfirmationRequirement:
+    """Resolve confirmation policy without mutation or external I/O."""
+    meta = _extract_plan_metadata(plan)
+    top_present = "confirmation_required" in meta
+    top_value = parse_confirmation_bool(meta.get("confirmation_required")) if top_present else None
+
+    nested_raw = meta.get("hybrid_client_quality_gate")
+    nested = nested_raw if isinstance(nested_raw, Mapping) else {}
+    nested_present = "confirmation_required" in nested
+    nested_value = (
+        parse_confirmation_bool(nested.get("confirmation_required"))
+        if nested_present else None
+    )
+
+    malformed = bool(
+        (top_present and top_value is None)
+        or (nested_present and nested_value is None)
+        or (nested_raw is not None and not isinstance(nested_raw, Mapping))
+    )
+    conflict = bool(
+        top_value is not None
+        and nested_value is not None
+        and top_value != nested_value
+    )
+    mode = str(execution_mode or "").strip().lower()
+    live = mode == "live"
+    parsed_default = parse_confirmation_bool(live_default_required)
+    live_default = (
+        True
+        if live_default_required is None or parsed_default is None
+        else parsed_default
+    )
+
+    explicit_true = top_value is True or nested_value is True
+    if conflict:
+        required = True
+        source = "metadata_conflict_fail_closed"
+    elif live:
+        required = bool(live_default or explicit_true)
+        if live_default and explicit_true:
+            source = "live_default_plus_explicit"
+        elif live_default:
+            source = "live_default_required"
+        elif explicit_true:
+            source = (
+                "top_level_metadata"
+                if top_value is True
+                else "legacy_nested_metadata"
+            )
+        elif malformed:
+            source = "live_break_glass_default_disabled"
+        else:
+            source = "live_break_glass_default_disabled"
+    elif top_value is not None:
+        required = top_value
+        source = "top_level_metadata"
+    elif nested_value is not None:
+        required = nested_value
+        source = "legacy_nested_metadata"
+    elif malformed:
+        required = False
+        source = "malformed_metadata_ignored"
+    else:
+        required = False
+        source = "not_requested"
+
+    return ConfirmationRequirement(
+        required=bool(required),
+        source=source,
+        execution_mode=mode,
+        top_level_present=top_present,
+        nested_present=nested_present,
+        top_level_value=top_value,
+        nested_value=nested_value,
+        conflict=conflict,
+        malformed=malformed,
+        live_default_required=bool(live_default),
+    )
 
 @dataclass
 class ConfirmationResult:
@@ -177,6 +309,15 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _finite_float(value: Any) -> float | None:
+    parsed = _as_float(value)
+    return parsed if parsed is not None and math.isfinite(parsed) else None
+
+
+def _is_missing(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
 
 
 def _candle_open(candle: Any) -> float | None:
@@ -358,12 +499,14 @@ def check_entry_confirmation(
     tier: Optional[str]   = None,
     timeframe: Optional[str] = None,
     sandbox_mode: bool = False,
+    execution_mode: str = "",
+    live_default_required: bool | None = None,
 ) -> ConfirmationResult:
     """
     Pre-submit confirmation preflight.
 
     Checks (in order, fail-fast):
-    1. confirmation_required present in plan metadata — skip if absent
+    1. canonical confirmation requirement
     2. Quote freshness
     3. Spread acceptability
     4. Option fade from decision price
@@ -374,8 +517,19 @@ def check_entry_confirmation(
     # ── Resolve plan metadata ─────────────────────────────────────────────
     meta_src = _extract_plan_metadata(plan)
 
-    gate_meta = meta_src.get('hybrid_client_quality_gate') or {}
-    confirmation_required = gate_meta.get('confirmation_required', False)
+    if live_default_required is None:
+        parsed_live_default = parse_confirmation_bool(
+            os.getenv("LIVE_CONFIRMATION_REQUIRED", "1")
+        )
+        live_default_required = (
+            True if parsed_live_default is None else parsed_live_default
+        )
+    requirement = resolve_entry_confirmation_requirement(
+        plan,
+        execution_mode=execution_mode,
+        live_default_required=live_default_required,
+    )
+    confirmation_required = requirement.required
 
     started_at   = datetime.now(timezone.utc).isoformat()
     max_fade     = _ef("MAX_PRE_ENTRY_OPTION_FADE_PCT",       8.0)
@@ -383,19 +537,31 @@ def check_entry_confirmation(
     max_spread   = _ef("CLIENT_PROOF_MAX_SPREAD_PCT",         0.10)
     max_quote_age_s = _ef("CLIENT_PROOF_QUOTE_MAX_AGE_SECONDS", 10.0)
     confirm_s    = _tier_confirm_seconds(score, tier, timeframe)
-    dirn         = direction.upper()
+    dirn         = str(direction or "").strip().upper()
 
-    live_mid = None
-    spread_pct = None
-    if live_bid is not None and live_ask is not None and live_bid > 0 and live_ask > 0:
-        live_mid   = (live_bid + live_ask) / 2
-        spread_pct = (live_ask - live_bid) / live_mid if live_mid > 0 else None
-
-    quote_age_s = (live_quote_age_ms or 0) / 1000.0
+    bid = _finite_float(live_bid)
+    ask = _finite_float(live_ask)
+    live_mid = (bid + ask) / 2 if bid is not None and ask is not None else None
+    spread_pct = (
+        (ask - bid) / live_mid
+        if live_mid is not None and live_mid > 0 else None
+    )
+    quote_age_ms = _finite_float(live_quote_age_ms)
+    quote_age_s = quote_age_ms / 1000.0 if quote_age_ms is not None else None
 
     base = {
         "confirmation_required":      bool(confirmation_required),
         "hybrid_confirmation_required": bool(confirmation_required),
+        "confirmation_requirement_source": requirement.source,
+        "confirmation_requirement_conflict": requirement.conflict,
+        "confirmation_requirement_malformed": requirement.malformed,
+        "confirmation_execution_mode": requirement.execution_mode,
+        "confirmation_top_level_present": requirement.top_level_present,
+        "confirmation_nested_present": requirement.nested_present,
+        "confirmation_top_level_value": requirement.top_level_value,
+        "confirmation_nested_value": requirement.nested_value,
+        "live_confirmation_default_required": requirement.live_default_required,
+        "direction":                   dirn or None,
         "confirmation_seconds":       confirm_s,
         "underlying_start":           trigger_price,
         "underlying_end":             underlying_last,
@@ -403,7 +569,8 @@ def check_entry_confirmation(
         "option_mid_end":             live_mid,
         "option_move_pct":            None,
         "underlying_move_pct":        None,
-        "quote_age_seconds":          round(quote_age_s, 2),
+        "quote_age_ms":               live_quote_age_ms,
+        "quote_age_seconds":          round(quote_age_s, 2) if quote_age_s is not None else None,
         "spread_pct":                 round(spread_pct, 4) if spread_pct is not None else None,
         "live_entry_bid":             live_bid,
         "live_entry_ask":             live_ask,
@@ -432,45 +599,116 @@ def check_entry_confirmation(
             metadata=base,
         )
 
-    # ── 1. Quote age ──────────────────────────────────────────────────────
+    # ── 1. Required direction and synchronized quote ─────────────────────
+    if dirn not in {"CALL", "PUT"}:
+        return _fail(
+            "entry_confirm_failed_invalid_direction",
+            {**base, "direction": dirn or None},
+        )
+
+    if _is_missing(live_bid) or _is_missing(live_ask):
+        return _fail(
+            "entry_confirm_failed_missing_quote",
+            {**base, "quote_evidence_status": "missing_or_one_sided"},
+        )
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return _fail(
+            "entry_confirm_failed_invalid_quote",
+            {**base, "quote_evidence_status": "invalid_nonfinite_or_nonpositive"},
+        )
+    if ask < bid:
+        return _fail(
+            "entry_confirm_failed_crossed_quote",
+            {**base, "quote_evidence_status": "crossed"},
+        )
+
+    # ── 2. Quote age ──────────────────────────────────────────────────────
     # Use the stricter of confirm_s and CLIENT_PROOF_QUOTE_MAX_AGE_SECONDS
     effective_max_age = min(confirm_s, max_quote_age_s)
-    if live_bid is None and live_ask is None:
-        return _fail("entry_confirm_failed_stale_quote",
-                     {**base, "reason": "no live quote available at submit time"})
-
+    if _is_missing(live_quote_age_ms):
+        return _fail(
+            "entry_confirm_failed_missing_quote_age",
+            {**base, "quote_age_status": "missing", "max_age_seconds": effective_max_age},
+        )
+    if quote_age_s is None or quote_age_s < 0:
+        return _fail(
+            "entry_confirm_failed_invalid_quote_age",
+            {**base, "quote_age_status": "invalid", "max_age_seconds": effective_max_age},
+        )
     if quote_age_s > effective_max_age:
         return _fail("entry_confirm_failed_stale_quote",
                      {**base,
                       "quote_age_seconds": round(quote_age_s, 2),
+                      "quote_age_status":  "stale",
                       "max_age_seconds":   effective_max_age})
 
-    # ── 2. Spread ─────────────────────────────────────────────────────────
+    # ── 3. Spread ─────────────────────────────────────────────────────────
     if spread_pct is not None and spread_pct > max_spread:
         return _fail("entry_confirm_failed_spread",
                      {**base,
                       "spread_pct":     round(spread_pct, 4),
                       "max_spread_pct": max_spread})
 
-    # ── 3. Option fade ────────────────────────────────────────────────────
-    if decision_option_price and decision_option_price > 0 and live_mid is not None:
-        fade_pct = (decision_option_price - live_mid) / decision_option_price * 100
+    # ── 4. Option fade ────────────────────────────────────────────────────
+    decision_price = _finite_float(decision_option_price)
+    require_complete_live_evidence = requirement.execution_mode == "live"
+    if require_complete_live_evidence and _is_missing(decision_option_price):
+        return _fail(
+            "entry_confirm_failed_missing_decision_price",
+            {**base, "decision_price_status": "missing"},
+        )
+    if require_complete_live_evidence and (
+        decision_price is None or decision_price <= 0
+    ):
+        return _fail(
+            "entry_confirm_failed_invalid_decision_price",
+            {**base, "decision_price_status": "invalid"},
+        )
+    if decision_price is not None and decision_price > 0 and live_mid is not None:
+        fade_pct = (decision_price - live_mid) / decision_price * 100
         base["option_move_pct"] = round(fade_pct, 2)
         if fade_pct > max_fade:
             return _fail("entry_confirm_failed_option_fade",
                          {**base,
                           "fade_pct":     round(fade_pct, 2),
                           "max_fade_pct": max_fade,
-                          "decision_price": decision_option_price,
+                          "decision_price": decision_price,
                           "live_mid":       live_mid})
 
         # Paper quote lag warning: if sandbox and live quotes differ materially
         if sandbox_mode and fade_pct > 2.0:
             base["paper_quote_lag_warning"] = True
 
-    # ── 4. Underlying reversal ────────────────────────────────────────────
-    if underlying_last is not None and trigger_price is not None and trigger_price > 0:
-        move_pct = (underlying_last - trigger_price) / trigger_price * 100
+    # ── 5. Underlying reversal ────────────────────────────────────────────
+    trigger = _finite_float(trigger_price)
+    current_underlying = _finite_float(underlying_last)
+    if require_complete_live_evidence and (
+        _is_missing(trigger_price) or trigger is None or trigger <= 0
+    ):
+        return _fail(
+            "entry_confirm_failed_missing_trigger"
+            if _is_missing(trigger_price)
+            else "entry_confirm_failed_invalid_trigger",
+            {**base, "trigger_status": "missing" if _is_missing(trigger_price) else "invalid"},
+        )
+    if require_complete_live_evidence and (
+        _is_missing(underlying_last)
+        or current_underlying is None
+        or current_underlying <= 0
+    ):
+        return _fail(
+            "entry_confirm_failed_missing_underlying"
+            if _is_missing(underlying_last)
+            else "entry_confirm_failed_invalid_underlying",
+            {**base, "underlying_status": "missing" if _is_missing(underlying_last) else "invalid"},
+        )
+    if (
+        current_underlying is not None
+        and current_underlying > 0
+        and trigger is not None
+        and trigger > 0
+    ):
+        move_pct = (current_underlying - trigger) / trigger * 100
         base["underlying_move_pct"] = round(move_pct, 2)
 
         if dirn == "CALL":
@@ -479,8 +717,8 @@ def check_entry_confirmation(
             if reversal > max_reversal:
                 return _fail("entry_confirm_failed_underlying_reversal",
                              {**base,
-                              "underlying_last":  underlying_last,
-                              "trigger_price":    trigger_price,
+                              "underlying_last":  current_underlying,
+                              "trigger_price":    trigger,
                               "reversal_pct":     round(reversal, 3),
                               "max_reversal_pct": max_reversal,
                               "direction": "CALL"})
@@ -490,8 +728,8 @@ def check_entry_confirmation(
             if reversal > max_reversal:
                 return _fail("entry_confirm_failed_underlying_reversal",
                              {**base,
-                              "underlying_last":  underlying_last,
-                              "trigger_price":    trigger_price,
+                              "underlying_last":  current_underlying,
+                              "trigger_price":    trigger,
                               "reversal_pct":     round(reversal, 3),
                               "max_reversal_pct": max_reversal,
                               "direction": "PUT"})

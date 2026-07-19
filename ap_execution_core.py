@@ -24,7 +24,7 @@ import uuid
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Mapping, Optional
 from types import MappingProxyType, SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -413,9 +413,11 @@ def _live_confirmation_required() -> bool:
     bypass and is logged at CRITICAL by the caller. Hot-read per call
     (repo convention for entry-confirmation flags).
     """
-    return str(
-        os.getenv("LIVE_CONFIRMATION_REQUIRED", "1")
-    ).strip().lower() in ("1", "true", "yes")
+    raw = str(os.getenv("LIVE_CONFIRMATION_REQUIRED", "1")).strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    # Unknown/malformed values fail closed to the LIVE default.
+    return True
 
 
 def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
@@ -5472,7 +5474,9 @@ class APExecutionCore:
             "submitted_limit_price":       float(submit_limit),
             "limit_vs_submit_ask_pct":     round((_ask_cross / _submit_ask) * 100, 4) if _submit_ask > 0 else None,
             "quote_refreshed_at_submit":   True,
-            "quote_age_ms":                int(_quote_age_ms),
+            "quote_age_ms":                (
+                int(_quote_age_ms) if _quote_age_ms is not None else None
+            ),
             "spread_pct_at_submit":        _submit_quote_fields.get("spread_pct"),
             "sandbox_mode":                self.paper,
             "broker_base_url":             getattr(getattr(self.broker, "cfg", None), "base_url", None),
@@ -5659,22 +5663,30 @@ class APExecutionCore:
             from ap_entry_confirmation import check_entry_confirmation
             _sig_for_confirm = watched.signal or {}
             _plan_meta_for_confirm = getattr(approved_plan, "metadata", {}) or {}
-            # P0 (PR #262): LIVE default-required. Force the flag into plan
-            # metadata so the legacy no-op path is impossible in LIVE — the
-            # confirmation checks ALWAYS run, and only an explicit
-            # passed=True reaches the broker. Paper behavior unchanged.
-            _is_live_submit = str(
-                getattr(self, "execution_mode", "") or getattr(self, "mode", "") or ""
-            ).strip().upper() == "LIVE"
+            _plan_meta_mapping = (
+                _plan_meta_for_confirm
+                if isinstance(_plan_meta_for_confirm, Mapping)
+                else {}
+            )
+            # Runtime-owned execution mode is authoritative for this broker
+            # boundary. Plan metadata must never be able to relabel LIVE as PAPER.
+            _confirmation_execution_mode = _normalize_execution_mode(
+                getattr(self, "execution_mode", None)
+            )
+            if _confirmation_execution_mode is None:
+                _confirmation_execution_mode = _normalize_execution_mode(
+                    getattr(self, "mode", None)
+                )
+            if _confirmation_execution_mode is None and isinstance(
+                getattr(self, "paper", None), bool
+            ):
+                _confirmation_execution_mode = (
+                    "paper" if self.paper else "live"
+                )
+            _is_live_submit = _confirmation_execution_mode == "live"
+            _live_confirmation_default = _live_confirmation_required()
             if _is_live_submit:
-                if _live_confirmation_required():
-                    if isinstance(_plan_meta_for_confirm, dict):
-                        _plan_meta_for_confirm["confirmation_required"] = True
-                        try:
-                            setattr(approved_plan, "metadata", _plan_meta_for_confirm)
-                        except Exception:
-                            pass
-                else:
+                if not _live_confirmation_default:
                     log.critical(
                         "[%s] LIVE_CONFIRMATION_BYPASSED_BY_ENV — "
                         "LIVE_CONFIRMATION_REQUIRED=0 is set; live submit will "
@@ -5683,7 +5695,7 @@ class APExecutionCore:
                         ticker,
                     )
             _sandbox = bool(
-                _plan_meta_for_confirm.get("sandbox_mode")
+                _plan_meta_mapping.get("sandbox_mode")
                 or getattr(self.broker, "sandbox", False)
             )
             _underlying_last = None
@@ -5700,7 +5712,7 @@ class APExecutionCore:
 
             _confirm_result = check_entry_confirmation(
                 plan             = approved_plan,
-                direction        = str(getattr(approved_plan, "side", "CALL") or "CALL").upper(),
+                direction        = str(getattr(approved_plan, "side", "") or "").upper(),
                 trigger_price    = float(getattr(approved_plan, "trigger_price", 0) or 0) or None,
                 live_bid         = _submit_quote_fields.get("submit_bid"),
                 live_ask         = _submit_quote_fields.get("submit_ask"),
@@ -5711,21 +5723,47 @@ class APExecutionCore:
                 tier      = str(getattr(approved_plan, "tier", "") or ""),
                 timeframe = str(_sig_for_confirm.get("timeframe") or "1d"),
                 sandbox_mode = _sandbox,
+                execution_mode = _confirmation_execution_mode or "",
+                live_default_required = _live_confirmation_default,
             )
             # P0 (PR #262): LIVE must block on an unknown/None result with an
             # explicit reason. (The outer except already fails closed on any
             # raise; this names the None-shape case instead of surfacing an
             # AttributeError.)
-            if _is_live_submit and (
-                _confirm_result is None or not hasattr(_confirm_result, "passed")
-            ):
+            if _is_live_submit and _confirm_result is None:
                 raise RuntimeError("live_confirmation_error:none_result")
+            _confirmation_passed = getattr(_confirm_result, "passed", None)
+            if _is_live_submit and not isinstance(_confirmation_passed, bool):
+                raise RuntimeError("live_confirmation_error:malformed_result")
             _confirm_meta = _confirm_result.to_meta(
                 started_at   = _confirm_result.metadata.get("live_entry_ts", ""),
                 completed_at = __import__("datetime").datetime.now(
                     __import__("datetime").timezone.utc).isoformat(),
             )
-            if not _confirm_result.passed:
+            _confirm_meta["client_id"] = str(
+                (_sig_for_confirm or {}).get("client_id")
+                or getattr(self, "client_id", "")
+                or ""
+            )
+            _confirm_meta["execution_mode"] = _confirmation_execution_mode or ""
+            if _confirm_meta.get("confirmation_requirement_conflict"):
+                log.critical(
+                    "[%s] ENTRY_CONFIRM_REQUIREMENT_CONFLICT — failing closed | "
+                    "client_id=%s execution_mode=%s",
+                    ticker,
+                    _confirm_meta["client_id"],
+                    _confirm_meta["execution_mode"],
+                )
+            elif _confirm_meta.get("confirmation_requirement_malformed"):
+                log.warning(
+                    "[%s] ENTRY_CONFIRM_REQUIREMENT_MALFORMED | client_id=%s "
+                    "execution_mode=%s required=%s",
+                    ticker,
+                    _confirm_meta["client_id"],
+                    _confirm_meta["execution_mode"],
+                    _confirm_meta.get("confirmation_required"),
+                )
+            if _confirmation_passed is not True:
                 _fail_reason = _confirm_result.fail_reason or "entry_confirm_failed"
 
                 # PR #219 Fix A: observe-only daily continuation must NOT terminalize.
@@ -5811,17 +5849,27 @@ class APExecutionCore:
             # When confirmation_required=True, a missing module is NOT safe to skip.
             # Client-eligible trades must not bypass confirmation — fail closed.
             _gate_meta_imp = (getattr(approved_plan, "metadata", {}) or {})
-            _hcqg_imp      = _gate_meta_imp.get("hybrid_client_quality_gate") or {}
+            _gate_meta_imp = _gate_meta_imp if isinstance(_gate_meta_imp, Mapping) else {}
+            _hcqg_imp = _gate_meta_imp.get("hybrid_client_quality_gate") or {}
+            _hcqg_imp = _hcqg_imp if isinstance(_hcqg_imp, Mapping) else {}
             # P0 (PR #262): in LIVE the module is required, full stop —
             # reason live_confirmation_required. The plan-flag path below
             # continues to cover client-gated paper flows.
             _live_needs_confirm_imp = (
-                str(
-                    getattr(self, "execution_mode", "") or getattr(self, "mode", "") or ""
-                ).strip().upper() == "LIVE"
+                (
+                    _normalize_execution_mode(getattr(self, "execution_mode", None))
+                    or _normalize_execution_mode(getattr(self, "mode", None))
+                    or ("paper" if getattr(self, "paper", None) is True else "live")
+                ) == "live"
                 and _live_confirmation_required()
             )
-            if _live_needs_confirm_imp or _hcqg_imp.get("confirmation_required"):
+            _top_required_imp = str(
+                _gate_meta_imp.get("confirmation_required", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            _nested_required_imp = str(
+                _hcqg_imp.get("confirmation_required", "")
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if _live_needs_confirm_imp or _top_required_imp or _nested_required_imp:
                 log.critical(
                     "[%s] ENTRY_CONFIRM_MODULE_MISSING — confirmation_required=True "
                     "but ap_entry_confirmation is not deployed. "
