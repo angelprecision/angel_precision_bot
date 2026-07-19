@@ -56,6 +56,16 @@ class MigrationChecksumDrift(RuntimeError):
     """A recorded migration file changed on disk after being applied."""
 
 
+class BaselineAttestationError(RuntimeError):
+    """Schema attestation failed before baseline could record any ledger rows.
+
+    Raised when ``baseline()`` is called without ``force=True`` and the
+    production database does not satisfy ``REQUIRED_SCHEMA``, or when the
+    database cannot be reached.  Zero ``schema_migrations`` rows are written
+    before this exception is raised.
+    """
+
+
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -145,13 +155,47 @@ def status(directory: Path | None = None) -> dict[str, Any]:
     }
 
 
-def baseline(directory: Path | None = None) -> dict[str, Any]:
+def baseline(directory: Path | None = None, *, force: bool = False) -> dict[str, Any]:
     """Mark every current file as applied WITHOUT executing SQL.
 
-    One-time adoption of the hand-applied production history. Idempotent:
+    One-time adoption of the hand-applied production history.  Idempotent:
     already-recorded files are untouched.
+
+    Before inserting any ledger rows, runs strict schema attestation against
+    ``REQUIRED_SCHEMA``.  If attestation fails, detects missing schema, or
+    cannot reach the database: zero ``schema_migrations`` rows are written
+    and ``BaselineAttestationError`` is raised.  This prevents the exact
+    incident this module was built to prevent: marking migrations as applied
+    when production does not actually have that schema.
+
+    ``force=True`` bypasses attestation and emits a CRITICAL log warning.
+    Use only for disaster recovery when you know the production database is
+    already correct but attestation is unavailable.  Force is never the
+    default.
     """
     _ensure_ledger()
+
+    if force:
+        log.critical(
+            "MIGRATION_BASELINE_FORCE — schema attestation bypassed. "
+            "The schema_migrations ledger may not reflect actual database schema. "
+            "Use only when you have independently verified production schema correctness."
+        )
+    else:
+        from ap.schema_attestation import (  # late import — keeps module import-safe
+            SchemaAttestationError as _SAError,
+            attest_schema,
+        )
+        try:
+            attest_schema(strict=True)
+        except _SAError as exc:
+            raise BaselineAttestationError(
+                f"Baseline refused: schema attestation failed — "
+                f"zero ledger rows written. "
+                f"Apply all pending migrations before running baseline. "
+                f"Detail: {exc}"
+            ) from exc
+
     recorded = _recorded()
     marked = []
     for path in _migration_files(directory):
@@ -183,14 +227,26 @@ def run_pending(*, apply: bool = False, directory: Path | None = None) -> dict[s
 
     from ap.db import conn
 
+    bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).strip().upper()
     directory = directory or MIGRATIONS_DIR
     for filename in report["pending"]:
         path = directory / filename
         sql_text = path.read_text(encoding="utf-8")
+        checksum = _sha256(sql_text)
         try:
+            # Migration SQL and ledger INSERT share one connection and one
+            # transaction.  Both commit together or both roll back together.
+            # Calling _record() after conn() closes is unsafe: a crash between
+            # commit and _record() leaves the migration applied but unrecorded,
+            # causing it to re-execute on the next run.
             with conn() as c:
                 c.execute(sql_text)
-            _record(filename, _sha256(sql_text), baselined=False)
+                c.execute(
+                    "INSERT INTO schema_migrations "
+                    "(filename, checksum, bot_mode, baselined) "
+                    "VALUES (%s,%s,%s,%s) ON CONFLICT (filename) DO NOTHING",
+                    (filename, checksum, bot_mode, False),
+                )
             result["applied"].append(filename)
             log.info("MIGRATION_APPLIED %s", filename)
         except Exception as exc:  # noqa: BLE001 — stop, report, do not continue past failure
@@ -213,13 +269,14 @@ def _main(argv: list[str]) -> int:
     if cmd == "status":
         print(status())
     elif cmd == "baseline":
-        print(baseline())
+        force = "--force" in argv[2:]
+        print(baseline(force=force))
     elif cmd == "apply":
         print(run_pending(apply=True))
     elif cmd == "dry-run":
         print(run_pending(apply=False))
     else:
-        print("usage: python -m ap.migration_runner [status|baseline|dry-run|apply]")
+        print("usage: python -m ap.migration_runner [status|baseline [--force]|dry-run|apply]")
         return 2
     return 0
 
