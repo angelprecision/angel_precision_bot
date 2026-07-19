@@ -3310,9 +3310,21 @@ class APContractSelectionEngine:
                     plan.selector_metadata = meta
                 except Exception:
                     pass
+            # P1 fix: the post-mutation identity read MUST use the identical
+            # ``execution_mode`` -> ``mode`` fallback chain used at capture
+            # (see _original_execution_mode above). Comparing a fallback-resolved
+            # capture against a non-fallback read made every plan that carries
+            # legacy ``mode`` (but no ``execution_mode`` attribute) trip this
+            # assertion as a false positive — 74 queue ERRORs/week in production
+            # ("contract_selector_error: Selector mutation changed execution
+            # identity") killing viable signals at contract selection.
+            _post_execution_mode = (
+                _safe_plan_attr(plan, "execution_mode", None)
+                or _safe_plan_attr(plan, "mode", None)
+            )
             if (
                 _safe_plan_attr(plan, "client_id", None) != _original_client_id
-                or _safe_plan_attr(plan, "execution_mode", None) != _original_execution_mode
+                or _post_execution_mode != _original_execution_mode
                 or _safe_plan_attr(plan, "signal_id", None) != _original_signal_id
             ):
                 raise AssertionError("Selector mutation changed execution identity")
