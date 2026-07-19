@@ -43,7 +43,7 @@ def install_trade_lifecycle_guards() -> dict[str, dict[str, str | bool]]:
             "module": "ap.schema_attestation",
             "installer": "attest_schema",
             "required_when_present": True,
-            "status": "ok" if _schema_report.get("ok") else "failed",
+            "status": "installed" if _schema_report.get("ok") else "failed",
             "detail": str({
                 "missing_tables": _schema_report.get("missing_tables"),
                 "missing_columns": _schema_report.get("missing_columns"),

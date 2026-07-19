@@ -27,9 +27,11 @@ import pytest
 sys.modules.setdefault("psycopg2", MagicMock())
 sys.modules.setdefault("psycopg2.extras", MagicMock())
 sys.modules.setdefault("psycopg2.pool", MagicMock())
+sys.modules.setdefault("ap.db", MagicMock())
 
 import ap.schema_attestation as sa
 import ap.migration_runner as mr
+import ap.trade_lifecycle_guards as lifecycle_guards
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +194,112 @@ def test_production_declaration_covers_claims_table():
     assert "generation_key" in sa.REQUIRED_SCHEMA["exit_decision_generation_claims"]
     assert "proof_trades" in sa.REQUIRED_SCHEMA
     assert "performance_taxonomy" in sa.REQUIRED_SCHEMA["proof_trades"]
+
+
+def test_lifecycle_manifest_records_healthy_schema_as_installed(monkeypatch):
+    schema_module = SimpleNamespace(
+        attest_schema=lambda strict=False: {
+            "ok": True,
+            "missing_tables": [],
+            "missing_columns": {},
+            "skipped": False,
+            "error": None,
+        }
+    )
+    guard_module = SimpleNamespace(install=lambda: None)
+    monkeypatch.setitem(sys.modules, "ap.schema_attestation", schema_module)
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "_GUARDS",
+        (("canonical_exit_fill_truth", "ap.fake_guard", "install", True),),
+    )
+    monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: guard_module)
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: True)
+
+    manifest = lifecycle_guards.install_trade_lifecycle_guards()
+    ok, diagnostics = lifecycle_guards.lifecycle_guard_preflight("live")
+
+    assert manifest["_schema_attestation"]["status"] == "installed"
+    assert ok is True
+    assert "_schema_attestation" not in diagnostics["missing_required_guards"]
+
+
+def test_lifecycle_preflight_blocks_failed_schema_attestation(monkeypatch):
+    schema_module = SimpleNamespace(
+        attest_schema=lambda strict=False: {
+            "ok": False,
+            "missing_tables": ["positions"],
+            "missing_columns": {"positions": ["execution_mode"]},
+            "skipped": False,
+            "error": None,
+        }
+    )
+    guard_module = SimpleNamespace(install=lambda: None)
+    monkeypatch.setitem(sys.modules, "ap.schema_attestation", schema_module)
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "_GUARDS",
+        (("canonical_exit_fill_truth", "ap.fake_guard", "install", True),),
+    )
+    monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: guard_module)
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: True)
+
+    manifest = lifecycle_guards.install_trade_lifecycle_guards()
+    ok, diagnostics = lifecycle_guards.lifecycle_guard_preflight("live")
+
+    assert manifest["_schema_attestation"]["status"] == "failed"
+    assert ok is False
+    assert "_schema_attestation" in diagnostics["missing_required_guards"]
+
+
+def test_lifecycle_preflight_blocks_schema_attestation_exception(monkeypatch):
+    def _boom(strict=False):
+        raise RuntimeError("db unavailable")
+
+    guard_module = SimpleNamespace(install=lambda: None)
+    monkeypatch.setitem(sys.modules, "ap.schema_attestation", SimpleNamespace(attest_schema=_boom))
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "_GUARDS",
+        (("canonical_exit_fill_truth", "ap.fake_guard", "install", True),),
+    )
+    monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: guard_module)
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: True)
+
+    manifest = lifecycle_guards.install_trade_lifecycle_guards()
+    ok, diagnostics = lifecycle_guards.lifecycle_guard_preflight("live")
+
+    assert manifest["_schema_attestation"]["status"] == "attestation_error"
+    assert ok is False
+    assert "_schema_attestation" in diagnostics["missing_required_guards"]
+
+
+def test_lifecycle_preflight_keeps_other_required_install_failures_blocking(monkeypatch):
+    schema_module = SimpleNamespace(
+        attest_schema=lambda strict=False: {
+            "ok": True,
+            "missing_tables": [],
+            "missing_columns": {},
+            "skipped": False,
+            "error": None,
+        }
+    )
+    def _boom():
+        raise RuntimeError("install failed")
+
+    monkeypatch.setitem(sys.modules, "ap.schema_attestation", schema_module)
+    monkeypatch.setattr(
+        lifecycle_guards,
+        "_GUARDS",
+        (("canonical_exit_fill_truth", "ap.fake_guard", "install", True),),
+    )
+    monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: SimpleNamespace(install=_boom))
+    monkeypatch.setattr(lifecycle_guards, "_generation_claims_table_exists", lambda: True)
+
+    ok, diagnostics = lifecycle_guards.lifecycle_guard_preflight("live")
+
+    assert ok is False
+    assert diagnostics["missing_required_guards"] == ["canonical_exit_fill_truth"]
 
 
 # ---------------------------------------------------------------------------

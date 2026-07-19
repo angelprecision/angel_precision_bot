@@ -48,6 +48,24 @@ jobs:
             -tAc "SELECT to_regclass('public.exit_decision_generation_claims') IS NOT NULL" \
             | grep -qx t
 
+      - name: Validate positions execution-mode migration
+        env:
+          PGPASSWORD: postgres
+        run: |
+          createdb -h localhost -U postgres position_mode_migration_test
+          psql -h localhost -U postgres -d position_mode_migration_test -v ON_ERROR_STOP=1 -c \
+            "CREATE TABLE positions (id text PRIMARY KEY, client_id text, local_order_id text, broker_order_id text); CREATE TABLE orders (id text PRIMARY KEY, client_id text, kind text, local_order_id text, broker_order_id text, execution_mode text); INSERT INTO positions VALUES ('unique','client@example.com','local-1',NULL),('unknown','client@example.com','missing',NULL),('ambiguous','client@example.com','local-2','broker-2'); INSERT INTO orders VALUES ('order-1','client@example.com','ENTRY','local-1',NULL,'LIVE'),('order-2','client@example.com','ENTRY','local-2',NULL,'paper'),('order-3','client@example.com','ENTRY',NULL,'broker-2','paper');"
+          psql -h localhost -U postgres -d position_mode_migration_test \
+            --single-transaction -v ON_ERROR_STOP=1 \
+            -f migrations/20260719032517_add_positions_execution_mode.sql
+          psql -h localhost -U postgres -d position_mode_migration_test \
+            -tAc "SELECT execution_mode FROM positions WHERE id='unique'" \
+            | grep -qx live
+          psql -h localhost -U postgres -d position_mode_migration_test \
+            -tAc "SELECT count(*) FROM positions WHERE id IN ('unknown','ambiguous') AND execution_mode IS NULL" \
+            | grep -qx 2
+          dropdb -h localhost -U postgres position_mode_migration_test
+
       - name: Run P0 plus cohesion tests
         env:
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
@@ -103,6 +121,8 @@ jobs:
             tests/test_p0_expired_broker_import_idempotency.py \
             tests/test_p0_broker_confirmed_daily_trade_count.py \
             tests/test_p0_schema_attestation_and_migration_runner.py \
+            tests/test_p0_position_execution_mode_schema.py \
+            tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes

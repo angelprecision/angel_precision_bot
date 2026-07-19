@@ -20,6 +20,8 @@ import os
 import pathlib
 import re
 import sys
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -33,7 +35,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://stub:stub@localhost/stub")
 for _m in (
     "psycopg2", "psycopg2.extras", "psycopg2.pool", "supabase",
     "cryptography", "cryptography.fernet", "ap.db", "ap.queue",
-    "ap.order_monitor", "ap.position_sizer", "ap.market_intelligence",
+    "ap.position_sizer", "ap.market_intelligence",
 ):
     sys.modules.setdefault(_m, MagicMock())
 
@@ -41,15 +43,86 @@ for _m in (
 # ── Load the preflight without full runner init (repo pattern) ──────────────
 
 def _make_runner(monkeypatch, mode="LIVE", email="jason@x.com", account="ACC1"):
-    import types
     import client_runner as cr
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ap.trade_lifecycle_guards",
+        SimpleNamespace(
+            lifecycle_guard_preflight=lambda _mode: (
+                True,
+                {"missing_required_guards": [], "generation_claims_table_exists": True},
+            )
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ap.schema_attestation",
+        SimpleNamespace(attest_schema=lambda strict=True: {"ok": True}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ap_entry_confirmation",
+        SimpleNamespace(check_entry_confirmation=lambda *args, **kwargs: True),
+    )
 
     r = cr.ClientRunner.__new__(cr.ClientRunner)
     r.email = email
     r.mode = mode
     r.account_id = account
     r.base_url = "https://api.tradier.com"
+    r._live_active_position_execution_mode_preflight = lambda: (True, "ok")
     return r
+
+
+def _install_active_position_mode_fake_db(monkeypatch, rows=None, *, error=None):
+    executed = []
+    active_statuses = {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}
+
+    class Cursor:
+        def __init__(self):
+            self.params = ()
+
+        def execute(self, sql, params=()):
+            executed.append((str(sql), tuple(params)))
+            self.params = tuple(params)
+            if error is not None:
+                raise error
+            return self
+
+        def fetchone(self):
+            if error is not None:
+                raise error
+            client_id, statuses = self.params
+            allowed_statuses = {str(status).upper() for status in statuses}
+            unresolved = 0
+            for row in rows or []:
+                status = str(row.get("status") or "").upper()
+                mode = row.get("execution_mode")
+                normalized_mode = str(mode or "").strip().lower()
+                if row.get("client_id") != client_id:
+                    continue
+                if status not in allowed_statuses:
+                    continue
+                if mode is None or not normalized_mode or normalized_mode not in {"paper", "live"}:
+                    unresolved += 1
+            return {"unresolved_count": unresolved}
+
+    @contextmanager
+    def fake_conn():
+        yield Cursor()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ap.db",
+        SimpleNamespace(conn=fake_conn, run_with_retry=lambda fn, **_: fn()),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "ap.position_manager",
+        SimpleNamespace(ACTIVE_DB_STATUSES=active_statuses),
+    )
+    return executed
 
 
 class _Broker:
@@ -222,3 +295,116 @@ def test_markers_present():
     assert "LIVE_PREFLIGHT_OK" in SRC
     assert "LIVE_PREFLIGHT_FAILED reason=" in SRC
     assert "data_quote_source=%s" in SRC
+
+
+def test_active_position_mode_check_passes_with_no_unresolved_rows(monkeypatch):
+    import client_runner as cr
+
+    runner = _make_runner(monkeypatch)
+    _install_active_position_mode_fake_db(
+        monkeypatch,
+        rows=[{"client_id": "jason@x.com", "status": "OPEN", "execution_mode": "live"}],
+    )
+
+    ok, reason = cr.ClientRunner._live_active_position_execution_mode_preflight(runner)
+
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_active_null_mode_row_blocks_live_before_broker_auth(monkeypatch):
+    import client_runner as cr
+
+    monkeypatch.delenv("LIVE_PREFLIGHT_ENABLED", raising=False)
+    runner = _make_runner(monkeypatch)
+    del runner._live_active_position_execution_mode_preflight
+    executed = _install_active_position_mode_fake_db(
+        monkeypatch,
+        rows=[{"client_id": "jason@x.com", "status": "OPEN", "execution_mode": None}],
+    )
+    broker = SimpleNamespace(get_account_equity=MagicMock(return_value=8421.55))
+
+    ok, reason = cr.ClientRunner._run_live_preflight(runner, broker)
+
+    assert ok is False
+    assert reason == "active_position_execution_mode_unresolved"
+    assert broker.get_account_equity.call_count == 0
+    assert all(
+        not sql.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+        for sql, _ in executed
+    )
+
+
+def test_active_blank_mode_row_blocks(monkeypatch):
+    import client_runner as cr
+
+    runner = _make_runner(monkeypatch)
+    _install_active_position_mode_fake_db(
+        monkeypatch,
+        rows=[{"client_id": "jason@x.com", "status": "CLOSING", "execution_mode": "   "}],
+    )
+
+    ok, reason = cr.ClientRunner._live_active_position_execution_mode_preflight(runner)
+
+    assert ok is False
+    assert reason == "active_position_execution_mode_unresolved"
+
+
+def test_active_invalid_mode_row_blocks(monkeypatch):
+    import client_runner as cr
+
+    runner = _make_runner(monkeypatch)
+    _install_active_position_mode_fake_db(
+        monkeypatch,
+        rows=[{"client_id": "jason@x.com", "status": "PARTIAL", "execution_mode": "staging"}],
+    )
+
+    ok, reason = cr.ClientRunner._live_active_position_execution_mode_preflight(runner)
+
+    assert ok is False
+    assert reason == "active_position_execution_mode_unresolved"
+
+
+def test_terminal_null_mode_history_does_not_block(monkeypatch):
+    import client_runner as cr
+
+    runner = _make_runner(monkeypatch)
+    _install_active_position_mode_fake_db(
+        monkeypatch,
+        rows=[{"client_id": "jason@x.com", "status": "CLOSED", "execution_mode": None}],
+    )
+
+    ok, reason = cr.ClientRunner._live_active_position_execution_mode_preflight(runner)
+
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_other_client_unresolved_row_does_not_block(monkeypatch):
+    import client_runner as cr
+
+    runner = _make_runner(monkeypatch)
+    _install_active_position_mode_fake_db(
+        monkeypatch,
+        rows=[{"client_id": "other@x.com", "status": "OPEN", "execution_mode": None}],
+    )
+
+    ok, reason = cr.ClientRunner._live_active_position_execution_mode_preflight(runner)
+
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_active_position_mode_check_db_failure_blocks(monkeypatch):
+    import client_runner as cr
+
+    runner = _make_runner(monkeypatch)
+    _install_active_position_mode_fake_db(
+        monkeypatch,
+        error=RuntimeError("database unavailable"),
+    )
+
+    ok, reason = cr.ClientRunner._live_active_position_execution_mode_preflight(runner)
+
+    assert ok is False
+    assert reason == "active_position_execution_mode_check_unavailable"

@@ -1033,6 +1033,7 @@ def _open_position_safe(
         "target_underlying": float(order.get("target_underlying")) if order.get("target_underlying") is not None else None,
         "local_order_id": local_id,
         "broker_order_id": order.get("broker_order_id"),
+        "execution_mode": order.get("execution_mode"),
     }
 
     try:

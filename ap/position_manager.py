@@ -1746,13 +1746,15 @@ class APPositionManager:
         _side = _normalize_position_side(side)
 
         _execution_mode = str(execution_mode or "").strip().lower()
-        if execution_mode is not None and _execution_mode not in {"paper", "live"}:
+        if _execution_mode not in {"paper", "live"}:
             raise ValueError(f"invalid_or_missing_position_execution_mode:{execution_mode}")
 
         has_local_col = self._has_position_column("local_order_id")
         has_broker_col = self._has_position_column("broker_order_id")
         has_underlying_entry_col = self._has_position_column("underlying_entry")
         has_execution_mode_col = self._has_position_column("execution_mode")
+        if not has_execution_mode_col:
+            raise RuntimeError("required_position_column_missing:execution_mode")
 
         position_id = str(uuid.uuid4())
         ts = now_utc_iso()
@@ -1805,9 +1807,8 @@ class APPositionManager:
         if broker_order_id and has_broker_col:
             columns.append("broker_order_id")
             values.append(broker_order_id)
-        if _execution_mode and has_execution_mode_col:
-            columns.append("execution_mode")
-            values.append(_execution_mode)
+        columns.append("execution_mode")
+        values.append(_execution_mode)
 
         placeholders = ",".join(["%s"] * len(columns))
         col_sql = ", ".join(columns)

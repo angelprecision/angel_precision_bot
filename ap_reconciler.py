@@ -2083,6 +2083,26 @@ class APBrokerReconciler:
             return None
 
         contract = self._norm_contract(order.get("contract") or order.get("symbol") or "")
+        order_execution_mode = _normalize_execution_mode(order.get("execution_mode"))
+        reconciler_execution_mode = _normalize_execution_mode(self.execution_mode)
+        if (
+            order_execution_mode is None
+            or reconciler_execution_mode is None
+            or order_execution_mode != reconciler_execution_mode
+        ):
+            log.error(
+                "[%s] RECONCILE_FILLED_ENTRY_POSITION_BLOCKED invalid execution_mode "
+                "order=%s reconciler=%s local_order_id=%s",
+                self.client_id,
+                order.get("execution_mode"),
+                self.execution_mode,
+                order.get("local_order_id"),
+            )
+            summary.setdefault("errors", []).append(
+                "reconciler_filled_entry_execution_mode_unproven"
+            )
+            summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1
+            return None
         existing = self._find_db_position_by_contract(contract)
         if existing:
             pos_id = str(existing.get("id") or existing.get("position_id") or "")
@@ -2113,6 +2133,9 @@ class APBrokerReconciler:
                 if order.get("stop_underlying") else None,
                 target_underlying=float(order.get("target_underlying"))
                 if order.get("target_underlying") else None,
+                local_order_id=order.get("local_order_id"),
+                broker_order_id=order.get("broker_order_id"),
+                execution_mode=order_execution_mode,
             )
             summary["positions_imported"] += 1
             self._alert(
@@ -2987,10 +3010,24 @@ class APBrokerReconciler:
             db_qty     = int(pos.get("qty") or pos.get("quantity") or 0)
             entry_px   = float(pos.get("avg_fill") or pos.get("entry_price") or 0.0)
 
-            if _normalize_execution_mode(pos.get("execution_mode")) is None:
+            position_execution_mode = _normalize_execution_mode(pos.get("execution_mode"))
+            if position_execution_mode is None:
                 summary.setdefault("errors", []).append("reconciler_unknown_execution_mode")
                 summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1
                 log.error("[%s] RECONCILER_POSITION_BLOCKED unknown execution_mode pos=%s contract=%s", self.client_id, pos_id, contract)
+                continue
+            if position_execution_mode != _normalize_execution_mode(self.execution_mode):
+                summary.setdefault("errors", []).append("reconciler_execution_mode_mismatch")
+                summary["positions_alerted"] = int(summary.get("positions_alerted", 0)) + 1
+                log.error(
+                    "[%s] RECONCILER_POSITION_BLOCKED execution_mode mismatch "
+                    "pos=%s contract=%s position_mode=%s reconciler_mode=%s",
+                    self.client_id,
+                    pos_id,
+                    contract,
+                    position_execution_mode,
+                    self.execution_mode,
+                )
                 continue
 
             if contract:
@@ -3906,7 +3943,8 @@ class APBrokerReconciler:
 
     def _find_db_position_by_contract(self, contract: str) -> Optional[dict]:
         contract = self._norm_contract(contract)
-        if not contract:
+        execution_mode = _normalize_execution_mode(self.execution_mode)
+        if not contract or execution_mode is None:
             return None
         try:
             from ap.db import conn, run_with_retry
@@ -3918,12 +3956,18 @@ class APBrokerReconciler:
                         SELECT *
                         FROM positions
                         WHERE client_id=%s
+                          AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s
                           AND status = ANY(%s)
                           AND UPPER(contract)=%s
                         ORDER BY entry_ts DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self.client_id, list(DB_OPEN_POSITION_STATUSES), contract),
+                        (
+                            self.client_id,
+                            execution_mode,
+                            list(DB_OPEN_POSITION_STATUSES),
+                            contract,
+                        ),
                     )
                     row = c.fetchone()
                     return dict(row) if row else None
