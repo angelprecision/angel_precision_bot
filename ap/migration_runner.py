@@ -121,6 +121,7 @@ def _strip_sql_comments_and_literals(sql: str) -> str:
     while i < n:
         ch = sql[i]
         nxt = sql[i + 1] if i + 1 < n else ""
+        prev = sql[i - 1] if i > 0 else ""
 
         if ch == "-" and nxt == "-":
             j = i + 2
@@ -146,6 +147,26 @@ def _strip_sql_comments_and_literals(sql: str) -> str:
                 j += 1
             j = min(n, j)
             for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+
+        if ch in ("E", "e") and nxt == "'" and not (
+            prev.isalnum() or prev in ("_", "$")
+        ):
+            j = i + 2
+            while j < n:
+                if sql[j] == "\\":
+                    j += 2
+                    continue
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
                 out[k] = " "
             i = j
             continue

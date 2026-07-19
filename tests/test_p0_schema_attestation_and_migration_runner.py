@@ -580,6 +580,73 @@ def test_sql_string_containing_transaction_words_is_not_refused(fake_db, tmp_pat
     assert result["applied"] == ["20260801_clean_with_string.sql"]
 
 
+def test_postgres_escape_string_transaction_words_are_not_refused(fake_db, tmp_path):
+    """Backslash-escaped quotes inside E strings must not corrupt masking."""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "20260801_clean_with_escape_string.sql").write_text(
+        "SELECT E'BEGIN; it\\'s only text; COMMIT;';\n"
+        "CREATE TABLE valid_table (id INT);\n"
+    )
+    result = mr.run_pending(apply=True, directory=d)
+    assert result["failed"] is None
+    assert result["applied"] == ["20260801_clean_with_escape_string.sql"]
+    assert len(_ledger_inserts(fake_db)) == 1
+
+
+def test_real_transaction_statement_after_escape_string_is_detected():
+    sql = (
+        "SELECT E'it\\'s only text';\n"
+        "BEGIN;\n"
+        "CREATE TABLE invalid_table (id INT);\n"
+    )
+    assert mr._top_level_transaction_control(sql) == ["BEGIN"]
+
+
+def test_lowercase_postgres_escape_string_behaves_identically():
+    accepted = "SELECT e'BEGIN; it\\'s only text; COMMIT;';\n"
+    rejected = "SELECT e'it\\'s only text';\nBEGIN;\n"
+    assert mr._top_level_transaction_control(accepted) == []
+    assert mr._top_level_transaction_control(rejected) == ["BEGIN"]
+
+
+def test_doubled_quotes_inside_postgres_escape_string_are_accepted(fake_db, tmp_path):
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "20260801_escape_string_doubled_quote.sql").write_text(
+        "SELECT E'it''s valid';\n"
+    )
+    result = mr.run_pending(apply=True, directory=d)
+    assert result["failed"] is None
+    assert result["applied"] == ["20260801_escape_string_doubled_quote.sql"]
+
+
+def test_e_prefix_embedded_in_identifier_is_not_treated_as_escape_string():
+    assert mr._top_level_transaction_control("someE'not an escape string';\nBEGIN;\n") == [
+        "BEGIN"
+    ]
+
+
+def test_valid_before_invalid_escape_string_batch_executes_zero_sql(fake_db, tmp_path):
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "20260801_valid_escape_string.sql").write_text(
+        "SELECT E'BEGIN; it\\'s only text; COMMIT;';\n"
+    )
+    (d / "20260802_invalid_after_escape_string.sql").write_text(
+        "SELECT E'it\\'s only text';\n"
+        "BEGIN;\n"
+        "CREATE TABLE invalid_table (id INT);\n"
+    )
+    with pytest.raises(mr.MigrationTransactionControlError) as excinfo:
+        mr.run_pending(apply=True, directory=d)
+    assert "20260802_invalid_after_escape_string.sql" in str(excinfo.value)
+    assert "BEGIN" in str(excinfo.value)
+    assert [s for s, _ in fake_db.executed if "SELECT E'BEGIN" in s] == []
+    assert [s for s, _ in fake_db.executed if "CREATE TABLE invalid_table" in s] == []
+    assert _ledger_inserts(fake_db) == []
+
+
 def test_postgres_do_block_begin_end_is_not_refused(fake_db, tmp_path):
     """PL/pgSQL BEGIN inside a DO $$ block is not transaction control."""
     d = tmp_path / "m"
