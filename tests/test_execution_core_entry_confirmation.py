@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import ap_execution_core as core_mod
 import ap_entry_confirmation as entry_confirmation_mod
-from ap_entry_watcher import WatchedSignal
+from ap_entry_watcher import APEntryWatcher, WatchedSignal
 
 
 def _plan(*, confirmation_required: bool = False, candles=None, side: str = "CALL"):
@@ -72,6 +72,7 @@ def _run_entry_trigger(
     submit_ask: float | None = 1.02,
     plan_metadata=None,
     plan_side: str = "CALL",
+    invoke_direct_trigger: bool = True,
 ):
     monkeypatch.delenv("ENABLE_DAILY_CONTINUATION_VALIDATION", raising=False)
     monkeypatch.setenv("ENABLE_DAILY_CONTINUATION_MODE", mode)
@@ -200,13 +201,119 @@ def _run_entry_trigger(
     watched.last_quote_ask = underlying_last
     watched.last_quote_age_ms = underlying_quote_age_ms
 
-    core_mod.APExecutionCore._on_entry_trigger(core, watched)
+    if invoke_direct_trigger:
+        core_mod.APExecutionCore._on_entry_trigger(core, watched)
     return {
         "core": core,
         "osm": osm,
         "store": core.store,
         "ledger_events": ledger_events,
+        "watched": watched,
     }
+
+
+def _run_watcher_poll_to_submit(
+    monkeypatch,
+    *,
+    execution_mode: str = "live",
+    plan_metadata=None,
+    quote_age_ms: float | None = 5,
+    submit_bid: float | None = 1.00,
+    submit_ask: float | None = 1.02,
+    underlying_last: float = 100.80,
+    underlying_quote_age_ms: float | None = 0,
+    plan_side: str = "CALL",
+    watcher_quote=None,
+):
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode=execution_mode,
+        plan_metadata=plan_metadata,
+        quote_age_ms=quote_age_ms,
+        submit_bid=submit_bid,
+        submit_ask=submit_ask,
+        underlying_last=underlying_last,
+        underlying_quote_age_ms=underlying_quote_age_ms,
+        plan_side=plan_side,
+        invoke_direct_trigger=False,
+    )
+    core = result["core"]
+
+    class _DummyBroker:
+        session = None
+
+    class _Watcher(APEntryWatcher):
+        def __init__(self, *args, quotes=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._quotes = quotes or {}
+
+        def _fetch_quotes(self, tickers):
+            return {str(k).upper(): dict(v) for k, v in self._quotes.items()}
+
+        def _persist_watcher_audit(self, local_order_id, payload):
+            return None
+
+    quote = {
+        "bid": 100.0,
+        "ask": 101.0,
+        "last": 101.0,
+        "quote_age_ms": underlying_quote_age_ms,
+    }
+    if watcher_quote is not None:
+        quote.update(watcher_quote)
+
+    watcher = _Watcher(_DummyBroker(), quotes={"AAPL": quote})
+    watcher.on_trigger = core._on_entry_trigger
+    watched = WatchedSignal(
+        {
+            "ticker": "AAPL",
+            "side": plan_side,
+            "entry_price": 100.0,
+            "stop_price": 95.0 if plan_side == "CALL" else 105.0,
+            "target_price": 110.0 if plan_side == "CALL" else 90.0,
+            "signal_id": "sig-1",
+            "canonical_signal_id": "sig-1",
+            "local_order_id": "local-1",
+            "client_id": "client@example.com",
+            "timeframe": "1d",
+            "score": 78,
+        },
+        overnight=False,
+    )
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(watched.signal_id)
+
+    fake_execution_mod = types.ModuleType("ap.execution")
+    fake_execution_mod._refresh_ask_at_submit = lambda broker, contract: (
+        submit_ask,
+        quote_age_ms,
+        True,
+        "ok",
+        {
+            "submit_bid": submit_bid,
+            "submit_ask": submit_ask,
+            "submit_last": (
+                (submit_bid + submit_ask) / 2
+                if submit_bid is not None and submit_ask is not None else None
+            ),
+            "submit_mid": (
+                (submit_bid + submit_ask) / 2
+                if submit_bid is not None and submit_ask is not None else None
+            ),
+            "spread_pct": (
+                (submit_ask - submit_bid) / ((submit_bid + submit_ask) / 2)
+                if submit_bid is not None and submit_ask is not None else None
+            ),
+        },
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution_mod)
+
+    watcher._poll_active_signals(False)
+    watcher._poll_active_signals(False)
+    result["watcher"] = watcher
+    return result
 
 
 def test_observe_missing_continuation_submits_and_records_would_block(monkeypatch):
@@ -390,3 +497,19 @@ def test_stale_underlying_cannot_borrow_option_quote_age(monkeypatch):
     assert meta["quote_age_seconds"] == 1.0
     assert meta["underlying_quote_age_seconds"] == 20.0
     assert meta["underlying_quote_age_status"] == "stale"
+
+
+def test_production_shaped_watcher_quote_age_reaches_submit_without_manual_seed(monkeypatch):
+    result = _run_watcher_poll_to_submit(
+        monkeypatch,
+        execution_mode="live",
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        watcher_quote={"bid": 100.0, "ask": 101.0, "quote_age_ms": 1000},
+    )
+
+    result["osm"].submit_existing_entry.assert_called_once()
+    meta = _capture_entry_confirmation_patch(result["osm"])
+    assert meta["quote_age_seconds"] == 1.0
+    assert meta["underlying_quote_age_seconds"] == 1.0
+    assert result["watcher"]._pending == []

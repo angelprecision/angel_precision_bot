@@ -239,6 +239,16 @@ def _production_result(monkeypatch, **kwargs):
     )
 
 
+def _production_watcher_result(monkeypatch, **kwargs):
+    from tests.test_execution_core_entry_confirmation import _run_watcher_poll_to_submit
+
+    return _run_watcher_poll_to_submit(
+        monkeypatch,
+        execution_mode="live",
+        **kwargs,
+    )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "reason"),
     [
@@ -269,11 +279,42 @@ def test_real_live_entry_trigger_blocks_before_submit(monkeypatch, kwargs, reaso
 
 
 def test_real_live_valid_confirmation_reaches_submit_once(monkeypatch):
-    result = _production_result(
-        monkeypatch, plan_metadata={"confirmation_required": True}
+    result = _production_watcher_result(
+        monkeypatch,
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        watcher_quote={"bid": 100.0, "ask": 101.0, "quote_age_ms": 1000},
     )
     result["osm"].submit_existing_entry.assert_called_once()
     result["osm"].expire_pending_entry.assert_not_called()
+
+
+def test_real_live_missing_watcher_quote_age_blocks_before_submit(monkeypatch):
+    result = _production_watcher_result(
+        monkeypatch,
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        watcher_quote={"bid": 100.0, "ask": 101.0, "quote_age_ms": None},
+    )
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_failed_missing_underlying_quote_age",
+    )
+
+
+def test_real_live_stale_watcher_quote_age_blocks_before_submit(monkeypatch):
+    result = _production_watcher_result(
+        monkeypatch,
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        watcher_quote={"bid": 100.0, "ask": 101.0, "quote_age_ms": 20_000},
+    )
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_failed_stale_underlying_quote",
+    )
 
 
 def test_real_paper_unrequested_confirmation_preserves_submit(monkeypatch):

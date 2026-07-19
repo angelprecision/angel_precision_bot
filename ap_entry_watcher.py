@@ -477,7 +477,7 @@ class WatchedSignal:
         except Exception:
             pass
 
-    def check(self, bid: float, ask: float) -> str:
+    def check(self, bid: float, ask: float, quote_age_ms: Optional[int] = None) -> str:
         # PR-C precedence note: when ask >= trigger AND bid <= stop on the
         # SAME poll tick, the breach check runs FIRST (may set
         # state=TRIGGERED), then the stop check runs and OVERWRITES with
@@ -490,6 +490,8 @@ class WatchedSignal:
         now = datetime.now(timezone.utc)
         self.last_quote_bid = bid
         self.last_quote_ask = ask
+        if quote_age_ms is not None:
+            self.last_quote_age_ms = quote_age_ms
 
         if now >= self.expire_at:
             self.state = WatchState.EXPIRED
@@ -4149,12 +4151,13 @@ class APEntryWatcher:
 
                 bid = float(quote.get("bid", 0) or 0)
                 ask = float(quote.get("ask", 0) or 0)
-                w.last_quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
+                _quote_age_ms = self._coerce_quote_age_ms(quote.get("quote_age_ms"))
+                w.last_quote_age_ms = _quote_age_ms
                 if bid == 0 and ask == 0:
                     last = float(quote.get("last", 0) or 0)
                     bid = ask = last
 
-                new_state = w.check(bid, ask)
+                new_state = w.check(bid, ask, quote_age_ms=_quote_age_ms)
                 if new_state == WatchState.TRIGGERED:
                     if open_protect_active and w.ticker in self._open_trigger_tickers:
                         # Per-ticker open protection: this ticker already triggered once
