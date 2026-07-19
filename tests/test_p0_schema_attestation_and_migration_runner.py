@@ -417,3 +417,112 @@ def test_failure_on_N_prevents_N_plus_1_and_writes_no_ledger_for_either(fake_db,
     # Ledger: only first migration's INSERT should appear.
     inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
     assert len(inserts) == 1, "Only the successful migration before failure may have a ledger row"
+
+
+# ---------------------------------------------------------------------------
+# Amendment tests — transaction-control guard (audit blocker)
+#
+# Migration files must not contain BEGIN/COMMIT/ROLLBACK/START TRANSACTION.
+# run_pending() wraps each file in its own transaction so that migration SQL
+# and the schema_migrations INSERT commit atomically.  A file that contains
+# its own COMMIT breaks that guarantee: the migration commits before the
+# ledger INSERT runs, recreating the exact unsafe state this runner was built
+# to prevent.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def txn_mig_dir(tmp_path):
+    d = tmp_path / "migrations_txn"
+    d.mkdir()
+    (d / "20260801_clean.sql").write_text("SELECT 'clean';")
+    (d / "20260802_has_begin_commit.sql").write_text(
+        "BEGIN;\nCREATE TABLE bad_table (id INT);\nCOMMIT;\n"
+    )
+    (d / "20260803_after_bad.sql").write_text("SELECT 'after';")
+    return d
+
+
+def test_begin_commit_migration_refused_before_execution(fake_db, txn_mig_dir):
+    """A BEGIN;...COMMIT; migration must be refused before any SQL runs."""
+    result = mr.run_pending(apply=True, directory=txn_mig_dir)
+    assert result["failed"]["filename"] == "20260802_has_begin_commit.sql"
+    assert "transaction_control" in result["failed"]["error"]
+    assert "BEGIN" in result["failed"]["error"] or "COMMIT" in result["failed"]["error"]
+    refused_body = [s for s, _ in fake_db.executed if "CREATE TABLE bad_table" in s]
+    assert refused_body == [], "Refused migration body must never execute"
+
+
+def test_begin_commit_migration_writes_no_ledger_row(fake_db, txn_mig_dir):
+    """A refused migration must not produce a schema_migrations row."""
+    mr.run_pending(apply=True, directory=txn_mig_dir)
+    ledger_inserts = [
+        p for s, p in fake_db.executed
+        if "INSERT INTO schema_migrations" in s
+        and any("20260802_has_begin_commit" in str(x) for x in p)
+    ]
+    assert ledger_inserts == [], "No ledger row for refused migration"
+
+
+def test_migration_after_refused_txn_file_does_not_run(fake_db, txn_mig_dir):
+    """Stop-at-first-failure: the file after the refused one must not execute."""
+    result = mr.run_pending(apply=True, directory=txn_mig_dir)
+    after = [s for s, _ in fake_db.executed if "SELECT 'after'" in s]
+    assert after == [], "Migration after refused file must not run"
+    assert "20260803_after_bad.sql" not in result["applied"]
+
+
+def test_commit_only_migration_refused(fake_db, tmp_path):
+    """A file containing only COMMIT (no BEGIN) is still refused."""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "20260801_commit_only.sql").write_text("SELECT 1;\nCOMMIT;\n")
+    result = mr.run_pending(apply=True, directory=d)
+    assert result["failed"]["filename"] == "20260801_commit_only.sql"
+    assert [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s] == []
+
+
+def test_rollback_migration_refused(fake_db, tmp_path):
+    """A file containing ROLLBACK is refused."""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "20260801_rollback.sql").write_text("BEGIN;\nSELECT 1;\nROLLBACK;\n")
+    result = mr.run_pending(apply=True, directory=d)
+    assert result["failed"]["filename"] == "20260801_rollback.sql"
+    assert [s for s, _ in fake_db.executed if "SELECT 1;" in s] == []
+
+
+def test_sql_comment_containing_begin_is_not_refused(fake_db, tmp_path):
+    """A SQL comment mentioning BEGIN must not trigger the guard."""
+    d = tmp_path / "m"
+    d.mkdir()
+    (d / "20260801_clean_with_comment.sql").write_text(
+        "-- BEGIN is not used here\nSELECT 'ok';\n"
+    )
+    result = mr.run_pending(apply=True, directory=d)
+    assert result["failed"] is None
+    assert result["applied"] == ["20260801_clean_with_comment.sql"]
+
+
+def test_production_shaped_begin_commit_pattern_is_detected():
+    """The regex catches the exact pattern used in 14 production migration files."""
+    production_shaped = (
+        "-- Durable one-decision-per-exit-generation fence.\n"
+        "-- Apply before deploying PR #361.\n\n"
+        "BEGIN;\n\n"
+        "CREATE TABLE IF NOT EXISTS exit_decision_generation_claims (\n"
+        "    generation_key TEXT PRIMARY KEY\n"
+        ");\n\n"
+        "COMMIT;\n"
+    )
+    assert mr._TXN_CONTROL_RE.search(production_shaped) is not None, (
+        "Production-shaped BEGIN;...COMMIT; pattern must be caught by the guard"
+    )
+
+
+def test_clean_migration_passes_txn_guard():
+    """A migration without transaction control passes the guard."""
+    clean = (
+        "CREATE TABLE IF NOT EXISTS foo (id SERIAL PRIMARY KEY);\n"
+        "ALTER TABLE bar ADD COLUMN IF NOT EXISTS x TEXT;\n"
+    )
+    assert mr._TXN_CONTROL_RE.search(clean) is None

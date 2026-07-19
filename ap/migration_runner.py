@@ -83,6 +83,18 @@ def _sort_key(filename: str) -> tuple:
     return (1, 0, filename)
 
 
+# Migration files must not contain transaction-control statements.
+# run_pending() wraps each file in its own transaction so that the migration
+# SQL and the schema_migrations ledger INSERT commit atomically.  A file that
+# contains its own BEGIN/COMMIT breaks that guarantee: the migration commits
+# before the ledger INSERT runs, recreating the exact unsafe state this runner
+# was built to prevent.  Future migration files must omit BEGIN/COMMIT/ROLLBACK.
+_TXN_CONTROL_RE = re.compile(
+    r"^\s*(?!--)(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 def _migration_files(directory: Path | None = None) -> list[Path]:
     directory = directory or MIGRATIONS_DIR
     if not directory.is_dir():
@@ -233,6 +245,31 @@ def run_pending(*, apply: bool = False, directory: Path | None = None) -> dict[s
         path = directory / filename
         sql_text = path.read_text(encoding="utf-8")
         checksum = _sha256(sql_text)
+
+        # Refuse files that own their own transaction.  If sql_text contains
+        # BEGIN/COMMIT the migration commits before the ledger INSERT runs,
+        # breaking the atomicity guarantee.  The runner must own the only
+        # transaction boundary.
+        txn_match = _TXN_CONTROL_RE.search(sql_text)
+        if txn_match:
+            stmt = txn_match.group().strip().upper()
+            result["failed"] = {
+                "filename": filename,
+                "error": (
+                    f"migration_contains_transaction_control:{stmt!r} — "
+                    "migration files must not contain BEGIN, COMMIT, ROLLBACK, "
+                    "or START TRANSACTION. The runner owns the transaction to "
+                    "guarantee atomic SQL+ledger recording. "
+                    "Remove the manual transaction wrapper from this file."
+                ),
+            }
+            log.critical(
+                "MIGRATION_REFUSED_TXN_CONTROL %s matched=%r — "
+                "remove manual transaction wrappers and re-submit",
+                filename, stmt,
+            )
+            break
+
         try:
             # Migration SQL and ledger INSERT share one connection and one
             # transaction.  Both commit together or both roll back together.
