@@ -205,7 +205,9 @@ def test_status_reports_all_pending_when_ledger_empty(fake_db, mig_dir):
     assert report["applied"] == [] and report["drifted"] == []
 
 
-def test_baseline_records_without_executing_sql(fake_db, mig_dir):
+def test_baseline_records_without_executing_sql(fake_db, mig_dir, monkeypatch):
+    # Attestation must pass for baseline to proceed; mock it to return ok.
+    monkeypatch.setattr(sa, "attest_schema", lambda **kw: {"ok": True, "skipped": False})
     result = mr.baseline(mig_dir)
     assert len(result["baselined"]) == 3
     # No migration body was executed — only ledger DDL/inserts/selects.
@@ -256,3 +258,162 @@ def test_checksum_drift_refuses_to_apply(fake_db, mig_dir):
 def test_startup_hook_disabled_by_default(fake_db, mig_dir, monkeypatch):
     monkeypatch.delenv("ENABLE_MIGRATION_RUNNER", raising=False)
     assert mr.run_pending_on_startup() is None
+
+
+# ---------------------------------------------------------------------------
+# Amendment tests — Blocker 1: baseline must not certify unapplied migrations
+# ---------------------------------------------------------------------------
+
+def _sa_raise(**kw):
+    raise sa.SchemaAttestationError("attestation failed: missing_tables=['missing_table']")
+
+
+def _sa_ok(**kw):
+    return {"ok": True, "skipped": False, "missing_tables": [], "missing_columns": {}}
+
+
+def test_baseline_raises_on_missing_table_writes_zero_rows(fake_db, mig_dir, monkeypatch):
+    """A missing table must cause baseline to raise and write zero ledger rows."""
+    monkeypatch.setattr(sa, "attest_schema", _sa_raise)
+    with pytest.raises(mr.BaselineAttestationError, match="attestation failed"):
+        mr.baseline(mig_dir)
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    assert inserts == [], "No ledger rows must be written when attestation fails"
+
+
+def test_baseline_raises_on_missing_column_writes_zero_rows(fake_db, mig_dir, monkeypatch):
+    """A missing column (non-table-level gap) must also raise and write zero rows."""
+    def _col_missing(**kw):
+        raise sa.SchemaAttestationError(
+            "attestation failed: missing_columns={'proof_trades': ['performance_taxonomy']}"
+        )
+    monkeypatch.setattr(sa, "attest_schema", _col_missing)
+    with pytest.raises(mr.BaselineAttestationError):
+        mr.baseline(mig_dir)
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    assert inserts == []
+
+
+def test_baseline_raises_when_db_unreachable_writes_zero_rows(fake_db, mig_dir, monkeypatch):
+    """An unreachable database under strict attestation must raise and write zero rows."""
+    def _db_unreachable(**kw):
+        raise sa.SchemaAttestationError("Schema attestation could not run against the database")
+    monkeypatch.setattr(sa, "attest_schema", _db_unreachable)
+    with pytest.raises(mr.BaselineAttestationError, match="could not run|attestation failed"):
+        mr.baseline(mig_dir)
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    assert inserts == []
+
+
+def test_baseline_passes_when_attestation_ok(fake_db, mig_dir, monkeypatch):
+    """When attestation passes, baseline records all files normally."""
+    monkeypatch.setattr(sa, "attest_schema", _sa_ok)
+    result = mr.baseline(mig_dir)
+    assert len(result["baselined"]) == 3
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    assert len(inserts) == 3
+
+
+def test_baseline_idempotent_when_attestation_passes(fake_db, mig_dir, monkeypatch):
+    """Calling baseline twice records 3 files the first time and 0 the second."""
+    monkeypatch.setattr(sa, "attest_schema", _sa_ok)
+    # Simulate already-recorded files on second call by pre-populating the ledger.
+    first = mr.baseline(mig_dir)
+    assert len(first["baselined"]) == 3
+    # Simulate subsequent status: all files now appear in schema_migrations_rows.
+    fake_db.schema_migrations_rows = [
+        {"filename": p.name, "checksum": mr._sha256(p.read_text()), "applied_at": None, "baselined": True}
+        for p in mr._migration_files(mig_dir)
+    ]
+    second = mr.baseline(mig_dir)
+    assert second["baselined"] == [], "Second baseline must be a no-op"
+
+
+def test_baseline_force_bypasses_attestation_logs_critical(fake_db, mig_dir, monkeypatch, caplog):
+    """force=True bypasses attestation and emits a CRITICAL warning."""
+    # attest_schema would fail if called — but with force=True it must NOT be called.
+    monkeypatch.setattr(sa, "attest_schema", _sa_raise)
+    import logging
+    with caplog.at_level(logging.CRITICAL, logger="ap.migration_runner"):
+        result = mr.baseline(mig_dir, force=True)
+    assert len(result["baselined"]) == 3, "force=True must still record files"
+    assert any("FORCE" in rec.message for rec in caplog.records), (
+        "CRITICAL warning must be emitted when force=True"
+    )
+
+
+def test_baseline_force_is_not_the_default(mig_dir):
+    """baseline() without force must not accept attestation bypass implicitly."""
+    import inspect
+    sig = inspect.signature(mr.baseline)
+    force_param = sig.parameters.get("force")
+    assert force_param is not None, "baseline must have a force parameter"
+    assert force_param.default is False, "force must default to False"
+
+
+# ---------------------------------------------------------------------------
+# Amendment tests — Blocker 2: migration SQL and ledger must be atomic
+# ---------------------------------------------------------------------------
+
+def test_migration_sql_failure_writes_no_ledger_row(fake_db, mig_dir):
+    """If migration SQL fails, no schema_migrations row must be written."""
+    fake_db.raise_on = "SELECT 1;"  # first migration body fails
+    result = mr.run_pending(apply=True, directory=mig_dir)
+    assert result["failed"]["filename"] == "2026_05_17_old_style.sql"
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    assert inserts == [], "Ledger INSERT must not run when migration SQL fails"
+
+
+def test_ledger_insert_failure_is_captured_as_failed_migration(fake_db, mig_dir):
+    """If the ledger INSERT fails, the migration must appear in result['failed']
+    and no further migrations must run — simulating transaction rollback."""
+    fake_db.raise_on = "INSERT INTO schema_migrations"
+    result = mr.run_pending(apply=True, directory=mig_dir)
+    # The first migration body ran but the INSERT failed.
+    assert result["failed"] is not None, "Failed INSERT must be captured in result['failed']"
+    assert result["applied"] == [], "No migration must appear in applied when INSERT fails"
+    # No third-file execution since we stopped at first failure.
+    third = [s for s, _ in fake_db.executed if "SELECT 3;" in s]
+    assert third == []
+
+
+def test_successful_migration_writes_both_sql_and_ledger_in_same_pass(fake_db, mig_dir):
+    """Both the body SQL and the ledger INSERT must appear in executed for each file."""
+    result = mr.run_pending(apply=True, directory=mig_dir)
+    assert result["applied"] == [
+        "2026_05_17_old_style.sql", "20260717_new_style.sql", "no_date_last.sql",
+    ]
+    bodies = [s for s, _ in fake_db.executed if s in ("SELECT 1;", "SELECT 2;", "SELECT 3;")]
+    assert bodies == ["SELECT 1;", "SELECT 2;", "SELECT 3;"]
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    # One ledger INSERT per applied file — same transaction, not a separate call.
+    assert len(inserts) == 3
+
+
+def test_recorded_migration_not_re_executed_on_restart(fake_db, mig_dir):
+    """A migration already in schema_migrations must not appear in would_apply."""
+    fake_db.schema_migrations_rows = [{
+        "filename": "2026_05_17_old_style.sql",
+        "checksum": mr._sha256((mig_dir / "2026_05_17_old_style.sql").read_text()),
+        "applied_at": None,
+        "baselined": False,
+    }]
+    report = mr.status(mig_dir)
+    assert "2026_05_17_old_style.sql" not in report["pending"]
+    assert "2026_05_17_old_style.sql" in report["applied"]
+    result = mr.run_pending(apply=True, directory=mig_dir)
+    executed_bodies = [s for s, _ in fake_db.executed if "SELECT 1;" in s]
+    assert executed_bodies == [], "Already-recorded migration must not re-execute"
+
+
+def test_failure_on_N_prevents_N_plus_1_and_writes_no_ledger_for_either(fake_db, mig_dir):
+    """Failure on migration N stops the run; N+1 must not execute or be recorded."""
+    fake_db.raise_on = "SELECT 2;"  # second migration (N) fails
+    result = mr.run_pending(apply=True, directory=mig_dir)
+    assert result["applied"] == ["2026_05_17_old_style.sql"]
+    assert result["failed"]["filename"] == "20260717_new_style.sql"
+    third_bodies = [s for s, _ in fake_db.executed if "SELECT 3;" in s]
+    assert third_bodies == [], "Migration N+1 must not execute after failure on N"
+    # Ledger: only first migration's INSERT should appear.
+    inserts = [s for s, _ in fake_db.executed if "INSERT INTO schema_migrations" in s]
+    assert len(inserts) == 1, "Only the successful migration before failure may have a ledger row"
