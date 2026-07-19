@@ -2580,12 +2580,37 @@ class APMasterControl:
 
         intel = self._run_intelligence(signal)
         intel_score = float(intel.get("score", 0))
-        intel_approve = intel.get("approved", True)
-        intel_reason = intel.get("reasoning", "")
         intel_avail = intel.get("_available", False)
-        if intel_avail and not intel_approve:
-            self._store_update(signal_id, "rejected", f"intel_blocked: {intel_reason[:100]}")
-            return self._block(signal_id, ticker, client_id, "blocked_intel", f"intel_rejected: {intel_reason[:80]}")
+        intel_approve = intel.get("approved", True)   # kept for downstream sizing logic
+        intel_reason = intel.get("reasoning", "")      # kept for downstream metadata
+
+        # ── Canonical intelligence admission gate ─────────────────────────
+        # APMasterControl no longer independently interprets `approved`,
+        # `intel_status`, or free-text `reasoning`. All interpretation
+        # is delegated to the canonical policy module.
+        from ap.intelligence_admission_policy import adjudicate_intelligence_result
+        _intel_verdict = adjudicate_intelligence_result(
+            intel,
+            signal=signal,
+            execution_mode=str(getattr(plan, "execution_mode", "") or ""),
+        )
+        if _intel_verdict.blocks_entry:
+            self._store_update(
+                signal_id, "rejected",
+                f"intel_blocked:{_intel_verdict.reason_code}",
+            )
+            return self._block(
+                signal_id,
+                ticker,
+                client_id,
+                "blocked_intel",
+                _intel_verdict.to_block_reason(),
+                reason_code=_intel_verdict.reason_code,
+                extra=_intel_verdict.to_metadata(
+                    signal_id=signal_id, ticker=ticker, side=side,
+                    execution_mode=str(getattr(plan, "execution_mode", "") or ""),
+                ),
+            )
 
         # ── PR-72: Quality Mode gate ──────────────────────────────────────
         # Runs AFTER score-floor and intel gate so we operate on the final
