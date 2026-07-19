@@ -50,7 +50,7 @@ jobs:
 
       - name: Run P0 plus cohesion tests
         env:
-          DATABASE_URL: "postgresql://test:test@localhost/test"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
         run: |
           python -m pytest \
