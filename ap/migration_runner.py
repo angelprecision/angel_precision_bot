@@ -21,6 +21,11 @@ Design (deliberately conservative for a hand-migrated history):
     * Startup auto-apply is OFF by default. ``ENABLE_MIGRATION_RUNNER=1``
       enables ``run_pending_on_startup()``; until then this module is a
       CLI/operator tool: ``python -m ap.migration_runner status|baseline|apply``.
+    * Migration files executed by this runner must not contain top-level
+      transaction-control statements. The runner owns the transaction and
+      atomically records the migration ledger entry before commit. Historical
+      hand-applied migrations may be adopted through ``baseline()`` without
+      execution.
 
 The pairing contract with ap/schema_attestation.py: attestation tells you
 the schema is behind; this runner is the sanctioned way to catch it up.
@@ -56,6 +61,10 @@ class MigrationChecksumDrift(RuntimeError):
     """A recorded migration file changed on disk after being applied."""
 
 
+class MigrationTransactionControlError(RuntimeError):
+    """Pending migration files contain top-level transaction-control SQL."""
+
+
 class BaselineAttestationError(RuntimeError):
     """Schema attestation failed before baseline could record any ledger rows.
 
@@ -83,16 +92,122 @@ def _sort_key(filename: str) -> tuple:
     return (1, 0, filename)
 
 
-# Migration files must not contain transaction-control statements.
-# run_pending() wraps each file in its own transaction so that the migration
-# SQL and the schema_migrations ledger INSERT commit atomically.  A file that
-# contains its own BEGIN/COMMIT breaks that guarantee: the migration commits
-# before the ledger INSERT runs, recreating the exact unsafe state this runner
-# was built to prevent.  Future migration files must omit BEGIN/COMMIT/ROLLBACK.
-_TXN_CONTROL_RE = re.compile(
-    r"^\s*(?!--)(BEGIN|COMMIT|ROLLBACK|START\s+TRANSACTION)\b",
-    re.IGNORECASE | re.MULTILINE,
-)
+_TXN_CONTROL_KEYWORDS = ("BEGIN", "COMMIT", "ROLLBACK", "START TRANSACTION")
+
+
+def _read_dollar_tag(sql: str, index: int) -> tuple[str, int] | None:
+    """Return (tag, end_index) for a PostgreSQL dollar-quote opener."""
+    if index >= len(sql) or sql[index] != "$":
+        return None
+    end = sql.find("$", index + 1)
+    if end < 0:
+        return None
+    tag_body = sql[index + 1:end]
+    if tag_body and not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", tag_body):
+        return None
+    return sql[index:end + 1], end + 1
+
+
+def _strip_sql_comments_and_literals(sql: str) -> str:
+    """Mask comments, quoted strings, and dollar-quoted blocks with spaces.
+
+    The migration runner only rejects top-level transaction-control statements.
+    Words inside comments, SQL strings, or PostgreSQL procedural DO $$ blocks
+    are not statements and must not trigger the guard.
+    """
+    out = list(sql)
+    i = 0
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+
+        if ch == "-" and nxt == "-":
+            j = i + 2
+            while j < n and sql[j] not in "\r\n":
+                j += 1
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+
+        if ch == "/" and nxt == "*":
+            depth = 1
+            j = i + 2
+            while j + 1 < n and depth:
+                if sql[j] == "/" and sql[j + 1] == "*":
+                    depth += 1
+                    j += 2
+                    continue
+                if sql[j] == "*" and sql[j + 1] == "/":
+                    depth -= 1
+                    j += 2
+                    continue
+                j += 1
+            j = min(n, j)
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
+                out[k] = " "
+            i = j
+            continue
+
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if sql[j] == '"':
+                    if j + 1 < n and sql[j + 1] == '"':
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            for k in range(i, min(j, n)):
+                out[k] = " "
+            i = j
+            continue
+
+        dollar = _read_dollar_tag(sql, i)
+        if dollar:
+            tag, body_start = dollar
+            close = sql.find(tag, body_start)
+            j = n if close < 0 else close + len(tag)
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+
+        i += 1
+    return "".join(out)
+
+
+def _top_level_transaction_control(sql: str) -> list[str]:
+    """Return prohibited top-level transaction-control statements in *sql*."""
+    masked = _strip_sql_comments_and_literals(sql)
+    statements: list[str] = []
+    for raw_stmt in masked.split(";"):
+        stmt = raw_stmt.strip()
+        if not stmt:
+            continue
+        compact = re.sub(r"\s+", " ", stmt).upper()
+        for keyword in _TXN_CONTROL_KEYWORDS:
+            if compact == keyword or compact.startswith(f"{keyword} "):
+                statements.append(keyword)
+                break
+    return statements
 
 
 def _migration_files(directory: Path | None = None) -> list[Path]:
@@ -241,35 +356,36 @@ def run_pending(*, apply: bool = False, directory: Path | None = None) -> dict[s
 
     bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).strip().upper()
     directory = directory or MIGRATIONS_DIR
+
+    offenders: dict[str, list[str]] = {}
+    for filename in report["pending"]:
+        path = directory / filename
+        sql_text = path.read_text(encoding="utf-8")
+        statements = _top_level_transaction_control(sql_text)
+        if statements:
+            offenders[filename] = statements
+    if offenders:
+        detail = ", ".join(
+            f"{filename}: {sorted(set(statements))}"
+            for filename, statements in sorted(offenders.items())
+        )
+        log.critical(
+            "MIGRATION_REFUSED_TXN_CONTROL offenders=%s — migration runner "
+            "must own the transaction so SQL and schema_migrations ledger "
+            "record commit atomically",
+            offenders,
+        )
+        raise MigrationTransactionControlError(
+            "Pending migrations contain top-level transaction-control statements; "
+            "zero migration bodies executed and zero ledger rows inserted. "
+            "Remove BEGIN, COMMIT, ROLLBACK, or START TRANSACTION from migration "
+            f"files. Offenders: {detail}"
+        )
+
     for filename in report["pending"]:
         path = directory / filename
         sql_text = path.read_text(encoding="utf-8")
         checksum = _sha256(sql_text)
-
-        # Refuse files that own their own transaction.  If sql_text contains
-        # BEGIN/COMMIT the migration commits before the ledger INSERT runs,
-        # breaking the atomicity guarantee.  The runner must own the only
-        # transaction boundary.
-        txn_match = _TXN_CONTROL_RE.search(sql_text)
-        if txn_match:
-            stmt = txn_match.group().strip().upper()
-            result["failed"] = {
-                "filename": filename,
-                "error": (
-                    f"migration_contains_transaction_control:{stmt!r} — "
-                    "migration files must not contain BEGIN, COMMIT, ROLLBACK, "
-                    "or START TRANSACTION. The runner owns the transaction to "
-                    "guarantee atomic SQL+ledger recording. "
-                    "Remove the manual transaction wrapper from this file."
-                ),
-            }
-            log.critical(
-                "MIGRATION_REFUSED_TXN_CONTROL %s matched=%r — "
-                "remove manual transaction wrappers and re-submit",
-                filename, stmt,
-            )
-            break
-
         try:
             # Migration SQL and ledger INSERT share one connection and one
             # transaction.  Both commit together or both roll back together.

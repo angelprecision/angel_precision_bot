@@ -1956,6 +1956,15 @@ def test_valid_environment_values_are_clamped(monkeypatch) -> None:
 def test_installed_guard_manifest_reports_exact_names(monkeypatch) -> None:
     installed = []
     module = SimpleNamespace(install=lambda: installed.append("canonical"))
+    schema_module = SimpleNamespace(
+        attest_schema=lambda strict=False: {
+            "ok": True,
+            "missing_tables": [],
+            "missing_columns": {},
+            "skipped": False,
+        }
+    )
+    monkeypatch.setitem(sys.modules, "ap.schema_attestation", schema_module)
     monkeypatch.setattr(
         lifecycle_guards,
         "_GUARDS",
@@ -1963,7 +1972,8 @@ def test_installed_guard_manifest_reports_exact_names(monkeypatch) -> None:
     )
     monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: module)
     manifest = lifecycle_guards.install_trade_lifecycle_guards()
-    assert list(manifest) == ["canonical_exit_fill_truth"]
+    assert list(manifest) == ["_schema_attestation", "canonical_exit_fill_truth"]
+    assert manifest["_schema_attestation"]["status"] == "ok"
     assert manifest["canonical_exit_fill_truth"]["status"] == "installed"
     assert installed == ["canonical"]
 
