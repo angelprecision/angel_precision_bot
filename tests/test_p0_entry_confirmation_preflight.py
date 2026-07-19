@@ -117,7 +117,7 @@ def test_stale_quote_blocks():
 def test_no_quote_blocks():
     r = _call(live_bid=None, live_ask=None)
     assert r.passed is False
-    assert r.fail_reason == "entry_confirm_failed_stale_quote"
+    assert r.fail_reason == "entry_confirm_failed_missing_quote"
 
 def test_fresh_quote_passes():
     r = _call(live_quote_age_ms=3000)  # 3s — well within 10s

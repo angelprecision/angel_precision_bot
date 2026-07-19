@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
+from ap_entry_confirmation import parse_confirmation_bool
+
 log = logging.getLogger("ap.underlying_confirmation_entry_guard")
 
 STAGE = "underlying_confirmation_missing"
@@ -14,12 +16,14 @@ NO_UNDERLYING_DATA = f"{STAGE}:no_underlying_data"
 STALE_UNDERLYING_QUOTE = f"{STAGE}:stale_underlying_quote"
 ZERO_UNDERLYING = f"{STAGE}:zero_underlying"
 CANNOT_EVALUATE_DIRECTION = f"{STAGE}:cannot_evaluate_direction"
+DIRECTION_NOT_CONFIRMED = "underlying_confirmation_failed:direction_not_confirmed"
 
 _REASON_CODES = {
     NO_UNDERLYING_DATA: "UNDERLYING_CONFIRMATION_MISSING_NO_UNDERLYING_DATA",
     STALE_UNDERLYING_QUOTE: "UNDERLYING_CONFIRMATION_MISSING_STALE_UNDERLYING_QUOTE",
     ZERO_UNDERLYING: "UNDERLYING_CONFIRMATION_MISSING_ZERO_UNDERLYING",
     CANNOT_EVALUATE_DIRECTION: "UNDERLYING_CONFIRMATION_MISSING_CANNOT_EVALUATE_DIRECTION",
+    DIRECTION_NOT_CONFIRMED: "UNDERLYING_CONFIRMATION_FAILED_DIRECTION_NOT_CONFIRMED",
 }
 DAILY_TIMEFRAMES = {"1d", "d", "daily", "1day", "1 day", "overnight"}
 PRICE_KEYS = ("last", "last_price", "price", "mark", "mid", "close", "current_underlying", "underlying_price")
@@ -156,14 +160,31 @@ def requires_underlying_confirmation(*, plan: Any = None, payload: Any = None, o
     if not _truthy_env("UNDERLYING_CONFIRMATION_ENTRY_GUARD_ENABLED", False):  # safe default: must be explicitly enabled in Render
         return False
     sources = _sources(plan, payload, order)
-    explicit = _first_text(
-        sources,
-        "underlying_confirmation_required",
-        "requires_underlying_confirmation",
-        "hybrid_client_quality_gate.confirmation_required",
-    )
-    if explicit is not None:
-        return str(explicit).strip().lower() in {"1", "true", "yes", "on"}
+    explicit_values: list[bool] = []
+    malformed_explicit = False
+    for source in sources:
+        for key in (
+            "underlying_confirmation_required",
+            "requires_underlying_confirmation",
+            "confirmation_required",
+            "hybrid_client_quality_gate.confirmation_required",
+        ):
+            present, raw = _read(source, key)
+            if not present:
+                continue
+            parsed = parse_confirmation_bool(raw)
+            if parsed is None:
+                malformed_explicit = True
+            else:
+                explicit_values.append(parsed)
+    if True in explicit_values:
+        return True
+    if explicit_values:
+        return False
+    if malformed_explicit:
+        # The optional guard is enabled explicitly; malformed policy cannot
+        # safely disable it.
+        return True
     timeframe = _clean(_first_text(sources, "timeframe")).lower()
     return timeframe in DAILY_TIMEFRAMES or bool(
         _first_text(sources, "overnight", "contract_deferred", "force_overnight_reeval_only")
@@ -335,6 +356,15 @@ def check_underlying_confirmation(
     if (side == "CALL" and not (target > trigger > stop)) or (side == "PUT" and not (target < trigger < stop)):
         return _block(CANNOT_EVALUATE_DIRECTION, with_quote)
     confirmed = current >= trigger if side == "CALL" else current <= trigger
+    if not confirmed:
+        return _block(
+            DIRECTION_NOT_CONFIRMED,
+            {
+                **with_quote,
+                "directional_confirmation_evaluable": True,
+                "directional_confirmed": False,
+            },
+        )
     return UnderlyingConfirmationResult(
         True,
         None,
