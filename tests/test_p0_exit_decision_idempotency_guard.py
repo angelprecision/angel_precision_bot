@@ -1973,7 +1973,7 @@ def test_installed_guard_manifest_reports_exact_names(monkeypatch) -> None:
     monkeypatch.setattr(lifecycle_guards.importlib, "import_module", lambda _name: module)
     manifest = lifecycle_guards.install_trade_lifecycle_guards()
     assert list(manifest) == ["_schema_attestation", "canonical_exit_fill_truth"]
-    assert manifest["_schema_attestation"]["status"] == "ok"
+    assert manifest["_schema_attestation"]["status"] == "installed"
     assert manifest["canonical_exit_fill_truth"]["status"] == "installed"
     assert installed == ["canonical"]
 

@@ -35,7 +35,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://stub:stub@localhost/stub")
 for _m in (
     "psycopg2", "psycopg2.extras", "psycopg2.pool", "supabase",
     "cryptography", "cryptography.fernet", "ap.db", "ap.queue",
-    "ap.order_monitor", "ap.position_sizer", "ap.market_intelligence",
+    "ap.position_sizer", "ap.market_intelligence",
 ):
     sys.modules.setdefault(_m, MagicMock())
 
