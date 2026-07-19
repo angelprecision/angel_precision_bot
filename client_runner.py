@@ -814,6 +814,10 @@ class ClientRunner(threading.Thread):
         except Exception as _schema_exc:
             return _fail(f"schema_attestation:{_schema_exc}")
 
+        _mode_ok, _mode_reason = self._live_active_position_execution_mode_preflight()
+        if not _mode_ok:
+            return _fail(_mode_reason)
+
         # 4–5. Broker auth round-trip + funded account.
         try:
             if not hasattr(broker, "get_account_equity"):
@@ -837,6 +841,47 @@ class ClientRunner(threading.Thread):
         self.live_preflight_status = "ok"
         self.live_preflight_equity = float(_equity)
         return True, "ok"
+
+    def _live_active_position_execution_mode_preflight(self) -> tuple[bool, str]:
+        """Fail LIVE startup when this client has active positions with unresolved mode."""
+        try:
+            from ap.db import conn, run_with_retry
+            from ap.position_manager import ACTIVE_DB_STATUSES
+
+            def _read():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT COUNT(*) AS unresolved_count
+                        FROM positions
+                        WHERE client_id=%s
+                          AND UPPER(COALESCE(status, '')) = ANY(%s)
+                          AND (
+                              execution_mode IS NULL
+                              OR BTRIM(COALESCE(execution_mode, '')) = ''
+                              OR LOWER(BTRIM(COALESCE(execution_mode, ''))) NOT IN ('paper', 'live')
+                          )
+                        """,
+                        (self.email, list({str(s).upper() for s in ACTIVE_DB_STATUSES})),
+                    )
+                    return c.fetchone()
+
+            row = run_with_retry(_read) or {}
+            unresolved_count = 0
+            if hasattr(row, "get"):
+                unresolved_count = int(row.get("unresolved_count") or 0)
+            elif isinstance(row, (tuple, list)) and row:
+                unresolved_count = int(row[0] or 0)
+            if unresolved_count > 0:
+                return False, "active_position_execution_mode_unresolved"
+            return True, "ok"
+        except Exception as exc:
+            logger.exception(
+                "[%s] LIVE active-position execution-mode preflight unavailable: %s",
+                self.email,
+                exc,
+            )
+            return False, "active_position_execution_mode_check_unavailable"
 
     def _run_live_market_data_preflight(
         self,
