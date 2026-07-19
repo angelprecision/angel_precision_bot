@@ -70,6 +70,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     # guard filters them dynamically via _table_columns()).
     "positions": frozenset({
         "id", "client_id", "contract", "status", "qty", "entry_ts",
+        "execution_mode",
         "exit_in_flight", "pending_exit_qty",
         "pending_exit_local_order_id", "pending_exit_broker_order_id",
         "quantity_remaining", "contracts_exited",
