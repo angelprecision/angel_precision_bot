@@ -340,12 +340,46 @@ def _map_result(result: dict, fallback_score: float) -> dict:
     # ── action == "skip" (portfolio manager decision) ─────────────────────────
     if action == "skip":
         # Hard-block phrases — always reject regardless of scanner score.
-        # Matched case-insensitively. risk_reason "approved"/"none"/"" is non-hard.
+        # Matched case-insensitively against reasoning.
+        #
+        # IMPORTANT: every phrase must be specific enough that it cannot
+        # accidentally match a positive/benign statement.  Broad terms such as
+        # "capital" or "auth" were removed because they match "capital efficient
+        # setup" or "authentication successful" and falsely create authoritative
+        # authority from benign free text.
+        #
+        # Structured evidence is preferred: RISK_VETO already handles
+        # risk_detail["approved"] is False (see above).  For skip, structured
+        # skip_reason_code from the producer is checked first (closed set);
+        # phrase matching is a secondary fallback for legacy producer text.
+        #
+        # Phrase-only skips that do NOT match a specific phrase are treated as
+        # LOW_CONFIDENCE and fail open — they must not create authority.
         _HARD_PHRASES = (
-            "risk manager", "scanner signal is neutral", "neutral direction",
-            "contract quality failed", "risk veto", "hard risk",
-            "capital", "buying power", "auth",
+            "risk manager veto",
+            "scanner signal is neutral",
+            "neutral direction",
+            "contract quality failed",
+            "risk veto",
+            "hard risk",
+            "buying power unavailable",
+            "insufficient buying power",
+            "account auth failed",
+            "authorization failed",
+            "account not authorized",
         )
+
+        # Closed-set structured skip reason codes that the producer may set
+        # explicitly (preferred over phrase matching).
+        _AUTHORITATIVE_SKIP_CODES = frozenset({
+            "NEUTRAL_DIRECTION",
+            "CONTRACT_QUALITY_FAILED",
+            "BUYING_POWER_UNAVAILABLE",
+            "ACCOUNT_AUTH_FAILED",
+            "RISK_MANAGER_VETO",
+        })
+
+        _producer_skip_code = str(result.get("skip_reason_code") or "").upper().strip()
         _reasoning_lower   = reasoning.lower()
         _risk_reason_lower = (risk_reason or "").lower().strip()
         _risk_says_ok      = _risk_reason_lower in (
@@ -354,6 +388,7 @@ def _map_result(result: dict, fallback_score: float) -> dict:
         _is_data_skip  = "insufficient edge" in _reasoning_lower
         _is_hard_block = (
             not _risk_says_ok or
+            (_producer_skip_code in _AUTHORITATIVE_SKIP_CODES) or
             any(p in _reasoning_lower for p in _HARD_PHRASES)
         )
         _missing_count = _count_missing_fundamentals(result)

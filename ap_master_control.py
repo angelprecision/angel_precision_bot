@@ -2961,6 +2961,11 @@ class APMasterControl:
                         "reason":    intel_reason[:200] if intel_reason else "",
                         "available": intel_avail,
                     } if intel_avail else None,
+                    # Canonical admission verdict — always present so the funnel
+                    # report and decision events can see TIMEOUT/LOW_CONFIDENCE/
+                    # UNAVAILABLE paths that continued (not just blocked ones).
+                    # reason_code uses stable INTEL_* taxonomy; never free text.
+                    "intelligence_admission": _intel_verdict.as_block_meta(),
                     "mode":                 "LIVE" if not self.paper else "PAPER",
                     "effective_mode":       current_mode,
                 },
@@ -2979,6 +2984,7 @@ class APMasterControl:
             plan=plan,
             intel=intel,
             snap=snap,
+            intel_verdict=_intel_verdict,
         )
         if _final_quality_block is not None:
             if _final_quality_block.plan is None:
@@ -3493,7 +3499,13 @@ class APMasterControl:
         plan: ApprovedExecutionPlan,
         intel: dict[str, Any],
         snap: dict[str, Any],
+        intel_verdict: Any = None,
     ) -> Optional[ControlDecision]:
+        # Normalize intel for safe .get() access — mirrors evaluate() normalization.
+        # intel may be an empty dict on fail-open paths where the bridge returned
+        # a non-dict value; isinstance guard makes all .get() calls below safe.
+        intel_raw = intel if isinstance(intel, dict) else {}
+
         if not _env_true("FINAL_QUALITY_MODE_ENABLED", True):
             self._store_update(signal_id, "rejected", "final_quality_mode_disabled")
             return self._block(
@@ -3651,62 +3663,108 @@ class APMasterControl:
             )
 
         if not self.paper:
-            # PR #224 amendment: explicit rollout-safe env gate.
-            # FINAL_ENTRY_INTELLIGENCE_REQUIRED defaults to True for live so
-            # the existing fail-closed behavior is preserved out of the box.
-            # Setting it false is an explicit emergency rollback switch —
-            # intel unavailability is then only OBSERVED (logged + recorded
-            # in plan.metadata) and does not block the entry.
-            intel_required = _env_true("FINAL_ENTRY_INTELLIGENCE_REQUIRED", True)
-            if not bool(intel_raw.get("_available")):
-                if intel_required:
-                    self._store_update(signal_id, "rejected", "entry_intelligence_missing")
-                    return self._block(
-                        signal_id,
-                        ticker,
-                        client_id,
-                        "REJECTED",
-                        "entry_intelligence_missing",
-                        reason_code="ENTRY_INTELLIGENCE_MISSING",
-                    )
-                log.warning(
-                    "[%s] ENTRY_INTELLIGENCE_MISSING_OBSERVED — intel unavailable "
-                    "but FINAL_ENTRY_INTELLIGENCE_REQUIRED=false (emergency "
-                    "rollback active) — proceeding without block",
-                    ticker,
+            # ── Canonical verdict guards the LIVE intel re-check ─────────────
+            # The canonical admission policy (Gate G, earlier in evaluate()) has
+            # already adjudicated the intelligence result.  If it classified the
+            # result as fail-open (TIMEOUT, ERROR, UNAVAILABLE, LOW_CONFIDENCE,
+            # MALFORMED, UNKNOWN, or any observe-only variant), we must not
+            # independently re-block here.  Doing so would mean the policy says
+            # "fail open" but LIVE entries are still blocked — violating the
+            # contract that the policy is the single admission authority.
+            #
+            # We only run the raw _available / score checks when the verdict is
+            # either None (legacy/test path) or a true authoritative approval.
+            from ap.intelligence_admission_policy import (  # late import — safe
+                INTEL_AUTHORITATIVE_APPROVED,
+                INTEL_SCANNER_APPROVED_OBSERVE,
+            )
+            _verdict_code = str(
+                getattr(intel_verdict, "reason_code", None) or ""
+            )
+            _verdict_is_fail_open = (
+                intel_verdict is not None
+                and _verdict_code not in (
+                    INTEL_AUTHORITATIVE_APPROVED,
+                    INTEL_SCANNER_APPROVED_OBSERVE,
                 )
+            )
+
+            # Persist canonical verdict into plan.metadata.intelligence_admission.
+            # evaluate() also writes it into score_audit; this write ensures it
+            # is visible to callers that invoke _run_final_quality_gates() directly
+            # (recovery paths, direct tests) without going through evaluate().
+            if intel_verdict is not None:
                 if plan.metadata is None:
                     plan.metadata = {}
-                plan.metadata["final_gate_diagnostics"] = {
-                    **(plan.metadata.get("final_gate_diagnostics") or {}),
-                    "entry_intelligence_missing_observed": True,
-                    "reason_code": "ENTRY_INTELLIGENCE_MISSING_OBSERVED",
-                }
-            else:
-                try:
-                    intel_score = float(intel_raw.get("intel_score", intel_raw.get("score", 0)) or 0)
-                except Exception:
-                    intel_score = 0.0
-                intel_min_score = float(
-                    os.getenv(
-                        "FINAL_ENTRY_INTELLIGENCE_MIN_SCORE",
-                        os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"),
-                    )
+                plan.metadata["intelligence_admission"] = intel_verdict.as_block_meta()
+
+            if _verdict_is_fail_open:
+                # Canonical policy classified this as fail-open.  Emit an
+                # observe-only log so operators can see it; do NOT block.
+                log.info(
+                    "[%s] LIVE_FINAL_GATE_INTEL_SKIP — canonical verdict=%s "
+                    "classified as fail-open; LIVE intel availability/score "
+                    "re-check suppressed per admission policy authority. "
+                    "signal_id=%s",
+                    ticker, _verdict_code, signal_id,
                 )
-                if intel_score < intel_min_score:
-                    self._store_update(
-                        signal_id,
-                        "rejected",
-                        f"entry_intelligence_score_too_low:{intel_score:.1f}",
-                    )
-                    return self._block(
-                        signal_id,
+            else:
+                # PR #224 amendment: explicit rollout-safe env gate.
+                # FINAL_ENTRY_INTELLIGENCE_REQUIRED defaults to True for live so
+                # the existing fail-closed behavior is preserved out of the box.
+                # Setting it false is an explicit emergency rollback switch —
+                # intel unavailability is then only OBSERVED (logged + recorded
+                # in plan.metadata) and does not block the entry.
+                intel_required = _env_true("FINAL_ENTRY_INTELLIGENCE_REQUIRED", True)
+                if not bool(intel_raw.get("_available")):
+                    if intel_required:
+                        self._store_update(signal_id, "rejected", "entry_intelligence_missing")
+                        return self._block(
+                            signal_id,
+                            ticker,
+                            client_id,
+                            "REJECTED",
+                            "entry_intelligence_missing",
+                            reason_code="ENTRY_INTELLIGENCE_MISSING",
+                        )
+                    log.warning(
+                        "[%s] ENTRY_INTELLIGENCE_MISSING_OBSERVED — intel unavailable "
+                        "but FINAL_ENTRY_INTELLIGENCE_REQUIRED=false (emergency "
+                        "rollback active) — proceeding without block",
                         ticker,
-                        client_id,
-                        "REJECTED",
-                        f"entry_intelligence_score_too_low ({intel_score:.1f}<{intel_min_score:.1f})",
-                        reason_code="ENTRY_INTELLIGENCE_SCORE_TOO_LOW",
                     )
+                    if plan.metadata is None:
+                        plan.metadata = {}
+                    plan.metadata["final_gate_diagnostics"] = {
+                        **(plan.metadata.get("final_gate_diagnostics") or {}),
+                        "entry_intelligence_missing_observed": True,
+                        "reason_code": "ENTRY_INTELLIGENCE_MISSING_OBSERVED",
+                    }
+                else:
+                    try:
+                        intel_score = float(intel_raw.get("intel_score", intel_raw.get("score", 0)) or 0)
+                    except Exception:
+                        intel_score = 0.0
+                    intel_min_score = float(
+                        os.getenv(
+                            "FINAL_ENTRY_INTELLIGENCE_MIN_SCORE",
+                            os.getenv("INTEL_APPROVE_THRESHOLD", "35.0"),
+                        )
+                    )
+                    if intel_score < intel_min_score:
+                        self._store_update(
+                            signal_id,
+                            "rejected",
+                            f"entry_intelligence_score_too_low:{intel_score:.1f}",
+                        )
+                        return self._block(
+                            signal_id,
+                            ticker,
+                            client_id,
+                            "REJECTED",
+                            f"entry_intelligence_score_too_low ({intel_score:.1f}<{intel_min_score:.1f})",
+                            reason_code="ENTRY_INTELLIGENCE_SCORE_TOO_LOW",
+                        )
 
         try:
             from ap_hybrid_client_quality_gate import evaluate_client_quality_gate

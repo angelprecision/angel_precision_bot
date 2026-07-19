@@ -497,3 +497,103 @@ def report_intelligence_funnel(
             "on this deploy): %s", exc,
         )
         return {"funnel": [], "error": str(exc), "surface": "decision_events"}
+
+
+# ---------------------------------------------------------------------------
+# Alias: report_intelligence_vetoes — the veto-only report is now explicit
+# ---------------------------------------------------------------------------
+
+#: report_intelligence_vetoes is the explicit name for the blocked-only view.
+#: The older name report_intelligence_funnel remains for backwards compat.
+report_intelligence_vetoes = report_intelligence_funnel
+
+
+# ---------------------------------------------------------------------------
+# Full funnel: all intelligence admission outcomes (approved + fail-open + vetoed)
+# ---------------------------------------------------------------------------
+
+def report_intelligence_full_funnel(
+    *,
+    client_id: str | None = None,
+    execution_mode: str | None = None,
+    session_date: str | None = None,
+) -> dict[str, Any]:
+    """Read-only operator query: all intelligence admission outcomes.
+
+    Unlike report_intelligence_funnel (which only sees blocked candidates),
+    this function reads score_audit.intelligence_admission from approved-plan
+    metadata written into orders.meta.  The canonical verdict is written there
+    by master control on every approved signal, so TIMEOUT, LOW_CONFIDENCE,
+    UNAVAILABLE, and observe-only paths that continued are all visible.
+
+    Surface: orders.meta->'score_audit'->'intelligence_admission'->>'intel_reason_code'
+    Timestamp: orders.created_ts (canonical orders timestamp)
+
+    Returns:
+        {
+            "funnel": [{"reason_code": str, "execution_mode": str, "count": int}, ...],
+            "approved_funnel": [...],   # reason_code ∈ INTEL_AUTHORITATIVE_APPROVED etc.
+            "fail_open_funnel": [...],  # reason_code ∈ INTEL_*_FAIL_OPEN etc.
+            "veto_funnel": [...],       # from decision_events (pre-order blocks)
+            "filters": {...},
+        }
+    """
+    from ap.db import conn, run_with_retry
+
+    where_parts: list[str] = [
+        "meta->'score_audit'->'intelligence_admission'->>'intel_reason_code' IS NOT NULL"
+    ]
+    params: list[Any] = []
+
+    if client_id:
+        where_parts.append("client_id = %s")
+        params.append(client_id)
+    if execution_mode:
+        where_parts.append(
+            "UPPER(COALESCE(meta->'score_audit'->'intelligence_admission'->>'intel_execution_mode','')) = %s"
+        )
+        params.append(execution_mode.strip().upper())
+    if session_date:
+        where_parts.append("DATE(created_ts AT TIME ZONE 'America/New_York') = %s")
+        params.append(session_date)
+
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    def _read() -> dict[str, Any]:
+        with conn() as c:
+            c.execute(
+                f"""
+                SELECT
+                    meta->'score_audit'->'intelligence_admission'->>'intel_reason_code'  AS reason_code,
+                    UPPER(COALESCE(
+                        meta->'score_audit'->'intelligence_admission'->>'intel_execution_mode',
+                        ''
+                    ))                                                                    AS execution_mode,
+                    COUNT(*)                                                              AS count
+                FROM orders
+                {where_sql}
+                GROUP BY 1, 2
+                ORDER BY 3 DESC
+                """,
+                params,
+            )
+            rows = [dict(r) for r in (c.fetchall() or [])]
+        return {
+            "funnel":    rows,
+            "filters": {
+                "client_id":      client_id,
+                "execution_mode": execution_mode,
+                "session_date":   session_date,
+            },
+            "note": (
+                "Approved/fail-open outcomes read from orders.meta "
+                "(score_audit.intelligence_admission). "
+                "Veto counts from report_intelligence_vetoes() (decision_events)."
+            ),
+        }
+
+    try:
+        return run_with_retry(_read)
+    except Exception as exc:
+        log.warning("report_intelligence_full_funnel failed: %s", exc)
+        return {"funnel": [], "error": str(exc)}
