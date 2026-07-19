@@ -39,18 +39,24 @@ Producer/authority table (traced 2026-07-18):
 
   SPY-trend vetoes: the bridge produces these through
   _map_result() → action="skip" → _is_hard_block evaluation.
-  Hard-block phrases include "risk manager", "risk veto", "hard risk",
-  "capital", "buying power", "auth", "scanner signal is neutral",
-  "neutral direction", "contract quality failed".  When matched, the
-  bridge emits intel_status="SKIP" only when _is_hard_block is true,
-  which maps to INTEL_AUTHORITATIVE_VETO_SKIP_HARD. Non-hard skip,
-  low-confidence, malformed-confidence, and incomplete-data outcomes
-  route through LOW_CONFIDENCE → INTEL_LOW_DATA_QUALITY_FAIL_OPEN or
-  the scanner-approved fallback (approved=True).
+  Hard-block authority requires ONE of:
+    (a) risk_ok=False from _risk_allows_trade() (structured risk_detail);
+    (b) skip_reason_code in the closed authoritative set:
+        NEUTRAL_DIRECTION, CONTRACT_QUALITY_FAILED, BUYING_POWER_UNAVAILABLE,
+        ACCOUNT_AUTH_FAILED, RISK_MANAGER_VETO; or
+    (c) reasoning matches a specific unambiguous phrase:
+        "risk manager veto", "scanner signal is neutral", "neutral direction",
+        "contract quality failed", "risk veto", "hard risk",
+        "buying power unavailable", "insufficient buying power",
+        "account auth failed", "authorization failed", "account not authorized".
+  Removed from phrase list (too broad — false-positive on benign text):
+    "capital", "auth", "buying power", "risk manager".
+  Non-hard skips and all other outcomes → LOW_CONFIDENCE fail open.
+  When matched, bridge emits intel_status="SKIP" → INTEL_AUTHORITATIVE_VETO_SKIP_HARD.
   The 222 SPY-trend vetoes observed in production are therefore either:
     (a) hard-block skips → INTEL_AUTHORITATIVE_VETO_SKIP_HARD; or
     (b) fail-open LOW_CONFIDENCE / scanner-approved fallbacks.
-  No free-text pass-through creates authority.
+  No free-text pass-through and no risk_reason text re-evaluation creates authority.
 
 Policy version: 1.0
 """
@@ -273,6 +279,34 @@ def adjudicate_intelligence_result(
     except (TypeError, ValueError):
         confidence = None
 
+    # ── Infrastructure / fail-open intel_status — classified BEFORE _available ──
+    # master control unconditionally stamps result["_available"] = True on every
+    # successful bridge call, including TIMEOUT, ERROR, and UNAVAILABLE results.
+    # Relying on `not available` to catch these statuses therefore fails in the
+    # real production path.  We classify them by intel_status first so the
+    # correct reason code is emitted regardless of the _available stamp.
+    #
+    # Note: LOW_CONFIDENCE is included here so it is handled consistently whether
+    # _available is True or False, and always produces INTEL_LOW_DATA_QUALITY_FAIL_OPEN.
+    _early_fail_open = _FAIL_OPEN_STATUS_MAP.get(raw_status)
+    if _early_fail_open is not None:
+        log.debug(
+            "[%s] %s intel_status=%r early fail-open (before _available check) signal_id=%s",
+            ticker, _early_fail_open, raw_status, signal_id,
+        )
+        return IntelligenceAdmissionVerdict(
+            allowed=True,
+            authoritative=False,
+            reason_code=_early_fail_open,
+            reasoning=reasoning or f"infrastructure status={raw_status!r} — fail open",
+            source=source,
+            confidence=confidence,
+            data_quality="unavailable" if raw_status != "LOW_CONFIDENCE" else "low_data_quality",
+            raw_status=raw_status,
+            policy_version=POLICY_VERSION,
+            diagnostics={**base_diag, "raw_status": raw_status, "available": available},
+        )
+
     # ── Missing 'approved' field → fail open ──────────────────────────────
     if approved is None:
         log.warning(
@@ -331,14 +365,20 @@ def adjudicate_intelligence_result(
 
     # ── approved=True ──────────────────────────────────────────────────────
     if approved is True:
+        _is_scanner_observe = (raw_status == "SCANNER_APPROVED_INTEL_OBSERVE_ONLY")
         reason_code = (
             INTEL_SCANNER_APPROVED_OBSERVE
-            if raw_status == "SCANNER_APPROVED_INTEL_OBSERVE_ONLY"
+            if _is_scanner_observe
             else INTEL_AUTHORITATIVE_APPROVED
         )
+        # SCANNER_APPROVED_INTEL_OBSERVE_ONLY is explicitly non-authoritative:
+        # the bridge approved via scanner score because intel had incomplete/
+        # neutral data — the intel score itself is observe-only metadata and
+        # must NOT be re-evaluated by the LIVE final gate.  Marking it
+        # authoritative=False ensures the final gate's fail-open bypass fires.
         return IntelligenceAdmissionVerdict(
             allowed=True,
-            authoritative=True,
+            authoritative=not _is_scanner_observe,
             reason_code=reason_code,
             reasoning=reasoning,
             source=source,

@@ -381,13 +381,14 @@ def _map_result(result: dict, fallback_score: float) -> dict:
 
         _producer_skip_code = str(result.get("skip_reason_code") or "").upper().strip()
         _reasoning_lower   = reasoning.lower()
-        _risk_reason_lower = (risk_reason or "").lower().strip()
-        _risk_says_ok      = _risk_reason_lower in (
-            "", "none", "approved", "ok", "null", "n/a", "risk ok"
-        )
         _is_data_skip  = "insufficient edge" in _reasoning_lower
+        # Use the already-computed risk_ok boolean from _risk_allows_trade().
+        # Do NOT re-derive authority from the risk_reason text: a reason like
+        # "position remains within account risk limits" is explanatory prose for
+        # an approved decision; it must not flip a passing risk_ok into a block.
+        # risk_ok=True when risk_detail["approved"]=True (or equivalent).
         _is_hard_block = (
-            not _risk_says_ok or
+            not risk_ok or
             (_producer_skip_code in _AUTHORITATIVE_SKIP_CODES) or
             any(p in _reasoning_lower for p in _HARD_PHRASES)
         )

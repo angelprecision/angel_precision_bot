@@ -232,18 +232,23 @@ def test_structured_skip_reason_code_neutral_direction_is_authoritative(monkeypa
         "contracts": 1, "ticker": "AAPL",
     }
     gate = ib._map_result(result, fallback_score=70.0)
-    # SKIP (hard block) or SKIP_OVERRIDE (data-collection) both prove authority
-    assert gate.get("intel_status") in ("SKIP", "SKIP_OVERRIDE"), (
-        f"NEUTRAL_DIRECTION skip_reason_code must produce authoritative block, got {gate.get('intel_status')!r}"
+    # Collection mode is disabled; exactly SKIP is required, not SKIP_OVERRIDE
+    assert gate.get("intel_status") == "SKIP", (
+        f"NEUTRAL_DIRECTION with collection disabled must produce exactly SKIP, "
+        f"got {gate.get('intel_status')!r}"
     )
-    # Either approved=False (SKIP) or approved=True with SKIP_OVERRIDE is fine —
-    # the adjudicator maps SKIP→block, SKIP_OVERRIDE is data-collection mode
-    assert gate.get("intel_status") in ("SKIP", "SKIP_OVERRIDE")
+    assert gate.get("approved") is False
 
 
-def test_buying_power_unavailable_phrase_remains_authoritative():
-    """Specific phrase \'buying power unavailable\' stays authoritative."""
+def test_buying_power_unavailable_phrase_remains_authoritative(monkeypatch):
+    """Specific phrase \'buying power unavailable\' stays authoritative.
+
+    Collection mode disabled so we get clean SKIP, not SKIP_OVERRIDE.
+    """
+    import intelligence_bridge as _ib_mod
+    monkeypatch.setattr(_ib_mod, "_data_collection_allowed", lambda: False)
     ib = _load_bridge()
+    ib._data_collection_allowed = lambda: False
     result = {
         "action": "skip", "approved": False,
         "score": 30.0, "confidence": 30.0,
@@ -252,7 +257,181 @@ def test_buying_power_unavailable_phrase_remains_authoritative():
         "contracts": 1, "ticker": "AAPL",
     }
     gate = ib._map_result(result, fallback_score=70.0)
-    assert gate.get("intel_status") in ("SKIP", "SKIP_OVERRIDE")
+    assert gate.get("intel_status") == "SKIP", (
+        f"'buying power unavailable' must produce SKIP, got {gate.get('intel_status')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# J. Scanner-approved observe-only passes through LIVE final gate
+# ---------------------------------------------------------------------------
+
+def test_scanner_approved_observe_only_passes_live_final_gate(monkeypatch):
+    """Bridge path: scanner=75, intel=28, threshold=35, SCANNER_APPROVED_INTEL_OBSERVE_ONLY.
+
+    The bridge approved via scanner score because intel had incomplete/neutral
+    data.  The raw intel_score (28) is observe-only metadata — it must not be
+    re-evaluated by the LIVE final gate.  Result must continue, not return
+    ENTRY_INTELLIGENCE_SCORE_TOO_LOW.
+    """
+    mc, _ = _build_mc(paper=False)
+    monkeypatch.setenv("FINAL_ENTRY_INTELLIGENCE_MIN_SCORE", "35.0")
+    monkeypatch.setenv("FINAL_ENTRY_INTELLIGENCE_REQUIRED", "1")
+
+    intel = {
+        "_available": True,
+        "approved": True,
+        "score": 75.0,           # scanner score — the effective score
+        "intel_score": 28.0,     # lower raw intel — observe-only
+        "intel_status": "SCANNER_APPROVED_INTEL_OBSERVE_ONLY",
+        "second_score_mode": "observe_only",
+    }
+    # This is what the canonical policy produces for SCANNER_APPROVED_INTEL_OBSERVE_ONLY
+    verdict = iap.IntelligenceAdmissionVerdict(
+        allowed=True,
+        authoritative=False,   # observe-only → NOT authoritative
+        reason_code=iap.INTEL_SCANNER_APPROVED_OBSERVE,
+        reasoning="scanner_approved_score=75.0 intel_score=28.0",
+        source="intelligence_bridge",
+        confidence=75.0,
+        data_quality="available",
+        raw_status="SCANNER_APPROVED_INTEL_OBSERVE_ONLY",
+        policy_version=iap.POLICY_VERSION,
+        diagnostics={"execution_mode": "LIVE"},
+    )
+
+    decision = _run(mc, intel=intel, intel_verdict=verdict, monkeypatch=monkeypatch)
+
+    assert decision is None or decision.ok is not False, (
+        "SCANNER_APPROVED_INTEL_OBSERVE_ONLY must pass the LIVE final gate; "
+        "raw intel_score=28 is observe-only and must not trigger "
+        "ENTRY_INTELLIGENCE_SCORE_TOO_LOW when scanner score=75 > threshold=35"
+    )
+
+
+def test_scanner_approved_observe_only_is_non_authoritative_in_policy():
+    """Policy must classify SCANNER_APPROVED_INTEL_OBSERVE_ONLY as authoritative=False."""
+    result = {
+        "approved": True,
+        "intel_status": "SCANNER_APPROVED_INTEL_OBSERVE_ONLY",
+        "reasoning": "scanner_approved_score=75.0 intel_score=28.0",
+        "_available": True,
+        "score": 75.0,
+    }
+    verdict = iap.adjudicate_intelligence_result(
+        result, signal={"ticker": "AAPL", "signal_id": "s1", "side": "CALL"},
+        execution_mode="LIVE",
+    )
+    assert verdict.allowed is True
+    assert verdict.authoritative is False, (
+        "SCANNER_APPROVED_INTEL_OBSERVE_ONLY must be authoritative=False "
+        "so the LIVE final gate treats it as non-authoritative and skips the score re-check"
+    )
+    assert verdict.reason_code == iap.INTEL_SCANNER_APPROVED_OBSERVE
+
+
+# ---------------------------------------------------------------------------
+# K. Structured risk approval not falsely hard-blocked by benign reason text
+# ---------------------------------------------------------------------------
+
+def test_approved_risk_with_benign_reason_text_fails_open():
+    """risk_detail[approved=True] with non-empty explanatory reason must NOT become SKIP.
+
+    Prior bug: _risk_says_ok checked risk_reason against a tiny allowlist.
+    A benign reason like 'position remains within account risk limits' is not
+    in ('', 'none', 'approved', ...) so _risk_says_ok was False → hard block.
+    The fix: use risk_ok (the structured boolean) not _risk_says_ok.
+    """
+    ib = _load_bridge()
+    result = {
+        "action": "skip",
+        "approved": False,
+        "score": 30.0,
+        "confidence": 30.0,
+        "reasoning": "mixed evidence, no strong directional edge",
+        "risk_detail": {
+            "approved": True,
+            "reason": "position remains within account risk limits",
+        },
+        "contracts": 1,
+        "ticker": "AAPL",
+    }
+    gate = ib._map_result(result, fallback_score=70.0)
+    assert gate.get("intel_status") != "SKIP", (
+        "risk_detail[approved=True] with benign reason text must not become SKIP; "
+        f"got intel_status={gate.get('intel_status')!r}. "
+        "Fix: use risk_ok boolean, not risk_reason text allowlist."
+    )
+    # Should fail open as LOW_CONFIDENCE (non-hard skip)
+    assert gate.get("intel_status") in ("LOW_CONFIDENCE",), (
+        f"Expected LOW_CONFIDENCE fail-open, got {gate.get('intel_status')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L. TIMEOUT/ERROR/UNAVAILABLE — correct reason code with _available=True stamp
+# ---------------------------------------------------------------------------
+
+def test_timeout_with_available_true_stamp_gets_correct_reason_code():
+    """master control stamps _available=True on all bridge results.
+
+    A TIMEOUT bridge result therefore arrives at the adjudicator as
+    _available=True.  The adjudicator must still produce INTEL_UNAVAILABLE_FAIL_OPEN,
+    not INTEL_UNKNOWN_REASON_FAIL_OPEN, by checking intel_status before _available.
+    """
+    result = {
+        "approved": False,
+        "intel_status": "TIMEOUT",
+        "reasoning": "intelligence pipeline timed out",
+        "_available": True,  # master control stamp — the shape in production
+        "score": 0.0,
+    }
+    verdict = iap.adjudicate_intelligence_result(
+        result, signal={"ticker": "AAPL", "signal_id": "s1", "side": "CALL"},
+        execution_mode="LIVE",
+    )
+    assert verdict.allowed is True
+    assert verdict.reason_code == iap.INTEL_UNAVAILABLE_FAIL_OPEN, (
+        f"TIMEOUT with _available=True stamp must produce INTEL_UNAVAILABLE_FAIL_OPEN, "
+        f"got {verdict.reason_code!r} — adjudicator must check intel_status before _available"
+    )
+    assert verdict.authoritative is False
+
+
+def test_error_with_available_true_stamp_gets_correct_reason_code():
+    """ERROR bridge result with _available=True stamp → INTEL_ERROR_FAIL_OPEN."""
+    result = {
+        "approved": False,
+        "intel_status": "ERROR",
+        "reasoning": "pipeline exception",
+        "_available": True,
+        "score": 0.0,
+    }
+    verdict = iap.adjudicate_intelligence_result(
+        result, signal={"ticker": "AAPL", "signal_id": "s1", "side": "CALL"},
+        execution_mode="LIVE",
+    )
+    assert verdict.allowed is True
+    assert verdict.reason_code == iap.INTEL_ERROR_FAIL_OPEN
+    assert verdict.authoritative is False
+
+
+def test_low_confidence_with_available_true_stamp_gets_correct_reason_code():
+    """LOW_CONFIDENCE with _available=True → INTEL_LOW_DATA_QUALITY_FAIL_OPEN."""
+    result = {
+        "approved": False,
+        "intel_status": "LOW_CONFIDENCE",
+        "reasoning": "insufficient evidence",
+        "_available": True,
+        "score": 20.0,
+    }
+    verdict = iap.adjudicate_intelligence_result(
+        result, signal={"ticker": "AAPL", "signal_id": "s1", "side": "CALL"},
+        execution_mode="LIVE",
+    )
+    assert verdict.allowed is True
+    assert verdict.reason_code == iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN
+    assert verdict.authoritative is False
 
 
 # ---------------------------------------------------------------------------

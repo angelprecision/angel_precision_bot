@@ -238,7 +238,8 @@ def test_scanner_approved_observe_only_is_not_a_veto():
     [
         (False, 22.0, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
         (True, 22.0, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
-        (None, 22.0, None, iap.INTEL_MALFORMED_FAIL_OPEN),
+        # approved=None + LOW_CONFIDENCE: early intel_status check fires first → LOW_DATA_QUALITY
+        (None, 22.0, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
         (False, None, "bad-confidence", iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
         (False, None, None, iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN),
     ],

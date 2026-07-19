@@ -3676,18 +3676,29 @@ class APMasterControl:
             # either None (legacy/test path) or a true authoritative approval.
             from ap.intelligence_admission_policy import (  # late import — safe
                 INTEL_AUTHORITATIVE_APPROVED,
-                INTEL_SCANNER_APPROVED_OBSERVE,
             )
-            _verdict_code = str(
-                getattr(intel_verdict, "reason_code", None) or ""
-            )
-            _verdict_is_fail_open = (
-                intel_verdict is not None
-                and _verdict_code not in (
-                    INTEL_AUTHORITATIVE_APPROVED,
-                    INTEL_SCANNER_APPROVED_OBSERVE,
+            # Only re-check raw intel score/availability when the verdict is a
+            # true authoritative approval (authoritative=True AND reason_code
+            # exactly INTEL_AUTHORITATIVE_APPROVED).
+            #
+            # Every other case bypasses the re-check:
+            #   - SCANNER_APPROVED_INTEL_OBSERVE_ONLY: authoritative=False.
+            #     The bridge approved via scanner score because intel had
+            #     incomplete data — the lower raw intel_score is observe-only
+            #     metadata; re-checking it would defeat the scanner fallback.
+            #   - Any fail-open verdict (TIMEOUT, ERROR, UNAVAILABLE,
+            #     LOW_CONFIDENCE, MALFORMED, UNKNOWN, observe-only mode):
+            #     authoritative=False by definition.
+            #   - Legacy path (intel_verdict=None): falls through to the
+            #     existing _available check to preserve prior behavior.
+            _requires_live_intel_recheck = (
+                intel_verdict is None
+                or (
+                    intel_verdict.authoritative
+                    and getattr(intel_verdict, "reason_code", None) == INTEL_AUTHORITATIVE_APPROVED
                 )
             )
+            _verdict_is_fail_open = not _requires_live_intel_recheck
 
             # Persist canonical verdict into plan.metadata.intelligence_admission.
             # evaluate() also writes it into score_audit; this write ensures it
@@ -3706,7 +3717,7 @@ class APMasterControl:
                     "classified as fail-open; LIVE intel availability/score "
                     "re-check suppressed per admission policy authority. "
                     "signal_id=%s",
-                    ticker, _verdict_code, signal_id,
+                    ticker, getattr(intel_verdict, "reason_code", ""), signal_id,
                 )
             else:
                 # PR #224 amendment: explicit rollout-safe env gate.
