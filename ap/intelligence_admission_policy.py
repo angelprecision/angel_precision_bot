@@ -132,20 +132,30 @@ class IntelligenceAdmissionVerdict:
     diagnostics: dict = field(default_factory=dict)
 
     def as_block_meta(self) -> dict[str, Any]:
-        """Return structured metadata for queue/plan/order block records.
+        """Return structured metadata for decision events and block records.
 
-        Stored in orders.meta and decision events so operators can query
-        stable reason codes without parsing free-text reasoning strings.
+        Written into decision_events.context_json (via _block → emit_decision_event)
+        so operators can query stable reason codes without parsing free-text
+        reasoning strings.
+
+        intel_execution_mode is extracted from diagnostics so that
+        report_intelligence_funnel can filter by LIVE/PAPER from
+        decision_events.context_json — decision_events has no standalone
+        execution_mode column.
         """
         return {
-            "intel_reason_code":   self.reason_code,
-            "intel_reasoning":     self.reasoning[:200],
-            "intel_source":        self.source,
-            "intel_authoritative": self.authoritative,
-            "intel_confidence":    self.confidence,
-            "intel_data_quality":  self.data_quality,
-            "intel_raw_status":    self.raw_status,
+            "intel_reason_code":    self.reason_code,
+            "intel_reasoning":      self.reasoning[:200],
+            "intel_source":         self.source,
+            "intel_authoritative":  self.authoritative,
+            "intel_confidence":     self.confidence,
+            "intel_data_quality":   self.data_quality,
+            "intel_raw_status":     self.raw_status,
             "intel_policy_version": self.policy_version,
+            # Execution mode preserved from diagnostics for funnel report filtering.
+            "intel_execution_mode": str(
+                self.diagnostics.get("execution_mode") or ""
+            ).upper() or None,
         }
 
 
@@ -394,8 +404,25 @@ def report_intelligence_funnel(
 ) -> dict[str, Any]:
     """Read-only operator query: intelligence admission counts by reason code.
 
-    Reads stable intel_reason_code values stored in orders.meta JSONB by
-    master control.  No new analytics table is required.
+    WHY decision_events, NOT orders
+    ────────────────────────────────
+    Authoritative intelligence vetoes are decided before any selector or order
+    row is created.  When the admission gate denies a signal, _block() returns
+    immediately and no order row is ever written.  Querying orders.meta for
+    intel_reason_code therefore produces an empty funnel for every blocked
+    candidate — the data is structurally absent from that table.
+
+    decision_events is the correct surface:
+      • _block() calls emit_decision_event() unconditionally for every REJECT.
+      • stage='blocked_intel' identifies admission-gate blocks specifically.
+      • reason_code stores the stable INTEL_* taxonomy code directly.
+      • context_json contains the full as_block_meta() dict, including
+        intel_execution_mode (LIVE/PAPER) written by the adjudicator.
+      • Timestamp column is `ts` (TIMESTAMPTZ), not `created_at` or `created_ts`.
+
+    Fallback: if decision_events does not exist on this deploy (pre-observability
+    schema), the function returns an empty funnel with a diagnostic note rather
+    than raising.
 
     Returns:
         {
@@ -405,18 +432,31 @@ def report_intelligence_funnel(
     """
     from ap.db import conn, run_with_retry
 
-    where_parts: list[str] = ["meta->>'intel_reason_code' IS NOT NULL"]
+    # decision_events uses `ts` (TIMESTAMPTZ), not created_at / created_ts.
+    where_parts: list[str] = [
+        "stage = 'blocked_intel'",
+        "decision = 'REJECT'",
+        "reason_code LIKE 'INTEL_%'",
+    ]
     params: list[Any] = []
 
     if client_id:
         where_parts.append("client_id = %s")
         params.append(client_id)
+
+    # execution_mode is stored in context_json by as_block_meta() as
+    # intel_execution_mode.  No standalone column exists in decision_events.
     if execution_mode:
-        where_parts.append("LOWER(COALESCE(execution_mode,'')) = %s")
-        params.append(execution_mode.strip().lower())
-    if session_date:
+        _mode_upper = execution_mode.strip().upper()
         where_parts.append(
-            "DATE(created_at AT TIME ZONE 'America/New_York') = %s"
+            "UPPER(COALESCE(context_json->>'intel_execution_mode', '')) = %s"
+        )
+        params.append(_mode_upper)
+
+    if session_date:
+        # `ts` is the canonical timestamp in decision_events.
+        where_parts.append(
+            "DATE(ts AT TIME ZONE 'America/New_York') = %s"
         )
         params.append(session_date)
 
@@ -427,10 +467,10 @@ def report_intelligence_funnel(
             c.execute(
                 f"""
                 SELECT
-                    meta->>'intel_reason_code'         AS reason_code,
-                    UPPER(COALESCE(execution_mode,'')) AS execution_mode,
-                    COUNT(*)                           AS count
-                FROM orders
+                    reason_code                                              AS reason_code,
+                    UPPER(COALESCE(context_json->>'intel_execution_mode','')) AS execution_mode,
+                    COUNT(*)                                                 AS count
+                FROM decision_events
                 {where_sql}
                 GROUP BY 1, 2
                 ORDER BY 3 DESC
@@ -450,5 +490,10 @@ def report_intelligence_funnel(
     try:
         return run_with_retry(_read)
     except Exception as exc:
-        log.warning("report_intelligence_funnel failed: %s", exc)
-        return {"funnel": [], "error": str(exc)}
+        # decision_events may not exist on older deploys; return diagnostic
+        # rather than raising so callers get a usable empty response.
+        log.warning(
+            "report_intelligence_funnel failed (decision_events may be missing "
+            "on this deploy): %s", exc,
+        )
+        return {"funnel": [], "error": str(exc), "surface": "decision_events"}

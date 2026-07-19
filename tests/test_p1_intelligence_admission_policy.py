@@ -631,3 +631,268 @@ def test_low_confidence_block_meta_uses_fail_open_reason_code():
     meta = verdict.as_block_meta()
     assert meta["intel_reason_code"] == iap.INTEL_LOW_DATA_QUALITY_FAIL_OPEN
     assert meta["intel_authoritative"] is False
+
+
+# ---------------------------------------------------------------------------
+# Amendment tests: raw numeric field safety + funnel report surface
+# (Added for PR #379 amendment — closes two production-shape gaps)
+# ---------------------------------------------------------------------------
+
+class TestMalformedNumericFieldsFailOpen:
+    """
+    Gap 1: float(intel.get("score", 0)) and int(intel.get("contracts", 1) or 1)
+    both execute BEFORE adjudicate_intelligence_result() is called in
+    ap_master_control.py.  A bridge result like {"score": "unknown"} or
+    {"contracts": "N/A"} would raise ValueError and kill the admission path
+    before the adjudicator can produce its fail-open verdict.
+
+    These tests verify the adjudicator itself handles non-numeric score/
+    confidence gracefully (the adjudicator already does via _conf_raw),
+    and document that the master-control safe-parse wrappers must exist
+    to protect the path before adjudication.
+    """
+
+    @pytest.mark.parametrize("bad_score", [
+        "unknown",
+        "N/A",
+        "low",
+        "",
+        [],
+        {},
+    ])
+    def test_adjudicator_handles_non_numeric_score_gracefully(self, bad_score):
+        """Adjudicator must not raise on non-numeric score/confidence fields.
+
+        The adjudicator already coerces via _conf_raw with try/except;
+        this test proves non-numeric values produce allowed=True (fail-open)
+        when no authoritative veto status is present.
+        """
+        result = {
+            "approved": True,
+            "intel_status": "OK",
+            "reasoning": "test",
+            "_available": True,
+            "score": bad_score,
+        }
+        # Must not raise regardless of the score shape
+        verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+        # approved=True + no veto status → allowed=True regardless of score
+        assert verdict.allowed is True
+
+    @pytest.mark.parametrize("bad_score", [
+        "unknown",
+        "N/A",
+    ])
+    def test_adjudicator_confidence_is_none_for_non_numeric_score(self, bad_score):
+        """Malformed score yields confidence=None, not a crash."""
+        result = {
+            "approved": True,
+            "intel_status": "OK",
+            "reasoning": "test",
+            "_available": True,
+            "score": bad_score,
+        }
+        verdict = adjudicate(result, signal=_signal(), execution_mode="PAPER")
+        assert verdict.confidence is None
+
+    def test_malformed_score_with_veto_status_still_blocks(self):
+        """A malformed score field must not suppress an authoritative veto.
+
+        If approved=False and intel_status=RISK_VETO, the block is
+        authoritative even when score is unparseable.
+        """
+        result = {
+            "approved": False,
+            "intel_status": "RISK_VETO",
+            "reasoning": "risk veto triggered",
+            "_available": True,
+            "score": "unknown",
+        }
+        verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+        assert verdict.allowed is False
+        assert verdict.reason_code == iap.INTEL_AUTHORITATIVE_VETO_RISK
+        assert verdict.confidence is None  # malformed score → None, not crash
+
+    def test_non_numeric_score_veto_block_meta_is_stable(self):
+        """block_meta must be stable even when score is non-numeric."""
+        result = {
+            "approved": False,
+            "intel_status": "RISK_VETO",
+            "reasoning": "risk veto",
+            "_available": True,
+            "score": "N/A",
+        }
+        verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+        meta = verdict.as_block_meta()
+        assert meta["intel_reason_code"] == iap.INTEL_AUTHORITATIVE_VETO_RISK
+        assert meta["intel_confidence"] is None
+
+
+class TestBlockMetaIncludesExecutionMode:
+    """
+    Amendment: as_block_meta() must export intel_execution_mode so that
+    report_intelligence_funnel can filter by LIVE/PAPER from
+    decision_events.context_json (decision_events has no standalone
+    execution_mode column).
+    """
+
+    def test_block_meta_includes_execution_mode_live(self):
+        result = _bridge_result(approved=False, intel_status="RISK_VETO")
+        verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+        meta = verdict.as_block_meta()
+        assert "intel_execution_mode" in meta
+        assert meta["intel_execution_mode"] == "LIVE"
+
+    def test_block_meta_includes_execution_mode_paper(self):
+        result = _bridge_result(approved=False, intel_status="RISK_VETO")
+        verdict = adjudicate(result, signal=_signal(), execution_mode="paper")
+        meta = verdict.as_block_meta()
+        assert meta["intel_execution_mode"] == "PAPER"
+
+    def test_block_meta_includes_execution_mode_for_approved_result(self):
+        """Approved verdicts also carry execution_mode in block_meta."""
+        result = _bridge_result(approved=True, intel_status="OK")
+        verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+        meta = verdict.as_block_meta()
+        assert meta["intel_execution_mode"] == "LIVE"
+
+    def test_block_meta_execution_mode_empty_string_becomes_none(self):
+        """Empty execution_mode normalises to None, not empty string."""
+        result = _bridge_result(approved=True, intel_status="OK")
+        verdict = adjudicate(result, signal=_signal(), execution_mode="")
+        meta = verdict.as_block_meta()
+        # Empty mode → no intel_execution_mode value (None)
+        assert meta["intel_execution_mode"] is None
+
+    def test_all_stable_veto_codes_carry_execution_mode(self):
+        """Every authoritative veto block_meta must include execution_mode."""
+        for raw_status in ("RISK_VETO", "SKIP"):
+            result = _bridge_result(approved=False, intel_status=raw_status)
+            verdict = adjudicate(result, signal=_signal(), execution_mode="LIVE")
+            meta = verdict.as_block_meta()
+            assert "intel_execution_mode" in meta, (
+                f"Missing intel_execution_mode for {raw_status}"
+            )
+            assert meta["intel_execution_mode"] == "LIVE"
+
+
+
+class TestFunnelReportSurface:
+    """
+    Amendment: report_intelligence_funnel must query decision_events, not
+    orders.  Intel-blocked signals never create an order row; querying
+    orders.meta produces an empty funnel for every blocked candidate.
+
+    DB patching: the function does `from ap.db import conn, run_with_retry`
+    at call time (local import).  We inject a mock ap.db via sys.modules
+    before invoking the function to avoid importing psycopg2.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _mock_ap_db(self, monkeypatch):
+        """Inject a minimal ap.db mock via sys.modules before each test."""
+        import sys
+        import types
+
+        self._captured_sql: list[str] = []
+        self._captured_params: list = []
+
+        captured_sql = self._captured_sql
+        captured_params = self._captured_params
+
+        class _FakeCursor:
+            rowcount = 0
+            def execute(self, sql, params=None):
+                captured_sql.append(sql)
+                captured_params.extend(params or [])
+            def fetchall(self):
+                return []
+
+        class _FakeConn:
+            def __enter__(self):
+                return _FakeCursor()
+            def __exit__(self, *a):
+                pass
+
+        mock_db = types.ModuleType("ap.db")
+        mock_db.conn = lambda: _FakeConn()
+        mock_db.run_with_retry = lambda fn: fn()
+
+        monkeypatch.setitem(sys.modules, "ap.db", mock_db)
+        # Force re-import of the module under test so it picks up the mock
+        import importlib
+        import ap.intelligence_admission_policy as _iap_mod
+        importlib.reload(_iap_mod)
+        yield
+        # Restore original module state after test
+        importlib.reload(_iap_mod)
+
+    def _run_funnel(self, **kw):
+        # Import fresh after the monkeypatch reload
+        from ap.intelligence_admission_policy import report_intelligence_funnel
+        return report_intelligence_funnel(**kw)
+
+    def test_funnel_query_targets_decision_events_not_orders(self):
+        """The SQL emitted must reference decision_events, never orders."""
+        self._run_funnel(session_date="2026-07-19")
+        assert self._captured_sql, "No SQL was executed"
+        sql = self._captured_sql[0].lower()
+        assert "decision_events" in sql, (
+            "Funnel report must query decision_events, not orders"
+        )
+        assert "from orders" not in sql, (
+            "Funnel report must NOT query orders — intel vetoes never reach orders"
+        )
+
+    def test_funnel_query_uses_ts_not_created_at(self):
+        """Timestamp filter must use `ts`, not `created_at` or `created_ts`."""
+        self._run_funnel(session_date="2026-07-19")
+        sql = self._captured_sql[0].lower()
+        assert "date(ts " in sql or "date(ts)" in sql, (
+            "Date filter must use `ts` column (decision_events canonical timestamp)"
+        )
+        assert "created_at" not in sql, "created_at must not appear — use `ts`"
+        assert "created_ts" not in sql, "created_ts belongs to orders, not decision_events"
+
+    def test_funnel_query_filters_blocked_intel_stage(self):
+        """Query must filter stage='blocked_intel' and reason_code LIKE 'INTEL_%'."""
+        self._run_funnel()
+        sql = self._captured_sql[0]
+        params_str = str(self._captured_params)
+        assert "blocked_intel" in sql or "blocked_intel" in params_str, (
+            "Must filter stage='blocked_intel'"
+        )
+        assert "INTEL_%" in sql or "INTEL_%" in params_str, (
+            "Must filter reason_code LIKE 'INTEL_%'"
+        )
+
+    def test_funnel_execution_mode_filter_uses_context_json(self):
+        """execution_mode filter must read context_json->>'intel_execution_mode'.
+
+        decision_events has no standalone execution_mode column; the value
+        is written by as_block_meta() into context_json.
+        """
+        self._run_funnel(execution_mode="LIVE")
+        sql = self._captured_sql[0]
+        assert "intel_execution_mode" in sql, (
+            "execution_mode filter must read context_json->>'intel_execution_mode'"
+        )
+        # Must NOT reference a non-existent standalone execution_mode column
+        assert "COALESCE(execution_mode," not in sql, (
+            "decision_events has no standalone execution_mode column"
+        )
+
+    def test_funnel_returns_dict_with_funnel_key(self):
+        """Return shape must have 'funnel' list and 'filters' dict."""
+        result = self._run_funnel(
+            client_id="jason@example.com",
+            execution_mode="LIVE",
+            session_date="2026-07-19",
+        )
+        assert isinstance(result, dict)
+        assert "funnel" in result
+        assert isinstance(result["funnel"], list)
+        assert "filters" in result
+        assert result["filters"]["client_id"] == "jason@example.com"
+        assert result["filters"]["execution_mode"] == "LIVE"
+        assert result["filters"]["session_date"] == "2026-07-19"

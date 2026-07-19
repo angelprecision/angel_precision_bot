@@ -2579,7 +2579,21 @@ class APMasterControl:
             tier = "C"
 
         intel = self._run_intelligence(signal)
-        intel_score  = float(intel.get("score", 0))
+        # ── Safe numeric parse: must survive any malformed bridge result ──
+        # A result shaped like {"score": "unknown"} or {"contracts": "N/A"}
+        # must NOT raise here and bypass the fail-open adjudicator below.
+        # Default malformed score to 0.0; log diagnostics so operators can
+        # trace the malformed field back to the originating bridge call.
+        _raw_score = intel.get("score")
+        try:
+            intel_score = float(_raw_score) if _raw_score is not None else 0.0
+        except (TypeError, ValueError):
+            log.warning(
+                "[%s] intel 'score' field is non-numeric (%r) — defaulting to 0.0 "
+                "(fail-open adjudicator will classify the full result below)",
+                signal.get("ticker", ""), _raw_score,
+            )
+            intel_score = 0.0
         intel_approve = intel.get("approved", True)   # kept for downstream sizing/metadata
         intel_reason  = intel.get("reasoning", "")
         intel_avail   = intel.get("_available", False)
@@ -2676,7 +2690,21 @@ class APMasterControl:
         except Exception:
             _qm_disabled_result = None
 
-        intel_contracts = int(intel.get("contracts", 1) or 1)
+        # ── Safe numeric parse: intel_contracts ──────────────────────────
+        # Bridge may return {"contracts": "N/A"} on partial/malformed results.
+        # int() raises on non-numeric strings; default to 1 (no intel cap).
+        _raw_contracts = intel.get("contracts")
+        try:
+            intel_contracts = int(_raw_contracts or 1)
+            if intel_contracts < 1:
+                raise ValueError(f"non-positive contracts={intel_contracts!r}")
+        except (TypeError, ValueError):
+            log.warning(
+                "[%s] intel 'contracts' field is non-numeric or invalid (%r) — "
+                "defaulting to 1 (no intel contract cap applied)",
+                signal.get("ticker", ""), _raw_contracts,
+            )
+            intel_contracts = 1
         if bootstrap_mode:
             intel_contracts = 1
 
