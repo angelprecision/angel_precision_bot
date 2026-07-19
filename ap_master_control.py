@@ -2579,30 +2579,12 @@ class APMasterControl:
             tier = "C"
 
         intel = self._run_intelligence(signal)
-        # ── Safe numeric parse: must survive any malformed bridge result ──
-        # A result shaped like {"score": "unknown"} or {"contracts": "N/A"}
-        # must NOT raise here and bypass the fail-open adjudicator below.
-        # Default malformed score to 0.0; log diagnostics so operators can
-        # trace the malformed field back to the originating bridge call.
-        _raw_score = intel.get("score")
-        try:
-            intel_score = float(_raw_score) if _raw_score is not None else 0.0
-        except (TypeError, ValueError):
-            log.warning(
-                "[%s] intel 'score' field is non-numeric (%r) — defaulting to 0.0 "
-                "(fail-open adjudicator will classify the full result below)",
-                signal.get("ticker", ""), _raw_score,
-            )
-            intel_score = 0.0
-        intel_approve = intel.get("approved", True)   # kept for downstream sizing/metadata
-        intel_reason  = intel.get("reasoning", "")
-        intel_avail   = intel.get("_available", False)
 
-        # ── Canonical intelligence admission gate ─────────────────────────
-        # ap_master_control must not independently interpret approved,
-        # intel_status, or free-text reasoning.  adjudicate_intelligence_result
-        # is the single authority: only INTEL_AUTHORITATIVE_VETO_* codes block.
-        # Infrastructure failure, missing data, and unknown statuses fail open.
+        # ── Canonical admission gate — MUST run before any raw field access ──
+        # adjudicate_intelligence_result() handles every failure mode:
+        #   None, non-dict, missing fields, unknown status, infrastructure
+        #   errors → fail open.  Raw .get() calls BELOW this block would crash
+        #   on intel=None or intel=[] before any policy can classify them.
         from ap.intelligence_admission_policy import (  # late import — module-load safe
             adjudicate_intelligence_result as _adjudicate_intel,
         )
@@ -2619,6 +2601,27 @@ class APMasterControl:
                 _intel_verdict.reason_code,
                 meta=_intel_verdict.as_block_meta(),
             )
+
+        # ── Normalize intel for downstream field access ───────────────────
+        # intel may be None or a non-dict (e.g. string, list) if the bridge
+        # returned a malformed value that failed open above.  All downstream
+        # code uses intel_raw so that .get() is always safe.
+        intel_raw = intel if isinstance(intel, dict) else {}
+
+        # Safe numeric parse: intel_score
+        # A result shaped like {"score": "unknown"} must not raise.
+        _raw_score = intel_raw.get("score")
+        try:
+            intel_score = float(_raw_score) if _raw_score is not None else 0.0
+        except (TypeError, ValueError):
+            log.warning(
+                "[%s] intel 'score' field is non-numeric (%r) — defaulting to 0.0",
+                signal.get("ticker", ""), _raw_score,
+            )
+            intel_score = 0.0
+        intel_approve = intel_raw.get("approved", True)   # kept for downstream sizing/metadata
+        intel_reason  = str(intel_raw.get("reasoning") or "")
+        intel_avail   = bool(intel_raw.get("_available", False))
 
         # ── PR-72: Quality Mode gate ──────────────────────────────────────
         # Runs AFTER score-floor and intel gate so we operate on the final
@@ -2640,7 +2643,7 @@ class APMasterControl:
             _qm_verdict = _qm_mod.check(
                 signal=signal,
                 client_id=client_id,
-                intel_status=intel.get("intel_status"),
+                intel_status=intel_raw.get("intel_status"),
                 daily_trades_today=int(_snap_for_qm.get("trades_today", 0) or 0),
                 open_positions=int(
                     (_snap_for_qm.get("open_count") or 0)
@@ -2693,7 +2696,8 @@ class APMasterControl:
         # ── Safe numeric parse: intel_contracts ──────────────────────────
         # Bridge may return {"contracts": "N/A"} on partial/malformed results.
         # int() raises on non-numeric strings; default to 1 (no intel cap).
-        _raw_contracts = intel.get("contracts")
+        # Uses intel_raw (normalized above) so intel=None cannot crash here.
+        _raw_contracts = intel_raw.get("contracts")
         try:
             intel_contracts = int(_raw_contracts or 1)
             if intel_contracts < 1:
@@ -3630,7 +3634,7 @@ class APMasterControl:
                     reason_code="REMAINING_OPPORTUNITY_TOO_SMALL",
                 )
 
-        risk_detail = (signal.get("risk_detail") or intel.get("risk_detail") or {})
+        risk_detail = (signal.get("risk_detail") or intel_raw.get("risk_detail") or {})
         if (
             risk_detail.get("contract_quality_passes") is False
             or _truthy(signal.get("contract_quality_failed"))
@@ -3654,7 +3658,7 @@ class APMasterControl:
             # intel unavailability is then only OBSERVED (logged + recorded
             # in plan.metadata) and does not block the entry.
             intel_required = _env_true("FINAL_ENTRY_INTELLIGENCE_REQUIRED", True)
-            if not bool(intel.get("_available")):
+            if not bool(intel_raw.get("_available")):
                 if intel_required:
                     self._store_update(signal_id, "rejected", "entry_intelligence_missing")
                     return self._block(
@@ -3680,7 +3684,7 @@ class APMasterControl:
                 }
             else:
                 try:
-                    intel_score = float(intel.get("intel_score", intel.get("score", 0)) or 0)
+                    intel_score = float(intel_raw.get("intel_score", intel_raw.get("score", 0)) or 0)
                 except Exception:
                     intel_score = 0.0
                 intel_min_score = float(

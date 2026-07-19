@@ -896,3 +896,62 @@ class TestFunnelReportSurface:
         assert result["filters"]["client_id"] == "jason@example.com"
         assert result["filters"]["execution_mode"] == "LIVE"
         assert result["filters"]["session_date"] == "2026-07-19"
+
+
+class TestNonDictIntelFailOpen:
+    """
+    Final gap: adjudicate_intelligence_result() must be called BEFORE any
+    .get() access on the raw intel value.  intel=None, intel="bad", intel=[]
+    all previously crashed at intel.get("score") before the adjudicator ran.
+
+    This class tests the adjudicator directly for non-dict inputs (which is
+    the contract ap_master_control.py now relies on).
+    """
+
+    @pytest.mark.parametrize("non_dict_intel", [
+        None,
+        "bad-result",
+        42,
+        [],
+        (),
+        object(),
+    ])
+    def test_non_dict_result_fails_open(self, non_dict_intel):
+        """adjudicate_intelligence_result must not raise for any non-dict input."""
+        verdict = adjudicate(non_dict_intel, signal=_signal(), execution_mode="LIVE")
+        assert verdict.allowed is True, (
+            f"Non-dict intel={non_dict_intel!r} must fail open, got allowed=False"
+        )
+        assert verdict.reason_code == iap.INTEL_MALFORMED_FAIL_OPEN
+
+    @pytest.mark.parametrize("non_dict_intel", [None, "bad", 0, []])
+    def test_non_dict_result_is_not_authoritative(self, non_dict_intel):
+        """Non-dict result must never produce an authoritative verdict."""
+        verdict = adjudicate(non_dict_intel, signal=_signal(), execution_mode="PAPER")
+        assert verdict.authoritative is False
+
+    def test_none_result_block_meta_is_stable(self):
+        """as_block_meta() must be callable even when intel was None."""
+        verdict = adjudicate(None, signal=_signal(), execution_mode="LIVE")
+        meta = verdict.as_block_meta()
+        assert meta["intel_reason_code"] == iap.INTEL_MALFORMED_FAIL_OPEN
+        assert meta["intel_authoritative"] is False
+        assert meta["intel_execution_mode"] == "LIVE"
+
+    def test_string_result_is_malformed_fail_open(self):
+        """A string result (e.g. error message) must fail open."""
+        verdict = adjudicate("error: timeout", signal=_signal(), execution_mode="LIVE")
+        assert verdict.allowed is True
+        assert verdict.reason_code == iap.INTEL_MALFORMED_FAIL_OPEN
+
+    def test_none_result_cannot_block_even_in_authoritative_mode(self, monkeypatch):
+        """intel=None must never produce allowed=False regardless of mode."""
+        monkeypatch.delenv("INTELLIGENCE_ADMISSION_MODE", raising=False)
+        verdict = adjudicate(None, signal=_signal(), execution_mode="LIVE")
+        assert verdict.allowed is True
+
+    def test_non_dict_observe_only_mode_also_fails_open(self, monkeypatch):
+        """observe_only mode must not crash on non-dict input."""
+        monkeypatch.setenv("INTELLIGENCE_ADMISSION_MODE", "observe_only")
+        verdict = adjudicate(None, signal=_signal(), execution_mode="LIVE")
+        assert verdict.allowed is True
