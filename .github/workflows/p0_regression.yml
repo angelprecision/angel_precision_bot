@@ -123,6 +123,7 @@ jobs:
             tests/test_p0_schema_attestation_and_migration_runner.py \
             tests/test_p0_position_execution_mode_schema.py \
             tests/test_p0_live_startup_preflight.py \
+            tests/test_p0_critical_money_fence_alerting.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes
