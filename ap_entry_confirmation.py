@@ -495,6 +495,7 @@ def check_entry_confirmation(
     live_quote_age_ms: Optional[float],  # ms since quote was fetched
     underlying_last: Optional[float],    # current underlying price
     decision_option_price: Optional[float],  # option price at signal decision time
+    underlying_quote_age_ms: Optional[float] = None,  # ms since underlying quote was fetched
     score: Optional[float] = None,
     tier: Optional[str]   = None,
     timeframe: Optional[str] = None,
@@ -548,6 +549,12 @@ def check_entry_confirmation(
     )
     quote_age_ms = _finite_float(live_quote_age_ms)
     quote_age_s = quote_age_ms / 1000.0 if quote_age_ms is not None else None
+    underlying_quote_age = _finite_float(underlying_quote_age_ms)
+    underlying_quote_age_s = (
+        underlying_quote_age / 1000.0
+        if underlying_quote_age is not None else None
+    )
+    effective_max_age = min(confirm_s, max_quote_age_s)
 
     base = {
         "confirmation_required":      bool(confirmation_required),
@@ -571,6 +578,14 @@ def check_entry_confirmation(
         "underlying_move_pct":        None,
         "quote_age_ms":               live_quote_age_ms,
         "quote_age_seconds":          round(quote_age_s, 2) if quote_age_s is not None else None,
+        "max_age_seconds":            effective_max_age,
+        "underlying_quote_age_ms":    underlying_quote_age_ms,
+        "underlying_quote_age_seconds": (
+            round(underlying_quote_age_s, 2)
+            if underlying_quote_age_s is not None else None
+        ),
+        "underlying_quote_max_age_seconds": effective_max_age,
+        "underlying_quote_age_status": None,
         "spread_pct":                 round(spread_pct, 4) if spread_pct is not None else None,
         "live_entry_bid":             live_bid,
         "live_entry_ask":             live_ask,
@@ -624,7 +639,6 @@ def check_entry_confirmation(
 
     # ── 2. Quote age ──────────────────────────────────────────────────────
     # Use the stricter of confirm_s and CLIENT_PROOF_QUOTE_MAX_AGE_SECONDS
-    effective_max_age = min(confirm_s, max_quote_age_s)
     if _is_missing(live_quote_age_ms):
         return _fail(
             "entry_confirm_failed_missing_quote_age",
@@ -701,6 +715,27 @@ def check_entry_confirmation(
             if _is_missing(underlying_last)
             else "entry_confirm_failed_invalid_underlying",
             {**base, "underlying_status": "missing" if _is_missing(underlying_last) else "invalid"},
+        )
+    if require_complete_live_evidence and _is_missing(underlying_quote_age_ms):
+        return _fail(
+            "entry_confirm_failed_missing_underlying_quote_age",
+            {**base, "underlying_quote_age_status": "missing"},
+        )
+    if require_complete_live_evidence and (
+        underlying_quote_age_s is None or underlying_quote_age_s < 0
+    ):
+        return _fail(
+            "entry_confirm_failed_invalid_underlying_quote_age",
+            {**base, "underlying_quote_age_status": "invalid"},
+        )
+    if require_complete_live_evidence and underlying_quote_age_s > effective_max_age:
+        return _fail(
+            "entry_confirm_failed_stale_underlying_quote",
+            {
+                **base,
+                "underlying_quote_age_seconds": round(underlying_quote_age_s, 2),
+                "underlying_quote_age_status": "stale",
+            },
         )
     if (
         current_underlying is not None

@@ -5699,10 +5699,12 @@ class APExecutionCore:
                 or getattr(self.broker, "sandbox", False)
             )
             _underlying_last = None
+            _underlying_quote_age_ms = None
             try:
                 # Re-use the latest watcher underlying quote if available
                 _ul_ask = getattr(watched, "last_quote_ask", None)
                 _ul_bid = getattr(watched, "last_quote_bid", None)
+                _underlying_quote_age_ms = getattr(watched, "last_quote_age_ms", None)
                 if _ul_ask and _ul_bid and _ul_ask > 0 and _ul_bid > 0:
                     _underlying_last = (_ul_ask + _ul_bid) / 2
                 elif _ul_ask and _ul_ask > 0:
@@ -5718,6 +5720,7 @@ class APExecutionCore:
                 live_ask         = _submit_quote_fields.get("submit_ask"),
                 live_quote_age_ms= _quote_age_ms if "_quote_age_ms" in dir() else None,
                 underlying_last  = _underlying_last,
+                underlying_quote_age_ms = _underlying_quote_age_ms,
                 decision_option_price = float(_plan_limit or 0) or None,  # use saved pre-overwrite decision price
                 score     = float(_sig_for_confirm.get("score") or 0) or None,
                 tier      = str(getattr(approved_plan, "tier", "") or ""),

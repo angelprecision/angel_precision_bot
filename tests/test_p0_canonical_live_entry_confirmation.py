@@ -89,6 +89,7 @@ def _confirm(**overrides):
         live_ask=1.02,
         live_quote_age_ms=1000,
         underlying_last=100.5,
+        underlying_quote_age_ms=1000,
         decision_option_price=1.01,
         score=78.0,
         tier="A",
@@ -107,6 +108,8 @@ def test_valid_required_live_evidence_passes_with_diagnostics():
     assert result.metadata["confirmation_requirement_source"] == "live_default_plus_explicit"
     assert result.metadata["confirmation_execution_mode"] == "live"
     assert result.metadata["live_entry_bid"] == 1.0
+    assert result.metadata["underlying_quote_age_seconds"] == 1.0
+    assert result.metadata["underlying_quote_max_age_seconds"] == 10.0
 
 
 @pytest.mark.parametrize(
@@ -127,6 +130,11 @@ def test_valid_required_live_evidence_passes_with_diagnostics():
         ({"live_quote_age_ms": -1}, "entry_confirm_failed_invalid_quote_age"),
         ({"live_quote_age_ms": math.inf}, "entry_confirm_failed_invalid_quote_age"),
         ({"live_quote_age_ms": 11_000}, "entry_confirm_failed_stale_quote"),
+        ({"underlying_quote_age_ms": None}, "entry_confirm_failed_missing_underlying_quote_age"),
+        ({"underlying_quote_age_ms": "bad"}, "entry_confirm_failed_invalid_underlying_quote_age"),
+        ({"underlying_quote_age_ms": -1}, "entry_confirm_failed_invalid_underlying_quote_age"),
+        ({"underlying_quote_age_ms": math.inf}, "entry_confirm_failed_invalid_underlying_quote_age"),
+        ({"underlying_quote_age_ms": 11_000}, "entry_confirm_failed_stale_underlying_quote"),
         ({"live_bid": 0.8, "live_ask": 1.2}, "entry_confirm_failed_spread"),
         ({"live_bid": 0.89, "live_ask": 0.91}, "entry_confirm_failed_option_fade"),
         ({"underlying_last": 99.0}, "entry_confirm_failed_underlying_reversal"),
@@ -159,9 +167,19 @@ def test_paper_without_request_keeps_fast_path():
         plan=_plan({}), execution_mode="paper", live_default_required=True,
         live_bid=None, live_ask=None, live_quote_age_ms=None,
         decision_option_price=None, trigger_price=None, underlying_last=None,
+        underlying_quote_age_ms=None,
     )
     assert result.passed is True
     assert result.metadata["confirmation_required"] is False
+
+
+def test_underlying_age_cannot_borrow_option_quote_age():
+    result = _confirm(live_quote_age_ms=1000, underlying_quote_age_ms=15_000)
+    assert result.passed is False
+    assert result.fail_reason == "entry_confirm_failed_stale_underlying_quote"
+    assert result.metadata["quote_age_seconds"] == 1.0
+    assert result.metadata["underlying_quote_age_seconds"] == 15.0
+    assert result.metadata["underlying_quote_age_status"] == "stale"
 
 
 def _underlying_plan(*, side="CALL", required=True):
@@ -233,6 +251,8 @@ def _production_result(monkeypatch, **kwargs):
         ({"underlying_last": 99.0}, "entry_confirm_failed_underlying_reversal"),
         ({"plan_side": "PUT", "underlying_last": 101.0}, "entry_confirm_failed_underlying_reversal"),
         ({"quote_age_ms": None}, "entry_confirm_failed_missing_quote_age"),
+        ({"underlying_quote_age_ms": None}, "entry_confirm_failed_missing_underlying_quote_age"),
+        ({"underlying_quote_age_ms": 11_000}, "entry_confirm_failed_stale_underlying_quote"),
     ],
 )
 def test_real_live_entry_trigger_blocks_before_submit(monkeypatch, kwargs, reason):

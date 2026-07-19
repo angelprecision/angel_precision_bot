@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,7 @@ def _run_entry_trigger(
     confirmation_required: bool = False,
     candles=None,
     underlying_last: float = 100.80,
+    underlying_quote_age_ms: float | None = 0,
     execution_mode: str = "paper",
     quote_age_ms: float | None = 5,
     submit_bid: float | None = 1.00,
@@ -196,6 +198,7 @@ def _run_entry_trigger(
     watched.trigger_price = 100.0
     watched.last_quote_bid = underlying_last
     watched.last_quote_ask = underlying_last
+    watched.last_quote_age_ms = underlying_quote_age_ms
 
     core_mod.APExecutionCore._on_entry_trigger(core, watched)
     return {
@@ -302,3 +305,88 @@ def test_confirmation_exception_fails_closed_even_when_confirmation_not_required
     )
     assert len(_blocked_calls(result["store"])) == 1
     assert result["ledger_events"], "ENTRY_CONFIRMATION_FAILED should be recorded"
+
+
+def test_fresh_option_and_fresh_underlying_reaches_submit(monkeypatch):
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="live",
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        underlying_quote_age_ms=1000,
+    )
+
+    result["osm"].submit_existing_entry.assert_called_once()
+    meta = _capture_entry_confirmation_patch(result["osm"])
+    assert meta["quote_age_seconds"] == 1.0
+    assert meta["underlying_quote_age_seconds"] == 1.0
+
+
+def test_missing_underlying_age_blocks_before_submit(monkeypatch):
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="live",
+        plan_metadata={"confirmation_required": True},
+        underlying_quote_age_ms=None,
+    )
+
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_failed_missing_underlying_quote_age",
+    )
+
+
+def test_stale_underlying_age_blocks_before_submit(monkeypatch):
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="live",
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        underlying_quote_age_ms=11_000,
+    )
+
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_failed_stale_underlying_quote",
+    )
+    meta = _capture_entry_confirmation_patch(result["osm"])
+    assert meta["quote_age_seconds"] == 1.0
+    assert meta["underlying_quote_age_seconds"] == 11.0
+
+
+def test_invalid_underlying_age_blocks_before_submit(monkeypatch):
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="live",
+        plan_metadata={"confirmation_required": True},
+        underlying_quote_age_ms=math.inf,
+    )
+
+    result["osm"].submit_existing_entry.assert_not_called()
+    result["osm"].expire_pending_entry.assert_called_once_with(
+        "local-1",
+        reason="entry_confirm_failed_invalid_underlying_quote_age",
+    )
+
+
+def test_stale_underlying_cannot_borrow_option_quote_age(monkeypatch):
+    result = _run_entry_trigger(
+        monkeypatch,
+        mode="off",
+        execution_mode="live",
+        plan_metadata={"confirmation_required": True},
+        quote_age_ms=1000,
+        underlying_quote_age_ms=20_000,
+    )
+
+    result["osm"].submit_existing_entry.assert_not_called()
+    meta = _capture_entry_confirmation_patch(result["osm"])
+    assert meta["quote_age_seconds"] == 1.0
+    assert meta["underlying_quote_age_seconds"] == 20.0
+    assert meta["underlying_quote_age_status"] == "stale"
