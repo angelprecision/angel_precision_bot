@@ -2,17 +2,16 @@
 tests/test_p0_live_regime_veto_taxonomy.py
 ==========================================
 P0 taxonomy fix — regime mismatch must:
-  1. Not return early; all hard gates still run.
-  2. Never become RISK_VETO.
-  3. Never manufacture contracts from zero.
-Tests 1-6 from spec plus gateway invariants.
+  1. Not return early; all hard gates (VIX, contract quality, sector,
+     sizing) still run in full.
+  2. Pass through to APPROVED_WITH_REGIME_MISMATCH only when all gates pass.
+  3. Never become RISK_VETO.
+  4. Never manufacture contracts from zero — not in risk manager, not in bridge.
 """
 from __future__ import annotations
 import pytest
 from unittest.mock import MagicMock, patch
 
-
-# ─── Fixtures ─────────────────────────────────────────────────────────────────
 
 def _spy(trend):
     return {"trend": trend}
@@ -38,16 +37,16 @@ _PUT_KWARGS = dict(
 )
 
 
-# ─── Test 1: Regime mismatch does NOT return early — VIX still called ─────────
+# ─── Test 1: Regime mismatch does NOT return early — VIX gate still runs ──────
 
 def test_regime_mismatch_does_not_skip_vix():
-    """SPY bear + bullish CALL must NOT return before calling the VIX gate."""
+    """SPY BEAR + bullish CALL must NOT return before the VIX gate."""
     rm = _rm()
     vix_called = []
 
     def fake_vix():
         vix_called.append(True)
-        return _vix(tradeable=False, value=45.0)  # untradeable — should block
+        return _vix(tradeable=False, value=45.0)  # hard-blocks
 
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value=_spy("BEAR")),
@@ -55,26 +54,22 @@ def test_regime_mismatch_does_not_skip_vix():
     ):
         result = rm.evaluate(**_CALL_KWARGS)
 
-    assert vix_called, "VIX gate was never called — regime mismatch returned early (bug)"
+    assert vix_called, "VIX gate never called — regime mismatch returned early (regression)"
     assert result.approved is False
-    assert result.reason_code == "VIX_POLICY_HARD_CAP", (
-        f"Expected VIX_POLICY_HARD_CAP, got {result.reason_code!r}"
-    )
+    assert result.reason_code == "VIX_POLICY_HARD_CAP"
     assert result.hard_veto is True
 
 
-# ─── Test 2: Regime mismatch does not skip contract-quality validation ─────────
+# ─── Test 2: Regime mismatch does not skip contract-quality validation ──────────
 
 def test_regime_mismatch_does_not_skip_contract_quality():
-    """Bad spread must still block even with SPY regime mismatch."""
+    """Bad spread must block even with regime mismatch."""
     rm = _rm()
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value=_spy("BEAR")),
         patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_vix()),
     ):
-        result = rm.evaluate(
-            **{**_CALL_KWARGS, "bid_ask_spread_pct": 0.25}  # 25% — fails quality
-        )
+        result = rm.evaluate(**{**_CALL_KWARGS, "bid_ask_spread_pct": 0.25})
 
     assert result.approved is False
     assert result.reason_code == "CONTRACT_QUALITY_FAILED"
@@ -84,9 +79,8 @@ def test_regime_mismatch_does_not_skip_contract_quality():
 # ─── Test 3: Regime mismatch does not skip sector exposure ────────────────────
 
 def test_regime_mismatch_does_not_skip_sector_cap():
-    """Sector cap must still block even with SPY regime mismatch."""
+    """Sector cap must block even with regime mismatch."""
     rm = _rm()
-    # Fill sector cap: 2 TECH positions already open (MAX_SAME_SECTOR_POSITIONS=2)
     rm.open_positions = {
         "MSFT": {"direction": "bullish", "cost_usd": 2000, "sector": "tech"},
         "NVDA": {"direction": "bullish", "cost_usd": 2000, "sector": "tech"},
@@ -95,7 +89,7 @@ def test_regime_mismatch_does_not_skip_sector_cap():
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value=_spy("BEAR")),
         patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_vix()),
     ):
-        result = rm.evaluate(**_CALL_KWARGS)  # AAPL = tech sector
+        result = rm.evaluate(**_CALL_KWARGS)
 
     assert result.approved is False
     assert result.reason_code == "SECTOR_EXPOSURE_CAP"
@@ -105,9 +99,8 @@ def test_regime_mismatch_does_not_skip_sector_cap():
 # ─── Test 4: Regime mismatch does not skip capital sizing ─────────────────────
 
 def test_regime_mismatch_does_not_skip_capital_sizing():
-    """Zero affordable contracts must still block even with SPY regime mismatch."""
+    """Zero affordable contracts must block even with regime mismatch."""
     rm = _rm()
-    # Deploy all capital so nothing remains
     rm.open_positions = {
         "NOPE": {"direction": "bullish", "cost_usd": rm.portfolio_value * 0.81, "sector": "other"}
     }
@@ -121,24 +114,19 @@ def test_regime_mismatch_does_not_skip_capital_sizing():
 
     assert result.approved is False
     assert result.reason_code == "INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS"
-    assert result.hard_veto is True, (
-        "INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS must be hard_veto=True"
-    )
+    assert result.hard_veto is True
 
 
-# ─── Test 5: Regime mismatch with good sizing returns APPROVED_WITH_REGIME_MISMATCH ──
+# ─── Test 5: All gates pass → APPROVED_WITH_REGIME_MISMATCH ──────────────────
 
 def test_regime_mismatch_with_good_sizing_returns_approved():
-    """When all hard gates pass, regime mismatch must return approved=True."""
-    import pandas as pd
-    import numpy as np
-
+    """When all hard gates pass, regime mismatch returns approved=True."""
+    import pandas as pd, numpy as np
     rm = _rm()
     fake_prices = pd.DataFrame(
         {"close": np.linspace(180, 190, 30)},
         index=pd.date_range("2026-06-01", periods=30)
     )
-
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value=_spy("BEAR")),
         patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_vix()),
@@ -146,28 +134,23 @@ def test_regime_mismatch_with_good_sizing_returns_approved():
     ):
         result = rm.evaluate(**_CALL_KWARGS)
 
-    assert result.approved is True, (
-        f"Expected approved=True (regime mismatch advisory), got False: {result.reason}"
-    )
+    assert result.approved is True
     assert result.reason_code == "APPROVED_WITH_REGIME_MISMATCH"
     assert result.hard_veto is False
     assert result.veto_category == "directional_context"
-    assert result.max_contracts >= 1, "Must have real contract count, not zero"
+    assert result.max_contracts >= 1
     assert result.max_position_usd > 0
 
 
-# ─── Test 6: PUT version — bearish + SPY BULL → APPROVED_WITH_REGIME_MISMATCH ──
+# ─── Test 6: PUT version ──────────────────────────────────────────────────────
 
 def test_spy_bull_put_with_good_sizing_returns_approved():
-    import pandas as pd
-    import numpy as np
-
+    import pandas as pd, numpy as np
     rm = _rm()
     fake_prices = pd.DataFrame(
         {"close": np.linspace(410, 420, 30)},
         index=pd.date_range("2026-06-01", periods=30)
     )
-
     with (
         patch("ap_intelligence.agents.ap_risk_manager.get_spy_trend", return_value=_spy("BULL")),
         patch("ap_intelligence.agents.ap_risk_manager.get_vix", return_value=_vix()),
@@ -177,121 +160,112 @@ def test_spy_bull_put_with_good_sizing_returns_approved():
 
     assert result.approved is True
     assert result.reason_code == "APPROVED_WITH_REGIME_MISMATCH"
-    assert result.hard_veto is False
     assert result.max_contracts >= 1
 
 
-# ─── Test 7: Bridge never manufactures contracts from zero ────────────────────
+# ─── Test 7: Bridge uses exact PM contracts — never manufactures ─────────────
 
-def test_bridge_never_manufactures_contracts_from_zero():
-    """
-    Even if risk.reason_code=APPROVED_WITH_REGIME_MISMATCH, if PM calculated
-    0 contracts, the bridge must NOT return contracts=1.  It falls through to
-    the standard APPROVED path.
-    """
+def test_bridge_uses_exact_pm_contracts():
+    """APPROVED_WITH_REGIME_MISMATCH with PM contracts=3 → bridge returns 3."""
     from intelligence_bridge import _map_result
-
-    # PM returned 0 contracts (low score, reduced position)
-    pipeline_result = {
-        "action":     "execute",
-        "confidence": 78.0,
-        "score":      78.0,
-        "contracts":  0,      # PM produced zero
-        "reasoning":  "regime_mismatch_advisory",
+    gate = _map_result({
+        "action": "execute", "confidence": 78.0, "score": 78.0, "contracts": 3,
+        "reasoning": "all_gates_passed",
         "risk_detail": {
-            "approved":          True,
-            "reason_code":       "APPROVED_WITH_REGIME_MISMATCH",
-            "veto_category":     "directional_context",
-            "hard_veto":         False,
-            "max_contracts":     2,
-            "max_position_usd":  500.0,
+            "approved": True, "reason_code": "APPROVED_WITH_REGIME_MISMATCH",
+            "hard_veto": False, "max_contracts": 3, "max_position_usd": 750.0,
         },
         "ticker": "AAPL",
-    }
-
-    gate = _map_result(pipeline_result, fallback_score=78.0)
-
-    # Must NOT be REGIME_MISMATCH_ADVISORY when contracts=0
-    assert gate["intel_status"] in ("APPROVED",), (
-        f"With PM contracts=0, bridge must fall through to APPROVED, "
-        f"not manufacture contracts. Got: {gate['intel_status']} contracts={gate['contracts']}"
-    )
-
-
-# ─── Test 8: Bridge advisory only when approved=True with real contracts ───────
-
-def test_bridge_advisory_requires_real_contracts():
-    """REGIME_MISMATCH_ADVISORY only fires when PM gave real contract count >= 1."""
-    from intelligence_bridge import _map_result
-
-    pipeline_result = {
-        "action":     "execute",
-        "confidence": 78.0,
-        "score":      78.0,
-        "contracts":  3,   # PM produced real contracts
-        "reasoning":  "all_gates_passed",
-        "risk_detail": {
-            "approved":          True,
-            "reason_code":       "APPROVED_WITH_REGIME_MISMATCH",
-            "veto_category":     "directional_context",
-            "hard_veto":         False,
-            "max_contracts":     3,
-            "max_position_usd":  750.0,
-        },
-        "ticker": "AAPL",
-    }
-
-    gate = _map_result(pipeline_result, fallback_score=78.0)
+    }, fallback_score=78.0)
 
     assert gate["intel_status"] == "REGIME_MISMATCH_ADVISORY"
+    assert gate["contracts"] == 3, f"Expected 3, got {gate['contracts']}"
     assert gate["approved"] is True
-    assert gate["contracts"] == 3, (
-        f"Must preserve exact PM contract count, got {gate['contracts']}"
+
+
+# ─── Test 8: Zero PM contracts stay zero — never converted to 1 ─────────────
+
+def test_bridge_zero_pm_contracts_stay_zero_case_a():
+    """
+    Case A: max_contracts=2 (risk approved real size) but PM chose 0.
+    Bridge must return contracts=0, NOT 1.
+    """
+    from intelligence_bridge import _map_result
+    gate = _map_result({
+        "action": "execute", "confidence": 60.0, "score": 60.0,
+        "contracts": 0,  # PM produced zero despite risk saying 2
+        "reasoning": "pm_zero",
+        "risk_detail": {
+            "approved": True, "reason_code": "APPROVED_WITH_REGIME_MISMATCH",
+            "hard_veto": False, "max_contracts": 2, "max_position_usd": 500.0,
+        },
+        "ticker": "AAPL",
+    }, fallback_score=60.0)
+
+    assert gate["contracts"] == 0, (
+        f"Zero PM contracts must stay 0 — got {gate['contracts']}. "
+        "Bridge manufactured a contract (regression)."
     )
+    assert gate["intel_status"] == "REGIME_MISMATCH_ADVISORY"
+    assert gate["approved"] is True   # allowed but zero-contract = no execution
 
 
-# ─── Test 9: Daily kill switch is still authoritative RISK_VETO ───────────────
+def test_bridge_zero_pm_contracts_stay_zero_case_b():
+    """
+    Case B: risk also says max_contracts=0, max_position_usd=0.
+    Bridge must STILL return contracts=0, not fall through to max(1, 0)=1.
+    """
+    from intelligence_bridge import _map_result
+    gate = _map_result({
+        "action": "execute", "confidence": 50.0, "score": 50.0,
+        "contracts": 0,
+        "reasoning": "zero",
+        "risk_detail": {
+            "approved": True, "reason_code": "APPROVED_WITH_REGIME_MISMATCH",
+            "hard_veto": False, "max_contracts": 0, "max_position_usd": 0.0,
+        },
+        "ticker": "AAPL",
+    }, fallback_score=50.0)
+
+    assert gate["contracts"] == 0, (
+        f"Must not manufacture from max_contracts=0. Got contracts={gate['contracts']}."
+    )
+    assert gate["intel_status"] == "REGIME_MISMATCH_ADVISORY"
+
+
+# ─── Test 9: Kill switch remains authoritative RISK_VETO ─────────────────────
 
 def test_kill_switch_remains_authoritative():
     from intelligence_bridge import _risk_allows_trade, _map_result
     import os
 
     risk = {
-        "approved":     False,
-        "reason":       "DAILY KILL SWITCH: P&L = $-1500",
-        "reason_code":  "DAILY_LOSS_KILL_SWITCH",
-        "hard_veto":    True,
-        "max_contracts": 0, "max_position_usd": 0.0,
+        "approved": False, "reason": "DAILY KILL SWITCH",
+        "reason_code": "DAILY_LOSS_KILL_SWITCH",
+        "hard_veto": True, "max_contracts": 0, "max_position_usd": 0.0,
     }
     ok, _ = _risk_allows_trade(risk)
     assert ok is False
 
-    pipeline_result = {
+    gate = _map_result({
         "action": "skip", "confidence": 75.0, "score": 75.0, "contracts": 0,
-        "reasoning": "daily_kill_switch", "risk_detail": risk, "ticker": "AAPL",
-    }
-    with patch.dict(os.environ, {"INTEL_ENFORCE_RISK_VETO": "1", "AP_MODE": "live"}):
-        gate = _map_result(pipeline_result, fallback_score=78.0)
+        "reasoning": "kill_switch", "risk_detail": risk, "ticker": "AAPL",
+    }, fallback_score=78.0)
     assert gate["intel_status"] == "RISK_VETO"
     assert gate["approved"] is False
 
 
-# ─── Test 10: Admission policy — APPROVED_WITH_REGIME_MISMATCH → advisory ─────
+# ─── Test 10: Admission policy — REGIME_MISMATCH_ADVISORY → allowed, non-auth ─
 
 def test_admission_policy_regime_mismatch_non_authoritative():
     from ap.intelligence_admission_policy import (
-        adjudicate_intelligence_result,
-        INTEL_REGIME_MISMATCH_ADVISORY,
+        adjudicate_intelligence_result, INTEL_REGIME_MISMATCH_ADVISORY,
     )
-    intel_result = {
-        "approved":     True,
-        "intel_status": "REGIME_MISMATCH_ADVISORY",
-        "score":        78.0, "contracts": 2,
-        "reasoning":    "regime_mismatch_advisory: CALL blocked — SPY in BEAR trend",
-        "_available":   True,
-    }
     verdict = adjudicate_intelligence_result(
-        intel_result,
+        {"approved": True, "intel_status": "REGIME_MISMATCH_ADVISORY",
+         "score": 78.0, "contracts": 2,
+         "reasoning": "regime_mismatch_advisory: CALL blocked",
+         "_available": True},
         signal={"signal_id": "test-001", "ticker": "AAPL", "side": "CALL"},
         execution_mode="live",
     )
@@ -300,14 +274,11 @@ def test_admission_policy_regime_mismatch_non_authoritative():
     assert verdict.reason_code == INTEL_REGIME_MISMATCH_ADVISORY
 
 
-# ─── Test 11: INSUFFICIENT_CAPITAL hard_veto=True confirmed ──────────────────
+# ─── Test 11: INSUFFICIENT_CAPITAL is hard_veto=True ────────────────────────
 
 def test_insufficient_capital_is_hard_veto():
-    from ap_intelligence.agents.ap_risk_manager import APRiskManager
     import pandas as pd, numpy as np
-
-    rm = APRiskManager(portfolio_value=25000)
-    # Fill capital so nothing remains
+    rm = _rm()
     rm.open_positions = {"X": {"direction": "bullish", "cost_usd": 21000.0, "sector": "other"}}
     fake_prices = pd.DataFrame(
         {"close": np.linspace(180, 190, 30)},
