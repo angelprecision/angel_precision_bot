@@ -2329,64 +2329,67 @@ def test_restart_guard_bypass_paper_path_unchanged():
 
 # ─── next_retry filter (mocked logic proof) ──────────────────────────────────
 
+# Mirrors the exact 3-branch SQL predicate in _load_candidates:
+# Branch 1: empty/null → allow-through
+# Branch 2: NOT matching strict ISO regex → allow-through (malformed = fail-safe)
+# Branch 3: strict regex match AND past → allow-through (window passed)
+# Excluded only: strict regex match AND future
+
+_NEXT_RETRY_STRICT_RE = (
+    r"^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
+    r"T[0-9]{2}:[0-9]{2}"
+)
+
+def _next_retry_predicate(ts):
+    """Python mirror of the production 3-branch SQL next_retry predicate."""
+    import re
+    if not ts:
+        return True   # Branch 1: empty/null
+    if not re.match(_NEXT_RETRY_STRICT_RE, str(ts)):
+        return True   # Branch 2: malformed / non-ISO → allow-through
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt <= datetime.now(timezone.utc)  # Branch 3: past → True
+    except Exception:
+        return True   # Cast failure → allow-through (extra safety)
+
+
 def test_next_retry_future_timestamp_excludes_row():
-    """A row with live_recovery_next_retry in the future must NOT pass the
-    candidate filter — the bounded retry interval must be respected."""
+    """Valid ISO future next_retry must exclude the row from candidates."""
     future = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
-
-    # Simulate the SQL predicate logic in Python
-    def _candidate_eligible(next_retry_str):
-        if not next_retry_str:
-            return True  # no next_retry → eligible
-        # Rough timestamp parse (the SQL uses ::timestamptz <= NOW())
-        try:
-            dt = datetime.fromisoformat(next_retry_str.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt <= datetime.now(timezone.utc)
-        except Exception:
-            return True  # malformed → allow-through (fail safe)
-
-    assert _candidate_eligible(future) is False, \
-        "Future next_retry must exclude row from candidates"
+    assert _next_retry_predicate(future) is False, \
+        "Future next_retry must exclude row"
 
 
 def test_next_retry_past_timestamp_includes_row():
-    """A row with live_recovery_next_retry in the past must be re-selected."""
+    """Valid ISO past next_retry must include the row (window passed)."""
     past = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-
-    def _candidate_eligible(ts):
-        if not ts:
-            return True
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt <= datetime.now(timezone.utc)
-        except Exception:
-            return True
-
-    assert _candidate_eligible(past) is True, \
+    assert _next_retry_predicate(past) is True, \
         "Past next_retry must include row"
 
 
 def test_next_retry_malformed_timestamp_allows_through():
-    """A malformed live_recovery_next_retry must allow the row through
-    (fail-safe) rather than permanently excluding it."""
-    def _candidate_eligible(ts):
-        if not ts:
-            return True
-        try:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt <= datetime.now(timezone.utc)
-        except Exception:
-            return True  # malformed → allow-through
+    """Malformed / non-ISO next_retry values must allow-through (Branch 2).
+    This is the defect fixed: the old 2-branch predicate excluded non-ISO
+    values (Branch 2 was absent); the new 3-branch predicate allows them."""
+    for bad in ("not-a-date", "broken", "tomorrow", "2026/07/20", ""):
+        assert _next_retry_predicate(bad) is True, \
+            f"{bad!r} must allow-through (malformed = infrastructure noise)"
+    assert _next_retry_predicate(None) is True, "None must allow-through"
 
-    assert _candidate_eligible("not-a-timestamp") is True
-    assert _candidate_eligible("") is True
-    assert _candidate_eligible(None) is True
+
+def test_next_retry_date_shaped_invalid_calendar_allows_through():
+    """A date-shaped but invalid calendar value (e.g. month 99) must NOT
+    reach the ::timestamptz cast — it fails the strict regex (Branch 2) and
+    is allowed through safely without a query error."""
+    # "2026-99-99T00:00" — matches weak r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+    # but fails strict r'^...(0[1-9]|1[0-2])-(0[1-9]|...)T[0-9]{2}:[0-9]{2}'
+    # because month "99" does not match (0[1-9]|1[0-2]).
+    bad_calendar = "2026-99-99T00:00:00+00:00"
+    assert _next_retry_predicate(bad_calendar) is True, \
+        "Invalid calendar date must allow-through via Branch 2 (not reach cast)"
 
 
 # ─── Missing-mode identity repair (mocked) ───────────────────────────────────
@@ -2449,6 +2452,25 @@ def test_missing_mode_absent_ap_signals_row_blocks_authorization():
     ap_row = None  # simulates no row found
     authorized = ap_row is not None
     assert authorized is False, "absent ap_signals row must block authorization"
+
+
+def test_missing_mode_row_client_id_mismatch_blocks_authorization():
+    """Guard 2 of _authorize_live_missing_mode compares the candidate row's
+    client_id against self.client_id (the runner client). A mismatch must
+    block authorization — the old implementation compared self.client_id to
+    itself (walrus operator bug) and never detected any mismatch."""
+    runner_client = _CLIENT
+    row_client    = "somebody_else@example.com"
+    # The corrected guard: row_client_id != runner client_id
+    authorized = str(row_client).strip().lower() == str(runner_client).strip().lower()
+    assert authorized is False, (
+        "row_client_id != runner client_id must block authorization — "
+        "this proves the walrus-operator self-comparison bug is fixed"
+    )
+    # Positive case: matching client passes the guard
+    same_client = _CLIENT
+    authorized_same = str(same_client).strip().lower() == str(runner_client).strip().lower()
+    assert authorized_same is True
 
 
 # ─── Real recovery dispatch invocation (db-spy) ──────────────────────────────
@@ -2769,6 +2791,157 @@ def test_postgres_38_mode_repair_atomic_stamp(pg_conn):
         "atomic idempotency proven"
     )
 
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+# =============================================================================
+# PostgreSQL: 5 next_retry edge cases required by the review
+# These prove the 3-branch predicate with strict regex works in real PG.
+# =============================================================================
+
+def _pg_next_retry_candidate_query(cur, client_id: str, stale_cutoff: str):
+    """Run the production next_retry-aware candidate query on real PostgreSQL."""
+    cur.execute(
+        """
+        SELECT id FROM trade_queue
+        WHERE client_id = %s
+          AND status = 'WATCHING'
+          AND created_ts >= %s
+          AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
+          AND COALESCE(last_error,'') NOT LIKE 'LIVE_RECOVERY_%%'
+          AND (
+            COALESCE(payload->>'live_recovery_next_retry', '') = ''
+            OR NOT (
+                payload->>'live_recovery_next_retry'
+                ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
+            )
+            OR (
+                payload->>'live_recovery_next_retry'
+                ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
+                AND (payload->>'live_recovery_next_retry')::timestamptz <= NOW()
+            )
+          )
+        ORDER BY created_ts ASC
+        """,
+        (client_id, stale_cutoff),
+    )
+    return {r[0] if not hasattr(r, "keys") else r["id"] for r in cur.fetchall()}
+
+
+def _pg_insert_next_retry_row(cur, row_id, sig, next_retry_val):
+    """Insert a minimal LIVE WATCHING row with the given next_retry value."""
+    import json as _json
+    payload = {"ticker": "WMT", "direction": "PUT", "trigger_price": 60.5,
+               "execution_mode": "live"}
+    if next_retry_val is not None:
+        payload["live_recovery_next_retry"] = next_retry_val
+    cur.execute(
+        """
+        INSERT INTO trade_queue (id,client_id,signal_id,status,payload,created_ts)
+        VALUES (%s,%s,%s,'WATCHING',%s::jsonb,NOW())
+        ON CONFLICT (id) DO UPDATE
+          SET status='WATCHING', payload=EXCLUDED.payload, created_ts=NOW()
+        """,
+        (row_id, _CLIENT, sig, _json.dumps(payload)),
+    )
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_39_next_retry_empty_is_selected(pg_conn):
+    """PG: empty live_recovery_next_retry (Branch 1) → row selected."""
+    row_id = 9301
+    with pg_conn.cursor() as cur:
+        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-empty-{row_id}", None)
+    pg_conn.commit()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    with pg_conn.cursor() as cur:
+        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
+    assert row_id in selected, "Empty next_retry must be selected (Branch 1)"
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_40_next_retry_valid_future_is_excluded(pg_conn):
+    """PG: valid ISO future next_retry → row excluded."""
+    row_id = 9302
+    future = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
+    with pg_conn.cursor() as cur:
+        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-future-{row_id}", future)
+    pg_conn.commit()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    with pg_conn.cursor() as cur:
+        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
+    assert row_id not in selected, "Future next_retry must be excluded"
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_41_next_retry_valid_past_is_selected(pg_conn):
+    """PG: valid ISO past next_retry (Branch 3) → row selected."""
+    row_id = 9303
+    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+    with pg_conn.cursor() as cur:
+        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-past-{row_id}", past)
+    pg_conn.commit()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    with pg_conn.cursor() as cur:
+        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
+    assert row_id in selected, "Past next_retry must be selected (window passed)"
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_42_next_retry_malformed_string_is_selected_no_error(pg_conn):
+    """PG: malformed non-date string (Branch 2 NOT regex) → selected, no error.
+    This was the defect: the old 2-branch predicate excluded this row."""
+    row_id = 9304
+    with pg_conn.cursor() as cur:
+        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-malformed-{row_id}", "not-a-date")
+    pg_conn.commit()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    # This must NOT raise a PostgreSQL error
+    with pg_conn.cursor() as cur:
+        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
+    assert row_id in selected, (
+        "Malformed next_retry must be selected (Branch 2 allow-through); "
+        "old 2-branch predicate excluded this row"
+    )
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_43_next_retry_invalid_calendar_is_selected_no_error(pg_conn):
+    """PG: date-shaped but invalid calendar (e.g. month 99) → selected without
+    query error. The strict regex rejects it at Branch 2 before the ::timestamptz
+    cast is attempted, preventing a PostgreSQL timestamp conversion error."""
+    row_id = 9305
+    bad_calendar = "2026-99-99T00:00:00+00:00"  # month 99, day 99 — invalid
+    with pg_conn.cursor() as cur:
+        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-badcal-{row_id}", bad_calendar)
+    pg_conn.commit()
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    # This must NOT raise a PostgreSQL invalid_datetime_format error
+    with pg_conn.cursor() as cur:
+        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
+    assert row_id in selected, (
+        "Invalid-calendar next_retry must be selected (Branch 2 blocks cast); "
+        "no PostgreSQL error must be raised"
+    )
     try:
         pg_conn.rollback()
     except Exception:

@@ -2921,11 +2921,27 @@ class APStartupRecovery:
                               -- must not be re-selected until that window passes.
                               -- Malformed timestamps treat as NULL (allow-through)
                               -- so infrastructure failures never permanently exclude.
+                              -- next_retry filter: 3-branch predicate.
+                              -- Branch 1: empty/null → allow-through.
+                              -- Branch 2: NOT matching strict ISO regex → allow-through
+                              --   (malformed values are infrastructure noise, never
+                              --    permanently excluded; fail-safe for bad writes).
+                              -- Branch 3: strict regex matches AND ::timestamptz <= NOW()
+                              --   → retry window passed, allow-through.
+                              -- Rows are excluded only when the strict regex matches
+                              -- AND the timestamp is still in the future.
+                              -- The strict regex validates YYYY-(01-12)-(01-31)THH:MM
+                              -- so values like "2026-99-99Tbroken" fail Branch 2
+                              -- (NOT matches → True) and never reach the cast.
                               AND (
                                 COALESCE(payload->>'live_recovery_next_retry', '') = ''
+                                OR NOT (
+                                    payload->>'live_recovery_next_retry'
+                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
+                                )
                                 OR (
-                                    (payload->>'live_recovery_next_retry')
-                                    ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                                    payload->>'live_recovery_next_retry'
+                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
                                     AND (payload->>'live_recovery_next_retry')::timestamptz
                                         <= NOW()
                                 )
@@ -2959,11 +2975,27 @@ class APStartupRecovery:
                               AND created_ts >= %s
                               AND COALESCE(payload->>'execution_mode', '') = ''
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_%%'
+                              -- next_retry filter: 3-branch predicate.
+                              -- Branch 1: empty/null → allow-through.
+                              -- Branch 2: NOT matching strict ISO regex → allow-through
+                              --   (malformed values are infrastructure noise, never
+                              --    permanently excluded; fail-safe for bad writes).
+                              -- Branch 3: strict regex matches AND ::timestamptz <= NOW()
+                              --   → retry window passed, allow-through.
+                              -- Rows are excluded only when the strict regex matches
+                              -- AND the timestamp is still in the future.
+                              -- The strict regex validates YYYY-(01-12)-(01-31)THH:MM
+                              -- so values like "2026-99-99Tbroken" fail Branch 2
+                              -- (NOT matches → True) and never reach the cast.
                               AND (
                                 COALESCE(payload->>'live_recovery_next_retry', '') = ''
+                                OR NOT (
+                                    payload->>'live_recovery_next_retry'
+                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
+                                )
                                 OR (
-                                    (payload->>'live_recovery_next_retry')
-                                    ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                                    payload->>'live_recovery_next_retry'
+                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
                                     AND (payload->>'live_recovery_next_retry')::timestamptz
                                         <= NOW()
                                 )
@@ -2975,14 +3007,19 @@ class APStartupRecovery:
                         return c.fetchall()
 
                 def _authorize_live_missing_mode(
-                    signal_id: str, canonical_signal_id: str
+                    signal_id: str,
+                    canonical_signal_id: str,
+                    row_client_id: str,
                 ) -> tuple[bool, str]:
                     """Return (authorized, reason).
 
                     LIVE identity for a missing-mode row is proven only when:
                       1. runner mode is exactly LIVE (_mc_mode == 'LIVE'  ← checked
                          by the outer `if _is_live:` gate before this function runs);
-                      2. queue client_id exactly equals runner client_id;
+                      2. the candidate row's client_id exactly equals the runner's
+                         client_id (belt-and-suspenders — the loading SQL already
+                         scopes by client, but an explicit row-level check ensures
+                         no row slips through from a multi-client query change);
                       3. ap_signals row exists for (signal_id, client_email);
                       4. ap_signals.decision_status is not 'rejected';
                       5. no conflicting PAPER queue row owns this signal;
@@ -2990,12 +3027,14 @@ class APStartupRecovery:
 
                     Never use COALESCE(payload->>'execution_mode','live') defaults.
                     """
-                    # Guard 2: client must match the runner (outer _is_live gate
-                    # already confirmed mc_mode == LIVE for the runner)
-                    if str(self.client_id or "").strip().lower() != str(
-                        _CLIENT := self.client_id
+                    # Guard 2: row client_id must equal runner client_id.
+                    # The loading SQL already filters client_id = self.client_id,
+                    # but an independent row-level check closes the gap if the query
+                    # ever changes.
+                    if str(row_client_id or "").strip().lower() != str(
+                        self.client_id or ""
                     ).strip().lower():
-                        return False, "client_mismatch"
+                        return False, "row_client_id_mismatch"
 
                     try:
                         with conn() as _c:
@@ -3779,7 +3818,8 @@ class APStartupRecovery:
                         continue
 
                     authorized, auth_reason = _authorize_live_missing_mode(
-                        mm_sig, mm_canon
+                        mm_sig, mm_canon,
+                        row_client_id=str(mm_row.get("client_id") or "").strip(),
                     )
                     if not authorized:
                         log.info(
