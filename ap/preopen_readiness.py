@@ -229,19 +229,39 @@ def _upsert_preopen_row_idempotent_overnight(
         errors  = int(result.get("errors") or 0)
         stalled = bool(result.get("stalled"))
 
-        # Success = some work done and armed, OR genuinely nothing to do
+        # Five honest classifications (P0-4):
+        #   1. fetched=0, errors=0, stalled=False → ok (genuine no-op / empty inventory)
+        #   2. fetched=0, errors>0 or stalled     → partial/degraded (failed empty run)
+        #   3. fetched>0, armed>0, errors=0, !stalled → ok (full success)
+        #   4. fetched>0, armed>0, errors>0 or stalled → partial/degraded
+        #   5. fetched>0, armed=0              → partial/degraded (all-terminal / LIVE BLOCKED)
         if new_fetched == 0:
-            is_ok = True
-            status = "ok"
-            last_error = None
-        elif armed > 0 and not stalled:
-            is_ok = True
-            status = "ok"
-            last_error = None
+            if errors == 0 and not stalled:
+                # Genuine no-op: empty inventory, no failures
+                is_ok = True
+                status = "ok"
+                last_error = None
+            else:
+                # Empty run with errors or stall — NOT a clean no-op
+                is_ok = False
+                status = "partial"
+                last_error = f"fetched=0 errors={errors} stalled={stalled}"
+        elif armed > 0:
+            if errors == 0 and not stalled:
+                # Full success
+                is_ok = True
+                status = "ok"
+                last_error = None
+            else:
+                # Armed some rows but encountered errors or stall
+                is_ok = False
+                status = "partial"
+                last_error = f"armed={armed} fetched={new_fetched} errors={errors} stalled={stalled}"
         else:
+            # fetched>0 but armed=0: all-terminal result
             is_ok = False
             status = "partial"
-            last_error = f"armed={armed} fetched={new_fetched} errors={errors} stalled={stalled}"
+            last_error = f"armed=0 fetched={new_fetched} errors={errors} stalled={stalled}"
 
         _upsert_preopen_row(
             client_id=client_id,
