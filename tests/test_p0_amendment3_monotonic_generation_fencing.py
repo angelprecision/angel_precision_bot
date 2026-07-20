@@ -81,6 +81,10 @@ def _claim_kwargs(**overrides):
         "observed_underlying_price": 100.2,
         "signal_id": "sig-1",
         "execution_mode": "live",
+        # PR #359: canonical_signal_id is now required by claim_deferred_materialization.
+        # Generation-fencing tests supply a valid canonical so the early-return guard
+        # is passed and the SQL generation predicate is exercised as intended.
+        "canonical_signal_id": "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72",
     }
     base.update(overrides)
     return base
@@ -101,7 +105,8 @@ def test_claim_binds_expected_previous_generation(db_spy):
     ) is True
     sql, params = sink[-1]
     # Last bound param is the expected-previous generation.
-    assert params[-1] == 4, "must bind new_generation - 1 as expected previous"
+    # PR #359: canonical is now last param; generation at params[-2]
+    assert params[-2] == 4, "must bind new_generation - 1 as expected previous"
     patch = json.loads(params[0])
     assert patch["materialization_generation"] == 5
 
@@ -115,7 +120,7 @@ def test_claim_legacy_generation_alias_binds_expected_previous(db_spy):
         "oid-1", generation=3, **_claim_kwargs()
     ) is True
     _, params = sink[-1]
-    assert params[-1] == 2
+    assert params[-2] == 2  # PR #359: canonical appended last, generation at -2
     patch = json.loads(params[0])
     assert patch["materialization_generation"] == 3
 
@@ -128,7 +133,7 @@ def test_new_generation_takes_precedence_over_legacy(db_spy):
         "oid-1", generation=9, new_generation=4, **_claim_kwargs()
     ) is True
     _, params = sink[-1]
-    assert params[-1] == 3          # 4 - 1
+    assert params[-2] == 3          # 4 - 1; PR #359: canonical at params[-1]
     patch = json.loads(params[0])
     assert patch["materialization_generation"] == 4
 
@@ -142,7 +147,7 @@ def test_generation_one_binds_zero_expected_previous(db_spy):
         "oid-1", new_generation=1, **_claim_kwargs()
     ) is True
     _, params = sink[-1]
-    assert params[-1] == 0
+    assert params[-2] == 0  # PR #359: canonical at params[-1]
 
 
 def test_monotonic_sequence_each_step_binds_prior(db_spy):
@@ -155,7 +160,7 @@ def test_monotonic_sequence_each_step_binds_prior(db_spy):
             "oid-1", new_generation=gen, **_claim_kwargs()
         ) is True
         _, params = sink[-1]
-        assert params[-1] == expected_prev
+        assert params[-2] == expected_prev  # PR #359: canonical at params[-1]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -236,7 +241,7 @@ def test_two_claims_same_prior_generation_bind_identical_expected_previous(db_sp
     a_sql, a_params = sink[-1]
     osm.claim_deferred_materialization("oid-1", new_generation=2, **_claim_kwargs(owner="worker-B"))
     b_sql, b_params = sink[-1]
-    assert a_params[-1] == b_params[-1] == 1
+    assert a_params[-2] == b_params[-2] == 1  # PR #359: canonical at params[-1]
     # Both are single atomic UPDATEs carrying the generation predicate.
     assert a_sql == b_sql
     assert "materialization_generation')::int, 0) = %s" in a_sql
