@@ -99,6 +99,19 @@ def _de_day_window_utc(trading_date_str: str) -> tuple[datetime, datetime]:
 
 # ── Shared population query builder ────────────────────────────────────────────
 
+def _recovery_ts_lower_bound_utc(trading_date_str: str) -> datetime:
+    """
+    Lower bound for the recovered_events CTE.
+    Any recovery event ts >= start-of-trading-date ET counts.
+    No upper bound — detects re-runs performed on later days.
+    """
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+    day = date.fromisoformat(trading_date_str)
+    start_et = datetime(day.year, day.month, day.day, 0, 0, 0, tzinfo=ET)
+    return start_et.astimezone(timezone.utc)
+
+
 def _build_rescue_population_sql(
     *,
     client_id: str,
@@ -109,33 +122,53 @@ def _build_rescue_population_sql(
     """
     Returns (sql_template, params) for the eligible rescue population.
 
-    Uses a MATERIALIZED CTE that:
-      1. Scans decision_events once with a UTC ts range (index-friendly).
-      2. Extracts original_signal_id via split_part(candidate_id, ':', 2).
-      3. Materialises the result so the planner builds a hash table.
+    Two MATERIALIZED CTEs — no correlated per-row scan on decision_events.
 
-    The trade_queue side is then hash-joined — no correlated per-row subquery.
-    The {select_clause} placeholder is filled by the caller:
-      - dry-run:  "SELECT COUNT(*) AS n"
-      - write:    "SELECT tq.id, tq.signal_id, ... ORDER BY tq.created_ts ASC FOR UPDATE OF tq"
+    verified_events  — scans once on (client_id, stage, ts) for false-veto proof.
+    recovered_events — scans once on (client_id, stage, reason_code, ts) to
+                       identify already-recovered signals.
 
-    Params order: [de_client_id, de_reasoning, de_ts_start, de_ts_end,
-                   tq_client_id, tq_created_start, tq_created_end,
-                   recovery_reason_code]
+    trade_queue:
+      INNER JOIN verified_events   (require a matching false-veto event)
+      LEFT  JOIN recovered_events + IS NULL  (exclude already-recovered rows)
+
+    The previous correlated:
+      AND NOT EXISTS (... rde.candidate_id LIKE 'RECOVER:' || tq.signal_id || ':%' ...)
+    is removed. Its function is replaced by the non-correlated LEFT JOIN + IS NULL.
+
+    {select_clause} placeholder:
+      dry-run : SELECT COUNT(*) AS n
+      write   : SELECT tq.id, ... ORDER BY tq.created_ts ASC FOR UPDATE OF tq
+
+    Params (10 total):
+      1. ve client_id
+      2. ve reasoning ANY array
+      3. ve de_ts_start
+      4. ve de_ts_end
+      5. re client_id
+      6. re reason_code
+      7. re recovery_ts_lower
+      8. tq client_id
+      9. tq created_ts >=
+     10. tq created_ts <=
     """
     de_ts_start, de_ts_end = _de_day_window_utc(trading_date)
+    recovery_ts_lower      = _recovery_ts_lower_bound_utc(trading_date)
 
     params: list[Any] = [
-        # CTE (decision_events filter)
-        client_id,          # %s 1 — client_id
-        _EXACT_REASONING,   # %s 2 — reasoning ANY array
-        de_ts_start,        # %s 3 — ts >=
-        de_ts_end,          # %s 4 — ts <
-        # Trade queue WHERE
-        client_id,          # %s 5 — tq.client_id
-        tq_window_start_utc,# %s 6 — tq.created_ts >=
-        tq_window_end_utc,  # %s 7 — tq.created_ts <=
-        RECOVER_PR379_REGIME_TAXONOMY,  # %s 8 — idempotency check
+        # verified_events CTE
+        client_id,         # 1
+        _EXACT_REASONING,  # 2 — ANY(%s::text[])
+        de_ts_start,       # 3
+        de_ts_end,         # 4
+        # recovered_events CTE
+        client_id,         # 5
+        RECOVER_PR379_REGIME_TAXONOMY,  # 6
+        recovery_ts_lower, # 7
+        # trade_queue WHERE
+        client_id,         # 8
+        tq_window_start_utc, # 9
+        tq_window_end_utc,   # 10
     ]
 
     sql = """
@@ -153,15 +186,26 @@ def _build_rescue_population_sql(
               AND context_json->>'intel_reasoning' = ANY(%s::text[])
               AND ts >= %s
               AND ts <  %s
+        ),
+        recovered_events AS MATERIALIZED (
+            SELECT DISTINCT split_part(candidate_id, ':', 2) AS original_signal_id
+            FROM decision_events
+            WHERE client_id   = %s
+              AND stage       = 'overnight_recovery'
+              AND reason_code = %s
+              AND split_part(candidate_id, ':', 1) = 'RECOVER'
+              AND ts >= %s
         )
         {{select_clause}}
         FROM trade_queue tq
-        JOIN verified_events ve ON ve.original_signal_id = tq.signal_id
+        JOIN      verified_events ve ON ve.original_signal_id = tq.signal_id
+        LEFT JOIN recovered_events re ON re.original_signal_id = tq.signal_id
         WHERE tq.client_id  = %s
           AND tq.status     = 'REJECTED'
           AND tq.last_error = 'mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK'
           AND tq.created_ts >= %s
           AND tq.created_ts <= %s
+          AND re.original_signal_id IS NULL
           AND (tq.payload IS NULL OR tq.payload->>'recovery_context' IS NULL)
           AND NOT EXISTS (
               SELECT 1 FROM orders o
@@ -182,18 +226,9 @@ def _build_rescue_population_sql(
               SELECT 1 FROM positions p
               WHERE p.client_id = tq.client_id AND p.signal_id = tq.signal_id
           )
-          AND NOT EXISTS (
-              SELECT 1 FROM decision_events rde
-              WHERE rde.client_id    = tq.client_id
-                AND rde.candidate_id LIKE ('RECOVER:' || tq.signal_id || ':%')
-                AND rde.stage        = 'overnight_recovery'
-                AND rde.reason_code  = %s
-          )
     """
     return sql, params
 
-
-# ── Identity verification ──────────────────────────────────────────────────────
 
 def _verify_live_identity(client_id: str, runner) -> tuple[bool, str]:
     if runner is None:
