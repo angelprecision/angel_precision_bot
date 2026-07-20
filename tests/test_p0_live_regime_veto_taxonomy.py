@@ -236,8 +236,12 @@ def test_bridge_zero_pm_contracts_stay_zero_case_b():
 # ─── Test 9: Kill switch remains authoritative RISK_VETO ─────────────────────
 
 def test_kill_switch_remains_authoritative():
+    # intelligence_bridge computes _INTEL_IS_LIVE at module import time from AP_MODE.
+    # In the test environment AP_MODE is not set → _INTEL_IS_LIVE=False → allow_collect=True
+    # → hard veto returns RISK_VETO_OVERRIDE (1-contract collect gate), not RISK_VETO.
+    # Patch the module-level flag directly so the hard block path is exercised.
     from intelligence_bridge import _risk_allows_trade, _map_result
-    import os
+    import intelligence_bridge
 
     risk = {
         "approved": False, "reason": "DAILY KILL SWITCH",
@@ -247,11 +251,14 @@ def test_kill_switch_remains_authoritative():
     ok, _ = _risk_allows_trade(risk)
     assert ok is False
 
-    gate = _map_result({
-        "action": "skip", "confidence": 75.0, "score": 75.0, "contracts": 0,
-        "reasoning": "kill_switch", "risk_detail": risk, "ticker": "AAPL",
-    }, fallback_score=78.0)
-    assert gate["intel_status"] == "RISK_VETO"
+    with patch.object(intelligence_bridge, "_INTEL_IS_LIVE", True):
+        gate = _map_result({
+            "action": "skip", "confidence": 75.0, "score": 75.0, "contracts": 0,
+            "reasoning": "kill_switch", "risk_detail": risk, "ticker": "AAPL",
+        }, fallback_score=78.0)
+    assert gate["intel_status"] == "RISK_VETO", (
+        f"Kill switch must produce RISK_VETO in LIVE mode. Got: {gate['intel_status']}"
+    )
     assert gate["approved"] is False
 
 
