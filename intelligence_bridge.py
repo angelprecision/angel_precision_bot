@@ -512,16 +512,20 @@ def _map_result(result: dict, fallback_score: float) -> dict:
     )
 
     # ── Advisory regime mismatch tagging (approved=True path only) ────────────
-    # Applied ONLY when the producer returned approved=True with real sizing.
-    # The producer ran every hard gate first; this tag is purely informational.
-    # Never manufacture contracts: if PM returned 0, fall through to APPROVED.
+    # Applied ONLY when the producer returned approved=True.
+    # CRITICAL: For APPROVED_WITH_REGIME_MISMATCH, zero contracts from PM must
+    # NEVER fall through to max(1, contracts) below.  This path handles every
+    # case — real contracts and zero contracts — so the standard path is
+    # unreachable for advisory results.
     if (risk.get("reason_code") == "APPROVED_WITH_REGIME_MISMATCH"
             and risk.get("hard_veto") is False
-            and risk.get("approved") is True
-            and int(risk.get("max_contracts") or 0) >= 1
-            and float(risk.get("max_position_usd") or 0) > 0):
+            and risk.get("approved") is True):
+
         _advisory_contracts = int(result.get("contracts") or 0)
-        if _advisory_contracts >= 1:
+
+        if (int(risk.get("max_contracts") or 0) >= 1
+                and float(risk.get("max_position_usd") or 0) > 0
+                and _advisory_contracts >= 1):
             log.info(
                 "[%s] GATE_G_REGIME_MISMATCH_ADVISORY scanner_score=%.1f "
                 "intel_score=%.1f risk_contracts=%d pm_contracts=%d "
@@ -543,12 +547,30 @@ def _map_result(result: dict, fallback_score: float) -> dict:
                 "intel_score":  round(score, 1),
                 "risk_detail":  risk,
             }
-        log.warning(
-            "[%s] REGIME_MISMATCH_ADVISORY: PM returned contracts=0 "
-            "— falling through to standard APPROVED",
-            ticker,
-        )
 
+        # PM returned zero contracts OR risk sizing was zero.
+        # Return zero explicitly — NEVER fall through to max(1, contracts).
+        log.warning(
+            "[%s] APPROVED_WITH_REGIME_MISMATCH pm_contracts=%d "
+            "risk_max_contracts=%d — preserving zero; not manufacturing",
+            ticker, _advisory_contracts,
+            int(risk.get("max_contracts") or 0),
+        )
+        return {
+            "approved":     True,
+            "score":        round(score, 1),
+            "contracts":    0,   # exact zero; no broker submit will fire
+            "reasoning":    (
+                f"regime_mismatch_advisory_zero_contracts: {risk.get('reason', '')} "
+                f"(pm_contracts={_advisory_contracts} "
+                f"risk_max={int(risk.get('max_contracts') or 0)})"
+            ),
+            "intel_status": "REGIME_MISMATCH_ADVISORY",
+            "intel_score":  round(score, 1),
+            "risk_detail":  risk,
+        }
+
+    # ── Standard approved path — only reached for non-advisory results ─────────
     return {
         "approved":     True,
         "score":        round(score, 1),
