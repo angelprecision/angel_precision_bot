@@ -224,27 +224,22 @@ class APRiskManager:
         # by SPY trend. Non-index single names still gated below.
         is_index = ticker.upper() in INDEX_TICKERS
 
-        if not is_index and direction == "bullish" and spy["trend"] == "BEAR":
-            # Advisory: SPY regime mismatch is directional context, not an
-            # execution-authoritative safety veto. hard_veto=False tells the
-            # intelligence bridge NOT to convert this into RISK_VETO.
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, "CALL blocked — SPY in BEAR trend",
-                                spy_trend=spy["trend"], vix=vix_data["vix"],
-                                reason_code="MARKET_REGIME_MISMATCH",
-                                veto_category="directional_context",
-                                hard_veto=False)
+        # Record regime advisory state — DO NOT return early.
+        # Regime mismatch is directional context, not an execution safety gate.
+        # All subsequent hard gates (VIX, contract quality, sector cap, sizing)
+        # still run in full. A regime-mismatched candidate that also fails VIX
+        # or contract quality must still be blocked — the advisory only applies
+        # to candidates that pass every hard gate and produce real sizing.
+        regime_mismatch = False
+        regime_reason   = ""
 
-        if not is_index and direction == "bearish" and spy["trend"] == "BULL":
-            # Advisory: same taxonomy as CALL_blocked — directional context only.
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, "PUT blocked — SPY in BULL trend",
-                                spy_trend=spy["trend"], vix=vix_data["vix"],
-                                reason_code="MARKET_REGIME_MISMATCH",
-                                veto_category="directional_context",
-                                hard_veto=False)
+        if not is_index and direction == "bullish" and spy["trend"] == "BEAR":
+            regime_mismatch = True
+            regime_reason   = "CALL blocked — SPY in BEAR trend (advisory context)"
+
+        elif not is_index and direction == "bearish" and spy["trend"] == "BULL":
+            regime_mismatch = True
+            regime_reason   = "PUT blocked — SPY in BULL trend (advisory context)"
 
         if is_index and (
             (direction == "bullish" and spy["trend"] == "BEAR") or
@@ -360,9 +355,25 @@ class APRiskManager:
 
         approved = max_contracts >= 1
 
+        # ── Capital / sizing failure: hard veto ───────────────────────────────
+        # Zero affordable contracts is a genuine execution gate, not advisory.
+        if not approved:
+            return self._reject(
+                ticker, direction, option_premium, dte,
+                bid_ask_spread_pct, open_interest, daily_volume_options,
+                option_delta,
+                "Insufficient capital or zero contracts",
+                spy_trend=spy["trend"], vix=vix_data["vix"],
+                contract_quality=cq,
+                reason_code="INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS",
+                veto_category="capital",
+                hard_veto=True,   # capital failure blocks; it is not advisory
+            )
+
+        # ── Approved — with or without regime advisory context ─────────────────
         return RiskResult(
             ticker=ticker,
-            approved=approved,
+            approved=True,
             max_contracts=max_contracts,
             max_position_usd=round(max_usd, 2),
             risk_dollars=round(risk_dollars, 2),
@@ -375,10 +386,11 @@ class APRiskManager:
             contract_quality=cq,
             spy_trend=spy["trend"],
             vix=vix_data["vix"],
-            reason="APPROVED" if approved else "Insufficient capital or zero contracts",
-            reason_code="APPROVED" if approved else "INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS",
-            veto_category="" if approved else "capital",
-            hard_veto=False,  # sizing failures are not execution-authoritative vetoes
+            # Regime mismatch survives as advisory on an otherwise-valid setup.
+            reason=regime_reason if regime_mismatch else "APPROVED",
+            reason_code="APPROVED_WITH_REGIME_MISMATCH" if regime_mismatch else "APPROVED",
+            veto_category="directional_context" if regime_mismatch else "",
+            hard_veto=False,  # producer is approving the trade; bridge tags it advisory
         )
 
     # ────────────────────────────────────────────
