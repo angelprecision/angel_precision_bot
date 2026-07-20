@@ -2739,6 +2739,48 @@ class ClientRunner(threading.Thread):
         self.entries_allowed.clear()
         self.stopped.set()
 
+    # ── PR: Overnight rescue admin interface ──────────────────────────────────
+    def run_overnight_rescue(
+        self,
+        trading_date: str,
+        *,
+        dry_run: bool = True,
+        expected_count: int | None = None,
+    ) -> dict:
+        """Admin interface for the fenced same-session LIVE overnight rescue.
+
+        Wraps recover_and_rerun_live_overnight() with this runner's identity
+        and component references. Must be called on a fully initialized LIVE
+        runner; raises RuntimeError if this runner is not LIVE mode.
+
+        Args:
+            trading_date:   Monday ISO date (e.g. "2026-07-20").
+            dry_run:        Default True — preview only, zero writes.
+            expected_count: Required count of eligible rows; mismatch aborts.
+
+        Returns:
+            dict with keys: eligible, writes, count_match, reeval_result,
+            readiness, rescue_result, errors.
+
+        Example (always preview first):
+            preview = runner.run_overnight_rescue("2026-07-20", dry_run=True, expected_count=53)
+            print(preview)
+            # Then execute:
+            result = runner.run_overnight_rescue("2026-07-20", dry_run=False, expected_count=53)
+        """
+        if str(self.mode).strip().upper() != "LIVE":
+            raise RuntimeError(
+                f"run_overnight_rescue is LIVE-only. "
+                f"This runner is mode={self.mode}. Refusing."
+            )
+        from ap.live_overnight_rescue import recover_and_rerun_live_overnight
+        return recover_and_rerun_live_overnight(
+            runner=self,
+            trading_date=trading_date,
+            dry_run=dry_run,
+            expected_count=expected_count,
+        )
+
     def _cleanup(self):
         self.entries_allowed.clear()
         self.degraded.set()
