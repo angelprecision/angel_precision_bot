@@ -243,11 +243,34 @@ def _signal_to_direction(signal: dict) -> str:
 
 
 def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
-    """Return (risk_ok, reason) from flexible intelligence risk payloads."""
+    """Return (risk_ok, reason) from flexible intelligence risk payloads.
+
+    Structured authority wins FIRST (PR: regime taxonomy fix):
+      hard_veto=False  → advisory/context result only; bridge MUST NOT
+                         convert this to an execution-authoritative veto.
+      hard_veto=True   → genuine hard execution block (kill switch, capital,
+                         contract quality, sector cap).
+      hard_veto absent → fall through to legacy key-based detection.
+
+    Only hard_veto=True may ultimately produce intel_status="RISK_VETO".
+    """
     if not isinstance(risk, dict):
         return True, ""
 
-    # Common explicit veto shapes.
+    # Structured authority check — checked before any generic key scanning.
+    # Ensures MARKET_REGIME_MISMATCH (hard_veto=False) never returns False.
+    _hard_veto = risk.get("hard_veto")
+    if _hard_veto is False:
+        # Advisory/context result: approved=False in the risk dict is
+        # directional context (e.g. SPY regime), NOT an execution veto.
+        return True, str(risk.get("reason") or risk.get("reason_code") or "")
+    if _hard_veto is True:
+        # Genuine hard veto with stable reason_code.
+        return False, str(
+            risk.get("reason") or risk.get("reason_code") or "hard_veto=True"
+        )
+
+    # Legacy key-based detection (no hard_veto field — old producer code).
     for key in ("risk_ok", "ok", "approved", "pass", "passed", "allow", "allowed"):
         if key in risk:
             val = risk.get(key)
@@ -315,6 +338,39 @@ def _map_result(result: dict, fallback_score: float) -> dict:
 
     risk_ok, risk_reason = _risk_allows_trade(risk)
     allow_collect = _data_collection_allowed()
+
+    # ── Advisory regime mismatch — MUST be checked BEFORE hard veto block ────
+    # When APRiskManager returns reason_code=MARKET_REGIME_MISMATCH with
+    # hard_veto=False, the result is directional context only.  It must NEVER
+    # produce intel_status="RISK_VETO" (which the admission policy maps to the
+    # execution-authoritative INTEL_AUTHORITATIVE_VETO_RISK).
+    #
+    # Root cause of 2026-07-20 incident (53 false terminal rejections):
+    # the previous code fell through to the generic approved=False → RISK_VETO
+    # path regardless of whether the veto was a hard safety gate or advisory.
+    if (risk.get("reason_code") == "MARKET_REGIME_MISMATCH"
+            and risk.get("hard_veto") is False):
+        log.info(
+            "[%s] GATE_G_REGIME_MISMATCH_ADVISORY scanner_score=%.1f "
+            "intel_score=%.1f veto_category=%s hard_veto=False "
+            "— non-authoritative advisory; allowing",
+            ticker, fallback_score, intel_score,
+            risk.get("veto_category", "directional_context"),
+        )
+        return {
+            "approved": True,
+            "score": round(fallback_score, 1),
+            "contracts": max(1, contracts),
+            "reasoning": (
+                f"regime_mismatch_advisory: "
+                f"{risk_reason or risk.get('reason', '')} "
+                f"(reason_code=MARKET_REGIME_MISMATCH hard_veto=False "
+                f"non_authoritative)"
+            ),
+            "intel_status": "REGIME_MISMATCH_ADVISORY",
+            "intel_score": round(intel_score, 1),
+            "risk_detail": risk,
+        }
 
     # ── Hard risk veto (explicit risk finding — always block) ─────────────────
     if _INTEL_ENFORCE_RISK_VETO and not risk_ok:
