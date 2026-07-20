@@ -310,6 +310,51 @@ def _run_watcher_poll_to_submit(
     )
     monkeypatch.setitem(sys.modules, "ap.execution", fake_execution_mod)
 
+    # ── Lifecycle singleton seed ──────────────────────────────────────────
+    # ap_lifecycle.LEDGER is a module-level singleton that persists across
+    # tests in the same pytest process.  _poll_active_signals → _ew_record
+    # attempts a TRIGGER_READY transition.  LEGAL_TRANSITIONS requires the
+    # signal to be in WATCHING state first; NONE→TRIGGER_READY is illegal
+    # and causes an ILLEGAL_TRANSITION error that prevents submit.
+    #
+    # This helper bypasses add_signal() (which is where WATCHING is normally
+    # registered), so we seed the lifecycle directly:
+    #   NONE → ADOPTED (legal from None)
+    #   ADOPTED → WATCHING (legal)
+    #
+    # The seed is reset for each call so prior test runs don't leave the
+    # signal in a terminal state that blocks the next test's transitions.
+    try:
+        from ap_lifecycle import (
+            LEDGER as _TEST_LEDGER,
+            SignalState as _TEST_SS,
+            LifecycleOwner as _TEST_LO,
+        )
+        _lc_sig_id = str(watched.signal.get("signal_id", ""))
+        _lc_ticker = str(watched.ticker or "")
+        if _lc_sig_id and _lc_ticker:
+            # Reset any prior state so this call is always self-contained.
+            with _TEST_LEDGER._entry_lock:
+                _TEST_LEDGER._current_state.pop(_lc_sig_id, None)
+            # NONE → ADOPTED → WATCHING (both legal transitions)
+            _TEST_LEDGER.transition(
+                _lc_sig_id, _lc_ticker,
+                _TEST_SS.ADOPTED, _TEST_LO.WATCHER, "test_helper_seed",
+            )
+            _TEST_LEDGER.transition(
+                _lc_sig_id, _lc_ticker,
+                _TEST_SS.WATCHING, _TEST_LO.WATCHER, "test_helper_seed_watching",
+            )
+    except Exception:
+        pass  # defensive — test proceeds if lifecycle is unavailable
+
+    # ── Disable time-of-day gates so test is not market-hours-dependent ──
+    # live_submit_gates checks ENTRY_CUTOFF_ET_HHMM (default 1530 = 3:30 PM ET).
+    # Running outside market hours causes ENTRY_CUTOFF_EXCEEDED and blocks the
+    # submit without mocking, making this test non-deterministic in CI depending
+    # on when the push triggers the run.  Set to 2359 (end of day) to disable.
+    monkeypatch.setenv("ENTRY_CUTOFF_ET_HHMM", "2359")
+
     watcher._poll_active_signals(False)
     watcher._poll_active_signals(False)
     result["watcher"] = watcher
