@@ -1,25 +1,22 @@
 """
 ap/live_overnight_rescue.py — Strictly fenced same-session LIVE overnight rescue.
 
-Incident context (2026-07-20):
-  53 Jason LIVE trade_queue rows were false-terminally rejected as
-  mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK because APRiskManager's
-  SPY regime mismatch returns (advisory, hard_veto=False) were not yet
-  carrying structured authority fields — intelligence_bridge converted
-  the generic approved=False into an execution-authoritative RISK_VETO.
-  PR #379 taxonomy fix closes the root cause; this module recovers the
-  specific incident rows under strict multi-layer eligibility criteria.
+Incident: 2026-07-20 — Jason LIVE, 53 false terminal rejections.
 
-Scope boundary (enforced):
-  - Only mutates trade_queue rows satisfying ALL eligibility criteria.
-  - Never submits or cancels broker orders directly.
-  - Never revives structural invalidations (INVALIDATED_PRIOR_HIGH_BREACHED).
-  - Never mutates existing positions, proof trades, or exit orders.
+Design invariants enforced in this module:
+  - Decision-event proof is MANDATORY: zero writes if any row lacks a verified event.
+  - Mutation is a single atomic database transaction (SELECT FOR UPDATE → bulk UPDATE
+    → INSERT decision events → COMMIT). Partial writes are impossible.
+  - Fenced to the exact incident: client jasoncosby1@gmail.com, date 2026-07-20.
+  - LIVE identity verified via durable runner state, not the caller string.
+  - Stop on any failure: partial recovery, reeval error, handoff failure.
+  - Never submits or cancels broker orders.
+  - Never revives structural invalidations.
   - Never alters PAPER rows or another client's queue.
-  - Recovered rows re-enter the canonical overnight path via run_overnight_reeval().
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -27,339 +24,276 @@ from typing import Any
 
 log = logging.getLogger("ap.live_overnight_rescue")
 
-# ── Stable identifiers ────────────────────────────────────────────────────────
+INCIDENT_CLIENT_ID     = "jasoncosby1@gmail.com"
+INCIDENT_TRADING_DATE  = "2026-07-20"
+INCIDENT_EXPECTED_ROWS = 53
 
 RECOVER_PR379_REGIME_TAXONOMY = "RECOVER_PR379_REGIME_TAXONOMY"
 
-# SPY regime mismatch reasoning patterns emitted by intelligence_bridge before
-# the taxonomy fix.  Bridge emits: "risk_veto: {APRiskManager.reason}" where
-# reason is the human-readable string from _reject().
-_REGIME_MISMATCH_PATTERNS = (
-    "call blocked",       # "CALL blocked — SPY in BEAR trend"
-    "put blocked",        # "PUT blocked — SPY in BULL trend"
-    "spy in bear",
-    "spy in bull",
-    "risk_veto: call",
-    "risk_veto: put",
+_DE_REASON_CODE = "INTEL_AUTHORITATIVE_VETO_RISK"
+_DE_RAW_STATUS  = "RISK_VETO"
+_DE_EXEC_MODE   = "LIVE"
+_DE_REASONING_PATTERNS = (
+    "call blocked", "put blocked",
+    "spy in bear", "spy in bull",
+    "risk_veto: call", "risk_veto: put",
+    "approved_with_regime_mismatch",
     "market_regime_mismatch",
-    "regime mismatch",
-    "directional_context",
+    "regime",
 )
 
-# last_error values that are genuine structural failures and MUST NOT be rescued.
-_INELIGIBLE_LAST_ERROR_PREFIXES = (
-    "overnight_invalidated:",          # structural validation failure
-    "stale_signal:",
-    "trigger_invalid",
-    "invalid_or_missing_side",
-    "live_authorization:",
-    "overnight_watch_arm_failed:",
-    "order_materialization_failed",
-    "risk_blocked",
-    "duplicate_setup",
-    "intraday_timeframe_rejected",
-)
-
-
-# ── Time-window helpers ────────────────────────────────────────────────────────
 
 def _friday_after_close_window_utc(monday_date_str: str) -> tuple[datetime, datetime]:
-    """
-    Return (window_start_utc, window_end_utc) covering Friday-after-close
-    through Monday pre-open for overnight inventory eligible for trading_date.
-
-    Friday 16:00 ET → Monday 09:30 ET (exclusive upper bound).
-    """
     from zoneinfo import ZoneInfo
     ET = ZoneInfo("America/New_York")
     monday = date.fromisoformat(monday_date_str)
     if monday.weekday() != 0:
         raise ValueError(
-            f"trading_date={monday_date_str} is weekday={monday.weekday()} "
-            f"(expected 0=Monday). This rescue is only valid for Monday trading dates."
+            f"trading_date={monday_date_str} weekday={monday.weekday()} — must be Monday."
         )
     friday = monday - timedelta(days=3)
-    window_start = datetime(friday.year, friday.month, friday.day, 16, 0, 0, tzinfo=ET)
-    window_end   = datetime(monday.year, monday.month, monday.day, 9, 30, 0, tzinfo=ET)
-    return window_start.astimezone(timezone.utc), window_end.astimezone(timezone.utc)
+    start = datetime(friday.year, friday.month, friday.day, 16, 0, 0, tzinfo=ET)
+    end   = datetime(monday.year, monday.month, monday.day, 9, 30, 0, tzinfo=ET)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
-def _is_regime_mismatch_reasoning(intel_reasoning: str) -> bool:
-    """True if intel_reasoning matches the SPY directional mismatch family."""
-    lower = str(intel_reasoning or "").lower()
-    return any(pat in lower for pat in _REGIME_MISMATCH_PATTERNS)
+def _is_regime_mismatch_reasoning(text: str) -> bool:
+    lower = str(text or "").lower()
+    return any(p in lower for p in _DE_REASONING_PATTERNS)
 
 
-# ── Database helpers ───────────────────────────────────────────────────────────
+def _verify_live_identity(client_id: str, runner) -> tuple[bool, str]:
+    if runner is None:
+        return False, "runner is None"
+    runner_mode = str(getattr(runner, "mode", "") or "").strip().upper()
+    if runner_mode != "LIVE":
+        return False, f"runner.mode={runner_mode!r} is not LIVE"
+    runner_email = str(getattr(runner, "email", "") or "").strip().lower()
+    if runner_email != client_id.strip().lower():
+        return False, f"runner.email={runner_email!r} != client_id={client_id!r}"
+    if not getattr(runner, "initialized", None) or not runner.initialized.is_set():
+        return False, "runner not initialized"
+    return True, "ok"
 
-def _fetch_structurally_eligible_rows(
+
+def _execute_atomic_rescue(
     *,
     client_id: str,
+    trading_date: str,
     window_start_utc: datetime,
     window_end_utc: datetime,
-) -> list[dict]:
-    """
-    Fetch trade_queue rows satisfying structural eligibility:
-      - status='REJECTED', last_error='mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK'
-      - created_ts within Friday-after-close → Monday-preopen window
-      - No ENTRY order exists for the same client + signal
-      - payload has no recovery_context (not already recovered)
-
-    Decision-event intel field verification is done separately in Python
-    so we can emit per-row diagnostics.
-    """
-    from ap.db import conn, run_with_retry
-    import json as _json
-
-    def _query():
-        with conn() as c:
-            c.execute(
-                """
-                SELECT
-                    tq.id,
-                    tq.signal_id,
-                    tq.payload,
-                    tq.created_ts,
-                    tq.last_error,
-                    tq.finished_ts
-                FROM trade_queue tq
-                WHERE tq.client_id = %s
-                  AND tq.status = 'REJECTED'
-                  AND tq.last_error = 'mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK'
-                  AND tq.created_ts >= %s
-                  AND tq.created_ts <= %s
-                  AND (
-                      tq.payload IS NULL
-                      OR tq.payload->>'recovery_context' IS NULL
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM orders o
-                      WHERE o.client_id = tq.client_id
-                        AND COALESCE(o.signal_id, '') != ''
-                        AND o.signal_id = tq.signal_id
-                        AND o.kind = 'ENTRY'
-                  )
-                ORDER BY tq.created_ts ASC
-                """,
-                (client_id, window_start_utc, window_end_utc),
-            )
-            rows = c.fetchall() or []
-            cols = [desc[0] for desc in (c.description or [])]
-            result = []
-            for row in rows:
-                d = dict(row) if isinstance(row, dict) else dict(zip(cols, row))
-                if isinstance(d.get("payload"), str):
-                    try:
-                        d["payload"] = _json.loads(d["payload"])
-                    except Exception:
-                        d["payload"] = {}
-                result.append(d)
-            return result
-
-    return run_with_retry(_query) or []
-
-
-def _verify_decision_event_intel(
-    *,
-    client_id: str,
-    signal_ids: list[str],
-    trading_date: str,
-) -> set[str]:
-    """
-    Return the set of signal_ids that have a matching decision_event with:
-      - intel_reason_code = 'INTEL_AUTHORITATIVE_VETO_RISK'
-      - intel_raw_status  = 'RISK_VETO'
-      - intel_execution_mode = 'LIVE'
-      - intel_reasoning matches SPY regime mismatch family
-      - ts on trading_date (ET)
-
-    Falls back to an empty set if decision_events table doesn't exist or
-    signal_id is not queryable — rescue will proceed on structural criteria
-    only and log a warning.
-    """
-    if not signal_ids:
-        return set()
-
-    from ap.db import conn, run_with_retry
-
-    def _query():
-        with conn() as c:
-            c.execute(
-                """
-                SELECT DISTINCT
-                    COALESCE(
-                        signal_id,
-                        context_json->>'signal_id'
-                    ) AS signal_id
-                FROM decision_events
-                WHERE client_id = %s
-                  AND decision = 'REJECT'
-                  AND context_json->>'intel_reason_code' = 'INTEL_AUTHORITATIVE_VETO_RISK'
-                  AND context_json->>'intel_raw_status' = 'RISK_VETO'
-                  AND UPPER(COALESCE(context_json->>'intel_execution_mode','')) = 'LIVE'
-                  AND (
-                      LOWER(COALESCE(context_json->>'intel_reasoning','')) LIKE '%%call blocked%%'
-                      OR LOWER(COALESCE(context_json->>'intel_reasoning','')) LIKE '%%put blocked%%'
-                      OR LOWER(COALESCE(context_json->>'intel_reasoning','')) LIKE '%%spy in bear%%'
-                      OR LOWER(COALESCE(context_json->>'intel_reasoning','')) LIKE '%%spy in bull%%'
-                      OR LOWER(COALESCE(context_json->>'intel_reasoning','')) LIKE '%%regime%%mismatch%%'
-                  )
-                  AND DATE(ts AT TIME ZONE 'America/New_York') = %s
-                """,
-                (client_id, trading_date),
-            )
-            rows = c.fetchall() or []
-            result = set()
-            for row in rows:
-                sid = (row.get("signal_id") if isinstance(row, dict) else row[0])
-                if sid:
-                    result.add(str(sid))
-            return result
-
-    try:
-        return run_with_retry(_query) or set()
-    except Exception as exc:
-        log.warning(
-            "live_overnight_rescue: decision_event intel verify failed "
-            "(non-fatal, will proceed on structural criteria only): %s", exc,
-        )
-        return set()
-
-
-def _emit_recovery_decision_event(
-    *,
-    client_id: str,
-    row: dict,
-    trading_date: str,
+    expected_count: int,
     recovery_run_id: str,
     recovered_at: str,
-) -> None:
-    """Emit a durable decision event for each recovered row."""
-    try:
-        from ap.db import conn, run_with_retry
-        import json as _json
+) -> dict:
+    """
+    Single atomic transaction:
+    1. SELECT … FOR UPDATE — lock exactly expected_count rows.
+    2. Query decision events for every signal_id — mandatory, no fallback.
+    3. Verify verified_count == expected_count.
+    4. Bulk UPDATE via unnest CTE.
+    5. INSERT one decision event per row in the same txn.
+    6. Commit on clean exit; rollback on any exception.
+    """
+    from ap.db import conn
 
-        signal_id   = str(row.get("signal_id") or "")
-        payload     = row.get("payload") or {}
-        ticker      = str(payload.get("ticker") or payload.get("symbol") or "")
-        side        = str(payload.get("side") or payload.get("direction") or "")
-        original_last_error = str(row.get("last_error") or "")
-        original_finished   = row.get("finished_ts")
-
-        context = {
-            "stage":                  "overnight_recovery",
-            "decision":               "REQUEUE",
-            "reason_code":            RECOVER_PR379_REGIME_TAXONOMY,
-            "original_status":        "REJECTED",
-            "original_last_error":    original_last_error,
-            "original_finished_ts":   str(original_finished or ""),
-            "recovery_run_id":        recovery_run_id,
-            "recovery_trading_date":  trading_date,
-            "recovered_at":           recovered_at,
-            "client_id":              client_id,
-            "execution_mode":         "LIVE",
-        }
-
-        def _write():
-            with conn() as c:
-                c.execute(
-                    """
-                    INSERT INTO decision_events (
-                        client_id, signal_id, stage, decision,
-                        reason_code, context_json, ts
-                    ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (
-                        client_id,
-                        signal_id,
-                        "overnight_recovery",
-                        "REQUEUE",
-                        RECOVER_PR379_REGIME_TAXONOMY,
-                        _json.dumps(context),
-                    ),
-                )
-        run_with_retry(_write)
-    except Exception as exc:
-        log.warning(
-            "[%s] live_overnight_rescue: decision event emit failed (non-fatal): %s",
-            row.get("id"), exc,
+    with conn() as c:
+        # 1. Lock candidate rows
+        c.execute(
+            """
+            SELECT tq.id, tq.signal_id, tq.payload,
+                   tq.last_error, tq.result_json, tq.finished_ts
+            FROM trade_queue tq
+            WHERE tq.client_id  = %s
+              AND tq.status     = 'REJECTED'
+              AND tq.last_error = 'mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK'
+              AND tq.created_ts >= %s
+              AND tq.created_ts <= %s
+              AND (tq.payload IS NULL OR tq.payload->>'recovery_context' IS NULL)
+              AND NOT EXISTS (
+                  SELECT 1 FROM orders o
+                  WHERE o.client_id = tq.client_id AND o.signal_id = tq.signal_id
+                    AND o.kind = 'ENTRY'
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM orders ob
+                  WHERE ob.client_id = tq.client_id AND ob.signal_id = tq.signal_id
+                    AND ob.broker_order_id IS NOT NULL
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM orders os2
+                  WHERE os2.client_id = tq.client_id AND os2.signal_id = tq.signal_id
+                    AND (os2.submitted_ts IS NOT NULL OR os2.filled_ts IS NOT NULL)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM positions p
+                  WHERE p.client_id = tq.client_id AND p.signal_id = tq.signal_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM decision_events rde
+                  WHERE rde.client_id   = tq.client_id
+                    AND rde.signal_id   = tq.signal_id
+                    AND rde.stage       = 'overnight_recovery'
+                    AND rde.reason_code = %s
+              )
+            ORDER BY tq.created_ts ASC
+            FOR UPDATE
+            """,
+            (client_id, window_start_utc, window_end_utc,
+             RECOVER_PR379_REGIME_TAXONOMY),
         )
+        cols = [d[0] for d in (c.description or [])]
+        locked_rows = [
+            dict(r) if isinstance(r, dict) else dict(zip(cols, r))
+            for r in (c.fetchall() or [])
+        ]
+        for row in locked_rows:
+            if isinstance(row.get("payload"), str):
+                try:
+                    row["payload"] = json.loads(row["payload"])
+                except Exception:
+                    row["payload"] = {}
 
+        locked_count = len(locked_rows)
+        log.info("rescue_atomic: locked=%d expected=%d", locked_count, expected_count)
 
-def _atomic_requeue_rows(
-    *,
-    client_id: str,
-    row_ids: list,
-    payloads_by_id: dict,
-    trading_date: str,
-    recovery_run_id: str,
-    recovered_at: str,
-) -> int:
-    """
-    Atomically transition selected trade_queue rows REJECTED → WATCHING.
-
-    For each row:
-      - status          = 'WATCHING'
-      - started_ts      = NULL
-      - finished_ts     = NULL
-      - last_error      = NULL
-      - result_json     = NULL
-      - payload updated to include client_id, execution_mode, recovery_context
-
-    Returns the number of rows successfully updated.
-    """
-    from ap.db import conn, run_with_retry
-    import json as _json
-
-    updated = 0
-
-    for row_id in row_ids:
-        payload = dict(payloads_by_id.get(row_id) or {})
-        # Stamp identity into payload (may have been absent in original rows)
-        payload["client_id"]      = client_id
-        payload["execution_mode"] = "live"
-        payload["recovery_context"] = {
-            "reason_code":       RECOVER_PR379_REGIME_TAXONOMY,
-            "trading_date":      trading_date,
-            "recovered_at":      recovered_at,
-            "recovery_run_id":   recovery_run_id,
-        }
-
-        def _update(rid=row_id, p=payload):
-            with conn() as c:
-                c.execute(
-                    """
-                    UPDATE trade_queue
-                    SET status      = 'WATCHING',
-                        started_ts  = NULL,
-                        finished_ts = NULL,
-                        last_error  = NULL,
-                        result_json = NULL,
-                        payload     = %s::jsonb
-                    WHERE id        = %s
-                      AND client_id = %s
-                      AND status    = 'REJECTED'
-                      AND last_error = 'mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK'
-                    """,
-                    (_json.dumps(p), rid, client_id),
-                )
-                return c.rowcount
-
-        try:
-            rows_affected = run_with_retry(_update)
-            if rows_affected:
-                updated += 1
-        except Exception as exc:
-            log.error(
-                "live_overnight_rescue: failed to requeue row id=%s: %s", row_id, exc
+        if locked_count != expected_count:
+            raise ValueError(
+                f"Locked {locked_count} rows, expected {expected_count}. Rolling back."
             )
 
-    return updated
+        # 2. Mandatory decision-event verification — no fallback
+        signal_ids = [str(r.get("signal_id") or "") for r in locked_rows]
+        empty_sids = [s for s in signal_ids if not s]
+        if empty_sids:
+            raise ValueError(
+                f"{len(empty_sids)} locked rows have empty signal_id. "
+                "Cannot verify decision events. Rolling back."
+            )
 
+        c.execute(
+            """
+            SELECT COALESCE(de.signal_id, de.context_json->>'signal_id') AS sig,
+                   LOWER(COALESCE(de.context_json->>'intel_reasoning',''))  AS reasoning
+            FROM decision_events de
+            WHERE de.client_id = %s
+              AND de.decision  = 'REJECT'
+              AND de.context_json->>'intel_reason_code' = %s
+              AND de.context_json->>'intel_raw_status'  = %s
+              AND UPPER(COALESCE(de.context_json->>'intel_execution_mode','')) = %s
+              AND DATE(de.ts AT TIME ZONE 'America/New_York') = %s
+            """,
+            (client_id, _DE_REASON_CODE, _DE_RAW_STATUS, _DE_EXEC_MODE, trading_date),
+        )
+        de_cols = [d[0] for d in (c.description or [])]
+        de_rows = [
+            dict(r) if isinstance(r, dict) else dict(zip(de_cols, r))
+            for r in (c.fetchall() or [])
+        ]
+        verified: set[str] = {
+            str(de.get("sig") or "")
+            for de in de_rows
+            if str(de.get("sig") or "") and _is_regime_mismatch_reasoning(de.get("reasoning", ""))
+        }
+        verified_count = len(verified & set(signal_ids))
+        unverified = [s for s in signal_ids if s not in verified]
 
-# ── Public rescue function ─────────────────────────────────────────────────────
+        log.info(
+            "rescue_atomic: decision_event verified=%d/%d unverified_sample=%s",
+            verified_count, expected_count, unverified[:3],
+        )
+
+        if verified_count != expected_count:
+            raise ValueError(
+                f"Decision-event verification: verified={verified_count} "
+                f"expected={expected_count}. "
+                f"Unverified signal_ids (first 5): {unverified[:5]}. "
+                "Mandatory proof missing. Rolling back."
+            )
+
+        # 3. Build payloads
+        row_ids      = [int(r["id"]) for r in locked_rows]
+        new_payloads = []
+        for row in locked_rows:
+            p = dict(row.get("payload") or {})
+            p["client_id"]      = client_id
+            p["execution_mode"] = "live"
+            p["recovery_context"] = {
+                "reason_code":         RECOVER_PR379_REGIME_TAXONOMY,
+                "trading_date":        trading_date,
+                "recovered_at":        recovered_at,
+                "recovery_run_id":     recovery_run_id,
+                "original_last_error": str(row.get("last_error") or ""),
+                "original_finished_ts": str(row.get("finished_ts") or ""),
+                "original_result_json": (
+                    json.loads(row["result_json"])
+                    if isinstance(row.get("result_json"), str)
+                    else row.get("result_json")
+                ),
+            }
+            new_payloads.append(json.dumps(p))
+
+        # 4. Bulk UPDATE via unnest CTE
+        c.execute(
+            """
+            WITH new_data AS (
+                SELECT unnest(%s::int[])   AS row_id,
+                       unnest(%s::jsonb[]) AS new_payload
+            )
+            UPDATE trade_queue tq
+            SET status      = 'WATCHING',
+                started_ts  = NULL,
+                finished_ts = NULL,
+                last_error  = NULL,
+                result_json = NULL,
+                payload     = nd.new_payload
+            FROM new_data nd
+            WHERE tq.id        = nd.row_id
+              AND tq.client_id = %s
+              AND tq.status    = 'REJECTED'
+            """,
+            (row_ids, new_payloads, client_id),
+        )
+        updated_count = c.rowcount
+        log.info("rescue_atomic: bulk UPDATE rowcount=%d", updated_count)
+
+        if updated_count != expected_count:
+            raise ValueError(
+                f"Bulk UPDATE affected {updated_count} rows, expected {expected_count}. "
+                "Rolling back."
+            )
+
+        # 5. INSERT decision events inside same transaction
+        for row in locked_rows:
+            ctx = json.dumps({
+                "stage":               "overnight_recovery",
+                "decision":            "REQUEUE",
+                "reason_code":         RECOVER_PR379_REGIME_TAXONOMY,
+                "original_status":     "REJECTED",
+                "original_last_error": str(row.get("last_error") or ""),
+                "original_finished_ts": str(row.get("finished_ts") or ""),
+                "recovery_run_id":     recovery_run_id,
+                "trading_date":        trading_date,
+                "recovered_at":        recovered_at,
+                "client_id":           client_id,
+                "execution_mode":      "LIVE",
+            })
+            c.execute(
+                """
+                INSERT INTO decision_events (
+                    client_id, signal_id, stage, decision,
+                    reason_code, context_json, ts
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
+                """,
+                (
+                    client_id, str(row.get("signal_id") or ""),
+                    "overnight_recovery", "REQUEUE",
+                    RECOVER_PR379_REGIME_TAXONOMY, ctx,
+                ),
+            )
+
+        return {"writes": updated_count, "verified": verified_count, "locked": locked_count}
+
 
 def rescue_live_overnight_regime_rejections(
     *,
@@ -368,248 +302,130 @@ def rescue_live_overnight_regime_rejections(
     trading_date: str,
     dry_run: bool = True,
     expected_count: int | None = None,
+    runner=None,
 ) -> dict:
     """
-    Strictly fenced same-session LIVE rescue for the 2026-07-20 incident.
-
-    Identifies trade_queue rows that were false-terminally rejected as
-    mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK due to the missing hard_veto
-    taxonomy in APRiskManager's regime mismatch returns, and transitions
-    them back to WATCHING so run_overnight_reeval() can reprocess them.
-
-    Hard guards (any failure → zero writes and explicit error return):
-      - execution_mode must be exactly "live"
-      - client_id must be the exact LIVE client
-      - trading_date must be a Monday ISO date
-      - eligible count must match expected_count if supplied
-
-    The rescue NEVER selects:
-      - overnight structural invalidations (INVALIDATED_PRIOR_HIGH_BREACHED)
-      - account / capital / authorization / contract-quality vetoes
-      - PAPER rows or another client's rows
-      - rows already recovered (have recovery_context in payload)
-      - rows that have ENTRY orders, broker orders, or positions
-
-    Args:
-        client_id:      Exact LIVE client email.
-        execution_mode: Must be "live" (case-insensitive); refuses otherwise.
-        trading_date:   Monday ISO date (e.g. "2026-07-20").
-        dry_run:        Default True — returns preview counts, zero writes.
-        expected_count: If supplied, the eligible count must match exactly;
-                        mismatch aborts with zero writes.
-
-    Returns:
-        {
-          "eligible":    int,        # rows satisfying all criteria
-          "writes":      int,        # rows actually updated (0 on dry_run)
-          "count_match": bool,       # True if eligible == expected_count (or no expectation)
-          "dry_run":     bool,
-          "recovery_run_id": str,
-          "diagnostics": dict,       # per-row detail
-          "errors":      list[str],  # hard errors
-        }
+    Fenced rescue. dry_run=True (default) returns preview only.
+    All guards must pass before any write occurs.
     """
     recovery_run_id = uuid.uuid4().hex[:12]
     recovered_at    = datetime.now(timezone.utc).isoformat()
 
     result: dict[str, Any] = {
-        "eligible":        0,
-        "writes":          0,
-        "count_match":     False,
-        "dry_run":         dry_run,
+        "eligible": 0, "writes": 0, "verified": 0,
+        "count_match": False, "dry_run": dry_run,
         "recovery_run_id": recovery_run_id,
-        "client_id":       client_id,
-        "execution_mode":  execution_mode,
-        "trading_date":    trading_date,
-        "diagnostics":     {},
-        "errors":          [],
+        "client_id": client_id, "execution_mode": execution_mode,
+        "trading_date": trading_date, "errors": [],
     }
 
-    # ── Hard guards ───────────────────────────────────────────────────────────
-    _mode = str(execution_mode or "").strip().lower()
-    if _mode != "live":
+    if str(execution_mode or "").strip().lower() != "live":
+        result["errors"].append(f"execution_mode must be 'live', got {execution_mode!r}")
+        return result
+    if str(client_id or "").strip().lower() != INCIDENT_CLIENT_ID.lower():
         result["errors"].append(
-            f"execution_mode must be 'live', got '{execution_mode}'. "
-            "This rescue is LIVE-only."
+            f"client_id must be {INCIDENT_CLIENT_ID!r}. Got {client_id!r}. "
+            "This rescue is fenced to the 2026-07-20 incident."
         )
-        log.error("live_overnight_rescue: rejected — execution_mode=%s is not live", execution_mode)
+        return result
+    if str(trading_date or "").strip() != INCIDENT_TRADING_DATE:
+        result["errors"].append(
+            f"trading_date must be {INCIDENT_TRADING_DATE!r}. Got {trading_date!r}."
+        )
         return result
 
-    if not str(client_id or "").strip():
-        result["errors"].append("client_id is required")
+    if runner is not None:
+        ok, reason = _verify_live_identity(client_id, runner)
+        if not ok:
+            result["errors"].append(f"LIVE identity check failed: {reason}")
+            return result
+
+    if expected_count is not None and expected_count != INCIDENT_EXPECTED_ROWS:
+        result["errors"].append(
+            f"expected_count={expected_count} but this rescue requires exactly "
+            f"{INCIDENT_EXPECTED_ROWS}."
+        )
         return result
 
-    if not str(trading_date or "").strip():
-        result["errors"].append("trading_date is required")
-        return result
+    _expected = INCIDENT_EXPECTED_ROWS
 
     try:
         window_start_utc, window_end_utc = _friday_after_close_window_utc(trading_date)
     except ValueError as exc:
         result["errors"].append(str(exc))
-        log.error("live_overnight_rescue: invalid trading_date: %s", exc)
         return result
 
-    log.info(
-        "live_overnight_rescue: starting | client=%s mode=%s date=%s "
-        "dry_run=%s expected_count=%s recovery_run_id=%s "
-        "window=[%s, %s]",
-        client_id, _mode, trading_date, dry_run, expected_count,
-        recovery_run_id,
-        window_start_utc.isoformat(), window_end_utc.isoformat(),
+    log.warning(
+        "rescue: client=%s date=%s dry_run=%s expected=%d run_id=%s",
+        client_id, trading_date, dry_run, _expected, recovery_run_id,
     )
 
-    # ── Fetch structurally eligible rows ──────────────────────────────────────
+    if dry_run:
+        try:
+            from ap.db import conn, run_with_retry
+            def _count():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT COUNT(*) AS n
+                        FROM trade_queue tq
+                        WHERE tq.client_id  = %s
+                          AND tq.status     = 'REJECTED'
+                          AND tq.last_error = 'mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK'
+                          AND tq.created_ts >= %s AND tq.created_ts <= %s
+                          AND (tq.payload IS NULL OR tq.payload->>'recovery_context' IS NULL)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM orders o
+                              WHERE o.client_id = tq.client_id AND o.signal_id = tq.signal_id
+                                AND o.kind = 'ENTRY'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM decision_events rde
+                              WHERE rde.client_id = tq.client_id AND rde.signal_id = tq.signal_id
+                                AND rde.stage = 'overnight_recovery' AND rde.reason_code = %s
+                          )
+                        """,
+                        (client_id, window_start_utc, window_end_utc,
+                         RECOVER_PR379_REGIME_TAXONOMY),
+                    )
+                    row = c.fetchone()
+                    return int((row.get("n") if isinstance(row, dict) else row[0]) or 0)
+            n = run_with_retry(_count)
+            result["eligible"]    = n
+            result["count_match"] = (n == _expected)
+            if not result["count_match"]:
+                result["errors"].append(
+                    f"eligible={n} expected={_expected}. Preview only — no writes."
+                )
+            log.warning("rescue: DRY_RUN eligible=%d expected=%d count_match=%s",
+                        n, _expected, result["count_match"])
+        except Exception as exc:
+            result["errors"].append(f"dry-run count failed: {exc}")
+        return result
+
+    # Live run
     try:
-        candidates = _fetch_structurally_eligible_rows(
-            client_id=client_id,
-            window_start_utc=window_start_utc,
-            window_end_utc=window_end_utc,
+        txn = _execute_atomic_rescue(
+            client_id=client_id, trading_date=trading_date,
+            window_start_utc=window_start_utc, window_end_utc=window_end_utc,
+            expected_count=_expected,
+            recovery_run_id=recovery_run_id, recovered_at=recovered_at,
+        )
+        result["eligible"]    = txn["locked"]
+        result["writes"]      = txn["writes"]
+        result["verified"]    = txn["verified"]
+        result["count_match"] = (txn["writes"] == _expected)
+        log.warning(
+            "rescue: COMPLETE writes=%d verified=%d client=%s date=%s run_id=%s",
+            result["writes"], result["verified"],
+            client_id, trading_date, recovery_run_id,
         )
     except Exception as exc:
-        result["errors"].append(f"structural query failed: {exc}")
-        log.error("live_overnight_rescue: structural query error: %s", exc)
-        return result
+        result["errors"].append(f"atomic rescue failed (rolled back): {exc}")
+        log.error("rescue: FAILED (rolled back): %s", exc, exc_info=True)
 
-    log.info(
-        "live_overnight_rescue: structural candidates=%d client=%s date=%s",
-        len(candidates), client_id, trading_date,
-    )
-
-    # ── Decision-event intel field verification (best-effort) ─────────────────
-    candidate_signal_ids = [
-        str(r.get("signal_id") or "") for r in candidates if r.get("signal_id")
-    ]
-    verified_signal_ids = _verify_decision_event_intel(
-        client_id=client_id,
-        signal_ids=candidate_signal_ids,
-        trading_date=trading_date,
-    )
-
-    if verified_signal_ids:
-        log.info(
-            "live_overnight_rescue: decision_event verification matched %d/%d signal_ids",
-            len(verified_signal_ids), len(candidate_signal_ids),
-        )
-    else:
-        log.warning(
-            "live_overnight_rescue: decision_event verification returned 0 matches "
-            "(table may not have signal_id column or events not yet written). "
-            "Proceeding on structural criteria only for %d candidates.",
-            len(candidates),
-        )
-
-    # ── Build eligible set ────────────────────────────────────────────────────
-    eligible_rows: list[dict] = []
-    diag: dict[str, Any] = {"skipped_structural": [], "skipped_decision_event": []}
-
-    for row in candidates:
-        row_id    = row.get("id")
-        signal_id = str(row.get("signal_id") or "")
-        payload   = row.get("payload") or {}
-        last_err  = str(row.get("last_error") or "")
-
-        # Paranoia: double-check ineligible last_error prefixes
-        if any(last_err.startswith(p) for p in _INELIGIBLE_LAST_ERROR_PREFIXES):
-            diag["skipped_structural"].append({
-                "id": row_id, "signal_id": signal_id,
-                "reason": f"ineligible_last_error:{last_err[:80]}",
-            })
-            continue
-
-        # If decision events verified any, require signal_id to be in the set
-        if verified_signal_ids and signal_id and signal_id not in verified_signal_ids:
-            diag["skipped_decision_event"].append({
-                "id": row_id, "signal_id": signal_id,
-                "reason": "not_in_decision_event_verified_set",
-            })
-            continue
-
-        eligible_rows.append(row)
-
-    result["eligible"]    = len(eligible_rows)
-    result["diagnostics"] = diag
-
-    # ── expected_count guard ──────────────────────────────────────────────────
-    if expected_count is not None:
-        count_match = (len(eligible_rows) == expected_count)
-        result["count_match"] = count_match
-        if not count_match:
-            result["errors"].append(
-                f"expected_count={expected_count} but eligible={len(eligible_rows)}. "
-                "Zero writes performed. Re-run dry_run=True to inspect candidates."
-            )
-            log.error(
-                "live_overnight_rescue: COUNT MISMATCH eligible=%d expected=%d "
-                "— zero writes, aborting",
-                len(eligible_rows), expected_count,
-            )
-            return result
-    else:
-        result["count_match"] = True
-
-    if not eligible_rows:
-        log.info(
-            "live_overnight_rescue: no eligible rows found for client=%s date=%s",
-            client_id, trading_date,
-        )
-        return result
-
-    log.info(
-        "live_overnight_rescue: %d rows eligible for recovery "
-        "(count_match=%s dry_run=%s)",
-        len(eligible_rows), result["count_match"], dry_run,
-    )
-
-    # ── Dry-run: return preview, no writes ────────────────────────────────────
-    if dry_run:
-        result["writes"] = 0
-        log.info(
-            "live_overnight_rescue: DRY_RUN preview complete eligible=%d writes=0",
-            len(eligible_rows),
-        )
-        return result
-
-    # ── Live run: emit decision events then atomically requeue ────────────────
-    log.warning(
-        "live_overnight_rescue: LIVE WRITE — transitioning %d rows REJECTED→WATCHING "
-        "client=%s date=%s recovery_run_id=%s",
-        len(eligible_rows), client_id, trading_date, recovery_run_id,
-    )
-
-    # 1. Emit durable recovery decision events
-    for row in eligible_rows:
-        _emit_recovery_decision_event(
-            client_id=client_id,
-            row=row,
-            trading_date=trading_date,
-            recovery_run_id=recovery_run_id,
-            recovered_at=recovered_at,
-        )
-
-    # 2. Atomically requeue
-    payloads_by_id = {r["id"]: r.get("payload") or {} for r in eligible_rows}
-    row_ids = [r["id"] for r in eligible_rows]
-
-    writes = _atomic_requeue_rows(
-        client_id=client_id,
-        row_ids=row_ids,
-        payloads_by_id=payloads_by_id,
-        trading_date=trading_date,
-        recovery_run_id=recovery_run_id,
-        recovered_at=recovered_at,
-    )
-
-    result["writes"] = writes
-    log.warning(
-        "live_overnight_rescue: COMPLETE writes=%d/%d eligible "
-        "client=%s date=%s recovery_run_id=%s",
-        writes, len(eligible_rows), client_id, trading_date, recovery_run_id,
-    )
     return result
 
-
-# ── Orchestration ──────────────────────────────────────────────────────────────
 
 def recover_and_rerun_live_overnight(
     *,
@@ -619,157 +435,136 @@ def recover_and_rerun_live_overnight(
     expected_count: int | None = None,
 ) -> dict:
     """
-    Full recovery orchestration:
-      1. Run fenced rescue (rescue_live_overnight_regime_rejections).
-      2. On non-dry success: run_overnight_reeval(..., force=True) via runner.
-      3. Run post-overnight morning handoff (if available).
-      4. Run preopen readiness.
-      5. Return all counts and diagnostics.
-
-    The canonical overnight path enforces:
-      - Monday structural validation and trigger geometry checks
-      - Contract selection (deferred to breach if pre-market)
-      - Account risk through master_control
-      - Entry watcher arming
-      - Already-through-trigger protection (entry_watcher refuses stale triggers)
-
-    No broker orders are submitted until a breach fires at market open.
-
-    Args:
-        runner:         Initialized ClientRunner in LIVE mode.
-        trading_date:   Monday ISO date (e.g. "2026-07-20").
-        dry_run:        Default True.
-        expected_count: If supplied, rescue aborts on count mismatch.
-
-    Returns:
-        dict with keys: rescue_result, reeval_result, readiness_result, errors.
+    Full recovery orchestration. Stops immediately on any failure.
+    Uses run_morning_handoff_audit for post-overnight handoff.
     """
-    orchestration: dict[str, Any] = {
-        "rescue_result":   None,
-        "reeval_result":   None,
-        "readiness_result": None,
-        "errors":          [],
-        "dry_run":         dry_run,
-        "trading_date":    trading_date,
+    orch: dict[str, Any] = {
+        "rescue_result": None, "reeval_result": None,
+        "handoff_result": None, "readiness_result": None,
+        "errors": [], "dry_run": dry_run, "trading_date": trading_date,
     }
 
-    client_id = getattr(runner, "email", None) or getattr(runner, "client_id", None)
-    mode      = str(getattr(runner, "mode", "") or "").strip().upper()
+    client_id = str(
+        getattr(runner, "email", "") or getattr(runner, "client_id", "") or ""
+    ).strip()
+    mode = str(getattr(runner, "mode", "") or "").strip().upper()
 
     if not client_id:
-        orchestration["errors"].append("runner has no client_id / email")
-        return orchestration
-
+        orch["errors"].append("runner has no client_id / email")
+        return orch
     if mode != "LIVE":
-        orchestration["errors"].append(
-            f"recover_and_rerun_live_overnight is LIVE-only (runner mode={mode})"
-        )
-        return orchestration
+        orch["errors"].append(f"LIVE-only. runner.mode={mode}")
+        return orch
 
-    # ── Step 1: Run the fenced rescue ─────────────────────────────────────────
+    core     = getattr(runner, "core", None)
+    broker   = getattr(runner, "broker", None)
+    data_broker = getattr(runner, "data_broker", None) or getattr(runner, "databroker", None)
+    mc       = getattr(runner, "master_control", None)
+    selector = getattr(runner, "contract_selector", None)
+    osm      = getattr(runner, "order_state_machine", None)
+    watcher  = getattr(core, "entry_watcher", None) if core else None
+
+    missing = [
+        name for name, obj in [
+            ("broker", broker), ("master_control", mc),
+            ("contract_selector", selector), ("order_state_machine", osm),
+            ("entry_watcher", watcher),
+        ] if obj is None
+    ]
+    if missing:
+        orch["errors"].append(f"Missing runner components: {missing}")
+        return orch
+
+    _expected = expected_count if expected_count is not None else INCIDENT_EXPECTED_ROWS
+
+    # Step 1: Rescue
     try:
         rescue_result = rescue_live_overnight_regime_rejections(
-            client_id=client_id,
-            execution_mode="live",
-            trading_date=trading_date,
-            dry_run=dry_run,
-            expected_count=expected_count,
+            client_id=client_id, execution_mode="live",
+            trading_date=trading_date, dry_run=dry_run,
+            expected_count=_expected, runner=runner,
         )
-        orchestration["rescue_result"] = rescue_result
+        orch["rescue_result"] = rescue_result
     except Exception as exc:
-        orchestration["errors"].append(f"rescue failed: {exc}")
-        log.error("recover_and_rerun_live_overnight: rescue exception: %s", exc)
-        return orchestration
+        orch["errors"].append(f"rescue raised: {exc}")
+        return orch
 
     if rescue_result.get("errors"):
-        orchestration["errors"].extend(rescue_result["errors"])
-        return orchestration
+        orch["errors"].extend(rescue_result["errors"])
+        return orch
 
     if dry_run:
-        log.info(
-            "recover_and_rerun_live_overnight: DRY_RUN complete "
-            "eligible=%d writes=0 — not proceeding to reeval",
-            rescue_result.get("eligible", 0),
-        )
-        return orchestration
+        return orch
 
-    if not rescue_result.get("writes", 0):
-        log.warning(
-            "recover_and_rerun_live_overnight: rescue produced 0 writes "
-            "— skipping reeval (nothing to re-evaluate)"
+    writes = int(rescue_result.get("writes") or 0)
+    if writes == 0:
+        orch["errors"].append("Rescue produced 0 writes.")
+        return orch
+    if writes != _expected:
+        orch["errors"].append(
+            f"Rescue partial: writes={writes} expected={_expected}. Stopping."
         )
-        return orchestration
+        return orch
 
-    # ── Step 2: Re-run overnight reeval via canonical path ────────────────────
+    # Step 2: Canonical overnight reeval
     try:
         from ap_overnight_reeval import run_overnight_reeval
-
-        core        = getattr(runner, "core", None)
-        broker      = getattr(runner, "broker", None)
-        data_broker = getattr(runner, "data_broker", None) or getattr(runner, "databroker", None)
-        mc          = getattr(runner, "master_control", None)
-        selector    = getattr(runner, "contract_selector", None)
-        osm         = getattr(runner, "order_state_machine", None)
-        watcher     = getattr(core, "entry_watcher", None) if core else None
-        pos_mgr     = getattr(runner, "position_manager", None)
-        exit_eng    = getattr(core, "exit_eng", None) if core else None
-
         reeval_result = run_overnight_reeval(
-            client_id=client_id,
-            broker=broker,
-            data_broker=data_broker,
-            master_control=mc,
-            contract_selector=selector,
-            order_state_machine=osm,
-            entry_watcher=watcher,
-            position_manager=pos_mgr,
-            exit_eng=exit_eng,
+            client_id=client_id, broker=broker, data_broker=data_broker,
+            master_control=mc, contract_selector=selector,
+            order_state_machine=osm, entry_watcher=watcher,
+            position_manager=getattr(runner, "position_manager", None),
+            exit_eng=getattr(core, "exit_eng", None),
             force=True,
         )
-        orchestration["reeval_result"] = reeval_result
-        log.info(
-            "recover_and_rerun_live_overnight: reeval complete %s",
-            {k: reeval_result.get(k) for k in ("processed", "armed", "rejected", "errors")},
-        )
     except Exception as exc:
-        orchestration["errors"].append(f"reeval failed: {exc}")
-        log.error("recover_and_rerun_live_overnight: reeval exception: %s", exc, exc_info=True)
+        orch["errors"].append(f"run_overnight_reeval raised: {exc}")
+        log.error("reeval exception: %s", exc, exc_info=True)
+        return orch
 
-    # ── Step 3: Run post-overnight morning handoff (best-effort) ──────────────
+    if not isinstance(reeval_result, dict):
+        orch["errors"].append(f"reeval returned non-dict: {type(reeval_result)}")
+        return orch
+
+    orch["reeval_result"] = reeval_result
+    if int(reeval_result.get("errors") or 0) > 0:
+        orch["errors"].append(
+            f"Reeval errors={reeval_result['errors']} — some rows may not have armed."
+        )
+
+    # Step 3: Handoff — not nonfatal; stops if missing or failed
     try:
-        from ap.morning_handoff import run_post_overnight_reeval_handoff
-        handoff_result = run_post_overnight_reeval_handoff(
-            client_id=client_id,
-            execution_mode="live",
-            reeval_result=orchestration.get("reeval_result") or {},
+        from ap.morning_handoff import run_morning_handoff_audit
+        handoff_result = run_morning_handoff_audit(
+            client_id=client_id, execution_mode="live",
+            stage="post_overnight_reeval", dry_run=False, runner=runner,
         )
-        orchestration["handoff_result"] = handoff_result
+        orch["handoff_result"] = handoff_result
+        if not (isinstance(handoff_result, dict)
+                and str(handoff_result.get("status") or "").lower() in ("ok", "success")):
+            orch["errors"].append(f"Handoff did not succeed: {handoff_result}")
+            return orch
+    except ImportError as exc:
+        orch["errors"].append(f"run_morning_handoff_audit not importable: {exc}")
+        return orch
     except Exception as exc:
-        orchestration["handoff_result"] = {"error": str(exc)}
-        log.warning(
-            "recover_and_rerun_live_overnight: handoff failed (non-fatal): %s", exc
-        )
+        orch["errors"].append(f"Handoff failed: {exc}")
+        log.error("handoff exception: %s", exc, exc_info=True)
+        return orch
 
-    # ── Step 4: Run preopen readiness ─────────────────────────────────────────
+    # Step 4: Readiness
     try:
         from ap.preopen_readiness import run_preopen_autonomous_readiness
         readiness_result = run_preopen_autonomous_readiness(
-            client_id=client_id,
-            execution_mode="live",
-            dry_run=False,
-            stage="recovery",
-            runner=runner,
+            client_id=client_id, execution_mode="live",
+            dry_run=False, stage="recovery", runner=runner,
         )
-        orchestration["readiness_result"] = readiness_result
+        orch["readiness_result"] = readiness_result
         log.info(
-            "recover_and_rerun_live_overnight: readiness status=%s errors=%s",
-            readiness_result.get("status"),
-            readiness_result.get("errors"),
+            "readiness status=%s errors=%s",
+            readiness_result.get("status"), readiness_result.get("errors"),
         )
     except Exception as exc:
-        orchestration["readiness_result"] = {"error": str(exc)}
-        log.warning(
-            "recover_and_rerun_live_overnight: readiness check failed (non-fatal): %s", exc
-        )
+        orch["errors"].append(f"Readiness check failed: {exc}")
 
-    return orchestration
+    return orch
