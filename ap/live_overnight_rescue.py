@@ -51,6 +51,13 @@ INCIDENT_EXPECTED_ROWS = 53
 
 RECOVER_PR379_REGIME_TAXONOMY = "RECOVER_PR379_REGIME_TAXONOMY"
 
+# Incident-specific primary-key lower bound.
+# Production EXPLAIN ANALYZE: full table scan of 2,023,543 rows ≈ 20,798 ms.
+# With id >= 2014021 using decision_events_pkey: ≈ 148 ms.
+# Both CTEs add this predicate so the planner uses the PK index.
+# No migration needed — PK index already exists.
+INCIDENT_DECISION_EVENT_MIN_ID = 2014021
+
 # Exact stage/decision/reason_code/explanation for the false-veto events
 _DE_STAGE       = "blocked_intel"
 _DE_DECISION    = "REJECT"
@@ -157,18 +164,20 @@ def _build_rescue_population_sql(
 
     params: list[Any] = [
         # verified_events CTE
-        client_id,         # 1
-        _EXACT_REASONING,  # 2 — ANY(%s::text[])
-        de_ts_start,       # 3
-        de_ts_end,         # 4
+        client_id,                      # 1
+        _EXACT_REASONING,               # 2 — ANY(%s::text[])
+        de_ts_start,                    # 3
+        de_ts_end,                      # 4
+        INCIDENT_DECISION_EVENT_MIN_ID, # 5 — id >= (PK index)
         # recovered_events CTE
-        client_id,         # 5
-        RECOVER_PR379_REGIME_TAXONOMY,  # 6
-        recovery_ts_lower, # 7
+        client_id,                      # 6
+        RECOVER_PR379_REGIME_TAXONOMY,  # 7
+        recovery_ts_lower,              # 8
+        INCIDENT_DECISION_EVENT_MIN_ID, # 9 — id >= (PK index)
         # trade_queue WHERE
-        client_id,         # 8
-        tq_window_start_utc, # 9
-        tq_window_end_utc,   # 10
+        client_id,                      # 10
+        tq_window_start_utc,            # 11
+        tq_window_end_utc,              # 12
     ]
 
     sql = """
@@ -186,6 +195,7 @@ def _build_rescue_population_sql(
               AND context_json->>'intel_reasoning' = ANY(%s::text[])
               AND ts >= %s
               AND ts <  %s
+              AND id  >= %s
         ),
         recovered_events AS MATERIALIZED (
             SELECT DISTINCT split_part(candidate_id, ':', 2) AS original_signal_id
@@ -195,6 +205,7 @@ def _build_rescue_population_sql(
               AND reason_code = %s
               AND split_part(candidate_id, ':', 1) = 'RECOVER'
               AND ts >= %s
+              AND id >= %s
         )
         {{select_clause}}
         FROM trade_queue tq
