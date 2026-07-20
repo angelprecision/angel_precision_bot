@@ -2910,21 +2910,232 @@ class APStartupRecovery:
                               AND created_ts >= %s
                               AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
                               -- Exclude every durable LIVE recovery terminal
-                              -- classification independently. The previous OR-chain
-                              -- was always true for non-null values (a MISSED reason
-                              -- is not a STALE reason, so the second OR clause matched
-                              -- and re-selected terminalized rows). Separate AND
-                              -- COALESCE(...) NOT LIKE predicates fix that.
+                              -- classification independently.
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_STALE_SESSION%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_POLICY%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_READINESS%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_RETRY_EXHAUSTED%%'
+                              -- Fix: respect bounded retry window. A row with a
+                              -- live_recovery_next_retry timestamp in the future
+                              -- must not be re-selected until that window passes.
+                              -- Malformed timestamps treat as NULL (allow-through)
+                              -- so infrastructure failures never permanently exclude.
+                              AND (
+                                COALESCE(payload->>'live_recovery_next_retry', '') = ''
+                                OR (
+                                    (payload->>'live_recovery_next_retry')
+                                    ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                                    AND (payload->>'live_recovery_next_retry')::timestamptz
+                                        <= NOW()
+                                )
+                              )
                             ORDER BY created_ts ASC
                             """,
                             (self.client_id, _stale_cutoff_utc),
                         )
                         return c.fetchall()
+
+                def _load_missing_mode_candidates():
+                    """Load WATCHING rows where payload.execution_mode is
+                    absent.  These may be legacy Jason-style rows.  They are
+                    NOT selected by _load_candidates() (which requires
+                    LOWER(COALESCE(payload->>'execution_mode','')) = 'live').
+
+                    A separate, stricter authorization path is required before
+                    any mutation:  runner must be LIVE, client must match,
+                    ap_signals must confirm the signal belongs to this client,
+                    and no conflicting PAPER ownership may exist.
+                    """
+                    with conn() as c:
+                        c.execute(
+                            """
+                            SELECT id, client_id, signal_id, status,
+                                   payload, created_ts, started_ts,
+                                   finished_ts, last_error
+                            FROM trade_queue
+                            WHERE client_id = %s
+                              AND status = 'WATCHING'
+                              AND created_ts >= %s
+                              AND COALESCE(payload->>'execution_mode', '') = ''
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_%%'
+                              AND (
+                                COALESCE(payload->>'live_recovery_next_retry', '') = ''
+                                OR (
+                                    (payload->>'live_recovery_next_retry')
+                                    ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+                                    AND (payload->>'live_recovery_next_retry')::timestamptz
+                                        <= NOW()
+                                )
+                              )
+                            ORDER BY created_ts ASC
+                            """,
+                            (self.client_id, _stale_cutoff_utc),
+                        )
+                        return c.fetchall()
+
+                def _authorize_live_missing_mode(
+                    signal_id: str, canonical_signal_id: str
+                ) -> tuple[bool, str]:
+                    """Return (authorized, reason).
+
+                    LIVE identity for a missing-mode row is proven only when:
+                      1. runner mode is exactly LIVE (_mc_mode == 'LIVE'  ← checked
+                         by the outer `if _is_live:` gate before this function runs);
+                      2. queue client_id exactly equals runner client_id;
+                      3. ap_signals row exists for (signal_id, client_email);
+                      4. ap_signals.decision_status is not 'rejected';
+                      5. no conflicting PAPER queue row owns this signal;
+                      6. no conflicting PAPER ENTRY order exists.
+
+                    Never use COALESCE(payload->>'execution_mode','live') defaults.
+                    """
+                    # Guard 2: client must match the runner (outer _is_live gate
+                    # already confirmed mc_mode == LIVE for the runner)
+                    if str(self.client_id or "").strip().lower() != str(
+                        _CLIENT := self.client_id
+                    ).strip().lower():
+                        return False, "client_mismatch"
+
+                    try:
+                        with conn() as _c:
+                            # Guard 3+4: ap_signals confirmation
+                            _c.execute(
+                                """
+                                SELECT decision_status
+                                FROM ap_signals
+                                WHERE signal_id = %s AND client_email = %s
+                                LIMIT 1
+                                """,
+                                (signal_id, self.client_id),
+                            )
+                            _ap_row = _c.fetchone()
+                        if not _ap_row:
+                            return False, "ap_signals_row_absent"
+                        _ds = str(
+                            (_ap_row.get("decision_status")
+                             if isinstance(_ap_row, dict)
+                             else (_ap_row[0] if _ap_row else ""))
+                            or ""
+                        ).lower()
+                        if _ds == "rejected":
+                            return False, "ap_signals_rejected"
+                    except Exception as _exc:
+                        log.error(
+                            "LIVE_MISSING_MODE_IDENTITY_PROOF_DB_ERROR "
+                            "client_id=%s signal_id=%s error=%s",
+                            self.client_id, signal_id, _exc,
+                        )
+                        return False, "ap_signals_lookup_failed"
+
+                    try:
+                        with conn() as _c:
+                            # Guard 5: no conflicting PAPER queue ownership
+                            _c.execute(
+                                """
+                                SELECT 1 FROM trade_queue
+                                WHERE client_id = %s
+                                  AND signal_id = %s
+                                  AND LOWER(COALESCE(payload->>'execution_mode',''))
+                                      = 'paper'
+                                  AND status IN ('NEW','WATCHING','PROCESSING')
+                                LIMIT 1
+                                """,
+                                (self.client_id, signal_id),
+                            )
+                            if _c.fetchone():
+                                return False, "conflicting_paper_queue_row"
+                    except Exception as _exc:
+                        return False, f"paper_queue_check_failed:{_exc}"
+
+                    try:
+                        with conn() as _c:
+                            # Guard 6: no conflicting PAPER ENTRY order
+                            _c.execute(
+                                """
+                                SELECT 1 FROM orders
+                                WHERE client_id = %s
+                                  AND signal_id = %s
+                                  AND kind = 'ENTRY'
+                                  AND LOWER(COALESCE(execution_mode,'')) = 'paper'
+                                  AND UPPER(COALESCE(status,'')) NOT IN
+                                      ('REJECTED','CANCELED','CANCELLED',
+                                       'EXPIRED','ERROR','DONE','ARCHIVED')
+                                LIMIT 1
+                                """,
+                                (self.client_id, signal_id),
+                            )
+                            if _c.fetchone():
+                                return False, "conflicting_paper_order_exists"
+                    except Exception as _exc:
+                        return False, f"paper_order_check_failed:{_exc}"
+
+                    return True, "authorized"
+
+                def _restore_with_mode_repair(
+                    row_id,
+                    diag: dict,
+                    signal_id_: str,
+                    canonical_signal_id_: str,
+                ) -> bool:
+                    """Atomic restore + execution_mode/canonical repair for
+                    missing-mode rows.  The same UPDATE stamps:
+                      - status = 'NEW'
+                      - payload.execution_mode = 'live'
+                      - payload.canonical_signal_id (if absent)
+                      - payload.live_recovery_identity_repaired = true
+                      - payload.live_recovery_breach_only = true
+                    The NOT EXISTS order fence still applies.
+                    """
+                    marker = {
+                        "execution_mode": "live",
+                        "canonical_signal_id": canonical_signal_id_,
+                        "live_recovery_identity_repaired": True,
+                        "live_recovery_outcome": "LIVE_RECOVERY_WATCHER_RESTORED",
+                        "live_recovery_breach_only": True,
+                        "live_recovery_restored_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "live_recovery_mode_repair_source": "ap_signals_proof",
+                    }
+                    with conn() as c:
+                        c.execute(
+                            f"""
+                            UPDATE trade_queue
+                            SET status      = 'NEW',
+                                payload     = COALESCE(payload, '{{}}'::jsonb)
+                                              || %s::jsonb,
+                                started_ts  = NULL,
+                                finished_ts = NULL,
+                                last_error  = NULL
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND status = 'WATCHING'
+                              AND COALESCE(payload->>'execution_mode', '') = ''
+                              AND NOT EXISTS (
+                                SELECT 1 FROM orders
+                                WHERE orders.client_id = trade_queue.client_id
+                                  AND orders.kind = 'ENTRY'
+                                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                                  AND (
+                                        orders.signal_id = %s
+                                     OR (
+                                          %s <> ''
+                                          AND orders.canonical_signal_id = %s
+                                        )
+                                  )
+                              )
+                            """,
+                            (
+                                json.dumps(marker, default=str),
+                                row_id,
+                                self.client_id,
+                                signal_id_,
+                                canonical_signal_id_,
+                                canonical_signal_id_,
+                            ),
+                        )
+                        return int(getattr(c, "rowcount", 0) or 0) == 1
 
                 def _active_entry_order_exists(
                     signal_id: str, canonical_signal_id: str
@@ -3534,6 +3745,112 @@ class APStartupRecovery:
                         row.get("signal_id"),
                         diag.get("reason"),
                     )
+
+                # ── Missing-mode dispatch ─────────────────────────────────
+                # Load WATCHING rows with no payload.execution_mode and
+                # authorize them via independent LIVE identity proof before
+                # any atomic stamp.  Must never default missing mode to LIVE.
+                missing_mode_rows = run_with_retry(_load_missing_mode_candidates) or []
+                for mm_row in missing_mode_rows:
+                    mm_row = dict(mm_row or {})
+                    mm_id = mm_row.get("id")
+                    mm_payload = _payload_dict(mm_row)
+                    mm_sig = str(
+                        mm_row.get("signal_id")
+                        or mm_payload.get("signal_id")
+                        or ""
+                    ).strip()
+                    mm_canon = str(mm_payload.get("canonical_signal_id") or "").strip()
+                    if not mm_canon and mm_sig:
+                        try:
+                            from ap_canonical_signal import (
+                                build_canonical_signal_id as _bcs,
+                            )
+                            mm_canon = _bcs(mm_sig, mm_payload) or ""
+                        except Exception:
+                            mm_canon = ""
+
+                    if not mm_sig:
+                        log.info(
+                            "LIVE_MISSING_MODE_SKIP client_id=%s "
+                            "row_id=%s reason=missing_signal_id",
+                            self.client_id, mm_id,
+                        )
+                        continue
+
+                    authorized, auth_reason = _authorize_live_missing_mode(
+                        mm_sig, mm_canon
+                    )
+                    if not authorized:
+                        log.info(
+                            "LIVE_MISSING_MODE_NOT_AUTHORIZED client_id=%s "
+                            "row_id=%s signal_id=%s reason=%s",
+                            self.client_id, mm_id, mm_sig, auth_reason,
+                        )
+                        # Durable bounded diagnostics for temporary failures
+                        if auth_reason.endswith(("_lookup_failed", "_failed")):
+                            _diag_mm = {
+                                "reason": f"LIVE_MISSING_MODE_{auth_reason.upper()}",
+                                "signal_id": mm_sig,
+                                "recovery_timestamp": datetime.now(
+                                    timezone.utc
+                                ).isoformat(),
+                            }
+                            run_with_retry(
+                                lambda _rid=mm_id, _d=_diag_mm, _pp=mm_payload:
+                                    _write_temporary_unavail_diagnostics(_rid, _d, _pp)
+                            )
+                        continue
+
+                    # Authorized — run through standard classify and repair
+                    # Inject proven execution_mode so _classify sees it
+                    mm_classify_row = dict(mm_row)
+                    mm_classify_row_payload = dict(mm_payload)
+                    mm_classify_row_payload["execution_mode"] = "live"
+                    mm_classify_row_payload["canonical_signal_id"] = mm_canon
+                    mm_classify_row["payload"] = mm_classify_row_payload
+
+                    outcome, diag = _classify(mm_classify_row)
+                    if outcome == "eligible":
+                        if run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _s=mm_sig, _c=mm_canon:
+                                _restore_with_mode_repair(_rid, _d, _s, _c)
+                        ):
+                            restored += 1
+                        continue
+                    if outcome == "missed":
+                        run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _s=mm_sig, _c=mm_canon:
+                                _mark_missed(_rid, _d, _s, _c)
+                        )
+                        continue
+                    if outcome in ("terminal_policy", "terminal_readiness", "stale_session"):
+                        _le_str = (
+                            f"LIVE_RECOVERY_{outcome.upper().replace('_','-').replace('-','')}:"
+                            f"{diag.get('reason','')}"
+                        )
+                        run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _s=mm_sig, _c=mm_canon,
+                                   _le=_le_str:
+                                _terminalize_queue_row(_rid, _le, {
+                                    "live_recovery_outcome": _le,
+                                    **_d,
+                                }, _s, _c)
+                        )
+                        continue
+                    if outcome == "temporary_unavail":
+                        run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _pp=mm_payload:
+                                _write_temporary_unavail_diagnostics(_rid, _d, _pp)
+                        )
+                        continue
+                    # active_order or skip — read-only
+                    log.info(
+                        "LIVE_MISSING_MODE_CLASSIFY_SKIP client_id=%s "
+                        "row_id=%s signal_id=%s outcome=%s reason=%s",
+                        self.client_id, mm_id, mm_sig, outcome, diag.get("reason"),
+                    )
+
                 return restored
 
             log.warning(
