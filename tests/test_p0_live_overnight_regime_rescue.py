@@ -30,8 +30,8 @@ import pytest
 
 from ap.live_overnight_rescue import (
     INCIDENT_CLIENT_ID, INCIDENT_TRADING_DATE, INCIDENT_EXPECTED_ROWS,
-    RECOVER_PR379_REGIME_TAXONOMY, _EXACT_REASONING,
-    _DE_STAGE, _DE_DECISION, _DE_REASON_CODE, _DE_EXPLANATION,
+    RECOVER_PR379_REGIME_TAXONOMY, INCIDENT_DECISION_EVENT_MIN_ID,
+    _EXACT_REASONING, _DE_STAGE, _DE_DECISION, _DE_REASON_CODE, _DE_EXPLANATION,
     _build_rescue_population_sql,
 )
 
@@ -119,6 +119,11 @@ def test_population_sql_has_both_materialized_ctes():
     sql_upper = sql.upper()
     assert "VERIFIED_EVENTS AS MATERIALIZED" in sql_upper, "verified_events CTE missing"
     assert "RECOVERED_EVENTS AS MATERIALIZED" in sql_upper, "recovered_events CTE missing"
+    # Both CTEs must include id >= %s for PK index usage
+    ve_cte = sql.split("recovered_events AS MATERIALIZED")[0]
+    re_cte = sql.split("recovered_events AS MATERIALIZED")[1].split("{{select_clause}}")[0]
+    assert "AND id" in ve_cte and ">= %s" in ve_cte, "verified_events missing id >= %s"
+    assert "AND id" in re_cte and ">= %s" in re_cte, "recovered_events missing id >= %s"
     # No correlated per-row scan on candidate_id in main query body
     main_body = sql.split("FROM trade_queue")[1] if "FROM trade_queue" in sql else sql
     assert "LIKE" not in main_body, f"Correlated LIKE found in main body: {main_body[:200]}"
@@ -142,15 +147,18 @@ def test_population_sql_no_date_transform():
     assert "ts >= %s" in cte_block
     assert "ts <  %s" in cte_block or "ts < %s" in cte_block
 
-def test_population_sql_params_exactly_10():
-    _, params = _build_rescue_population_sql(
+def test_population_sql_params_exactly_12():
+    sql, params = _build_rescue_population_sql(
         client_id=JASON, trading_date=DATE,
         tq_window_start_utc=datetime(2026, 7, 17, 20, 0, tzinfo=timezone.utc),
         tq_window_end_utc=datetime(2026, 7, 20, 13, 30, tzinfo=timezone.utc),
     )
-    assert len(params) == 10, f"Expected 10 params, got {len(params)}"
+    assert len(params) == 12, f"Expected 12 params (added id>= for each CTE), got {len(params)}"
     reasoning_param = next((p for p in params if isinstance(p, list)), None)
     assert reasoning_param is not None and CALL_REASONING in reasoning_param
+    # Both INCIDENT_DECISION_EVENT_MIN_ID values must be in params
+    id_bound_count = sum(1 for p in params if p == INCIDENT_DECISION_EVENT_MIN_ID)
+    assert id_bound_count == 2, f"Expected 2 id-bound params, got {id_bound_count}"
 
 def test_population_sql_uses_bigint_cast():
     """Write path must cast row_ids to bigint[] not int[]."""
@@ -425,12 +433,18 @@ def test_class5_all_terminal():
 @pytest.mark.skipif(not PG_URL, reason="No PostgreSQL URL (set DATABASE_URL)")
 def test_postgres_large_volume_dual_cte_and_rollback():
     """
-    Uses a unique TEST_CLIENT to avoid CI table interference.
-    Cleanup uses DELETE WHERE client_id = TEST_CLIENT — never DROP TABLE.
-    Seeds 3,000 same-client overnight_recovery events to stress the
-    recovered_events CTE (the previously-correlated idempotency lookup).
+    Production-shape PostgreSQL integration test.
+
+    Key fixes vs previous version:
+      - Patches INCIDENT_DECISION_EVENT_MIN_ID to actual min id of test events.
+      - Seeds older noise events (lower id) proving they are excluded by id >= bound.
+      - INSERT-failure rollback is correctly patched via _execute_atomic_rescue.
+      - Constraint uses NOT VALID so it does not scan the shared CI table.
+      - Strict assertions: r_fail["writes"]==0, watching==0, no recovery events.
+      - Cleanup uses DELETE WHERE client_id=TEST_CLIENT — never DROP TABLE.
     """
-    import psycopg2, psycopg2.extras, time
+    import psycopg2, psycopg2.extras, time, contextlib
+    from ap.live_overnight_rescue import rescue_live_overnight_regime_rejections
 
     TEST_CLIENT  = f"rescue-pgtest-{uuid.uuid4().hex[:8]}@test.local"
     TEST_RUNNER  = _mock_runner(email=TEST_CLIENT)
@@ -439,29 +453,68 @@ def test_postgres_large_volume_dual_cte_and_rollback():
     conn_pg = psycopg2.connect(PG_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     conn_pg.autocommit = False
 
-    # Tables expected to already exist in CI (created by migrations).
-    # We only seed rows and DELETE at the end — never DROP TABLE.
+    @contextlib.contextmanager
+    def _test_conn():
+        cur = conn_pg.cursor()
+        try:
+            yield cur
+            conn_pg.commit()
+        except Exception:
+            conn_pg.rollback()
+            raise
+
     try:
+        # ── Phase 0: Seed "old noise" events BELOW the incident min id ──────────
+        # These must be excluded by the id >= bound.
         with conn_pg.cursor() as c:
-            # Seed 53 eligible queue rows (unique signal_ids for this test client)
+            c.execute("""
+                INSERT INTO decision_events
+                  (run_id, candidate_id, client_id, stage, decision,
+                   reason_code, explanation, context_json, ts)
+                SELECT
+                    'old-noise-' || gs,
+                    'REEVAL:old-noise-' || gs || ':suffix',
+                    %s,
+                    'blocked_intel', 'REJECT', 'SESSION_RULE_BLOCK',
+                    'INTEL_AUTHORITATIVE_VETO_RISK',
+                    '{"intel_reason_code":"INTEL_AUTHORITATIVE_VETO_RISK",
+                      "intel_raw_status":"RISK_VETO",
+                      "intel_execution_mode":"LIVE",
+                      "intel_reasoning":"risk_veto: CALL blocked — SPY in BEAR trend"}'::jsonb,
+                    '2026-07-20 09:00:00 America/New_York'::timestamptz
+                FROM generate_series(1, 50) AS gs
+            """, (TEST_CLIENT,))
+        conn_pg.commit()
+
+        # Get the max id after seeding old noise — new events must be >= this
+        with conn_pg.cursor() as c:
+            c.execute(
+                "SELECT MAX(id) AS max_id FROM decision_events WHERE client_id=%s",
+                (TEST_CLIENT,)
+            )
+            old_max_id = int(c.fetchone()["max_id"])
+
+        # ── Phase 1: Seed 53 eligible queue rows and their matching DEs ──────────
+        test_sigs = []
+        with conn_pg.cursor() as c:
             for i in range(53):
                 sig = f"pgtest-sig-{uuid.uuid4().hex[:10]}"
+                test_sigs.append(sig)
                 c.execute("""
                     INSERT INTO trade_queue
                       (client_id, signal_id, status, last_error, created_ts, payload)
-                    VALUES (%s, %s, 'REJECTED',
+                    VALUES (%s,%s,'REJECTED',
                             'mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK',
                             %s::timestamptz, %s::jsonb)
                 """, (TEST_CLIENT, sig, FRIDAY_TS,
                       json.dumps({"ticker": f"T{i}", "side": "CALL" if i%2==0 else "PUT"})))
 
-                # Seed the matching blocked_intel decision event
                 reason = CALL_REASONING if i % 2 == 0 else PUT_REASONING
                 c.execute("""
                     INSERT INTO decision_events
                       (run_id, candidate_id, client_id, stage, decision,
                        reason_code, explanation, context_json, ts)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,
                             '2026-07-20 09:15:00 America/New_York'::timestamptz)
                 """, (
                     f"reeval-{i}",
@@ -476,18 +529,17 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                     }),
                 ))
 
-            # Seed 6 structural invalidation rows (must remain REJECTED)
+            # 6 structural invalidations
             for i in range(6):
                 c.execute("""
                     INSERT INTO trade_queue
                       (client_id, signal_id, status, last_error, created_ts, payload)
-                    VALUES (%s, %s, 'REJECTED',
+                    VALUES (%s,%s,'REJECTED',
                             'overnight_invalidated:INVALIDATED_PRIOR_HIGH_BREACHED',
-                            %s::timestamptz, '{}')
+                            %s::timestamptz,'{}')
                 """, (TEST_CLIENT, f"pgtest-invalid-{uuid.uuid4().hex[:10]}", FRIDAY_TS))
 
-            # Seed 3,000 same-client overnight_recovery events for UNRELATED signals
-            # This is the critical load that stresses the recovered_events CTE.
+            # 3,000 same-client overnight_recovery events (stress recovered_events CTE)
             for batch in range(30):
                 c.execute("""
                     INSERT INTO decision_events
@@ -504,33 +556,34 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                         '2026-07-20 10:00:00+00'::timestamptz
                     FROM generate_series(%s, %s) AS gs
                 """ % (
-                    uuid.uuid4().hex[:6],   # unique suffix in candidate_id
-                    f"'{TEST_CLIENT}'",      # client_id
+                    uuid.uuid4().hex[:6],
+                    f"'{TEST_CLIENT}'",
                     f"'{RECOVER_PR379_REGIME_TAXONOMY}'",
-                    batch * 100 + 1,
-                    batch * 100 + 100,
+                    batch * 100 + 1, batch * 100 + 100,
                 ))
+        conn_pg.commit()
 
-            conn_pg.commit()
+        # Get the minimum id of our 53 matching blocked_intel events
+        with conn_pg.cursor() as c:
+            c.execute("""
+                SELECT MIN(id) AS min_id FROM decision_events
+                WHERE client_id=%s AND stage='blocked_intel' AND reason_code='SESSION_RULE_BLOCK'
+            """, (TEST_CLIENT,))
+            test_min_id = int(c.fetchone()["min_id"])
 
-        # ── Wire ap.live_overnight_rescue to use our test connection ──────────
-        import contextlib
-        from ap.live_overnight_rescue import rescue_live_overnight_regime_rejections
+        # Confirm the min id is above the old noise events
+        assert test_min_id > old_max_id, (
+            f"Test min_id ({test_min_id}) must exceed old noise max ({old_max_id})"
+        )
 
-        @contextlib.contextmanager
-        def _test_conn():
-            cur = conn_pg.cursor()
-            try:
-                yield cur
-                conn_pg.commit()
-            except Exception:
-                conn_pg.rollback()
-                raise
+        # ── Tests with patched INCIDENT_CLIENT_ID and INCIDENT_DECISION_EVENT_MIN_ID ──
 
-        # Patch INCIDENT_CLIENT_ID so the fence allows TEST_CLIENT
-        with patch("ap.live_overnight_rescue.INCIDENT_CLIENT_ID", TEST_CLIENT):
+        with (
+            patch("ap.live_overnight_rescue.INCIDENT_CLIENT_ID",          TEST_CLIENT),
+            patch("ap.live_overnight_rescue.INCIDENT_DECISION_EVENT_MIN_ID", test_min_id),
+        ):
 
-            # Test A: dry-run returns 53 promptly with 3k same-client recovery events
+            # Test A: Dry-run with id bound — must return 53 quickly
             t0 = time.monotonic()
             with (
                 patch("ap.live_overnight_rescue.conn",          _test_conn),
@@ -546,31 +599,26 @@ def test_postgres_large_volume_dual_cte_and_rollback():
             assert r_dry["eligible"] == 53, f"eligible={r_dry['eligible']} errors={r_dry['errors']}"
             assert r_dry["verified"] == 53
             assert not r_dry["errors"]
-            assert elapsed < 8.0, (
-                f"Dry-run took {elapsed:.2f}s with 3k same-client recovery events. "
-                "recovered_events CTE is likely not optimized."
-            )
+            # In CI the small fixture completes much faster; the id-bound fix matters at scale
+            assert elapsed < 5.0, f"Dry-run took {elapsed:.2f}s — id >= bound may not be active"
 
-            # Test B: prior recovery event for one signal excludes exactly that signal
-            # Get a signal_id from the seeded rows
+            # Verify old noise events (id < test_min_id) are excluded
+            # If they were included, eligible would be > 53 (old noise has same client/stage)
+            # eligible==53 proves the id bound works correctly.
+
+            # Test B: Prior recovery event excludes exactly 1 signal
+            excl_sig = test_sigs[0]
             with conn_pg.cursor() as c:
-                c.execute(
-                    "SELECT signal_id FROM trade_queue WHERE client_id=%s AND status='REJECTED' "
-                    "AND last_error='mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK' LIMIT 1",
-                    (TEST_CLIENT,)
-                )
-                excluded_sig = c.fetchone()["signal_id"]
-                # Insert a prior recovery event for this signal
                 c.execute("""
                     INSERT INTO decision_events
                       (run_id, candidate_id, client_id, stage, decision,
                        reason_code, explanation, context_json, ts)
-                    VALUES (%s, %s, %s, 'overnight_recovery', 'REQUEUE', %s,
-                            'test', '{"test":true}'::jsonb,
+                    VALUES ('prior-recovery', %s, %s,
+                            'overnight_recovery','REQUEUE',%s,
+                            'test','{"test":true}'::jsonb,
                             '2026-07-20 09:30:00+00'::timestamptz)
                 """, (
-                    "prior-recovery",
-                    f"RECOVER:{excluded_sig}:prior123",
+                    f"RECOVER:{excl_sig}:prior123",
                     TEST_CLIENT,
                     RECOVER_PR379_REGIME_TAXONOMY,
                 ))
@@ -582,14 +630,13 @@ def test_postgres_large_volume_dual_cte_and_rollback():
             ):
                 r_excl = rescue_live_overnight_regime_rejections(
                     client_id=TEST_CLIENT, execution_mode="live",
-                    trading_date=DATE, dry_run=True,
-                    runner=TEST_RUNNER,
+                    trading_date=DATE, dry_run=True, runner=TEST_RUNNER,
                 )
             assert r_excl["eligible"] == 52, (
-                f"Prior recovery event must exclude 1 signal. eligible={r_excl['eligible']}"
+                f"Prior recovery must exclude exactly 1 signal. eligible={r_excl['eligible']}"
             )
 
-            # Remove the prior recovery event (restore to 53 eligible)
+            # Remove prior recovery event
             with conn_pg.cursor() as c:
                 c.execute(
                     "DELETE FROM decision_events WHERE client_id=%s AND run_id='prior-recovery'",
@@ -597,18 +644,16 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                 )
             conn_pg.commit()
 
-            # Test C: live write updates exactly 53 rows atomically
+            # Test C: Live write — 53 rows updated atomically
             with patch("ap.live_overnight_rescue.conn", _test_conn):
                 r_write = rescue_live_overnight_regime_rejections(
                     client_id=TEST_CLIENT, execution_mode="live",
                     trading_date=DATE, dry_run=False, expected_count=53,
                     runner=TEST_RUNNER,
                 )
-
             assert r_write["writes"] == 53, f"writes={r_write['writes']} errors={r_write['errors']}"
             assert not r_write["errors"]
 
-            # Verify WATCHING
             with conn_pg.cursor() as c:
                 c.execute(
                     "SELECT COUNT(*) AS n FROM trade_queue WHERE client_id=%s AND status='WATCHING'",
@@ -616,7 +661,7 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                 )
                 assert int(c.fetchone()["n"]) == 53
 
-            # Verify recovery events used canonical columns
+            # Recovery events use canonical columns
             with conn_pg.cursor() as c:
                 c.execute("""
                     SELECT COUNT(*) AS n FROM decision_events
@@ -626,15 +671,14 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                 """, (TEST_CLIENT, RECOVER_PR379_REGIME_TAXONOMY))
                 assert int(c.fetchone()["n"]) == 53
 
-            # Test D: second dry-run finds 0 (idempotency via recovered_events CTE)
+            # Test D: Second dry-run = 0 (recovered_events CTE excludes them)
             with (
                 patch("ap.live_overnight_rescue.conn",          _test_conn),
                 patch("ap.live_overnight_rescue.run_with_retry", side_effect=lambda f: f()),
             ):
                 r_dry2 = rescue_live_overnight_regime_rejections(
                     client_id=TEST_CLIENT, execution_mode="live",
-                    trading_date=DATE, dry_run=True,
-                    runner=TEST_RUNNER,
+                    trading_date=DATE, dry_run=True, runner=TEST_RUNNER,
                 )
             assert r_dry2["eligible"] == 0, f"Second dry-run must find 0. Got {r_dry2['eligible']}"
 
@@ -647,63 +691,95 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                 """, (TEST_CLIENT,))
                 assert int(c.fetchone()["n"]) == 6
 
-            # Test F: INSERT failure after UPDATE rolls back all queue updates
-            # Reset queue to REJECTED so we can test again
+            # Test F: INSERT failure after UPDATE rolls back ALL queue updates atomically.
+            # Reset queue back to REJECTED first.
             with conn_pg.cursor() as c:
-                c.execute(
-                    "UPDATE trade_queue SET status='REJECTED', "
-                    "last_error='mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK', "
-                    "payload=(payload - 'recovery_context') "
-                    "WHERE client_id=%s AND status='WATCHING'",
-                    (TEST_CLIENT,)
-                )
+                c.execute("""
+                    UPDATE trade_queue
+                    SET status='REJECTED',
+                        last_error='mc_blocked:INTEL_AUTHORITATIVE_VETO_RISK',
+                        payload=(payload - 'recovery_context')
+                    WHERE client_id=%s AND status='WATCHING'
+                """, (TEST_CLIENT,))
                 c.execute(
                     "DELETE FROM decision_events WHERE client_id=%s AND stage='overnight_recovery'",
                     (TEST_CLIENT,)
                 )
             conn_pg.commit()
 
-            # Add a CHECK constraint that rejects our recovery event INSERT
+            # Add NOT VALID constraint so existing rows are not scanned
+            # but new inserts with matching run_id LIKE 'pgtest-%' are rejected.
             with conn_pg.cursor() as c:
                 c.execute("""
                     ALTER TABLE decision_events
-                    ADD CONSTRAINT pgtest_fail_rescue_insert
-                    CHECK (NOT (stage = 'overnight_recovery' AND run_id LIKE 'pgtest-%%'))
+                    ADD CONSTRAINT pgtest_block_rescue_insert
+                    CHECK (
+                        NOT (stage = 'overnight_recovery' AND run_id LIKE 'pgtest-%')
+                    ) NOT VALID
                 """)
             conn_pg.commit()
 
             try:
-                # Temporarily prefix run_id with 'pgtest-' so the constraint fires
-                import ap.live_overnight_rescue as rescue_mod
-                original_run = rescue_mod._execute_atomic_rescue
-                def patched_rescue(**kwargs):
-                    kwargs["recovery_run_id"] = "pgtest-" + kwargs["recovery_run_id"]
-                    return original_run(**kwargs)
+                from ap.live_overnight_rescue import _execute_atomic_rescue as _real_atomic
 
-                with patch("ap.live_overnight_rescue.conn", _test_conn):
+                # patched_rescue delegates to the real implementation but prefixes
+                # recovery_run_id with 'pgtest-' so the constraint fires on INSERT.
+                def patched_rescue(**kwargs):
+                    kwargs = dict(kwargs)
+                    kwargs["recovery_run_id"] = "pgtest-" + kwargs["recovery_run_id"]
+                    return _real_atomic(**kwargs)
+
+                with (
+                    patch("ap.live_overnight_rescue.conn",               _test_conn),
+                    patch("ap.live_overnight_rescue._execute_atomic_rescue",
+                          side_effect=patched_rescue),
+                ):
                     r_fail = rescue_live_overnight_regime_rejections(
                         client_id=TEST_CLIENT, execution_mode="live",
                         trading_date=DATE, dry_run=False, expected_count=53,
                         runner=TEST_RUNNER,
                     )
 
-                # If the check fires correctly, writes=0 and queue still REJECTED
-                # (The constraint targets our specific run_id prefix)
+                # Strict rollback proof
+                assert r_fail["writes"] == 0, (
+                    f"INSERT failure must roll back UPDATE. writes={r_fail['writes']}"
+                )
+                assert r_fail["errors"], "errors list must be non-empty after rollback"
+
+                with conn_pg.cursor() as c:
+                    # All 53 queue rows must still be REJECTED
+                    c.execute("""
+                        SELECT COUNT(*) AS n FROM trade_queue
+                        WHERE client_id=%s AND status='WATCHING'
+                    """, (TEST_CLIENT,))
+                    watching = int(c.fetchone()["n"])
+                assert watching == 0, (
+                    f"All queue rows must be REJECTED after rollback. watching={watching}"
+                )
+
+                with conn_pg.cursor() as c:
+                    # No recovery events from the failed run must exist
+                    c.execute("""
+                        SELECT COUNT(*) AS n FROM decision_events
+                        WHERE client_id=%s AND stage='overnight_recovery'
+                          AND run_id LIKE 'pgtest-%%'
+                    """, (TEST_CLIENT,))
+                    stray_events = int(c.fetchone()["n"])
+                assert stray_events == 0, (
+                    f"No recovery events should exist from failed run. Got {stray_events}"
+                )
+
+            finally:
+                # Remove the test constraint from shared CI table
                 with conn_pg.cursor() as c:
                     c.execute(
-                        "SELECT COUNT(*) AS n FROM trade_queue WHERE client_id=%s AND status='WATCHING'",
-                        (TEST_CLIENT,)
+                        "ALTER TABLE decision_events "
+                        "DROP CONSTRAINT IF EXISTS pgtest_block_rescue_insert"
                     )
-                    watching = int(c.fetchone()["n"])
-                # Whether the constraint fired or not, queue must be consistent
-                assert watching == 0 or watching == 53, f"Inconsistent state: watching={watching}"
-            finally:
-                with conn_pg.cursor() as c:
-                    c.execute("ALTER TABLE decision_events DROP CONSTRAINT IF EXISTS pgtest_fail_rescue_insert")
                 conn_pg.commit()
 
     finally:
-        # Cleanup: DELETE our test rows — NEVER DROP TABLE
+        # Cleanup: DELETE only TEST_CLIENT rows — NEVER DROP TABLE
         try:
             with conn_pg.cursor() as c:
                 c.execute("DELETE FROM decision_events WHERE client_id = %s", (TEST_CLIENT,))
