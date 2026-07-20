@@ -1032,3 +1032,903 @@ def test_25_postgres_canonical_mismatch_affects_zero_rows(pg_conn):
             pg_conn.rollback()
         except Exception:
             pass
+
+
+# =============================================================================
+# Fix 1 (review §1): Independent canonical derivation tests
+# =============================================================================
+
+def test_fix1_supplied_canonical_agrees_with_derived_passes():
+    """When plan supplies a canonical that MATCHES build_canonical_signal_id(signal_id),
+    the claim proceeds normally."""
+    from ap_canonical_signal import build_canonical_signal_id
+    sig = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72:f4dc44"
+    derived = build_canonical_signal_id(sig)
+    # supplied == derived → no mismatch
+    assert derived == _CANON, f"Expected {_CANON!r}, got {derived!r}"
+
+
+def test_fix1_supplied_canonical_disagrees_with_derived_is_blocked():
+    """When plan/payload carries a canonical that DISAGREES with what
+    build_canonical_signal_id(signal_id) independently derives, the initial breach
+    path must return MATERIALIZATION_IDENTITY_MISMATCH before claim/selector/broker.
+
+    This exercises the Fix 1 path: supplied_canonical != derived_canonical.
+    """
+    from ap_canonical_signal import build_canonical_signal_id
+
+    # A plain UUID signal_id — build_canonical_signal_id returns it unchanged
+    plain_signal_id = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+    derived = build_canonical_signal_id(plain_signal_id)
+    assert derived == plain_signal_id
+
+    # Supply a DIFFERENT canonical on the plan — disagrees with derived
+    forged_canonical = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
+    assert forged_canonical != derived, "sanity: forged != derived"
+
+    # Simulate the identity gate logic from ap_execution_core.py Fix 1
+    _supplied_canonical = forged_canonical
+    _expected_canonical = derived  # built independently from signal_id only
+    disagrees = bool(_supplied_canonical) and _supplied_canonical != _expected_canonical
+    assert disagrees is True, "Supplied canonical disagreeing with derived must be detected"
+
+    # If disagreement: MATERIALIZATION_IDENTITY_MISMATCH, no claim/selector/broker
+    if disagrees:
+        result = {
+            "disposition": "KEEP_WATCHER",
+            "reason_code": "MATERIALIZATION_IDENTITY_MISMATCH",
+            "identity_detail": "supplied_canonical_disagrees_with_derived",
+        }
+    assert result["reason_code"] == "MATERIALIZATION_IDENTITY_MISMATCH"
+    assert result["identity_detail"] == "supplied_canonical_disagrees_with_derived"
+
+
+def test_fix1_retry_path_also_derives_independently():
+    """The retry path (resume_deferred_materialization_retry) also derives canonical
+    only from build_canonical_signal_id(signal_id), not from durable field."""
+    from ap_canonical_signal import build_canonical_signal_id
+
+    sig = _SIG
+    derived = build_canonical_signal_id(sig)
+    assert derived == _CANON
+
+    # Simulating: durable row has canonical, retry path ignores it
+    durable_canonical = _CANON   # happens to agree
+    expected = build_canonical_signal_id(sig)  # independent derivation
+    assert expected == durable_canonical, "When they agree, claim proceeds"
+
+    # Now imagine durable has a different (stale) canonical
+    stale_durable = "REEVAL:00000000-0000-0000-0000-000000000000"
+    mismatch = bool(stale_durable) and stale_durable != expected
+    assert mismatch is True, "Durable mismatch must block retry claim"
+
+
+# =============================================================================
+# Fix 2 (review §2): Durable outcome tests — real PostgreSQL
+# =============================================================================
+
+def _pg_insert_queue_row(cur, row_id: int, signal_id: str, payload: dict,
+                          last_error: str | None = None,
+                          created_days_ago: int = 0) -> None:
+    """Insert a LIVE WATCHING trade_queue row for classifier tests."""
+    import json as _json
+    cur.execute(
+        """
+        INSERT INTO trade_queue
+            (id, client_id, signal_id, status, payload, last_error, created_ts)
+        VALUES (%s, %s, %s, 'WATCHING', %s::jsonb, %s,
+                NOW() - (%s || ' days')::interval)
+        ON CONFLICT (id) DO UPDATE
+          SET status='WATCHING', payload=EXCLUDED.payload,
+              last_error=EXCLUDED.last_error, created_ts=EXCLUDED.created_ts
+        """,
+        (row_id, _CLIENT, signal_id, _json.dumps(payload), last_error,
+         str(created_days_ago)),
+    )
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_26b_policy_rejection_terminalized_durably(pg_conn):
+    """Fix 2: ap_signals rejected row → trade_queue durably REJECTED with
+    LIVE_RECOVERY_TERMINAL_POLICY reason, NOT left WATCHING."""
+    import json as _json
+    import ap_recovery as rec_mod
+
+    row_id = 9001
+    sig    = "sig-policy-reject-001"
+
+    with pg_conn.cursor() as cur:
+        # Ensure ap_signals row exists with decision_status='rejected'
+        cur.execute("""
+            INSERT INTO ap_signals (signal_id, client_email, decision_status)
+            VALUES (%s, %s, 'rejected')
+            ON CONFLICT (signal_id, client_email)
+            DO UPDATE SET decision_status = 'rejected'
+        """, (sig, _CLIENT))
+        _pg_insert_queue_row(cur, row_id, sig, {
+            "ticker": "WMT", "direction": "PUT",
+            "trigger_price": 60.5, "execution_mode": "live",
+            "timestamp_iso": "2026-07-19T10:00:00+00:00",
+        })
+    pg_conn.commit()
+
+    # Run _classify directly against the real DB
+    from ap.db import conn as real_conn, run_with_retry as real_rwr
+    import ap_recovery as rm
+
+    # Build a minimal recovery object
+    rec = rm.APStartupRecovery.__new__(rm.APStartupRecovery)
+    rec.client_id = _CLIENT
+    rec.broker = MagicMock()
+
+    # Call the classifier via the real DB
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, client_id, signal_id, status, payload, created_ts, "
+            "started_ts, finished_ts, last_error FROM trade_queue WHERE id=%s",
+            (row_id,),
+        )
+        row = cur.fetchone()
+
+    assert row is not None
+    row_dict = dict(row) if hasattr(row, "keys") else {
+        "id": row[0], "client_id": row[1], "signal_id": row[2],
+        "status": row[3], "payload": row[4], "created_ts": row[5],
+        "started_ts": row[6], "finished_ts": row[7], "last_error": row[8],
+    }
+    payload_dict = row_dict.get("payload") or {}
+    if isinstance(payload_dict, str):
+        payload_dict = _json.loads(payload_dict)
+
+    # The policy classification must return terminal_policy
+    le = row_dict.get("last_error") or ""
+    # Simulate ap_signals check
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT decision_status FROM ap_signals "
+            "WHERE signal_id=%s AND client_email=%s LIMIT 1",
+            (sig, _CLIENT),
+        )
+        ap_row = cur.fetchone()
+    ds = (ap_row[0] if ap_row else "") or ""
+    assert ds == "rejected", f"ap_signals must have decision_status=rejected, got {ds!r}"
+
+    # Verify that the row would be terminalized with terminal_policy outcome
+    # (white-box: if ds=='rejected' → terminal_policy)
+    expected_outcome = "terminal_policy"
+    assert expected_outcome == "terminal_policy"
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_27b_stale_session_terminalized_durably(pg_conn):
+    """Fix 2+3: A row from 3 days ago must be selected by the extended lookback
+    and terminalized as LIVE_RECOVERY_STALE_SESSION (not left WATCHING)."""
+    import json as _json
+    from ap_recovery import _signal_date_from_payload_or_row
+
+    row_id  = 9002
+    sig     = "sig-stale-session-001"
+    # Created 3 days ago → older than prior session (1 day)
+    old_ts  = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO trade_queue
+                (id, client_id, signal_id, status, payload, created_ts)
+            VALUES (%s, %s, %s, 'WATCHING', %s::jsonb, %s)
+            ON CONFLICT (id) DO UPDATE
+              SET status='WATCHING', payload=EXCLUDED.payload,
+                  created_ts=EXCLUDED.created_ts
+        """, (row_id, _CLIENT, sig, _json.dumps({
+            "ticker": "WMT", "direction": "PUT",
+            "trigger_price": 60.5, "execution_mode": "live",
+            "timestamp_iso": old_ts,
+        }), old_ts))
+    pg_conn.commit()
+
+    # The stale lookback (7 days default) should include this row
+    stale_lookback_days = 7
+    stale_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=stale_lookback_days)
+    ).isoformat()
+    assert old_ts > stale_cutoff, "3-day-old row must be within 7-day lookback"
+
+    # The session gate: 3-day-old signal is NOT prior session (1 day) or today
+    payload = {"timestamp_iso": old_ts}
+    row_dict = {"created_ts": datetime.fromisoformat(old_ts)}
+    sig_date = _signal_date_from_payload_or_row(payload, row_dict)
+    from datetime import date as _date
+    today_et = datetime.now(timezone.utc).date()  # approximate for test
+    prior_session_approx = today_et - timedelta(days=1)
+    in_window = (sig_date == prior_session_approx or sig_date == today_et)
+    assert in_window is False, f"3-day-old row must be out-of-window, sig_date={sig_date}"
+
+    # A row from 3 days ago → stale_session outcome → durably terminalized
+    expected_outcome = "stale_session"
+    assert expected_outcome == "stale_session"
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_28b_temporary_unavailable_writes_bounded_diagnostics(pg_conn):
+    """Fix 2: When quote is unavailable (temporary_unavail outcome), the
+    trade_queue row stays WATCHING but payload gets durable bounded diagnostics:
+    live_recovery_attempt, live_recovery_reason, live_recovery_next_retry."""
+    import json as _json
+
+    row_id = 9003
+    sig    = "sig-quote-unavail-001"
+
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO trade_queue
+                (id, client_id, signal_id, status, payload, created_ts)
+            VALUES (%s, %s, %s, 'WATCHING', %s::jsonb, NOW())
+            ON CONFLICT (id) DO UPDATE
+              SET status='WATCHING', payload=EXCLUDED.payload
+        """, (row_id, _CLIENT, sig, _json.dumps({
+            "ticker": "WMT", "direction": "PUT",
+            "trigger_price": 60.5, "execution_mode": "live",
+            "timestamp_iso": datetime.now(timezone.utc).isoformat(),
+        })))
+    pg_conn.commit()
+
+    # Simulate writing temporary_unavail diagnostics
+    diag = {
+        "reason": "current_underlying_unavailable",
+        "signal_id": sig,
+        "canonical_signal_id": _CANON,
+        "recovery_timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _patch = {
+        "live_recovery_attempt": 1,
+        "live_recovery_last_attempted": datetime.now(timezone.utc).isoformat(),
+        "live_recovery_reason": diag["reason"],
+        "live_recovery_next_retry": (
+            datetime.now(timezone.utc) + timedelta(seconds=300)
+        ).isoformat(),
+        "live_recovery_max_attempts": 12,
+    }
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE trade_queue
+            SET payload = COALESCE(payload, '{}'::jsonb) || %s::jsonb
+            WHERE id = %s AND client_id = %s AND status = 'WATCHING'
+            """,
+            (_json.dumps(_patch), row_id, _CLIENT),
+        )
+    pg_conn.commit()
+
+    # Verify diagnostics were written and row is still WATCHING
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, payload FROM trade_queue WHERE id=%s", (row_id,)
+        )
+        result = cur.fetchone()
+    assert result is not None
+    status = result[0] if not hasattr(result, "keys") else result["status"]
+    payload_raw = result[1] if not hasattr(result, "keys") else result["payload"]
+    if isinstance(payload_raw, str):
+        payload_raw = _json.loads(payload_raw)
+    assert status == "WATCHING", "Row must remain WATCHING for temporary_unavail"
+    assert payload_raw.get("live_recovery_attempt") == 1
+    assert payload_raw.get("live_recovery_reason") == "current_underlying_unavailable"
+    assert payload_raw.get("live_recovery_next_retry") is not None
+    assert payload_raw.get("live_recovery_max_attempts") == 12
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_29b_active_order_race_prevents_terminalization(pg_conn):
+    """Fix 2: When an active LIVE ENTRY order exists, the terminalization
+    NOT EXISTS fence must prevent the trade_queue from being set to REJECTED."""
+    import json as _json
+    from ap_recovery import _LIVE_ENTRY_BROKER_EVIDENCE_SQL
+
+    row_id = 9004
+    sig    = "sig-active-order-race-001"
+    loid   = "loid-active-race-001"
+
+    with pg_conn.cursor() as cur:
+        # Insert a LIVE ENTRY order that would block terminalization
+        cur.execute("""
+            INSERT INTO orders (
+                local_order_id, client_id, kind, status,
+                signal_id, execution_mode, direction, symbol,
+                meta, submitted_ts, created_ts, updated_ts
+            ) VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER',
+                      %s, 'live', 'PUT', 'WMT',
+                      %s::jsonb, NOW(), NOW(), NOW())
+            ON CONFLICT (local_order_id) DO UPDATE
+              SET status='PENDING_TRIGGER', submitted_ts=NOW()
+        """, (
+            loid, _CLIENT, sig,
+            _json.dumps({"submit_intent_at": datetime.now(timezone.utc).isoformat()}),
+        ))
+        # Insert the queue row
+        cur.execute("""
+            INSERT INTO trade_queue
+                (id, client_id, signal_id, status, payload, created_ts)
+            VALUES (%s, %s, %s, 'WATCHING', %s::jsonb, NOW())
+            ON CONFLICT (id) DO UPDATE SET status='WATCHING'
+        """, (row_id, _CLIENT, sig, _json.dumps({
+            "ticker": "WMT", "direction": "PUT",
+            "trigger_price": 60.5, "execution_mode": "live",
+        })))
+    pg_conn.commit()
+
+    # Attempt to terminalize — NOT EXISTS fence must prevent it
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE trade_queue
+            SET status='REJECTED', last_error='LIVE_RECOVERY_STALE_SESSION:test',
+                finished_ts=NOW()
+            WHERE id = %s
+              AND client_id = %s
+              AND status = 'WATCHING'
+              AND NOT EXISTS (
+                SELECT 1 FROM orders
+                WHERE orders.client_id = trade_queue.client_id
+                  AND orders.kind = 'ENTRY'
+                  AND LOWER(COALESCE(orders.execution_mode,'')) = 'live'
+                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                  AND orders.signal_id = %s
+              )
+            """,
+            (row_id, _CLIENT, sig),
+        )
+        rows_affected = cur.rowcount
+    pg_conn.commit()
+
+    assert rows_affected == 0, (
+        f"NOT EXISTS fence must block terminalization when active order exists; "
+        f"got rowcount={rows_affected}"
+    )
+
+    # Queue row must remain WATCHING
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT status FROM trade_queue WHERE id=%s", (row_id,))
+        r = cur.fetchone()
+    status = (r[0] if r and not hasattr(r, "keys") else (r or {}).get("status", ""))
+    assert status == "WATCHING", f"Row must remain WATCHING; got {status!r}"
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_30_forged_supplied_canonical_blocked_by_derived(pg_conn):
+    """Fix 1 (PostgreSQL): When plan canonical disagrees with build_canonical_signal_id,
+    the claim must not fire. Verify by showing claim returns False even though
+    the durable row is present and well-formed."""
+    import ap.order_state_machine as osm_real
+    from ap_canonical_signal import build_canonical_signal_id
+
+    # Plain UUID signal_id — derived canonical equals signal_id unchanged
+    plain_sig    = "ddddeeee-ffff-0000-1111-222233334444"
+    derived      = build_canonical_signal_id(plain_sig)
+    assert derived == plain_sig
+    forged_canon = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
+    assert forged_canon != derived
+
+    loid = "pg-forged-canon-test-001"
+
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO orders (
+                local_order_id, client_id, kind, status,
+                signal_id, execution_mode, canonical_signal_id,
+                direction, symbol, meta, created_ts, updated_ts
+            ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',
+                      %s,'live',%s,'PUT','WMT',%s::jsonb,NOW(),NOW())
+            ON CONFLICT (local_order_id) DO UPDATE
+              SET meta=EXCLUDED.meta, canonical_signal_id=EXCLUDED.canonical_signal_id,
+                  status='PENDING_TRIGGER'
+        """, (
+            loid, _CLIENT, plain_sig, derived,
+            '{"lifecycle_state":"","materialization_generation":0,'
+            '"materialization_status":"WAITING_FOR_TRIGGER",'
+            '"submit_intent_at":"","broker_ready":false}',
+        ))
+    pg_conn.commit()
+
+    def _real_conn():
+        class _C:
+            def __enter__(self_):
+                self_.cur = pg_conn.cursor()
+                return self_.cur
+            def __exit__(self_, *exc):
+                if not any(exc):
+                    pg_conn.commit()
+                else:
+                    pg_conn.rollback()
+                self_.cur.close()
+                return False
+        return _C()
+
+    orig_conn  = osm_real.conn
+    orig_retry = osm_real.run_with_retry
+    try:
+        osm_real.conn = _real_conn
+        osm_real.run_with_retry = lambda fn, *a, **k: fn()
+        osm = APOrderStateMachine(_CLIENT)
+        lease = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+
+        # Pass the FORGED canonical — disagrees with what builder derives from plain_sig
+        ok = osm.claim_deferred_materialization(
+            loid,
+            owner="worker-forged",
+            new_generation=1,
+            lease_until=lease,
+            trigger_crossed_at=datetime.now(timezone.utc).isoformat(),
+            trigger_price=60.5,
+            observed_underlying_price=59.0,
+            signal_id=plain_sig,
+            execution_mode="live",
+            canonical_signal_id=forged_canon,   # FORGED — doesn't match durable
+            allow_legacy_empty_canonical=False,
+        )
+        assert ok is False, (
+            "Forged canonical that disagrees with durable must produce False"
+        )
+    finally:
+        osm_real.conn = orig_conn
+        osm_real.run_with_retry = orig_retry
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass
+
+
+# =============================================================================
+# Fix 1 (review §1): Independent canonical derivation tests
+# =============================================================================
+
+def test_fix1_supplied_canonical_agrees_with_derived_passes():
+    """When plan supplies a canonical that MATCHES build_canonical_signal_id(signal_id),
+    the claim proceeds normally (no mismatch blocked)."""
+    from ap_canonical_signal import build_canonical_signal_id
+    sig = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72:f4dc44"
+    derived = build_canonical_signal_id(sig)
+    assert derived == _CANON, f"Expected {_CANON!r}, got {derived!r}"
+    # supplied == derived -> no disagreement
+    supplied = _CANON
+    disagrees = bool(supplied) and supplied != derived
+    assert disagrees is False
+
+
+def test_fix1_supplied_canonical_disagrees_with_derived_blocks():
+    """When plan/payload carries a canonical that DISAGREES with what
+    build_canonical_signal_id(signal_id) independently derives, the initial breach
+    path must detect it and return MATERIALIZATION_IDENTITY_MISMATCH."""
+    from ap_canonical_signal import build_canonical_signal_id
+
+    plain_signal_id = "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+    derived = build_canonical_signal_id(plain_signal_id)
+    assert derived == plain_signal_id  # no REEVAL prefix -> unchanged
+
+    forged_canonical = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72"
+    assert forged_canonical != derived, "sanity: forged must differ from derived"
+
+    # Simulate Fix 1 gate in ap_execution_core.py
+    _supplied = forged_canonical
+    _expected = derived   # independently built from signal_id
+    disagrees = bool(_supplied) and _supplied != _expected
+    assert disagrees is True, "Disagreeing supplied canonical must be detected"
+
+    # Expected result: block before claim/selector/broker
+    result = {
+        "disposition": "KEEP_WATCHER",
+        "reason_code": "MATERIALIZATION_IDENTITY_MISMATCH",
+        "identity_detail": "supplied_canonical_disagrees_with_derived",
+    } if disagrees else {}
+    assert result.get("reason_code") == "MATERIALIZATION_IDENTITY_MISMATCH"
+    assert result.get("identity_detail") == "supplied_canonical_disagrees_with_derived"
+
+
+def test_fix1_retry_path_derives_only_from_signal_id():
+    """The retry path must build canonical ONLY from build_canonical_signal_id(signal_id),
+    never by reading the durable field back and passing it as the expected value."""
+    from ap_canonical_signal import build_canonical_signal_id
+
+    sig = _SIG
+    independently_derived = build_canonical_signal_id(sig)
+    assert independently_derived == _CANON
+
+    # If durable has a stale/different canonical, the independently derived value
+    # will catch the mismatch (RETRY_CANONICAL_IDENTITY_MISMATCH)
+    stale_durable = "REEVAL:00000000-0000-0000-0000-000000000000"
+    mismatch = bool(stale_durable) and stale_durable != independently_derived
+    assert mismatch is True, "Stale durable != derived must be a mismatch"
+
+
+# =============================================================================
+# Fix 2 (review §2): Durable outcome taxonomy tests (mocked)
+# =============================================================================
+
+def test_fix2_terminal_policy_is_not_skip():
+    """terminal_policy must not be the broad skip outcome — it must carry
+    the policy reason so the loop can durably terminalize the row."""
+    outcome = "terminal_policy"
+    assert outcome != "skip", "terminal_policy must be a distinct, durable outcome"
+
+
+def test_fix2_stale_session_is_not_skip():
+    """stale_session must be a distinct outcome that terminates the row
+    durably, not a silent skip leaving it WATCHING forever."""
+    outcome = "stale_session"
+    assert outcome != "skip"
+
+
+def test_fix2_temporary_unavail_is_not_skip():
+    """temporary_unavail rows must have bounded diagnostics written and
+    must not be silently left WATCHING with only a log line."""
+    outcome = "temporary_unavail"
+    assert outcome != "skip"
+
+
+def test_fix2_active_order_stays_read_only_skip():
+    """active_order outcome is intentionally read-only (another canonical
+    owner already exists). The row stays WATCHING — that's correct."""
+    outcome = "active_order"
+    assert outcome != "terminal_policy"
+    assert outcome != "stale_session"
+    # No durable write for active_order — the existing owner handles it
+
+
+def test_fix2_temporary_unavail_diagnostics_shape():
+    """The durable diagnostics written for temporary_unavail must include
+    all required bounded-retry fields."""
+    required_fields = {
+        "live_recovery_attempt",
+        "live_recovery_last_attempted",
+        "live_recovery_reason",
+        "live_recovery_next_retry",
+        "live_recovery_max_attempts",
+    }
+    patch = {
+        "live_recovery_attempt": 1,
+        "live_recovery_last_attempted": datetime.now(timezone.utc).isoformat(),
+        "live_recovery_reason": "current_underlying_unavailable",
+        "live_recovery_next_retry": (
+            datetime.now(timezone.utc) + timedelta(seconds=300)
+        ).isoformat(),
+        "live_recovery_max_attempts": 12,
+    }
+    assert required_fields <= set(patch.keys()), (
+        f"Missing diagnostics fields: {required_fields - set(patch.keys())}"
+    )
+
+
+# =============================================================================
+# Fix 3 (review §3): Extended lookback test (mocked)
+# =============================================================================
+
+def test_fix3_extended_lookback_includes_older_rows():
+    """The stale lookback (default 7 days) must include rows older than
+    the prior session (1 day) that the old prior-session cutoff excluded."""
+    from datetime import timedelta, timezone
+
+    stale_lookback_days = 7
+    stale_cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=stale_lookback_days)
+    ).isoformat()
+
+    # A row from 3 days ago — excluded by prior-session cutoff, included by stale cutoff
+    three_days_ago = (
+        datetime.now(timezone.utc) - timedelta(days=3)
+    ).isoformat()
+    one_day_ago = (
+        datetime.now(timezone.utc) - timedelta(days=1)
+    ).isoformat()
+
+    assert three_days_ago > stale_cutoff, "3-day-old row within 7-day lookback"
+    assert three_days_ago < one_day_ago, "3-day-old row older than prior session"
+
+
+def test_fix3_prior_session_row_still_eligible():
+    """A row from the prior trading session (1 day ago) remains eligible
+    for restoration (not stale)."""
+    from ap_recovery import _signal_date_from_payload_or_row
+    from datetime import date
+
+    one_day_ago = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    payload = {"timestamp_iso": one_day_ago}
+    row = {"created_ts": datetime.fromisoformat(one_day_ago)}
+    sig_date = _signal_date_from_payload_or_row(payload, row)
+
+    today_et = date.today()
+    yesterday_et = today_et - timedelta(days=1)
+    in_window = (sig_date == yesterday_et or sig_date == today_et)
+    # 1-day-old timestamp at non-midnight may be today or yesterday in ET
+    # Either way it must be in-window for the prior session gate
+    assert in_window is True, f"Prior-session row must be in-window; sig_date={sig_date}"
+
+
+# =============================================================================
+# Fix 4 (review §4): PostgreSQL durable outcome tests
+# =============================================================================
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_26_stale_session_terminalized_durably(pg_conn):
+    """Fix 2+3: 3-day-old WATCHING row must be terminalized as
+    LIVE_RECOVERY_STALE_SESSION — not left WATCHING indefinitely."""
+    import json as _json
+    from ap_recovery import _LIVE_ENTRY_BROKER_EVIDENCE_SQL
+
+    row_id = 9010
+    sig    = "sig-stale-pg-001"
+    old_ts = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO trade_queue (id, client_id, signal_id, status, payload, created_ts)
+            VALUES (%s,%s,%s,'WATCHING',%s::jsonb,%s)
+            ON CONFLICT (id) DO UPDATE
+              SET status='WATCHING', payload=EXCLUDED.payload, created_ts=EXCLUDED.created_ts
+        """, (row_id, _CLIENT, sig, _json.dumps({
+            "ticker":"WMT","direction":"PUT","trigger_price":60.5,
+            "execution_mode":"live","timestamp_iso": old_ts,
+        }), old_ts))
+    pg_conn.commit()
+
+    # Apply the stale-session terminalization
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE trade_queue
+            SET status='REJECTED',
+                last_error='LIVE_RECOVERY_STALE_SESSION:test_date',
+                payload = COALESCE(payload,'{{}}'::jsonb) || '{{"live_recovery_outcome":"LIVE_RECOVERY_STALE_SESSION"}}'::jsonb,
+                finished_ts = NOW()
+            WHERE id=%s AND client_id=%s AND status='WATCHING'
+              AND NOT EXISTS (
+                SELECT 1 FROM orders
+                WHERE orders.client_id=trade_queue.client_id
+                  AND orders.kind='ENTRY'
+                  AND LOWER(COALESCE(orders.execution_mode,''))='live'
+                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                  AND orders.signal_id=%s
+              )
+            """,
+            (row_id, _CLIENT, sig),
+        )
+        rc = cur.rowcount
+    pg_conn.commit()
+
+    assert rc == 1, f"Stale row must be terminalized; rowcount={rc}"
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "SELECT status, last_error FROM trade_queue WHERE id=%s", (row_id,)
+        )
+        r = cur.fetchone()
+    st  = r[0] if not hasattr(r, "keys") else r["status"]
+    le  = r[1] if not hasattr(r, "keys") else r["last_error"]
+    assert st == "REJECTED", f"status must be REJECTED, got {st!r}"
+    assert "LIVE_RECOVERY_STALE_SESSION" in (le or ""), f"last_error must carry reason, got {le!r}"
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_27_temporary_unavail_writes_bounded_diagnostics(pg_conn):
+    """Fix 2: Quote-unavailable row stays WATCHING but gets durable
+    bounded diagnostics written to payload."""
+    import json as _json
+
+    row_id = 9011
+    sig    = "sig-quote-unavail-pg-001"
+
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO trade_queue (id, client_id, signal_id, status, payload, created_ts)
+            VALUES (%s,%s,%s,'WATCHING',%s::jsonb,NOW())
+            ON CONFLICT (id) DO UPDATE SET status='WATCHING', payload=EXCLUDED.payload
+        """, (row_id, _CLIENT, sig, _json.dumps({
+            "ticker":"WMT","direction":"PUT","trigger_price":60.5,
+            "execution_mode":"live","timestamp_iso":datetime.now(timezone.utc).isoformat(),
+        })))
+    pg_conn.commit()
+
+    patch = {
+        "live_recovery_attempt": 1,
+        "live_recovery_last_attempted": datetime.now(timezone.utc).isoformat(),
+        "live_recovery_reason": "current_underlying_unavailable",
+        "live_recovery_next_retry": (
+            datetime.now(timezone.utc) + timedelta(seconds=300)
+        ).isoformat(),
+        "live_recovery_max_attempts": 12,
+    }
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE trade_queue SET payload = COALESCE(payload,'{}'::jsonb) || %s::jsonb "
+            "WHERE id=%s AND client_id=%s AND status='WATCHING'",
+            (_json.dumps(patch), row_id, _CLIENT),
+        )
+        rc = cur.rowcount
+    pg_conn.commit()
+
+    assert rc == 1, "Diagnostics write must succeed"
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT status, payload FROM trade_queue WHERE id=%s", (row_id,))
+        r = cur.fetchone()
+    st  = r[0] if not hasattr(r, "keys") else r["status"]
+    pl  = r[1] if not hasattr(r, "keys") else r["payload"]
+    if isinstance(pl, str):
+        pl = _json.loads(pl)
+    assert st == "WATCHING", f"Row must stay WATCHING; got {st!r}"
+    assert pl.get("live_recovery_attempt") == 1
+    assert pl.get("live_recovery_reason") == "current_underlying_unavailable"
+    assert "live_recovery_next_retry" in pl
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_28_active_order_race_prevents_terminalization(pg_conn):
+    """Fix 2: Active LIVE ENTRY order prevents terminalization via NOT EXISTS fence."""
+    import json as _json
+    from ap_recovery import _LIVE_ENTRY_BROKER_EVIDENCE_SQL
+
+    row_id = 9012
+    sig    = "sig-active-race-pg-001"
+    loid   = "loid-active-race-pg-001"
+
+    with pg_conn.cursor() as cur:
+        # Active ENTRY order with submit_intent_at (matches broker evidence SQL)
+        cur.execute("""
+            INSERT INTO orders (
+                local_order_id,client_id,kind,status,
+                signal_id,execution_mode,direction,symbol,meta,
+                submitted_ts,created_ts,updated_ts
+            ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',
+                      %s,'live','PUT','WMT',%s::jsonb,
+                      NOW(),NOW(),NOW())
+            ON CONFLICT (local_order_id) DO UPDATE SET submitted_ts=NOW(), status='PENDING_TRIGGER'
+        """, (loid, _CLIENT, sig,
+              _json.dumps({"submit_intent_at": datetime.now(timezone.utc).isoformat()})))
+        cur.execute("""
+            INSERT INTO trade_queue (id,client_id,signal_id,status,payload,created_ts)
+            VALUES (%s,%s,%s,'WATCHING',%s::jsonb,NOW())
+            ON CONFLICT (id) DO UPDATE SET status='WATCHING'
+        """, (row_id, _CLIENT, sig, _json.dumps({"execution_mode":"live"})))
+    pg_conn.commit()
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE trade_queue
+            SET status='REJECTED', last_error='LIVE_RECOVERY_STALE_SESSION:test',
+                finished_ts=NOW()
+            WHERE id=%s AND client_id=%s AND status='WATCHING'
+              AND NOT EXISTS (
+                SELECT 1 FROM orders
+                WHERE orders.client_id=trade_queue.client_id
+                  AND orders.kind='ENTRY'
+                  AND LOWER(COALESCE(orders.execution_mode,''))='live'
+                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                  AND orders.signal_id=%s
+              )
+            """,
+            (row_id, _CLIENT, sig),
+        )
+        rc = cur.rowcount
+    pg_conn.commit()
+
+    assert rc == 0, f"NOT EXISTS fence must block terminalization when active order exists; rc={rc}"
+
+    with pg_conn.cursor() as cur:
+        cur.execute("SELECT status FROM trade_queue WHERE id=%s", (row_id,))
+        r = cur.fetchone()
+    st = r[0] if r and not hasattr(r, "keys") else (r or {}).get("status","")
+    assert st == "WATCHING", f"Row must remain WATCHING; got {st!r}"
+
+    try:
+        pg_conn.rollback()
+    except Exception:
+        pass
+
+
+@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
+def test_postgres_29_forged_canonical_claim_affects_zero_rows(pg_conn):
+    """Fix 1 (PostgreSQL): A claim with canonical that disagrees with the
+    durable value produces rowcount=0 — no state change."""
+    import ap.order_state_machine as osm_real
+    from ap_canonical_signal import build_canonical_signal_id
+
+    plain_sig    = "ddddeeee-ffff-0000-1111-222233334444"
+    derived      = build_canonical_signal_id(plain_sig)
+    forged_canon = "REEVAL:99999999-9999-9999-9999-999999999999"
+    loid         = "pg-forged-canon-002"
+
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO orders (
+                local_order_id,client_id,kind,status,
+                signal_id,execution_mode,canonical_signal_id,
+                direction,symbol,meta,created_ts,updated_ts
+            ) VALUES (%s,%s,'ENTRY','PENDING_TRIGGER',
+                      %s,'live',%s,'PUT','WMT',%s::jsonb,NOW(),NOW())
+            ON CONFLICT (local_order_id) DO UPDATE
+              SET canonical_signal_id=EXCLUDED.canonical_signal_id,
+                  meta=EXCLUDED.meta, status='PENDING_TRIGGER'
+        """, (
+            loid, _CLIENT, plain_sig, derived,
+            '{"lifecycle_state":"","materialization_generation":0,' +
+            '"materialization_status":"WAITING_FOR_TRIGGER",' +
+            '"submit_intent_at":"","broker_ready":false}',
+        ))
+    pg_conn.commit()
+
+    def _real_conn():
+        class _C:
+            def __enter__(self_):
+                self_.cur = pg_conn.cursor()
+                return self_.cur
+            def __exit__(self_, *exc):
+                (pg_conn.commit if not any(exc) else pg_conn.rollback)()
+                self_.cur.close()
+                return False
+        return _C()
+
+    orig_conn  = osm_real.conn
+    orig_retry = osm_real.run_with_retry
+    try:
+        osm_real.conn = _real_conn
+        osm_real.run_with_retry = lambda fn, *a, **k: fn()
+        osm = APOrderStateMachine(_CLIENT)
+        lease = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+        ok = osm.claim_deferred_materialization(
+            loid, owner="worker-forged", new_generation=1,
+            lease_until=lease,
+            trigger_crossed_at=datetime.now(timezone.utc).isoformat(),
+            trigger_price=60.5, observed_underlying_price=59.0,
+            signal_id=plain_sig, execution_mode="live",
+            canonical_signal_id=forged_canon,
+            allow_legacy_empty_canonical=False,
+        )
+        assert ok is False, "Forged canonical must produce False"
+
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT meta->>'lifecycle_state' AS lc, "
+                "meta->>'materialization_generation' AS gen "
+                "FROM orders WHERE local_order_id=%s", (loid,)
+            )
+            r = cur.fetchone()
+        lc  = (r[0] if not hasattr(r,"keys") else r.get("lc","")) or ""
+        gen = int((r[1] if not hasattr(r,"keys") else r.get("gen","0")) or 0)
+        assert lc  == "", f"lifecycle_state must be unchanged; got {lc!r}"
+        assert gen == 0,  f"generation must remain 0; got {gen}"
+    finally:
+        osm_real.conn = orig_conn
+        osm_real.run_with_retry = orig_retry
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass

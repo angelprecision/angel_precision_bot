@@ -4105,16 +4105,40 @@ class APExecutionCore:
                             _durable_exec_mode = str(
                                 _durable_row.get("execution_mode") or ""
                             ).strip().lower()
+                        # Fix 1 (review §1): Derive expected canonical ONLY from
+                        # the resolved source signal_id via the canonical builder.
+                        # Never trust plan, metadata or payload canonical as the
+                        # expected value — that would allow a forged/stale canonical
+                        # on the plan to bypass the CAS predicate.
                         _expected_canonical = str(
+                            build_canonical_signal_id(_expected_source_signal_id) or ""
+                        ).strip()
+                        # If the plan or payload carries a pre-computed canonical,
+                        # compare it against the independently derived value.
+                        # Disagreement means the caller's identity is inconsistent
+                        # with the source signal — block before claim/selector/broker.
+                        _supplied_canonical = str(
                             getattr(approved_plan, "canonical_signal_id", "")
                             or _plan_meta_for_id.get("canonical_signal_id", "")
                             or _sig_payload_for_id.get("canonical_signal_id", "")
-                            or build_canonical_signal_id(
-                                _expected_source_signal_id,
-                                _sig_payload_for_id,
-                            )
                             or ""
                         ).strip()
+                        if _supplied_canonical and _supplied_canonical != _expected_canonical:
+                            log.critical(
+                                "[%s] MATERIALIZATION_IDENTITY_MISMATCH order=%s "
+                                "supplied_canonical=%s derived_canonical=%s "
+                                "signal_id=%s — supplied canonical disagrees with "
+                                "independently derived value; selector blocked",
+                                ticker, queue_local_order_id,
+                                _supplied_canonical, _expected_canonical,
+                                _expected_source_signal_id,
+                            )
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": "MATERIALIZATION_IDENTITY_MISMATCH",
+                                "identity_detail": "supplied_canonical_disagrees_with_derived",
+                                "retry_after_seconds": 5,
+                            }
                         # Core identity must match on signal_id + client + mode.
                         # Canonical split: modern row must match exactly; legacy
                         # row (empty durable canonical) gets atomic backfill.
