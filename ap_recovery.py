@@ -2909,11 +2909,17 @@ class APStartupRecovery:
                               AND status = 'WATCHING'
                               AND created_ts >= %s
                               AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
-                              AND (
-                                    last_error IS NULL
-                                 OR last_error NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
-                                 OR last_error NOT LIKE 'LIVE_RECOVERY_STALE_SESSION%%'
-                              )
+                              -- Exclude every durable LIVE recovery terminal
+                              -- classification independently. The previous OR-chain
+                              -- was always true for non-null values (a MISSED reason
+                              -- is not a STALE reason, so the second OR clause matched
+                              -- and re-selected terminalized rows). Separate AND
+                              -- COALESCE(...) NOT LIKE predicates fix that.
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_STALE_SESSION%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_POLICY%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_READINESS%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_RETRY_EXHAUSTED%%'
                             ORDER BY created_ts ASC
                             """,
                             (self.client_id, _stale_cutoff_utc),
