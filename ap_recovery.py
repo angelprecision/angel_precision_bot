@@ -2909,43 +2909,18 @@ class APStartupRecovery:
                               AND status = 'WATCHING'
                               AND created_ts >= %s
                               AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
-                              -- Exclude every durable LIVE recovery terminal
-                              -- classification independently.
+                              -- Terminal-family exclusions (independent AND predicates).
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_STALE_SESSION%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_POLICY%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_READINESS%%'
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_RETRY_EXHAUSTED%%'
-                              -- Fix: respect bounded retry window. A row with a
-                              -- live_recovery_next_retry timestamp in the future
-                              -- must not be re-selected until that window passes.
-                              -- Malformed timestamps treat as NULL (allow-through)
-                              -- so infrastructure failures never permanently exclude.
-                              -- next_retry filter: 3-branch predicate.
-                              -- Branch 1: empty/null → allow-through.
-                              -- Branch 2: NOT matching strict ISO regex → allow-through
-                              --   (malformed values are infrastructure noise, never
-                              --    permanently excluded; fail-safe for bad writes).
-                              -- Branch 3: strict regex matches AND ::timestamptz <= NOW()
-                              --   → retry window passed, allow-through.
-                              -- Rows are excluded only when the strict regex matches
-                              -- AND the timestamp is still in the future.
-                              -- The strict regex validates YYYY-(01-12)-(01-31)THH:MM
-                              -- so values like "2026-99-99Tbroken" fail Branch 2
-                              -- (NOT matches → True) and never reach the cast.
-                              AND (
-                                COALESCE(payload->>'live_recovery_next_retry', '') = ''
-                                OR NOT (
-                                    payload->>'live_recovery_next_retry'
-                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
-                                )
-                                OR (
-                                    payload->>'live_recovery_next_retry'
-                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
-                                    AND (payload->>'live_recovery_next_retry')::timestamptz
-                                        <= NOW()
-                                )
-                              )
+                              -- live_recovery_next_retry is intentionally NOT
+                              -- evaluated here. Timestamp validation belongs in Python
+                              -- where try/except can safely handle any malformed value
+                              -- (including 2026-02-31T12:00, 2026-01-01T99:99, etc.)
+                              -- without the risk of a PostgreSQL cast error.
+                              -- _next_retry_due() is applied to each row after loading.
                             ORDER BY created_ts ASC
                             """,
                             (self.client_id, _stale_cutoff_utc),
@@ -2975,31 +2950,8 @@ class APStartupRecovery:
                               AND created_ts >= %s
                               AND COALESCE(payload->>'execution_mode', '') = ''
                               AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_%%'
-                              -- next_retry filter: 3-branch predicate.
-                              -- Branch 1: empty/null → allow-through.
-                              -- Branch 2: NOT matching strict ISO regex → allow-through
-                              --   (malformed values are infrastructure noise, never
-                              --    permanently excluded; fail-safe for bad writes).
-                              -- Branch 3: strict regex matches AND ::timestamptz <= NOW()
-                              --   → retry window passed, allow-through.
-                              -- Rows are excluded only when the strict regex matches
-                              -- AND the timestamp is still in the future.
-                              -- The strict regex validates YYYY-(01-12)-(01-31)THH:MM
-                              -- so values like "2026-99-99Tbroken" fail Branch 2
-                              -- (NOT matches → True) and never reach the cast.
-                              AND (
-                                COALESCE(payload->>'live_recovery_next_retry', '') = ''
-                                OR NOT (
-                                    payload->>'live_recovery_next_retry'
-                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
-                                )
-                                OR (
-                                    payload->>'live_recovery_next_retry'
-                                    ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
-                                    AND (payload->>'live_recovery_next_retry')::timestamptz
-                                        <= NOW()
-                                )
-                              )
+                              -- next_retry evaluated in Python after loading;
+                              -- see _next_retry_due() below.
                             ORDER BY created_ts ASC
                             """,
                             (self.client_id, _stale_cutoff_utc),
@@ -3679,13 +3631,58 @@ class APStartupRecovery:
                         )
                         return int(getattr(c, "rowcount", 0) or 0) == 1
 
-                # ── Dispatch loop ─────────────────────────────────────────
+                def _next_retry_due(row_payload: dict) -> bool:
+                    """Return True when this row should be processed now.
+
+                    Option 3 from the review: parse and validate
+                    live_recovery_next_retry entirely in Python after bounded
+                    candidate loading — no SQL cast, no regex in WHERE clause.
+
+                    Rules:
+                      absent / empty  → due (allow-through)
+                      valid past      → due (window elapsed)
+                      valid future    → NOT due (suppress until window passes)
+                      any malformed   → due (infrastructure noise, fail-safe)
+
+                    All inputs that cannot be parsed as aware UTC datetimes
+                    are treated as absent and therefore eligible.  This covers:
+                      "not-a-date", "2026-02-31T12:00",
+                      "2026-01-01T99:99", "2026-01-01T12:99",
+                      "2026-01-01T12:00garbage"
+                    and any other invalid or exotic value.
+                    """
+                    raw = (row_payload or {}).get("live_recovery_next_retry")
+                    if not raw:
+                        return True                   # absent → due
+                    try:
+                        s = str(raw).strip()
+                        if s.endswith("Z"):
+                            s = s[:-1] + "+00:00"
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt <= datetime.now(timezone.utc)
+                    except Exception:
+                        return True                   # malformed → due (fail-safe)
+
+                # ── Main dispatch loop ────────────────────────────────────
                 restored = 0
                 rows = run_with_retry(_load_candidates) or []
                 for row in rows:
                     row = dict(row or {})
                     row_id  = row.get("id")
                     prior_payload = _payload_dict(row)
+                    # Python-level next_retry gate: skip rows whose retry
+                    # window has not yet elapsed. Any malformed timestamp
+                    # is treated as due (fail-safe, never permanently excluded).
+                    if not _next_retry_due(prior_payload):
+                        log.debug(
+                            "LIVE_RECOVERY_NEXT_RETRY_PENDING client_id=%s "
+                            "row_id=%s next_retry=%s",
+                            self.client_id, row_id,
+                            prior_payload.get("live_recovery_next_retry"),
+                        )
+                        continue
                     outcome, diag = _classify(row)
                     _sig_id = diag.get("signal_id", "") or str(row.get("signal_id") or "")
                     _can_id = diag.get("canonical_signal_id", "")
@@ -3794,6 +3791,15 @@ class APStartupRecovery:
                     mm_row = dict(mm_row or {})
                     mm_id = mm_row.get("id")
                     mm_payload = _payload_dict(mm_row)
+                    # Python-level next_retry gate (same safe logic as main loop).
+                    if not _next_retry_due(mm_payload):
+                        log.debug(
+                            "LIVE_MISSING_MODE_NEXT_RETRY_PENDING client_id=%s "
+                            "row_id=%s next_retry=%s",
+                            self.client_id, mm_row.get("id"),
+                            mm_payload.get("live_recovery_next_retry"),
+                        )
+                        continue
                     mm_sig = str(
                         mm_row.get("signal_id")
                         or mm_payload.get("signal_id")

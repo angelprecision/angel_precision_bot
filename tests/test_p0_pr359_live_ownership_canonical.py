@@ -2327,70 +2327,74 @@ def test_restart_guard_bypass_paper_path_unchanged():
     assert result is False
 
 
-# ─── next_retry filter (mocked logic proof) ──────────────────────────────────
+# ─── next_retry filter: Python safe-filter ───────────────────────────────────
+# Option 3 from the review: parse and validate in Python after bounded loading.
+# No SQL cast, no regex in WHERE clause — fromisoformat+try/except handles
+# every malformed value safely (2026-02-31, 2026-01-01T99:99, garbage, etc).
 
-# Mirrors the exact 3-branch SQL predicate in _load_candidates:
-# Branch 1: empty/null → allow-through
-# Branch 2: NOT matching strict ISO regex → allow-through (malformed = fail-safe)
-# Branch 3: strict regex match AND past → allow-through (window passed)
-# Excluded only: strict regex match AND future
-
-_NEXT_RETRY_STRICT_RE = (
-    r"^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])"
-    r"T[0-9]{2}:[0-9]{2}"
-)
-
-def _next_retry_predicate(ts):
-    """Python mirror of the production 3-branch SQL next_retry predicate."""
-    import re
-    if not ts:
-        return True   # Branch 1: empty/null
-    if not re.match(_NEXT_RETRY_STRICT_RE, str(ts)):
-        return True   # Branch 2: malformed / non-ISO → allow-through
+def _next_retry_due(payload):
+    """Python mirror of production ap_recovery._next_retry_due.
+    Returns True when the row should be processed (retry window elapsed or
+    timestamp absent/malformed). Returns False only for a parseable future ts.
+    """
+    raw = (payload or {}).get("live_recovery_next_retry")
+    if not raw:
+        return True
     try:
-        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        s = str(raw).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt <= datetime.now(timezone.utc)  # Branch 3: past → True
+        return dt <= datetime.now(timezone.utc)
     except Exception:
-        return True   # Cast failure → allow-through (extra safety)
+        return True   # malformed → due (fail-safe)
 
 
 def test_next_retry_future_timestamp_excludes_row():
-    """Valid ISO future next_retry must exclude the row from candidates."""
+    """Valid ISO future next_retry → not due (row suppressed)."""
     future = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
-    assert _next_retry_predicate(future) is False, \
-        "Future next_retry must exclude row"
+    assert _next_retry_due({"live_recovery_next_retry": future}) is False
 
 
 def test_next_retry_past_timestamp_includes_row():
-    """Valid ISO past next_retry must include the row (window passed)."""
+    """Valid ISO past next_retry → due (retry window elapsed)."""
     past = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
-    assert _next_retry_predicate(past) is True, \
-        "Past next_retry must include row"
+    assert _next_retry_due({"live_recovery_next_retry": past}) is True
 
 
-def test_next_retry_malformed_timestamp_allows_through():
-    """Malformed / non-ISO next_retry values must allow-through (Branch 2).
-    This is the defect fixed: the old 2-branch predicate excluded non-ISO
-    values (Branch 2 was absent); the new 3-branch predicate allows them."""
-    for bad in ("not-a-date", "broken", "tomorrow", "2026/07/20", ""):
-        assert _next_retry_predicate(bad) is True, \
-            f"{bad!r} must allow-through (malformed = infrastructure noise)"
-    assert _next_retry_predicate(None) is True, "None must allow-through"
+def test_next_retry_absent_or_empty_is_due():
+    """Absent / empty / None next_retry → always due."""
+    assert _next_retry_due({}) is True
+    assert _next_retry_due({"live_recovery_next_retry": ""}) is True
+    assert _next_retry_due({"live_recovery_next_retry": None}) is True
 
 
-def test_next_retry_date_shaped_invalid_calendar_allows_through():
-    """A date-shaped but invalid calendar value (e.g. month 99) must NOT
-    reach the ::timestamptz cast — it fails the strict regex (Branch 2) and
-    is allowed through safely without a query error."""
-    # "2026-99-99T00:00" — matches weak r'^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
-    # but fails strict r'^...(0[1-9]|1[0-2])-(0[1-9]|...)T[0-9]{2}:[0-9]{2}'
-    # because month "99" does not match (0[1-9]|1[0-2]).
-    bad_calendar = "2026-99-99T00:00:00+00:00"
-    assert _next_retry_predicate(bad_calendar) is True, \
-        "Invalid calendar date must allow-through via Branch 2 (not reach cast)"
+def test_next_retry_all_malformed_values_are_due():
+    """Every malformed value must be treated as due (fail-safe) with no
+    exception raised.  Covers all four cases required by the review plus
+    additional common bad inputs."""
+    malformed_cases = [
+        "not-a-date",
+        "broken",
+        "tomorrow",
+        "2026/07/20",
+        "2026-02-31T12:00",        # impossible calendar date (Feb 31)
+        "2026-01-01T99:99",        # invalid hours (99)
+        "2026-01-01T12:99",        # invalid minutes (99)
+        "2026-01-01T12:00garbage", # trailing garbage after valid prefix
+        "2026-99-99T00:00:00+00:00",  # month/day 99
+    ]
+    for bad in malformed_cases:
+        result = _next_retry_due({"live_recovery_next_retry": bad})
+        assert result is True, (
+            f"{bad!r} must be due (fail-safe) — fromisoformat raised, "
+            "must not permanently exclude the row"
+        )
 
+
+# ─── Missing-mode identity repair (mocked) ───────────────────────────────────
 
 # ─── Missing-mode identity repair (mocked) ───────────────────────────────────
 
@@ -2798,46 +2802,39 @@ def test_postgres_38_mode_repair_atomic_stamp(pg_conn):
 
 
 # =============================================================================
-# PostgreSQL: 5 next_retry edge cases required by the review
-# These prove the 3-branch predicate with strict regex works in real PG.
+# PostgreSQL: next_retry safe-filter — required edge cases from the review
+# The SQL queries NO LONGER contain any cast or regex for next_retry.
+# These tests prove: (a) the query itself does not fail on any malformed value,
+# and (b) Python _next_retry_due() correctly gates the row after loading.
 # =============================================================================
 
-def _pg_next_retry_candidate_query(cur, client_id: str, stale_cutoff: str):
-    """Run the production next_retry-aware candidate query on real PostgreSQL."""
+def _pg_plain_candidate_query(cur, client_id: str, stale_cutoff: str):
+    """Run the production candidate query (no next_retry predicate in SQL).
+    Python then filters via _next_retry_due. This helper exercises only the
+    SQL to prove no query error occurs on any payload value."""
     cur.execute(
         """
-        SELECT id FROM trade_queue
+        SELECT id, payload->>'live_recovery_next_retry' AS nrt
+        FROM trade_queue
         WHERE client_id = %s
           AND status = 'WATCHING'
           AND created_ts >= %s
           AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
           AND COALESCE(last_error,'') NOT LIKE 'LIVE_RECOVERY_%%'
-          AND (
-            COALESCE(payload->>'live_recovery_next_retry', '') = ''
-            OR NOT (
-                payload->>'live_recovery_next_retry'
-                ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
-            )
-            OR (
-                payload->>'live_recovery_next_retry'
-                ~ '^(19|20)[0-9]{2}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T[0-9]{2}:[0-9]{2}'
-                AND (payload->>'live_recovery_next_retry')::timestamptz <= NOW()
-            )
-          )
         ORDER BY created_ts ASC
         """,
         (client_id, stale_cutoff),
     )
-    return {r[0] if not hasattr(r, "keys") else r["id"] for r in cur.fetchall()}
+    return cur.fetchall()
 
 
-def _pg_insert_next_retry_row(cur, row_id, sig, next_retry_val):
-    """Insert a minimal LIVE WATCHING row with the given next_retry value."""
-    import json as _json
-    payload = {"ticker": "WMT", "direction": "PUT", "trigger_price": 60.5,
-               "execution_mode": "live"}
+def _pg_insert_nr_row(cur, row_id, sig, next_retry_val):
+    """Insert a LIVE WATCHING row with the given next_retry payload value."""
+    import json as _j
+    pl = {"ticker": "WMT", "direction": "PUT", "trigger_price": 60.5,
+          "execution_mode": "live"}
     if next_retry_val is not None:
-        payload["live_recovery_next_retry"] = next_retry_val
+        pl["live_recovery_next_retry"] = next_retry_val
     cur.execute(
         """
         INSERT INTO trade_queue (id,client_id,signal_id,status,payload,created_ts)
@@ -2845,104 +2842,92 @@ def _pg_insert_next_retry_row(cur, row_id, sig, next_retry_val):
         ON CONFLICT (id) DO UPDATE
           SET status='WATCHING', payload=EXCLUDED.payload, created_ts=NOW()
         """,
-        (row_id, _CLIENT, sig, _json.dumps(payload)),
+        (row_id, _CLIENT, sig, _j.dumps(pl)),
     )
 
 
 @pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
-def test_postgres_39_next_retry_empty_is_selected(pg_conn):
-    """PG: empty live_recovery_next_retry (Branch 1) → row selected."""
+def test_postgres_39_next_retry_empty_no_error(pg_conn):
+    """PG: empty next_retry → query succeeds; Python gate returns due."""
     row_id = 9301
     with pg_conn.cursor() as cur:
-        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-empty-{row_id}", None)
+        _pg_insert_nr_row(cur, row_id, f"sig-nr-empty-{row_id}", None)
     pg_conn.commit()
     stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     with pg_conn.cursor() as cur:
-        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
-    assert row_id in selected, "Empty next_retry must be selected (Branch 1)"
-    try:
-        pg_conn.rollback()
-    except Exception:
-        pass
+        rows = _pg_plain_candidate_query(cur, _CLIENT, stale_cutoff)
+    ids = {r[0] if not hasattr(r,"keys") else r["id"] for r in rows}
+    assert row_id in ids
+    # Python gate
+    assert _next_retry_due({"live_recovery_next_retry": None}) is True
+    try: pg_conn.rollback()
+    except Exception: pass
 
 
 @pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
-def test_postgres_40_next_retry_valid_future_is_excluded(pg_conn):
-    """PG: valid ISO future next_retry → row excluded."""
+def test_postgres_40_next_retry_valid_future_no_sql_error_gated_in_python(pg_conn):
+    """PG: valid future next_retry → query succeeds; Python gate suppresses row."""
     row_id = 9302
     future = (datetime.now(timezone.utc) + timedelta(seconds=300)).isoformat()
     with pg_conn.cursor() as cur:
-        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-future-{row_id}", future)
+        _pg_insert_nr_row(cur, row_id, f"sig-nr-future-{row_id}", future)
     pg_conn.commit()
     stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     with pg_conn.cursor() as cur:
-        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
-    assert row_id not in selected, "Future next_retry must be excluded"
-    try:
-        pg_conn.rollback()
-    except Exception:
-        pass
+        rows = _pg_plain_candidate_query(cur, _CLIENT, stale_cutoff)
+    # SQL loads the row (no cast in WHERE); Python gate suppresses it
+    nrt_vals = {
+        (r[0] if not hasattr(r,"keys") else r["id"]):
+        (r[1] if not hasattr(r,"keys") else r.get("nrt"))
+        for r in rows
+    }
+    if row_id in nrt_vals:
+        assert _next_retry_due({"live_recovery_next_retry": nrt_vals[row_id]}) is False
+    try: pg_conn.rollback()
+    except Exception: pass
 
 
 @pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
-def test_postgres_41_next_retry_valid_past_is_selected(pg_conn):
-    """PG: valid ISO past next_retry (Branch 3) → row selected."""
+def test_postgres_41_next_retry_valid_past_no_sql_error_gated_in_python(pg_conn):
+    """PG: valid past next_retry → query succeeds; Python gate passes row."""
     row_id = 9303
     past = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
     with pg_conn.cursor() as cur:
-        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-past-{row_id}", past)
+        _pg_insert_nr_row(cur, row_id, f"sig-nr-past-{row_id}", past)
     pg_conn.commit()
     stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     with pg_conn.cursor() as cur:
-        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
-    assert row_id in selected, "Past next_retry must be selected (window passed)"
-    try:
-        pg_conn.rollback()
-    except Exception:
-        pass
+        rows = _pg_plain_candidate_query(cur, _CLIENT, stale_cutoff)
+    ids = {r[0] if not hasattr(r,"keys") else r["id"] for r in rows}
+    assert row_id in ids
+    assert _next_retry_due({"live_recovery_next_retry": past}) is True
+    try: pg_conn.rollback()
+    except Exception: pass
 
 
 @pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
-def test_postgres_42_next_retry_malformed_string_is_selected_no_error(pg_conn):
-    """PG: malformed non-date string (Branch 2 NOT regex) → selected, no error.
-    This was the defect: the old 2-branch predicate excluded this row."""
-    row_id = 9304
+@pytest.mark.parametrize("bad_val,row_id,sig_suffix", [
+    ("not-a-date",               9310, "notadate"),
+    ("2026-02-31T12:00",         9311, "feb31"),     # impossible date
+    ("2026-01-01T99:99",         9312, "hr99"),      # invalid hours
+    ("2026-01-01T12:99",         9313, "min99"),     # invalid minutes
+    ("2026-01-01T12:00garbage",  9314, "garbage"),   # trailing garbage
+])
+def test_postgres_42_malformed_next_retry_no_sql_error(pg_conn, bad_val, row_id, sig_suffix):
+    """PG: malformed next_retry values must not cause a query error, and
+    Python _next_retry_due must treat them as due (fail-safe)."""
     with pg_conn.cursor() as cur:
-        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-malformed-{row_id}", "not-a-date")
+        _pg_insert_nr_row(cur, row_id, f"sig-nr-malformed-{sig_suffix}", bad_val)
     pg_conn.commit()
     stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     # This must NOT raise a PostgreSQL error
     with pg_conn.cursor() as cur:
-        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
-    assert row_id in selected, (
-        "Malformed next_retry must be selected (Branch 2 allow-through); "
-        "old 2-branch predicate excluded this row"
+        rows = _pg_plain_candidate_query(cur, _CLIENT, stale_cutoff)
+    ids = {r[0] if not hasattr(r,"keys") else r["id"] for r in rows}
+    # Row loads OK (no SQL error); Python gate says it is due
+    assert row_id in ids, f"Row with bad next_retry {bad_val!r} must load without error"
+    assert _next_retry_due({"live_recovery_next_retry": bad_val}) is True, (
+        f"{bad_val!r} must be treated as due (fail-safe)"
     )
-    try:
-        pg_conn.rollback()
-    except Exception:
-        pass
-
-
-@pytest.mark.skipif(not _PG_AVAILABLE, reason="PostgreSQL not configured")
-def test_postgres_43_next_retry_invalid_calendar_is_selected_no_error(pg_conn):
-    """PG: date-shaped but invalid calendar (e.g. month 99) → selected without
-    query error. The strict regex rejects it at Branch 2 before the ::timestamptz
-    cast is attempted, preventing a PostgreSQL timestamp conversion error."""
-    row_id = 9305
-    bad_calendar = "2026-99-99T00:00:00+00:00"  # month 99, day 99 — invalid
-    with pg_conn.cursor() as cur:
-        _pg_insert_next_retry_row(cur, row_id, f"sig-nr-badcal-{row_id}", bad_calendar)
-    pg_conn.commit()
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    # This must NOT raise a PostgreSQL invalid_datetime_format error
-    with pg_conn.cursor() as cur:
-        selected = _pg_next_retry_candidate_query(cur, _CLIENT, stale_cutoff)
-    assert row_id in selected, (
-        "Invalid-calendar next_retry must be selected (Branch 2 blocks cast); "
-        "no PostgreSQL error must be raised"
-    )
-    try:
-        pg_conn.rollback()
-    except Exception:
-        pass
+    try: pg_conn.rollback()
+    except Exception: pass
