@@ -190,6 +190,75 @@ def _upsert_preopen_row(
     run_with_retry(_write)
 
 
+def _upsert_preopen_row_idempotent_overnight(
+    *,
+    client_id: str,
+    execution_mode: str,
+    trading_date: str,
+    result: dict,
+) -> None:
+    """Write overnight_reeval result to preopen_readiness_runs (stage='overnight_reeval').
+
+    Idempotency rule: a later run with fetched=0 MUST NOT overwrite an earlier
+    productive run with fetched>0.  This prevents a no-op duplicate handoff call
+    from wiping the evidence that the first run processed real rows.
+    """
+    try:
+        existing = _load_preopen_row(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            trading_date=trading_date,
+            stage="overnight_reeval",
+        )
+        existing_details = {}
+        if existing and isinstance(existing.get("details"), dict):
+            existing_details = existing["details"]
+
+        existing_fetched = int(existing_details.get("fetched") or 0)
+        new_fetched = int(result.get("fetched") or 0)
+
+        if existing and existing_fetched > 0 and new_fetched == 0:
+            log.info(
+                "overnight_reeval idempotent write: skipping empty duplicate run "
+                "(existing fetched=%d new fetched=0) client=%s date=%s",
+                existing_fetched, client_id, trading_date,
+            )
+            return
+
+        armed   = int(result.get("armed") or 0)
+        errors  = int(result.get("errors") or 0)
+        stalled = bool(result.get("stalled"))
+
+        # Success = some work done and armed, OR genuinely nothing to do
+        if new_fetched == 0:
+            is_ok = True
+            status = "ok"
+            last_error = None
+        elif armed > 0 and not stalled:
+            is_ok = True
+            status = "ok"
+            last_error = None
+        else:
+            is_ok = False
+            status = "partial"
+            last_error = f"armed={armed} fetched={new_fetched} errors={errors} stalled={stalled}"
+
+        _upsert_preopen_row(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            trading_date=trading_date,
+            stage="overnight_reeval",
+            status=status,
+            last_error=last_error,
+            details=dict(result),
+            mark_success=is_ok,
+        )
+    except Exception as exc:
+        log.warning(
+            "preopen_readiness: overnight_reeval row write failed (non-fatal): %s", exc
+        )
+
+
 def _latest_preopen_rows(trading_date: str) -> list[dict]:
     from ap.db import conn, run_with_retry
 
@@ -475,8 +544,47 @@ def _overnight_status(
     stage: str = "",
     now: datetime | None = None,
 ) -> tuple[str, dict]:
+    # PR: Load the actual overnight_reeval stage record to verify materialization.
+    # A post_overnight_reeval handoff success row is NOT sufficient proof that
+    # overnight reeval armed any entries — a run that rejected all 53 rows on a
+    # false veto still produces a "success" handoff row.
+    reeval_row = None
+    try:
+        reeval_row = _load_preopen_row(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            trading_date=trading_date,
+            stage="overnight_reeval",
+        )
+    except Exception as _exc:
+        log.debug("_overnight_status: reeval row load failed (non-fatal): %s", _exc)
+
     if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
+        # For LIVE mode: verify the reeval actually materialized entry orders.
+        # WATCHING rows > 0, armed=0, and no runtime watchers = false-green.
+        if execution_mode == "live" and reeval_row:
+            reeval_details = (reeval_row.get("details") or {}) if isinstance(reeval_row.get("details"), dict) else {}
+            reeval_fetched = int(reeval_details.get("fetched") or 0)
+            reeval_armed   = int(reeval_details.get("armed") or 0)
+            watching_count = int(client_state.get("watching_count") or 0)
+            pending_rows   = client_state.get("pending_trigger_rows") or []
+            if reeval_fetched > 0 and reeval_armed == 0 and watching_count > 0 and not pending_rows:
+                log.error(
+                    "[%s] LIVE_WATCHING_ROWS_NOT_MATERIALIZED "
+                    "reeval_fetched=%d reeval_armed=0 watching=%d pending_trigger=0 "
+                    "— overnight reeval ran but produced no armed entry orders; "
+                    "handoff row is false-green",
+                    client_id, reeval_fetched, watching_count,
+                )
+                return "degraded", {
+                    "source": "live_watching_not_materialized",
+                    "error_code": "LIVE_WATCHING_ROWS_NOT_MATERIALIZED",
+                    "reeval_fetched": reeval_fetched,
+                    "reeval_armed": reeval_armed,
+                    "watching_count": watching_count,
+                }
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
+
     last_ran = getattr(runner, "_last_overnight_reeval_date", None)
     if str(last_ran or "") == trading_date:
         return "success", {"source": "runner_last_overnight_reeval_date"}
@@ -647,6 +755,16 @@ def run_preopen_autonomous_readiness(
             errors.append("overnight_reeval_missing")
         else:
             warnings.append("overnight_reeval_missing")
+    elif overnight_state == "degraded":
+        # PR: LIVE_WATCHING_ROWS_NOT_MATERIALIZED — overnight reeval ran but
+        # armed no entries while WATCHING rows remain.  This is BLOCKED for LIVE
+        # (watching rows exist with no orders = clients money is not deployed per
+        # their strategy and the system did not catch the failure).
+        error_code = overnight_details.get("error_code", "overnight_reeval_degraded")
+        if mode == "live":
+            errors.append(error_code.lower())
+        else:
+            warnings.append(error_code.lower())
     details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
 
     blocked_keys = {
@@ -656,6 +774,8 @@ def run_preopen_autonomous_readiness(
         "morning_handoff_missing",
         "selector_quote_identity_unresolved",
         "runner_not_alive",
+        # PR: LIVE overnight reeval that produced no armed entries is BLOCKED
+        "live_watching_rows_not_materialized",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"
