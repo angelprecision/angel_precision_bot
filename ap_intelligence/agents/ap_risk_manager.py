@@ -128,6 +128,17 @@ class RiskResult:
     spy_trend: str
     vix: float
     reason: str
+    # ── PR: Structured veto authority ─────────────────────────────────────
+    # Stable fields consumed by intelligence_bridge._risk_allows_trade().
+    # hard_veto=False: advisory context (e.g. SPY regime mismatch) — the
+    #   bridge MUST NOT convert this to an execution-authoritative RISK_VETO.
+    # hard_veto=True:  genuine execution-blocking veto (kill switch, capital,
+    #   contract quality, sector cap). Only these may produce RISK_VETO.
+    # reason_code: stable closed-set identifier for the rejection class.
+    # veto_category: bucket for funnel reporting.
+    reason_code: str = ""
+    veto_category: str = ""
+    hard_veto: bool = False
 
 
 class APRiskManager:
@@ -199,7 +210,10 @@ class APRiskManager:
         if self.daily_pnl < (self.portfolio_value * self.daily_loss_limit_pct):
             return self._reject(ticker, direction, option_premium, dte,
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, f"DAILY KILL SWITCH: P&L = ${self.daily_pnl:.0f}")
+                                option_delta, f"DAILY KILL SWITCH: P&L = ${self.daily_pnl:.0f}",
+                                reason_code="DAILY_LOSS_KILL_SWITCH",
+                                veto_category="account_safety",
+                                hard_veto=True)
 
         # ── 1. Market regime gates ────────────────────────────
         spy = get_spy_trend()
@@ -211,16 +225,26 @@ class APRiskManager:
         is_index = ticker.upper() in INDEX_TICKERS
 
         if not is_index and direction == "bullish" and spy["trend"] == "BEAR":
+            # Advisory: SPY regime mismatch is directional context, not an
+            # execution-authoritative safety veto. hard_veto=False tells the
+            # intelligence bridge NOT to convert this into RISK_VETO.
             return self._reject(ticker, direction, option_premium, dte,
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, "CALL blocked — SPY in BEAR trend",
-                                spy_trend=spy["trend"], vix=vix_data["vix"])
+                                spy_trend=spy["trend"], vix=vix_data["vix"],
+                                reason_code="MARKET_REGIME_MISMATCH",
+                                veto_category="directional_context",
+                                hard_veto=False)
 
         if not is_index and direction == "bearish" and spy["trend"] == "BULL":
+            # Advisory: same taxonomy as CALL_blocked — directional context only.
             return self._reject(ticker, direction, option_premium, dte,
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, "PUT blocked — SPY in BULL trend",
-                                spy_trend=spy["trend"], vix=vix_data["vix"])
+                                spy_trend=spy["trend"], vix=vix_data["vix"],
+                                reason_code="MARKET_REGIME_MISMATCH",
+                                veto_category="directional_context",
+                                hard_veto=False)
 
         if is_index and (
             (direction == "bullish" and spy["trend"] == "BEAR") or
@@ -237,7 +261,10 @@ class APRiskManager:
             return self._reject(ticker, direction, option_premium, dte,
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, f"VIX={vix_data['vix']} outside 12-35",
-                                spy_trend=spy["trend"], vix=vix_data["vix"])
+                                spy_trend=spy["trend"], vix=vix_data["vix"],
+                                reason_code="VIX_POLICY_HARD_CAP",
+                                veto_category="market_safety",
+                                hard_veto=True)
 
         # ── 2. Contract quality filter (HARD GATE) ────────────
         cq = self._contract_quality(
@@ -252,7 +279,10 @@ class APRiskManager:
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, f"CONTRACT QUALITY: {cq.rejection_reason}",
                                 spy_trend=spy["trend"], vix=vix_data["vix"],
-                                contract_quality=cq)
+                                contract_quality=cq,
+                                reason_code="CONTRACT_QUALITY_FAILED",
+                                veto_category="execution_quality",
+                                hard_veto=True)
 
         # ── 3. Exposure bucket check ──────────────────────────
         sector = SECTOR_MAP.get(ticker, "other")
@@ -262,7 +292,10 @@ class APRiskManager:
                                 bid_ask_spread_pct, open_interest, daily_volume_options,
                                 option_delta, f"SECTOR CAP: {sector} exposure limit reached",
                                 spy_trend=spy["trend"], vix=vix_data["vix"],
-                                contract_quality=cq)
+                                contract_quality=cq,
+                                reason_code="SECTOR_EXPOSURE_CAP",
+                                veto_category="exposure_limit",
+                                hard_veto=True)
 
         # ── 4. Volatility-adjusted position cap ───────────────
         end   = datetime.date.today().strftime("%Y-%m-%d")
@@ -343,6 +376,9 @@ class APRiskManager:
             spy_trend=spy["trend"],
             vix=vix_data["vix"],
             reason="APPROVED" if approved else "Insufficient capital or zero contracts",
+            reason_code="APPROVED" if approved else "INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS",
+            veto_category="" if approved else "capital",
+            hard_veto=False,  # sizing failures are not execution-authoritative vetoes
         )
 
     # ────────────────────────────────────────────
@@ -542,7 +578,10 @@ class APRiskManager:
     # HELPERS
     # ────────────────────────────────────────────
     def _reject(self, ticker, direction, premium, dte, spread, oi, vol, delta,
-                reason, spy_trend="UNKNOWN", vix=0.0, contract_quality=None) -> RiskResult:
+                reason, spy_trend="UNKNOWN", vix=0.0, contract_quality=None,
+                reason_code: str = "",
+                veto_category: str = "execution",
+                hard_veto: bool = True) -> RiskResult:
         if contract_quality is None:
             contract_quality = self._contract_quality(spread, oi, vol, delta, dte)
         return RiskResult(
@@ -555,4 +594,7 @@ class APRiskManager:
             contract_quality=contract_quality,
             spy_trend=spy_trend, vix=vix,
             reason=reason,
+            reason_code=reason_code,
+            veto_category=veto_category,
+            hard_veto=hard_veto,
         )
