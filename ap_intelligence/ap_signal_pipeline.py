@@ -245,6 +245,10 @@ class APSignalPipeline:
             "risk": {
                 "approved":           risk_result.approved,
                 "reason":             risk_result.reason,
+                # PR: Structured veto authority — consumed by intelligence_bridge
+                "reason_code":        risk_result.reason_code,
+                "veto_category":      risk_result.veto_category,
+                "hard_veto":          risk_result.hard_veto,
                 "max_contracts":      risk_result.max_contracts,
                 "max_position_usd":   risk_result.max_position_usd,
                 "spy_trend":          risk_result.spy_trend,
@@ -309,6 +313,10 @@ class APSignalPipeline:
             "risk_detail": {
                 "approved":                risk_result.approved,
                 "reason":                  risk_result.reason,
+                # PR: Structured veto authority fields
+                "reason_code":             risk_result.reason_code,
+                "veto_category":           risk_result.veto_category,
+                "hard_veto":               risk_result.hard_veto,
                 "stop_price":              getattr(risk_result, "stop_price", None),
                 "risk_per_contract":       getattr(risk_result, "risk_per_contract", None),
                 "max_contracts":           risk_result.max_contracts,
