@@ -544,10 +544,9 @@ def _overnight_status(
     stage: str = "",
     now: datetime | None = None,
 ) -> tuple[str, dict]:
-    # PR: Load the actual overnight_reeval stage record to verify materialization.
-    # A post_overnight_reeval handoff success row is NOT sufficient proof that
-    # overnight reeval armed any entries — a run that rejected all 53 rows on a
-    # false veto still produces a "success" handoff row.
+    # PR: The actual overnight_reeval preopen_readiness_runs record is
+    # authoritative and takes precedence over handoff_run_locks.
+    # A handoff success row cannot override an unsuccessful evaluation.
     reeval_row = None
     try:
         reeval_row = _load_preopen_row(
@@ -557,30 +556,68 @@ def _overnight_status(
             stage="overnight_reeval",
         )
     except Exception as _exc:
-        log.debug("_overnight_status: reeval row load failed (non-fatal): %s", _exc)
+        log.debug("_overnight_status: reeval row load failed: %s", _exc)
 
-    if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
-        # For LIVE mode: verify the reeval actually materialized entry orders.
-        # WATCHING rows > 0, armed=0, and no runtime watchers = false-green.
-        if execution_mode == "live" and reeval_row:
-            reeval_details = (reeval_row.get("details") or {}) if isinstance(reeval_row.get("details"), dict) else {}
-            reeval_fetched = int(reeval_details.get("fetched") or 0)
-            reeval_armed   = int(reeval_details.get("armed") or 0)
+    if reeval_row:
+        reeval_details = (
+            reeval_row.get("details") or {}
+        ) if isinstance(reeval_row.get("details"), dict) else {}
+        reeval_fetched = int(reeval_details.get("fetched") or 0)
+        reeval_armed   = int(reeval_details.get("armed") or 0)
+        reeval_status  = str(reeval_row.get("status") or "").lower()
+
+        # All-terminal: fetched work but armed nothing — honest failure.
+        # A later handoff success row MUST NOT override this.
+        if reeval_fetched > 0 and reeval_armed == 0:
             watching_count = int(client_state.get("watching_count") or 0)
             pending_rows   = client_state.get("pending_trigger_rows") or []
-            if reeval_fetched > 0 and reeval_armed == 0 and watching_count > 0 and not pending_rows:
+            detail = {
+                "source":          "preopen_readiness_runs.overnight_reeval",
+                "reeval_fetched":  reeval_fetched,
+                "reeval_armed":    reeval_armed,
+                "reeval_status":   reeval_status,
+                "watching_count":  watching_count,
+                "has_pending":     bool(pending_rows),
+            }
+            if execution_mode == "live":
                 log.error(
-                    "[%s] LIVE_WATCHING_ROWS_NOT_MATERIALIZED "
-                    "reeval_fetched=%d reeval_armed=0 watching=%d pending_trigger=0 "
-                    "— overnight reeval ran but produced no armed entry orders; "
-                    "handoff row is false-green",
-                    client_id, reeval_fetched, watching_count,
+                    "[%s] OVERNIGHT_REEVAL_ZERO_ARMED "
+                    "fetched=%d armed=0 status=%s watching=%d pending=%s",
+                    client_id, reeval_fetched, reeval_status,
+                    watching_count, bool(pending_rows),
                 )
+                detail["error_code"] = "OVERNIGHT_REEVAL_ZERO_ARMED"
+                return "degraded", detail
+            # PAPER: warn but allow
+            return "degraded", detail
+
+        # Reeval record exists and armed > 0 — genuine success
+        if reeval_armed > 0:
+            return "success", {
+                "source":         "preopen_readiness_runs.overnight_reeval",
+                "reeval_fetched": reeval_fetched,
+                "reeval_armed":   reeval_armed,
+            }
+
+        # fetched == 0: no-op run (nothing to process)
+        if reeval_fetched == 0:
+            # Confirm via handoff row or no-inventory state
+            if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
+                return "success", {"source": "overnight_reeval_noop+handoff"}
+            watching_count = int(client_state.get("watching_count") or 0)
+            if watching_count == 0 and not client_state.get("pending_trigger_rows"):
+                return "explicit_noop", {"source": "overnight_reeval_noop_no_inventory"}
+
+    # No reeval record — fall back to handoff row and legacy checks
+    if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
+        # For LIVE, validate that reeval materialized entry orders
+        if execution_mode == "live":
+            watching_count = int(client_state.get("watching_count") or 0)
+            pending_rows   = client_state.get("pending_trigger_rows") or []
+            if watching_count > 0 and not pending_rows:
                 return "degraded", {
-                    "source": "live_watching_not_materialized",
+                    "source":     "live_watching_not_materialized",
                     "error_code": "LIVE_WATCHING_ROWS_NOT_MATERIALIZED",
-                    "reeval_fetched": reeval_fetched,
-                    "reeval_armed": reeval_armed,
                     "watching_count": watching_count,
                 }
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
@@ -756,11 +793,12 @@ def run_preopen_autonomous_readiness(
         else:
             warnings.append("overnight_reeval_missing")
     elif overnight_state == "degraded":
-        # PR: LIVE_WATCHING_ROWS_NOT_MATERIALIZED — overnight reeval ran but
-        # armed no entries while WATCHING rows remain.  This is BLOCKED for LIVE
-        # (watching rows exist with no orders = clients money is not deployed per
-        # their strategy and the system did not catch the failure).
-        error_code = overnight_details.get("error_code", "overnight_reeval_degraded")
+        # overnight_reeval row is authoritative: armed=0 with fetched>0 is a failure.
+        error_code = overnight_details.get(
+            "error_code",
+            "overnight_reeval_zero_armed" if overnight_details.get("reeval_fetched", 0) > 0
+            else "overnight_reeval_degraded"
+        )
         if mode == "live":
             errors.append(error_code.lower())
         else:
@@ -776,6 +814,7 @@ def run_preopen_autonomous_readiness(
         "runner_not_alive",
         # PR: LIVE overnight reeval that produced no armed entries is BLOCKED
         "live_watching_rows_not_materialized",
+        "overnight_reeval_zero_armed",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"
