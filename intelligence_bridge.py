@@ -258,7 +258,7 @@ def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
         return True, ""
 
     # Structured authority check — checked before any generic key scanning.
-    # Ensures MARKET_REGIME_MISMATCH (hard_veto=False) never returns False.
+    # Ensures APPROVED_WITH_REGIME_MISMATCH (hard_veto=False) never returns False.
     _hard_veto = risk.get("hard_veto")
     if _hard_veto is False:
         # Advisory/context result: approved=False in the risk dict is
@@ -338,39 +338,6 @@ def _map_result(result: dict, fallback_score: float) -> dict:
 
     risk_ok, risk_reason = _risk_allows_trade(risk)
     allow_collect = _data_collection_allowed()
-
-    # ── Advisory regime mismatch — MUST be checked BEFORE hard veto block ────
-    # When APRiskManager returns reason_code=MARKET_REGIME_MISMATCH with
-    # hard_veto=False, the result is directional context only.  It must NEVER
-    # produce intel_status="RISK_VETO" (which the admission policy maps to the
-    # execution-authoritative INTEL_AUTHORITATIVE_VETO_RISK).
-    #
-    # Root cause of 2026-07-20 incident (53 false terminal rejections):
-    # the previous code fell through to the generic approved=False → RISK_VETO
-    # path regardless of whether the veto was a hard safety gate or advisory.
-    if (risk.get("reason_code") == "MARKET_REGIME_MISMATCH"
-            and risk.get("hard_veto") is False):
-        log.info(
-            "[%s] GATE_G_REGIME_MISMATCH_ADVISORY scanner_score=%.1f "
-            "intel_score=%.1f veto_category=%s hard_veto=False "
-            "— non-authoritative advisory; allowing",
-            ticker, fallback_score, intel_score,
-            risk.get("veto_category", "directional_context"),
-        )
-        return {
-            "approved": True,
-            "score": round(fallback_score, 1),
-            "contracts": max(1, contracts),
-            "reasoning": (
-                f"regime_mismatch_advisory: "
-                f"{risk_reason or risk.get('reason', '')} "
-                f"(reason_code=MARKET_REGIME_MISMATCH hard_veto=False "
-                f"non_authoritative)"
-            ),
-            "intel_status": "REGIME_MISMATCH_ADVISORY",
-            "intel_score": round(intel_score, 1),
-            "risk_detail": risk,
-        }
 
     # ── Hard risk veto (explicit risk finding — always block) ─────────────────
     if _INTEL_ENFORCE_RISK_VETO and not risk_ok:
@@ -543,6 +510,45 @@ def _map_result(result: dict, fallback_score: float) -> dict:
         "effective_score=%.1f hard_risk_reason=none",
         ticker, fallback_score, intel_score, intel_score,
     )
+
+    # ── Advisory regime mismatch tagging (approved=True path only) ────────────
+    # Applied ONLY when the producer returned approved=True with real sizing.
+    # The producer ran every hard gate first; this tag is purely informational.
+    # Never manufacture contracts: if PM returned 0, fall through to APPROVED.
+    if (risk.get("reason_code") == "APPROVED_WITH_REGIME_MISMATCH"
+            and risk.get("hard_veto") is False
+            and risk.get("approved") is True
+            and int(risk.get("max_contracts") or 0) >= 1
+            and float(risk.get("max_position_usd") or 0) > 0):
+        _advisory_contracts = int(result.get("contracts") or 0)
+        if _advisory_contracts >= 1:
+            log.info(
+                "[%s] GATE_G_REGIME_MISMATCH_ADVISORY scanner_score=%.1f "
+                "intel_score=%.1f risk_contracts=%d pm_contracts=%d "
+                "veto_category=%s — approved, all hard gates passed",
+                ticker, fallback_score, intel_score,
+                int(risk.get("max_contracts") or 0), _advisory_contracts,
+                risk.get("veto_category", "directional_context"),
+            )
+            return {
+                "approved":     True,
+                "score":        round(score, 1),
+                "contracts":    _advisory_contracts,  # exact PM value; never manufactured
+                "reasoning":    (
+                    f"regime_mismatch_advisory: {risk.get('reason', '')} "
+                    f"(reason_code=APPROVED_WITH_REGIME_MISMATCH hard_veto=False "
+                    f"all_hard_gates_passed pm_contracts={_advisory_contracts})"
+                ),
+                "intel_status": "REGIME_MISMATCH_ADVISORY",
+                "intel_score":  round(score, 1),
+                "risk_detail":  risk,
+            }
+        log.warning(
+            "[%s] REGIME_MISMATCH_ADVISORY: PM returned contracts=0 "
+            "— falling through to standard APPROVED",
+            ticker,
+        )
+
     return {
         "approved":     True,
         "score":        round(score, 1),
