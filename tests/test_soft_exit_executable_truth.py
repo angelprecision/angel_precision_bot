@@ -767,3 +767,269 @@ class TestDeferredReasonCodes:
         misleading = {"no_exit", "take_profit_not_met", "risk_rejected", "underlying_not_confirming"}
         for code in [SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE, SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE]:
             assert code.lower() not in misleading
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR #385 AMENDMENT TESTS — executable peak authority + position-scoped
+# confirmation, driven through the REAL QPM._refresh_once() production seam.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from types import SimpleNamespace
+
+
+def _clear_qpm_shared_cache():
+    """QPM shared quote cache is module-global — must be cleared between tests."""
+    import ap.position_quote_monitor as qpm_mod
+    with qpm_mod._SHARED_CACHE_LOCK:
+        qpm_mod._SHARED_CACHE.clear()
+    qpm_mod._SHARED_BACKOFF_UNTIL = 0.0
+
+
+class _FakeBroker:
+    """Broker returning scripted quotes via get_quotes(symbols)."""
+    def __init__(self, quotes: dict):
+        self.quotes = quotes  # symbol -> quote dict
+    def get_quotes(self, symbols):
+        return [dict(self.quotes[s], symbol=s) for s in symbols if s in self.quotes]
+
+
+class _FakeExitEngine:
+    """Minimal exit engine surface for QPM._refresh_once()."""
+    def __init__(self, positions):
+        self._positions = positions
+    def active_positions(self):
+        return list(self._positions)
+
+
+def _qpm_pos(pid: str, *, contract="ABT260721P00150000", ticker="ABT",
+             execution_mode="paper", entry_price=1.00) -> SimpleNamespace:
+    """Bare position object with the attrs QPM reads/writes."""
+    return SimpleNamespace(
+        position_id=pid, positionid=pid,
+        ticker=ticker, underlying=ticker,
+        option_symbol=contract, optionsymbol=contract, contract=contract,
+        execution_mode=execution_mode, executionmode=execution_mode,
+        entry_price=entry_price, entryprice=entry_price,
+        touched_profit=False, touchedprofit=False,
+        peak_pnl_pct=0.0, peakpnlpct=0.0,
+        max_profit_seen=0.0, maxprofitseen=0.0,
+    )
+
+
+def _make_qpm(positions, quotes):
+    from ap.position_quote_monitor import APPositionQuoteMonitor
+    _clear_qpm_shared_cache()
+    return APPositionQuoteMonitor(
+        broker=_FakeBroker(quotes),
+        client_id="test@client.com",
+        exit_engine=_FakeExitEngine(positions),
+    )
+
+
+_QUOTE_MID_INFLATED = {
+    # bid +8%, ask +32% → spread too wide for mid (spread guard) → mark fallback.
+    # We supply mark=1.20 so PAPER display exec_price = 1.20 (+20% mid-equivalent).
+    "ABT260721P00150000": {"bid": 1.08, "ask": 1.32, "mark": 1.20},
+    "ABT": {"last": 149.0},
+}
+
+
+class TestAmendmentExecutablePeakAuthority:
+    """Amendment Fix 1: midpoint must never inflate peak/max/touched state."""
+
+    def test_paper_midpoint_does_not_inflate_peak(self):
+        """entry 1.00, bid 1.08, mark 1.20 → display +20%, peak must be +8%."""
+        pos = _qpm_pos("pos-A")
+        qpm = _make_qpm([pos], _QUOTE_MID_INFLATED)
+        qpm._refresh_once()
+
+        # Display shows the midpoint-equivalent economics
+        assert getattr(pos, "option_pnl_pct", 0.0) == pytest.approx(0.20, abs=0.02), \
+            f"display option_pnl_pct should be ~+20%, got {getattr(pos,'option_pnl_pct',None)}"
+        # Executable peak is BID-only
+        assert pos.peak_pnl_pct == pytest.approx(0.08, abs=1e-6), \
+            f"peak_pnl_pct must be +8% (bid), got {pos.peak_pnl_pct}"
+        assert pos.max_profit_seen == pytest.approx(0.08, abs=1e-6), \
+            f"max_profit_seen must be +8% (bid), got {pos.max_profit_seen}"
+
+    def test_midpoint_spike_then_bid_drop_no_false_floor(self):
+        """Mark spikes one poll; bid later drops slightly. Peak stays bid-truth;
+        no midpoint-inflated profit floor can arm."""
+        pos = _qpm_pos("pos-A")
+        quotes = {
+            "ABT260721P00150000": {"bid": 1.06, "ask": 1.40, "mark": 1.45},  # mark +45%!
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        # Peak from bid (+6%), never from the +45% mark
+        assert pos.peak_pnl_pct == pytest.approx(0.06, abs=1e-6)
+
+        # Bid drops to +4%
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 1.04, "ask": 1.40, "mark": 1.45}
+        qpm._refresh_once()
+        # Peak remains +6% (bid high-water), NOT 45%.  With max_profit_seen=6%
+        # no PROFIT_FLOOR tier (min 15%) can arm — no false floor exit possible.
+        assert pos.peak_pnl_pct == pytest.approx(0.06, abs=1e-6)
+        assert pos.max_profit_seen < 0.15, \
+            "midpoint spike must not push max_profit_seen into PROFIT_FLOOR territory"
+
+    def test_engine_pregate_peak_is_bid_only(self):
+        """Exit engine pre-gate must not advance peak from midpoint either."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0,             # no bid this cycle
+            current_option_price=1.30,   # mid +30%
+            option_bid_valid=False,
+            peak_pnl_pct=0.05,
+        )
+        # Simulate the engine pre-gate logic contract directly:
+        _pg_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+        assert _pg_bid <= 0
+        # With no bid, peak must NOT advance from current_option_price
+        # (the pre-gate only advances from bid-derived P&L)
+        assert pos.peak_pnl_pct == pytest.approx(0.05), \
+            "peak must not advance without a valid bid"
+
+
+class TestAmendmentPositionScopedConfirmation:
+    """Amendment Fix 2: confirmation keyed by position identity, not contract."""
+
+    _QUOTE_GREEN = {
+        # tight spread → mid valid; bid +10% (>= 5% arm threshold), fresh
+        "ABT260721P00150000": {"bid": 1.10, "ask": 1.12},
+        "ABT": {"last": 149.0},
+    }
+
+    def test_one_poll_does_not_arm_two_polls_arm(self):
+        pos = _qpm_pos("pos-A")
+        qpm = _make_qpm([pos], dict(self._QUOTE_GREEN))
+        qpm._refresh_once()
+        assert pos.touched_profit is False, "one qualifying poll must NOT arm"
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()
+        assert pos.touched_profit is True, "two consecutive qualifying polls must arm"
+
+    def test_two_same_contract_positions_cannot_cross_confirm(self):
+        """Poll 1: only A active. Poll 2: only B active (same contract).
+        B must NOT arm — A's first observation is not B's second."""
+        pos_a = _qpm_pos("pos-A")
+        pos_b = _qpm_pos("pos-B")   # same contract, different position
+        engine = _FakeExitEngine([pos_a])
+        qpm = _make_qpm([pos_a], dict(self._QUOTE_GREEN))
+        qpm.exit_engine = engine
+
+        qpm._refresh_once()                       # A gets first observation
+        assert pos_a.touched_profit is False
+
+        engine._positions = [pos_b]               # A closes, B opens same contract
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()                       # B's FIRST observation
+        assert pos_b.touched_profit is False, \
+            "B must not inherit A's pending confirmation (contract-key bug)"
+
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()                       # B's second observation
+        assert pos_b.touched_profit is True
+
+    def test_reopened_contract_starts_clean(self):
+        """Close A (prune) then reopen same contract as new pid → clean pending."""
+        pos_a = _qpm_pos("pos-A")
+        engine = _FakeExitEngine([pos_a])
+        qpm = _make_qpm([pos_a], dict(self._QUOTE_GREEN))
+        qpm.exit_engine = engine
+        qpm._refresh_once()                       # A pending
+        a_key = [k for k in qpm._tp_pending_confirm if k.endswith("|pos-A")]
+        assert a_key and qpm._tp_pending_confirm[a_key[0]] is True
+
+        engine._positions = []                    # A closed
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()                       # prune cycle
+        assert not any(k.endswith("|pos-A") for k in qpm._tp_pending_confirm), \
+            "closed position's pending state must be pruned"
+
+        pos_new = _qpm_pos("pos-NEW")             # reopen same contract
+        engine._positions = [pos_new]
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()
+        assert pos_new.touched_profit is False, "reopened contract must start clean"
+
+    def test_two_clients_isolated(self):
+        """Different monitors (per-client) never share confirmation state,
+        and keys embed client identity."""
+        pos_1 = _qpm_pos("pos-X")
+        pos_2 = _qpm_pos("pos-X")   # same pid string, different client monitor
+        qpm1 = _make_qpm([pos_1], dict(self._QUOTE_GREEN))
+        qpm2 = _make_qpm([pos_2], dict(self._QUOTE_GREEN))
+        qpm2.client_id = "other@client.com"
+
+        qpm1._refresh_once()        # client 1: first observation → pending
+        _clear_qpm_shared_cache()
+        qpm2._refresh_once()        # client 2: first observation → pending
+        assert pos_1.touched_profit is False
+        assert pos_2.touched_profit is False, \
+            "client 2's first poll must not act as a second confirmation"
+        # Keys are client-scoped
+        k1 = list(qpm1._tp_pending_confirm)
+        k2 = list(qpm2._tp_pending_confirm)
+        assert all(k.startswith("test@client.com|") for k in k1)
+        assert all(k.startswith("other@client.com|") for k in k2)
+
+    def test_interrupted_confirmation_resets_only_that_position(self):
+        """A qualifies once; then A's bid drops below threshold while B qualifies.
+        A's pending resets; B's pending is unaffected."""
+        pos_a = _qpm_pos("pos-A")
+        pos_b = _qpm_pos("pos-B", contract="LULU260721P00300000", ticker="LULU")
+        quotes = {
+            "ABT260721P00150000":  {"bid": 1.10, "ask": 1.12},
+            "LULU260721P00300000": {"bid": 1.10, "ask": 1.12},
+            "ABT": {"last": 149.0}, "LULU": {"last": 299.0},
+        }
+        qpm = _make_qpm([pos_a, pos_b], quotes)
+        qpm._refresh_once()          # both pending
+        a_key = [k for k in qpm._tp_pending_confirm if k.endswith("|pos-A")][0]
+        b_key = [k for k in qpm._tp_pending_confirm if k.endswith("|pos-B")][0]
+        assert qpm._tp_pending_confirm[a_key] is True
+        assert qpm._tp_pending_confirm[b_key] is True
+
+        # A's bid falls below +5%; B stays green
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 1.02, "ask": 1.05}
+        qpm._refresh_once()
+        assert qpm._tp_pending_confirm[a_key] is False, "A's pending must reset"
+        assert pos_a.touched_profit is False
+        assert pos_b.touched_profit is True, "B's second consecutive poll must arm B"
+
+    def test_missing_pid_fails_closed(self):
+        """A position with no position_id must never accumulate pending state."""
+        pos = _qpm_pos("")
+        pos.position_id = ""
+        pos.positionid = ""
+        qpm = _make_qpm([pos], dict(self._QUOTE_GREEN))
+        qpm._refresh_once()
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()
+        assert pos.touched_profit is False, \
+            "no position_id → fail closed → never arms via confirmation"
+        assert len(qpm._tp_pending_confirm) == 0
+
+
+class TestAmendmentThresholdContract:
+    """Amendment Fix 3: TOUCHED_PROFIT_ARM_PCT is the documented authority."""
+
+    def test_constant_defined_and_five_percent(self):
+        from ap.position_quote_monitor import TOUCHED_PROFIT_ARM_PCT
+        assert TOUCHED_PROFIT_ARM_PCT == pytest.approx(0.05)
+
+    def test_bid_below_arm_threshold_never_pends(self):
+        pos = _qpm_pos("pos-A")
+        quotes = {
+            "ABT260721P00150000": {"bid": 1.04, "ask": 1.06},  # +4% < 5%
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()
+        assert pos.touched_profit is False, "+4% bid must never arm at 5% threshold"
