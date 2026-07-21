@@ -1118,12 +1118,14 @@ class APPositionQuoteMonitor:
             last_ts    = self._last_db_persist_ts.get(position_id, 0.0)
             last_price = self._last_db_persist_price.get(position_id, 0.0)
             elapsed = now - last_ts
-            if last_price > 0 and option_price > 0:
-                price_delta_pct = abs(option_price - last_price) / last_price
-            else:
-                price_delta_pct = float("inf")
             time_ok  = elapsed >= QPM_DB_PERSIST_THROTTLE_SEC
-            price_ok = price_delta_pct >= QPM_DB_PERSIST_PRICE_DELTA_PCT
+            if option_price > 0:
+                price_ok = (
+                    last_price <= 0
+                    or abs(option_price - last_price) / last_price >= QPM_DB_PERSIST_PRICE_DELTA_PCT
+                )
+            else:
+                price_ok = False
             hard_ref_payload = hard_ref if isinstance(hard_ref, dict) else None
             hard_ref_fingerprint = json.dumps(hard_ref_payload, sort_keys=True, default=str) if hard_ref_payload is not None else ""
             hard_ref_ok = bool(hard_ref_fingerprint and hard_ref_fingerprint != self._last_db_persist_hard_ref.get(position_id, ""))
@@ -1147,7 +1149,10 @@ class APPositionQuoteMonitor:
                             updated_at           = NOW()
                         WHERE id        = %s
                           AND client_id = %s
-                          AND UPPER(status) IN ('OPEN', 'CLOSING')
+                          AND (
+                              UPPER(COALESCE(status, '')) IN ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')
+                              OR COALESCE(quantity_remaining, 0) > 0
+                          )
                         """,
                         (
                             float(option_price) if option_price > 0 else None,
@@ -1162,12 +1167,14 @@ class APPositionQuoteMonitor:
                     return c.rowcount
 
             rowcount = run_with_retry(_do_update) or 0
+            if rowcount != 1:
+                return False
             self._last_db_persist_ts[position_id] = now
             if option_price > 0:
                 self._last_db_persist_price[position_id] = float(option_price)
             if hard_ref_fingerprint:
                 self._last_db_persist_hard_ref[position_id] = hard_ref_fingerprint
-            return rowcount == 1
+            return True
         except Exception as exc:
             log.debug(
                 "[%s] _persist_quote_to_db non-fatal failure for pos=%s: %s",

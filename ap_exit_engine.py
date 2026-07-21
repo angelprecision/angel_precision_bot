@@ -5581,9 +5581,8 @@ class APExitEngine:
                                         "persisted=%.6f recomputed=%.6f",
                                         mp.client_id, mp.position_id, _persisted_pnl, _hr_pnl_r,
                                     )
-                                _hr_pnl_final = _persisted_pnl if _persisted_pnl is not None else _hr_pnl_r
-                                mp.hard_exit_reference_pnl_pct = _hr_pnl_final
-                                mp.hardexitreferencepnlpct     = _hr_pnl_final
+                                mp.hard_exit_reference_pnl_pct = _hr_pnl_r
+                                mp.hardexitreferencepnlpct     = _hr_pnl_r
                             log.info(
                                 "[exit_eng] SEED_HARD_REF_RESTORED client=%s position_id=%s "
                                 "price=%.4f source=%s validity=%s",

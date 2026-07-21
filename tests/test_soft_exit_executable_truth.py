@@ -856,6 +856,7 @@ class _CaptureConn:
 
 
 def _patch_qpm_db(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://mock/mock")
     import ap.db as db_mod
     capture = _CaptureConn()
     monkeypatch.setattr(db_mod, "conn", lambda: capture)
@@ -2685,6 +2686,28 @@ class TestAmendment7HardRefPersistenceRoundTrip:
         assert "hard_exit_reference" in sql
         return json.loads(params[4])
 
+    def _persist_direct(self, monkeypatch, *, rowcount=1, option_price=0.0, hard_ref=None):
+        capture = _patch_qpm_db(monkeypatch)
+        capture.rowcount = rowcount
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+        changed = qpm._persist_quote_to_db(
+            position_id="pos-DIRECT",
+            option_price=option_price,
+            underlying_price=149.0,
+            option_pnl_pct=0.10 if option_price > 0 else None,
+            now_utc=datetime.now(_UTC),
+            hard_ref=hard_ref if hard_ref is not None else {
+                "price": 0.55,
+                "pnl_pct": -0.45,
+                "source": "last",
+                "validity": "proven",
+                "ts": datetime.now(_UTC).isoformat(),
+                "refresh_needed": False,
+            },
+        )
+        return qpm, capture, changed
+
     def test_qpm_trusted_reference_persists_positions_meta_json(self, monkeypatch):
         capture = _patch_qpm_db(monkeypatch)
         monkeypatch.setattr(
@@ -2852,6 +2875,49 @@ class TestAmendment7HardRefPersistenceRoundTrip:
         assert changed is True
         assert len(capture.calls) == 1
 
+    def test_identical_missing_bid_payload_inside_throttle_window_does_not_write(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        payload = {
+            "price": 0.55, "pnl_pct": -0.45, "source": "last",
+            "validity": "proven", "ts": "2026-07-21T15:00:00+00:00",
+            "refresh_needed": False,
+        }
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+        qpm._last_db_persist_ts["pos-STABLE"] = time.time()
+        qpm._last_db_persist_hard_ref["pos-STABLE"] = json.dumps(payload, sort_keys=True)
+
+        changed = qpm._persist_quote_to_db(
+            position_id="pos-STABLE",
+            option_price=0.0,
+            underlying_price=149.0,
+            option_pnl_pct=None,
+            now_utc=datetime.now(_UTC),
+            hard_ref=payload,
+        )
+
+        assert changed is False
+        assert capture.calls == []
+
+    def test_positive_option_price_movement_bypasses_time_throttle(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+        qpm._last_db_persist_ts["pos-PRICE"] = time.time()
+        qpm._last_db_persist_price["pos-PRICE"] = 1.00
+
+        changed = qpm._persist_quote_to_db(
+            position_id="pos-PRICE",
+            option_price=1.20,
+            underlying_price=149.0,
+            option_pnl_pct=0.20,
+            now_utc=datetime.now(_UTC),
+            hard_ref=None,
+        )
+
+        assert changed is True
+        assert len(capture.calls) == 1
+
     def test_positions_meta_update_is_jsonb_merge_not_overwrite(self, monkeypatch):
         capture = _patch_qpm_db(monkeypatch)
         from ap.position_quote_monitor import APPositionQuoteMonitor
@@ -2874,6 +2940,16 @@ class TestAmendment7HardRefPersistenceRoundTrip:
         assert "jsonb_set(COALESCE(meta, '{}'::jsonb), '{hard_exit_reference}'" in sql
         assert "SET meta = %s" not in sql
 
+    def test_positions_update_uses_canonical_active_predicate_and_identity_scope(self, monkeypatch):
+        _, capture, changed = self._persist_direct(monkeypatch)
+        assert changed is True
+        sql, params = capture.calls[-1]
+        assert "WHERE id        = %s" in sql
+        assert "AND client_id = %s" in sql
+        assert "UPPER(COALESCE(status, '')) IN ('OPEN', 'CLOSING', 'PARTIAL', 'ACTIVE')" in sql
+        assert "OR COALESCE(quantity_remaining, 0) > 0" in sql
+        assert params[-2:] == ("pos-DIRECT", "test@client.com")
+
     def test_zero_row_update_reports_failure(self, monkeypatch):
         capture = _patch_qpm_db(monkeypatch)
         capture.rowcount = 0
@@ -2894,10 +2970,27 @@ class TestAmendment7HardRefPersistenceRoundTrip:
         )
 
         assert changed is False
+        assert qpm._last_db_persist_ts == {}
+        assert qpm._last_db_persist_price == {}
+        assert qpm._last_db_persist_hard_ref == {}
+
+    def test_multi_row_update_reports_failure_and_does_not_mutate_caches(self, monkeypatch):
+        qpm, _, changed = self._persist_direct(monkeypatch, rowcount=2)
+        assert changed is False
+        assert qpm._last_db_persist_ts == {}
+        assert qpm._last_db_persist_price == {}
+        assert qpm._last_db_persist_hard_ref == {}
+
+    def test_one_row_update_mutates_persistence_caches(self, monkeypatch):
+        qpm, _, changed = self._persist_direct(monkeypatch, rowcount=1, option_price=1.20)
+        assert changed is True
+        assert "pos-DIRECT" in qpm._last_db_persist_ts
+        assert qpm._last_db_persist_price["pos-DIRECT"] == pytest.approx(1.20)
+        assert "pos-DIRECT" in qpm._last_db_persist_hard_ref
 
 
 class TestAmendment7SeedResolverAndDecisionUse:
-    def _seeded_pos(self, ts, validity="proven", refresh_needed=False):
+    def _seeded_pos(self, ts, validity="proven", refresh_needed=False, pnl_pct=-0.45):
         eng = TestAmendment6RestartHydration()._make_engine()
 
         class _PM:
@@ -2912,7 +3005,7 @@ class TestAmendment7SeedResolverAndDecisionUse:
                     "meta": {
                         "keep_me": "survives",
                         "hard_exit_reference": {
-                            "price": 0.55, "pnl_pct": -0.45,
+                            "price": 0.55, "pnl_pct": pnl_pct,
                             "source": "last", "validity": validity,
                             "ts": ts, "refresh_needed": refresh_needed,
                         },
@@ -2934,6 +3027,22 @@ class TestAmendment7SeedResolverAndDecisionUse:
         pos = self._seeded_pos(datetime.now(_UTC).isoformat(), refresh_needed=True)
         assert pos.hard_exit_reference_validity == "proven"
         assert pos.hard_exit_reference_refresh_needed is True
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) == pytest.approx(-0.45)
+
+    def test_seed_from_db_recomputes_mismatched_persisted_pnl_and_warns(self, caplog):
+        import logging
+        import ap_exit_engine as ee_mod
+        caplog.set_level(logging.WARNING, logger="ap.exit_engine")
+        pos = self._seeded_pos(datetime.now(_UTC).isoformat(), pnl_pct=-0.10)
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.45)
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) == pytest.approx(-0.45)
+        assert "SEED_HARD_REF_PNL_MISMATCH" in caplog.text
+
+    @pytest.mark.parametrize("bad_pnl", [float("nan"), float("inf"), "bad", None])
+    def test_seed_from_db_recomputes_malformed_nonfinite_or_missing_pnl(self, bad_pnl):
+        import ap_exit_engine as ee_mod
+        pos = self._seeded_pos(datetime.now(_UTC).isoformat(), pnl_pct=bad_pnl)
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.45)
         assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) == pytest.approx(-0.45)
 
     def test_seed_from_db_rejects_expired_persisted_timestamp(self):
