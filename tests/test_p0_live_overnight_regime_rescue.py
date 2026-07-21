@@ -268,7 +268,8 @@ def test_atomic_rescue_propagates_db_exception():
 def test_orchestration_stops_on_missing_handoff():
     from ap.live_overnight_rescue import recover_and_rerun_live_overnight
     rescue_ok={"eligible":53,"verified":53,"writes":53,"count_match":True,"errors":[],"dry_run":False}
-    reeval_ok={"processed":53,"armed":50,"errors":0,"stalled":False}
+    # fetched/rejected/skipped required by exact-accounting postcondition gate
+    reeval_ok={"fetched":53,"processed":53,"armed":50,"rejected":3,"skipped":0,"errors":0,"stalled":False}
     with (
         patch("ap.live_overnight_rescue.rescue_live_overnight_regime_rejections",return_value=rescue_ok),
         patch("ap_overnight_reeval.run_overnight_reeval",return_value=reeval_ok),
@@ -322,7 +323,7 @@ def test_orchestration_stops_on_blocked_readiness():
     rescue_ok={"eligible":53,"verified":53,"writes":53,"count_match":True,"errors":[],"dry_run":False}
     with (
         patch("ap.live_overnight_rescue.rescue_live_overnight_regime_rejections",return_value=rescue_ok),
-        patch("ap_overnight_reeval.run_overnight_reeval",return_value={"processed":53,"armed":50,"errors":0,"stalled":False}),
+        patch("ap_overnight_reeval.run_overnight_reeval",return_value={"fetched":53,"processed":53,"armed":50,"rejected":3,"skipped":0,"errors":0,"stalled":False}),
         patch("ap_morning_handoff_audit.run_morning_handoff_audit",return_value={"ok":True,"errors":[]}),
         patch("ap.preopen_readiness.run_preopen_autonomous_readiness",return_value={"status":"BLOCKED","errors":["live_watching_rows_not_materialized"]}),
     ):
@@ -334,7 +335,7 @@ def test_orchestration_recovery_complete():
     rescue_ok={"eligible":53,"verified":53,"writes":53,"count_match":True,"errors":[],"dry_run":False}
     with (
         patch("ap.live_overnight_rescue.rescue_live_overnight_regime_rejections",return_value=rescue_ok),
-        patch("ap_overnight_reeval.run_overnight_reeval",return_value={"processed":53,"armed":50,"errors":0,"stalled":False}),
+        patch("ap_overnight_reeval.run_overnight_reeval",return_value={"fetched":53,"processed":53,"armed":50,"rejected":3,"skipped":0,"errors":0,"stalled":False}),
         patch("ap_morning_handoff_audit.run_morning_handoff_audit",return_value={"ok":True,"errors":[]}),
         patch("ap.preopen_readiness.run_preopen_autonomous_readiness",return_value={"status":"OK","errors":[]}),
     ):
@@ -354,7 +355,7 @@ def test_handoff_signature_no_stage_no_runner():
     mock_h = MagicMock(return_value={"ok":True,"errors":[]})
     with (
         patch("ap.live_overnight_rescue.rescue_live_overnight_regime_rejections",return_value=rescue_ok),
-        patch("ap_overnight_reeval.run_overnight_reeval",return_value={"processed":53,"armed":50,"errors":0,"stalled":False}),
+        patch("ap_overnight_reeval.run_overnight_reeval",return_value={"fetched":53,"processed":53,"armed":50,"rejected":3,"skipped":0,"errors":0,"stalled":False}),
         patch("ap_morning_handoff_audit.run_morning_handoff_audit",mock_h),
         patch("ap.preopen_readiness.run_preopen_autonomous_readiness",return_value={"status":"OK","errors":[]}),
     ):
@@ -617,12 +618,16 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                       batch * 100 + 1, batch * 100 + 100))
         conn_pg.commit()
 
-        # Get the minimum id of our matching blocked_intel events (must be > old_max_id)
+        # Get the minimum id of our matching blocked_intel events (must be > old_max_id).
+        # Scope to id > old_max_id so the 50 old-noise rows (inserted first, lower ids)
+        # are excluded — otherwise MIN(id) would always be 1 and the assertion below
+        # would be structurally impossible.
         with conn_pg.cursor() as c:
             c.execute("""
                 SELECT MIN(id) AS min_id FROM decision_events
                 WHERE client_id=%s AND stage='blocked_intel' AND reason_code='SESSION_RULE_BLOCK'
-            """, (TEST_CLIENT,))
+                  AND id > %s
+            """, (TEST_CLIENT, old_max_id))
             test_min_id = int(c.fetchone()["min_id"])
 
         assert test_min_id > old_max_id, (
@@ -821,8 +826,16 @@ def test_postgres_large_volume_dual_cte_and_rollback():
                 conn_pg.commit()
 
     finally:
-        # DROP private schema CASCADE — removes all private tables and data
-        # public.* is never touched
+        # Rollback any open transaction before touching session-level settings.
+        # psycopg2 raises "set_session cannot be used inside a transaction" if
+        # autocommit is flipped while a transaction is still active — which
+        # happens whenever an assertion failure aborts a test mid-flight.
+        try:
+            conn_pg.rollback()
+        except Exception:
+            pass
+        # DROP private schema CASCADE — removes all private tables and data.
+        # public.* is never touched.
         conn_pg.autocommit = True
         try:
             with conn_pg.cursor() as c:

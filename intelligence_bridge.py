@@ -258,12 +258,27 @@ def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
         return True, ""
 
     # Structured authority check — checked before any generic key scanning.
-    # Ensures APPROVED_WITH_REGIME_MISMATCH (hard_veto=False) never returns False.
-    _hard_veto = risk.get("hard_veto")
+    # CLOSED-SET ADVISORY ALLOWLIST: hard_veto=False only permits execution when
+    # approved=True AND reason_code is an explicitly known advisory code.
+    # Any other combination (approved=False, unknown reason_code, missing fields)
+    # fails closed — never silently allows an unvalidated result to trade.
+    _ADVISORY_REASON_ALLOWLIST: frozenset[str] = frozenset({
+        "APPROVED_WITH_REGIME_MISMATCH",
+    })
+    _hard_veto   = risk.get("hard_veto")
+    _approved    = risk.get("approved")
+    _reason_code = str(risk.get("reason_code") or "")
     if _hard_veto is False:
-        # Advisory/context result: approved=False in the risk dict is
-        # directional context (e.g. SPY regime), NOT an execution veto.
-        return True, str(risk.get("reason") or risk.get("reason_code") or "")
+        if _approved is True and _reason_code in _ADVISORY_REASON_ALLOWLIST:
+            # Legitimate advisory result: regime context only, all hard gates passed.
+            return True, str(risk.get("reason") or risk.get("reason_code") or "")
+        # hard_veto=False but not in the advisory allowlist (e.g. approved=False,
+        # unknown reason_code, future metadata mistake) — fail closed to prevent
+        # a malformed result from reaching broker submission.
+        return False, (
+            f"hard_veto=False rejected: not advisory-approved "
+            f"(approved={_approved!r} reason_code={_reason_code!r}); fail closed"
+        )
     if _hard_veto is True:
         # Genuine hard veto with stable reason_code.
         return False, str(

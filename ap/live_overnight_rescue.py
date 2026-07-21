@@ -692,6 +692,40 @@ def recover_and_rerun_live_overnight(
         )
         return orch
 
+    # Exact-count postcondition: every rescued row must be accounted for.
+    # fetched must equal the rescue writes so no recovered row was silently dropped.
+    # processed must equal fetched so every fetched row reached a decision.
+    # armed + rejected + skipped must equal processed so the outcome set is complete.
+    # Note: stale_skipped is a subset of rejected — do not add it separately.
+    reeval_fetched  = int(reeval_result.get("fetched")  or 0)
+    reeval_rejected = int(reeval_result.get("rejected") or 0)
+    reeval_skipped  = int(reeval_result.get("skipped")  or 0)
+
+    if reeval_fetched != writes:
+        orch["errors"].append(
+            f"Reeval fetched={reeval_fetched} != rescue writes={writes} — "
+            "not all recovered rows were picked up by reevaluator. "
+            "Stopping before handoff."
+        )
+        return orch
+
+    if reeval_processed != reeval_fetched:
+        orch["errors"].append(
+            f"Reeval processed={reeval_processed} != fetched={reeval_fetched} — "
+            "some recovered rows were not processed. "
+            "Stopping before handoff."
+        )
+        return orch
+
+    _accounted = reeval_armed + reeval_rejected + reeval_skipped
+    if _accounted != reeval_processed:
+        orch["errors"].append(
+            f"Reeval accounting gap: armed={reeval_armed} + rejected={reeval_rejected} "
+            f"+ skipped={reeval_skipped} = {_accounted} != processed={reeval_processed}. "
+            "Stopping before handoff."
+        )
+        return orch
+
     # Phase 3: Handoff — mandatory, not nonfatal
     orch["overall_status"] = "FAILED_HANDOFF"
     try:
