@@ -142,6 +142,9 @@ def _make_qpm(positions: list, *, bid: float, ask: float, und: float = 220.0) ->
     qpm._last_immediate_refresh_ts = {}
     qpm._last_db_persist_ts = {}
     qpm._last_db_persist_price = {}
+    # PR #385: position-scoped touched-profit consecutive-confirmation dict.
+    # Required attribute; tests that exercise touched_profit must init this.
+    qpm._tp_pending_confirm = {}
     qpm._orders_meta_available = None
     qpm._cycles = 0
     qpm._consecutive_failures = 0
@@ -267,9 +270,26 @@ class TestBAExactReplay:
 
 class TestRealExecutableWinner:
     def test_bid_above_5pct_arms_touched_profit(self):
+        # PR #385: touched_profit requires TWO consecutive fresh BID observations
+        # above TOUCHED_PROFIT_ARM_PCT. This test uses the SAME QPM instance
+        # across polls so the position-scoped confirmation state persists.
         pos = _Pos()
-        _run_refresh(pos, bid=1.70, ask=1.79)
-        assert pos.touched_profit is True
+        qpm = _make_qpm([pos], bid=1.70, ask=1.79)
+        # Poll 1: qualifying observation — pending set, not armed
+        qpm._test_bid = 1.70
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is False, (
+            "PR #385: one qualifying poll must NOT arm touched_profit; "
+            "requires two consecutive fresh BID observations"
+        )
+        # Poll 2: consecutive qualifying observation — armed
+        qpm._test_bid = 1.70
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is True, (
+            "PR #385: two consecutive fresh BID polls above +5% must arm touched_profit"
+        )
 
     def test_peak_stored_from_bid(self):
         pos = _Pos()
@@ -321,11 +341,34 @@ class TestPaperBehavior:
         )
 
     def test_paper_touched_profit_from_mid(self):
-        pos = _Pos(execution_mode="paper")
-        _run_refresh(pos, bid=1.63, ask=1.79)
-        mid_pnl = ((1.63 + 1.79) / 2.0 - _ENTRY) / _ENTRY  # ~+7.55%
-        if mid_pnl >= 0.05:
-            assert pos.touched_profit is True
+        # PR #385: PAPER midpoint MUST NOT arm touched_profit — that state feeds
+        # soft-exit decisions and midpoint is not executable.  Only two consecutive
+        # fresh BID observations above TOUCHED_PROFIT_ARM_PCT (+5%) arm it, in
+        # every execution mode.
+        # Part A: PAPER midpoint above +5%, BID below +5%, two polls → False.
+        pos_a = _Pos(execution_mode="paper")
+        qpm_a = _make_qpm([pos_a], bid=1.63, ask=1.79)  # mid=1.71 → +7.55%; bid +2.52%
+        qpm_a._test_bid = 1.63
+        qpm_a._test_ask = 1.79
+        _run_once(qpm_a)
+        _run_once(qpm_a)
+        assert pos_a.touched_profit is False, (
+            "PR #385: PAPER midpoint above +5% with BID below +5% must NEVER arm "
+            "touched_profit — even after two polls"
+        )
+
+        # Part B: PAPER with BID above +5% for two consecutive polls → True.
+        pos_b = _Pos(execution_mode="paper")
+        qpm_b = _make_qpm([pos_b], bid=1.70, ask=1.79)  # bid +6.92%
+        qpm_b._test_bid = 1.70
+        qpm_b._test_ask = 1.79
+        _run_once(qpm_b)
+        assert pos_b.touched_profit is False, "PAPER: one poll must not arm"
+        _run_once(qpm_b)
+        assert pos_b.touched_profit is True, (
+            "PR #385: PAPER with BID above +5% for two consecutive fresh polls "
+            "must arm touched_profit"
+        )
 
     def test_paper_source_labeled_simulation(self):
         pos = _Pos(execution_mode="paper")
