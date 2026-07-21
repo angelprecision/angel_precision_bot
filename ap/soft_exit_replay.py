@@ -45,15 +45,31 @@ def _engine(pos):
 
 
 def _cycle(engine, pos, bid, ask, underlying, ts):
+    cycle_id = f"replay-{pos.ticker}-{ts.timestamp()}"
     engine._qpm_cycle_context = {
-        "option_quotes": {pos.option_symbol: {"bid": bid, "ask": ask, "mark": (bid + ask) / 2}},
-        "underlying_quotes": {pos.ticker: ({"bid": underlying - 0.02, "ask": underlying + 0.02, "last": underlying} if underlying else {})},
+        "option_quotes": {
+            pos.option_symbol: {
+                "bid": bid,
+                "ask": ask,
+                "mark": (bid + ask) / 2,
+                "last": (bid + ask) / 2,
+            }
+        },
+        "underlying_quotes": {
+            pos.ticker: ({
+                "bid": underlying - 0.02,
+                "ask": underlying + 0.02,
+                "last": underlying,
+            } if underlying else {})
+        },
+        "option_quote_timestamps": {pos.option_symbol: ts},
+        "underlying_quote_timestamps": {pos.ticker: ts},
         "original_modes": {pos.position_id: "paper"},
         "original_modes_by_symbol": {pos.option_symbol: "paper"},
         "quote_provider": "tradier",
         "quote_domain": "tradier_live_market_data",
         "snapshot_timestamp": ts,
-        "cycle_id": f"replay-{pos.ticker}-{ts.timestamp()}",
+        "cycle_id": cycle_id,
     }
     engine.apply_exit_decision_snapshots([{
         "position_id": pos.position_id,
