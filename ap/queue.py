@@ -485,6 +485,20 @@ def _manual_restart_guard_bypass_enabled(
     payload: dict | None = None,
     execution_mode: str | None = None,
 ) -> bool:
+    # ── LIVE breach-only recovery bypass ─────────────────────────────────────
+    # PR #380: _restore() stamps live_recovery_breach_only=True on rows that
+    # were safely classified as eligible and reset to NEW by the LIVE recovery
+    # classifier.  Without this bypass, a prior-session timestamp in payload
+    # causes should_skip_on_restart() to return True during market hours, and
+    # the row would be immediately rejected as restart_guard:overnight_skip.
+    # The bypass is intentionally exact-mode-gated (LIVE only) and requires
+    # the exact breach-only marker — it is not a general LIVE overnight bypass.
+    if (
+        str(execution_mode or "").strip().upper() == "LIVE"
+        and isinstance(payload, dict)
+        and payload.get("live_recovery_breach_only") is True
+    ):
+        return True
     if str(execution_mode or "").strip().upper() != "PAPER":
         return False
     # ── 1. Current-session PAPER recovery (production incident 2026-07-16) ──

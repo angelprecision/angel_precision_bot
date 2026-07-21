@@ -95,10 +95,17 @@ def test_paper_recovery_still_resets_watching_and_tags_payload():
 # =============================================================================
 
 def test_live_recovery_does_not_reset_watching_or_tag_payload():
-    """LIVE mode must skip the _reset() block entirely."""
+    """LIVE mode must skip the blind _reset() block entirely.
+
+    PR #359 replaced the LIVE no-op (count=0) with a per-row classifier
+    that may write to trade_queue for missed/eligible rows, but it must
+    NEVER call the broad _reset() that blindly sets all WATCHING→NEW and
+    stamps payload.recovery_rescue=true (which would replay stale signals
+    through MC/contract_selector).
+    """
     rec, _ = _make_recovery("LIVE")
 
-    reset_calls = []
+    recovery_rescue_writes = []
 
     def fake_run_with_retry(fn, *args, **kwargs):
         import inspect
@@ -106,18 +113,24 @@ def test_live_recovery_does_not_reset_watching_or_tag_payload():
             src = inspect.getsource(fn)
         except Exception:
             src = ""
-        if "UPDATE trade_queue" in src:
-            reset_calls.append(src)
-            return 0
-        return []
+        # The blind _reset() is the only path that writes recovery_rescue.
+        # The PR #359 LIVE classifier writes LIVE_RECOVERY_WATCHER_RESTORED
+        # or LIVE_RECOVERY_MISSED_TRIGGER — never recovery_rescue.
+        if "recovery_rescue" in src and "UPDATE trade_queue" in src:
+            recovery_rescue_writes.append(src)
+        try:
+            return fn()
+        except Exception:
+            return 0 if "UPDATE" in src else []
 
     with patch("ap.db.run_with_retry", side_effect=fake_run_with_retry), \
          patch("ap.db.conn"):
         result = {}
         rec._reseed_watchers(result)
 
-    assert reset_calls == [], (
-        f"LIVE must NOT invoke _reset() — got {len(reset_calls)} calls. "
+    assert recovery_rescue_writes == [], (
+        f"LIVE must NOT invoke blind _reset() with recovery_rescue marker — "
+        f"got {len(recovery_rescue_writes)} calls. "
         "LIVE rows must never be replayed through MC/selector with stale data."
     )
 
@@ -127,8 +140,13 @@ def test_live_recovery_does_not_reset_watching_or_tag_payload():
 # =============================================================================
 
 def test_live_recovery_emits_live_recovery_replay_skipped_audit_log():
-    """LIVE mode must emit LIVE_RECOVERY_REPLAY_SKIPPED with the required
-    client_id and reason=live_no_replay_policy."""
+    """LIVE mode must emit a structured audit log before any queue mutation.
+
+    PR #359 replaced LIVE_RECOVERY_REPLAY_SKIPPED (count=0 no-op) with
+    LIVE_RECOVERY_CLASSIFIED_RESEED (per-row classifier). The audit invariant
+    is preserved: an operator-visible warning is emitted before any mutation,
+    carrying client_id and the current ET session date.
+    """
     rec, recovery_mod = _make_recovery("LIVE")
 
     captured_warnings = []
@@ -148,16 +166,14 @@ def test_live_recovery_emits_live_recovery_replay_skipped_audit_log():
         result = {}
         rec._reseed_watchers(result)
 
-    matching = [w for w in captured_warnings if "LIVE_RECOVERY_REPLAY_SKIPPED" in w]
+    # PR #359: log token is now LIVE_RECOVERY_CLASSIFIED_RESEED
+    matching = [w for w in captured_warnings if "LIVE_RECOVERY_CLASSIFIED_RESEED" in w]
     assert matching, (
-        f"LIVE must emit LIVE_RECOVERY_REPLAY_SKIPPED audit log; "
+        f"LIVE must emit LIVE_RECOVERY_CLASSIFIED_RESEED audit log before mutation; "
         f"got warnings: {captured_warnings}"
     )
     audit = matching[0]
     assert "jasoncosby1@gmail.com" in audit, "client_id must appear in audit log"
-    assert "live_no_replay_policy" in audit, (
-        "reason=live_no_replay_policy must appear in audit log"
-    )
 
 
 # =============================================================================
@@ -196,23 +212,27 @@ def test_queue_dispatch_immediate_promote_still_blocks_live():
 def test_live_recovery_still_runs_pending_trigger_reattachment():
     """The orphan PENDING_TRIGGER watcher reattachment is safe for LIVE —
     it rebinds an in-memory watcher to an existing OSM order, no MC/selector
-    replay. This path must still run for LIVE clients (otherwise restart
-    leaves their PENDING_TRIGGER orders stranded without watchers).
+    replay. This path must still run for LIVE clients.
 
-    Source-level assertion: the LIVE skip block must end before the
-    `if self.entry_watcher is None` reattachment branch, so LIVE flows
-    into it normally with rearmed >= 0."""
+    Source-level assertion: the LIVE classifier log (LIVE_RECOVERY_CLASSIFIED_RESEED)
+    must appear BEFORE the orphan reattachment branch so LIVE flows into it
+    normally with rearmed >= 0.
+
+    PR #359 replaced LIVE_RECOVERY_REPLAY_SKIPPED with LIVE_RECOVERY_CLASSIFIED_RESEED;
+    the ordering invariant (classifier before PENDING_TRIGGER reattachment) is preserved.
+    """
     src = (REPO / "ap_recovery.py").read_text()
 
-    skip_marker = "LIVE_RECOVERY_REPLAY_SKIPPED"
+    # PR #359: the new audit log token
+    skip_marker  = "LIVE_RECOVERY_CLASSIFIED_RESEED"
     attach_marker = "RECOVERY: entry_watcher missing"
 
-    skip_idx = src.find(skip_marker)
+    skip_idx   = src.find(skip_marker)
     attach_idx = src.find(attach_marker)
-    assert skip_idx > 0, "LIVE skip log not present"
-    assert attach_idx > 0, "orphan reattachment branch not present"
+    assert skip_idx > 0,   f"LIVE classifier log ({skip_marker!r}) not present in ap_recovery.py"
+    assert attach_idx > 0, "orphan reattachment branch not present in ap_recovery.py"
     assert skip_idx < attach_idx, (
-        "LIVE skip must come BEFORE the orphan reattachment so LIVE still "
+        "LIVE classifier log must come BEFORE the orphan reattachment so LIVE still "
         "flows through PENDING_TRIGGER watcher rebinding"
     )
 

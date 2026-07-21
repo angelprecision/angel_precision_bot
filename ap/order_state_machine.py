@@ -2136,6 +2136,14 @@ class APOrderStateMachine:
         # always shows the correct attempt count for the in-flight claim, even
         # if the process crashes between claim and schedule_deferred_materialization_retry.
         retry_attempt: int | None = None,
+        # PR #359 — caller-supplied canonical identity.
+        # Required for all claims; legacy empty-canonical rows may be
+        # atomically backfilled when allow_legacy_empty_canonical=True.
+        canonical_signal_id: str | None = None,
+        expected_order_status: str = "PENDING_TRIGGER",
+        expected_materialization_status: str | None = None,
+        expected_lifecycle_state: str | None = None,
+        allow_legacy_empty_canonical: bool = False,
     ) -> bool:
         """Atomically fence one deferred-breach materialization worker.
 
@@ -2171,6 +2179,18 @@ class APOrderStateMachine:
         _owner = str(owner or "").strip()
         _signal_id = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
+        _canonical = str(canonical_signal_id or "").strip()
+        _expected_order_status = str(expected_order_status or "PENDING_TRIGGER").strip().upper()
+
+        # PR #359 §1: canonical identity is required — reject early so the CAS
+        # never fires on a row the caller cannot positively identify.
+        if not _canonical:
+            log.error(
+                "[%s] claim_deferred_materialization blocked: "
+                "missing canonical identity order=%s signal_id=%s mode=%s",
+                self.client_id, local_order_id, _signal_id, _mode,
+            )
+            return False
 
         # ── §3: resolve the target new generation ────────────────────
         # new_generation takes precedence when both are supplied.
@@ -2235,6 +2255,53 @@ class APOrderStateMachine:
             with conn() as c:
                 _attempt_predicate = ""
                 _attempt_params: list = []
+
+                # ── PR #359: Two-mode canonical identity CAS ──────────────
+                # Build ordered predicate + param lists so %s placeholders
+                # always match parameter tuple positions exactly.
+                #
+                # (a) Modern path (allow_legacy_empty_canonical=False):
+                #     durable canonical_signal_id must EQUAL the resolved
+                #     value.  The row was written by a modern order-creation
+                #     path and must not be claimed by a mismatched caller.
+                #
+                # (b) Legacy path (allow_legacy_empty_canonical=True):
+                #     durable canonical_signal_id must be NULL or '' (proven
+                #     by Python-level identity checks); the UPDATE atomically
+                #     backfills it AND verifies it was still empty.  This
+                #     closes the race where a concurrent worker could stamp
+                #     canonical between our read and our claim.
+                _canonical_predicates: list[str] = []
+                _canonical_params: list = []
+                _canonical_backfill_set = ""
+                if _canonical:
+                    if allow_legacy_empty_canonical:
+                        # Atomic: require empty AND backfill in same UPDATE
+                        _canonical_predicates.append("COALESCE(canonical_signal_id, '') = ''")
+                        _canonical_backfill_set = ", canonical_signal_id = %s"
+                    else:
+                        # Modern: exact durable match required
+                        _canonical_predicates.append("canonical_signal_id = %s")
+                        _canonical_params.append(_canonical)
+
+                # Optional extra lifecycle predicates (passed by callers for
+                # belt-and-suspenders fencing beyond the generation check).
+                _extra_predicates: list[str] = []
+                _extra_params: list = []
+                _extra_predicates.append("UPPER(COALESCE(status,'')) = %s")
+                _extra_params.append(_expected_order_status)
+                _extra_predicates.append("COALESCE(meta->>'submit_intent_at','') = ''")
+                if expected_materialization_status:
+                    _extra_predicates.append(
+                        "COALESCE(meta->>'materialization_status','') IN ('', %s)"
+                    )
+                    _extra_params.append(str(expected_materialization_status).strip().upper())
+                if expected_lifecycle_state is not None:
+                    _extra_predicates.append(
+                        "COALESCE(meta->>'lifecycle_state','') = %s"
+                    )
+                    _extra_params.append(str(expected_lifecycle_state).strip().upper())
+
                 if _prev_attempt is not None:
                     # Verify the canonical retry_attempt is at the expected
                     # prior value — prevents double-claiming an attempt slot.
@@ -2242,15 +2309,21 @@ class APOrderStateMachine:
                         " AND COALESCE((meta->>'retry_attempt')::int, 0) = %s"
                     )
                     _attempt_params = [_prev_attempt]
+
+                # Assemble predicates (ordering: extra, then canonical)
+                _all_extra = " AND ".join(_extra_predicates)
+                _all_canonical = (" AND " + " AND ".join(_canonical_predicates)) if _canonical_predicates else ""
+
                 cur = c.execute(
-                    """
+                    f"""
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    SET meta = COALESCE(meta, '{{}}'::jsonb) || %s::jsonb
+                        {_canonical_backfill_set},
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND kind = 'ENTRY'
-                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND {_all_extra}
                       AND (broker_order_id IS NULL OR broker_order_id = '')
                       AND submitted_ts IS NULL
                       AND signal_id = %s
@@ -2261,10 +2334,15 @@ class APOrderStateMachine:
                          OR COALESCE(meta->>'materialization_lease_until','') < %s
                       )
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                    {_all_canonical}
                     """ + _attempt_predicate,
                     (
-                        _patch_json, local_order_id, self.client_id,
-                        _signal_id, _mode, _now, _expected_previous_generation,
+                        _patch_json,
+                        # canonical backfill value inserted right after patch when legacy path
+                        *([_canonical] if _canonical_backfill_set else []),
+                        local_order_id, self.client_id,
+                        *_extra_params, _signal_id, _mode, _now, _expected_previous_generation,
+                        *_canonical_params,
                         *_attempt_params,
                     ),
                 )

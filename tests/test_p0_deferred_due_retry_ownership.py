@@ -1588,6 +1588,8 @@ def test_blocker4_claim_writes_canonical_retry_attempt():
             signal_id=SIGNAL_ID,
             execution_mode="paper",
             retry_attempt=2,
+            # PR #359: canonical_signal_id required.
+            canonical_signal_id="REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72",
         )
 
     assert patches_seen, "no patch was written to the DB"

@@ -196,6 +196,154 @@ def _normalize_execution_mode(value) -> str | None:
     return mode if mode in _VALID_EXECUTION_MODES else None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #359 — LIVE recovery helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# One canonical predicate for LIVE recovery ownership checks.  A terminal-
+# looking order is clean only when every broker/fill/reconciliation signal
+# is absent.  Intentionally inlined as a SQL fragment (not a subquery) so
+# callers compose it into their own WHERE clause via an f-string.
+_LIVE_ENTRY_BROKER_EVIDENCE_SQL = """(
+       COALESCE(orders.filled_qty, 0) > 0
+    OR orders.filled_ts IS NOT NULL
+    OR COALESCE(orders.broker_order_id, '') <> ''
+    OR orders.submitted_ts IS NOT NULL
+    OR COALESCE(orders.meta->>'submit_intent_at', '') <> ''
+    OR COALESCE(orders.meta->>'broker_submit_key', '') <> ''
+    OR COALESCE(orders.meta->>'current_owner', '') LIKE 'broker_submit:%%'
+    OR UPPER(COALESCE(orders.meta->>'lifecycle_state', '')) IN ('SUBMITTING', 'SUBMITTED')
+    OR LOWER(COALESCE(orders.meta->>'reconciliation_required', '')) IN ('1', 'true', 'yes', 'on')
+    OR LOWER(COALESCE(orders.meta->>'split_brain_quarantine', '')) IN ('1', 'true', 'yes', 'on')
+    OR COALESCE(orders.last_error, '') LIKE 'SPLIT_BRAIN:%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_AMBIGUOUS_%%RECONCILIATION_REQUIRED%%'
+    OR UPPER(COALESCE(orders.last_error, ''))
+           LIKE '%%BROKER_ACCEPTED_MISSING_ID_RECONCILIATION_REQUIRED%%'
+    OR UPPER(COALESCE(orders.last_error, '')) LIKE '%%BROKER_IDENTITY_UNPROVEN%%'
+    OR UPPER(COALESCE(orders.meta->>'recovery_reason_code', '')) LIKE 'RECONCILE_%%'
+    OR UPPER(COALESCE(orders.meta->>'recovery_reason_code', ''))
+       = 'RECOVERY_SUBMIT_INTENT_REQUIRES_RECONCILIATION'
+    OR UPPER(COALESCE(orders.status, '')) NOT IN (
+        'REJECTED', 'CANCELED', 'CANCELLED', 'EXPIRED',
+        'ERROR', 'DONE', 'ARCHIVED'
+    )
+)"""
+
+
+def _prior_trading_session_date_et(now_et) -> "Optional[date]":
+    """Return the prior NYSE trading session date relative to *now_et* (ET),
+    or ``None`` when the canonical calendar cannot be consulted.
+
+    Walks back at least one calendar day, skipping weekends AND NYSE full-
+    closure holidays via ``ap.flatline_alarm.is_trading_day``.
+
+    LIVE recovery treats calendar uncertainty as a hard failure.  Returning
+    ``None`` here causes the LIVE recovery pass to skip entirely — no queue
+    mutation, no quote lookup, no broker path.
+    """
+    from datetime import date as _date
+    d = now_et.date() - timedelta(days=1)
+    try:
+        from ap.flatline_alarm import is_trading_day as _td
+    except Exception:
+        return None
+    try:
+        guard = 0
+        while not _td(d):
+            if guard >= 14:
+                return None
+            d -= timedelta(days=1)
+            guard += 1
+        return d
+    except Exception:
+        return None
+
+
+def _prior_trading_session_cutoff_utc(now_et) -> "Optional[str]":
+    """UTC ISO timestamp of the start of the prior-trading-session ET day,
+    or ``None`` when the canonical calendar cannot resolve a prior session.
+
+    Used as the SQL lower-bound ``created_ts >= %s`` for LIVE recovery
+    candidate selection.  Returns ``None`` when the calendar is unavailable
+    or the prior session cannot be proven — LIVE recovery MUST fail closed.
+    """
+    from zoneinfo import ZoneInfo as _ZI
+    _ET_TZ = _ZI("America/New_York")
+    prior_session = _prior_trading_session_date_et(now_et)
+    if prior_session is None:
+        return None
+    try:
+        session_start_et = datetime(
+            prior_session.year, prior_session.month, prior_session.day,
+            0, 0, 0, tzinfo=_ET_TZ,
+        )
+        return session_start_et.astimezone(timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+def _signal_date_from_payload_or_row(payload: dict, row: dict) -> "Optional[date]":
+    """Extract the signal generation date (ET calendar) for the session gate.
+
+    Date-only fields (``signal_date``, ``date``, ``signal_bar_date``) are
+    treated as ET calendar dates as-is.  Timestamp fields (``created_at``,
+    ``timestamp_iso``, ``generated_at``) are parsed as timezone-aware
+    datetimes and converted to America/New_York.  Naive timestamps fail
+    closed and return ``None``.  Falls back to ``trade_queue.created_ts``.
+
+    Returns ``None`` when no date can be reliably extracted — callers MUST
+    treat ``None`` as "session unprovable" and skip the row.
+    """
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo as _ZI
+    _ET_TZ = _ZI("America/New_York")
+
+    # 1. Date-only fields — direct ISO date parse
+    for key in ("signal_date", "date", "signal_bar_date"):
+        val = payload.get(key)
+        if not val:
+            continue
+        try:
+            return _date.fromisoformat(str(val).strip()[:10])
+        except (ValueError, TypeError):
+            continue
+
+    # 2. Timestamp fields — parse as aware datetime, convert to ET, take date
+    for key in ("created_at", "timestamp_iso", "generated_at"):
+        val = payload.get(key)
+        if not val:
+            continue
+        try:
+            s = str(val).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(s)
+        except (ValueError, TypeError):
+            continue
+        if parsed.tzinfo is None:
+            # Naive timestamp — cannot prove ET calendar date; fail closed
+            return None
+        return parsed.astimezone(_ET_TZ).date()
+
+    # 3. Fallback: trade_queue.created_ts column
+    created_raw = row.get("created_ts")
+    if created_raw is None:
+        return None
+    try:
+        if isinstance(created_raw, datetime):
+            ts = created_raw
+        else:
+            s = str(created_raw).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            ts = datetime.fromisoformat(s)
+        if ts.tzinfo is None:
+            return None
+        return ts.astimezone(_ET_TZ).date()
+    except Exception:
+        return None
+
+
 def _resolve_side_from_order_or_meta(order: dict, meta: dict | None = None) -> tuple[str | None, str]:
     """Resolve strategy side without ever defaulting missing direction to CALL."""
     meta = meta or {}
@@ -2705,16 +2853,1058 @@ class APStartupRecovery:
             return any(_le.startswith(_p) for _p in _READINESS_SKIP_LAST_ERRORS)
 
         if _is_live:
-            # Audit-required log; emitted before any DB write so it's
-            # visible even if downstream paths fail.
+            # PR #359 — LIVE WATCHING recovery classifier.
+            # Each row is read-only classified before any mutation.  The prior
+            # broad PAPER reset (_reset) is NEVER used for LIVE.  Instead,
+            # eligible untriggered rows are restored to NEW with a breach-only
+            # marker; rows whose trigger has already crossed are durably marked
+            # LIVE_RECOVERY_MISSED_TRIGGER.  Rows that cannot be proven (no
+            # calendar, no fresh quote, policy-rejected, wrong session) are
+            # left WATCHING with a structured log — never silently abandoned.
+
+            def _recover_unowned_live_watching_signals() -> int:
+                # ── Session window ────────────────────────────────────────
+                # Two-tier lookback:
+                #   Tier 1 (eligible/missed): prior trading session only.
+                #   Tier 2 (stale): bounded extended lookback so older rows
+                #     can be durably terminalized rather than left WATCHING.
+                #
+                # Fix 3 (review §3): the prior-session-only cutoff excluded
+                # older WATCHING rows before the stale classifier could see
+                # them. Extended lookback is bounded (default 7 days / env).
+                # LIVE recovery fails closed when NYSE calendar unavailable.
+                _prior_session_date = _prior_trading_session_date_et(now_et)
+                _live_cutoff_utc    = _prior_trading_session_cutoff_utc(now_et)
+                if _prior_session_date is None or _live_cutoff_utc is None:
+                    log.error(
+                        "LIVE_RECOVERY_SESSION_CALENDAR_UNAVAILABLE client_id=%s "
+                        "— recovery skipped",
+                        self.client_id,
+                    )
+                    return 0
+                _today_et_date = now_et.date()
+
+                try:
+                    _stale_lookback_days = int(
+                        os.getenv("LIVE_RECOVERY_STALE_LOOKBACK_DAYS", "7")
+                    )
+                except (TypeError, ValueError):
+                    _stale_lookback_days = 7
+                from zoneinfo import ZoneInfo as _ZI2
+                _ET2 = _ZI2("America/New_York")
+                _stale_cutoff_utc = (
+                    now_et.astimezone(timezone.utc)
+                    - timedelta(days=_stale_lookback_days)
+                ).isoformat()
+
+                def _load_candidates():
+                    with conn() as c:
+                        c.execute(
+                            """
+                            SELECT id, client_id, signal_id, status,
+                                   payload, created_ts, started_ts,
+                                   finished_ts, last_error
+                            FROM trade_queue
+                            WHERE client_id = %s
+                              AND status = 'WATCHING'
+                              AND created_ts >= %s
+                              AND LOWER(COALESCE(payload->>'execution_mode','')) = 'live'
+                              -- Terminal-family exclusions (independent AND predicates).
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_MISSED_TRIGGER%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_STALE_SESSION%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_POLICY%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_TERMINAL_READINESS%%'
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_RETRY_EXHAUSTED%%'
+                              -- live_recovery_next_retry is intentionally NOT
+                              -- evaluated here. Timestamp validation belongs in Python
+                              -- where try/except can safely handle any malformed value
+                              -- (including 2026-02-31T12:00, 2026-01-01T99:99, etc.)
+                              -- without the risk of a PostgreSQL cast error.
+                              -- _next_retry_due() is applied to each row after loading.
+                            ORDER BY created_ts ASC
+                            """,
+                            (self.client_id, _stale_cutoff_utc),
+                        )
+                        return c.fetchall()
+
+                def _load_missing_mode_candidates():
+                    """Load WATCHING rows where payload.execution_mode is
+                    absent.  These may be legacy Jason-style rows.  They are
+                    NOT selected by _load_candidates() (which requires
+                    LOWER(COALESCE(payload->>'execution_mode','')) = 'live').
+
+                    A separate, stricter authorization path is required before
+                    any mutation:  runner must be LIVE, client must match,
+                    ap_signals must confirm the signal belongs to this client,
+                    and no conflicting PAPER ownership may exist.
+                    """
+                    with conn() as c:
+                        c.execute(
+                            """
+                            SELECT id, client_id, signal_id, status,
+                                   payload, created_ts, started_ts,
+                                   finished_ts, last_error
+                            FROM trade_queue
+                            WHERE client_id = %s
+                              AND status = 'WATCHING'
+                              AND created_ts >= %s
+                              AND COALESCE(payload->>'execution_mode', '') = ''
+                              AND COALESCE(last_error, '') NOT LIKE 'LIVE_RECOVERY_%%'
+                              -- next_retry evaluated in Python after loading;
+                              -- see _next_retry_due() below.
+                            ORDER BY created_ts ASC
+                            """,
+                            (self.client_id, _stale_cutoff_utc),
+                        )
+                        return c.fetchall()
+
+                def _authorize_live_missing_mode(
+                    signal_id: str,
+                    canonical_signal_id: str,
+                    row_client_id: str,
+                ) -> tuple[bool, str]:
+                    """Return (authorized, reason).
+
+                    LIVE identity for a missing-mode row is proven only when:
+                      1. runner mode is exactly LIVE (_mc_mode == 'LIVE'  ← checked
+                         by the outer `if _is_live:` gate before this function runs);
+                      2. the candidate row's client_id exactly equals the runner's
+                         client_id (belt-and-suspenders — the loading SQL already
+                         scopes by client, but an explicit row-level check ensures
+                         no row slips through from a multi-client query change);
+                      3. ap_signals row exists for (signal_id, client_email);
+                      4. ap_signals.decision_status is not 'rejected';
+                      5. no conflicting PAPER queue row owns this signal;
+                      6. no conflicting PAPER ENTRY order exists.
+
+                    Never use COALESCE(payload->>'execution_mode','live') defaults.
+                    """
+                    # Guard 2: row client_id must equal runner client_id.
+                    # The loading SQL already filters client_id = self.client_id,
+                    # but an independent row-level check closes the gap if the query
+                    # ever changes.
+                    if str(row_client_id or "").strip().lower() != str(
+                        self.client_id or ""
+                    ).strip().lower():
+                        return False, "row_client_id_mismatch"
+
+                    try:
+                        with conn() as _c:
+                            # Guard 3+4: ap_signals confirmation
+                            _c.execute(
+                                """
+                                SELECT decision_status
+                                FROM ap_signals
+                                WHERE signal_id = %s AND client_email = %s
+                                LIMIT 1
+                                """,
+                                (signal_id, self.client_id),
+                            )
+                            _ap_row = _c.fetchone()
+                        if not _ap_row:
+                            return False, "ap_signals_row_absent"
+                        _ds = str(
+                            (_ap_row.get("decision_status")
+                             if isinstance(_ap_row, dict)
+                             else (_ap_row[0] if _ap_row else ""))
+                            or ""
+                        ).lower()
+                        if _ds == "rejected":
+                            return False, "ap_signals_rejected"
+                    except Exception as _exc:
+                        log.error(
+                            "LIVE_MISSING_MODE_IDENTITY_PROOF_DB_ERROR "
+                            "client_id=%s signal_id=%s error=%s",
+                            self.client_id, signal_id, _exc,
+                        )
+                        return False, "ap_signals_lookup_failed"
+
+                    try:
+                        with conn() as _c:
+                            # Guard 5: no conflicting PAPER queue ownership
+                            _c.execute(
+                                """
+                                SELECT 1 FROM trade_queue
+                                WHERE client_id = %s
+                                  AND signal_id = %s
+                                  AND LOWER(COALESCE(payload->>'execution_mode',''))
+                                      = 'paper'
+                                  AND status IN ('NEW','WATCHING','PROCESSING')
+                                LIMIT 1
+                                """,
+                                (self.client_id, signal_id),
+                            )
+                            if _c.fetchone():
+                                return False, "conflicting_paper_queue_row"
+                    except Exception as _exc:
+                        return False, f"paper_queue_check_failed:{_exc}"
+
+                    try:
+                        with conn() as _c:
+                            # Guard 6: no conflicting PAPER ENTRY order
+                            _c.execute(
+                                """
+                                SELECT 1 FROM orders
+                                WHERE client_id = %s
+                                  AND signal_id = %s
+                                  AND kind = 'ENTRY'
+                                  AND LOWER(COALESCE(execution_mode,'')) = 'paper'
+                                  AND UPPER(COALESCE(status,'')) NOT IN
+                                      ('REJECTED','CANCELED','CANCELLED',
+                                       'EXPIRED','ERROR','DONE','ARCHIVED')
+                                LIMIT 1
+                                """,
+                                (self.client_id, signal_id),
+                            )
+                            if _c.fetchone():
+                                return False, "conflicting_paper_order_exists"
+                    except Exception as _exc:
+                        return False, f"paper_order_check_failed:{_exc}"
+
+                    return True, "authorized"
+
+                def _restore_with_mode_repair(
+                    row_id,
+                    diag: dict,
+                    signal_id_: str,
+                    canonical_signal_id_: str,
+                ) -> bool:
+                    """Atomic restore + execution_mode/canonical repair for
+                    missing-mode rows.  The same UPDATE stamps:
+                      - status = 'NEW'
+                      - payload.execution_mode = 'live'
+                      - payload.canonical_signal_id (if absent)
+                      - payload.live_recovery_identity_repaired = true
+                      - payload.live_recovery_breach_only = true
+                    The NOT EXISTS order fence still applies.
+                    """
+                    marker = {
+                        "execution_mode": "live",
+                        "canonical_signal_id": canonical_signal_id_,
+                        "live_recovery_identity_repaired": True,
+                        "live_recovery_outcome": "LIVE_RECOVERY_WATCHER_RESTORED",
+                        "live_recovery_breach_only": True,
+                        "live_recovery_restored_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "live_recovery_mode_repair_source": "ap_signals_proof",
+                    }
+                    with conn() as c:
+                        c.execute(
+                            f"""
+                            UPDATE trade_queue
+                            SET status      = 'NEW',
+                                payload     = COALESCE(payload, '{{}}'::jsonb)
+                                              || %s::jsonb,
+                                started_ts  = NULL,
+                                finished_ts = NULL,
+                                last_error  = NULL
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND status = 'WATCHING'
+                              AND COALESCE(payload->>'execution_mode', '') = ''
+                              AND NOT EXISTS (
+                                SELECT 1 FROM orders
+                                WHERE orders.client_id = trade_queue.client_id
+                                  AND orders.kind = 'ENTRY'
+                                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                                  AND (
+                                        orders.signal_id = %s
+                                     OR (
+                                          %s <> ''
+                                          AND orders.canonical_signal_id = %s
+                                        )
+                                  )
+                              )
+                            """,
+                            (
+                                json.dumps(marker, default=str),
+                                row_id,
+                                self.client_id,
+                                signal_id_,
+                                canonical_signal_id_,
+                                canonical_signal_id_,
+                            ),
+                        )
+                        return int(getattr(c, "rowcount", 0) or 0) == 1
+
+                def _active_entry_order_exists(
+                    signal_id: str, canonical_signal_id: str
+                ) -> bool:
+                    with conn() as c:
+                        c.execute(
+                            f"""
+                            SELECT 1
+                            FROM orders
+                            WHERE client_id = %s
+                              AND kind = 'ENTRY'
+                              AND LOWER(COALESCE(execution_mode,'')) = 'live'
+                              AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                              AND (
+                                    signal_id = %s
+                                 OR (%s <> '' AND canonical_signal_id = %s)
+                              )
+                            LIMIT 1
+                            """,
+                            (
+                                self.client_id,
+                                signal_id,
+                                canonical_signal_id,
+                                canonical_signal_id,
+                            ),
+                        )
+                        return c.fetchone() is not None
+
+                _MAX_QUOTE_AGE_SECONDS = 120
+
+                def _current_underlying(symbol: str):
+                    broker = self.broker
+                    now_utc_ts = datetime.now(timezone.utc)
+
+                    def _parse_epoch_ms(val):
+                        if val is None:
+                            return None
+                        try:
+                            ep = float(val)
+                            if ep > 1e10:
+                                ep /= 1000.0
+                            return datetime.fromtimestamp(ep, tz=timezone.utc)
+                        except Exception:
+                            return None
+
+                    def _ts_age_ok(dt):
+                        if dt is None:
+                            return False
+                        age = (now_utc_ts - dt).total_seconds()
+                        return -5 <= age <= _MAX_QUOTE_AGE_SECONDS
+
+                    for method_name in ("get_quote", "quote"):
+                        method = getattr(broker, method_name, None)
+                        if not callable(method):
+                            continue
+                        try:
+                            raw = method(symbol)
+                        except Exception as exc:
+                            log.warning(
+                                "LIVE_RECOVERY_QUOTE_UNAVAILABLE client_id=%s "
+                                "symbol=%s method=%s error=%s",
+                                self.client_id, symbol, method_name, exc,
+                            )
+                            continue
+                        raw_dict = (
+                            raw if isinstance(raw, dict)
+                            else (vars(raw) if hasattr(raw, "__dict__") else {})
+                        )
+                        _last_px = _safe_float(raw_dict.get("last"), 0.0)
+                        _bid_px  = _safe_float(raw_dict.get("bid"),  0.0)
+                        _ask_px  = _safe_float(raw_dict.get("ask"),  0.0)
+                        _trade_dt = _parse_epoch_ms(raw_dict.get("trade_date"))
+                        _bid_dt   = _parse_epoch_ms(raw_dict.get("bid_date"))
+                        _ask_dt   = _parse_epoch_ms(raw_dict.get("ask_date"))
+                        _generic_raw = (
+                            raw_dict.get("timestamp") or raw_dict.get("quote_time")
+                            or raw_dict.get("trade_time") or raw_dict.get("time")
+                            or raw_dict.get("updated_at")
+                        )
+                        _generic_dt = None
+                        if _generic_raw is not None:
+                            try:
+                                if isinstance(_generic_raw, (int, float)):
+                                    _generic_dt = _parse_epoch_ms(_generic_raw)
+                                else:
+                                    _s = str(_generic_raw).strip()
+                                    if _s.endswith("Z"):
+                                        _s = _s[:-1] + "+00:00"
+                                    _gdt = datetime.fromisoformat(_s)
+                                    if _gdt.tzinfo is None:
+                                        _gdt = _gdt.replace(tzinfo=timezone.utc)
+                                    _generic_dt = _gdt.astimezone(timezone.utc)
+                            except Exception:
+                                pass
+                        if _last_px > 0 and _ts_age_ok(_trade_dt):
+                            return _last_px
+                        if (
+                            _bid_px > 0 and _ask_px > 0
+                            and _ts_age_ok(_bid_dt) and _ts_age_ok(_ask_dt)
+                        ):
+                            return (_bid_px + _ask_px) / 2.0
+                        if _ts_age_ok(_generic_dt):
+                            for attr in ("last", "mark", "mid", "price", "ask", "bid"):
+                                px = _safe_float(
+                                    raw_dict.get(attr) if isinstance(raw, dict)
+                                    else getattr(raw, attr, None),
+                                    0.0,
+                                )
+                                if px > 0:
+                                    return px
+                        log.warning(
+                            "LIVE_RECOVERY_QUOTE_NO_VALID_TIMESTAMP client_id=%s "
+                            "symbol=%s method=%s — refusing to terminalize without "
+                            "fresh evidence",
+                            self.client_id, symbol, method_name,
+                        )
+                        return None
+                    return None
+
+                def _payload_dict(row) -> dict:
+                    payload = row.get("payload") if isinstance(row, dict) else None
+                    if isinstance(payload, dict):
+                        return dict(payload)
+                    if isinstance(payload, str):
+                        try:
+                            parsed = json.loads(payload)
+                            return parsed if isinstance(parsed, dict) else {}
+                        except Exception:
+                            return {}
+                    return {}
+
+                def _classify(row) -> tuple[str, dict]:
+                    """Classify a LIVE WATCHING queue row.
+
+                    Fix 2 (review §2): explicit outcome taxonomy — no broad
+                    skip bucket that leaves rows WATCHING indefinitely.
+
+                    Outcomes:
+                      eligible          → restore to NEW (breach-only)
+                      missed            → terminalize LIVE_RECOVERY_MISSED_TRIGGER
+                      terminal_policy   → terminalize with policy reason
+                      terminal_readiness→ terminalize with readiness reason
+                      stale_session     → terminalize LIVE_RECOVERY_STALE_SESSION
+                      temporary_unavail → remain WATCHING + durable diagnostics
+                      active_order      → read-only skip (another owner exists)
+                      skip              → unclassifiable, log only
+                    """
+                    row = dict(row or {})
+                    payload = _payload_dict(row)
+                    signal_id = str(
+                        row.get("signal_id") or payload.get("signal_id") or ""
+                    ).strip()
+                    canonical_signal_id = str(
+                        payload.get("canonical_signal_id") or ""
+                    ).strip()
+                    if not canonical_signal_id:
+                        try:
+                            from ap_canonical_signal import build_canonical_signal_id as _bcs
+                            canonical_signal_id = _bcs(signal_id, payload)
+                        except Exception:
+                            canonical_signal_id = ""
+                    symbol = str(
+                        payload.get("ticker")
+                        or payload.get("symbol")
+                        or payload.get("underlying")
+                        or ""
+                    ).strip().upper()
+                    direction = str(
+                        payload.get("direction") or payload.get("side") or ""
+                    ).strip().upper()
+                    trigger = _safe_float(
+                        payload.get("trigger_price")
+                        or payload.get("entry_price")
+                        or payload.get("trigger")
+                        or payload.get("entry"),
+                        0.0,
+                    )
+                    last_error = row.get("last_error")
+                    _now_ts = datetime.now(timezone.utc).isoformat()
+
+                    # ── Readiness-terminal ────────────────────────────────
+                    # Row was already classified by the readiness pass.
+                    if _last_error_is_readiness_skip(last_error):
+                        return "terminal_readiness", {
+                            "reason": "terminal_readiness_classification",
+                            "prior_last_error": last_error,
+                            "recovery_timestamp": _now_ts,
+                        }
+
+                    # ── Policy-terminal (last_error prefix) ───────────────
+                    _le_upper = str(last_error or "").upper()
+                    if _le_upper.startswith(
+                        ("POLICY_", "RISK_VETO", "POLICY_BLOCKED", "INTEL_REJECTED")
+                    ):
+                        return "terminal_policy", {
+                            "reason": "terminal_policy_classification",
+                            "prior_last_error": last_error,
+                            "recovery_timestamp": _now_ts,
+                        }
+
+                    # ── Authoritative ap_signals decision ─────────────────
+                    if signal_id:
+                        try:
+                            with conn() as _c:
+                                _c.execute(
+                                    """
+                                    SELECT decision_status FROM ap_signals
+                                    WHERE signal_id = %s AND client_email = %s
+                                    LIMIT 1
+                                    """,
+                                    (signal_id, self.client_id),
+                                )
+                                _ap_row = _c.fetchone()
+                            if _ap_row:
+                                _ds = str(
+                                    (
+                                        _ap_row.get("decision_status")
+                                        if isinstance(_ap_row, dict)
+                                        else (_ap_row[0] if _ap_row else "")
+                                    )
+                                    or ""
+                                ).lower()
+                                if _ds == "rejected":
+                                    return "terminal_policy", {
+                                        "reason": "ap_signals_rejected",
+                                        "ap_signals_decision_status": _ds,
+                                        "prior_last_error": last_error,
+                                        "recovery_timestamp": _now_ts,
+                                    }
+                        except Exception as _policy_err:
+                            # Cannot confirm policy truth — temporary.
+                            log.error(
+                                "LIVE_RECOVERY_POLICY_TRUTH_UNAVAILABLE "
+                                "client_id=%s signal_id=%s error=%s",
+                                self.client_id, signal_id, _policy_err,
+                            )
+                            return "temporary_unavail", {
+                                "reason": "LIVE_RECOVERY_POLICY_TRUTH_UNAVAILABLE",
+                                "error": str(_policy_err),
+                                "recovery_timestamp": _now_ts,
+                            }
+
+                    # ── Required identity/geometry ─────────────────────────
+                    if not signal_id or not canonical_signal_id:
+                        return "skip", {"reason": "missing_canonical_signal_identity"}
+                    if not symbol or direction not in {"CALL", "PUT"} or trigger <= 0:
+                        return "skip", {"reason": "invalid_symbol_direction_or_trigger"}
+
+                    # ── Session-identity gate ─────────────────────────────
+                    # Fix 3: rows older than prior session → stale_session
+                    # (terminalized durably), rows in-window → eligible/missed.
+                    _sig_date = _signal_date_from_payload_or_row(payload, row)
+                    if _sig_date is None:
+                        return "temporary_unavail", {
+                            "reason": "session_unprovable_no_date",
+                            "recovery_timestamp": _now_ts,
+                        }
+                    _in_window = (
+                        _sig_date == _prior_session_date
+                        or _sig_date == _today_et_date
+                    )
+                    if not _in_window:
+                        return "stale_session", {
+                            "reason": "session_out_of_window",
+                            "signal_date": _sig_date.isoformat(),
+                            "prior_session": _prior_session_date.isoformat(),
+                            "today_et": _today_et_date.isoformat(),
+                            "prior_last_error": last_error,
+                            "recovery_timestamp": _now_ts,
+                            "signal_id": signal_id,
+                            "canonical_signal_id": canonical_signal_id,
+                        }
+
+                    # ── Active ENTRY order → read-only skip ───────────────
+                    # Another canonical owner exists; don't interfere.
+                    try:
+                        if _active_entry_order_exists(signal_id, canonical_signal_id):
+                            return "active_order", {
+                                "reason": "active_entry_order_exists",
+                                "signal_id": signal_id,
+                                "canonical_signal_id": canonical_signal_id,
+                            }
+                    except Exception as _ord_err:
+                        return "temporary_unavail", {
+                            "reason": "active_order_lookup_failed",
+                            "error": str(_ord_err),
+                            "recovery_timestamp": _now_ts,
+                        }
+
+                    # ── Fresh quote ───────────────────────────────────────
+                    current = _current_underlying(symbol)
+                    if current is None:
+                        return "temporary_unavail", {
+                            "reason": "current_underlying_unavailable",
+                            "symbol": symbol,
+                            "signal_id": signal_id,
+                            "canonical_signal_id": canonical_signal_id,
+                            "recovery_timestamp": _now_ts,
+                        }
+
+                    crossed = (
+                        current >= trigger if direction == "CALL"
+                        else current <= trigger
+                    )
+                    diag = {
+                        "client_id": self.client_id,
+                        "execution_mode": "live",
+                        "signal_id": signal_id,
+                        "canonical_signal_id": canonical_signal_id,
+                        "symbol": symbol,
+                        "direction": direction,
+                        "trigger_price": trigger,
+                        "current_underlying": current,
+                        "recovery_timestamp": _now_ts,
+                        "source_queue_row": row.get("id"),
+                        "prior_last_error": last_error,
+                        "reason": (
+                            "ownership_absent_at_trigger" if crossed
+                            else "eligible_untriggered"
+                        ),
+                    }
+                    return ("missed" if crossed else "eligible"), diag
+
+                # ── Durable terminalizers ─────────────────────────────────
+
+                def _terminalize_queue_row(
+                    row_id, last_error_str: str, diag: dict,
+                    signal_id_: str, canonical_signal_id_: str,
+                ) -> bool:
+                    """Fenced REJECTED write — NOT EXISTS order fence so a
+                    concurrent order creation cannot race the terminalization."""
+                    with conn() as c:
+                        c.execute(
+                            f"""
+                            UPDATE trade_queue
+                            SET status      = 'REJECTED',
+                                last_error  = %s,
+                                payload     = COALESCE(payload, '{{}}'::jsonb)
+                                              || %s::jsonb,
+                                finished_ts = NOW()
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND status = 'WATCHING'
+                              AND NOT EXISTS (
+                                SELECT 1 FROM orders
+                                WHERE orders.client_id = trade_queue.client_id
+                                  AND orders.kind = 'ENTRY'
+                                  AND LOWER(COALESCE(orders.execution_mode,''))
+                                      = 'live'
+                                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                                  AND (
+                                        orders.signal_id = %s
+                                     OR (
+                                          %s <> ''
+                                          AND orders.canonical_signal_id = %s
+                                        )
+                                  )
+                              )
+                            """,
+                            (
+                                last_error_str,
+                                json.dumps(diag, default=str),
+                                row_id,
+                                self.client_id,
+                                signal_id_,
+                                canonical_signal_id_,
+                                canonical_signal_id_,
+                            ),
+                        )
+                        return int(getattr(c, "rowcount", 0) or 0) == 1
+
+                def _mark_missed(
+                    row_id, diag: dict, signal_id_: str, canonical_signal_id_: str
+                ) -> bool:
+                    return _terminalize_queue_row(
+                        row_id,
+                        "LIVE_RECOVERY_MISSED_TRIGGER:ownership_absent_at_trigger",
+                        {"live_recovery_outcome": "LIVE_RECOVERY_MISSED_TRIGGER", **diag},
+                        signal_id_, canonical_signal_id_,
+                    )
+
+                def _write_temporary_unavail_diagnostics(
+                    row_id, diag: dict, prior_payload: dict,
+                ) -> None:
+                    """Persist bounded diagnostics for uncertain rows.
+                    The row stays WATCHING; attempt count + next retry are written
+                    to payload so the classifier can escalate on a future pass."""
+                    try:
+                        _prev_attempt = int(
+                            (prior_payload or {}).get(
+                                "live_recovery_attempt", 0
+                            ) or 0
+                        )
+                        try:
+                            _retry_interval = int(
+                                os.getenv("LIVE_RECOVERY_RETRY_INTERVAL_SECONDS", "300")
+                            )
+                            _max_attempts = int(
+                                os.getenv("LIVE_RECOVERY_MAX_ATTEMPTS", "12")
+                            )
+                        except (TypeError, ValueError):
+                            _retry_interval = 300
+                            _max_attempts   = 12
+                        _new_attempt  = _prev_attempt + 1
+                        _next_retry   = (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=_retry_interval)
+                        ).isoformat()
+                        _patch = {
+                            "live_recovery_attempt": _new_attempt,
+                            "live_recovery_last_attempted": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                            "live_recovery_reason": diag.get("reason", ""),
+                            "live_recovery_next_retry": _next_retry,
+                            "live_recovery_max_attempts": _max_attempts,
+                        }
+                        with conn() as c:
+                            c.execute(
+                                """
+                                UPDATE trade_queue
+                                SET payload = COALESCE(payload, '{}'::jsonb)
+                                              || %s::jsonb
+                                WHERE id = %s
+                                  AND client_id = %s
+                                  AND status = 'WATCHING'
+                                """,
+                                (
+                                    json.dumps(_patch, default=str),
+                                    row_id,
+                                    self.client_id,
+                                ),
+                            )
+                        # If retry budget exhausted, terminalize visibly.
+                        if _new_attempt >= _max_attempts:
+                            _terminalize_queue_row(
+                                row_id,
+                                f"LIVE_RECOVERY_RETRY_EXHAUSTED:{diag.get('reason','')}",
+                                {
+                                    "live_recovery_outcome": "LIVE_RECOVERY_RETRY_EXHAUSTED",
+                                    "live_recovery_attempt": _new_attempt,
+                                    **diag,
+                                },
+                                diag.get("signal_id", ""),
+                                diag.get("canonical_signal_id", ""),
+                            )
+                    except Exception as _diag_exc:
+                        log.warning(
+                            "LIVE_RECOVERY_DIAGNOSTICS_WRITE_FAILED "
+                            "client_id=%s row_id=%s error=%s",
+                            self.client_id, row_id, _diag_exc,
+                        )
+
+                def _restore(
+                    row_id, diag: dict, signal_id_: str, canonical_signal_id_: str
+                ) -> bool:
+                    marker = {
+                        "live_recovery_outcome": "LIVE_RECOVERY_WATCHER_RESTORED",
+                        "live_recovery_breach_only": True,
+                        "live_recovery_restored_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "canonical_signal_id": diag.get("canonical_signal_id"),
+                    }
+                    with conn() as c:
+                        c.execute(
+                            f"""
+                            UPDATE trade_queue
+                            SET status      = 'NEW',
+                                payload     = COALESCE(payload, '{{}}'::jsonb)
+                                              || %s::jsonb,
+                                started_ts  = NULL,
+                                finished_ts = NULL,
+                                last_error  = NULL
+                            WHERE id = %s
+                              AND client_id = %s
+                              AND status = 'WATCHING'
+                              AND NOT EXISTS (
+                                SELECT 1 FROM orders
+                                WHERE orders.client_id = trade_queue.client_id
+                                  AND orders.kind = 'ENTRY'
+                                  AND LOWER(COALESCE(orders.execution_mode,''))
+                                      = 'live'
+                                  AND {_LIVE_ENTRY_BROKER_EVIDENCE_SQL}
+                                  AND (
+                                        orders.signal_id = %s
+                                     OR (
+                                          %s <> ''
+                                          AND orders.canonical_signal_id = %s
+                                        )
+                                  )
+                              )
+                            """,
+                            (
+                                json.dumps(marker, default=str),
+                                row_id,
+                                self.client_id,
+                                signal_id_,
+                                canonical_signal_id_,
+                                canonical_signal_id_,
+                            ),
+                        )
+                        return int(getattr(c, "rowcount", 0) or 0) == 1
+
+                def _next_retry_due(row_payload: dict) -> bool:
+                    """Return True when this row should be processed now.
+
+                    Option 3 from the review: parse and validate
+                    live_recovery_next_retry entirely in Python after bounded
+                    candidate loading — no SQL cast, no regex in WHERE clause.
+
+                    Rules:
+                      absent / empty  → due (allow-through)
+                      valid past      → due (window elapsed)
+                      valid future    → NOT due (suppress until window passes)
+                      any malformed   → due (infrastructure noise, fail-safe)
+
+                    All inputs that cannot be parsed as aware UTC datetimes
+                    are treated as absent and therefore eligible.  This covers:
+                      "not-a-date", "2026-02-31T12:00",
+                      "2026-01-01T99:99", "2026-01-01T12:99",
+                      "2026-01-01T12:00garbage"
+                    and any other invalid or exotic value.
+                    """
+                    raw = (row_payload or {}).get("live_recovery_next_retry")
+                    if not raw:
+                        return True                   # absent → due
+                    try:
+                        s = str(raw).strip()
+                        if s.endswith("Z"):
+                            s = s[:-1] + "+00:00"
+                        dt = datetime.fromisoformat(s)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return dt <= datetime.now(timezone.utc)
+                    except Exception:
+                        return True                   # malformed → due (fail-safe)
+
+                # ── Main dispatch loop ────────────────────────────────────
+                restored = 0
+                rows = run_with_retry(_load_candidates) or []
+                for row in rows:
+                    row = dict(row or {})
+                    row_id  = row.get("id")
+                    prior_payload = _payload_dict(row)
+                    # Python-level next_retry gate: skip rows whose retry
+                    # window has not yet elapsed. Any malformed timestamp
+                    # is treated as due (fail-safe, never permanently excluded).
+                    if not _next_retry_due(prior_payload):
+                        log.debug(
+                            "LIVE_RECOVERY_NEXT_RETRY_PENDING client_id=%s "
+                            "row_id=%s next_retry=%s",
+                            self.client_id, row_id,
+                            prior_payload.get("live_recovery_next_retry"),
+                        )
+                        continue
+                    outcome, diag = _classify(row)
+                    _sig_id = diag.get("signal_id", "") or str(row.get("signal_id") or "")
+                    _can_id = diag.get("canonical_signal_id", "")
+
+                    if outcome == "eligible":
+                        if run_with_retry(
+                            lambda _rid=row_id, _d=diag, _s=_sig_id, _c=_can_id:
+                                _restore(_rid, _d, _s, _c)
+                        ):
+                            restored += 1
+                        continue
+
+                    if outcome == "missed":
+                        run_with_retry(
+                            lambda _rid=row_id, _d=diag, _s=_sig_id, _c=_can_id:
+                                _mark_missed(_rid, _d, _s, _c)
+                        )
+                        log.warning(
+                            "LIVE_RECOVERY_MISSED_TRIGGER client_id=%s "
+                            "signal_id=%s canonical=%s symbol=%s direction=%s "
+                            "trigger=%.4f current=%.4f",
+                            self.client_id,
+                            diag.get("signal_id"), diag.get("canonical_signal_id"),
+                            diag.get("symbol"), diag.get("direction"),
+                            float(diag.get("trigger_price") or 0),
+                            float(diag.get("current_underlying") or 0),
+                        )
+                        continue
+
+                    if outcome == "terminal_policy":
+                        run_with_retry(
+                            lambda _rid=row_id, _d=diag, _s=_sig_id, _c=_can_id:
+                                _terminalize_queue_row(
+                                    _rid,
+                                    f"LIVE_RECOVERY_TERMINAL_POLICY:{_d.get('reason','')}",
+                                    {"live_recovery_outcome": "LIVE_RECOVERY_TERMINAL_POLICY",
+                                     **_d},
+                                    _s, _c,
+                                )
+                        )
+                        log.warning(
+                            "LIVE_RECOVERY_TERMINAL_POLICY client_id=%s "
+                            "signal_id=%s reason=%s",
+                            self.client_id, _sig_id, diag.get("reason"),
+                        )
+                        continue
+
+                    if outcome == "terminal_readiness":
+                        run_with_retry(
+                            lambda _rid=row_id, _d=diag, _s=_sig_id, _c=_can_id:
+                                _terminalize_queue_row(
+                                    _rid,
+                                    f"LIVE_RECOVERY_TERMINAL_READINESS:{_d.get('prior_last_error','')}",
+                                    {"live_recovery_outcome": "LIVE_RECOVERY_TERMINAL_READINESS",
+                                     **_d},
+                                    _s, _c,
+                                )
+                        )
+                        continue
+
+                    if outcome == "stale_session":
+                        run_with_retry(
+                            lambda _rid=row_id, _d=diag, _s=_sig_id, _c=_can_id:
+                                _terminalize_queue_row(
+                                    _rid,
+                                    f"LIVE_RECOVERY_STALE_SESSION:{_d.get('signal_date','')}",
+                                    {"live_recovery_outcome": "LIVE_RECOVERY_STALE_SESSION",
+                                     **_d},
+                                    _s, _c,
+                                )
+                        )
+                        log.info(
+                            "LIVE_RECOVERY_STALE_SESSION client_id=%s "
+                            "signal_id=%s signal_date=%s",
+                            self.client_id, _sig_id, diag.get("signal_date"),
+                        )
+                        continue
+
+                    if outcome == "temporary_unavail":
+                        run_with_retry(
+                            lambda _rid=row_id, _d=diag, _pp=prior_payload:
+                                _write_temporary_unavail_diagnostics(_rid, _d, _pp)
+                        )
+                        log.info(
+                            "LIVE_RECOVERY_TEMPORARY_UNAVAILABLE client_id=%s "
+                            "signal_id=%s reason=%s",
+                            self.client_id, _sig_id, diag.get("reason"),
+                        )
+                        continue
+
+                    # active_order or unclassifiable skip — read-only, no write
+                    log.info(
+                        "LIVE_RECOVERY_WATCHING_SKIP client_id=%s "
+                        "signal_id=%s reason=%s",
+                        self.client_id,
+                        row.get("signal_id"),
+                        diag.get("reason"),
+                    )
+
+                # ── Missing-mode dispatch ─────────────────────────────────
+                # Load WATCHING rows with no payload.execution_mode and
+                # authorize them via independent LIVE identity proof before
+                # any atomic stamp.  Must never default missing mode to LIVE.
+                missing_mode_rows = run_with_retry(_load_missing_mode_candidates) or []
+                for mm_row in missing_mode_rows:
+                    mm_row = dict(mm_row or {})
+                    mm_id = mm_row.get("id")
+                    mm_payload = _payload_dict(mm_row)
+                    # Python-level next_retry gate (same safe logic as main loop).
+                    if not _next_retry_due(mm_payload):
+                        log.debug(
+                            "LIVE_MISSING_MODE_NEXT_RETRY_PENDING client_id=%s "
+                            "row_id=%s next_retry=%s",
+                            self.client_id, mm_row.get("id"),
+                            mm_payload.get("live_recovery_next_retry"),
+                        )
+                        continue
+                    mm_sig = str(
+                        mm_row.get("signal_id")
+                        or mm_payload.get("signal_id")
+                        or ""
+                    ).strip()
+                    mm_canon = str(mm_payload.get("canonical_signal_id") or "").strip()
+                    if not mm_canon and mm_sig:
+                        try:
+                            from ap_canonical_signal import (
+                                build_canonical_signal_id as _bcs,
+                            )
+                            mm_canon = _bcs(mm_sig, mm_payload) or ""
+                        except Exception:
+                            mm_canon = ""
+
+                    if not mm_sig:
+                        log.info(
+                            "LIVE_MISSING_MODE_SKIP client_id=%s "
+                            "row_id=%s reason=missing_signal_id",
+                            self.client_id, mm_id,
+                        )
+                        continue
+
+                    authorized, auth_reason = _authorize_live_missing_mode(
+                        mm_sig, mm_canon,
+                        row_client_id=str(mm_row.get("client_id") or "").strip(),
+                    )
+                    if not authorized:
+                        log.info(
+                            "LIVE_MISSING_MODE_NOT_AUTHORIZED client_id=%s "
+                            "row_id=%s signal_id=%s reason=%s",
+                            self.client_id, mm_id, mm_sig, auth_reason,
+                        )
+                        # Durable bounded diagnostics for temporary failures
+                        if auth_reason.endswith(("_lookup_failed", "_failed")):
+                            _diag_mm = {
+                                "reason": f"LIVE_MISSING_MODE_{auth_reason.upper()}",
+                                "signal_id": mm_sig,
+                                "recovery_timestamp": datetime.now(
+                                    timezone.utc
+                                ).isoformat(),
+                            }
+                            run_with_retry(
+                                lambda _rid=mm_id, _d=_diag_mm, _pp=mm_payload:
+                                    _write_temporary_unavail_diagnostics(_rid, _d, _pp)
+                            )
+                        continue
+
+                    # Authorized — run through standard classify and repair
+                    # Inject proven execution_mode so _classify sees it
+                    mm_classify_row = dict(mm_row)
+                    mm_classify_row_payload = dict(mm_payload)
+                    mm_classify_row_payload["execution_mode"] = "live"
+                    mm_classify_row_payload["canonical_signal_id"] = mm_canon
+                    mm_classify_row["payload"] = mm_classify_row_payload
+
+                    outcome, diag = _classify(mm_classify_row)
+                    if outcome == "eligible":
+                        if run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _s=mm_sig, _c=mm_canon:
+                                _restore_with_mode_repair(_rid, _d, _s, _c)
+                        ):
+                            restored += 1
+                        continue
+                    if outcome == "missed":
+                        run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _s=mm_sig, _c=mm_canon:
+                                _mark_missed(_rid, _d, _s, _c)
+                        )
+                        continue
+                    if outcome in ("terminal_policy", "terminal_readiness", "stale_session"):
+                        _le_str = (
+                            f"LIVE_RECOVERY_{outcome.upper().replace('_','-').replace('-','')}:"
+                            f"{diag.get('reason','')}"
+                        )
+                        run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _s=mm_sig, _c=mm_canon,
+                                   _le=_le_str:
+                                _terminalize_queue_row(_rid, _le, {
+                                    "live_recovery_outcome": _le,
+                                    **_d,
+                                }, _s, _c)
+                        )
+                        continue
+                    if outcome == "temporary_unavail":
+                        run_with_retry(
+                            lambda _rid=mm_id, _d=diag, _pp=mm_payload:
+                                _write_temporary_unavail_diagnostics(_rid, _d, _pp)
+                        )
+                        continue
+                    # active_order or skip — read-only
+                    log.info(
+                        "LIVE_MISSING_MODE_CLASSIFY_SKIP client_id=%s "
+                        "row_id=%s signal_id=%s outcome=%s reason=%s",
+                        self.client_id, mm_id, mm_sig, outcome, diag.get("reason"),
+                    )
+
+                return restored
+
             log.warning(
-                "LIVE_RECOVERY_REPLAY_SKIPPED client_id=%s mode=%s "
-                "reason=live_no_replay_policy lookback_hours=%d cutoff=%s "
-                "| WATCHING rows are NOT reset for LIVE clients; only "
-                "orphaned PENDING_TRIGGER watcher reattachment will run",
-                self.client_id, _mc_mode, _lookback_hours, cutoff_utc[:19],
+                "LIVE_RECOVERY_CLASSIFIED_RESEED client_id=%s mode=%s "
+                "session_date_et=%s | loading WATCHING rows before mutation",
+                self.client_id, _mc_mode, now_et.date().isoformat(),
             )
-            count = 0  # No WATCHING rows reset for LIVE.
+            count = int(run_with_retry(_recover_unowned_live_watching_signals) or 0)
         else:
             count = run_with_retry(_reset) or 0
         rearmed = 0
@@ -2889,7 +4079,7 @@ class APStartupRecovery:
         result["already_verified_owner_rows"] = int(already_verified_owner_rows or 0)
         result["watchers_requeued"] = count + rearmed
         log.info(
-            "[%s] RECOVERY: %d WATCHING signals reset to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
+            "[%s] RECOVERY: %d WATCHING signals restored to NEW and %d orphaned PENDING_TRIGGER orders re-armed "
             "for watcher reseed (lookback=%dh cutoff=%s)",
             self.client_id, count, rearmed, _lookback_hours, cutoff_utc[:19],
         )
