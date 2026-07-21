@@ -92,8 +92,10 @@ INTEL_UNKNOWN_REASON_FAIL_OPEN   = "INTEL_UNKNOWN_REASON_FAIL_OPEN"
 INTEL_LOW_DATA_QUALITY_FAIL_OPEN = "INTEL_LOW_DATA_QUALITY_FAIL_OPEN"
 
 # Observe-only / advisory codes — never produce allowed=False
-INTEL_ADVISORY_ONLY    = "INTEL_ADVISORY_ONLY"
-INTEL_OBSERVE_ONLY_MODE = "INTEL_OBSERVE_ONLY_MODE"
+INTEL_ADVISORY_ONLY         = "INTEL_ADVISORY_ONLY"
+INTEL_OBSERVE_ONLY_MODE     = "INTEL_OBSERVE_ONLY_MODE"
+# PR: Regime mismatch is directional context — non-authoritative, allowed=True
+INTEL_REGIME_MISMATCH_ADVISORY = "INTEL_REGIME_MISMATCH_ADVISORY"
 
 # ---------------------------------------------------------------------------
 # Allowlist: intel_status values that are authoritative enough to deny entry.
@@ -366,6 +368,28 @@ def adjudicate_intelligence_result(
     # ── approved=True ──────────────────────────────────────────────────────
     if approved is True:
         _is_scanner_observe = (raw_status == "SCANNER_APPROVED_INTEL_OBSERVE_ONLY")
+        # PR: Regime mismatch is advisory — never authoritative, never blocks
+        _is_regime_advisory = (raw_status == "REGIME_MISMATCH_ADVISORY")
+
+        if _is_regime_advisory:
+            log.debug(
+                "[%s] %s raw_status=REGIME_MISMATCH_ADVISORY "
+                "allowed=True authoritative=False signal_id=%s",
+                ticker, INTEL_REGIME_MISMATCH_ADVISORY, signal_id,
+            )
+            return IntelligenceAdmissionVerdict(
+                allowed=True,
+                authoritative=False,
+                reason_code=INTEL_REGIME_MISMATCH_ADVISORY,
+                reasoning=reasoning,
+                source=source,
+                confidence=confidence,
+                data_quality="available",
+                raw_status=raw_status,
+                policy_version=POLICY_VERSION,
+                diagnostics={**base_diag, "raw_status": raw_status, "available": True},
+            )
+
         reason_code = (
             INTEL_SCANNER_APPROVED_OBSERVE
             if _is_scanner_observe

@@ -243,11 +243,49 @@ def _signal_to_direction(signal: dict) -> str:
 
 
 def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
-    """Return (risk_ok, reason) from flexible intelligence risk payloads."""
+    """Return (risk_ok, reason) from flexible intelligence risk payloads.
+
+    Structured authority wins FIRST (PR: regime taxonomy fix):
+      hard_veto=False  → advisory/context result only; bridge MUST NOT
+                         convert this to an execution-authoritative veto.
+      hard_veto=True   → genuine hard execution block (kill switch, capital,
+                         contract quality, sector cap).
+      hard_veto absent → fall through to legacy key-based detection.
+
+    Only hard_veto=True may ultimately produce intel_status="RISK_VETO".
+    """
     if not isinstance(risk, dict):
         return True, ""
 
-    # Common explicit veto shapes.
+    # Structured authority check — checked before any generic key scanning.
+    # CLOSED-SET ADVISORY ALLOWLIST: hard_veto=False only permits execution when
+    # approved=True AND reason_code is an explicitly known advisory code.
+    # Any other combination (approved=False, unknown reason_code, missing fields)
+    # fails closed — never silently allows an unvalidated result to trade.
+    _ADVISORY_REASON_ALLOWLIST: frozenset[str] = frozenset({
+        "APPROVED_WITH_REGIME_MISMATCH",
+    })
+    _hard_veto   = risk.get("hard_veto")
+    _approved    = risk.get("approved")
+    _reason_code = str(risk.get("reason_code") or "")
+    if _hard_veto is False:
+        if _approved is True and _reason_code in _ADVISORY_REASON_ALLOWLIST:
+            # Legitimate advisory result: regime context only, all hard gates passed.
+            return True, str(risk.get("reason") or risk.get("reason_code") or "")
+        # hard_veto=False but not in the advisory allowlist (e.g. approved=False,
+        # unknown reason_code, future metadata mistake) — fail closed to prevent
+        # a malformed result from reaching broker submission.
+        return False, (
+            f"hard_veto=False rejected: not advisory-approved "
+            f"(approved={_approved!r} reason_code={_reason_code!r}); fail closed"
+        )
+    if _hard_veto is True:
+        # Genuine hard veto with stable reason_code.
+        return False, str(
+            risk.get("reason") or risk.get("reason_code") or "hard_veto=True"
+        )
+
+    # Legacy key-based detection (no hard_veto field — old producer code).
     for key in ("risk_ok", "ok", "approved", "pass", "passed", "allow", "allowed"):
         if key in risk:
             val = risk.get(key)
@@ -487,6 +525,67 @@ def _map_result(result: dict, fallback_score: float) -> dict:
         "effective_score=%.1f hard_risk_reason=none",
         ticker, fallback_score, intel_score, intel_score,
     )
+
+    # ── Advisory regime mismatch tagging (approved=True path only) ────────────
+    # Applied ONLY when the producer returned approved=True.
+    # CRITICAL: For APPROVED_WITH_REGIME_MISMATCH, zero contracts from PM must
+    # NEVER fall through to max(1, contracts) below.  This path handles every
+    # case — real contracts and zero contracts — so the standard path is
+    # unreachable for advisory results.
+    if (risk.get("reason_code") == "APPROVED_WITH_REGIME_MISMATCH"
+            and risk.get("hard_veto") is False
+            and risk.get("approved") is True):
+
+        _advisory_contracts = int(result.get("contracts") or 0)
+
+        if (int(risk.get("max_contracts") or 0) >= 1
+                and float(risk.get("max_position_usd") or 0) > 0
+                and _advisory_contracts >= 1):
+            log.info(
+                "[%s] GATE_G_REGIME_MISMATCH_ADVISORY scanner_score=%.1f "
+                "intel_score=%.1f risk_contracts=%d pm_contracts=%d "
+                "veto_category=%s — approved, all hard gates passed",
+                ticker, fallback_score, intel_score,
+                int(risk.get("max_contracts") or 0), _advisory_contracts,
+                risk.get("veto_category", "directional_context"),
+            )
+            return {
+                "approved":     True,
+                "score":        round(score, 1),
+                "contracts":    _advisory_contracts,  # exact PM value; never manufactured
+                "reasoning":    (
+                    f"regime_mismatch_advisory: {risk.get('reason', '')} "
+                    f"(reason_code=APPROVED_WITH_REGIME_MISMATCH hard_veto=False "
+                    f"all_hard_gates_passed pm_contracts={_advisory_contracts})"
+                ),
+                "intel_status": "REGIME_MISMATCH_ADVISORY",
+                "intel_score":  round(score, 1),
+                "risk_detail":  risk,
+            }
+
+        # PM returned zero contracts OR risk sizing was zero.
+        # Return zero explicitly — NEVER fall through to max(1, contracts).
+        log.warning(
+            "[%s] APPROVED_WITH_REGIME_MISMATCH pm_contracts=%d "
+            "risk_max_contracts=%d — preserving zero; not manufacturing",
+            ticker, _advisory_contracts,
+            int(risk.get("max_contracts") or 0),
+        )
+        return {
+            "approved":     True,
+            "score":        round(score, 1),
+            "contracts":    0,   # exact zero; no broker submit will fire
+            "reasoning":    (
+                f"regime_mismatch_advisory_zero_contracts: {risk.get('reason', '')} "
+                f"(pm_contracts={_advisory_contracts} "
+                f"risk_max={int(risk.get('max_contracts') or 0)})"
+            ),
+            "intel_status": "REGIME_MISMATCH_ADVISORY",
+            "intel_score":  round(score, 1),
+            "risk_detail":  risk,
+        }
+
+    # ── Standard approved path — only reached for non-advisory results ─────────
     return {
         "approved":     True,
         "score":        round(score, 1),

@@ -714,6 +714,16 @@ def run_overnight_reeval(
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
         ticker = signal.get("ticker") or signal.get("symbol", "?")
+        # PR: Log recovery_context for traceability on rescued rows
+        _recovery_ctx = signal.get("recovery_context") if isinstance(signal, dict) else None
+        if _recovery_ctx:
+            log.info(
+                "[%s] overnight_reeval: processing RECOVERED signal=%s "
+                "recovery_reason=%s recovery_run_id=%s",
+                ticker, signal_id,
+                _recovery_ctx.get("reason_code", "unknown"),
+                _recovery_ctx.get("recovery_run_id", "unknown"),
+            )
         side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
         if side not in {"CALL", "PUT"}:
             log.warning(
@@ -1030,6 +1040,12 @@ def run_overnight_reeval(
                         "score_below_priority_floor",
                         "context_below_floor",
                         "tier_reject",
+                        # PR: Regime mismatch is advisory — never hard safety.
+                        # Safety net for recovery path in case taxonomy fix
+                        # doesn't fully resolve before reeval runs.
+                        "market_regime_mismatch",
+                        "regime_mismatch_advisory",
+                        "regime_mismatch",
                     )
                     _observe_only_reason_codes = {
                         "SCORE_BELOW_THRESHOLD",
@@ -1622,6 +1638,24 @@ def run_overnight_reeval(
         and result["fresh_processed"] == 0
         and result["stale_skipped"] > 0
     )
+
+    # PR: Write result to preopen_readiness_runs (stage='overnight_reeval') so
+    # preopen readiness can verify actual materialization counts rather than
+    # treating any post_overnight_reeval handoff row as proof of success.
+    try:
+        from ap.preopen_readiness import _upsert_preopen_row_idempotent_overnight
+        _execution_mode_lower = (_run_execution_mode or "unknown").lower()
+        _upsert_preopen_row_idempotent_overnight(
+            client_id=client_id,
+            execution_mode=_execution_mode_lower,
+            trading_date=session_key,
+            result=result,
+        )
+    except Exception as _prw_exc:
+        log.warning(
+            "[%s] overnight_reeval: preopen_readiness write failed (non-fatal): %s",
+            client_id, _prw_exc,
+        )
     log.info(
         "[%s] overnight_reeval complete: processed=%d armed=%d rejected=%d skipped=%d errors=%d stale_skipped=%d fresh_processed=%d fresh_armed=%d stale_inventory_only=%s",
         client_id,
