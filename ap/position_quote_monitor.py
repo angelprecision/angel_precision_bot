@@ -41,6 +41,51 @@ DIRECT_POSITION_WRITES      = os.getenv("QUOTE_MONITOR_DIRECT_WRITES", "1") == "
 # (20-25% depending on DTE/instrument), which governs trail activation.
 TOUCHED_PROFIT_ARM_PCT      = float(os.getenv("TOUCHED_PROFIT_ARM_PCT", "0.05"))
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AMENDMENT #5 (blocker 4): shared hard-exit reference selector.
+# Long-option liquidation policy:
+#   BID   - executable liquidation price. Best evidence.
+#   MID   - (bid + ask)/2 when BOTH available.
+#   LAST  - actual last-traded price. Strong evidence of a real market clear.
+#   MARK  - broker-computed mark. Strong evidence when LAST unavailable.
+#   ASK   - price someone wants you to PAY. NEVER a liquidation price for a
+#           long option.  Cannot certify safety.  When ONLY ASK is available,
+#           we record it with source="ask_unproven" so downstream can treat it
+#           with degraded trust (hard-stop consumers still trigger if ASK
+#           itself is below the stop — a self-proving catastrophe signal —
+#           but soft/winner logic can distinguish ask-only from proven price).
+#
+# This function is IMPORTED by every quote writer path (QPM, exit engine's
+# _apply_option_quote_for_decision, broker-position precheck, restart recovery)
+# so hard-exit truth cannot silently disappear on any code path.
+# ══════════════════════════════════════════════════════════════════════════════
+def _select_hard_exit_reference(*, bid: float, ask: float, mark: float, last: float) -> tuple[float, str]:
+    """Return (price, source) for the hard-exit reference. Source is one of:
+    'bid', 'mid', 'last', 'mark', 'ask_unproven', or '' if no data available.
+
+    Conservative long-option policy: ASK-only quotes are recorded but flagged
+    as unproven — they can prove catastrophe (ASK below stop) but cannot
+    certify a position is safe."""
+    _bid = float(bid) if bid and bid > 0 else 0.0
+    _ask = float(ask) if ask and ask > 0 else 0.0
+    _mark = float(mark) if mark and mark > 0 else 0.0
+    _last = float(last) if last and last > 0 else 0.0
+
+    if _bid > 0:
+        return (_bid, "bid")
+    if _bid > 0 and _ask > 0:
+        return (round((_bid + _ask) / 2.0, 4), "mid")  # unreachable given branch above, kept for clarity
+    if _last > 0:
+        return (_last, "last")
+    if _mark > 0:
+        return (_mark, "mark")
+    if _ask > 0:
+        # ASK-only: unproven. Recorded so hard-stop can still fire if ASK
+        # itself indicates catastrophe (self-proving), but source is flagged.
+        return (_ask, "ask_unproven")
+    return (0.0, "")
+
 # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
 # QPM must also persist live quote / PnL state to the positions table so the
 # dashboard, audit trail, and restart recovery have non-NULL truth. The exit
@@ -391,15 +436,15 @@ class APPositionQuoteMonitor:
                 opt_price, price_source = self._extract_option_price(oq, bid, ask)
 
                 if und_last > 0:
-                    self._write_field(pos, "currentunderlying", und_last)
-                    self._write_field(pos, "current_underlying", und_last)
-                    self._write_field(pos, "lastunderlyingquoteupdatets", now_utc)
-                    self._write_field(pos, "last_underlying_quote_update_ts", now_utc)
-                    self._write_field(pos, "lastunderlyingquotemissingts", None)
-                    self._write_field(pos, "last_underlying_quote_missing_ts", None)
+                    self._write_field_unconditional(pos, "currentunderlying", und_last)
+                    self._write_field_unconditional(pos, "current_underlying", und_last)
+                    self._write_field_unconditional(pos, "lastunderlyingquoteupdatets", now_utc)
+                    self._write_field_unconditional(pos, "last_underlying_quote_update_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastunderlyingquotemissingts", None)
+                    self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", None)
                 else:
-                    self._write_field(pos, "lastunderlyingquotemissingts", now_utc)
-                    self._write_field(pos, "last_underlying_quote_missing_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastunderlyingquotemissingts", now_utc)
+                    self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", now_utc)
 
                 # ── P0 (PR #385 amendment #2, blocker 1): BID is CYCLE truth ─────────
                 # current_bid/current_ask are ALWAYS overwritten from THIS cycle's
@@ -421,13 +466,13 @@ class APPositionQuoteMonitor:
                 if opt_price > 0:
                     self._write_field(pos, "currentoptionprice", opt_price)
                     self._write_field(pos, "current_option_price", opt_price)
-                    self._write_field(pos, "lastoptionquoteupdatets", now_utc)
-                    self._write_field(pos, "last_option_quote_update_ts", now_utc)
-                    self._write_field(pos, "lastquoteupdatets", now_utc)
-                    self._write_field(pos, "last_option_price_source", price_source)
-                    self._write_field(pos, "lastoptionpricesource", price_source)
-                    self._write_field(pos, "lastoptionquotemissingts", None)
-                    self._write_field(pos, "last_option_quote_missing_ts", None)
+                    self._write_field_unconditional(pos, "lastoptionquoteupdatets", now_utc)
+                    self._write_field_unconditional(pos, "last_option_quote_update_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastquoteupdatets", now_utc)
+                    self._write_field_unconditional(pos, "last_option_price_source", price_source)
+                    self._write_field_unconditional(pos, "lastoptionpricesource", price_source)
+                    self._write_field_unconditional(pos, "lastoptionquotemissingts", None)
+                    self._write_field_unconditional(pos, "last_option_quote_missing_ts", None)
 
                     # ── Publish to QuoteAuthority so Exit Engine can consume ──
                     # QPM is the ONLY authorized writer. Exit engine reads from
@@ -455,8 +500,8 @@ class APPositionQuoteMonitor:
                         wake_engine = True
                     self._last_push_price[c] = opt_price
                 else:
-                    self._write_field(pos, "lastoptionquotemissingts", now_utc)
-                    self._write_field(pos, "last_option_quote_missing_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastoptionquotemissingts", now_utc)
+                    self._write_field_unconditional(pos, "last_option_quote_missing_ts", now_utc)
 
                 cost_basis = (
                     _safe_float(_get_attr(pos, "entryprice", "entry_price", default=None), 0.0)
@@ -472,26 +517,23 @@ class APPositionQuoteMonitor:
                 # option_pnl_pct return 0.0, silently disarming the HARD STOP on the
                 # real live money path.  Fix: a SEPARATE authority for catastrophic-loss
                 # detection that never zeroes when a valid market price of any kind is
-                # available.  Preference order: bid > mid > mark > ask > last.
-                # ONLY consumed by hard exits (HARD STOP, EOD FORCE CLOSE) — never by
-                # soft-exit branches — so it does not re-open the soft-exit midpoint hole.
+                # available.  Preference order (AMENDMENT #5, blocker 4):
+                # BID > MID (bid+ask) > MARK > LAST > ASK-as-conservative.
+                # For a LONG option, ASK is the price to BUY more, never the
+                # liquidation price.  ASK alone cannot certify "healthy" — if
+                # LAST or MARK evidence is available, they win because they
+                # reflect the last actually-traded/quoted midpoint.  If ONLY
+                # ASK is available, we still record it but flag the source as
+                # "ask_unproven" so consumers can treat it with degraded trust.
+                # ASK CAN prove catastrophe (if ASK itself is below the hard
+                # stop, the position is unquestionably impaired) — this is
+                # captured naturally because the pnl calc runs regardless.
                 _mark_for_ref = _safe_float(oq.get("mark"), 0.0)
                 _last_for_ref = _safe_float(oq.get("last"), 0.0)
-                _hard_mid = round((bid + ask) / 2.0, 4) if (bid > 0 and ask > 0) else 0.0
-                _hard_ref_price = 0.0
-                _hard_ref_source = ""
+                _hard_ref_price, _hard_ref_source = _select_hard_exit_reference(
+                    bid=bid, ask=ask, mark=_mark_for_ref, last=_last_for_ref,
+                )
                 _hard_ref_pnl = None  # AMENDMENT #4: ensure defined for snapshot dict
-                for _cand, _src in (
-                    (bid,           "bid"),
-                    (_hard_mid,     "mid"),
-                    (_mark_for_ref, "mark"),
-                    (ask,           "ask"),
-                    (_last_for_ref, "last"),
-                ):
-                    if _cand > 0:
-                        _hard_ref_price = _cand
-                        _hard_ref_source = _src
-                        break
 
                 if _hard_ref_price > 0:
                     self._write_field_unconditional(pos, "hard_exit_reference_price",  _hard_ref_price)
@@ -673,10 +715,10 @@ class APPositionQuoteMonitor:
                             _safe_float(_get_attr(pos, "peakpnlpct", "peak_pnl_pct", default=None), float("-inf")),
                             _safe_float(_get_attr(pos, "maxprofitseen", "max_profit_seen", default=None), float("-inf")),
                         )
-                        self._write_field(pos, "peakpnlpct", _exec_peak)
-                        self._write_field(pos, "peak_pnl_pct", _exec_peak)
-                        self._write_field(pos, "maxprofitseen", _exec_peak)
-                        self._write_field(pos, "max_profit_seen", _exec_peak)
+                        self._write_field_unconditional(pos, "peakpnlpct", _exec_peak)
+                        self._write_field_unconditional(pos, "peak_pnl_pct", _exec_peak)
+                        self._write_field_unconditional(pos, "maxprofitseen", _exec_peak)
+                        self._write_field_unconditional(pos, "max_profit_seen", _exec_peak)
 
                     # ── touched_profit consecutive-confirmation arming ───────────────
                     # NEVER arm touched_profit from a single poll or from midpoint.
@@ -697,8 +739,8 @@ class APPositionQuoteMonitor:
                             self._tp_pending_confirm[_tp_key] = True
                         else:
                             # Second consecutive qualifying observation — arm touched_profit.
-                            self._write_field(pos, "touchedprofit", True)
-                            self._write_field(pos, "touched_profit", True)
+                            self._write_field_unconditional(pos, "touchedprofit", True)
+                            self._write_field_unconditional(pos, "touched_profit", True)
                     elif _tp_key:
                         # Bid unavailable, stale, or below threshold → reset pending.
                         # touched_profit, once True, is never reset here (only close clears it).
