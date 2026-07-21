@@ -767,6 +767,34 @@ def _apply_option_quote_for_decision(
         except Exception as _e:
             log.debug("_aqfd: quote_ts write failed: %s", _e)
 
+    # ── AMENDMENT #5 (blocker 3): HARD-EXIT REFERENCE ────────────────────────
+    # QPM is not the only writer path.  Broker-position repair and startup
+    # hydration route through this helper.  If we don't populate the hard-exit
+    # reference here too, a repaired LIVE position with a missing bid but a
+    # catastrophic mark/last shows 0% loss until QPM independently reaches it.
+    # Uses the SAME shared selector as QPM (single source of truth for policy).
+    try:
+        from ap.position_quote_monitor import _select_hard_exit_reference as _sel_href
+        _hard_ref_price, _hard_ref_source = _sel_href(
+            bid=float(bid or 0.0), ask=float(ask or 0.0),
+            mark=float(mark or 0.0), last=0.0,  # last not currently supplied to _aqfd; use mark
+        )
+        if _hard_ref_price > 0:
+            pos.hard_exit_reference_price = _hard_ref_price
+            pos.hardexitreferenceprice = _hard_ref_price
+            pos.hard_exit_reference_source = _hard_ref_source
+            pos.hardexitreferencesource = _hard_ref_source
+            if quote_ts is not None:
+                pos.hard_exit_reference_ts = quote_ts
+                pos.hardexitreferencets = quote_ts
+            _cost_basis = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            if _cost_basis > 0:
+                _hr_pnl = (_hard_ref_price - _cost_basis) / _cost_basis
+                pos.hard_exit_reference_pnl_pct = _hr_pnl
+                pos.hardexitreferencepnlpct = _hr_pnl
+    except Exception as _e:
+        log.debug("_aqfd: hard_exit_reference write failed: %s", _e)
+
     return ExecutableQuoteApplication(
         pricing_mode     = _pricing_mode,
         executable_price = _exec_price,
@@ -1055,7 +1083,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # AMENDMENT #4 (blocker 1): pos.is_at_target already zero-guards
     # current_underlying, but we additionally verify the snapshot's
     # underlying_available.  Missing underlying truth is not a target hit.
-    if snap.underlying_available and pos.is_at_target:
+    # AMENDMENT #5 (blocker 2): underlying must be BOTH available AND fresh.
+    # A frozen at-target price left over from a QPM stall must not close a trade.
+    if snap.underlying_available and snap.underlying_fresh and pos.is_at_target:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
@@ -1067,12 +1097,15 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
     # AMENDMENT #4 (blocker 1): STOP HIT is an underlying-driven risk-reducing
-    # exit and must NOT fire from retained underlying=0.  Additionally, the
-    # ExitDecision.pnl_pct must reflect the true loss authority
-    # (hard_exit_reference_pnl_pct), not option_pnl (which returns 0.0 when
-    # LIVE current_option_price is zeroed by a missing bid).  This defended
-    # the reviewer's "STOP HIT but pnl reads 0%" trap.
-    if snap.underlying_available and pos.is_at_stop:
+    # exit and must NOT fire from retained underlying=0.
+    # AMENDMENT #5 (blocker 2): also requires underlying_fresh.  When underlying
+    # is stale/unavailable, we also RESET the breach timer — otherwise elapsed
+    # wall-clock on a single stale observation would satisfy the confirmation
+    # window (reviewer's "produce aging on the shelf" case).
+    if not (snap.underlying_available and snap.underlying_fresh):
+        if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
+            pos._underlying_stop_breach_ts = None
+    elif pos.is_at_stop:
         _stop_pnl_authority = (
             float(getattr(pos, "hard_exit_reference_pnl_pct"))
             if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
@@ -6434,6 +6467,13 @@ class APExitEngine:
                 # (never soft-exit truth) so it cannot fire from mid/mark for a soft
                 # exit; evaluate_exit() itself gates all soft branches behind their
                 # own truth gates.
+                #
+                # AMENDMENT #5 (blocker 1): use the SAME per-position threshold the
+                # evaluator uses — _effective_thresholds(pos) returns contract-
+                # specific hard stops (0DTE index -18%, 0DTE equity -22%, 1-2 DTE
+                # -26%, longer -33%).  The prior implementation compared against the
+                # global HARD_STOP_PCT (-33%), missing the contracts with the
+                # TIGHTEST hard stops (0DTE SPY at -25% would not force eval).
                 _hard_ref_pnl_early = getattr(pos, "hard_exit_reference_pnl_pct", None)
                 _force_hard_eval = (
                     _hard_ref_pnl_early is not None
@@ -6445,8 +6485,10 @@ class APExitEngine:
                 if _force_hard_eval:
                     try:
                         _hard_ref_val = float(_hard_ref_pnl_early)
-                        # HARD_STOP_PCT is negative (e.g. -0.33). Force eval when at/past it.
-                        _force_hard_eval = _hard_ref_val <= HARD_STOP_PCT
+                        _pos_hard_stop, _, _ = _effective_thresholds(pos)
+                        # _pos_hard_stop is negative (e.g. -0.18 for SPY 0DTE).
+                        # Force eval when hard-ref is at or past THIS position's stop.
+                        _force_hard_eval = _hard_ref_val <= _pos_hard_stop
                     except Exception:
                         _force_hard_eval = False
 
