@@ -30,8 +30,8 @@ for _name in dir(_base):
 
 _BaseAPPositionQuoteMonitor = _base.APPositionQuoteMonitor
 _ORIGINAL_GET_ATTR = _base._get_attr
-_MODE_OVERRIDES: _contextvars.ContextVar[dict[int, str]] = _contextvars.ContextVar(
-    "p0_qpm_execution_mode_view", default={}
+_MODE_OVERRIDES: _contextvars.ContextVar[dict[int, str]] = (
+    _contextvars.ContextVar("p0_qpm_execution_mode_view", default={})
 )
 
 
@@ -53,43 +53,6 @@ def _get_attr_with_execution_view(obj, *names, default=None):
 _base._get_attr = _get_attr_with_execution_view
 
 
-def _install_underlying_level_truth_guards() -> bool:
-    """Prevent missing/stale underlying from impersonating target/stop truth."""
-    try:
-        import ap_exit_engine as exit_mod
-
-        cls = exit_mod.ManagedPosition
-        if getattr(cls, "_soft_exit_level_truth_guard_installed", False):
-            return True
-        target_descriptor = getattr(cls, "is_at_target", None)
-        stop_descriptor = getattr(cls, "is_at_stop", None)
-        target_getter = getattr(target_descriptor, "fget", None)
-        stop_getter = getattr(stop_descriptor, "fget", None)
-        if not callable(target_getter) or not callable(stop_getter):
-            return False
-
-        def truth_is_valid(pos) -> bool:
-            if getattr(pos, "executable_bid_soft_exit_truth_enabled", False) is not True:
-                return True
-            try:
-                return bool(exit_mod._validate_exit_truth_snapshot(pos).valid)
-            except Exception:
-                return False
-
-        def guarded_target(pos):
-            return bool(target_getter(pos)) if truth_is_valid(pos) else False
-
-        def guarded_stop(pos):
-            return bool(stop_getter(pos)) if truth_is_valid(pos) else False
-
-        cls.is_at_target = property(guarded_target)
-        cls.is_at_stop = property(guarded_stop)
-        cls._soft_exit_level_truth_guard_installed = True
-        return True
-    except Exception:
-        return False
-
-
 def _broker_provider_domain(broker) -> tuple[str, str]:
     cfg = getattr(broker, "cfg", None)
     base_url = str(
@@ -100,7 +63,11 @@ def _broker_provider_domain(broker) -> tuple[str, str]:
         or getattr(cfg, "baseurl", None)
         or ""
     ).strip().lower()
-    class_name = broker.__class__.__name__.lower() if broker is not None else "unknown"
+    class_name = (
+        broker.__class__.__name__.lower()
+        if broker is not None
+        else "unknown"
+    )
     provider = (
         "tradier"
         if "tradier" in class_name or "tradier" in base_url
@@ -128,13 +95,28 @@ def _cache_observation_epoch(symbol: str, fallback: float) -> float:
 
 
 class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
+    def request_immediate_refresh(self, *symbols: str) -> bool:
+        # The shadowed legacy method resolves its scalar backoff value in the
+        # private module. Synchronize the public seam so existing runtime tests,
+        # diagnostics, and operator patches keep working exactly as before.
+        _base._SHARED_BACKOFF_UNTIL = globals().get(
+            "_SHARED_BACKOFF_UNTIL", _base._SHARED_BACKOFF_UNTIL
+        )
+        result = super().request_immediate_refresh(*symbols)
+        globals()["_SHARED_BACKOFF_UNTIL"] = _base._SHARED_BACKOFF_UNTIL
+        return result
+
     def _refresh_once(self):
-        _install_underlying_level_truth_guards()
         positions = list(self.exit_engine.active_positions() or [])
         production_positions = [
             pos
             for pos in positions
-            if getattr(pos, "executable_bid_soft_exit_truth_enabled", False) is True
+            if getattr(
+                pos,
+                "executable_bid_soft_exit_truth_enabled",
+                False,
+            )
+            is True
         ]
         if not production_positions:
             return super()._refresh_once()
@@ -154,6 +136,8 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
             if symbol:
                 original_modes_by_symbol[symbol] = mode
             if mode == "paper":
+                # Present a bid-authoritative view only to the legacy QPM's
+                # local field reader. The position remains PAPER throughout.
                 mode_overrides[id(pos)] = "live"
 
         option_symbols = {
@@ -179,9 +163,13 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
         underlying_timestamps: dict[str, _datetime] = {}
         original_fetch = self._fetch_batch_cached
 
-        provider, domain = _broker_provider_domain(getattr(self, "broker", None))
+        provider, domain = _broker_provider_domain(
+            getattr(self, "broker", None)
+        )
         cycle_started_epoch = _time.time()
-        cycle_ts = _datetime.fromtimestamp(cycle_started_epoch, _timezone.utc)
+        cycle_ts = _datetime.fromtimestamp(
+            cycle_started_epoch, _timezone.utc
+        )
         cycle_id = (
             f"qpm-{getattr(self, '_cycles', 0) + 1}-"
             f"{int(cycle_started_epoch * 1_000_000)}"
@@ -208,15 +196,19 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
             for symbol, quote in dict(result or {}).items():
                 upper = str(symbol or "").upper()
                 quote_dict = dict(quote or {})
-                observation_epoch = _cache_observation_epoch(upper, returned_epoch)
+                observation_epoch = _cache_observation_epoch(
+                    upper, returned_epoch
+                )
                 # A cache row created before this refresh is a prior-poll
-                # observation. The legacy QPM may use it for dashboards, but it
-                # is not eligible for the canonical exit-decision snapshot.
+                # observation. It may remain useful for dashboards, but cannot
+                # authorize a new exit-decision snapshot.
                 if observation_epoch + 0.001 < cycle_started_epoch:
                     continue
-                quote_dict["source_observed_at"] = _datetime.fromtimestamp(
-                    observation_epoch, _timezone.utc
-                ).isoformat()
+                quote_dict["source_observed_at"] = (
+                    _datetime.fromtimestamp(
+                        observation_epoch, _timezone.utc
+                    ).isoformat()
+                )
                 if upper in option_symbols:
                     captured_options[upper] = quote_dict
                     option_timestamps[upper] = cycle_ts
@@ -238,6 +230,6 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
                 pass
 
 
-_install_underlying_level_truth_guards()
+APPositionQuoteMonitor.__module__ = __name__
 _base.APPositionQuoteMonitor = APPositionQuoteMonitor
 globals()["APPositionQuoteMonitor"] = APPositionQuoteMonitor
