@@ -1,9 +1,9 @@
 """Production QPM wrapper for coherent option/underlying exit snapshots.
 
 The legacy QPM remains the only market-data poller. This wrapper captures raw
-option and underlying observations from the same refresh cycle, exposes
-executable-bid accounting to the legacy QPM through a thread-local read adapter,
-and hands one coherent snapshot to the existing APExitEngine before wake-up.
+option and underlying observations proven fresh inside one refresh cycle,
+exposes executable-bid accounting through a thread-local read adapter, and
+hands one coherent snapshot to the existing APExitEngine before wake-up.
 
 Canonical ``execution_mode`` is never mutated.
 """
@@ -54,14 +54,7 @@ _base._get_attr = _get_attr_with_execution_view
 
 
 def _install_underlying_level_truth_guards() -> bool:
-    """Prevent missing/stale underlying from impersonating target/stop truth.
-
-    Legacy properties compare numeric levels directly. For example, a missing
-    CALL underlying represented as 0 can satisfy ``0 <= underlying_stop``.
-    Protected positions therefore require the canonical snapshot validator
-    before either target or stop can report True. Non-protected positions retain
-    the legacy properties unchanged.
-    """
+    """Prevent missing/stale underlying from impersonating target/stop truth."""
     try:
         import ap_exit_engine as exit_mod
 
@@ -161,8 +154,6 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
             if symbol:
                 original_modes_by_symbol[symbol] = mode
             if mode == "paper":
-                # Present a bid-authoritative view only to the legacy QPM's
-                # local field reader. The position remains PAPER throughout.
                 mode_overrides[id(pos)] = "live"
 
         option_symbols = {
@@ -189,9 +180,11 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
         original_fetch = self._fetch_batch_cached
 
         provider, domain = _broker_provider_domain(getattr(self, "broker", None))
+        cycle_started_epoch = _time.time()
+        cycle_ts = _datetime.fromtimestamp(cycle_started_epoch, _timezone.utc)
         cycle_id = (
             f"qpm-{getattr(self, '_cycles', 0) + 1}-"
-            f"{int(_time.time() * 1_000_000)}"
+            f"{int(cycle_started_epoch * 1_000_000)}"
         )
         context = {
             "option_quotes": captured_options,
@@ -203,30 +196,33 @@ class APPositionQuoteMonitor(_BaseAPPositionQuoteMonitor):
             "default_execution_mode": "",
             "quote_provider": provider,
             "quote_domain": domain,
-            "snapshot_timestamp": _datetime.now(_timezone.utc),
+            "snapshot_timestamp": cycle_ts,
             "cycle_id": cycle_id,
+            "cycle_started_at": cycle_ts,
         }
         self.exit_engine._qpm_cycle_context = context
 
         def capturing_fetch(symbols):
             result = original_fetch(symbols)
-            observed_epoch = _time.time()
-            context["snapshot_timestamp"] = _datetime.fromtimestamp(
-                observed_epoch, _timezone.utc
-            )
+            returned_epoch = _time.time()
             for symbol, quote in dict(result or {}).items():
                 upper = str(symbol or "").upper()
                 quote_dict = dict(quote or {})
-                observation_epoch = _cache_observation_epoch(upper, observed_epoch)
-                observation_ts = _datetime.fromtimestamp(
+                observation_epoch = _cache_observation_epoch(upper, returned_epoch)
+                # A cache row created before this refresh is a prior-poll
+                # observation. The legacy QPM may use it for dashboards, but it
+                # is not eligible for the canonical exit-decision snapshot.
+                if observation_epoch + 0.001 < cycle_started_epoch:
+                    continue
+                quote_dict["source_observed_at"] = _datetime.fromtimestamp(
                     observation_epoch, _timezone.utc
-                )
+                ).isoformat()
                 if upper in option_symbols:
                     captured_options[upper] = quote_dict
-                    option_timestamps[upper] = observation_ts
+                    option_timestamps[upper] = cycle_ts
                 if upper in tickers:
                     captured_underlyings[upper] = quote_dict
-                    underlying_timestamps[upper] = observation_ts
+                    underlying_timestamps[upper] = cycle_ts
             return result
 
         self._fetch_batch_cached = capturing_fetch
