@@ -176,7 +176,12 @@ class TestBuildExitDecisionSnapshot:
         assert snap.underlying_available is False
 
     def test_fresh_quote_detected(self):
-        pos = _make_pos(opt_ts=_fresh_ts(), option_quote_fresh=True)
+        # Amendment #3: freshness requires bid_valid AND fresh ts (explicit True
+        # can no longer prove freshness on its own).
+        pos = _make_pos(current_bid=1.10, current_ask=1.12,
+                        opt_ts=_fresh_ts(), option_quote_fresh=True)
+        pos.last_option_bid_update_ts = _fresh_ts()
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
         snap = _build_exit_decision_snapshot(pos)
         assert snap.option_quote_fresh is True
 
@@ -1271,3 +1276,213 @@ class TestAmendment2EntryGrace:
         decision = evaluate_exit(pos, now_et)
         assert decision.action == "CLOSE_ALL"
         assert "EOD FORCE CLOSE" in decision.reason
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR #385 AMENDMENT #3 TESTS — production-seam transitions for the 3 P0 blockers.
+# These drive REAL QPM._refresh_once() + the REAL evaluate_exit() with no
+# pre-supplied truth values.  The QPM writes; the engine reads what QPM wrote.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mp_from_qpm_pos(qpm_pos, *, entry_price=1.00, underlying_entry=150.0,
+                     underlying_target=145.0, underlying_stop=152.0,
+                     side="PUT") -> ManagedPosition:
+    """Build a ManagedPosition mirroring the QPM-written truth for evaluate_exit."""
+    mp = ManagedPosition(
+        ticker=str(qpm_pos.ticker or "ABT"),
+        option_symbol=str(qpm_pos.option_symbol or "ABT260721P00150000"),
+        side=side, quantity=2, quantity_remaining=2,
+        entry_price=entry_price,
+        underlying_entry=underlying_entry,
+        underlying_target=underlying_target, underlying_stop=underlying_stop,
+        execution_mode=str(getattr(qpm_pos, "execution_mode", "live") or "live"),
+        opened_at=datetime.now(_UTC) - timedelta(minutes=10),
+    )
+    # Copy every field QPM writes; anything QPM did not write remains at ManagedPosition default.
+    for name in dir(qpm_pos):
+        if name.startswith("_"): continue
+        try:
+            val = getattr(qpm_pos, name)
+        except Exception:
+            continue
+        if callable(val): continue
+        try:
+            setattr(mp, name, val)
+        except Exception:
+            pass
+    return mp
+
+
+class TestAmendment3HardExitAuthority:
+    """Blocker 1: real LIVE missing-bid transition → HARD STOP must still fire."""
+
+    def test_live_missing_bid_catastrophic_loss_hard_stops_via_qpm(self):
+        """Full production seam: valid bid → LIVE missing-bid clears
+        current_option_price → hard_exit_reference_pnl_pct preserves the loss →
+        HARD STOP fires."""
+        pos = _qpm_pos("pos-A", execution_mode="live")
+        # Poll 1: bid at -45% established
+        quotes = {"ABT260721P00150000": {"bid": 0.55, "ask": 0.60},
+                  "ABT": {"last": 149.0}}
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        # Poll 2: bid missing, mark still available at ~breakeven equivalent
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 0, "ask": 0.70, "mark": 0.60}
+        qpm._refresh_once()
+
+        # Verify LIVE zeroed current_option_price (existing safety)
+        assert getattr(pos, "current_option_price", None) == pytest.approx(0.0), \
+            "LIVE missing-bid must clear current_option_price"
+        # Verify the DEDICATED hard-exit reference preserved the loss
+        _ref = getattr(pos, "hard_exit_reference_pnl_pct", None)
+        assert _ref is not None, "hard_exit_reference_pnl_pct must be written"
+        assert _ref <= -0.30, f"hard-exit ref must reflect the loss, got {_ref}"
+
+        # Real evaluate_exit against real QPM-written state
+        mp = _mp_from_qpm_pos(pos)
+        decision = evaluate_exit(mp, _et_noon().replace(hour=10))
+        assert decision.action == "STOP", (
+            f"HARD STOP must fire on real LIVE missing-bid transition — got "
+            f"{decision.action}: {decision.reason}"
+        )
+        assert "HARD STOP" in decision.reason
+
+    def test_hard_ref_never_zeros_when_any_price_available(self):
+        """A bid-less quote with only a mark/ask must still populate hard-ref."""
+        pos = _qpm_pos("pos-A", execution_mode="live")
+        quotes = {"ABT260721P00150000": {"bid": 0, "ask": 0.70, "mark": 0.65},
+                  "ABT": {"last": 149.0}}
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        assert getattr(pos, "hard_exit_reference_price", 0.0) > 0, \
+            "hard-ref must populate from mark/ask when bid absent"
+        assert getattr(pos, "hard_exit_reference_source") in ("mark", "mid", "ask", "last")
+
+
+class TestAmendment3FreshnessTransition:
+    """Blocker 2: sticky-fresh regression on QPM stall / thread death."""
+
+    def test_stalled_qpm_snapshot_reports_stale(self):
+        """QPM writes True at t0; no further polls; at t0+60s the snapshot must
+        report stale because timestamp-derived age is 60s, not because a new
+        boolean write happened."""
+        pos = _qpm_pos("pos-A")
+        quotes = {"ABT260721P00150000": {"bid": 1.10, "ask": 1.12},
+                  "ABT": {"last": 149.0}}
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        assert getattr(pos, "option_quote_fresh") is True
+        _initial_ts = getattr(pos, "last_option_bid_update_ts")
+
+        # QPM stalls — no additional cycle.  Rewind the ts by 60 seconds to
+        # simulate elapsed wall-clock without a fresh poll.
+        pos.last_option_bid_update_ts = _initial_ts - timedelta(seconds=60)
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+        # The stored boolean is still True — the snapshot must NOT trust it.
+        snap = _build_exit_decision_snapshot(pos)
+        assert snap.option_quote_fresh is False, (
+            "sticky True must not survive an elapsed timestamp — freshness must be "
+            "recomputed from ts every evaluation"
+        )
+
+    def test_winner_protection_holds_on_sticky_fresh(self):
+        """Peak established; QPM stalls; runner-trail-eligible state; snapshot
+        stale means the soft-exit gate must defer — no submission."""
+        pos = _qpm_pos("pos-A", execution_mode="live")
+        quotes = {"ABT260721P00150000": {"bid": 1.40, "ask": 1.44},
+                  "ABT": {"last": 149.0}}
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        _clear_qpm_shared_cache()
+        qpm._refresh_once()   # second poll arms touched_profit
+
+        # QPM stalls — rewind the bid ts
+        pos.last_option_bid_update_ts = pos.last_option_bid_update_ts - timedelta(seconds=60)
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+
+        mp = _mp_from_qpm_pos(pos, entry_price=1.00, underlying_target=155.0, side="CALL")
+        mp.peak_pnl_pct = 0.40
+        mp.max_profit_seen = 0.40
+        mp.scale_outs_done = 1
+        mp.touched_profit = True
+
+        decision = evaluate_exit(mp, _et_noon().replace(hour=10))
+        assert decision.action == "HOLD", (
+            f"Winner-protection soft exit must defer on stale sticky-True — "
+            f"got {decision.action}: {decision.reason}"
+        )
+        assert decision.reason_code == SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE, (
+            f"Got {decision.reason_code}: {decision.reason}"
+        )
+
+    def test_underlying_freshness_recomputed(self):
+        """Same discipline for underlying_fresh."""
+        pos = _qpm_pos("pos-A")
+        quotes = {"ABT260721P00150000": {"bid": 1.10, "ask": 1.12},
+                  "ABT": {"last": 149.0}}
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        assert getattr(pos, "underlying_fresh") is True
+        # Rewind underlying ts past threshold
+        pos.last_underlying_quote_update_ts = pos.last_underlying_quote_update_ts - timedelta(seconds=180)
+        pos.lastunderlyingquoteupdatets = pos.last_underlying_quote_update_ts
+        snap = _build_exit_decision_snapshot(pos)
+        assert snap.underlying_fresh is False, (
+            "underlying sticky True must not survive an elapsed timestamp"
+        )
+
+
+class TestAmendment3DirectWritesOff:
+    """Blocker 3: money-safety fields must reach the position even when
+    QUOTE_MONITOR_DIRECT_WRITES=0 disables the legacy _write_field path."""
+
+    def test_bid_invalidation_survives_direct_writes_off(self):
+        import ap.position_quote_monitor as qpm_mod
+        # Force the flag off for this test
+        orig = qpm_mod.DIRECT_POSITION_WRITES
+        qpm_mod.DIRECT_POSITION_WRITES = False
+        try:
+            pos = _qpm_pos("pos-A", execution_mode="live")
+            quotes = {"ABT260721P00150000": {"bid": 1.10, "ask": 1.12},
+                      "ABT": {"last": 149.0}}
+            qpm = _make_qpm([pos], quotes)
+            qpm._refresh_once()
+            assert getattr(pos, "current_bid", None) == pytest.approx(1.10), \
+                "cycle bid must reach position even with direct writes off"
+            assert getattr(pos, "option_bid_valid", None) is True
+
+            # Mark-only cycle — must invalidate the bid on the position
+            _clear_qpm_shared_cache()
+            qpm.broker.quotes["ABT260721P00150000"] = {"bid": 0, "ask": 1.20, "mark": 1.15}
+            qpm._refresh_once()
+            assert getattr(pos, "current_bid", None) == pytest.approx(0.0), (
+                "money-safety bid write must be unconditional — "
+                "direct-writes-off must not retain the stale 1.10"
+            )
+            assert getattr(pos, "option_bid_valid", None) is False, \
+                "option_bid_valid must reach the position under direct-writes-off"
+            assert getattr(pos, "underlying_available", None) is True
+
+            # And the snapshot honors it
+            snap = _build_exit_decision_snapshot(pos)
+            assert snap.option_bid_valid is False
+            assert snap.option_bid is None
+        finally:
+            qpm_mod.DIRECT_POSITION_WRITES = orig
+
+    def test_hard_exit_ref_survives_direct_writes_off(self):
+        """Even with direct writes off, hard-exit reference must reach the position."""
+        import ap.position_quote_monitor as qpm_mod
+        orig = qpm_mod.DIRECT_POSITION_WRITES
+        qpm_mod.DIRECT_POSITION_WRITES = False
+        try:
+            pos = _qpm_pos("pos-A", execution_mode="live")
+            quotes = {"ABT260721P00150000": {"bid": 0.55, "ask": 0.60},
+                      "ABT": {"last": 149.0}}
+            qpm = _make_qpm([pos], quotes)
+            qpm._refresh_once()
+            assert getattr(pos, "hard_exit_reference_price", 0.0) > 0
+            assert getattr(pos, "hard_exit_reference_pnl_pct", 0.0) <= -0.30
+        finally:
+            qpm_mod.DIRECT_POSITION_WRITES = orig
