@@ -53,9 +53,12 @@ def _pos(**overrides) -> ManagedPosition:
         current_underlying=500.0,
         opened_at=datetime.now(timezone.utc) - timedelta(minutes=20),
         last_option_quote_update_ts=datetime.now(timezone.utc),
+        last_underlying_quote_update_ts=datetime.now(timezone.utc),
     )
     data.update(overrides)
-    return ManagedPosition(**data)
+    pos = ManagedPosition(**data)
+    pos.lastunderlyingquoteupdatets = pos.last_underlying_quote_update_ts
+    return pos
 
 
 def _decision(code="IMMEDIATE_TP", reason="IMMEDIATE TP -- +20%", qty=1) -> ExitDecision:

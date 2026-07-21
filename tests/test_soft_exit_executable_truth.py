@@ -1581,6 +1581,10 @@ class TestAmendment4HardExitPrecedence:
         # Provide the hard-exit reference (QPM would have written this)
         pos.hard_exit_reference_pnl_pct = -0.45
         pos.hard_exit_reference_price = 0.55
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = datetime.now(_UTC)
+        pos.hardexitreferencets = pos.hard_exit_reference_ts
 
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)

@@ -266,6 +266,7 @@ def _signal(**overrides):
         "pattern": "2-3",
         "score": 95.0,
         "entry_trigger": 200.0,
+        "underlying_at_signal": 200.0,
         "target_price": 205.0,
         "stop_price": 197.5,
     }
