@@ -529,12 +529,12 @@ class APExitEngine(_BaseAPExitEngine):
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT COALESCE(meta, '{}'::jsonb)
+                        SELECT COALESCE(meta, '{}'::jsonb) AS meta
                         FROM positions
                         WHERE id = %s
                           AND client_id = %s
                           AND LOWER(COALESCE(execution_mode, '')) = %s
-                          AND COALESCE(contract, option_symbol, '') = %s
+                          AND COALESCE(NULLIF(contract, ''), option_symbol, '') = %s
                         LIMIT 1
                         """,
                         (
@@ -545,7 +545,11 @@ class APExitEngine(_BaseAPExitEngine):
                         ),
                     )
                     row = c.fetchone()
-                    return row[0] if row else {}
+                    if not row:
+                        return {}
+                    if hasattr(row, 'get'):
+                        return row.get('meta') or {}
+                    return row[0]
 
             meta = run_with_retry(_read) or {}
             if isinstance(meta, str):
@@ -664,7 +668,7 @@ class APExitEngine(_BaseAPExitEngine):
                         WHERE id = %s
                           AND client_id = %s
                           AND LOWER(COALESCE(execution_mode, '')) = %s
-                          AND COALESCE(contract, option_symbol, '') = %s
+                          AND COALESCE(NULLIF(contract, ''), option_symbol, '') = %s
                           AND status IN ('OPEN', 'CLOSING')
                         """,
                         (
