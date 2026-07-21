@@ -94,6 +94,7 @@ INTEL_LOW_DATA_QUALITY_FAIL_OPEN = "INTEL_LOW_DATA_QUALITY_FAIL_OPEN"
 # Observe-only / advisory codes — never produce allowed=False
 INTEL_ADVISORY_ONLY    = "INTEL_ADVISORY_ONLY"
 INTEL_OBSERVE_ONLY_MODE = "INTEL_OBSERVE_ONLY_MODE"
+INTEL_REGIME_MISMATCH_ADVISORY = "INTEL_REGIME_MISMATCH_ADVISORY"
 
 # ---------------------------------------------------------------------------
 # Allowlist: intel_status values that are authoritative enough to deny entry.
@@ -365,6 +366,25 @@ def adjudicate_intelligence_result(
 
     # ── approved=True ──────────────────────────────────────────────────────
     if approved is True:
+        if raw_status == "REGIME_MISMATCH_ADVISORY":
+            return IntelligenceAdmissionVerdict(
+                allowed=True,
+                authoritative=False,
+                reason_code=INTEL_REGIME_MISMATCH_ADVISORY,
+                reasoning=reasoning,
+                source=source,
+                confidence=confidence,
+                data_quality="available",
+                raw_status=raw_status,
+                policy_version=POLICY_VERSION,
+                diagnostics={
+                    **base_diag,
+                    "raw_status": raw_status,
+                    "available": True,
+                    "advisory_type": "market_regime_mismatch",
+                },
+            )
+
         _is_scanner_observe = (raw_status == "SCANNER_APPROVED_INTEL_OBSERVE_ONLY")
         reason_code = (
             INTEL_SCANNER_APPROVED_OBSERVE

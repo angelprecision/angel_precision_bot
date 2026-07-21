@@ -128,6 +128,19 @@ class RiskResult:
     spy_trend: str
     vix: float
     reason: str
+    # Structured execution-authority contract.
+    #
+    # hard_veto=False means the result is approved/advisory and must not be
+    # converted into an execution-authoritative RISK_VETO by the bridge.
+    #
+    # hard_veto=True means a genuine risk/safety/capital gate failed.
+    #
+    # reason_code is a stable machine-readable classification.
+    # veto_category is a stable reporting bucket and must never itself decide
+    # eligibility.
+    reason_code: str = ""
+    veto_category: str = ""
+    hard_veto: bool = False
 
 
 class APRiskManager:
@@ -197,47 +210,84 @@ class APRiskManager:
 
         # ── 0. Daily kill switch ──────────────────────────────
         if self.daily_pnl < (self.portfolio_value * self.daily_loss_limit_pct):
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, f"DAILY KILL SWITCH: P&L = ${self.daily_pnl:.0f}")
+            return self._reject(
+                ticker,
+                direction,
+                option_premium,
+                dte,
+                bid_ask_spread_pct,
+                open_interest,
+                daily_volume_options,
+                option_delta,
+                f"DAILY KILL SWITCH: P&L = ${self.daily_pnl:.0f}",
+                reason_code="DAILY_LOSS_KILL_SWITCH",
+                veto_category="ACCOUNT_SAFETY",
+                hard_veto=True,
+            )
 
-        # ── 1. Market regime gates ────────────────────────────
+        # ── 1. Market regime context + VIX hard gate ───────────
         spy = get_spy_trend()
         vix_data = get_vix()
 
-        # Index tickers bypass the SPY regime gate — they ARE the regime,
-        # so a bearish 232 setup on SPY/QQQ/IWM/DIA should not be blocked
-        # by SPY trend. Non-index single names still gated below.
+        spy_trend = str((spy or {}).get("trend") or "UNKNOWN").upper()
+        vix_value = (vix_data or {}).get("vix")
+
+        # Index tickers are themselves broad-market instruments. Preserve the
+        # existing exemption, but still record SPY context in RiskResult.
         is_index = ticker.upper() in INDEX_TICKERS
 
-        if not is_index and direction == "bullish" and spy["trend"] == "BEAR":
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, "CALL blocked — SPY in BEAR trend",
-                                spy_trend=spy["trend"], vix=vix_data["vix"])
+        # SPY trend is a broad, multi-session context measurement. A disagreement
+        # between that measurement and an individual scanner setup is advisory.
+        # It must not return early or prevent the remaining hard gates from
+        # running.
+        regime_mismatch = bool(
+            not is_index
+            and (
+                (direction == "bullish" and spy_trend == "BEAR")
+                or
+                (direction == "bearish" and spy_trend == "BULL")
+            )
+        )
 
-        if not is_index and direction == "bearish" and spy["trend"] == "BULL":
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, "PUT blocked — SPY in BULL trend",
-                                spy_trend=spy["trend"], vix=vix_data["vix"])
-
-        if is_index and (
-            (direction == "bullish" and spy["trend"] == "BEAR") or
-            (direction == "bearish" and spy["trend"] == "BULL")
-        ):
-            # Log but allow — caller still sees full SPY context in result.
-            import logging as _lg
-            _lg.getLogger(__name__).info(
-                f"[{ticker}] Index regime exemption — {direction} allowed "
-                f"despite SPY trend={spy['trend']} (index setup judged on own merit)"
+        regime_reason = ""
+        if regime_mismatch:
+            regime_reason = (
+                "SPY regime mismatch advisory: "
+                f"{direction.upper()} setup while SPY 20-day trend={spy_trend}"
             )
 
-        if not vix_data["tradeable"]:
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, f"VIX={vix_data['vix']} outside 12-35",
-                                spy_trend=spy["trend"], vix=vix_data["vix"])
+        if is_index and (
+            (direction == "bullish" and spy_trend == "BEAR")
+            or
+            (direction == "bearish" and spy_trend == "BULL")
+        ):
+            import logging as _lg
+
+            _lg.getLogger(__name__).info(
+                "[%s] Index regime exemption — %s allowed despite SPY trend=%s "
+                "(index setup judged on its own technical merit)",
+                ticker,
+                direction,
+                spy_trend,
+            )
+
+        if (vix_data or {}).get("tradeable") is not True:
+            return self._reject(
+                ticker,
+                direction,
+                option_premium,
+                dte,
+                bid_ask_spread_pct,
+                open_interest,
+                daily_volume_options,
+                option_delta,
+                f"VIX={vix_value} outside 12-35",
+                spy_trend=spy_trend,
+                vix=vix_value,
+                reason_code="VIX_POLICY_HARD_CAP",
+                veto_category="MARKET_SAFETY",
+                hard_veto=True,
+            )
 
         # ── 2. Contract quality filter (HARD GATE) ────────────
         cq = self._contract_quality(
@@ -248,21 +298,45 @@ class APRiskManager:
             dte=dte,
         )
         if not cq.passes:
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, f"CONTRACT QUALITY: {cq.rejection_reason}",
-                                spy_trend=spy["trend"], vix=vix_data["vix"],
-                                contract_quality=cq)
+            return self._reject(
+                ticker,
+                direction,
+                option_premium,
+                dte,
+                bid_ask_spread_pct,
+                open_interest,
+                daily_volume_options,
+                option_delta,
+                f"CONTRACT QUALITY: {cq.rejection_reason}",
+                spy_trend=spy_trend,
+                vix=vix_value,
+                contract_quality=cq,
+                reason_code="CONTRACT_QUALITY_FAILED",
+                veto_category="EXECUTION_QUALITY",
+                hard_veto=True,
+            )
 
         # ── 3. Exposure bucket check ──────────────────────────
         sector = SECTOR_MAP.get(ticker, "other")
         sector_mult = self._sector_multiplier(ticker, direction, sector)
         if sector_mult == 0.0:
-            return self._reject(ticker, direction, option_premium, dte,
-                                bid_ask_spread_pct, open_interest, daily_volume_options,
-                                option_delta, f"SECTOR CAP: {sector} exposure limit reached",
-                                spy_trend=spy["trend"], vix=vix_data["vix"],
-                                contract_quality=cq)
+            return self._reject(
+                ticker,
+                direction,
+                option_premium,
+                dte,
+                bid_ask_spread_pct,
+                open_interest,
+                daily_volume_options,
+                option_delta,
+                f"SECTOR CAP: {sector} exposure limit reached",
+                spy_trend=spy_trend,
+                vix=vix_value,
+                contract_quality=cq,
+                reason_code="SECTOR_EXPOSURE_CAP",
+                veto_category="PORTFOLIO_EXPOSURE",
+                hard_veto=True,
+            )
 
         # ── 4. Volatility-adjusted position cap ───────────────
         end   = datetime.date.today().strftime("%Y-%m-%d")
@@ -327,9 +401,28 @@ class APRiskManager:
 
         approved = max_contracts >= 1
 
+        if not approved:
+            return self._reject(
+                ticker,
+                direction,
+                option_premium,
+                dte,
+                bid_ask_spread_pct,
+                open_interest,
+                daily_volume_options,
+                option_delta,
+                "Insufficient capital or zero contracts",
+                spy_trend=spy_trend,
+                vix=vix_value,
+                contract_quality=cq,
+                reason_code="INSUFFICIENT_CAPITAL_OR_ZERO_CONTRACTS",
+                veto_category="CAPITAL",
+                hard_veto=True,
+            )
+
         return RiskResult(
             ticker=ticker,
-            approved=approved,
+            approved=True,
             max_contracts=max_contracts,
             max_position_usd=round(max_usd, 2),
             risk_dollars=round(risk_dollars, 2),
@@ -340,9 +433,20 @@ class APRiskManager:
             correlation_multiplier=round(corr_mult, 3),
             sector_multiplier=round(sector_mult, 3),
             contract_quality=cq,
-            spy_trend=spy["trend"],
-            vix=vix_data["vix"],
-            reason="APPROVED" if approved else "Insufficient capital or zero contracts",
+            spy_trend=spy_trend,
+            vix=vix_value,
+            reason=regime_reason or "APPROVED",
+            reason_code=(
+                "APPROVED_WITH_REGIME_MISMATCH"
+                if regime_mismatch
+                else "APPROVED"
+            ),
+            veto_category=(
+                "MARKET_CONTEXT"
+                if regime_mismatch
+                else "NONE"
+            ),
+            hard_veto=False,
         )
 
     # ────────────────────────────────────────────
@@ -541,18 +645,50 @@ class APRiskManager:
     # ────────────────────────────────────────────
     # HELPERS
     # ────────────────────────────────────────────
-    def _reject(self, ticker, direction, premium, dte, spread, oi, vol, delta,
-                reason, spy_trend="UNKNOWN", vix=0.0, contract_quality=None) -> RiskResult:
+    def _reject(
+        self,
+        ticker,
+        direction,
+        premium,
+        dte,
+        spread,
+        oi,
+        vol,
+        delta,
+        reason,
+        spy_trend="UNKNOWN",
+        vix=0.0,
+        contract_quality=None,
+        reason_code: str = "UNCLASSIFIED_RISK_REJECTION",
+        veto_category: str = "RISK",
+        hard_veto: bool = True,
+    ) -> RiskResult:
         if contract_quality is None:
-            contract_quality = self._contract_quality(spread, oi, vol, delta, dte)
+            contract_quality = self._contract_quality(
+                spread,
+                oi,
+                vol,
+                delta,
+                dte,
+            )
+
         return RiskResult(
-            ticker=ticker, approved=False,
-            max_contracts=0, max_position_usd=0.0,
-            risk_dollars=0.0, stop_distance_pct=0.0,
+            ticker=ticker,
+            approved=False,
+            max_contracts=0,
+            max_position_usd=0.0,
+            risk_dollars=0.0,
+            stop_distance_pct=0.0,
             expected_loss_per_contract=0.0,
-            volatility_pct=0.0, position_limit_pct=0.0,
-            correlation_multiplier=1.0, sector_multiplier=1.0,
+            volatility_pct=0.0,
+            position_limit_pct=0.0,
+            correlation_multiplier=1.0,
+            sector_multiplier=1.0,
             contract_quality=contract_quality,
-            spy_trend=spy_trend, vix=vix,
+            spy_trend=spy_trend,
+            vix=vix,
             reason=reason,
+            reason_code=reason_code,
+            veto_category=veto_category,
+            hard_veto=hard_veto,
         )

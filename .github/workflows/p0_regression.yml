@@ -36,7 +36,7 @@ jobs:
       - name: Install minimal test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pytest requests psycopg2-binary python-dotenv cryptography
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
 
       - name: Apply exit decision generation migration
         env:
@@ -92,6 +92,7 @@ jobs:
             tests/test_p1_selector_identity_assertion_mode_fallback.py \
             tests/test_p1_intelligence_admission_policy.py \
             tests/test_p1_intel_admission_e2e_final_gate.py \
+            tests/test_p0_forward_regime_advisory_flow.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \

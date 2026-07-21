@@ -242,33 +242,173 @@ def _signal_to_direction(signal: dict) -> str:
     return "neutral"
 
 
+_STRUCTURED_RISK_APPROVAL_CODES = frozenset({
+    "APPROVED",
+    "APPROVED_WITH_REGIME_MISMATCH",
+})
+
+
 def _risk_allows_trade(risk: dict) -> tuple[bool, str]:
-    """Return (risk_ok, reason) from flexible intelligence risk payloads."""
+    """Resolve structured risk authority before legacy compatibility fields.
+
+    Structured payload contract:
+
+    hard_veto=True
+        Always blocks. approved must be False and reason_code must be present.
+
+    hard_veto=False
+        Allows only an explicitly approved result whose reason_code belongs to
+        _STRUCTURED_RISK_APPROVAL_CODES and whose durable sizing is positive.
+
+    hard_veto absent
+        Uses the legacy compatibility parser below.
+
+    A malformed structured payload fails closed. Legacy payload behavior remains
+    unchanged because the strict contract is activated only when `hard_veto`
+    exists in the payload.
+    """
     if not isinstance(risk, dict):
         return True, ""
 
-    # Common explicit veto shapes.
-    for key in ("risk_ok", "ok", "approved", "pass", "passed", "allow", "allowed"):
+    # New structured contract. Presence of the key activates strict validation.
+    if "hard_veto" in risk:
+        hard_veto   = risk.get("hard_veto")
+        approved    = risk.get("approved")
+        reason_code = str(risk.get("reason_code") or "").strip().upper()
+        reason      = str(
+            risk.get("reason")
+            or reason_code
+            or "structured risk result"
+        )
+
+        # Literal bool required. Values such as 0, 1, "false" and None are not
+        # accepted as structured authority.
+        if type(hard_veto) is not bool:
+            return False, (
+                "malformed structured risk result: "
+                f"hard_veto must be bool, got {hard_veto!r}"
+            )
+
+        if hard_veto is True:
+            if approved is not False:
+                return False, (
+                    "contradictory structured hard veto: "
+                    f"approved={approved!r} hard_veto=True "
+                    f"reason_code={reason_code!r}"
+                )
+            if not reason_code:
+                return False, (
+                    "malformed structured hard veto: reason_code is required"
+                )
+            return False, reason
+
+        # hard_veto is exactly False from here.
+        if approved is not True:
+            return False, (
+                "contradictory structured approval: "
+                f"approved={approved!r} hard_veto=False "
+                f"reason_code={reason_code!r}"
+            )
+
+        if reason_code not in _STRUCTURED_RISK_APPROVAL_CODES:
+            return False, (
+                "unknown structured approval reason: "
+                f"reason_code={reason_code!r} hard_veto=False"
+            )
+
+        try:
+            max_contracts   = int(risk.get("max_contracts") or 0)
+            max_position_usd = float(risk.get("max_position_usd") or 0.0)
+        except (TypeError, ValueError):
+            return False, (
+                "malformed structured approval sizing: "
+                f"max_contracts={risk.get('max_contracts')!r} "
+                f"max_position_usd={risk.get('max_position_usd')!r}"
+            )
+
+        if max_contracts < 1 or max_position_usd <= 0:
+            return False, (
+                "structured approval has no executable size: "
+                f"max_contracts={max_contracts} "
+                f"max_position_usd={max_position_usd}"
+            )
+
+        return True, reason
+
+    # Legacy compatibility parser. Do not change this behavior in this PR.
+    for key in (
+        "risk_ok",
+        "ok",
+        "approved",
+        "pass",
+        "passed",
+        "allow",
+        "allowed",
+    ):
         if key in risk:
             val = risk.get(key)
+
             if isinstance(val, str):
                 val_norm = val.strip().lower()
-                if val_norm in {"false", "no", "0", "fail", "failed", "reject", "veto", "blocked"}:
-                    return False, str(risk.get("reason") or f"{key}={val}")
-                if val_norm in {"true", "yes", "1", "pass", "passed", "allow", "allowed", "ok"}:
+
+                if val_norm in {
+                    "false",
+                    "no",
+                    "0",
+                    "fail",
+                    "failed",
+                    "reject",
+                    "veto",
+                    "blocked",
+                }:
+                    return False, str(
+                        risk.get("reason") or f"{key}={val}"
+                    )
+
+                if val_norm in {
+                    "true",
+                    "yes",
+                    "1",
+                    "pass",
+                    "passed",
+                    "allow",
+                    "allowed",
+                    "ok",
+                }:
                     return True, str(risk.get("reason") or "")
+
             elif val is False:
-                return False, str(risk.get("reason") or f"{key}=False")
+                return False, str(
+                    risk.get("reason") or f"{key}=False"
+                )
+
             elif val is True:
                 return True, str(risk.get("reason") or "")
 
     for key in ("veto", "blocked", "rejected", "hard_block"):
         if bool(risk.get(key)):
-            return False, str(risk.get("reason") or f"{key}=True")
+            return False, str(
+                risk.get("reason") or f"{key}=True"
+            )
 
-    status = str(risk.get("status") or risk.get("decision") or "").strip().lower()
-    if status in {"reject", "rejected", "block", "blocked", "veto", "fail", "failed"}:
-        return False, str(risk.get("reason") or f"status={status}")
+    status = str(
+        risk.get("status")
+        or risk.get("decision")
+        or ""
+    ).strip().lower()
+
+    if status in {
+        "reject",
+        "rejected",
+        "block",
+        "blocked",
+        "veto",
+        "fail",
+        "failed",
+    }:
+        return False, str(
+            risk.get("reason") or f"status={status}"
+        )
 
     return True, str(risk.get("reason") or "")
 
@@ -316,20 +456,34 @@ def _map_result(result: dict, fallback_score: float) -> dict:
     risk_ok, risk_reason = _risk_allows_trade(risk)
     allow_collect = _data_collection_allowed()
 
+    structured_risk_contract = (
+        isinstance(risk, dict)
+        and "hard_veto" in risk
+    )
+
     # ── Hard risk veto (explicit risk finding — always block) ─────────────────
+    # Structured risk authority is identical in LIVE and PAPER. PAPER may retain
+    # the historical data-collection override only for legacy payloads that do
+    # not carry the new hard_veto contract.
     if _INTEL_ENFORCE_RISK_VETO and not risk_ok:
         log.info(
             "[%s] GATE_G_HARD_RISK_BLOCK scanner_score=%.1f intel_score=%.1f "
-            "effective_score=%.1f hard_risk_reason=%s",
+            "effective_score=%.1f hard_risk_reason=%s structured=%s",
             ticker, fallback_score, intel_score, intel_score, risk_reason,
+            structured_risk_contract,
         )
-        if allow_collect:
+
+        if allow_collect and not structured_risk_contract:
             return _collect_gate(
                 status="RISK_VETO_OVERRIDE",
                 score=score,
-                reasoning=f"risk_veto_override: {risk_reason} (1 contract data collection)",
+                reasoning=(
+                    f"risk_veto_override: {risk_reason} "
+                    "(legacy 1-contract data collection)"
+                ),
                 risk_detail=risk,
             )
+
         return _block_gate(
             status="RISK_VETO",
             score=score,
@@ -482,6 +636,51 @@ def _map_result(result: dict, fallback_score: float) -> dict:
 
     # ── Approved ──────────────────────────────────────────────────────────────
     # Intel contracts is a CAP — MC still applies min(kelly, risk cap, intel cap).
+
+    # Regime mismatch is an approved, non-authoritative market-context result.
+    # Preserve the exact Portfolio Manager contract count. Never manufacture one
+    # through max(1, contracts).
+    if (
+        str(risk.get("reason_code") or "").strip().upper()
+        == "APPROVED_WITH_REGIME_MISMATCH"
+        and risk.get("hard_veto") is False
+        and risk.get("approved") is True
+    ):
+        try:
+            advisory_contracts = int(result.get("contracts") or 0)
+        except (TypeError, ValueError):
+            advisory_contracts = 0
+
+        advisory_contracts = max(0, advisory_contracts)
+
+        log.info(
+            "[%s] GATE_G_REGIME_MISMATCH_ADVISORY "
+            "scanner_score=%.1f intel_score=%.1f "
+            "risk_max_contracts=%s pm_contracts=%d "
+            "veto_category=%s",
+            ticker,
+            fallback_score,
+            intel_score,
+            risk.get("max_contracts"),
+            advisory_contracts,
+            risk.get("veto_category") or "MARKET_CONTEXT",
+        )
+
+        return {
+            "approved": True,
+            "score": round(score, 1),
+            "contracts": advisory_contracts,
+            "reasoning": (
+                "regime_mismatch_advisory: "
+                f"{risk.get('reason') or ''} "
+                "(reason_code=APPROVED_WITH_REGIME_MISMATCH "
+                "hard_veto=False)"
+            ),
+            "intel_status": "REGIME_MISMATCH_ADVISORY",
+            "intel_score": round(score, 1),
+            "risk_detail": risk,
+        }
+
     log.info(
         "[%s] GATE_G_APPROVED scanner_score=%.1f intel_score=%.1f "
         "effective_score=%.1f hard_risk_reason=none",
