@@ -868,7 +868,12 @@ class ManagedPosition:
 
     @property
     def is_at_target(self) -> bool:
-        if self.underlying_target <= 0:
+        # P0 (PR #385 audit): current_underlying must be a real positive price.
+        # With missing underlying data (0.0), a PUT's `current <= target` was
+        # ALWAYS true (0 <= target), firing TARGET HIT instantly on data gaps.
+        # This is the exact premature-PUT-exit signature (PEP PUT, LULU PUT).
+        # Missing truth is not a market signal.
+        if self.underlying_target <= 0 or self.current_underlying <= 0:
             return False
         if self.side == "CALL":
             return self.current_underlying >= self.underlying_target
@@ -876,7 +881,10 @@ class ManagedPosition:
 
     @property
     def is_at_stop(self) -> bool:
-        if self.underlying_stop <= 0:
+        # P0 (PR #385 audit): same zero-guard as is_at_target. A CALL's
+        # `current <= stop` was always true with current_underlying=0,
+        # firing STOP HIT on data gaps for CALLs.
+        if self.underlying_stop <= 0 or self.current_underlying <= 0:
             return False
         if self.side == "CALL":
             return self.current_underlying <= self.underlying_stop
@@ -1289,9 +1297,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # P0: Use exec_pnl (BID-based) for the soft-loss stop threshold comparison.
     # Underlying is required for this branch — apply both gates before evaluating.
+    #
+    # P0 AUDIT FIX (PR #385): a deferral returned from inside this branch must
+    # NEVER shadow the HARD STOP below.  If the last-known loss is already at or
+    # past the hard-stop threshold, we SKIP this entire soft branch so the hard
+    # stop (which fires regardless of bid/underlying availability) is reachable.
+    # Without this, a position at -45% with a missing bid returned
+    # SOFT_EXIT_DEFERRED_* forever and had NO exit path — worse than main.
     _sl_pnl = exec_pnl if exec_pnl is not None else option_pnl  # fallback for breach-stamp only
-    if (exec_pnl is not None and exec_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit) or \
-       (exec_pnl is None and option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit):
+    _sl_catastrophic = option_pnl <= _hard_stop  # hard stop must remain reachable
+    if not _sl_catastrophic and (
+        (exec_pnl is not None and exec_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit) or
+        (exec_pnl is None and option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit)
+    ):
         # ── Option truth gate ────────────────────────────────────────────────
         _sl_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
         if _sl_opt_gate is not None:
@@ -1455,8 +1473,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             else:               _ng_stop = -0.08
 
         # P0: use exec_pnl (BID) for comparison — midpoint below threshold does not fire.
+        # P0 AUDIT FIX (PR #385): catastrophic losses skip this branch entirely so a
+        # deferral cannot shadow the HARD STOP below (same rescue as soft-loss branch).
         _ng_pnl = exec_pnl if exec_pnl is not None else option_pnl
-        if _ng_pnl <= _ng_stop:
+        if _ng_pnl <= _ng_stop and not (option_pnl <= _hard_stop):
             # ── Option truth gate ────────────────────────────────────────────
             _ng_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
             if _ng_opt_gate is not None:
@@ -1633,6 +1653,27 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             reason=f"THETA STOP -- exec/bid down {_theta_pnl*100:.0f}% after noon, cutting losses",
             urgency="NORMAL", pnl_pct=_theta_pnl,
         )
+
+    # ── P0 AUDIT FIX (PR #385): explicit deferral surfacing ──────────────────
+    # When executable truth is unavailable/stale AND the display (midpoint) P&L
+    # sits in territory where a soft exit would otherwise have been evaluated,
+    # return the explicit deferred reason instead of a silent "No exit condition
+    # met".  Operators must be able to distinguish "nothing to do" from
+    # "soft exit was possible but truth was missing" (spec §5.12).
+    _final_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+    if _final_gate is not None:
+        _dp = snap.display_pnl_pct
+        _soft_territory = (
+            (_dp is not None and (
+                _dp >= SCALE_OUT_1_THRESHOLD
+                or _dp <= float(os.getenv("SOFT_LOSS_STOP_PCT", "-0.12"))
+            ))
+            or pos.touched_profit
+            or pos.peak_pnl_pct >= _immediate_tp
+            or pos.max_profit_seen >= SMALL_WIN_PCT
+        )
+        if _soft_territory:
+            return _final_gate
 
     return ExitDecision(
         action="HOLD", quantity=0,
