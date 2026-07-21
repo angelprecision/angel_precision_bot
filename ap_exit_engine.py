@@ -1052,18 +1052,32 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     qty_rem      = pos.quantity_remaining
 
     # ── 1. TARGET HIT ────────────────────────────────────────────────────────
-    if pos.is_at_target:
+    # AMENDMENT #4 (blocker 1): pos.is_at_target already zero-guards
+    # current_underlying, but we additionally verify the snapshot's
+    # underlying_available.  Missing underlying truth is not a target hit.
+    if snap.underlying_available and pos.is_at_target:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
+            urgency="IMMEDIATE",
+            pnl_pct=(_positive_or_none(getattr(pos, "hard_exit_reference_pnl_pct", None))
+                     if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
+                     else option_pnl),
         )
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
-    # Require 30s confirmation before exiting on underlying stop breach.
-    # A single candle wick that immediately recovers should NOT trigger exit.
-    # Uses HIGH urgency (bid-limit) not IMMEDIATE (market).
-    if pos.is_at_stop:
+    # AMENDMENT #4 (blocker 1): STOP HIT is an underlying-driven risk-reducing
+    # exit and must NOT fire from retained underlying=0.  Additionally, the
+    # ExitDecision.pnl_pct must reflect the true loss authority
+    # (hard_exit_reference_pnl_pct), not option_pnl (which returns 0.0 when
+    # LIVE current_option_price is zeroed by a missing bid).  This defended
+    # the reviewer's "STOP HIT but pnl reads 0%" trap.
+    if snap.underlying_available and pos.is_at_stop:
+        _stop_pnl_authority = (
+            float(getattr(pos, "hard_exit_reference_pnl_pct"))
+            if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
+            else option_pnl
+        )
         # PR-A / BUG-2: stamp is datetime now (was time.time() float).
         _now_dt = datetime.now(timezone.utc)
         _stop_dt = pos._underlying_stop_breach_ts
@@ -1089,7 +1103,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"held below stop ${pos.underlying_stop:.2f} "
                         f"for {_breach_age_sec:.0f}s"
                     ),
-                    urgency="HIGH", pnl_pct=option_pnl,
+                    urgency="HIGH", pnl_pct=_stop_pnl_authority,
                 )
             else:
                 log.info(
@@ -3672,35 +3686,76 @@ class APExitEngine:
                     continue
 
                 try:
-                    current_underlying   = float(snap.get("current_underlying") or 0.0)
-                    current_option_price = float(snap.get("current_option_price") or 0.0)
-                    current_bid          = float(snap.get("current_bid") or 0.0)
-                    current_ask          = float(snap.get("current_ask") or 0.0)
-                    analytics_mark       = float(snap.get("analytics_mark_price") or 0.0)
+                    # ── AMENDMENT #4 (blocker 4): apply all money-safety fields ──
+                    # Prior code used `if x > 0` guards which meant a missing-bid
+                    # cycle could not INVALIDATE a retained bid — the exact stale-
+                    # retained-bid failure this PR exists to close.  Under
+                    # DIRECT_POSITION_WRITES=0 this path is the ONLY writer, so
+                    # money-safety truth transitions MUST propagate through here.
+                    # For price fields: apply the value verbatim (0.0 valid).
+                    # For explicit truth booleans: apply verbatim (False wins).
+                    # For timestamps: apply if present in the snapshot payload.
 
-                    if current_underlying > 0:
-                        pos.current_underlying = current_underlying
-                    # P0 contract: QPM already writes bid-based current_option_price
-                    # for LIVE positions. apply_quote_snapshots trusts that invariant
-                    # and propagates it. analytics_mark_price is always propagated
-                    # separately for charts.
-                    if current_option_price > 0:
-                        pos.current_option_price = current_option_price
-                    if current_bid > 0:
-                        pos.current_bid = current_bid
-                    if current_ask > 0:
-                        pos.current_ask = current_ask
-                    if analytics_mark > 0:
+                    def _apply(name, snap_key=None):
+                        k = snap_key or name
+                        if k in snap:
+                            try:
+                                setattr(pos, name, snap[k])
+                            except Exception:
+                                pass
+
+                    # Prices (0.0 must be honored — this is the invalidation)
+                    _apply("current_underlying")
+                    _apply("currentunderlying", "current_underlying")
+                    _apply("current_option_price")
+                    _apply("currentoptionprice", "current_option_price")
+                    _apply("current_bid")
+                    _apply("currentbid", "current_bid")
+                    _apply("current_ask")
+                    _apply("currentask", "current_ask")
+
+                    # Money-safety booleans / metadata
+                    _apply("option_bid_valid")
+                    _apply("optionbidvalid", "option_bid_valid")
+                    _apply("option_quote_fresh")
+                    _apply("optionquotefresh", "option_quote_fresh")
+                    _apply("option_quote_age_sec")
+                    _apply("underlying_available")
+                    _apply("underlyingavailable", "underlying_available")
+                    _apply("underlying_fresh")
+                    _apply("underlyingfresh", "underlying_fresh")
+                    _apply("underlying_age_sec")
+                    _apply("display_mark")
+                    _apply("display_pnl_pct")
+                    _apply("exit_executable_mark")
+                    _apply("exit_executable_pnl_pct")
+
+                    # Hard-exit reference (LIVE-money HARD STOP consumer)
+                    _apply("hard_exit_reference_price")
+                    _apply("hardexitreferenceprice", "hard_exit_reference_price")
+                    _apply("hard_exit_reference_source")
+                    _apply("hardexitreferencesource", "hard_exit_reference_source")
+                    _apply("hard_exit_reference_ts")
+                    _apply("hardexitreferencets", "hard_exit_reference_ts")
+                    _apply("hard_exit_reference_pnl_pct")
+                    _apply("hardexitreferencepnlpct", "hard_exit_reference_pnl_pct")
+
+                    # Timestamps
+                    _apply("last_option_bid_update_ts")
+                    _apply("lastoptionbidupdatets", "last_option_bid_update_ts")
+                    _apply("last_underlying_quote_update_ts")
+                    _apply("lastunderlyingquoteupdatets", "last_underlying_quote_update_ts")
+                    _apply("last_option_quote_update_ts")
+                    _apply("lastoptionquoteupdatets", "last_option_quote_update_ts")
+
+                    # Analytics mark carried separately
+                    analytics_mark = snap.get("analytics_mark_price")
+                    if analytics_mark is not None:
                         try:
                             pos.analytics_mark_price = analytics_mark
                             pos.analyticsmarkprice   = analytics_mark
                         except Exception:
                             pass
-
-                    if snap.get("last_underlying_quote_update_ts") is not None:
-                        pos.last_underlying_quote_update_ts = snap.get("last_underlying_quote_update_ts")
-                    if snap.get("last_option_quote_update_ts") is not None:
-                        pos.last_option_quote_update_ts = snap.get("last_option_quote_update_ts")
 
                     if snap.get("price_source"):
                         setattr(pos, "last_option_price_source", snap.get("price_source"))
@@ -3747,12 +3802,23 @@ class APExitEngine:
                     if qty <= 0:
                         continue
 
+                    # AMENDMENT #4 (blocker 3): pnl_pct on the emergency decision
+                    # must reflect true loss authority.  Reading option_pnl_pct
+                    # here returns 0.0 for LIVE missing-bid positions, misreporting
+                    # the actual risk being cleared.  The exit still fires (this
+                    # is IMMEDIATE + allow_inflight_override), but the audit trail
+                    # and downstream decisioning must see the true P&L.
+                    _flatten_pnl = (
+                        float(getattr(pos, "hard_exit_reference_pnl_pct"))
+                        if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
+                        else float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
+                    )
                     decision = ExitDecision(
                         action="CLOSE_ALL",
                         quantity=qty,
                         reason=f"SENTINEL FORCED EXIT -- {reason}",
                         urgency="IMMEDIATE",
-                        pnl_pct=float(getattr(pos, "option_pnl_pct", 0.0) or 0.0),
+                        pnl_pct=_flatten_pnl,
                         reason_code="SENTINEL_FORCED_EXIT",
                     )
 
@@ -4404,7 +4470,19 @@ class APExitEngine:
             if pos.closed or int(pos.quantity_remaining or 0) <= 0:
                 continue
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
-            pnl     = pos.option_pnl_pct
+            # AMENDMENT #4 (blocker 2): sentinels are the LAST-CHANCE money-safety
+            # net for a stuck exit. They MUST NOT read option_pnl_pct — that property
+            # returns 0.0 whenever current_option_price is zero, which is the exact
+            # state QPM produces on LIVE missing-bid to keep soft exits safe.  Using
+            # option_pnl_pct here makes a Jason position at -45% with no bid look
+            # like +0% to the sentinel, and no SENTINEL_FORCED_EXIT ever triggers.
+            # Fall back to option_pnl_pct only for pre-amendment positions.
+            _sentinel_pnl_authority = (
+                float(getattr(pos, "hard_exit_reference_pnl_pct"))
+                if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
+                else pos.option_pnl_pct
+            )
+            pnl     = _sentinel_pnl_authority
             peak    = pos.peak_pnl_pct
 
             if (
