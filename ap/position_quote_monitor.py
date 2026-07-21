@@ -33,6 +33,14 @@ IMMEDIATE_REFRESH_MIN_INTERVAL_SECONDS = float(os.getenv("IMMEDIATE_REFRESH_MIN_
 # Feature flag: migrate to snapshots-only ownership later by setting this to "0".
 DIRECT_POSITION_WRITES      = os.getenv("QUOTE_MONITOR_DIRECT_WRITES", "1") == "1"
 
+# P0 (PR #385 amendment): touched-profit arming threshold.
+# Semantic authority: "touched green" = executable BID P&L has reached +5%,
+# confirmed by two consecutive fresh polls.  This is the long-standing business
+# rule (previously an inline 0.05 literal); it is intentionally NOT the
+# per-position immediate-TP threshold from ap_exit_engine._effective_thresholds
+# (20-25% depending on DTE/instrument), which governs trail activation.
+TOUCHED_PROFIT_ARM_PCT      = float(os.getenv("TOUCHED_PROFIT_ARM_PCT", "0.05"))
+
 # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
 # QPM must also persist live quote / PnL state to the positions table so the
 # dashboard, audit trail, and restart recovery have non-NULL truth. The exit
@@ -106,12 +114,19 @@ class APPositionQuoteMonitor:
         self._last_wake_ts:    dict[str, float] = {}
         self._last_immediate_refresh_ts: dict[str, float] = {}
 
-        # P0: touched_profit consecutive-confirmation tracking (per contract).
+        # P0 (PR #385 amendment): touched_profit consecutive-confirmation tracking.
         # touched_profit must NEVER arm from a single poll or from midpoint P&L.
         # We require two consecutive fresh executable BID observations at or above
-        # the IMMEDIATE_TP_PCT threshold before arming.  This dict tracks whether
-        # the first confirming observation has been seen for each contract.
-        # Keyed by contract OCC symbol string.
+        # TOUCHED_PROFIT_ARM_PCT (+5% — the existing "touched green" business rule;
+        # deliberately NOT the per-position immediate-TP threshold from
+        # _effective_thresholds, which governs trail activation, not green-arming).
+        #
+        # KEYED BY DURABLE POSITION IDENTITY: client_id|execution_mode|position_id.
+        # Contract symbol alone is NOT position identity — two entries, a reopen,
+        # or two accounts can share one OCC contract, and one position's first
+        # confirming poll must never become another position's second.
+        # Fail-closed: positions without a position_id never accumulate pending
+        # confirmation state (and therefore never arm via this path).
         self._tp_pending_confirm: dict[str, bool] = {}
 
         # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
@@ -570,39 +585,69 @@ class APPositionQuoteMonitor:
                 self._write_field(pos, "exit_executable_mark",    _exec_exit_mark)
                 self._write_field(pos, "exit_executable_pnl_pct", _exec_exit_pnl if _exec_exit_pnl is not None else 0.0)
 
+                # ── P0 (PR #385 amendment): Position-scoped confirmation key ─────────
+                # Durable identity: client_id|execution_mode|position_id.
+                # Fail-closed: no position_id → no key → never accumulates pending
+                # state and never arms via consecutive confirmation.
+                _tp_key = ""
+                if pid:
+                    _tp_key = "|".join([
+                        str(self.client_id or ""),
+                        _raw_exec_mode.lower() or "unknown",
+                        str(pid),
+                    ])
+
                 if cost_basis > 0 and exec_price > 0 and _exec_quote_valid:
                     pnl_pct = (exec_price - cost_basis) / cost_basis
-                    peak = max(
-                        pnl_pct,
-                        _safe_float(_get_attr(pos, "peakpnlpct", "peak_pnl_pct", default=None), float("-inf")),
-                        _safe_float(_get_attr(pos, "maxprofitseen", "max_profit_seen", default=None), float("-inf")),
-                    )
-                    self._write_field(pos, "peakpnlpct", peak)
-                    self._write_field(pos, "peak_pnl_pct", peak)
-                    self._write_field(pos, "maxprofitseen", peak)
-                    self._write_field(pos, "max_profit_seen", peak)
+                    # ── DISPLAY / HARD-EXIT AUTHORITY (mode-specific) ────────────────
+                    # option_pnl_pct is mid-derived for PAPER and bid for LIVE; the
+                    # exit engine's hard exits consume it (backward compatible).
                     self._write_field(pos, "optionpnlpct", pnl_pct)
                     self._write_field(pos, "option_pnl_pct", pnl_pct)
 
-                    # ── P0: touched_profit consecutive-confirmation arming ──────────────
+                    # ── EXECUTABLE PEAK AUTHORITY (BID-ONLY, ALL MODES) ──────────────
+                    # P0 (PR #385 amendment): peak_pnl_pct, max_profit_seen, and the
+                    # touched-profit confirmation state feed soft-exit decisions
+                    # (touched-profit floors, runner trails, small-win capture).
+                    # They must be updated ONLY from a valid, fresh executable BID.
+                    # A PAPER midpoint spike must never inflate the historical peak
+                    # that later soft exits are measured against.
+                    if _opt_bid_valid and _opt_quote_fresh and _exec_exit_pnl is not None:
+                        _exec_peak = max(
+                            _exec_exit_pnl,
+                            _safe_float(_get_attr(pos, "peakpnlpct", "peak_pnl_pct", default=None), float("-inf")),
+                            _safe_float(_get_attr(pos, "maxprofitseen", "max_profit_seen", default=None), float("-inf")),
+                        )
+                        self._write_field(pos, "peakpnlpct", _exec_peak)
+                        self._write_field(pos, "peak_pnl_pct", _exec_peak)
+                        self._write_field(pos, "maxprofitseen", _exec_peak)
+                        self._write_field(pos, "max_profit_seen", _exec_peak)
+
+                    # ── touched_profit consecutive-confirmation arming ───────────────
                     # NEVER arm touched_profit from a single poll or from midpoint.
                     # Require two consecutive fresh executable BID observations at or
-                    # above the IMMEDIATE_TP_PCT threshold (5% / 0.05).
-                    # Any interruption (bid goes missing, falls below threshold, or quote
-                    # becomes stale) resets the pending state.
-                    _TP_THRESHOLD = 0.05
-                    if _opt_bid_valid and _opt_quote_fresh and _exec_exit_pnl is not None and _exec_exit_pnl >= _TP_THRESHOLD:
-                        if not self._tp_pending_confirm.get(c, False):
+                    # above TOUCHED_PROFIT_ARM_PCT (+5%, the "touched green" rule —
+                    # see constant docstring; NOT the immediate-TP trail threshold).
+                    # Any interruption (bid missing, stale, or below threshold) resets
+                    # pending state for THIS position only.
+                    if (
+                        _tp_key
+                        and _opt_bid_valid
+                        and _opt_quote_fresh
+                        and _exec_exit_pnl is not None
+                        and _exec_exit_pnl >= TOUCHED_PROFIT_ARM_PCT
+                    ):
+                        if not self._tp_pending_confirm.get(_tp_key, False):
                             # First qualifying observation — set pending, do NOT arm yet.
-                            self._tp_pending_confirm[c] = True
+                            self._tp_pending_confirm[_tp_key] = True
                         else:
                             # Second consecutive qualifying observation — arm touched_profit.
                             self._write_field(pos, "touchedprofit", True)
                             self._write_field(pos, "touched_profit", True)
-                    else:
+                    elif _tp_key:
                         # Bid unavailable, stale, or below threshold → reset pending.
                         # touched_profit, once True, is never reset here (only close clears it).
-                        self._tp_pending_confirm[c] = False
+                        self._tp_pending_confirm[_tp_key] = False
 
                     self._persist_quote_to_db(
                         position_id     = pid,
@@ -1131,6 +1176,17 @@ class APPositionQuoteMonitor:
             self._last_wake_price.pop(k, None)
             self._last_wake_ts.pop(k, None)
             self._last_immediate_refresh_ts.pop(k, None)
+
+        # P0 (PR #385 amendment): prune touched-profit confirmation state by
+        # POSITION identity.  Key format: client_id|execution_mode|position_id —
+        # the position_id is the final segment.  A closed position's pending
+        # confirmation must never survive to a reopened position on the same
+        # contract (clean-slate rule).
+        _stale_tp_keys = [
+            k for k in self._tp_pending_confirm
+            if k.rsplit("|", 1)[-1] not in active_ids
+        ]
+        for k in _stale_tp_keys:
             self._tp_pending_confirm.pop(k, None)
 
     # ── Quote fetch (shared cache + 429 backoff) ─────────────────────────────
