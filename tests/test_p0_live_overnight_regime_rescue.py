@@ -130,8 +130,12 @@ def test_population_sql_has_both_materialized_ctes():
     # Idempotency via LEFT JOIN + IS NULL
     assert "LEFT JOIN recovered_events re" in sql
     assert "re.original_signal_id IS NULL" in sql
-    # No correlated NOT EXISTS over decision_events
-    for seg in sql.split("NOT EXISTS"):
+    # No correlated NOT EXISTS over decision_events.
+    # Split on "NOT EXISTS" and skip seg[0] — it is the CTE + main query body
+    # that legitimately contains "decision_events" (the CTE source tables).
+    # Segments [1:] are the subquery bodies inside each NOT EXISTS clause;
+    # those must only reference orders or positions, never decision_events.
+    for seg in sql.split("NOT EXISTS")[1:]:
         if "decision_events" in seg[:200].lower() and "orders" not in seg[:80].lower():
             assert False, f"Unexpected NOT EXISTS over decision_events: {seg[:200]}"
 
@@ -645,9 +649,9 @@ def test_postgres_large_volume_dual_cte_and_rollback():
             elapsed = time.monotonic() - t0
 
             assert r_dry["eligible"] == 53, (
-                f"eligible={r_dry['eligible']} errors={r_dry['errors']}
-"
-                f"Old noise events (id<={old_max_id}) must be excluded by id>={test_min_id}"
+                f"eligible={r_dry['eligible']} errors={r_dry['errors']}\n"
+                f"Old noise events (id<={old_max_id}) must be excluded "
+                f"by id>={test_min_id}"
             )
             assert r_dry["verified"] == 53
             assert not r_dry["errors"]
