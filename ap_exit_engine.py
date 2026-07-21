@@ -313,32 +313,48 @@ def _build_exit_decision_snapshot(
     """
     now_utc = now_utc or datetime.now(timezone.utc)
 
+    def _attr(pos_, *names):
+        """None-safe dual-name read.  `a or b` swallows meaningful False/0 —
+        this returns the FIRST attribute that exists (is not None)."""
+        for n in names:
+            v = getattr(pos_, n, None)
+            if v is not None:
+                return v
+        return None
+
     # ── Option bid / ask / mid ────────────────────────────────────────────────
-    bid_raw = getattr(pos, "current_bid", None) or getattr(pos, "currentbid", None)
-    ask_raw = getattr(pos, "current_ask", None) or getattr(pos, "currentask", None)
-    bid = _positive_or_none(bid_raw)
-    ask = _positive_or_none(ask_raw)
-    analytics_mark = _positive_or_none(
-        getattr(pos, "analytics_mark_price", None)
-        or getattr(pos, "analyticsmarkprice", None)
-    )
+    bid = _positive_or_none(_attr(pos, "current_bid", "currentbid"))
+    ask = _positive_or_none(_attr(pos, "current_ask", "currentask"))
+    analytics_mark = _positive_or_none(_attr(pos, "analytics_mark_price", "analyticsmarkprice"))
     if bid is not None and ask is not None:
         mid: Optional[float] = round((bid + ask) / 2.0, 4)
     elif analytics_mark is not None:
         mid = analytics_mark
     else:
-        mid = _positive_or_none(getattr(pos, "current_option_price", None)
-                                or getattr(pos, "currentoptionprice", None))
+        mid = _positive_or_none(_attr(pos, "current_option_price", "currentoptionprice"))
 
-    opt_bid_valid = bid is not None and bid > 0.0
+    # ── AMENDMENT #2 (blocker 1): explicit truth fields are AUTHORITATIVE ─────
+    # QPM writes option_bid_valid from THIS cycle's broker response.  When QPM
+    # says the bid is invalid, the retained numeric bid on the position is a
+    # PREVIOUS poll's value and must be discarded — option_bid_valid=False
+    # forces bid=None.  Derived positivity is only a fallback for positions
+    # that predate the explicit fields (never overrides an explicit False).
+    bid_valid_direct = _attr(pos, "option_bid_valid", "optionbidvalid")
+    if bid_valid_direct is not None:
+        opt_bid_valid = bool(bid_valid_direct)
+        if not opt_bid_valid:
+            bid = None
+    else:
+        opt_bid_valid = bid is not None and bid > 0.0
     exit_executable_mark: Optional[float] = bid if opt_bid_valid else None
 
     # ── Option quote freshness ────────────────────────────────────────────────
-    # Prefer the explicit QPM-written field; fall back to computing from ts.
-    opt_quote_fresh_direct = getattr(pos, "option_quote_fresh", None) or getattr(pos, "optionquotefresh", None)
-    opt_age_direct = getattr(pos, "option_quote_age_sec", None)
-    opt_ts = (getattr(pos, "last_option_quote_update_ts", None)
-              or getattr(pos, "lastoptionquoteupdatets", None))
+    # Prefer the explicit QPM field (computed from the dedicated BID timestamp);
+    # fall back to the dedicated bid ts, then the general option ts.
+    opt_quote_fresh_direct = _attr(pos, "option_quote_fresh", "optionquotefresh")
+    opt_age_direct = _attr(pos, "option_quote_age_sec")
+    opt_ts = _attr(pos, "last_option_bid_update_ts", "lastoptionbidupdatets",
+                   "last_option_quote_update_ts", "lastoptionquoteupdatets")
     _exit_stale_sec = float(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", str(STALE_OPTION_QUOTE_MAX_AGE_SEC)))
 
     if opt_quote_fresh_direct is not None:
@@ -354,14 +370,22 @@ def _build_exit_decision_snapshot(
         opt_age_sec, opt_quote_fresh = None, False
 
     # ── Underlying truth ──────────────────────────────────────────────────────
-    und_raw = getattr(pos, "current_underlying", None) or getattr(pos, "currentunderlying", None)
-    und_price = _positive_or_none(und_raw)
-    und_available = und_price is not None and und_price > 0.0
+    # AMENDMENT #2 (blocker 2): explicit underlying_available is AUTHORITATIVE.
+    # QPM writes it from THIS cycle's fetch (und_last).  When False, the numeric
+    # current_underlying on the position is the previous poll's retained price —
+    # it must be discarded, not re-derived as "available".
+    und_price = _positive_or_none(_attr(pos, "current_underlying", "currentunderlying"))
+    und_avail_direct = _attr(pos, "underlying_available", "underlyingavailable")
+    if und_avail_direct is not None:
+        und_available = bool(und_avail_direct)
+        if not und_available:
+            und_price = None
+    else:
+        und_available = und_price is not None and und_price > 0.0
 
-    und_fresh_direct = getattr(pos, "underlying_fresh", None) or getattr(pos, "underlyingfresh", None)
-    und_age_direct = getattr(pos, "underlying_age_sec", None)
-    und_ts = (getattr(pos, "last_underlying_quote_update_ts", None)
-              or getattr(pos, "lastunderlyingquoteupdatets", None))
+    und_fresh_direct = _attr(pos, "underlying_fresh", "underlyingfresh")
+    und_age_direct = _attr(pos, "underlying_age_sec")
+    und_ts = _attr(pos, "last_underlying_quote_update_ts", "lastunderlyingquoteupdatets")
     _und_stale_sec = float(os.getenv("UNDERLYING_QUOTE_STALE_SEC", str(_exit_stale_sec * 2)))
 
     if und_fresh_direct is not None:
@@ -435,7 +459,25 @@ def _soft_exit_option_truth_gate(
     Returns None when truth is sufficient (caller may proceed with the soft exit).
 
     Must be called before EVERY soft exit branch.  Never call before hard exits.
+
+    AMENDMENT #2 (blocker 4): the entry-grace contract is enforced HERE, as the
+    first check, so it applies globally to every soft exit (all soft branches
+    route through this gate).  Hard exits are pre-evaluated before any gate and
+    are never affected by grace.
     """
+    if snap.in_grace_window:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=(
+                "SOFT_EXIT_DEFERRED — inside post-entry grace window "
+                f"({_MIN_HOLD_BEFORE_EXIT_MIN:.0f}min); soft exits deferred, hard exits unaffected"
+            ),
+            urgency="NORMAL",
+            pnl_pct=(snap.exit_executable_pnl_pct
+                     if snap.exit_executable_pnl_pct is not None
+                     else (snap.display_pnl_pct or 0.0)),
+            reason_code=SOFT_EXIT_DEFERRED_ENTRY_GRACE,
+        )
     if not snap.option_bid_valid:
         return ExitDecision(
             action="HOLD", quantity=0,
@@ -1049,6 +1091,37 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         if pos._underlying_stop_breach_ts is not None:
             pos._underlying_stop_breach_ts = None
             log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
+
+    # ══ P0 (PR #385 amendment #2, blocker 3): HARD-EXIT PRE-EVALUATION ════════
+    # Hard exits are evaluated BEFORE every soft branch, matching the declared
+    # EXIT_RULE_PRECEDENCE (STOP_HIT, HARD_STOP, EOD_FORCE_CLOSE first).
+    # Previously the touched-profit / runner / small-win / soft-loss branches ran
+    # first and could return a SOFT_EXIT_DEFERRED_* HOLD when bid/underlying was
+    # missing — trapping a touched_profit=True position at -45% with no exit path,
+    # and letting a 3:55pm deferral return before EOD was ever reached.
+    # These fire on option_pnl (mode-specific last-known truth) regardless of
+    # bid or underlying availability.  The original later blocks remain as
+    # redundant safety.
+
+    # HARD STOP (pre-evaluated)
+    if option_pnl <= _hard_stop:
+        return ExitDecision(
+            action="STOP", quantity=qty_rem,
+            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
+        )
+
+    # EOD FORCE CLOSE (pre-evaluated)
+    _pre_past_eod = (hour > EOD_HARD_CLOSE_HOUR or
+                     (hour == EOD_HARD_CLOSE_HOUR and minute >= EOD_HARD_CLOSE_MIN))
+    _pre_market_closed = (hour >= 16)
+    if _pre_past_eod or (_pre_market_closed and not getattr(pos, "overnight_hold_approved", False)):
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET {'(market closed)' if _pre_market_closed else f'past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}'}",
+            urgency="IMMEDIATE", pnl_pct=option_pnl,
+        )
+    # ══════════════════════════════════════════════════════════════════════════
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
     # Once green, we LOCK IN a minimum profit. Never let a green trade
