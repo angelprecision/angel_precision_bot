@@ -168,6 +168,17 @@ _MIN_HOLD_BEFORE_EXIT_MIN = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT",
 
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
+# ── P0: Soft-exit deferred reason codes ──────────────────────────────────────
+# Used when a soft exit condition is met but the required truth is unavailable.
+# These are explicit stable codes; callers can distinguish real non-confirmation
+# (the underlying moved against us) from missing/stale data.
+SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE           = "SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE"
+SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE               = "SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE"
+SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE           = "SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE"
+SOFT_EXIT_DEFERRED_UNDERLYING_STALE                 = "SOFT_EXIT_DEFERRED_UNDERLYING_STALE"
+SOFT_EXIT_DEFERRED_ENTRY_GRACE                      = "SOFT_EXIT_DEFERRED_ENTRY_GRACE"
+SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED = "SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED"
+
 
 def _et_session_date():
     """Return the current market/session calendar date in America/New_York."""
@@ -241,6 +252,246 @@ def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
     is_index = root in index_roots or ticker in index_roots or any(root.startswith(t) for t in _INDEX_ETFS)
     profile  = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
     return dte, is_index, profile
+
+
+@dataclass(frozen=True)
+class ExitDecisionSnapshot:
+    """Canonical quote/P&L snapshot for one exit evaluation cycle.
+
+    Built once at the top of evaluate_exit() and consumed by every classifier.
+    No exit branch may independently fetch option or underlying quotes after
+    this is built.  One decision evaluation; one coherent snapshot.
+
+    Field semantics
+    ───────────────
+    option_bid / option_ask / option_mid  — raw market data from position state
+    exit_executable_mark   — bid when bid is valid; None otherwise
+                             (NEVER midpoint/ask/last for soft exit decisions)
+    option_bid_valid       — bid is a real finite positive number
+    option_quote_fresh     — quote timestamp within EXIT_ENGINE_STALE_OPTION_QUOTE_SEC
+    exit_executable_pnl_pct — bid-based P&L vs entry; None when bid unavailable
+    display_pnl_pct        — midpoint-based P&L for charting / display only
+
+    underlying_available   — current underlying price is a real positive number
+    underlying_fresh       — underlying timestamp within UNDERLYING_QUOTE_STALE_SEC
+    in_grace_window        — position is inside the soft-exit grace window
+    """
+    # Option truth
+    option_bid:               Optional[float]
+    option_ask:               Optional[float]
+    option_mid:               Optional[float]
+    exit_executable_mark:     Optional[float]
+    option_bid_valid:         bool
+    option_quote_fresh:       bool
+    option_quote_age_sec:     Optional[float]
+    option_quote_ts:          Optional[datetime]
+
+    # Underlying truth
+    underlying_price:         Optional[float]
+    underlying_available:     bool
+    underlying_fresh:         bool
+    underlying_age_sec:       Optional[float]
+
+    # Position-derived truth
+    entry_price:              float
+    exit_executable_pnl_pct:  Optional[float]
+    display_pnl_pct:          Optional[float]
+    touched_profit:           bool
+    in_grace_window:          bool
+
+
+def _build_exit_decision_snapshot(
+    pos: "ManagedPosition",
+    now_utc: Optional[datetime] = None,
+) -> ExitDecisionSnapshot:
+    """Build the canonical ExitDecisionSnapshot for one evaluation cycle.
+
+    Reads from position attributes written by QPM._refresh_once().  Falls back
+    to computing values directly from bid/ask/ts when explicit fields are absent
+    (e.g. positions seeded before this PR deployed).  Never fetches from broker
+    or market data.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    # ── Option bid / ask / mid ────────────────────────────────────────────────
+    bid_raw = getattr(pos, "current_bid", None) or getattr(pos, "currentbid", None)
+    ask_raw = getattr(pos, "current_ask", None) or getattr(pos, "currentask", None)
+    bid = _positive_or_none(bid_raw)
+    ask = _positive_or_none(ask_raw)
+    analytics_mark = _positive_or_none(
+        getattr(pos, "analytics_mark_price", None)
+        or getattr(pos, "analyticsmarkprice", None)
+    )
+    if bid is not None and ask is not None:
+        mid: Optional[float] = round((bid + ask) / 2.0, 4)
+    elif analytics_mark is not None:
+        mid = analytics_mark
+    else:
+        mid = _positive_or_none(getattr(pos, "current_option_price", None)
+                                or getattr(pos, "currentoptionprice", None))
+
+    opt_bid_valid = bid is not None and bid > 0.0
+    exit_executable_mark: Optional[float] = bid if opt_bid_valid else None
+
+    # ── Option quote freshness ────────────────────────────────────────────────
+    # Prefer the explicit QPM-written field; fall back to computing from ts.
+    opt_quote_fresh_direct = getattr(pos, "option_quote_fresh", None) or getattr(pos, "optionquotefresh", None)
+    opt_age_direct = getattr(pos, "option_quote_age_sec", None)
+    opt_ts = (getattr(pos, "last_option_quote_update_ts", None)
+              or getattr(pos, "lastoptionquoteupdatets", None))
+    _exit_stale_sec = float(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", str(STALE_OPTION_QUOTE_MAX_AGE_SEC)))
+
+    if opt_quote_fresh_direct is not None:
+        opt_quote_fresh: bool = bool(opt_quote_fresh_direct)
+        opt_age_sec: Optional[float] = float(opt_age_direct) if opt_age_direct is not None else None
+    elif opt_ts is not None:
+        try:
+            opt_age_sec = max(0.0, (now_utc - opt_ts).total_seconds())
+            opt_quote_fresh = opt_age_sec <= _exit_stale_sec
+        except Exception:
+            opt_age_sec, opt_quote_fresh = None, False
+    else:
+        opt_age_sec, opt_quote_fresh = None, False
+
+    # ── Underlying truth ──────────────────────────────────────────────────────
+    und_raw = getattr(pos, "current_underlying", None) or getattr(pos, "currentunderlying", None)
+    und_price = _positive_or_none(und_raw)
+    und_available = und_price is not None and und_price > 0.0
+
+    und_fresh_direct = getattr(pos, "underlying_fresh", None) or getattr(pos, "underlyingfresh", None)
+    und_age_direct = getattr(pos, "underlying_age_sec", None)
+    und_ts = (getattr(pos, "last_underlying_quote_update_ts", None)
+              or getattr(pos, "lastunderlyingquoteupdatets", None))
+    _und_stale_sec = float(os.getenv("UNDERLYING_QUOTE_STALE_SEC", str(_exit_stale_sec * 2)))
+
+    if und_fresh_direct is not None:
+        und_fresh: bool = bool(und_fresh_direct)
+        und_age_sec: Optional[float] = float(und_age_direct) if und_age_direct is not None else None
+    elif und_ts is not None:
+        try:
+            und_age_sec = max(0.0, (now_utc - und_ts).total_seconds())
+            und_fresh = und_age_sec <= _und_stale_sec
+        except Exception:
+            und_age_sec, und_fresh = None, False
+    else:
+        und_age_sec, und_fresh = None, False
+
+    # ── P&L ──────────────────────────────────────────────────────────────────
+    entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    exec_pnl: Optional[float] = None
+    disp_pnl: Optional[float] = None
+
+    if entry_price > 0.0:
+        # Prefer the explicit QPM-written field for exec P&L
+        exec_pnl_direct = getattr(pos, "exit_executable_pnl_pct", None)
+        if exec_pnl_direct is not None and exit_executable_mark is not None:
+            try:
+                exec_pnl = float(exec_pnl_direct)
+            except Exception:
+                pass
+        elif exit_executable_mark is not None:
+            try:
+                exec_pnl = (exit_executable_mark - entry_price) / entry_price
+            except Exception:
+                pass
+
+        if mid is not None:
+            try:
+                disp_pnl = (mid - entry_price) / entry_price
+            except Exception:
+                pass
+
+    # ── Grace window ──────────────────────────────────────────────────────────
+    age_min = _position_age_minutes(pos)
+    in_grace = age_min < _MIN_HOLD_BEFORE_EXIT_MIN
+
+    return ExitDecisionSnapshot(
+        option_bid            = bid,
+        option_ask            = ask,
+        option_mid            = mid,
+        exit_executable_mark  = exit_executable_mark,
+        option_bid_valid      = opt_bid_valid,
+        option_quote_fresh    = opt_quote_fresh,
+        option_quote_age_sec  = opt_age_sec,
+        option_quote_ts       = opt_ts,
+        underlying_price      = und_price,
+        underlying_available  = und_available,
+        underlying_fresh      = und_fresh,
+        underlying_age_sec    = und_age_sec,
+        entry_price           = entry_price,
+        exit_executable_pnl_pct = exec_pnl,
+        display_pnl_pct       = disp_pnl,
+        touched_profit        = bool(getattr(pos, "touched_profit", False)),
+        in_grace_window       = in_grace,
+    )
+
+
+def _soft_exit_option_truth_gate(
+    snap: ExitDecisionSnapshot,
+    *,
+    qty_rem: int,
+) -> "Optional[ExitDecision]":
+    """Return a HOLD ExitDecision if option executable truth is insufficient.
+    Returns None when truth is sufficient (caller may proceed with the soft exit).
+
+    Must be called before EVERY soft exit branch.  Never call before hard exits.
+    """
+    if not snap.option_bid_valid:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason="SOFT_EXIT_DEFERRED — option bid unavailable; executable truth required for soft exits",
+            urgency="NORMAL",
+            pnl_pct=snap.display_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
+        )
+    if not snap.option_quote_fresh:
+        age_str = f"{snap.option_quote_age_sec:.0f}s" if snap.option_quote_age_sec is not None else "unknown"
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=f"SOFT_EXIT_DEFERRED — option quote stale ({age_str}); fresh executable truth required",
+            urgency="NORMAL",
+            pnl_pct=snap.display_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE,
+        )
+    if snap.exit_executable_pnl_pct is None:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason="SOFT_EXIT_DEFERRED — executable P&L unavailable (missing entry or valid bid)",
+            urgency="NORMAL",
+            pnl_pct=0.0,
+            reason_code=SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
+        )
+    return None
+
+
+def _soft_exit_underlying_truth_gate(
+    snap: ExitDecisionSnapshot,
+) -> "Optional[ExitDecision]":
+    """Return a HOLD ExitDecision if underlying truth is insufficient for
+    underlying-dependent soft exits.  Returns None when truth is sufficient.
+
+    ONLY call this for exit branches that require underlying direction confirmation
+    (soft stops, never-green stops).  Take-profit / trail branches do NOT need
+    underlying confirmation and must NOT call this gate.
+    """
+    if not snap.underlying_available:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason="SOFT_EXIT_DEFERRED — underlying price unavailable; cannot confirm thesis for soft exit",
+            urgency="NORMAL",
+            pnl_pct=snap.exit_executable_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+        )
+    if not snap.underlying_fresh:
+        age_str = f"{snap.underlying_age_sec:.0f}s" if snap.underlying_age_sec is not None else "unknown"
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=f"SOFT_EXIT_DEFERRED — underlying quote stale ({age_str}); fresh truth required",
+            urgency="NORMAL",
+            pnl_pct=snap.exit_executable_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
+        )
+    return None
 
 
 def _effective_thresholds(pos: "ManagedPosition") -> tuple:
@@ -713,13 +964,29 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     alert that previously lived here (blocking requests.post under self._lock)
     has been moved to _submit_exit_decision(), which fires it after the
     callback returns, outside both lock sections.
+
+    P0 (soft-exit executable-truth): Builds one canonical ExitDecisionSnapshot
+    at the top of evaluation.  All soft exit branches use exec_pnl from the
+    snapshot (always BID-based) rather than option_pnl_pct (which is midpoint
+    for PAPER positions).  Hard exits retain backward-compatible option_pnl_pct
+    so they fire even when bid is unavailable.
     """
     if now_et is None:
         now_et = datetime.now(ET)
     _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
 
+    # ── Build canonical decision snapshot ────────────────────────────────────
+    # One snapshot per evaluation; all soft exit branches consume it.
+    now_utc = datetime.now(timezone.utc)
+    snap = _build_exit_decision_snapshot(pos, now_utc)
+
     hour, minute = now_et.hour, now_et.minute
+    # option_pnl: backward-compatible (bid for LIVE, mid for PAPER) — ONLY used
+    # by hard exits that must fire even without a valid bid.
     option_pnl   = pos.option_pnl_pct
+    # exec_pnl: always BID-based — used by ALL soft exit branches.
+    # May be None when bid is missing.  Soft exit gates will catch None.
+    exec_pnl     = snap.exit_executable_pnl_pct
     qty_rem      = pos.quantity_remaining
 
     # ── 1. TARGET HIT ────────────────────────────────────────────────────────
@@ -777,7 +1044,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
     # Once green, we LOCK IN a minimum profit. Never let a green trade
-    # become a loss. Average winner target = 25%.
+    # become a loss.  Uses executable BID P&L only (never midpoint).
+    # Gated on fresh executable bid truth — stale/missing bid defers.
     #
     # Floor logic (option_pnl must stay ABOVE floor or we exit):
     #   peak >= 25%  → floor +12%  (never give back more than 13pts of a big winner)
@@ -786,6 +1054,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     #   peak >= 5%   → floor +3%   (MINIMUM green — never turn a 5%+ win into a loss)
     #   any green    → floor  0%   (breakeven floor — touched green = never go red)
     if pos.scale_outs_done == 0 and pos.touched_profit:
+        # ── Option executable truth gate (soft exit) ─────────────────────────
+        _tp_option_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _tp_option_gate is not None:
+            return _tp_option_gate
+
         _max = pos.max_profit_seen or 0
         if _max >= 0.25:
             _floor = 0.12   # secured 12% minimum
@@ -798,12 +1071,18 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         else:
             _floor = 0.00   # any green: floor at breakeven
 
-        if option_pnl <= _floor:
-            # Before firing: check if underlying still confirming.
+        # Use exec_pnl (BID-based) for the floor comparison, not midpoint.
+        _tp_pnl = exec_pnl if exec_pnl is not None else option_pnl
+        if _tp_pnl <= _floor:
+            # Before firing: apply underlying data truth gate.
+            # Missing or stale underlying → defer (not genuine non-confirmation).
+            _tp_und_gate = _soft_exit_underlying_truth_gate(snap)
+            if _tp_und_gate is not None:
+                return _tp_und_gate
+
+            # Underlying data is fresh and available — check direction.
             # A single penny drop on a cheap contract (-9%) is not a real signal
             # if the underlying is still moving in our direction.
-            # The thesis check applies regardless of age — if underlying
-            # is still holding, we do not punish the option for spread noise.
             _age_min = _position_age_minutes(pos)
             _confirming, _confirm_reason = _underlying_still_confirming(pos)
             _MAX_THESIS_OVERRIDE = float(
@@ -813,19 +1092,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 # Underlying still in our direction — hold, don't exit on noise
                 log.info(
                     "[%s] TOUCHED_PROFIT_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin thesis window | pnl=%.1f%%",
+                    "(%s) | age=%.1fmin < %.0fmin thesis window | exec_pnl=%.1f%%",
                     pos.ticker, _confirm_reason, _age_min,
-                    _MAX_THESIS_OVERRIDE, option_pnl * 100,
+                    _MAX_THESIS_OVERRIDE, _tp_pnl * 100,
                 )
             else:
                 return ExitDecision(
                     action="CLOSE_ALL", quantity=qty_rem,
                     reason=(
                         f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
-                        f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}% | "
+                        f"now {_tp_pnl*100:.0f}% (exec/bid) — floor={_floor*100:.0f}% | "
                         f"underlying={'confirming' if _confirming else 'not confirming'}"
                     ),
-                    urgency="IMMEDIATE", pnl_pct=option_pnl,
+                    urgency="IMMEDIATE", pnl_pct=_tp_pnl,
                 )
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
@@ -836,8 +1115,12 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Do NOT close everything at 15% — let winners run to 25-30%+ with trail.
     # Single-contract positions: hold until trail fires or 30%+ hit.
 
-    # Scale 1: first +10% hit → sell first third
-    if option_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+    # Scale 1: first +15% hit → sell first third
+    # Uses executable BID P&L — midpoint above threshold but bid below does NOT trigger.
+    _scale_gate_1 = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+    if exec_pnl is not None and exec_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+        if _scale_gate_1 is not None:
+            return _scale_gate_1
         if qty_rem <= 1:
             # 1 contract — do NOT sell here, let it run to trail
             pass  # fall through to trail/profit-lock checks
@@ -845,20 +1128,23 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             qty_s1 = max(1, round(qty_rem / 3))
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s1,
-                reason=f"SCALE_1 (+15%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +25%",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"SCALE_1 (+15% exec/bid) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +25%",
+                urgency="HIGH", pnl_pct=exec_pnl,
             )
 
-    # Scale 2: +20% hit → sell second third
-    if option_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+    # Scale 2: +25% hit → sell second third
+    _scale_gate_2 = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+    if exec_pnl is not None and exec_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+        if _scale_gate_2 is not None:
+            return _scale_gate_2
         if qty_rem <= 1:
             pass  # 1 contract runner — let it run to +30% or trail
         else:
             qty_s2 = max(1, round(qty_rem / 2))  # half of what's left ≈ second third of original
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s2,
-                reason=f"SCALE_2 (+25%) -- selling {qty_s2}/{qty_rem} runner | targeting +40%",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"SCALE_2 (+25% exec/bid) -- selling {qty_s2}/{qty_rem} runner | targeting +40%",
+                urgency="HIGH", pnl_pct=exec_pnl,
             )
 
     # Scale 3: +30% → close remainder (full exit for final runner)
@@ -873,27 +1159,35 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # FIX-1: Discord runner alert moved to _submit_exit_decision(). This branch
     # now returns the alert metadata on the decision object instead of calling
     # requests.post() here under self._lock.
+    # P0: Uses executable BID P&L for both peak and drawdown comparisons.
     _single_contract = (qty_rem == 1 and pos.scale_outs_done == 0)
     if (pos.scale_outs_done >= 1 or _single_contract) and pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
+        # ── Option executable truth gate ─────────────────────────────────────
+        _runner_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _runner_opt_gate is not None:
+            return _runner_opt_gate
+
+        # exec_pnl is guaranteed non-None here (gate passed above).
+        _r_pnl = exec_pnl  # type: ignore[assignment]
 
         # ── PROFIT FLOOR CHECK — fires before trail math ──────────────────────
-        # If peak crossed a floor threshold and current P&L is below that floor,
+        # If peak crossed a floor threshold and current BID P&L is below that floor,
         # sell immediately. This protects against QPM gaps missing the peak.
-        # Example: peaked at +25% (floor=10%), now at +7% → EXIT at +7%.
+        # Example: peaked at +25% (floor=10%), now bid at +7% → EXIT at +7%.
         _applicable_floor = 0.0
         for _floor_trigger, _floor_min in sorted(PROFIT_FLOOR.items(), reverse=True):
             if pos.peak_pnl_pct >= _floor_trigger:
                 _applicable_floor = _floor_min
                 break
-        if _applicable_floor > 0 and 0 < option_pnl < _applicable_floor:
+        if _applicable_floor > 0 and 0 < _r_pnl < _applicable_floor:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"PROFIT LOCK — peaked +{pos.peak_pnl_pct*100:.0f}%, "
-                    f"now +{option_pnl*100:.0f}% below floor +{_applicable_floor*100:.0f}%"
+                    f"now +{_r_pnl*100:.0f}% (exec/bid) below floor +{_applicable_floor*100:.0f}%"
                 ),
                 urgency="IMMEDIATE",
-                pnl_pct=option_pnl,
+                pnl_pct=_r_pnl,
                 reason_code="PROFIT_LOCK",
             )
         # ─────────────────────────────────────────────────────────────────────
@@ -910,8 +1204,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             _runner_trail = 0.08   # single contracts: tight 8% trail (was 12%)
         else:
             _runner_trail = 0.15   # multi-contract runner: 15% trail (was 20%)
-        runner_drop = pos.peak_pnl_pct - option_pnl
-        if runner_drop >= _runner_trail or option_pnl <= 0:
+        runner_drop = pos.peak_pnl_pct - _r_pnl
+        if runner_drop >= _runner_trail or _r_pnl <= 0:
             _dur_min = 0
             try:
                 _opened_ts = pos.opened_at.timestamp() if hasattr(pos.opened_at, "timestamp") else time.time()
@@ -922,9 +1216,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"RUNNER TRAIL EXIT -- peaked +{pos.peak_pnl_pct*100:.0f}%, "
-                    f"now +{option_pnl*100:.0f}%, protecting runner gains"
+                    f"now +{_r_pnl*100:.0f}% (exec/bid), protecting runner gains"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_r_pnl,
             )
             # FIX-1: carry alert metadata so _submit_exit_decision() can fire
             # the Discord notification after callback returns (outside lock).
@@ -935,16 +1229,21 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             return d
 
     # ── SMALL WIN CAPTURE ─────────────────────────────────────────────────────
+    # P0: gate on executable bid truth; use exec_pnl for comparison.
     if pos.max_profit_seen >= SMALL_WIN_PCT:
+        _sw_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _sw_gate is not None:
+            return _sw_gate
+        _sw_pnl = exec_pnl if exec_pnl is not None else option_pnl
         floor = max(0.03, pos.max_profit_seen - SMALL_WIN_TRAIL)
-        if 0 < option_pnl <= floor:
+        if 0 < _sw_pnl <= floor:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"SMALL WIN LOCK — peaked +{pos.max_profit_seen*100:.0f}%, "
-                    f"protecting +{option_pnl*100:.0f}%"
+                    f"protecting +{_sw_pnl*100:.0f}% (exec/bid)"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_sw_pnl,
             )
 
     # Underlying progress: if 60%+ toward scanner target, log but do NOT close.
@@ -988,7 +1287,23 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Prevents exiting on intraday wicks that immediately recover
     _STOP_CONFIRM_SEC   = float(os.getenv("STOP_BREACH_CONFIRM_SECONDS", "45"))
 
-    if option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit:
+    # P0: Use exec_pnl (BID-based) for the soft-loss stop threshold comparison.
+    # Underlying is required for this branch — apply both gates before evaluating.
+    _sl_pnl = exec_pnl if exec_pnl is not None else option_pnl  # fallback for breach-stamp only
+    if (exec_pnl is not None and exec_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit) or \
+       (exec_pnl is None and option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit):
+        # ── Option truth gate ────────────────────────────────────────────────
+        _sl_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _sl_opt_gate is not None:
+            return _sl_opt_gate
+        _sl_pnl = exec_pnl  # type: ignore[assignment]  # guaranteed non-None after gate
+
+        # ── Underlying truth gate ─────────────────────────────────────────────
+        # Missing or stale underlying → DEFER (not genuine non-confirmation).
+        _sl_und_gate = _soft_exit_underlying_truth_gate(snap)
+        if _sl_und_gate is not None:
+            return _sl_und_gate
+
         _soft_age       = _position_age_minutes(pos)
         _soft_confirm, _soft_reason = _underlying_still_confirming(pos)
 
@@ -1011,14 +1326,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             # First time we see this breach — stamp it, don't exit yet
             pos._stop_breach_ts = _now_dt
             log.info(
-                "[%s] STOP_BREACH_STARTED — %.1f%% loss | confirming=%s | "
+                "[%s] STOP_BREACH_STARTED — %.1f%% exec/bid loss | confirming=%s | "
                 "will exit if breach holds >%.0fs | age=%.1fmin",
-                pos.ticker, option_pnl * 100, _soft_confirm, _STOP_CONFIRM_SEC, _soft_age,
+                pos.ticker, _sl_pnl * 100, _soft_confirm, _STOP_CONFIRM_SEC, _soft_age,
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
-                reason=f"STOP_BREACH_STARTED — {option_pnl*100:.1f}% loss | breach stamped, waiting for confirmation window",
-                urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_STARTED",
+                reason=f"STOP_BREACH_STARTED — {_sl_pnl*100:.1f}% exec/bid loss | breach stamped, waiting for confirmation window",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_STARTED",
             )
 
         _breach_age_sec = (_now_dt - _breach_dt).total_seconds()
@@ -1030,81 +1345,84 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 pos._stop_breach_ts = None
                 log.info(
                     "[%s] STOP_BREACH_RESET — underlying recovered (%.2f%% move) "
-                    "| option=%.1f%% | breach lasted %.0fs < %.0fs confirm window",
-                    pos.ticker, _u_move * 100, option_pnl * 100,
+                    "| exec/bid=%.1f%% | breach lasted %.0fs < %.0fs confirm window",
+                    pos.ticker, _u_move * 100, _sl_pnl * 100,
                     _breach_age_sec, _STOP_CONFIRM_SEC,
                 )
                 return ExitDecision(
                     action="HOLD", quantity=0,
                     reason=f"STOP_BREACH_RESET — underlying recovered {_u_move*100:.2f}%, wick not confirmed",
-                    urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_RESET",
+                    urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_RESET",
                 )
             # Still in confirmation window — log and wait
             log.info(
-                "[%s] STOP_BREACH_CONFIRMING — %.1f%% loss | breach=%.0fs/%.0fs | "
+                "[%s] STOP_BREACH_CONFIRMING — %.1f%% exec/bid loss | breach=%.0fs/%.0fs | "
                 "underlying=%s",
-                pos.ticker, option_pnl * 100, _breach_age_sec, _STOP_CONFIRM_SEC,
+                pos.ticker, _sl_pnl * 100, _breach_age_sec, _STOP_CONFIRM_SEC,
                 _soft_reason,
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
-                reason=f"STOP_BREACH_CONFIRMING — {option_pnl*100:.1f}% loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
-                urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_CONFIRMING",
+                reason=f"STOP_BREACH_CONFIRMING — {_sl_pnl*100:.1f}% exec/bid loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_CONFIRMING",
             )
 
         # ── Breach confirmed (held past confirmation window) ──────────────────
         # Now evaluate whether to exit
 
         # Past -20% with confirmed breach → exit, bid-limit
-        if option_pnl <= _SOFT_LOSS_DEEP_PCT:
+        if _sl_pnl <= _SOFT_LOSS_DEEP_PCT:
             pos._stop_breach_ts = None
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
-                    f"DEEP_LOSS_STOP — {option_pnl*100:.0f}% exceeds deep floor "
+                    f"DEEP_LOSS_STOP — {_sl_pnl*100:.0f}% exec/bid exceeds deep floor "
                     f"{_SOFT_LOSS_DEEP_PCT*100:.0f}% | confirmed {_breach_age_sec:.0f}s | "
                     f"underlying={_soft_reason}"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_sl_pnl,
             )
 
         # Young position with confirming underlying → suppress, give more time
         if _soft_age < _MIN_HOLD_SOFT and (_soft_confirm or _strong_confirm):
             log.info(
-                "[%s] SOFT_STOP_SUPPRESSED — %.1f%% loss but age=%.1fmin < %.0fmin "
+                "[%s] SOFT_STOP_SUPPRESSED — %.1f%% exec/bid loss but age=%.1fmin < %.0fmin "
                 "hold floor | underlying=%s | giving thesis time to develop",
-                pos.ticker, option_pnl * 100, _soft_age, _MIN_HOLD_SOFT, _soft_reason,
+                pos.ticker, _sl_pnl * 100, _soft_age, _MIN_HOLD_SOFT, _soft_reason,
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
                 reason=f"SOFT_STOP_SUPPRESSED — age {_soft_age:.1f}min < {_MIN_HOLD_SOFT:.0f}min floor, underlying confirming",
-                urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_STOP_SUPPRESSED",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="SOFT_STOP_SUPPRESSED",
             )
 
         if not _soft_confirm:
             # Thesis confirmed broken — underlying not holding, breach confirmed
+            # NOTE: _underlying_still_confirming returning "no_underlying_data" is NOT
+            # reachable here because the underlying gate above already deferred for
+            # missing/stale data.  Any "not confirming" here is genuine adverse movement.
             pos._stop_breach_ts = None
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
-                    f"THESIS_FAIL_SOFT_STOP — {option_pnl*100:.0f}% loss "
+                    f"THESIS_FAIL_SOFT_STOP — {_sl_pnl*100:.0f}% exec/bid loss "
                     f"and underlying not confirming ({_soft_reason}) | "
                     f"age={_soft_age:.1f}min | confirmed {_breach_age_sec:.0f}s"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_sl_pnl,
             )
 
         # Thesis still valid — watch, don't exit on time alone
         log.warning(
-            "[%s] SOFT_LOSS_WATCH — %.1f%% loss | underlying=%s | "
+            "[%s] SOFT_LOSS_WATCH — %.1f%% exec/bid loss | underlying=%s | "
             "age=%.1fmin | breach confirmed %.0fs | waiting for thesis to break",
-            pos.ticker, option_pnl * 100, _soft_reason,
+            pos.ticker, _sl_pnl * 100, _soft_reason,
             _soft_age, _breach_age_sec,
         )
         return ExitDecision(
             action="HOLD", quantity=0,
-            reason=f"SOFT_LOSS_WATCH — {option_pnl*100:.1f}% loss | thesis holding, underlying={_soft_reason}",
-            urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_LOSS_WATCH",
+            reason=f"SOFT_LOSS_WATCH — {_sl_pnl*100:.1f}% exec/bid loss | thesis holding, underlying={_soft_reason}",
+            urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="SOFT_LOSS_WATCH",
         )
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
@@ -1136,7 +1454,23 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             elif _age_min < 20: _ng_stop = -0.10
             else:               _ng_stop = -0.08
 
-        if option_pnl <= _ng_stop:
+        # P0: use exec_pnl (BID) for comparison — midpoint below threshold does not fire.
+        _ng_pnl = exec_pnl if exec_pnl is not None else option_pnl
+        if _ng_pnl <= _ng_stop:
+            # ── Option truth gate ────────────────────────────────────────────
+            _ng_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+            if _ng_opt_gate is not None:
+                return _ng_opt_gate
+            _ng_pnl = exec_pnl  # type: ignore[assignment]  # non-None after gate
+
+            # ── Underlying truth gate ────────────────────────────────────────
+            # Missing/stale underlying → DEFER.  Never treat missing data as
+            # "thesis never confirmed" — that is only valid when we actually
+            # have confirming underlying price data and it says wrong direction.
+            _ng_und_gate = _soft_exit_underlying_truth_gate(snap)
+            if _ng_und_gate is not None:
+                return _ng_und_gate
+
             _ng_age_min = _position_age_minutes(pos)
             _ng_confirming, _ng_confirm_reason = _underlying_still_confirming(pos)
             # PR-A / BUG-4: read from unified module-level constant; previously
@@ -1152,9 +1486,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             if _ng_confirming and _ng_age_min < _MIN_HOLD_NG:
                 log.info(
                     "[%s] NEVER_GREEN_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin hold floor | pnl=%.1f%%",
+                    "(%s) | age=%.1fmin < %.0fmin hold floor | exec_pnl=%.1f%%",
                     pos.ticker, _ng_confirm_reason, _ng_age_min,
-                    _MIN_HOLD_NG, option_pnl * 100,
+                    _MIN_HOLD_NG, _ng_pnl * 100,
                 )
             else:
                 _profile = (
@@ -1165,11 +1499,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 return ExitDecision(
                     action="CLOSE_ALL", quantity=qty_rem,
                     reason=(
-                        f"NEVER GREEN STOP [{_profile}] — {option_pnl*100:.0f}% "
+                        f"NEVER GREEN STOP [{_profile}] — {_ng_pnl*100:.0f}% (exec/bid) "
                         f"at {_ng_age_min:.0f}min | threshold={_ng_stop*100:.0f}% | "
                         f"thesis never confirmed | underlying:{_ng_confirm_reason}"
                     ),
-                    urgency="HIGH", pnl_pct=option_pnl,
+                    urgency="HIGH", pnl_pct=_ng_pnl,
                 )
 
     # ── HARD STOP ─────────────────────────────────────────────────────────────
@@ -1180,20 +1514,25 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="IMMEDIATE", pnl_pct=option_pnl,
         )
 
-    # ── PROFIT LOCK ───────────────────────────────────────────────────────────
+    # ── PROFIT LOCK / TRAILING STOP ───────────────────────────────────────────
+    # P0: gate on executable bid truth; use exec_pnl for comparisons.
     if pos.peak_pnl_pct >= _immediate_tp:
-        if option_pnl <= _profit_lock:
+        _pl_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _pl_opt_gate is not None:
+            return _pl_opt_gate
+        _pl_pnl = exec_pnl  # type: ignore[assignment]  # non-None after gate
+        if _pl_pnl <= _profit_lock:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
-                reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, fell to +{option_pnl*100:.0f}% — locking in",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, exec/bid fell to +{_pl_pnl*100:.0f}% — locking in",
+                urgency="HIGH", pnl_pct=_pl_pnl,
             )
-        drop_from_peak = pos.peak_pnl_pct - option_pnl
+        drop_from_peak = pos.peak_pnl_pct - _pl_pnl
         if drop_from_peak >= TRAIL_DROP_FROM_PEAK:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
-                reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, dropped {drop_from_peak*100:.0f}pts to +{option_pnl*100:.0f}%",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, exec/bid dropped {drop_from_peak*100:.0f}pts to +{_pl_pnl*100:.0f}%",
+                urgency="HIGH", pnl_pct=_pl_pnl,
             )
 
     # ── TREND DAY MULTIPLIERS ─────────────────────────────────────────────────
@@ -1222,15 +1561,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── 4. PROFIT PROTECTION -- WINDOW 3 (2:00 PM+) ──────────────────────────
+    # P0: gate on executable bid truth; use exec_pnl for profit comparison.
     past_window3 = (hour > PROFIT_PROTECT_3_HOUR or
                     (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN))
     protect3_thresh = 0.50 if direction_aligns else PROTECT_3_THRESHOLD
-    if past_window3 and option_pnl >= protect3_thresh:
+    if past_window3 and exec_pnl is not None and exec_pnl >= protect3_thresh:
+        _w3_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _w3_gate is not None:
+            return _w3_gate
         trend_note = " [trend day -- raised to 50% threshold]" if direction_aligns else ""
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"PROFIT PROTECT W3 -- +{option_pnl*100:.0f}% at 2PM+{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl,
+            reason=f"PROFIT PROTECT W3 -- +{exec_pnl*100:.0f}% exec/bid at 2PM+{trend_note}",
+            urgency="HIGH", pnl_pct=exec_pnl,
         )
 
     # ── 5. PROFIT PROTECTION -- WINDOW 2 (1:00 PM+, or 1:30 PM on trend day) ─
@@ -1243,13 +1586,16 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w2_min  -= 60
     past_window2 = (hour > w2_hour or (hour == w2_hour and minute >= w2_min))
     scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
-    if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
+    if past_window2 and exec_pnl is not None and exec_pnl >= scale2_threshold and pos.scale_outs_done < 2:
+        _w2_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _w2_gate is not None:
+            return _w2_gate
         qty_close  = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
         trend_note = " [TREND DAY -- reduced scale]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W2 -- +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}+ scale{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl,
+            reason=f"PROFIT PROTECT W2 -- +{exec_pnl*100:.0f}% exec/bid at {w2_hour}:{w2_min:02d}+ scale{trend_note}",
+            urgency="HIGH", pnl_pct=exec_pnl,
         )
 
     # ── 6. PROFIT PROTECTION -- WINDOW 1 (11:00 AM+, or 11:30 AM on trend day) ─
@@ -1262,22 +1608,30 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w1_min  -= 60
     past_window1 = (hour > w1_hour or (hour == w1_hour and minute >= w1_min))
     scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
-    if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
+    if past_window1 and exec_pnl is not None and exec_pnl >= scale1_threshold and pos.scale_outs_done < 1:
+        _w1_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _w1_gate is not None:
+            return _w1_gate
         qty_close  = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
         trend_note = " [TREND DAY -- let runner breathe]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W1 -- +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}+ scale{trend_note}",
-            urgency="NORMAL", pnl_pct=option_pnl,
+            reason=f"PROFIT PROTECT W1 -- +{exec_pnl*100:.0f}% exec/bid at {w1_hour}:{w1_min:02d}+ scale{trend_note}",
+            urgency="NORMAL", pnl_pct=exec_pnl,
         )
 
     # ── 7. THETA KILL SWITCH (past noon, down >35%) ───────────────────────────
+    # P0: gate on executable truth; use exec_pnl for loss comparison.
     past_noon = hour >= 12
-    if past_noon and option_pnl <= THETA_STOP_LOSS_PCT:
+    _theta_pnl = exec_pnl if exec_pnl is not None else option_pnl
+    if past_noon and _theta_pnl <= THETA_STOP_LOSS_PCT:
+        _theta_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _theta_gate is not None:
+            return _theta_gate
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"THETA STOP -- option down {option_pnl*100:.0f}% after noon, cutting losses",
-            urgency="NORMAL", pnl_pct=option_pnl,
+            reason=f"THETA STOP -- exec/bid down {_theta_pnl*100:.0f}% after noon, cutting losses",
+            urgency="NORMAL", pnl_pct=_theta_pnl,
         )
 
     return ExitDecision(
@@ -5798,6 +6152,13 @@ class APExitEngine:
                 # and trail/profit-floor logic fires based on a false 0% peak.
                 # Fix: advance peak from ANY non-zero option price, stale or not.
                 # Never allow a QPM gap to erase a real peak.
+                #
+                # P0 amendment: peak_pnl_pct and max_profit_seen may advance from
+                # any non-zero price (preserving the anti-QPM-gap intent).  However,
+                # touched_profit MUST ONLY arm from bid-proven executable truth:
+                # the consecutive confirmation is handled by QPM._refresh_once();
+                # here we only propagate touched_profit=True when current_bid > 0
+                # so a midpoint spike (PAPER) cannot arm touched_profit in the engine.
                 if pos.current_option_price > 0 and pos.entry_price > 0:
                     _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
                     if _raw_pnl > pos.peak_pnl_pct:
@@ -5807,8 +6168,18 @@ class APExitEngine:
                             pos.ticker, _raw_pnl * 100,
                             pos.current_option_price, pos.entry_price,
                         )
-                    if _raw_pnl > 0:
+                    # touched_profit: only arm from bid-proven executable truth.
+                    # QPM already enforces consecutive confirmation.  The exit engine
+                    # re-checks here as a defence-in-depth guard against midpoint arming.
+                    _pg_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    _pg_bid_valid = _pg_bid > 0.0
+                    if _raw_pnl > 0 and _pg_bid_valid:
                         pos.touched_profit = True
+                        if _raw_pnl > pos.max_profit_seen:
+                            pos.max_profit_seen = _raw_pnl
+                    elif _raw_pnl > 0 and not _pg_bid_valid:
+                        # Advance max_profit_seen for anti-QPM-gap peak tracking,
+                        # but do NOT arm touched_profit without a valid bid.
                         if _raw_pnl > pos.max_profit_seen:
                             pos.max_profit_seen = _raw_pnl
                     # Keep in-memory option_pnl_pct fresh for the DB write
