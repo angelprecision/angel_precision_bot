@@ -113,6 +113,7 @@ jobs:
             tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
             tests/test_p0_unknown_execution_mode_fail_closed.py \
             tests/test_p0_live_executable_bid_pnl.py \
+            tests/test_p0_soft_exit_quote_truth.py \
             tests/test_p0_canonical_exit_fill_truth.py \
             tests/test_p0_partial_exit_ownership_guard.py \
             tests/test_p0_exit_position_ambiguity_guard.py \
@@ -130,6 +131,11 @@ jobs:
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
             -v --tb=short --color=yes
+
+      - name: Run PEP LULU ABT exit replays
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
+        run: python -m ap.soft_exit_replay
 
       - name: Summary
         if: always()
