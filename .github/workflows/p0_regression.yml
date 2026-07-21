@@ -114,6 +114,7 @@ jobs:
             tests/test_p0_unknown_execution_mode_fail_closed.py \
             tests/test_p0_live_executable_bid_pnl.py \
             tests/test_p0_soft_exit_quote_truth.py \
+            tests/test_p0_underlying_level_truth_guard.py \
             tests/test_p0_canonical_exit_fill_truth.py \
             tests/test_p0_partial_exit_ownership_guard.py \
             tests/test_p0_exit_position_ambiguity_guard.py \
