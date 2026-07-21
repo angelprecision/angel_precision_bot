@@ -2764,6 +2764,89 @@ class TestAmendment7HardRefPersistenceRoundTrip:
         assert payload["ts"] == now.isoformat()
         assert payload["refresh_needed"] is False
 
+    def test_qpm_mark_only_catastrophic_missing_mark_ts_uses_fresh_receipt_and_hard_stops(self, monkeypatch):
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        pos = _qpm_pos("pos-MARK-RECEIPT-CAT", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0, "ask": 0, "mark": 0.55, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_source == "mark"
+        assert pos.hard_exit_reference_validity == "proven"
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.45)
+        decision = evaluate_exit(_mp_from_qpm_pos(pos), _et_noon().replace(hour=10))
+        assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
+        assert "HARD STOP" in decision.reason
+
+    def test_qpm_mark_only_healthy_missing_mark_ts_uses_fresh_receipt(self, monkeypatch):
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        pos = _qpm_pos("pos-MARK-RECEIPT-HEALTHY", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0, "ask": 0, "mark": 1.10, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_source == "mark"
+        assert pos.hard_exit_reference_validity == "proven"
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(0.10)
+
+    def test_qpm_mark_explicit_stale_mark_ts_is_not_laundered_by_fresh_receipt(self, monkeypatch):
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        old_mark_ts = datetime.now(_UTC) - timedelta(seconds=120)
+        pos = _qpm_pos("pos-MARK-EXPLICIT-STALE", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {
+                "bid": 0, "ask": 0, "mark": 0.55, "last": 0,
+                "mark_ts": old_mark_ts,
+            },
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_source == "mark_stale"
+        assert pos.hard_exit_reference_validity == "unproven"
+        assert pos.hard_exit_reference_ts == old_mark_ts
+
+    def test_qpm_mark_missing_mark_ts_with_old_cached_receipt_remains_unproven(self, monkeypatch):
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        old_receipt = time.time() - 120
+        pos = _qpm_pos("pos-MARK-OLD-RECEIPT", execution_mode="live")
+        qpm = _make_qpm([pos], {"ABT": {"last": 149.0}})
+        monkeypatch.setattr(
+            qpm,
+            "_fetch_batch_cached",
+            lambda symbols: {
+                "ABT260721P00150000": {
+                    "bid": 0, "ask": 0, "mark": 0.55, "last": 0,
+                    "_ap_receipt_epoch": old_receipt,
+                },
+                "ABT": {"last": 149.0, "_ap_receipt_epoch": old_receipt},
+            },
+        )
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_source == "mark_stale"
+        assert pos.hard_exit_reference_validity == "unproven"
+
     def test_qpm_missing_bid_catastrophic_ask_persists_catastrophic_validity(self, monkeypatch):
         capture = _patch_qpm_db(monkeypatch)
         monkeypatch.setattr(

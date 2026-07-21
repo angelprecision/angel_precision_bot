@@ -633,7 +633,10 @@ class APPositionQuoteMonitor:
                     oq.get("last_trade_ts") or oq.get("trade_date"),
                     now_utc=now_utc,
                 )
-                _mark_ts = normalize_hard_ref_ts(oq.get("mark_ts"), now_utc=now_utc)
+                _raw_mark_ts = oq.get("mark_ts")
+                _mark_ts = normalize_hard_ref_ts(_raw_mark_ts, now_utc=now_utc)
+                if _mark_for_ref > 0 and _raw_mark_ts in (None, ""):
+                    _mark_ts = _receipt_ts
                 _bid_ts = normalize_hard_ref_ts(oq.get("bid_ts"), now_utc=now_utc) or (_receipt_ts if bid > 0 else None)
                 _ask_ts = normalize_hard_ref_ts(oq.get("ask_ts"), now_utc=now_utc) or (_receipt_ts if ask > 0 else None)
 
