@@ -565,6 +565,73 @@ TRAIL_DROP_FROM_PEAK  = 0.10   # 10pt drop from peak fires exit (e.g. +30% → e
 SMALL_WIN_PCT         = 0.12   # trail kicks in once we've seen +12%
 SMALL_WIN_TRAIL       = 0.08   # floor 8pt below peak (seen +20% → floor at +12%)
 
+# ── HARD-EXIT REFERENCE EXPIRATION ───────────────────────────────────────────
+# A "proven" label cannot remain trusted forever — it was computed at a
+# specific moment.  After this threshold the label is considered expired and
+# the consumer must fall back to option_pnl_pct.  The threshold is deliberately
+# generous (5 minutes) because a freshly-proven reference should stay trusted
+# through a brief QPM gap, but not through a full QPM outage where new
+# catastrophic losses could accumulate undetected.
+HARD_REF_MAX_AGE_SEC = float(os.getenv("HARD_EXIT_REF_MAX_AGE_SEC", "300"))
+
+
+def get_effective_hard_exit_reference(
+    pos: "ManagedPosition",
+    now_utc: "Optional[datetime]" = None,
+) -> "Optional[float]":
+    """Single authority for resolving hard-exit P&L across all consumers.
+
+    Returns the hard-exit reference P&L when the stored reference is:
+      - validity in ("proven", "catastrophic_ask"), AND
+      - timestamp parses successfully AND age is within HARD_REF_MAX_AGE_SEC.
+
+    Returns None when:
+      - no hard-exit reference exists on the position (pre-amendment),
+      - validity is "unproven" or "no_data",
+      - the timestamp cannot be parsed,
+      - the reference has expired (age > HARD_REF_MAX_AGE_SEC).
+
+    All four consumers (evaluate_exit, _check_all_positions pre-gate,
+    _run_sentinels, emergency_flatten) MUST call this function.  None of them
+    may read hard_exit_reference_pnl_pct directly.
+
+    PR #385 amendment #6, blocker 2: consumers were trusting a validity label
+    without recomputing age.  A stale healthy reference could hide a new
+    catastrophic loss (false safety during QPM outage); a stale catastrophic
+    reference could manufacture a false forced exit.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    validity = str(getattr(pos, "hard_exit_reference_validity",
+                            getattr(pos, "hardexitreferencevalidity", "")) or "")
+    if validity not in ("proven", "catastrophic_ask"):
+        return None
+
+    pnl_raw = getattr(pos, "hard_exit_reference_pnl_pct",
+                      getattr(pos, "hardexitreferencepnlpct", None))
+    if pnl_raw is None:
+        return None
+
+    try:
+        pnl = float(pnl_raw)
+    except (TypeError, ValueError):
+        return None
+
+    ts = getattr(pos, "hard_exit_reference_ts",
+                 getattr(pos, "hardexitreferencets", None))
+    if ts is None:
+        return None  # no timestamp → cannot verify freshness → fail closed
+
+    try:
+        age_sec = max(0.0, (now_utc - ts).total_seconds())
+    except Exception:
+        return None  # unparseable timestamp → fail closed
+
+    if age_sec > HARD_REF_MAX_AGE_SEC:
+        return None  # expired — consumer must fall back to option_pnl_pct
+
+    return pnl
+
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
 
@@ -783,6 +850,11 @@ def _apply_option_quote_for_decision(
         from ap.position_quote_monitor import _select_hard_exit_reference as _sel_href
         _now = datetime.now(timezone.utc)
         _cost_basis = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        # AMENDMENT #6 blocker 4: use per-position hard stop for catastrophic-ASK test
+        try:
+            _pos_hs, _, _ = _effective_thresholds(pos)
+        except Exception:
+            _pos_hs = -0.33
         _href = _sel_href(
             bid=float(bid or 0.0), ask=float(ask or 0.0),
             mark=float(mark or 0.0), last=float(last or 0.0),
@@ -792,14 +864,14 @@ def _apply_option_quote_for_decision(
             last_ts=last_ts,
             now_utc=_now,
             entry_price=_cost_basis,
-            hard_stop_pct=-0.33,
+            hard_stop_pct=_pos_hs,
             last_stale_sec=float(os.getenv("LAST_TRADE_STALE_SEC", "30.0")),
         )
         # ASK-only-healthy must not clobber a prior proven ref.
         _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
         _prior_price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
         _overwrite = True
-        if _href.validity == "unproven" and _prior_validity == "proven" and _prior_price > 0:
+        if _href.validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0:
             _overwrite = False
             pos.hard_exit_reference_refresh_needed = True
             pos.hardexitreferencerefreshneeded = True
@@ -1190,20 +1262,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # hard-stop check that reads it.  The dedicated authority never zeroes when
     # ANY market price is available, closing the catastrophic-loser trap.
     #
-    # Fallback: when the dedicated reference is absent (pre-amendment positions),
-    # fall back to option_pnl_pct — behavior identical to prior amendment.
-    # AMENDMENT #6: use hard-ref only when validity is proven or catastrophic_ask.
-    # An unproven hard-ref (ASK-only healthy) must NOT drive HARD STOP.
-    _hard_ref_pnl = getattr(pos, "hard_exit_reference_pnl_pct",
-                    getattr(pos, "hardexitreferencepnlpct", None))
-    _hard_ref_validity = str(getattr(pos, "hard_exit_reference_validity",
-                             getattr(pos, "hardexitreferencevalidity", "")) or "")
-    if _hard_ref_pnl is not None and _hard_ref_validity in ("proven", "catastrophic_ask"):
-        try:
-            _hard_loss_pnl = float(_hard_ref_pnl)
-        except Exception:
-            _hard_loss_pnl = option_pnl
-    else:
+    # All hard-exit consumers use the shared resolver — never direct attribute reads.
+    # Blocker 2 (amendment #6+): resolver also recomputes age from the stored
+    # hard_exit_reference_ts so an expired "proven" label cannot mask new losses.
+    _hard_loss_pnl = get_effective_hard_exit_reference(pos, now_utc) if now_utc else None
+    if _hard_loss_pnl is None:
         _hard_loss_pnl = option_pnl
 
     # HARD STOP (pre-evaluated, using dedicated loss authority)
@@ -3804,6 +3867,11 @@ class APExitEngine:
                     _apply("hardexitreferencets", "hard_exit_reference_ts")
                     _apply("hard_exit_reference_pnl_pct")
                     _apply("hardexitreferencepnlpct", "hard_exit_reference_pnl_pct")
+                    # AMENDMENT #6 blocker 1: validity and refresh_needed must transit
+                    _apply("hard_exit_reference_validity")
+                    _apply("hardexitreferencevalidity", "hard_exit_reference_validity")
+                    _apply("hard_exit_reference_refresh_needed")
+                    _apply("hardexitreferencerefreshneeded", "hard_exit_reference_refresh_needed")
 
                     # Timestamps
                     _apply("last_option_bid_update_ts")
@@ -3873,13 +3941,8 @@ class APExitEngine:
                     # the actual risk being cleared.  The exit still fires (this
                     # is IMMEDIATE + allow_inflight_override), but the audit trail
                     # and downstream decisioning must see the true P&L.
-                    # AMENDMENT #6: only use hard-ref when proven or catastrophic_ask.
-                    _flatten_href_pnl = getattr(pos, "hard_exit_reference_pnl_pct", None)
-                    _flatten_href_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
-                    if _flatten_href_pnl is not None and _flatten_href_validity in ("proven", "catastrophic_ask"):
-                        _flatten_pnl = float(_flatten_href_pnl)
-                    else:
-                        _flatten_pnl = float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
+                    _ef_pnl_resolved = get_effective_hard_exit_reference(pos, datetime.now(timezone.utc))
+                    _flatten_pnl = _ef_pnl_resolved if _ef_pnl_resolved is not None else float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
                     decision = ExitDecision(
                         action="CLOSE_ALL",
                         quantity=qty,
@@ -4547,12 +4610,8 @@ class APExitEngine:
             # AMENDMENT #6: only use hard-ref when its validity is proven or
             # catastrophic_ask.  An unproven ref (ASK-only healthy) may not be
             # authoritative and must not drive sentinel fires.
-            _href_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
-            _href_pnl_raw = getattr(pos, "hard_exit_reference_pnl_pct", None)
-            if _href_pnl_raw is not None and _href_validity in ("proven", "catastrophic_ask"):
-                _sentinel_pnl_authority = float(_href_pnl_raw)
-            else:
-                _sentinel_pnl_authority = pos.option_pnl_pct
+            _href_pnl_resolved = get_effective_hard_exit_reference(pos, now)
+            _sentinel_pnl_authority = _href_pnl_resolved if _href_pnl_resolved is not None else pos.option_pnl_pct
             pnl     = _sentinel_pnl_authority
             peak    = pos.peak_pnl_pct
 
@@ -5391,7 +5450,6 @@ class APExitEngine:
                         # PR #176: carry execution_mode from positions row
                         execution_mode=str(row.get("execution_mode") or "").lower().strip(),
                     )
-                    mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
                     _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
                     if _qty_remaining > 0:
@@ -5402,7 +5460,27 @@ class APExitEngine:
                         "seed_from_db: %s original_qty=%d qty_remaining=%d scale_outs=%d",
                         mp.ticker, mp.quantity, mp.quantity_remaining, mp.scale_outs_done,
                     )
-                    mp.current_underlying = float(row.get("underlying_entry", 0) or 0)
+                    # AMENDMENT #6 blocker 3: ALL current-quote fields are zeroed.
+                    # Entry fill is NEVER current market truth. option_pnl_pct will
+                    # return 0.0 explicitly (property guard: current_option_price<=0)
+                    # which is honest — we have no market data yet.  QPM/broker-
+                    # precheck will populate within one cycle.
+                    mp.current_option_price  = 0.0
+                    mp.currentoptionprice    = 0.0
+                    mp.current_bid           = 0.0
+                    mp.currentbid            = 0.0
+                    mp.current_ask           = 0.0
+                    mp.currentask            = 0.0
+                    mp.current_underlying    = 0.0
+                    mp.currentunderlying     = 0.0
+                    mp.option_bid_valid      = False
+                    mp.optionbidvalid        = False
+                    mp.option_quote_fresh    = False
+                    mp.optionquotefresh      = False
+                    mp.underlying_available  = False
+                    mp.underlyingavailable   = False
+                    mp.underlying_fresh      = False
+                    mp.underlyingfresh       = False
 
                     # ── AMENDMENT #6 (blocker 1): RESTART HARD-REF HYDRATION ────
                     # Restore persisted hard-exit reference fields from the meta
@@ -5428,13 +5506,31 @@ class APExitEngine:
                             mp.hard_exit_reference_source   = str(_persisted_href.get("source", ""))
                             mp.hardexitreferencesource      = mp.hard_exit_reference_source
                             _persisted_validity = str(_persisted_href.get("validity", "") or "")
-                            # Persisted proven refs stay proven if the persistence
-                            # was recent; otherwise degrade to "unproven" so the
-                            # next fresh quote is required before hard-stop trusts it.
                             _persisted_ts = _persisted_href.get("ts")
+                            # AMENDMENT #6 blocker 3: age-check the persisted ts.
+                            # "Merely having a timestamp" was not a real age check.
+                            # A persisted proven ref written hours ago is NOT still fresh.
+                            # Use HARD_REF_MAX_AGE_SEC from the shared constant.
+                            _persisted_trusted = False
                             if _persisted_ts and _persisted_validity in ("proven", "catastrophic_ask"):
+                                try:
+                                    _now_seed = datetime.now(timezone.utc)
+                                    _ts_parsed = _persisted_ts if hasattr(_persisted_ts, "total_seconds") else None
+                                    if _ts_parsed is None and isinstance(_persisted_ts, str):
+                                        from datetime import datetime as _dt
+                                        _ts_parsed = _dt.fromisoformat(_persisted_ts.replace("Z", "+00:00"))
+                                    elif hasattr(_persisted_ts, "total_seconds"):
+                                        _ts_parsed = _persisted_ts
+                                    if _ts_parsed is not None:
+                                        _persisted_age_sec = max(0.0, (_now_seed - _ts_parsed).total_seconds())
+                                        _persisted_trusted = _persisted_age_sec <= HARD_REF_MAX_AGE_SEC
+                                except Exception:
+                                    _persisted_trusted = False
+                            if _persisted_trusted:
                                 mp.hard_exit_reference_validity = _persisted_validity
                                 mp.hardexitreferencevalidity    = _persisted_validity
+                                mp.hard_exit_reference_refresh_needed = False
+                                mp.hardexitreferencerefreshneeded    = False
                             else:
                                 mp.hard_exit_reference_validity = "unproven"
                                 mp.hardexitreferencevalidity    = "unproven"
@@ -6393,18 +6489,32 @@ class APExitEngine:
                 if _quote_authority_available and _QUOTES is not None:
                     _snap = _QUOTES.get_fresh(pos.option_symbol, max_age_s=12)
                     if _snap is not None:
-                        if _snap.bid > 0 or _snap.ask > 0:
-                            # P0 fix: route through the single authoritative quote helper.
+                        if _snap.bid > 0 or _snap.ask > 0 or getattr(_snap, "last", 0) > 0:
+                            # P0: route through the single authoritative quote helper.
                             # LIVE positions must use bid, never _snap.mid.
+                            # AMENDMENT #6 blocker 5: pass raw LAST and its timestamp
+                            # from the QuoteAuthority snapshot so the hard-ref selector
+                            # receives real provenance, not synthetic mid-as-mark.
+                            _snap_bid = float(_snap.bid or 0.0)
+                            _snap_ask = float(_snap.ask or 0.0)
+                            _snap_last = float(getattr(_snap, "last", 0.0) or 0.0)
+                            # mark from explicit mark field only — never use mid as mark
+                            _snap_mark = float(getattr(_snap, "mark", 0.0) or 0.0)
+                            # bid_ts: use snap's own ts if provided; if not, the
+                            # quote-arrival time is our best estimate — but NOT now_utc
+                            # (which would launder any BID as "born this second").
+                            _snap_ts = getattr(_snap, "ts", None) or getattr(_snap, "quote_ts", None)
+                            _snap_last_ts = getattr(_snap, "last_trade_ts", None) or _snap_ts
                             _apply_option_quote_for_decision(
                                 pos,
-                                bid      = float(_snap.bid or 0.0),
-                                ask      = float(_snap.ask or 0.0),
-                                mark     = float(getattr(_snap, "mid", 0.0)
-                                                 or getattr(_snap, "mark", 0.0)
-                                                 or 0.0),
-                                quote_ts = now_utc,
-                                source   = "",   # helper stamps bid/paper based on mode
+                                bid      = _snap_bid,
+                                ask      = _snap_ask,
+                                mark     = _snap_mark,
+                                last     = _snap_last,
+                                quote_ts = _snap_ts or now_utc,
+                                last_ts  = _snap_last_ts,
+                                mark_ts  = _snap_ts,
+                                source   = "",
                             )
                             pos.last_option_quote_missing_ts = None
                             pos.last_quote_update_ts  = now_utc
@@ -6586,17 +6696,13 @@ class APExitEngine:
                     (getattr(pos, "current_option_price", 0) or 0) > 0
                     or (getattr(pos, "current_bid", 0) or 0) > 0
                 )
-                # ── HARD-RISK PRE-GATE (amendment #4 blocker 6 + amendment #6) ────
-                # AMENDMENT #6: the pre-gate must ALSO check hard-ref validity.
-                # An unproven hard-ref (ASK-only healthy) must not force eval —
-                # doing so would let ASK certify a position as needing attention
-                # when it cannot certify anything.  Proven or catastrophic_ask
-                # references do force eval when they cross the per-position stop.
-                _hard_ref_pnl_early = getattr(pos, "hard_exit_reference_pnl_pct", None)
-                _hard_ref_validity  = str(getattr(pos, "hard_exit_reference_validity", "") or "")
+                # ── HARD-RISK PRE-GATE ────────────────────────────────────────
+                # Uses shared resolver: checks validity + recomputes timestamp age.
+                # An expired or unproven reference cannot force evaluation.
+                _gate_now = now_utc if now_utc else datetime.now(timezone.utc)
+                _hard_ref_pnl_early = get_effective_hard_exit_reference(pos, _gate_now)
                 _force_hard_eval = (
                     _hard_ref_pnl_early is not None
-                    and _hard_ref_validity in ("proven", "catastrophic_ask")
                     and _has_entry_price
                     and not getattr(pos, "closed", False)
                     and int(getattr(pos, "quantity_remaining", 0) or 0) > 0
@@ -6604,9 +6710,8 @@ class APExitEngine:
                 )
                 if _force_hard_eval:
                     try:
-                        _hard_ref_val = float(_hard_ref_pnl_early)
                         _pos_hard_stop, _, _ = _effective_thresholds(pos)
-                        _force_hard_eval = _hard_ref_val <= _pos_hard_stop
+                        _force_hard_eval = _hard_ref_pnl_early <= _pos_hard_stop
                     except Exception:
                         _force_hard_eval = False
 
