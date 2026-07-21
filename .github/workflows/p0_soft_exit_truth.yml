@@ -1,0 +1,35 @@
+name: P0 Soft Exit Truth
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "ap_exit_engine.py"
+      - "ap_exit_engine/**"
+      - "ap/position_quote_monitor.py"
+      - "ap/position_quote_monitor/**"
+      - "tests/test_p0_soft_exit_executable_truth.py"
+      - ".github/workflows/p0_soft_exit_truth.yml"
+
+jobs:
+  focused-soft-exit-truth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run executable soft-exit truth regressions
+        env:
+          DATABASE_URL: "postgresql://test:test@localhost/test"
+        run: |
+          python -m pytest tests/test_p0_soft_exit_executable_truth.py -v --tb=short --color=yes
