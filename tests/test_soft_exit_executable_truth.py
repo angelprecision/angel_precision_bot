@@ -71,7 +71,7 @@ def _make_pos(
     option_symbol: str = "ABT260721P00150000",
     underlying_available: bool = True,
     underlying_fresh: bool = True,
-    option_bid_valid: bool = False,
+    option_bid_valid: "bool | None" = None,
     option_quote_fresh: bool = True,
     exit_executable_pnl_pct: float | None = None,
     exit_executable_mark: float = 0.0,
@@ -113,6 +113,11 @@ def _make_pos(
     pos.underlyingavailable = underlying_available
     pos.underlying_fresh = underlying_fresh
     pos.underlyingfresh = underlying_fresh
+    # option_bid_valid: None → derive from current_bid (mirrors QPM writing
+    # cycle truth); explicit True/False is authoritative (mirrors the explicit
+    # field taking precedence in the snapshot builder).
+    if option_bid_valid is None:
+        option_bid_valid = current_bid > 0
     pos.option_bid_valid = option_bid_valid
     pos.optionbidvalid = option_bid_valid
     pos.option_quote_fresh = option_quote_fresh
@@ -440,10 +445,15 @@ class TestEvaluateExitExecutableTruth:
         )
         now_et = _et_noon().replace(hour=10)
         decision_soft = evaluate_exit(pos_soft, now_et)
-        # Scale-out should NOT fire (position too young)
-        # Note: some paths don't explicitly check grace — they use _MIN_HOLD_SOFT.
-        # The scale-out and never-green paths honor MIN_HOLD. Check result is not SCALE_OUT.
-        # (This confirms "entry grace" semantics match existing MIN_HOLD behavior.)
+        # AMENDMENT #2 (blocker 4): the grace contract is now enforced in the
+        # soft-exit gate — a 1-minute-old position with fresh +18% bid must
+        # return the explicit ENTRY_GRACE deferral, not scale out.
+        assert decision_soft.action == "HOLD", (
+            f"Soft exit must defer inside grace: {decision_soft.action}: {decision_soft.reason}"
+        )
+        assert decision_soft.reason_code == SOFT_EXIT_DEFERRED_ENTRY_GRACE, (
+            f"Got {decision_soft.reason_code}: {decision_soft.reason}"
+        )
 
         # Hard stop should fire even when young.
         # AUDIT FIX: a catastrophic loss (past _hard_stop) now SKIPS the soft-loss
@@ -1033,3 +1043,231 @@ class TestAmendmentThresholdContract:
         _clear_qpm_shared_cache()
         qpm._refresh_once()
         assert pos.touched_profit is False, "+4% bid must never arm at 5% threshold"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR #385 AMENDMENT #2 TESTS — truth-transition regressions (blockers 1-4).
+# All QPM tests drive the REAL _refresh_once() production seam.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAmendment2BidTransition:
+    """Blocker 1: valid-BID poll followed by mark-only/missing-BID poll."""
+
+    def test_bid_then_mark_only_poll_invalidates_bid(self):
+        """Poll 1: bid=1.10.  Poll 2: bid=0, ask=1.20, mark=1.15.
+        The retained 1.10 must NOT be classified as fresh executable truth."""
+        pos = _qpm_pos("pos-A")
+        quotes = {
+            "ABT260721P00150000": {"bid": 1.10, "ask": 1.12},
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()                        # bid arrives, pending set
+        assert getattr(pos, "current_bid", 0.0) == pytest.approx(1.10)
+        assert getattr(pos, "option_bid_valid") is True
+
+        # Poll 2: bid missing, mark present
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 0, "ask": 1.20, "mark": 1.15}
+        qpm._refresh_once()
+        # current_bid must be OVERWRITTEN to 0, not retained at 1.10
+        assert getattr(pos, "current_bid", None) == pytest.approx(0.0), \
+            "mark-only poll must zero current_bid, not retain the previous bid"
+        assert getattr(pos, "option_bid_valid") is False
+        # touched_profit must NOT have armed (second confirmation interrupted)
+        assert pos.touched_profit is False, \
+            "retained stale bid must not complete the touched-profit confirmation"
+        # Snapshot must defer: explicit False forces bid=None
+        snap = _build_exit_decision_snapshot(pos)
+        assert snap.option_bid_valid is False
+        assert snap.option_bid is None
+        assert snap.exit_executable_mark is None
+        assert snap.exit_executable_pnl_pct is None
+
+    def test_mark_only_poll_does_not_advance_peak(self):
+        """Peak must not advance during a mark-only cycle from the retained bid."""
+        pos = _qpm_pos("pos-A")
+        quotes = {
+            "ABT260721P00150000": {"bid": 1.10, "ask": 1.12},
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        assert pos.peak_pnl_pct == pytest.approx(0.10, abs=1e-6)
+
+        _clear_qpm_shared_cache()
+        # mark spikes to +50% equivalent, bid missing
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 0, "ask": 1.60, "mark": 1.50}
+        qpm._refresh_once()
+        assert pos.peak_pnl_pct == pytest.approx(0.10, abs=1e-6), \
+            "peak must not advance on a bid-less cycle (neither from mark nor retained bid)"
+
+
+class TestAmendment2UnderlyingTransition:
+    """Blocker 2: valid underlying poll followed by missing-underlying poll."""
+
+    def test_underlying_missing_poll_marks_unavailable(self):
+        pos = _qpm_pos("pos-A")
+        quotes = {
+            "ABT260721P00150000": {"bid": 0.85, "ask": 0.88},
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        assert getattr(pos, "underlying_available") is True
+
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT"] = {"last": 0}      # underlying missing this cycle
+        qpm._refresh_once()
+        assert getattr(pos, "underlying_available") is False, \
+            "missing-underlying cycle must write underlying_available=False"
+        # Retained numeric price may remain on the position — the SNAPSHOT must
+        # honor the explicit False and null it out:
+        snap = _build_exit_decision_snapshot(pos)
+        assert snap.underlying_available is False
+        assert snap.underlying_price is None, \
+            "explicit underlying_available=False must force underlying_price=None"
+
+    def test_missing_underlying_defers_soft_loss_via_explicit_field(self):
+        """End-to-end: QPM missing-underlying cycle → evaluate_exit defers."""
+        pos = _qpm_pos("pos-A")
+        # give the position soft-loss economics: entry 1.00, bid 0.85 (-15%)
+        quotes = {
+            "ABT260721P00150000": {"bid": 0.85, "ask": 0.88},
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT"] = {"last": 0}
+        qpm._refresh_once()
+
+        # Build a ManagedPosition mirroring the QPM-written truth for evaluate_exit
+        mp = _make_pos(
+            entry_price=1.00,
+            current_bid=0.85, current_ask=0.88, current_option_price=0.865,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.15,
+            current_underlying=149.0,               # retained numeric
+            underlying_available=False,             # explicit truth: missing
+            underlying_fresh=True,
+            touched_profit=False,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(mp, now_et)
+        assert decision.action == "HOLD"
+        assert decision.reason_code == SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE, \
+            f"Got {decision.reason_code}: {decision.reason}"
+
+
+class TestAmendment2HardExitPrecedence:
+    """Blocker 3: hard exits pre-evaluated before every soft truth gate."""
+
+    def test_touched_profit_catastrophic_loss_missing_bid_hard_stops(self):
+        """touched_profit=True, -45%, bid missing, underlying missing → HARD STOP."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0, option_bid_valid=False,
+            current_option_price=0.55,   # -45% last-known
+            exit_executable_pnl_pct=None,
+            current_underlying=0.0, underlying_available=False, underlying_fresh=False,
+            touched_profit=True,         # THE trap state from the review
+            max_profit_seen=0.10, peak_pnl_pct=0.10,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
+        assert "HARD STOP" in decision.reason
+
+    def test_runner_state_catastrophic_loss_missing_bid_hard_stops(self):
+        """Runner state (scale_outs=1, peak 40%), -45%, bid missing → HARD STOP."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0, option_bid_valid=False,
+            current_option_price=0.55,
+            exit_executable_pnl_pct=None,
+            scale_outs_done=1, peak_pnl_pct=0.40, max_profit_seen=0.40,
+            touched_profit=True,
+            quantity=3, quantity_remaining=2,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
+        assert "HARD STOP" in decision.reason
+
+    def test_small_win_state_catastrophic_loss_missing_bid_hard_stops(self):
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0, option_bid_valid=False,
+            current_option_price=0.55,
+            exit_executable_pnl_pct=None,
+            max_profit_seen=0.14, touched_profit=True,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
+
+    def test_eod_fires_with_missing_bid_and_underlying(self):
+        """EOD due, bid+underlying missing, touched_profit=True (would have
+        deferred pre-amendment) → EOD FORCE CLOSE."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0, option_bid_valid=False,
+            current_option_price=0.95,   # mild loss — below hard stop, above soft
+            exit_executable_pnl_pct=None,
+            current_underlying=0.0, underlying_available=False, underlying_fresh=False,
+            touched_profit=True, max_profit_seen=0.08,
+        )
+        now_et = _et_noon().replace(hour=15, minute=55)   # 3:55 PM ET — past 3:50 EOD
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "CLOSE_ALL", f"{decision.action}: {decision.reason}"
+        assert "EOD FORCE CLOSE" in decision.reason, decision.reason
+
+
+class TestAmendment2EntryGrace:
+    """Blocker 4: the grace contract is actually enforced."""
+
+    def test_one_minute_old_sixteen_pct_bid_returns_entry_grace(self):
+        """The reviewer's exact case: 1-min-old, fresh BID +16% → ENTRY_GRACE."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=1.16, current_ask=1.20, current_option_price=1.18,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=0.16,
+            underlying_available=True, underlying_fresh=True,
+            scale_outs_done=0, quantity=3, quantity_remaining=3,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "HOLD"
+        assert decision.reason_code == SOFT_EXIT_DEFERRED_ENTRY_GRACE, \
+            f"Got {decision.reason_code}: {decision.reason}"
+
+    def test_grace_does_not_suppress_hard_stop(self):
+        """1-min-old at -45% → HARD STOP fires despite grace."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.55, current_option_price=0.55,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.45,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
+        assert "HARD STOP" in decision.reason
+
+    def test_grace_does_not_suppress_eod(self):
+        """1-min-old at EOD → EOD FORCE CLOSE fires despite grace."""
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=1.05, current_option_price=1.05,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=0.05,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+        )
+        now_et = _et_noon().replace(hour=15, minute=55)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "CLOSE_ALL"
+        assert "EOD FORCE CLOSE" in decision.reason
