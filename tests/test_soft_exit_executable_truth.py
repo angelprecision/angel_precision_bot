@@ -1358,7 +1358,11 @@ class TestAmendment3HardExitAuthority:
         qpm._refresh_once()
         assert getattr(pos, "hard_exit_reference_price", 0.0) > 0, \
             "hard-ref must populate from mark/ask when bid absent"
-        assert getattr(pos, "hard_exit_reference_source") in ("mark", "mid", "ask", "last")
+        assert getattr(pos, "hard_exit_reference_source") in (
+            "mark", "mid", "ask", "last",
+            # amendment 6 additions:
+            "mark_stale", "last_stale", "ask_unproven", "ask_catastrophic",
+        )
 
 
 class TestAmendment3FreshnessTransition:
@@ -1565,70 +1569,131 @@ class TestAmendment4HardExitPrecedence:
 
 
 class TestAmendment4SentinelHardRef:
-    """Blocker 2: _run_sentinels forced-exit uses hard-ref, not option_pnl_pct."""
+    """Blocker 2: _run_sentinels forced-exit uses hard-ref.
+    AMENDMENT #6: rewritten to call REAL _run_sentinels() with mocked external
+    boundaries only (no formula copy)."""
 
-    def test_live_missing_bid_hard_stop_sentinel_fires(self):
-        """LIVE position, current_option_price=0 (missing bid), hard-ref shows -45%,
-        exit_in_flight=False, age > 1min → SENTINEL FORCED EXIT must trigger."""
-        # We can't easily instantiate the full APExitEngine, but we can verify
-        # the pnl computation directly (this is the exact code path that runs).
-        from types import SimpleNamespace
-        pos = SimpleNamespace(
-            closed=False, quantity_remaining=2,
-            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
-            option_pnl_pct=0.0,                     # THE trap value
-            hard_exit_reference_pnl_pct=-0.45,      # true loss
-            peak_pnl_pct=0.10,
-            exit_in_flight=False,
-        )
-        # Replicate the amendment-4 sentinel PNL selection logic
-        _sentinel_pnl_authority = (
-            float(getattr(pos, "hard_exit_reference_pnl_pct"))
-            if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
-            else pos.option_pnl_pct
-        )
-        assert _sentinel_pnl_authority == pytest.approx(-0.45), \
-            "sentinel must read hard-ref, not option_pnl_pct=0.0 which would trap the fire"
-        # And with the -45% authority, HARD_STOP_PCT=-0.33 trips the trigger:
-        assert _sentinel_pnl_authority <= HARD_STOP_PCT
+    def _make_engine(self):
+        import ap_exit_engine as ee_mod
+        class _MB:
+            def get_quotes(self, s): return []
+        eng = ee_mod.APExitEngine(broker=_MB(), email="t@t")
+        eng._persist_peak_state_to_db = lambda pos: None
+        eng._emit_exit_decision_stamp = lambda *a, **kw: None
+        eng._submitted = []
+        def _cap(pos, decision, **kw):
+            eng._submitted.append((pos, decision, kw))
+            return True
+        eng._submit_exit_decision = _cap
+        return eng
 
-    def test_sentinel_falls_back_to_option_pnl_for_legacy_positions(self):
-        """Pre-amendment positions without hard_exit_reference_pnl_pct field
-        must still work using option_pnl_pct."""
-        from types import SimpleNamespace
-        pos = SimpleNamespace(
-            closed=False, quantity_remaining=2,
-            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
-            option_pnl_pct=-0.40,
-            peak_pnl_pct=0.10,
-            exit_in_flight=False,
+    def _make_pos(self, *, hard_ref_pnl=-0.45, validity="proven",
+                   current_option_price=0.0, age_minutes=5, exit_in_flight=False):
+        import ap_exit_engine as ee_mod
+        from datetime import datetime, timedelta, timezone as _tz
+        expiry = datetime.now(_tz.utc) + timedelta(days=5)
+        _exp = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
+        pos = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol=f"ABT{_exp}C00150000",
+            side="CALL", quantity=2, quantity_remaining=2, entry_price=1.00,
+            underlying_entry=150.0, underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=datetime.now(_tz.utc) - timedelta(minutes=age_minutes),
         )
-        _sentinel_pnl_authority = (
-            float(getattr(pos, "hard_exit_reference_pnl_pct"))
-            if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
-            else pos.option_pnl_pct
+        pos.expiry = expiry
+        pos.current_option_price = current_option_price
+        pos.current_bid = 0.0
+        pos.hard_exit_reference_pnl_pct = hard_ref_pnl
+        pos.hard_exit_reference_price = 1.00 * (1 + hard_ref_pnl)
+        pos.hard_exit_reference_source = "last"
+        pos.hard_exit_reference_validity = validity
+        pos.exit_in_flight = exit_in_flight
+        return pos
+
+    def test_real_run_sentinels_fires_on_proven_catastrophic_hard_ref(self):
+        """LIVE catastrophic hard-ref (validity=proven), no bid, no exit in flight.
+        REAL _run_sentinels() must submit a SENTINEL FORCED EXIT."""
+        eng = self._make_engine()
+        pos = self._make_pos(hard_ref_pnl=-0.45, validity="proven")
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._run_sentinels()   # REAL METHOD
+
+        assert len(eng._submitted) >= 1, "expected at least one sentinel submission"
+        assert any("SENTINEL FORCED EXIT" in d.reason for _, d, _ in eng._submitted), \
+            "expected SENTINEL FORCED EXIT reason"
+
+    def test_real_run_sentinels_does_not_fire_on_unproven_hard_ref(self):
+        """AMENDMENT #6 blocker 2: unproven hard-ref (ASK-only healthy) must
+        NOT be treated as authoritative by the sentinel — even at 'catastrophic'
+        percentage.  Otherwise ASK-only quotes could trigger false SENTINEL fires."""
+        eng = self._make_engine()
+        # option_pnl_pct falls back — current_option_price=0 → pnl_pct=0.0
+        pos = self._make_pos(hard_ref_pnl=-0.45, validity="unproven",
+                              current_option_price=0.0)
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._run_sentinels()   # REAL METHOD
+
+        # option_pnl_pct is 0.0 (missing price), so sentinel sees 0% not -45%
+        # and correctly does NOT fire from unproven data.
+        assert len(eng._submitted) == 0, (
+            f"unproven hard-ref must not drive sentinel fires; got {len(eng._submitted)}"
         )
-        assert _sentinel_pnl_authority == pytest.approx(-0.40)
 
 
 class TestAmendment4EmergencyFlatten:
-    """Blocker 3: emergency_flatten decision pnl uses hard-ref."""
+    """Blocker 3: emergency_flatten decision pnl uses hard-ref.
+    AMENDMENT #6: rewritten to call REAL emergency_flatten()."""
 
-    def test_emergency_flatten_decision_pnl_uses_hard_ref(self):
-        """Replicate the amendment-4 decision-construction path."""
-        from types import SimpleNamespace
-        pos = SimpleNamespace(
-            quantity_remaining=2,
-            option_pnl_pct=0.0,                     # THE trap value
-            hard_exit_reference_pnl_pct=-0.45,      # true loss
+    def _make_engine(self):
+        import ap_exit_engine as ee_mod
+        class _MB:
+            def get_quotes(self, s): return []
+        eng = ee_mod.APExitEngine(broker=_MB(), email="t@t")
+        eng._persist_peak_state_to_db = lambda pos: None
+        eng._emit_exit_decision_stamp = lambda *a, **kw: None
+        eng._submitted = []
+        def _cap(pos, decision, **kw):
+            eng._submitted.append((pos, decision, kw))
+            return True
+        eng._submit_exit_decision = _cap
+        return eng
+
+    def test_real_emergency_flatten_uses_hard_ref_pnl(self):
+        """REAL emergency_flatten() — decision.pnl_pct must reflect proven hard-ref."""
+        import ap_exit_engine as ee_mod
+        from datetime import datetime, timedelta, timezone as _tz
+        eng = self._make_engine()
+        expiry = datetime.now(_tz.utc) + timedelta(days=5)
+        _exp = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
+        pos = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol=f"ABT{_exp}C00150000",
+            side="CALL", quantity=2, quantity_remaining=2, entry_price=1.00,
+            underlying_entry=150.0, underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=datetime.now(_tz.utc) - timedelta(minutes=5),
         )
-        _flatten_pnl = (
-            float(getattr(pos, "hard_exit_reference_pnl_pct"))
-            if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
-            else float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
+        pos.expiry = expiry
+        pos.current_option_price = 0.0          # LIVE missing-bid → option_pnl=0
+        pos.hard_exit_reference_pnl_pct = -0.45  # true loss
+        pos.hard_exit_reference_validity = "proven"
+        pos.closed = False
+        pos.exit_in_flight = False
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        # REAL METHOD — not a formula copy
+        eng.emergency_flatten(reason="test_amendment_6", force=True)
+
+        assert len(eng._submitted) >= 1, "expected emergency flatten submission"
+        _, dec, _ = eng._submitted[0]
+        assert dec.pnl_pct == pytest.approx(-0.45), (
+            f"emergency_flatten must report hard-ref pnl (-45%), got {dec.pnl_pct}"
         )
-        assert _flatten_pnl == pytest.approx(-0.45), \
-            f"emergency_flatten pnl must reflect true loss, got {_flatten_pnl}"
+        assert dec.action == "CLOSE_ALL"
 
 
 class TestAmendment4SnapshotPathCarriesMoneySafety:
@@ -1826,8 +1891,11 @@ class TestAmendment4HardRiskPreGate:
             eng._submitted.append((pos, decision, kw))
             return True
         eng._submit_exit_decision = _capture_submit
-        # Skip DB-adjacent guardrails that don't apply to this test
-        eng._eligible_for_new_exit = lambda pos, now_utc: True
+        # AMENDMENT #6 (test integrity): do NOT bypass _eligible_for_new_exit.
+        # Positions constructed below satisfy the real gate: not closed,
+        # quantity_remaining > 0, exit_in_flight=False, no identity quarantine.
+        # Also stub only external boundaries beyond that:
+        eng._emit_exit_event = lambda *a, **kw: None
         return eng
 
     def _make_managed_position(self, *, side="CALL", entry=1.00,
@@ -1864,6 +1932,7 @@ class TestAmendment4HardRiskPreGate:
         pos.hard_exit_reference_pnl_pct = hard_ref_pnl
         pos.hard_exit_reference_price = entry * (1 + hard_ref_pnl)
         pos.hard_exit_reference_source = "last"
+        pos.hard_exit_reference_validity = "proven"   # amendment 6: required
         # Truth fields
         pos.option_bid_valid = current_bid > 0
         pos.option_quote_fresh = current_bid > 0
@@ -2086,56 +2155,307 @@ class TestAmendment5Blocker3SharedHardRef:
 
 
 class TestAmendment5Blocker4HardRefSourcePolicy:
-    """Blocker 4: ASK cannot certify safety; conservative source ordering."""
+    """Blocker 4: ASK cannot certify safety; conservative source ordering.
+    AMENDMENT #6: also verifies validity classification and freshness gating."""
 
     def test_bid_wins_when_present(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=1.10, ask=1.20, mark=1.15, last=1.05)
-        assert source == "bid"
-        assert price == pytest.approx(1.10)
+        h = _select_hard_exit_reference(bid=1.10, ask=1.20, mark=1.15, last=1.05)
+        assert h.source == "bid"
+        assert h.price == pytest.approx(1.10)
+        assert h.validity == "proven"
 
     def test_last_beats_ask_when_no_bid(self):
-        """The reviewer's exact case: bid=0, mark=0, ask=1.20, last=0.50.
-        Old code picked ASK (+20%). New code must pick LAST (-50%)."""
+        """The reviewer's exact case: bid=0, mark=0, ask=1.20, last=0.50, LAST fresh.
+        Must pick LAST -50%, not ASK +20%."""
         from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=0, ask=1.20, mark=0, last=0.50)
-        assert source == "last", (
-            f"LAST must outrank ASK for long-option liquidation truth. "
-            f"ASK is not a liquidation price; got source={source} price={price}"
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=1.20, mark=0, last=0.50,
+            last_ts=_now, ask_ts=_now, now_utc=_now,
+            entry_price=1.00, hard_stop_pct=-0.33,
         )
-        assert price == pytest.approx(0.50)
+        assert h.source == "last"
+        assert h.price == pytest.approx(0.50)
+        assert h.validity == "proven"
 
     def test_last_beats_mark_when_no_bid(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=0, ask=0, mark=1.10, last=0.60)
-        assert source == "last", "LAST — real traded price — beats broker-computed MARK"
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=0, mark=1.10, last=0.60,
+            last_ts=_now, mark_ts=_now, now_utc=_now,
+            entry_price=1.00,
+        )
+        assert h.source == "last"
+        assert h.validity == "proven"
+
+    def test_stale_last_falls_behind_fresh_mark(self):
+        """AMENDMENT #6 blocker 5: stale LAST must not manufacture false loss
+        when a FRESH MARK contradicts it."""
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        _stale = _now - timedelta(seconds=120)   # 2 minutes old (>30s threshold)
+        h = _select_hard_exit_reference(
+            bid=0, ask=0, mark=1.10, last=0.50,
+            last_ts=_stale, mark_ts=_now, now_utc=_now,
+            entry_price=1.00,
+        )
+        assert h.source == "mark", (
+            f"stale LAST must not manufacture false hard-stop when fresh MARK "
+            f"contradicts it; got source={h.source}"
+        )
+        assert h.validity == "proven"
 
     def test_mark_beats_ask_when_no_bid_or_last(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=0, ask=1.20, mark=0.55, last=0)
-        assert source == "mark"
-        assert price == pytest.approx(0.55)
-
-    def test_ask_only_flagged_unproven(self):
-        from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=0, ask=1.20, mark=0, last=0)
-        assert source == "ask_unproven", (
-            "ASK-only quote must be flagged as unproven so downstream can treat "
-            "it with degraded trust — ASK cannot certify safety"
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=1.20, mark=0.55, last=0,
+            mark_ts=_now, ask_ts=_now, now_utc=_now,
+            entry_price=1.00,
         )
-        # Still records the price so hard-stop can fire if ASK itself is catastrophic
-        assert price == pytest.approx(1.20)
+        assert h.source == "mark"
+        assert h.price == pytest.approx(0.55)
+        assert h.validity == "proven"
 
-    def test_ask_only_catastrophic_still_fires_hard_stop(self):
-        """ASK below hard stop is self-proving catastrophe."""
+    def test_ask_only_healthy_is_unproven(self):
+        """ASK-only + healthy pnl → validity=unproven (downstream consumers must
+        not treat as safety certification)."""
         from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=0, ask=0.55, mark=0, last=0)
-        # source is unproven but pnl calc against entry=1.00 gives -45%
-        pnl = (price - 1.00) / 1.00
-        assert pnl <= -0.30, "ASK-only catastrophic must still register the loss"
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=1.20, mark=0, last=0,
+            ask_ts=_now, now_utc=_now,
+            entry_price=1.00, hard_stop_pct=-0.33,
+        )
+        assert h.source == "ask_unproven"
+        assert h.validity == "unproven", (
+            "ASK-only healthy must be UNPROVEN — downstream cannot treat as safety cert"
+        )
+        assert h.price == pytest.approx(1.20)
+
+    def test_ask_only_catastrophic_is_self_proving(self):
+        """ASK-only at/below hard stop → validity=catastrophic_ask (self-proving)."""
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=0.55, mark=0, last=0,
+            ask_ts=_now, now_utc=_now,
+            entry_price=1.00, hard_stop_pct=-0.33,
+        )
+        assert h.validity == "catastrophic_ask"
+        assert h.price == pytest.approx(0.55)
 
     def test_no_data_returns_empty(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
-        price, source = _select_hard_exit_reference(bid=0, ask=0, mark=0, last=0)
-        assert price == 0.0
-        assert source == ""
+        h = _select_hard_exit_reference(bid=0, ask=0, mark=0, last=0)
+        assert h.price == 0.0
+        assert h.source == ""
+        assert h.validity == "no_data"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PR #385 AMENDMENT #6 TESTS — restart hydration, ASK safety, laundering.
+# All via REAL production methods with minimal external mocks.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAmendment6RestartHydration:
+    """Blocker 1: seed_from_db must not represent entry price as current
+    market truth.  Missing persisted hard-ref → explicit no_data validity +
+    warning; present persisted hard-ref → restored fields."""
+
+    def _make_engine(self):
+        import ap_exit_engine as ee_mod
+        class _MB:
+            def get_quotes(self, s): return []
+        return ee_mod.APExitEngine(broker=_MB(), email="t@t")
+
+    def test_seed_from_db_no_meta_marks_hard_ref_no_data(self):
+        """No persisted meta → validity='no_data', refresh_needed=True."""
+        eng = self._make_engine()
+
+        class _PM:
+            def get_active_positions(self):
+                return [{
+                    "id": "pos-restart-1", "client_id": "test@x",
+                    "underlying": "ABT", "contract": "ABT260731C00150000",
+                    "direction": "CALL", "qty": 2, "quantity_remaining": 2,
+                    "avg_fill": 1.00, "underlying_entry": 150.0,
+                    "target_underlying": 155.0, "stop_underlying": 145.0,
+                    "execution_mode": "live",
+                    "meta": None,
+                }]
+
+        eng.seed_from_db(_PM())
+        assert len(eng._positions) == 1
+        pos = eng._positions[0]
+        assert getattr(pos, "hard_exit_reference_validity", None) == "no_data", (
+            "no persisted hard-ref → validity must be 'no_data', not 'proven'"
+        )
+        assert getattr(pos, "hard_exit_reference_refresh_needed", False) is True
+
+    def test_seed_from_db_restores_persisted_hard_ref(self):
+        """Persisted hard-ref in meta → fields restored, validity downgraded to
+        'unproven' unless a fresh persisted ts confirms it."""
+        eng = self._make_engine()
+        _now = datetime.now(_UTC)
+
+        class _PM:
+            def get_active_positions(self):
+                return [{
+                    "id": "pos-restart-2", "client_id": "test@x",
+                    "underlying": "ABT", "contract": "ABT260731C00150000",
+                    "direction": "CALL", "qty": 2, "quantity_remaining": 2,
+                    "avg_fill": 1.00, "underlying_entry": 150.0,
+                    "target_underlying": 155.0, "stop_underlying": 145.0,
+                    "execution_mode": "live",
+                    "meta": {
+                        "hard_exit_reference": {
+                            "price": 0.55, "source": "last",
+                            "validity": "proven", "ts": _now,
+                        }
+                    },
+                }]
+
+        eng.seed_from_db(_PM())
+        pos = eng._positions[0]
+        assert getattr(pos, "hard_exit_reference_price", 0.0) == pytest.approx(0.55)
+        assert getattr(pos, "hard_exit_reference_pnl_pct", 0.0) == pytest.approx(-0.45)
+        assert getattr(pos, "hard_exit_reference_source") == "last"
+
+
+class TestAmendment6AskDoesNotClobberProven:
+    """Blocker 2: ASK-only healthy quote must NOT overwrite a prior proven ref."""
+
+    def test_ask_only_healthy_preserves_prior_proven_ref(self):
+        """Cycle 1: proven LAST=-45%.  Cycle 2: only ASK=+20% (healthy).
+        The prior proven -45% must remain — ASK cannot clear it."""
+        pos = _qpm_pos("pos-A", execution_mode="live")
+        # Cycle 1: LAST=0.55, entry=1.00 → -45%
+        quotes = {
+            "ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55},
+            "ABT": {"last": 149.0},
+        }
+        qpm = _make_qpm([pos], quotes)
+        qpm._refresh_once()
+        assert getattr(pos, "hard_exit_reference_pnl_pct", 0.0) == pytest.approx(-0.45, abs=0.01)
+        assert getattr(pos, "hard_exit_reference_validity") == "proven"
+
+        # Cycle 2: ONLY ASK (bid=0, mark=0, last=0)
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 0, "ask": 1.20, "mark": 0, "last": 0}
+        qpm._refresh_once()
+
+        # The prior proven -45% MUST be preserved
+        assert getattr(pos, "hard_exit_reference_pnl_pct", 0.0) == pytest.approx(-0.45, abs=0.01), (
+            "ASK-only healthy quote must NOT overwrite prior proven -45% reference"
+        )
+        assert getattr(pos, "hard_exit_reference_refresh_needed", False) is True, (
+            "when refusing to overwrite, refresh_needed must be set"
+        )
+
+
+class TestAmendment6BrokerPrecheckNoLaundering:
+    """Blocker 3: broker precheck must not collapse fields; LAST must reach the
+    selector; ASK must not launder as MARK."""
+
+    def test_apply_option_quote_for_decision_receives_raw_last(self):
+        """Real _apply_option_quote_for_decision call with LAST=0.50 catastrophic
+        and MARK=1.10 healthy.  With fresh LAST timestamp, LAST wins (catastrophic)."""
+        import ap_exit_engine as ee_mod
+        pos = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol="ABT260731C00150000",
+            side="CALL", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+        _now = datetime.now(_UTC)
+        # Bid missing, mark healthy, LAST catastrophic (fresh)
+        ee_mod._apply_option_quote_for_decision(
+            pos, bid=0.0, ask=0, mark=1.10, last=0.50,
+            quote_ts=_now, last_ts=_now, mark_ts=_now,
+        )
+        assert getattr(pos, "hard_exit_reference_source") == "last", (
+            "with LAST passed as raw, LAST must win over MARK for hard-ref"
+        )
+        assert getattr(pos, "hard_exit_reference_pnl_pct", 0) == pytest.approx(-0.50, abs=0.01)
+
+    def test_ask_only_via_aqfd_is_unproven(self):
+        """ASK-only quote through _apply_option_quote_for_decision produces
+        validity=unproven, not laundered to trusted MARK."""
+        import ap_exit_engine as ee_mod
+        pos = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol="ABT260731C00150000",
+            side="CALL", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+        _now = datetime.now(_UTC)
+        ee_mod._apply_option_quote_for_decision(
+            pos, bid=0.0, ask=1.20, mark=0, last=0.0,
+            quote_ts=_now, last_ts=None, mark_ts=None,
+        )
+        assert getattr(pos, "hard_exit_reference_validity") in ("unproven", "catastrophic_ask"), (
+            "ASK-only must be unproven (or catastrophic_ask if catastrophic), never proven"
+        )
+
+
+class TestAmendment6ApplyQuoteSnapshotsDistinctObjects:
+    """Test-integrity: apply_quote_snapshots test uses SEPARATE producer and
+    consumer objects so QPM writes on one, exit engine reads on another —
+    no shared-object pass-through cheating."""
+
+    def test_snapshot_bridges_between_distinct_objects(self):
+        """QPM writes to producer; snapshot is captured; consumer receives
+        applied snapshot; consumer is a different object than producer."""
+        import ap.position_quote_monitor as qpm_mod
+        import ap_exit_engine as ee_mod
+        import threading
+
+        # Producer: a QPM-writable position object
+        producer = _qpm_pos("pos-DISTINCT", execution_mode="live")
+
+        # Consumer: a separately-constructed ManagedPosition (real class)
+        consumer = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol=str(producer.option_symbol),
+            side="PUT", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=145.0, underlying_stop=155.0,
+            execution_mode="live",
+            position_id="pos-DISTINCT",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+
+        # Capture snapshots QPM builds and apply them to CONSUMER
+        captured = []
+        class _RelayEngine:
+            def __init__(self):
+                self._lock = threading.RLock()
+                self._positions = [consumer]
+            def active_positions(self):
+                return [producer]                        # QPM iterates producer
+            def apply_quote_snapshots(self, snapshots):
+                captured.extend(snapshots)
+                # Now apply the snapshot to the CONSUMER via real method
+                ee_mod.APExitEngine.apply_quote_snapshots(self, snapshots)
+
+        eng = _RelayEngine()
+        qpm = _make_qpm([producer], {
+            "ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55},
+            "ABT": {"last": 149.0},
+        })
+        qpm.exit_engine = eng
+        qpm._refresh_once()
+
+        # Producer must have been written by QPM
+        assert getattr(producer, "hard_exit_reference_price", 0.0) > 0
+        # Consumer must have received the field via apply_quote_snapshots
+        assert getattr(consumer, "hard_exit_reference_price", 0.0) > 0, (
+            "apply_quote_snapshots must bridge from producer to consumer object"
+        )
+        assert consumer is not producer  # sanity: distinct objects
