@@ -480,6 +480,7 @@ class APPositionQuoteMonitor:
                 _hard_mid = round((bid + ask) / 2.0, 4) if (bid > 0 and ask > 0) else 0.0
                 _hard_ref_price = 0.0
                 _hard_ref_source = ""
+                _hard_ref_pnl = None  # AMENDMENT #4: ensure defined for snapshot dict
                 for _cand, _src in (
                     (bid,           "bid"),
                     (_hard_mid,     "mid"),
@@ -751,6 +752,30 @@ class APPositionQuoteMonitor:
                     "last_underlying_quote_update_ts": und_ts,
                     "lastoptionquoteupdatets": opt_ts,
                     "last_option_quote_update_ts": opt_ts,
+                    # ── AMENDMENT #4 (blocker 4): money-safety fields ─────────
+                    # If DIRECT_POSITION_WRITES=0 turns off _write_field_unconditional
+                    # in a future migration, this snapshot payload is the ONLY way
+                    # money-safety truth reaches the engine.  Every field the exit
+                    # engine consults for defer/hard-exit decisions is carried here.
+                    "option_bid_valid":            _opt_bid_valid,
+                    "optionbidvalid":              _opt_bid_valid,
+                    "option_quote_fresh":          _opt_quote_fresh,
+                    "optionquotefresh":            _opt_quote_fresh,
+                    "option_quote_age_sec":        _opt_age_sec,
+                    "underlying_available":        _und_available,
+                    "underlyingavailable":         _und_available,
+                    "underlying_fresh":            _und_fresh,
+                    "underlyingfresh":             _und_fresh,
+                    "underlying_age_sec":          _und_age_sec,
+                    "display_mark":                _display_mark,
+                    "display_pnl_pct":             _display_pnl,
+                    "exit_executable_mark":        _exec_exit_mark if _opt_bid_valid else None,
+                    "exit_executable_pnl_pct":     _exec_exit_pnl,
+                    "last_option_bid_update_ts":   _get_attr(pos, "lastoptionbidupdatets", "last_option_bid_update_ts", default=None),
+                    "hard_exit_reference_price":   _hard_ref_price if _hard_ref_price > 0 else None,
+                    "hard_exit_reference_source":  _hard_ref_source if _hard_ref_price > 0 else None,
+                    "hard_exit_reference_ts":      now_utc if _hard_ref_price > 0 else None,
+                    "hard_exit_reference_pnl_pct": (_hard_ref_pnl if (_hard_ref_price > 0 and cost_basis > 0) else None),
                 })
 
                 self._classify_health(pid, c, t, pos)
