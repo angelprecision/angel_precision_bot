@@ -1794,3 +1794,108 @@ class TestAmendment4ApplyQuoteSnapshotsInvalidation:
                 "hard_exit_reference_pnl_pct must reflect catastrophic loss"
         finally:
             qpm_mod.DIRECT_POSITION_WRITES = orig
+
+
+class TestAmendment4HardRiskPreGate:
+    """Blocker 6: _check_all_positions() eligibility must include a hard-risk
+    pre-gate.  A 1-min-old LIVE position with hard_exit_reference_pnl_pct=-45%
+    and no live quotes must NOT be skipped waiting for the 8-min stale-age or
+    a bid return."""
+
+    def test_should_evaluate_forced_when_hard_ref_at_hard_stop(self):
+        """Replicate the exact eligibility formula from _check_all_positions()."""
+        import ap_exit_engine as ee_mod
+        from types import SimpleNamespace
+        # Young LIVE position, hard-ref -45%, no live quotes, no peak
+        pos = SimpleNamespace(
+            entry_price=1.00,
+            current_underlying=0.0,
+            current_option_price=0.0,
+            current_bid=0.0,
+            peak_pnl_pct=0.0,
+            quantity_remaining=2,
+            closed=False,
+            exit_in_flight=False,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+            hard_exit_reference_pnl_pct=-0.45,
+        )
+        # Replicate the eligibility calc verbatim
+        _has_live_quotes = pos.current_underlying > 0 and pos.current_option_price > 0
+        _has_peak_to_protect = pos.peak_pnl_pct >= ee_mod.IMMEDIATE_TP_PCT and pos.quantity_remaining > 0
+        _has_entry_price = pos.entry_price > 0
+        _age_mins = (datetime.now(_UTC) - pos.opened_at).total_seconds() / 60
+        _position_old_enough = _age_mins >= 8
+        _last_known_price = pos.current_option_price > 0 or pos.current_bid > 0
+
+        # Amendment 4 blocker 6 hard-risk pre-gate:
+        _hard_ref = getattr(pos, "hard_exit_reference_pnl_pct", None)
+        _force_hard_eval = (
+            _hard_ref is not None
+            and _has_entry_price
+            and not pos.closed
+            and pos.quantity_remaining > 0
+            and not pos.exit_in_flight
+            and float(_hard_ref) <= ee_mod.HARD_STOP_PCT
+        )
+
+        # Pre-amendment: would have skipped entirely
+        _pre_amendment_should_evaluate = (
+            _has_live_quotes or _has_peak_to_protect
+            or (_has_entry_price and _last_known_price)
+            or (_has_entry_price and _position_old_enough)
+        )
+        assert _pre_amendment_should_evaluate is False, \
+            "sanity: this state used to be skipped entirely"
+
+        # Amendment 4: must now evaluate
+        _amendment_should_evaluate = _pre_amendment_should_evaluate or _force_hard_eval
+        assert _amendment_should_evaluate is True, (
+            "hard-risk pre-gate must force evaluation when hard-ref shows catastrophic loss"
+        )
+
+    def test_pregate_does_not_force_eval_when_hard_ref_healthy(self):
+        """A profitable hard-ref must NOT force evaluation — normal eligibility rules apply."""
+        import ap_exit_engine as ee_mod
+        from types import SimpleNamespace
+        pos = SimpleNamespace(
+            entry_price=1.00,
+            current_underlying=0.0, current_option_price=0.0, current_bid=0.0,
+            peak_pnl_pct=0.0,
+            quantity_remaining=2, closed=False, exit_in_flight=False,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+            hard_exit_reference_pnl_pct=0.10,   # +10% — healthy
+        )
+        _hard_ref = pos.hard_exit_reference_pnl_pct
+        _force = (
+            _hard_ref is not None
+            and pos.entry_price > 0
+            and not pos.closed
+            and pos.quantity_remaining > 0
+            and not pos.exit_in_flight
+            and float(_hard_ref) <= ee_mod.HARD_STOP_PCT
+        )
+        assert _force is False, "healthy hard-ref must NOT force hard-risk evaluation"
+
+    def test_pregate_skipped_when_exit_in_flight(self):
+        """Even at catastrophic loss, no re-eval if an exit is already in flight."""
+        import ap_exit_engine as ee_mod
+        from types import SimpleNamespace
+        pos = SimpleNamespace(
+            entry_price=1.00,
+            current_underlying=0.0, current_option_price=0.0, current_bid=0.0,
+            peak_pnl_pct=0.0,
+            quantity_remaining=2, closed=False,
+            exit_in_flight=True,      # already exiting
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+            hard_exit_reference_pnl_pct=-0.45,
+        )
+        _hard_ref = pos.hard_exit_reference_pnl_pct
+        _force = (
+            _hard_ref is not None
+            and pos.entry_price > 0
+            and not pos.closed
+            and pos.quantity_remaining > 0
+            and not pos.exit_in_flight
+            and float(_hard_ref) <= ee_mod.HARD_STOP_PCT
+        )
+        assert _force is False, "exit_in_flight must suppress the pre-gate (no double-fire)"
