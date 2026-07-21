@@ -26,6 +26,7 @@ from ap_exit_engine import (
     SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
     SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
     SOFT_EXIT_DEFERRED_ENTRY_GRACE,
+    SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED,
     HARD_STOP_PCT,
     IMMEDIATE_TP_PCT,
     SCALE_OUT_1_THRESHOLD,
@@ -359,12 +360,13 @@ class TestEvaluateExitExecutableTruth:
         )
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
-        # Soft loss threshold crossed but underlying unavailable → DEFER
-        assert decision.action == "HOLD"
-        assert decision.reason_code in (
-            SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
-            "STOP_BREACH_STARTED",  # Breach stamp fires first on first observation
-        ), f"Got {decision.reason_code}: {decision.reason}"
+        # Soft loss threshold crossed but underlying unavailable → DEFER.
+        # AUDIT: also proves the is_at_target zero-guard — before the fix a PUT
+        # with current_underlying=0 fired TARGET HIT instantly (0 <= target).
+        assert decision.action == "HOLD", f"Got {decision.action}: {decision.reason}"
+        assert decision.reason_code == SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE, (
+            f"Got {decision.reason_code}: {decision.reason}"
+        )
 
     """
     Test 6: Stale underlying defers underlying-dependent soft exit.
@@ -443,23 +445,26 @@ class TestEvaluateExitExecutableTruth:
         # The scale-out and never-green paths honor MIN_HOLD. Check result is not SCALE_OUT.
         # (This confirms "entry grace" semantics match existing MIN_HOLD behavior.)
 
-        # Hard stop should fire even when young
+        # Hard stop should fire even when young.
+        # AUDIT FIX: a catastrophic loss (past _hard_stop) now SKIPS the soft-loss
+        # branch entirely, so the HARD STOP is reachable on the first evaluation —
+        # no 45s breach-confirmation delay for losses at/past the hard threshold.
         pos_hard = _make_pos(
             entry_price=1.00,
-            current_bid=0.55,           # -45% — past hard stop threshold
+            current_bid=0.55,           # -45% — past hard stop threshold (-33%)
             current_option_price=0.55,
             option_bid_valid=True,
             option_quote_fresh=True,
             exit_executable_pnl_pct=-0.45,
             opened_at=datetime.now(_UTC) - timedelta(minutes=1),
         )
-        # Hard stop uses option_pnl_pct (backward compat) — set current_option_price
         pos_hard.current_option_price = 0.55
         pos_hard.currentoptionprice = 0.55
         decision_hard = evaluate_exit(pos_hard, now_et)
         assert decision_hard.action in ("STOP", "CLOSE_ALL"), (
             f"Expected hard stop but got {decision_hard.action}: {decision_hard.reason}"
         )
+        assert "HARD STOP" in decision_hard.reason, decision_hard.reason
 
     """
     Test 9: One executable threshold observation does NOT arm touched_profit;
@@ -523,21 +528,91 @@ class TestRegressionCoverage:
     Tests 11–20: Regression coverage for invariants the PR must preserve.
     """
 
-    """Test 11: Hard stop behavior is unchanged — fires without bid/underlying."""
+    """Test 11: Hard stop behavior — fires without bid/underlying.
+    AUDIT FIX: catastrophic losses (past _hard_stop) bypass the gated soft
+    branches so the hard stop is reachable even when bid is missing.  A
+    deferral must NEVER trap a position at -40% with no exit path."""
     def test_hard_stop_fires_without_bid(self):
         pos = _make_pos(
             entry_price=1.00,
             current_bid=0.0,            # no bid
-            current_option_price=0.60,  # mid shows -40% — past hard stop
+            current_option_price=0.60,  # mid shows -40% — past hard stop (-33%)
             option_bid_valid=False,
             underlying_available=False,
+            underlying_fresh=False,
+            current_underlying=0.0,
+            exit_executable_pnl_pct=None,
         )
-        # Hard stop uses option_pnl_pct (backward compat bid for LIVE, mid for PAPER)
-        # For PAPER with no bid, current_option_price = mid = 0.60 → -40%
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
         assert decision.action in ("STOP", "CLOSE_ALL"), (
             f"Hard stop should fire regardless of bid availability: {decision.action}: {decision.reason}"
+        )
+        assert "HARD STOP" in decision.reason, decision.reason
+
+    """Test 11b (AUDIT): PUT with missing underlying must NOT fire TARGET HIT."""
+    def test_put_zero_underlying_does_not_fire_target_hit(self):
+        pos = _make_pos(
+            side="PUT",
+            entry_price=1.00,
+            current_bid=1.02,
+            current_ask=1.06,
+            current_option_price=1.04,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+            exit_executable_pnl_pct=0.02,
+            current_underlying=0.0,     # MISSING — 0 <= target must not be TARGET HIT
+            underlying_available=False,
+            underlying_fresh=False,
+            underlying_target=145.0,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert "TARGET HIT" not in decision.reason, (
+            f"PUT with underlying=0 fired TARGET HIT — the PEP/LULU bug: {decision.reason}"
+        )
+
+    """Test 11c (AUDIT): CALL with missing underlying must NOT fire STOP HIT."""
+    def test_call_zero_underlying_does_not_fire_stop_hit(self):
+        pos = _make_pos(
+            side="CALL",
+            entry_price=1.00,
+            current_bid=1.02,
+            current_ask=1.06,
+            current_option_price=1.04,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+            exit_executable_pnl_pct=0.02,
+            current_underlying=0.0,     # MISSING — 0 <= stop must not be STOP HIT
+            underlying_available=False,
+            underlying_fresh=False,
+            underlying_target=155.0,
+            underlying_stop=145.0,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert "STOP HIT" not in decision.reason, (
+            f"CALL with underlying=0 fired STOP HIT on missing data: {decision.reason}"
+        )
+
+    """Test 11d (AUDIT): missing bid + mid in soft-exit territory surfaces the
+    explicit deferred reason code instead of a silent 'No exit condition met'."""
+    def test_missing_bid_in_soft_territory_surfaces_deferral(self):
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0,            # missing bid
+            current_option_price=1.18,  # mid = +18% — above scale threshold
+            option_bid_valid=False,
+            option_quote_fresh=True,
+            exit_executable_pnl_pct=None,
+            underlying_available=True,
+            underlying_fresh=True,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "HOLD"
+        assert decision.reason_code == SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE, (
+            f"Expected explicit deferral, got: {decision.reason_code!r} | {decision.reason}"
         )
 
     """Test 12: No broker submit occurs for deferred decisions."""
