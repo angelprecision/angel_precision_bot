@@ -6424,11 +6424,38 @@ class APExitEngine:
                     (getattr(pos, "current_option_price", 0) or 0) > 0
                     or (getattr(pos, "current_bid", 0) or 0) > 0
                 )
+                # ── AMENDMENT #4 (blocker 6): HARD-RISK PRE-GATE ──────────────
+                # A LIVE position at 1-min-old with hard_exit_reference_pnl_pct=-45%
+                # and no live bid used to skip evaluate_exit() entirely — no live
+                # quotes, no peak, no last-known price (LIVE zeroes it), too young.
+                # The sentinel path catches it later, but the deterministic fix is
+                # to force evaluation whenever a valid hard-exit reference shows a
+                # catastrophic loss. This uses ONLY the dedicated hard-exit authority
+                # (never soft-exit truth) so it cannot fire from mid/mark for a soft
+                # exit; evaluate_exit() itself gates all soft branches behind their
+                # own truth gates.
+                _hard_ref_pnl_early = getattr(pos, "hard_exit_reference_pnl_pct", None)
+                _force_hard_eval = (
+                    _hard_ref_pnl_early is not None
+                    and _has_entry_price
+                    and not getattr(pos, "closed", False)
+                    and int(getattr(pos, "quantity_remaining", 0) or 0) > 0
+                    and not getattr(pos, "exit_in_flight", False)
+                )
+                if _force_hard_eval:
+                    try:
+                        _hard_ref_val = float(_hard_ref_pnl_early)
+                        # HARD_STOP_PCT is negative (e.g. -0.33). Force eval when at/past it.
+                        _force_hard_eval = _hard_ref_val <= HARD_STOP_PCT
+                    except Exception:
+                        _force_hard_eval = False
+
                 _should_evaluate = (
                     _has_live_quotes
                     or _has_peak_to_protect
                     or (_has_entry_price and _last_known_price)
                     or (_has_entry_price and _position_old_enough)
+                    or _force_hard_eval
                 )
                 if _should_evaluate:
                     # Gate now only controls whether evaluate_exit() is called.
