@@ -106,6 +106,14 @@ class APPositionQuoteMonitor:
         self._last_wake_ts:    dict[str, float] = {}
         self._last_immediate_refresh_ts: dict[str, float] = {}
 
+        # P0: touched_profit consecutive-confirmation tracking (per contract).
+        # touched_profit must NEVER arm from a single poll or from midpoint P&L.
+        # We require two consecutive fresh executable BID observations at or above
+        # the IMMEDIATE_TP_PCT threshold before arming.  This dict tracks whether
+        # the first confirming observation has been seen for each contract.
+        # Keyed by contract OCC symbol string.
+        self._tp_pending_confirm: dict[str, bool] = {}
+
         # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
         # Throttle state for DB persistence of live quote/PnL fields.
         # QPM polls every ~1-2s; persisting every poll would hammer the DB.
@@ -506,6 +514,62 @@ class APPositionQuoteMonitor:
                         )
                         self.request_immediate_refresh(c)
 
+                # ── P0: Executable exit authority fields (always BID-based, all modes) ──
+                # Separate from the display/analytics mark.  For PAPER, the existing
+                # exec_price is midpoint (kept for display), but the BID is the only
+                # valid exit authority for soft exits per spec section 3.1/5.1.
+                _bid_for_exit = _safe_float(_get_attr(pos, "currentbid", "current_bid", default=None), 0.0)
+                _opt_bid_valid = _bid_for_exit > 0
+
+                # Quote freshness: computed from the timestamp we just wrote so it
+                # always reflects this cycle's quote age, never a stale stamp.
+                _opt_ts_now = _get_attr(pos, "lastoptionquoteupdatets", "last_option_quote_update_ts", default=None)
+                _und_ts_now = _get_attr(pos, "lastunderlyingquoteupdatets", "last_underlying_quote_update_ts", default=None)
+                # Use the exit engine's staleness constant (STALE_OPTION_QUOTE_MAX_AGE_SEC = 20s)
+                # as the threshold.  Import lazily to avoid circular deps.
+                _EXIT_STALE_SEC = float(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
+                _UNDERLYING_STALE_SEC = float(os.getenv("UNDERLYING_QUOTE_STALE_SEC", "40"))
+                try:
+                    _opt_age_sec = max(0.0, (now_utc - _opt_ts_now).total_seconds()) if _opt_ts_now else 999.0
+                    _opt_quote_fresh = _opt_age_sec <= _EXIT_STALE_SEC
+                except Exception:
+                    _opt_age_sec, _opt_quote_fresh = 999.0, False
+                try:
+                    _und_age_sec = max(0.0, (now_utc - _und_ts_now).total_seconds()) if _und_ts_now else 999.0
+                    _und_fresh = _und_age_sec <= _UNDERLYING_STALE_SEC
+                except Exception:
+                    _und_age_sec, _und_fresh = 999.0, False
+
+                _und_available = und_last > 0
+
+                # Display mark: always the mid/analytics mark written by existing logic.
+                # Exit executable mark: always the BID (never mid/ask/last).
+                _display_mark = _safe_float(_get_attr(pos, "analyticsmarkprice", "analytics_mark_price", default=None), 0.0) or cur_opt
+                _exec_exit_mark = _bid_for_exit if _opt_bid_valid else 0.0
+                _exec_exit_pnl: "Optional[float]" = None
+                _display_pnl: "Optional[float]" = None
+                if cost_basis > 0:
+                    if _opt_bid_valid and _exec_exit_mark > 0:
+                        _exec_exit_pnl = (_exec_exit_mark - cost_basis) / cost_basis
+                    if _display_mark > 0:
+                        _display_pnl = (_display_mark - cost_basis) / cost_basis
+
+                # Write explicit truth fields onto position.
+                self._write_field(pos, "option_bid_valid",        _opt_bid_valid)
+                self._write_field(pos, "optionbidvalid",          _opt_bid_valid)
+                self._write_field(pos, "option_quote_fresh",      _opt_quote_fresh)
+                self._write_field(pos, "optionquotefresh",        _opt_quote_fresh)
+                self._write_field(pos, "option_quote_age_sec",    _opt_age_sec)
+                self._write_field(pos, "underlying_available",    _und_available)
+                self._write_field(pos, "underlyingavailable",     _und_available)
+                self._write_field(pos, "underlying_fresh",        _und_fresh)
+                self._write_field(pos, "underlyingfresh",         _und_fresh)
+                self._write_field(pos, "underlying_age_sec",      _und_age_sec)
+                self._write_field(pos, "display_mark",            _display_mark)
+                self._write_field(pos, "display_pnl_pct",         _display_pnl if _display_pnl is not None else 0.0)
+                self._write_field(pos, "exit_executable_mark",    _exec_exit_mark)
+                self._write_field(pos, "exit_executable_pnl_pct", _exec_exit_pnl if _exec_exit_pnl is not None else 0.0)
+
                 if cost_basis > 0 and exec_price > 0 and _exec_quote_valid:
                     pnl_pct = (exec_price - cost_basis) / cost_basis
                     peak = max(
@@ -519,9 +583,26 @@ class APPositionQuoteMonitor:
                     self._write_field(pos, "max_profit_seen", peak)
                     self._write_field(pos, "optionpnlpct", pnl_pct)
                     self._write_field(pos, "option_pnl_pct", pnl_pct)
-                    if pnl_pct >= 0.05:
-                        self._write_field(pos, "touchedprofit", True)
-                        self._write_field(pos, "touched_profit", True)
+
+                    # ── P0: touched_profit consecutive-confirmation arming ──────────────
+                    # NEVER arm touched_profit from a single poll or from midpoint.
+                    # Require two consecutive fresh executable BID observations at or
+                    # above the IMMEDIATE_TP_PCT threshold (5% / 0.05).
+                    # Any interruption (bid goes missing, falls below threshold, or quote
+                    # becomes stale) resets the pending state.
+                    _TP_THRESHOLD = 0.05
+                    if _opt_bid_valid and _opt_quote_fresh and _exec_exit_pnl is not None and _exec_exit_pnl >= _TP_THRESHOLD:
+                        if not self._tp_pending_confirm.get(c, False):
+                            # First qualifying observation — set pending, do NOT arm yet.
+                            self._tp_pending_confirm[c] = True
+                        else:
+                            # Second consecutive qualifying observation — arm touched_profit.
+                            self._write_field(pos, "touchedprofit", True)
+                            self._write_field(pos, "touched_profit", True)
+                    else:
+                        # Bid unavailable, stale, or below threshold → reset pending.
+                        # touched_profit, once True, is never reset here (only close clears it).
+                        self._tp_pending_confirm[c] = False
 
                     self._persist_quote_to_db(
                         position_id     = pid,
@@ -1050,6 +1131,7 @@ class APPositionQuoteMonitor:
             self._last_wake_price.pop(k, None)
             self._last_wake_ts.pop(k, None)
             self._last_immediate_refresh_ts.pop(k, None)
+            self._tp_pending_confirm.pop(k, None)
 
     # ── Quote fetch (shared cache + 429 backoff) ─────────────────────────────
     def _fetch_batch_cached(self, symbols: list[str]) -> dict[str, dict]:
