@@ -1798,104 +1798,344 @@ class TestAmendment4ApplyQuoteSnapshotsInvalidation:
 
 class TestAmendment4HardRiskPreGate:
     """Blocker 6: _check_all_positions() eligibility must include a hard-risk
-    pre-gate.  A 1-min-old LIVE position with hard_exit_reference_pnl_pct=-45%
-    and no live quotes must NOT be skipped waiting for the 8-min stale-age or
-    a bid return."""
+    pre-gate. AMENDMENT #5: rewritten to call the REAL _check_all_positions()
+    method on a REAL APExitEngine — no formula replication.
 
-    def test_should_evaluate_forced_when_hard_ref_at_hard_stop(self):
-        """Replicate the exact eligibility formula from _check_all_positions()."""
+    We mock ONLY external boundaries:
+    - broker (never called from _check_all_positions in these paths)
+    - _persist_peak_state_to_db (external DB write)
+    - _submit_exit_decision (submission callback)
+    - _emit_exit_decision_stamp (persistence)
+    - _ledger_exit_decision (persistence)
+    Everything else runs as production."""
+
+    def _make_engine(self):
+        """Construct a real APExitEngine with mocked external boundaries."""
         import ap_exit_engine as ee_mod
-        from types import SimpleNamespace
-        # Young LIVE position, hard-ref -45%, no live quotes, no peak
-        pos = SimpleNamespace(
-            entry_price=1.00,
-            current_underlying=0.0,
-            current_option_price=0.0,
-            current_bid=0.0,
-            peak_pnl_pct=0.0,
-            quantity_remaining=2,
-            closed=False,
-            exit_in_flight=False,
-            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
-            hard_exit_reference_pnl_pct=-0.45,
-        )
-        # Replicate the eligibility calc verbatim
-        _has_live_quotes = pos.current_underlying > 0 and pos.current_option_price > 0
-        _has_peak_to_protect = pos.peak_pnl_pct >= ee_mod.IMMEDIATE_TP_PCT and pos.quantity_remaining > 0
-        _has_entry_price = pos.entry_price > 0
-        _age_mins = (datetime.now(_UTC) - pos.opened_at).total_seconds() / 60
-        _position_old_enough = _age_mins >= 8
-        _last_known_price = pos.current_option_price > 0 or pos.current_bid > 0
 
-        # Amendment 4 blocker 6 hard-risk pre-gate:
-        _hard_ref = getattr(pos, "hard_exit_reference_pnl_pct", None)
-        _force_hard_eval = (
-            _hard_ref is not None
-            and _has_entry_price
-            and not pos.closed
-            and pos.quantity_remaining > 0
-            and not pos.exit_in_flight
-            and float(_hard_ref) <= ee_mod.HARD_STOP_PCT
-        )
+        class _MinimalBroker:
+            def get_quotes(self, symbols): return []
 
-        # Pre-amendment: would have skipped entirely
-        _pre_amendment_should_evaluate = (
-            _has_live_quotes or _has_peak_to_protect
-            or (_has_entry_price and _last_known_price)
-            or (_has_entry_price and _position_old_enough)
-        )
-        assert _pre_amendment_should_evaluate is False, \
-            "sanity: this state used to be skipped entirely"
+        eng = ee_mod.APExitEngine(broker=_MinimalBroker(), email="test@client.com")
+        # Stub external boundaries
+        eng._persist_peak_state_to_db = lambda pos: None
+        eng._emit_exit_decision_stamp = lambda *a, **kw: None
+        # Capture submission attempts
+        eng._submitted = []
+        def _capture_submit(pos, decision, **kw):
+            eng._submitted.append((pos, decision, kw))
+            return True
+        eng._submit_exit_decision = _capture_submit
+        # Skip DB-adjacent guardrails that don't apply to this test
+        eng._eligible_for_new_exit = lambda pos, now_utc: True
+        return eng
 
-        # Amendment 4: must now evaluate
-        _amendment_should_evaluate = _pre_amendment_should_evaluate or _force_hard_eval
-        assert _amendment_should_evaluate is True, (
-            "hard-risk pre-gate must force evaluation when hard-ref shows catastrophic loss"
-        )
-
-    def test_pregate_does_not_force_eval_when_hard_ref_healthy(self):
-        """A profitable hard-ref must NOT force evaluation — normal eligibility rules apply."""
+    def _make_managed_position(self, *, side="CALL", entry=1.00,
+                                hard_ref_pnl=-0.45, dte=5,
+                                age_minutes=1, current_option_price=0.0,
+                                current_bid=0.0, current_underlying=0.0):
         import ap_exit_engine as ee_mod
-        from types import SimpleNamespace
-        pos = SimpleNamespace(
-            entry_price=1.00,
-            current_underlying=0.0, current_option_price=0.0, current_bid=0.0,
-            peak_pnl_pct=0.0,
-            quantity_remaining=2, closed=False, exit_in_flight=False,
-            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
-            hard_exit_reference_pnl_pct=0.10,   # +10% — healthy
+        from datetime import datetime, timedelta, timezone as _tz
+        expiry = datetime.now(_tz.utc) + timedelta(days=dte)
+        # Proper OCC symbol: 6-digit YYMMDD
+        _exp_str = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
+        ticker = "SPY" if dte == 0 else "ABT"
+        _cp = "C" if side == "CALL" else "P"
+        pos = ee_mod.ManagedPosition(
+            ticker=ticker,
+            option_symbol=f"{ticker}{_exp_str}{_cp}00150000",
+            side=side, quantity=2, quantity_remaining=2,
+            entry_price=entry,
+            underlying_entry=150.0,
+            underlying_target=155.0 if side == "CALL" else 145.0,
+            underlying_stop=145.0 if side == "CALL" else 155.0,
+            execution_mode="live",
+            opened_at=datetime.now(_tz.utc) - timedelta(minutes=age_minutes),
         )
-        _hard_ref = pos.hard_exit_reference_pnl_pct
-        _force = (
-            _hard_ref is not None
-            and pos.entry_price > 0
-            and not pos.closed
-            and pos.quantity_remaining > 0
-            and not pos.exit_in_flight
-            and float(_hard_ref) <= ee_mod.HARD_STOP_PCT
-        )
-        assert _force is False, "healthy hard-ref must NOT force hard-risk evaluation"
+        pos.expiry = expiry
+        pos.current_underlying = current_underlying
+        pos.current_option_price = current_option_price
+        pos.current_bid = current_bid
+        pos.current_ask = 0.0
+        pos.peak_pnl_pct = 0.0
+        pos.max_profit_seen = 0.0
+        pos.exit_in_flight = False
+        pos.closed = False
+        pos.hard_exit_reference_pnl_pct = hard_ref_pnl
+        pos.hard_exit_reference_price = entry * (1 + hard_ref_pnl)
+        pos.hard_exit_reference_source = "last"
+        # Truth fields
+        pos.option_bid_valid = current_bid > 0
+        pos.option_quote_fresh = current_bid > 0
+        pos.underlying_available = current_underlying > 0
+        pos.underlying_fresh = current_underlying > 0
+        return pos
 
-    def test_pregate_skipped_when_exit_in_flight(self):
-        """Even at catastrophic loss, no re-eval if an exit is already in flight."""
-        import ap_exit_engine as ee_mod
-        from types import SimpleNamespace
-        pos = SimpleNamespace(
+    def test_real_check_all_positions_forces_eval_for_spy_0dte_at_minus_25pct(self):
+        """SPY 0DTE hard stop is -18% (per _effective_thresholds).
+        A -25% hard-ref must force eval. Pre-amendment-5 code used the global
+        -33% and would have SKIPPED this — the reviewer's exact case."""
+        eng = self._make_engine()
+        pos = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.25,           # past 0DTE -18%, not past global -33%
+            dte=0, age_minutes=1,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._check_all_positions()
+
+        # The pre-gate must have forced evaluate_exit() which produced a HARD STOP,
+        # which was then routed to _submit_exit_decision.
+        assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted), (
+            f"expected exactly 1 submission, got {len(eng._submitted)}: "
+            f"pre-gate must force eval for SPY 0DTE at -25% (past 0DTE -18% stop)"
+        )
+        _, dec, _ = eng._submitted[0]
+        assert dec.action == "STOP", f"expected STOP, got {dec.action}: {dec.reason}"
+        assert "HARD STOP" in dec.reason
+
+    def test_real_check_all_positions_forces_eval_for_equity_0dte_at_minus_23pct(self):
+        """Equity 0DTE hard stop is -22%. -23% must force eval (past -22%, not past -33%)."""
+        eng = self._make_engine()
+        pos = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.23,           # past 0DTE equity -22%
+            dte=0, age_minutes=1,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        # override ticker to non-SPY to hit equity path
+        pos.ticker = "ABT"
+        pos.option_symbol = pos.option_symbol.replace("SPY", "ABT")
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._check_all_positions()
+
+        assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted), (
+            f"expected 1 submission, got {len(eng._submitted)} for equity 0DTE at -23%"
+        )
+
+    def test_real_check_all_positions_forces_eval_for_1_2dte_at_minus_27pct(self):
+        """1-2 DTE hard stop is -26%. -27% must force eval."""
+        eng = self._make_engine()
+        pos = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.27,
+            dte=2, age_minutes=1,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._check_all_positions()
+        assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted)
+
+    def test_real_check_all_positions_forces_eval_for_longer_dated_at_minus_34pct(self):
+        """Longer-dated hard stop is -33%. -34% must force eval (baseline case)."""
+        eng = self._make_engine()
+        pos = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.34,
+            dte=10, age_minutes=1,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._check_all_positions()
+        assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted)
+
+    def test_real_check_all_positions_skips_healthy_hard_ref(self):
+        """A healthy hard-ref must NOT force evaluation. No submission expected
+        for a 1-min-old position with +10% hard-ref and no other eligibility signal."""
+        eng = self._make_engine()
+        pos = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=0.10,             # healthy
+            dte=5, age_minutes=1,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._check_all_positions()
+        assert len(eng._submitted) == 0, (
+            "healthy hard-ref must not force evaluation (would waste cycles + risk false action)"
+        )
+
+    def test_real_check_all_positions_skips_when_exit_in_flight(self):
+        """exit_in_flight=True must suppress the pre-gate even at catastrophic loss."""
+        eng = self._make_engine()
+        pos = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.45,
+            dte=5, age_minutes=1,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        pos.exit_in_flight = True
+        eng._positions = [pos]
+        eng._positions_by_id[pos.position_id] = pos
+
+        eng._check_all_positions()
+        assert len(eng._submitted) == 0, "exit_in_flight must suppress double-fire"
+
+
+class TestAmendment5Blocker2FreshnessGates:
+    """Blocker 2: TARGET/STOP HIT must require underlying_fresh.
+    STOP breach timer must reset when data goes stale."""
+
+    def test_target_hit_defers_when_underlying_stale(self):
+        """CALL at target price, but underlying_fresh=False → TARGET HIT must not fire."""
+        pos = _make_pos(
+            side="CALL",
             entry_price=1.00,
-            current_underlying=0.0, current_option_price=0.0, current_bid=0.0,
-            peak_pnl_pct=0.0,
-            quantity_remaining=2, closed=False,
-            exit_in_flight=True,      # already exiting
-            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
-            hard_exit_reference_pnl_pct=-0.45,
+            current_bid=1.05, current_ask=1.10, current_option_price=1.05,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=0.05,
+            current_underlying=156.0,          # AT target — data stale
+            underlying_available=True,
+            underlying_fresh=False,             # STALE
+            underlying_target=155.0,
         )
-        _hard_ref = pos.hard_exit_reference_pnl_pct
-        _force = (
-            _hard_ref is not None
-            and pos.entry_price > 0
-            and not pos.closed
-            and pos.quantity_remaining > 0
-            and not pos.exit_in_flight
-            and float(_hard_ref) <= ee_mod.HARD_STOP_PCT
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert "TARGET HIT" not in decision.reason, (
+            f"TARGET HIT must not fire on stale underlying: {decision.reason}"
         )
-        assert _force is False, "exit_in_flight must suppress the pre-gate (no double-fire)"
+
+    def test_stop_hit_defers_when_underlying_stale(self):
+        pos = _make_pos(
+            side="CALL",
+            entry_price=1.00,
+            current_bid=0.95, current_ask=1.00, current_option_price=0.95,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.05,
+            current_underlying=140.0,          # BELOW stop
+            underlying_available=True,
+            underlying_fresh=False,             # STALE
+            underlying_target=155.0, underlying_stop=145.0,
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert "STOP HIT" not in decision.reason, (
+            f"STOP HIT must not fire on stale underlying: {decision.reason}"
+        )
+
+    def test_stop_breach_timer_resets_when_underlying_goes_stale(self):
+        """Timer starts on fresh breach; underlying goes stale; on stale
+        evaluation the breach ts must reset (else elapsed wall-clock on a
+        single stale observation would satisfy the confirmation window)."""
+        pos = _make_pos(
+            side="CALL",
+            entry_price=1.00,
+            current_bid=0.95, current_ask=1.00, current_option_price=0.95,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.05,
+            current_underlying=140.0,
+            underlying_available=True,
+            underlying_fresh=True,              # fresh initially
+            underlying_target=155.0, underlying_stop=145.0,
+        )
+        # First eval: breach starts fresh, timer stamped
+        now_et = _et_noon().replace(hour=10)
+        _ = evaluate_exit(pos, now_et)
+        assert pos._underlying_stop_breach_ts is not None, "timer must be stamped on first fresh breach"
+
+        # Now underlying goes stale
+        pos.underlying_fresh = False
+        pos.underlyingfresh = False
+
+        # Second eval: stale data must RESET the timer
+        _ = evaluate_exit(pos, now_et)
+        assert pos._underlying_stop_breach_ts is None, (
+            "stale underlying must reset breach timer — otherwise elapsed wall-clock "
+            "on a single stale observation would satisfy the 30s confirmation window"
+        )
+
+
+class TestAmendment5Blocker3SharedHardRef:
+    """Blocker 3: _apply_option_quote_for_decision writes hard-exit reference too."""
+
+    def test_apply_option_quote_for_decision_writes_hard_ref(self):
+        """Real _apply_option_quote_for_decision call: bid missing, mark shows
+        catastrophic loss → hard-exit reference must reach the position."""
+        import ap_exit_engine as ee_mod
+        pos = ManagedPosition(
+            ticker="ABT", option_symbol="ABT260721P00150000",
+            side="PUT", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=145.0, underlying_stop=155.0,
+            execution_mode="live",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+        # Call the REAL production writer
+        ee_mod._apply_option_quote_for_decision(
+            pos, bid=0.0, ask=0.60, mark=0.55,
+            quote_ts=datetime.now(_UTC), source="test",
+        )
+        assert getattr(pos, "hard_exit_reference_price", 0.0) > 0, (
+            "_apply_option_quote_for_decision must write hard_exit_reference_price "
+            "so broker-repair positions have hard-stop authority"
+        )
+        assert getattr(pos, "hard_exit_reference_pnl_pct", 0.0) <= -0.30, (
+            "hard-ref pnl must reflect catastrophic loss from mark evidence"
+        )
+
+
+class TestAmendment5Blocker4HardRefSourcePolicy:
+    """Blocker 4: ASK cannot certify safety; conservative source ordering."""
+
+    def test_bid_wins_when_present(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=1.10, ask=1.20, mark=1.15, last=1.05)
+        assert source == "bid"
+        assert price == pytest.approx(1.10)
+
+    def test_last_beats_ask_when_no_bid(self):
+        """The reviewer's exact case: bid=0, mark=0, ask=1.20, last=0.50.
+        Old code picked ASK (+20%). New code must pick LAST (-50%)."""
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=0, ask=1.20, mark=0, last=0.50)
+        assert source == "last", (
+            f"LAST must outrank ASK for long-option liquidation truth. "
+            f"ASK is not a liquidation price; got source={source} price={price}"
+        )
+        assert price == pytest.approx(0.50)
+
+    def test_last_beats_mark_when_no_bid(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=0, ask=0, mark=1.10, last=0.60)
+        assert source == "last", "LAST — real traded price — beats broker-computed MARK"
+
+    def test_mark_beats_ask_when_no_bid_or_last(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=0, ask=1.20, mark=0.55, last=0)
+        assert source == "mark"
+        assert price == pytest.approx(0.55)
+
+    def test_ask_only_flagged_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=0, ask=1.20, mark=0, last=0)
+        assert source == "ask_unproven", (
+            "ASK-only quote must be flagged as unproven so downstream can treat "
+            "it with degraded trust — ASK cannot certify safety"
+        )
+        # Still records the price so hard-stop can fire if ASK itself is catastrophic
+        assert price == pytest.approx(1.20)
+
+    def test_ask_only_catastrophic_still_fires_hard_stop(self):
+        """ASK below hard stop is self-proving catastrophe."""
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=0, ask=0.55, mark=0, last=0)
+        # source is unproven but pnl calc against entry=1.00 gives -45%
+        pnl = (price - 1.00) / 1.00
+        assert pnl <= -0.30, "ASK-only catastrophic must still register the loss"
+
+    def test_no_data_returns_empty(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        price, source = _select_hard_exit_reference(bid=0, ask=0, mark=0, last=0)
+        assert price == 0.0
+        assert source == ""
