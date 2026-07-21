@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 
 from ap.position_quote_monitor import APPositionQuoteMonitor  # noqa: E402
+from ap.soft_exit_replay import run_replays  # noqa: E402
 from ap_exit_engine import (  # noqa: E402
     APExitEngine,
     ExitDecision,
@@ -269,6 +270,17 @@ class TestIncidentReplays:
         assert broken.should_act is True
         assert broken.reason_code == "SOFT_OPTION_STOP"
         assert broken._exit_truth_cycle_id == "abt-broken"
+
+    def test_replay_cli_contract_reports_all_incidents(self):
+        replay = run_replays()
+        assert replay["PEP"]["action"] == "HOLD"
+        assert replay["PEP"]["reason_code"] == SOFT_EXIT_SUPPRESSED_CONFIRMING_THESIS
+        assert replay["PEP"]["broker_exit_submitted"] is False
+        assert replay["LULU"]["action"] == "HOLD"
+        assert replay["LULU"]["broker_exit_submitted"] is False
+        assert replay["ABT"]["missing_underlying"]["reason_code"] == SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE
+        assert replay["ABT"]["fresh_confirming_underlying"]["action"] == "HOLD"
+        assert replay["ABT"]["fresh_nonconfirming_underlying"]["would_submit_existing_exit_authority"] is True
 
 
 class TestUnderlyingTruthFailClosed:
