@@ -5805,16 +5805,17 @@ class APExitEngine:
                     self._email, sym,
                 )
 
-            # Seed peak P&L / touched_profit using executable price (never mid).
+            # Seed peak P&L using BID only (never mid/mark).
+            # P0 (PR #385 amendment): touched_profit is NEVER armed here — a
+            # single seed observation would defeat QPM's two-consecutive-fresh-BID
+            # confirmation contract.  QPM arms it within ~2 polls of restart.
             broker_pnl_pct = 0.0
-            _seed_exec_price = (pos.current_option_price if pos.current_option_price > 0
-                                else (broker_bid if broker_bid > 0 else 0.0))
-            if pos.entry_price > 0 and _seed_exec_price > 0:
-                broker_pnl_pct = (_seed_exec_price - pos.entry_price) / pos.entry_price
-                if broker_pnl_pct > 0:
-                    if broker_pnl_pct > pos.peak_pnl_pct:
-                        pos.peak_pnl_pct = broker_pnl_pct
-                    pos.touched_profit = True
+            if pos.entry_price > 0 and broker_bid > 0:
+                broker_pnl_pct = (broker_bid - pos.entry_price) / pos.entry_price
+                if broker_pnl_pct > 0 and broker_pnl_pct > pos.peak_pnl_pct:
+                    pos.peak_pnl_pct = broker_pnl_pct
+                    if broker_pnl_pct > pos.max_profit_seen:
+                        pos.max_profit_seen = broker_pnl_pct
 
             # ── 3e. Required structured log ────────────────────────────────────
             log.info(
@@ -6186,51 +6187,40 @@ class APExitEngine:
                     and int(pos.quantity_remaining or 0) > 0
                 )
 
-                # ── PEAK TRACKING — runs BEFORE quote gate, always ────────────
-                # The quote gate exists to prevent false exits on stale prices.
-                # It must NOT prevent recording a new high-water mark.
-                # If QPM has a gap exactly at peak, peak_pnl_pct never updates
-                # and trail/profit-floor logic fires based on a false 0% peak.
-                # Fix: advance peak from ANY non-zero option price, stale or not.
-                # Never allow a QPM gap to erase a real peak.
+                # ── PEAK TRACKING — runs BEFORE quote gate ────────────────────
+                # P0 (PR #385 amendment): peak_pnl_pct and max_profit_seen are
+                # EXECUTABLE-BID-ONLY authority.  They feed soft-exit decisions
+                # (profit floors, runner trails, small-win capture), so a PAPER
+                # midpoint spike must never inflate them.  The engine advances
+                # peak only from a bid-derived P&L; when bid is missing this
+                # cycle, the peak simply does not advance (QPM will catch it on
+                # the next bid-valid poll — bounded by poll cadence, not lost).
                 #
-                # P0 amendment: peak_pnl_pct and max_profit_seen may advance from
-                # any non-zero price (preserving the anti-QPM-gap intent).  However,
-                # touched_profit MUST ONLY arm from bid-proven executable truth:
-                # the consecutive confirmation is handled by QPM._refresh_once();
-                # here we only propagate touched_profit=True when current_bid > 0
-                # so a midpoint spike (PAPER) cannot arm touched_profit in the engine.
-                if pos.current_option_price > 0 and pos.entry_price > 0:
-                    _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
-                    if _raw_pnl > pos.peak_pnl_pct:
-                        pos.peak_pnl_pct = _raw_pnl
-                        log.debug(
-                            "[%s] PEAK UPDATE (pre-gate) | peak=%.1f%% | option=$%.2f entry=$%.2f",
-                            pos.ticker, _raw_pnl * 100,
-                            pos.current_option_price, pos.entry_price,
-                        )
-                    # touched_profit: only arm from bid-proven executable truth.
-                    # QPM already enforces consecutive confirmation.  The exit engine
-                    # re-checks here as a defence-in-depth guard against midpoint arming.
+                # touched_profit: the engine NEVER arms it.  QPM is the sole
+                # arming authority via two-consecutive-fresh-BID confirmation
+                # (position-scoped).  A single engine-side observation arming
+                # touched_profit would defeat that confirmation contract.
+                if pos.entry_price > 0:
                     _pg_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
                     _pg_bid_valid = _pg_bid > 0.0
-                    if _raw_pnl > 0 and _pg_bid_valid:
-                        pos.touched_profit = True
-                        if _raw_pnl > pos.max_profit_seen:
-                            pos.max_profit_seen = _raw_pnl
-                    elif _raw_pnl > 0 and not _pg_bid_valid:
-                        # Advance max_profit_seen for anti-QPM-gap peak tracking,
-                        # but do NOT arm touched_profit without a valid bid.
-                        if _raw_pnl > pos.max_profit_seen:
-                            pos.max_profit_seen = _raw_pnl
-                    # Keep in-memory option_pnl_pct fresh for the DB write
-                    # below (property-backed in some paths; setter ensures
-                    # the persistence layer sees the same value the engine
-                    # decisioned on).
-                    try:
-                        pos.option_pnl_pct = _raw_pnl
-                    except Exception:
-                        pass
+                    if _pg_bid_valid:
+                        _bid_pnl = (_pg_bid - pos.entry_price) / pos.entry_price
+                        if _bid_pnl > pos.peak_pnl_pct:
+                            pos.peak_pnl_pct = _bid_pnl
+                            log.debug(
+                                "[%s] PEAK UPDATE (pre-gate, bid) | peak=%.1f%% | bid=$%.2f entry=$%.2f",
+                                pos.ticker, _bid_pnl * 100, _pg_bid, pos.entry_price,
+                            )
+                        if _bid_pnl > 0 and _bid_pnl > pos.max_profit_seen:
+                            pos.max_profit_seen = _bid_pnl
+                    # Keep in-memory option_pnl_pct fresh for the DB write below
+                    # (display/hard-exit authority — mode-specific, unchanged).
+                    if pos.current_option_price > 0:
+                        _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
+                        try:
+                            pos.option_pnl_pct = _raw_pnl
+                        except Exception:
+                            pass
                     # PR: position-lifecycle-integrity-and-sizing (P0 FIX-3)
                     # Persist peak / max_profit / touched / option_pnl_pct
                     # to positions table. Throttled, non-fatal. The exit
