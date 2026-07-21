@@ -587,13 +587,22 @@ class APPositionQuoteMonitor:
                 _bid_ts = oq.get("bid_ts") or (now_utc if bid > 0 else None)
                 _ask_ts = oq.get("ask_ts") or (now_utc if ask > 0 else None)
 
+                # AMENDMENT #6 blocker 4: pass per-position hard stop.
+                # ASK-only at -25% on SPY 0DTE is catastrophic (stop=-18%),
+                # but the global -0.33 check would call it unproven.
+                # Get the position's actual threshold if possible.
+                try:
+                    _pos_hard_stop_for_href, _, _ = _effective_thresholds(pos)
+                except Exception:
+                    _pos_hard_stop_for_href = -0.33
+
                 _href = _select_hard_exit_reference(
                     bid=bid, ask=ask, mark=_mark_for_ref, last=_last_for_ref,
                     bid_ts=_bid_ts, last_ts=_last_trade_ts,
                     mark_ts=_mark_ts, ask_ts=_ask_ts,
                     now_utc=now_utc,
                     entry_price=cost_basis,
-                    hard_stop_pct=-0.33,   # global hard-stop for catastrophic-ASK test
+                    hard_stop_pct=_pos_hard_stop_for_href,
                     last_stale_sec=float(os.getenv("LAST_TRADE_STALE_SEC", "30.0")),
                 )
                 _hard_ref_price  = _href.price
@@ -613,7 +622,7 @@ class APPositionQuoteMonitor:
                               "hardexitreferenceprice", default=None), 0.0
                 )
                 _overwrite_allowed = True
-                if _hard_ref_validity == "unproven" and _prior_validity == "proven" and _prior_price > 0:
+                if _hard_ref_validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0:
                     _overwrite_allowed = False
                     self._write_field_unconditional(pos, "hard_exit_reference_refresh_needed", True)
                     self._write_field_unconditional(pos, "hardexitreferencerefreshneeded",     True)
@@ -907,6 +916,10 @@ class APPositionQuoteMonitor:
                     "hard_exit_reference_source":  _hard_ref_source if _hard_ref_price > 0 else None,
                     "hard_exit_reference_ts":      now_utc if _hard_ref_price > 0 else None,
                     "hard_exit_reference_pnl_pct": (_hard_ref_pnl if (_hard_ref_price > 0 and cost_basis > 0) else None),
+                    # AMENDMENT #6 blocker 1: validity and refresh_needed MUST be in
+                    # the snapshot — every consumer requires validity to trust the pnl.
+                    "hard_exit_reference_validity":       (_hard_ref_validity if _hard_ref_price > 0 else "no_data"),
+                    "hard_exit_reference_refresh_needed": (False if _hard_ref_validity == "proven" else True),
                 })
 
                 self._classify_health(pid, c, t, pos)
