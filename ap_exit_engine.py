@@ -575,6 +575,14 @@ SMALL_WIN_TRAIL       = 0.08   # floor 8pt below peak (seen +20% → floor at +1
 HARD_REF_MAX_AGE_SEC = float(os.getenv("HARD_EXIT_REF_MAX_AGE_SEC", "300"))
 
 
+def _normalize_hard_ref_ts(ts, *, now_utc: Optional[datetime] = None) -> Optional[datetime]:
+    try:
+        from ap.position_quote_monitor import normalize_hard_ref_ts
+        return normalize_hard_ref_ts(ts, now_utc=now_utc or datetime.now(timezone.utc))
+    except Exception:
+        return None
+
+
 def get_effective_hard_exit_reference(
     pos: "ManagedPosition",
     now_utc: "Optional[datetime]" = None,
@@ -622,11 +630,11 @@ def get_effective_hard_exit_reference(
     if ts is None:
         return None  # no timestamp → cannot verify freshness → fail closed
 
-    try:
-        age_sec = max(0.0, (now_utc - ts).total_seconds())
-    except Exception:
+    parsed_ts = _normalize_hard_ref_ts(ts, now_utc=now_utc)
+    if parsed_ts is None:
         return None  # unparseable timestamp → fail closed
 
+    age_sec = max(0.0, (now_utc - parsed_ts).total_seconds())
     if age_sec > HARD_REF_MAX_AGE_SEC:
         return None  # expired — consumer must fall back to option_pnl_pct
 
@@ -858,9 +866,9 @@ def _apply_option_quote_for_decision(
         _href = _sel_href(
             bid=float(bid or 0.0), ask=float(ask or 0.0),
             mark=float(mark or 0.0), last=float(last or 0.0),
-            bid_ts=(quote_ts if (bid or 0) > 0 else None),
-            ask_ts=(quote_ts if (ask or 0) > 0 else None),
-            mark_ts=(mark_ts or quote_ts),
+            bid_ts=(_normalize_hard_ref_ts(quote_ts, now_utc=_now) if (bid or 0) > 0 else None),
+            ask_ts=(_normalize_hard_ref_ts(quote_ts, now_utc=_now) if (ask or 0) > 0 else None),
+            mark_ts=_normalize_hard_ref_ts(mark_ts, now_utc=_now),
             last_ts=last_ts,
             now_utc=_now,
             entry_price=_cost_basis,
@@ -871,7 +879,10 @@ def _apply_option_quote_for_decision(
         _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
         _prior_price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
         _overwrite = True
-        if _href.validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0:
+        if (
+            (_href.validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0)
+            or (_href.validity == "no_data" and _prior_price > 0)
+        ):
             _overwrite = False
             pos.hard_exit_reference_refresh_needed = True
             pos.hardexitreferencerefreshneeded = True
@@ -882,7 +893,7 @@ def _apply_option_quote_for_decision(
             pos.hardexitreferencesource = _href.source
             pos.hard_exit_reference_validity = _href.validity
             pos.hardexitreferencevalidity = _href.validity
-            _ts_to_write = _href.ts or quote_ts or _now
+            _ts_to_write = _href.ts
             pos.hard_exit_reference_ts = _ts_to_write
             pos.hardexitreferencets = _ts_to_write
             if _cost_basis > 0:
@@ -1169,11 +1180,13 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # One snapshot per evaluation; all soft exit branches consume it.
     now_utc = datetime.now(timezone.utc)
     snap = _build_exit_decision_snapshot(pos, now_utc)
+    _effective_hard_ref = get_effective_hard_exit_reference(pos, now_utc)
 
     hour, minute = now_et.hour, now_et.minute
     # option_pnl: backward-compatible (bid for LIVE, mid for PAPER) — ONLY used
     # by hard exits that must fire even without a valid bid.
     option_pnl   = pos.option_pnl_pct
+    _decision_pnl = _effective_hard_ref if _effective_hard_ref is not None else option_pnl
     # exec_pnl: always BID-based — used by ALL soft exit branches.
     # May be None when bid is missing.  Soft exit gates will catch None.
     exec_pnl     = snap.exit_executable_pnl_pct
@@ -1190,9 +1203,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
             urgency="IMMEDIATE",
-            pnl_pct=(_positive_or_none(getattr(pos, "hard_exit_reference_pnl_pct", None))
-                     if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
-                     else option_pnl),
+            pnl_pct=_decision_pnl,
         )
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
@@ -1206,11 +1217,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
             pos._underlying_stop_breach_ts = None
     elif pos.is_at_stop:
-        _stop_pnl_authority = (
-            float(getattr(pos, "hard_exit_reference_pnl_pct"))
-            if getattr(pos, "hard_exit_reference_pnl_pct", None) is not None
-            else option_pnl
-        )
+        _stop_pnl_authority = _decision_pnl
         # PR-A / BUG-2: stamp is datetime now (was time.time() float).
         _now_dt = datetime.now(timezone.utc)
         _stop_dt = pos._underlying_stop_breach_ts
@@ -1265,9 +1272,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # All hard-exit consumers use the shared resolver — never direct attribute reads.
     # Blocker 2 (amendment #6+): resolver also recomputes age from the stored
     # hard_exit_reference_ts so an expired "proven" label cannot mask new losses.
-    _hard_loss_pnl = get_effective_hard_exit_reference(pos, now_utc) if now_utc else None
-    if _hard_loss_pnl is None:
-        _hard_loss_pnl = option_pnl
+    _hard_loss_pnl = _decision_pnl
 
     # HARD STOP (pre-evaluated, using dedicated loss authority)
     if _hard_loss_pnl <= _hard_stop:
@@ -3859,19 +3864,43 @@ class APExitEngine:
                     _apply("exit_executable_pnl_pct")
 
                     # Hard-exit reference (LIVE-money HARD STOP consumer)
-                    _apply("hard_exit_reference_price")
-                    _apply("hardexitreferenceprice", "hard_exit_reference_price")
-                    _apply("hard_exit_reference_source")
-                    _apply("hardexitreferencesource", "hard_exit_reference_source")
-                    _apply("hard_exit_reference_ts")
-                    _apply("hardexitreferencets", "hard_exit_reference_ts")
-                    _apply("hard_exit_reference_pnl_pct")
-                    _apply("hardexitreferencepnlpct", "hard_exit_reference_pnl_pct")
-                    # AMENDMENT #6 blocker 1: validity and refresh_needed must transit
-                    _apply("hard_exit_reference_validity")
-                    _apply("hardexitreferencevalidity", "hard_exit_reference_validity")
-                    _apply("hard_exit_reference_refresh_needed")
-                    _apply("hardexitreferencerefreshneeded", "hard_exit_reference_refresh_needed")
+                    if "hard_exit_reference_validity" in snap or "hard_exit_reference_price" in snap:
+                        _incoming_validity = str(snap.get("hard_exit_reference_validity") or "no_data")
+                        _incoming_ts = _normalize_hard_ref_ts(
+                            snap.get("hard_exit_reference_ts"),
+                            now_utc=datetime.now(timezone.utc),
+                        )
+                        _incoming_price = snap.get("hard_exit_reference_price")
+                        _incoming_refresh = bool(snap.get("hard_exit_reference_refresh_needed", True))
+                        if _incoming_validity in ("proven", "catastrophic_ask") and _incoming_ts is None:
+                            _incoming_validity = "unproven"
+                            _incoming_refresh = True
+                        _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
+                        _prior_price = getattr(pos, "hard_exit_reference_price", 0.0) or 0.0
+                        try:
+                            _prior_price = float(_prior_price)
+                        except Exception:
+                            _prior_price = 0.0
+                        _preserve_prior = (
+                            (_incoming_validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0)
+                            or (_incoming_validity == "no_data" and _prior_price > 0)
+                        )
+                        if _preserve_prior:
+                            pos.hard_exit_reference_refresh_needed = True
+                            pos.hardexitreferencerefreshneeded = True
+                        else:
+                            pos.hard_exit_reference_price = _incoming_price
+                            pos.hardexitreferenceprice = _incoming_price
+                            pos.hard_exit_reference_source = snap.get("hard_exit_reference_source")
+                            pos.hardexitreferencesource = snap.get("hard_exit_reference_source")
+                            pos.hard_exit_reference_ts = _incoming_ts
+                            pos.hardexitreferencets = _incoming_ts
+                            pos.hard_exit_reference_pnl_pct = snap.get("hard_exit_reference_pnl_pct")
+                            pos.hardexitreferencepnlpct = snap.get("hard_exit_reference_pnl_pct")
+                            pos.hard_exit_reference_validity = _incoming_validity
+                            pos.hardexitreferencevalidity = _incoming_validity
+                            pos.hard_exit_reference_refresh_needed = _incoming_refresh
+                            pos.hardexitreferencerefreshneeded = _incoming_refresh
 
                     # Timestamps
                     _apply("last_option_bid_update_ts")
@@ -5512,15 +5541,11 @@ class APExitEngine:
                             # A persisted proven ref written hours ago is NOT still fresh.
                             # Use HARD_REF_MAX_AGE_SEC from the shared constant.
                             _persisted_trusted = False
+                            _ts_parsed = None
                             if _persisted_ts and _persisted_validity in ("proven", "catastrophic_ask"):
                                 try:
                                     _now_seed = datetime.now(timezone.utc)
-                                    _ts_parsed = _persisted_ts if hasattr(_persisted_ts, "total_seconds") else None
-                                    if _ts_parsed is None and isinstance(_persisted_ts, str):
-                                        from datetime import datetime as _dt
-                                        _ts_parsed = _dt.fromisoformat(_persisted_ts.replace("Z", "+00:00"))
-                                    elif hasattr(_persisted_ts, "total_seconds"):
-                                        _ts_parsed = _persisted_ts
+                                    _ts_parsed = _normalize_hard_ref_ts(_persisted_ts, now_utc=_now_seed)
                                     if _ts_parsed is not None:
                                         _persisted_age_sec = max(0.0, (_now_seed - _ts_parsed).total_seconds())
                                         _persisted_trusted = _persisted_age_sec <= HARD_REF_MAX_AGE_SEC
@@ -5536,8 +5561,8 @@ class APExitEngine:
                                 mp.hardexitreferencevalidity    = "unproven"
                                 mp.hard_exit_reference_refresh_needed = True
                                 mp.hardexitreferencerefreshneeded    = True
-                            mp.hard_exit_reference_ts = _persisted_ts
-                            mp.hardexitreferencets    = _persisted_ts
+                            mp.hard_exit_reference_ts = _ts_parsed
+                            mp.hardexitreferencets    = _ts_parsed
                             if mp.entry_price > 0:
                                 _hr_pnl_r = (mp.hard_exit_reference_price - mp.entry_price) / mp.entry_price
                                 mp.hard_exit_reference_pnl_pct = _hr_pnl_r
@@ -6498,30 +6523,31 @@ class APExitEngine:
                             _snap_bid = float(_snap.bid or 0.0)
                             _snap_ask = float(_snap.ask or 0.0)
                             _snap_last = float(getattr(_snap, "last", 0.0) or 0.0)
-                            # mark from explicit mark field only — never use mid as mark
-                            _snap_mark = float(getattr(_snap, "mark", 0.0) or 0.0)
-                            # bid_ts: use snap's own ts if provided; if not, the
-                            # quote-arrival time is our best estimate — but NOT now_utc
-                            # (which would launder any BID as "born this second").
-                            _snap_ts = getattr(_snap, "ts", None) or getattr(_snap, "quote_ts", None)
-                            _snap_last_ts = getattr(_snap, "last_trade_ts", None) or _snap_ts
+                            _snap_mark = 0.0
+                            _receipt_ts = _normalize_hard_ref_ts(
+                                getattr(_snap, "timestamp_epoch", None),
+                                now_utc=now_utc,
+                            )
                             _apply_option_quote_for_decision(
                                 pos,
                                 bid      = _snap_bid,
                                 ask      = _snap_ask,
                                 mark     = _snap_mark,
                                 last     = _snap_last,
-                                quote_ts = _snap_ts or now_utc,
-                                last_ts  = _snap_last_ts,
-                                mark_ts  = _snap_ts,
+                                quote_ts = _receipt_ts,
+                                last_ts  = None,
+                                mark_ts  = None,
                                 source   = "",
                             )
                             pos.last_option_quote_missing_ts = None
-                            pos.last_quote_update_ts  = now_utc
+                            pos.last_quote_update_ts  = _receipt_ts
                             pos.last_quote_missing_ts = None
                         if _snap.underlying_price > 0:
                             pos.current_underlying              = _snap.underlying_price
-                            pos.last_underlying_quote_update_ts  = now_utc
+                            pos.last_underlying_quote_update_ts  = _normalize_hard_ref_ts(
+                                getattr(_snap, "timestamp_epoch", None),
+                                now_utc=now_utc,
+                            )
                             pos.last_underlying_quote_missing_ts = None
 
                 option_pnl = pos.option_pnl_pct

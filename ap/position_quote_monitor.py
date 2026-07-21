@@ -5,6 +5,7 @@ import json
 import time
 import logging
 import threading
+import math
 from datetime import datetime, timezone, time as dtime
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
@@ -75,6 +76,43 @@ class HardExitRef:
     ts: "Optional[datetime]"
 
 
+def normalize_hard_ref_ts(
+    ts,
+    *,
+    now_utc: "Optional[datetime]" = None,
+    future_skew_sec: float = 60.0,
+) -> "Optional[datetime]":
+    """Normalize quote/reference timestamps to aware UTC, failing closed."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    try:
+        if isinstance(ts, bool) or ts is None:
+            return None
+        if isinstance(ts, datetime):
+            parsed = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+        elif isinstance(ts, (int, float)):
+            value = float(ts)
+            if not math.isfinite(value):
+                return None
+            parsed = datetime.fromtimestamp(value, tz=timezone.utc)
+        elif isinstance(ts, str):
+            raw = ts.strip()
+            if not raw:
+                return None
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            parsed = parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        else:
+            return None
+    except Exception:
+        return None
+
+    try:
+        if (parsed - now_utc).total_seconds() > float(future_skew_sec):
+            return None
+    except Exception:
+        return None
+    return parsed
+
+
 def _select_hard_exit_reference(
     *,
     bid: float, ask: float, mark: float, last: float,
@@ -94,11 +132,17 @@ def _select_hard_exit_reference(
     - ASK-only catastrophic quotes return validity='catastrophic_ask'.
     """
     now_utc = now_utc or datetime.now(timezone.utc)
+    _future_skew_sec = float(os.getenv("HARD_EXIT_REF_FUTURE_SKEW_SEC", "60"))
+    bid_ts = normalize_hard_ref_ts(bid_ts, now_utc=now_utc, future_skew_sec=_future_skew_sec)
+    last_ts = normalize_hard_ref_ts(last_ts, now_utc=now_utc, future_skew_sec=_future_skew_sec)
+    mark_ts = normalize_hard_ref_ts(mark_ts, now_utc=now_utc, future_skew_sec=_future_skew_sec)
+    ask_ts = normalize_hard_ref_ts(ask_ts, now_utc=now_utc, future_skew_sec=_future_skew_sec)
 
     def _fresh(ts):
         if ts is None: return False
         try:
-            return (now_utc - ts).total_seconds() <= last_stale_sec
+            age = (now_utc - ts).total_seconds()
+            return 0 <= age <= last_stale_sec
         except Exception:
             return False
 
@@ -107,27 +151,24 @@ def _select_hard_exit_reference(
     _mark = float(mark) if mark and mark > 0 else 0.0
     _last = float(last) if last and last > 0 else 0.0
 
-    # BID wins whenever present (executable liquidation truth).
-    if _bid > 0:
+    # BID wins only when its receipt timestamp is valid and fresh.
+    if _bid > 0 and _fresh(bid_ts):
         return HardExitRef(price=_bid, source="bid", validity="proven", ts=bid_ts)
 
-    # Prefer fresh LAST over MARK; stale LAST drops behind MARK.
+    # Prefer fresh LAST over MARK; stale/missing-ts values are retained only as
+    # unproven fallbacks after all fresh sources are exhausted.
     _last_fresh = _last > 0 and _fresh(last_ts)
     _mark_fresh = _mark > 0 and _fresh(mark_ts)
+    _ask_fresh = _ask > 0 and _fresh(ask_ts)
 
     if _last_fresh:
         return HardExitRef(price=_last, source="last", validity="proven", ts=last_ts)
     if _mark_fresh:
         return HardExitRef(price=_mark, source="mark", validity="proven", ts=mark_ts)
-    # Neither fresh — take whichever exists at all, still proven if we have ts;
-    # otherwise mark as unproven so downstream can request refresh.
-    if _last > 0:
-        return HardExitRef(price=_last, source="last_stale", validity="unproven", ts=last_ts)
-    if _mark > 0:
-        return HardExitRef(price=_mark, source="mark_stale", validity="unproven", ts=mark_ts)
 
-    # ASK-only path: never trusted for "healthy" but can prove catastrophe.
-    if _ask > 0:
+    # ASK-only path: never trusted for "healthy" and catastrophic only when
+    # the ASK receipt timestamp is valid/fresh.
+    if _ask > 0 and _ask_fresh:
         if entry_price > 0:
             _ask_pnl = (_ask - entry_price) / entry_price
             if _ask_pnl <= hard_stop_pct:
@@ -137,6 +178,15 @@ def _select_hard_exit_reference(
         # ASK-only healthy: unproven — do not use as safety certification.
         return HardExitRef(price=_ask, source="ask_unproven",
                            validity="unproven", ts=ask_ts)
+
+    if _bid > 0:
+        return HardExitRef(price=_bid, source="bid_stale", validity="unproven", ts=bid_ts)
+    if _last > 0:
+        return HardExitRef(price=_last, source="last_stale", validity="unproven", ts=last_ts)
+    if _mark > 0:
+        return HardExitRef(price=_mark, source="mark_stale", validity="unproven", ts=mark_ts)
+    if _ask > 0:
+        return HardExitRef(price=_ask, source="ask_stale", validity="unproven", ts=ask_ts)
 
     return HardExitRef(price=0.0, source="", validity="no_data", ts=None)
 
@@ -239,6 +289,7 @@ class APPositionQuoteMonitor:
         # audit, and restart-recovery integrity.
         self._last_db_persist_ts:    dict[str, float] = {}   # pid -> epoch
         self._last_db_persist_price: dict[str, float] = {}   # pid -> option price
+        self._last_db_persist_hard_ref: dict[str, str] = {}
         self._orders_meta_available: Optional[bool] = None
 
         self._cycles = 0
@@ -577,15 +628,14 @@ class APPositionQuoteMonitor:
                 # - ASK-only catastrophic: self-proving; allowed as authority.
                 _mark_for_ref = _safe_float(oq.get("mark"), 0.0)
                 _last_for_ref = _safe_float(oq.get("last"), 0.0)
-                # Provenance timestamps: when the broker doesn't stamp per-field
-                # trade times, the QUOTE ARRIVAL is the freshness signal (the
-                # broker returned this LAST value on this cycle, so it is at
-                # least as fresh as the cycle).  Only downgrade LAST to stale
-                # when the broker explicitly says it's older via last_trade_ts.
-                _last_trade_ts = oq.get("last_trade_ts") or oq.get("trade_date") or (now_utc if _last_for_ref > 0 else None)
-                _mark_ts = oq.get("mark_ts") or (now_utc if _mark_for_ref > 0 else None)
-                _bid_ts = oq.get("bid_ts") or (now_utc if bid > 0 else None)
-                _ask_ts = oq.get("ask_ts") or (now_utc if ask > 0 else None)
+                _receipt_ts = normalize_hard_ref_ts(oq.get("_ap_receipt_epoch"), now_utc=now_utc) or now_utc
+                _last_trade_ts = normalize_hard_ref_ts(
+                    oq.get("last_trade_ts") or oq.get("trade_date"),
+                    now_utc=now_utc,
+                )
+                _mark_ts = normalize_hard_ref_ts(oq.get("mark_ts"), now_utc=now_utc)
+                _bid_ts = normalize_hard_ref_ts(oq.get("bid_ts"), now_utc=now_utc) or (_receipt_ts if bid > 0 else None)
+                _ask_ts = normalize_hard_ref_ts(oq.get("ask_ts"), now_utc=now_utc) or (_receipt_ts if ask > 0 else None)
 
                 # AMENDMENT #6 blocker 4: pass per-position hard stop.
                 # ASK-only at -25% on SPY 0DTE is catastrophic (stop=-18%),
@@ -621,8 +671,12 @@ class APPositionQuoteMonitor:
                     _get_attr(pos, "hard_exit_reference_price",
                               "hardexitreferenceprice", default=None), 0.0
                 )
+                _prior_ts = _get_attr(pos, "hard_exit_reference_ts", "hardexitreferencets", default=None)
                 _overwrite_allowed = True
-                if _hard_ref_validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0:
+                if (
+                    (_hard_ref_validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0)
+                    or (_hard_ref_validity == "no_data" and _prior_price > 0)
+                ):
                     _overwrite_allowed = False
                     self._write_field_unconditional(pos, "hard_exit_reference_refresh_needed", True)
                     self._write_field_unconditional(pos, "hardexitreferencerefreshneeded",     True)
@@ -634,8 +688,8 @@ class APPositionQuoteMonitor:
                     self._write_field_unconditional(pos, "hardexitreferencesource",      _hard_ref_source)
                     self._write_field_unconditional(pos, "hard_exit_reference_validity", _hard_ref_validity)
                     self._write_field_unconditional(pos, "hardexitreferencevalidity",    _hard_ref_validity)
-                    self._write_field_unconditional(pos, "hard_exit_reference_ts",       now_utc)
-                    self._write_field_unconditional(pos, "hardexitreferencets",          now_utc)
+                    self._write_field_unconditional(pos, "hard_exit_reference_ts",       _href.ts)
+                    self._write_field_unconditional(pos, "hardexitreferencets",          _href.ts)
                     if cost_basis > 0:
                         _hard_ref_pnl = (_hard_ref_price - cost_basis) / cost_basis
                         self._write_field_unconditional(pos, "hard_exit_reference_pnl_pct", _hard_ref_pnl)
@@ -644,6 +698,20 @@ class APPositionQuoteMonitor:
                     if _hard_ref_validity == "proven":
                         self._write_field_unconditional(pos, "hard_exit_reference_refresh_needed", False)
                         self._write_field_unconditional(pos, "hardexitreferencerefreshneeded",     False)
+
+                _final_href_price = _safe_float(_get_attr(pos, "hard_exit_reference_price", "hardexitreferenceprice", default=None), 0.0)
+                _final_href_pnl_raw = _get_attr(pos, "hard_exit_reference_pnl_pct", "hardexitreferencepnlpct", default=None)
+                try:
+                    _final_href_pnl = float(_final_href_pnl_raw) if _final_href_pnl_raw is not None else None
+                except Exception:
+                    _final_href_pnl = None
+                _final_href_source = str(_get_attr(pos, "hard_exit_reference_source", "hardexitreferencesource", default="") or "")
+                _final_href_validity = str(_get_attr(pos, "hard_exit_reference_validity", "hardexitreferencevalidity", default="no_data") or "no_data")
+                _final_href_ts = normalize_hard_ref_ts(
+                    _get_attr(pos, "hard_exit_reference_ts", "hardexitreferencets", default=None),
+                    now_utc=now_utc,
+                )
+                _final_href_refresh = bool(_get_attr(pos, "hard_exit_reference_refresh_needed", "hardexitreferencerefreshneeded", default=True))
 
                 # ── Blocker 1: Three-tier execution mode classification ────────
                 # Only exact "paper" may use midpoint/mark simulation.
@@ -850,6 +918,14 @@ class APPositionQuoteMonitor:
                         underlying_price= und_last,
                         option_pnl_pct  = pnl_pct,
                         now_utc         = now_utc,
+                        hard_ref={
+                            "price": _final_href_price if _final_href_price > 0 else None,
+                            "pnl_pct": _final_href_pnl,
+                            "source": _final_href_source,
+                            "validity": _final_href_validity,
+                            "ts": _final_href_ts.isoformat() if _final_href_ts else None,
+                            "refresh_needed": _final_href_refresh,
+                        },
                     )
                     self._persist_mfe_mae_to_orders(
                         position_id    = pid,
@@ -912,14 +988,14 @@ class APPositionQuoteMonitor:
                     "exit_executable_mark":        _exec_exit_mark if _opt_bid_valid else None,
                     "exit_executable_pnl_pct":     _exec_exit_pnl,
                     "last_option_bid_update_ts":   _get_attr(pos, "lastoptionbidupdatets", "last_option_bid_update_ts", default=None),
-                    "hard_exit_reference_price":   _hard_ref_price if _hard_ref_price > 0 else None,
-                    "hard_exit_reference_source":  _hard_ref_source if _hard_ref_price > 0 else None,
-                    "hard_exit_reference_ts":      now_utc if _hard_ref_price > 0 else None,
-                    "hard_exit_reference_pnl_pct": (_hard_ref_pnl if (_hard_ref_price > 0 and cost_basis > 0) else None),
+                    "hard_exit_reference_price":   _final_href_price if _final_href_price > 0 else None,
+                    "hard_exit_reference_source":  _final_href_source if _final_href_price > 0 else None,
+                    "hard_exit_reference_ts":      _final_href_ts if _final_href_price > 0 else None,
+                    "hard_exit_reference_pnl_pct": _final_href_pnl,
                     # AMENDMENT #6 blocker 1: validity and refresh_needed MUST be in
                     # the snapshot — every consumer requires validity to trust the pnl.
-                    "hard_exit_reference_validity":       (_hard_ref_validity if _hard_ref_price > 0 else "no_data"),
-                    "hard_exit_reference_refresh_needed": (False if _hard_ref_validity == "proven" else True),
+                    "hard_exit_reference_validity":       _final_href_validity,
+                    "hard_exit_reference_refresh_needed": _final_href_refresh,
                 })
 
                 self._classify_health(pid, c, t, pos)
@@ -1015,6 +1091,7 @@ class APPositionQuoteMonitor:
         underlying_price: float,
         option_pnl_pct: float,
         now_utc=None,
+        hard_ref: Optional[dict] = None,
     ) -> bool:
         """Persist QPM state to the positions row. Non-fatal, throttled."""
         if not QPM_DB_PERSIST_ENABLED:
@@ -1032,7 +1109,10 @@ class APPositionQuoteMonitor:
                 price_delta_pct = float("inf")
             time_ok  = elapsed >= QPM_DB_PERSIST_THROTTLE_SEC
             price_ok = price_delta_pct >= QPM_DB_PERSIST_PRICE_DELTA_PCT
-            if not (time_ok or price_ok):
+            hard_ref_payload = hard_ref if isinstance(hard_ref, dict) else None
+            hard_ref_fingerprint = json.dumps(hard_ref_payload, sort_keys=True, default=str) if hard_ref_payload is not None else ""
+            hard_ref_ok = bool(hard_ref_fingerprint and hard_ref_fingerprint != self._last_db_persist_hard_ref.get(position_id, ""))
+            if not (time_ok or price_ok or hard_ref_ok):
                 return False
 
             from ap.db import conn, run_with_retry  # local import avoids cycle
@@ -1045,6 +1125,10 @@ class APPositionQuoteMonitor:
                         SET current_option_price = %s,
                             current_underlying   = COALESCE(NULLIF(%s, 0), current_underlying),
                             option_pnl_pct       = %s,
+                            meta                 = CASE
+                                WHEN %s::jsonb IS NULL THEN meta
+                                ELSE jsonb_set(COALESCE(meta, '{}'::jsonb), '{hard_exit_reference}', %s::jsonb, true)
+                            END,
                             updated_at           = NOW()
                         WHERE id        = %s
                           AND client_id = %s
@@ -1054,6 +1138,8 @@ class APPositionQuoteMonitor:
                             float(option_price) if option_price > 0 else None,
                             float(underlying_price) if underlying_price > 0 else 0.0,
                             float(option_pnl_pct),
+                            json.dumps(hard_ref_payload, default=str) if hard_ref_payload is not None else None,
+                            json.dumps(hard_ref_payload, default=str) if hard_ref_payload is not None else None,
                             position_id,
                             self.client_id,
                         ),
@@ -1064,6 +1150,8 @@ class APPositionQuoteMonitor:
             self._last_db_persist_ts[position_id] = now
             if option_price > 0:
                 self._last_db_persist_price[position_id] = float(option_price)
+            if hard_ref_fingerprint:
+                self._last_db_persist_hard_ref[position_id] = hard_ref_fingerprint
             return rowcount > 0
         except Exception as exc:
             log.debug(
@@ -1440,7 +1528,9 @@ class APPositionQuoteMonitor:
             for s in symbols:
                 row = _SHARED_CACHE.get(s)
                 if row and now - row.get("ts", 0.0) <= CACHE_TTL_SEC:
-                    out[s] = row["quote"]
+                    cached = dict(row["quote"] or {})
+                    cached["_ap_receipt_epoch"] = row.get("ts", 0.0)
+                    out[s] = cached
                     self._metrics["cache_hits"] += 1
                 else:
                     stale.append(s)
@@ -1458,8 +1548,10 @@ class APPositionQuoteMonitor:
             with _SHARED_CACHE_LOCK:
                 ts = time.time()
                 for s, q in fresh.items():
-                    _SHARED_CACHE[s] = {"quote": q, "ts": ts}
-                    out[s] = q
+                    q_with_receipt = dict(q or {})
+                    q_with_receipt["_ap_receipt_epoch"] = ts
+                    _SHARED_CACHE[s] = {"quote": q_with_receipt, "ts": ts}
+                    out[s] = q_with_receipt
             self._rate_limit_backoff_sec = RATE_LIMIT_BACKOFF_BASE_SEC
         return out
 

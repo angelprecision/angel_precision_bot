@@ -2163,10 +2163,41 @@ class TestAmendment5Blocker4HardRefSourcePolicy:
 
     def test_bid_wins_when_present(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
-        h = _select_hard_exit_reference(bid=1.10, ask=1.20, mark=1.15, last=1.05)
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=1.10, ask=1.20, mark=1.15, last=1.05,
+            bid_ts=_now, ask_ts=_now, mark_ts=_now, last_ts=_now, now_utc=_now,
+        )
         assert h.source == "bid"
         assert h.price == pytest.approx(1.10)
         assert h.validity == "proven"
+
+    def test_bid_missing_timestamp_is_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(bid=1.10, ask=0, mark=0, last=0, now_utc=_now)
+        assert h.source == "bid_stale"
+        assert h.validity == "unproven"
+
+    def test_stale_bid_is_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=1.10, ask=0, mark=0, last=0,
+            bid_ts=_now - timedelta(seconds=120), now_utc=_now,
+        )
+        assert h.source == "bid_stale"
+        assert h.validity == "unproven"
+
+    def test_future_bid_is_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=1.10, ask=0, mark=0, last=0,
+            bid_ts=_now + timedelta(seconds=120), now_utc=_now,
+        )
+        assert h.source == "bid_stale"
+        assert h.validity == "unproven"
 
     def test_last_beats_ask_when_no_bid(self):
         """The reviewer's exact case: bid=0, mark=0, ask=1.20, last=0.50, LAST fresh.
@@ -2210,6 +2241,28 @@ class TestAmendment5Blocker4HardRefSourcePolicy:
         )
         assert h.validity == "proven"
 
+    def test_stale_bid_falls_through_to_fresh_last(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=1.20, ask=0, mark=0, last=0.55,
+            bid_ts=_now - timedelta(seconds=120), last_ts=_now, now_utc=_now,
+            entry_price=1.00,
+        )
+        assert h.source == "last"
+        assert h.validity == "proven"
+
+    def test_stale_bid_falls_through_to_fresh_mark(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=1.20, ask=0, mark=0.55, last=0,
+            bid_ts=_now - timedelta(seconds=120), mark_ts=_now, now_utc=_now,
+            entry_price=1.00,
+        )
+        assert h.source == "mark"
+        assert h.validity == "proven"
+
     def test_mark_beats_ask_when_no_bid_or_last(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
         _now = datetime.now(_UTC)
@@ -2249,6 +2302,39 @@ class TestAmendment5Blocker4HardRefSourcePolicy:
         )
         assert h.validity == "catastrophic_ask"
         assert h.price == pytest.approx(0.55)
+
+    def test_stale_catastrophic_ask_is_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=0.55, mark=0, last=0,
+            ask_ts=_now - timedelta(seconds=120), now_utc=_now,
+            entry_price=1.00, hard_stop_pct=-0.33,
+        )
+        assert h.source == "ask_stale"
+        assert h.validity == "unproven"
+
+    def test_catastrophic_ask_missing_timestamp_is_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=0.55, mark=0, last=0,
+            now_utc=_now,
+            entry_price=1.00, hard_stop_pct=-0.33,
+        )
+        assert h.source == "ask_stale"
+        assert h.validity == "unproven"
+
+    def test_future_catastrophic_ask_is_unproven(self):
+        from ap.position_quote_monitor import _select_hard_exit_reference
+        _now = datetime.now(_UTC)
+        h = _select_hard_exit_reference(
+            bid=0, ask=0.55, mark=0, last=0,
+            ask_ts=_now + timedelta(seconds=120), now_utc=_now,
+            entry_price=1.00, hard_stop_pct=-0.33,
+        )
+        assert h.source == "ask_stale"
+        assert h.validity == "unproven"
 
     def test_no_data_returns_empty(self):
         from ap.position_quote_monitor import _select_hard_exit_reference
@@ -2336,8 +2422,9 @@ class TestAmendment6AskDoesNotClobberProven:
         The prior proven -45% must remain — ASK cannot clear it."""
         pos = _qpm_pos("pos-A", execution_mode="live")
         # Cycle 1: LAST=0.55, entry=1.00 → -45%
+        _now = datetime.now(_UTC)
         quotes = {
-            "ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55},
+            "ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55, "last_trade_ts": _now},
             "ABT": {"last": 149.0},
         }
         qpm = _make_qpm([pos], quotes)
@@ -2448,8 +2535,9 @@ class TestAmendment6ApplyQuoteSnapshotsDistinctObjects:
                 ee_mod.APExitEngine.apply_quote_snapshots(self, snapshots)
 
         eng = _RelayEngine()
+        _now = datetime.now(_UTC)
         qpm = _make_qpm([producer], {
-            "ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55},
+            "ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55, "last_trade_ts": _now},
             "ABT": {"last": 149.0},
         })
         qpm.exit_engine = eng
@@ -2470,6 +2558,102 @@ class TestAmendment6ApplyQuoteSnapshotsDistinctObjects:
         assert getattr(consumer, "hard_exit_reference_ts", None) is not None, \
             "hard_exit_reference_ts must transit via snapshot (needed by shared resolver)"
         assert consumer is not producer  # sanity: distinct objects
+
+    def test_snapshot_no_data_preserves_prior_reference_and_sets_refresh_needed(self):
+        import ap_exit_engine as ee_mod
+        import threading
+
+        consumer = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol="ABT260731C00150000",
+            side="CALL", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            position_id="pos-NODATA",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+        original_ts = datetime.now(_UTC) - timedelta(seconds=10)
+        consumer.hard_exit_reference_price = 0.55
+        consumer.hardexitreferenceprice = 0.55
+        consumer.hard_exit_reference_pnl_pct = -0.45
+        consumer.hardexitreferencepnlpct = -0.45
+        consumer.hard_exit_reference_source = "last"
+        consumer.hardexitreferencesource = "last"
+        consumer.hard_exit_reference_validity = "proven"
+        consumer.hardexitreferencevalidity = "proven"
+        consumer.hard_exit_reference_ts = original_ts
+        consumer.hardexitreferencets = original_ts
+
+        eng = type("_E", (), {"_lock": threading.RLock(), "_positions": [consumer]})()
+        ee_mod.APExitEngine.apply_quote_snapshots(eng, [{
+            "position_id": "pos-NODATA",
+            "hard_exit_reference_price": None,
+            "hard_exit_reference_source": None,
+            "hard_exit_reference_pnl_pct": None,
+            "hard_exit_reference_ts": None,
+            "hard_exit_reference_validity": "no_data",
+            "hard_exit_reference_refresh_needed": True,
+        }])
+
+        assert consumer.hard_exit_reference_price == pytest.approx(0.55)
+        assert consumer.hard_exit_reference_pnl_pct == pytest.approx(-0.45)
+        assert consumer.hard_exit_reference_validity == "proven"
+        assert consumer.hard_exit_reference_ts == original_ts
+        assert consumer.hard_exit_reference_refresh_needed is True
+
+    def test_snapshot_trusted_invalid_timestamp_fails_closed(self):
+        import ap_exit_engine as ee_mod
+        import threading
+
+        consumer = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol="ABT260731C00150000",
+            side="CALL", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            position_id="pos-BADTS",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+        eng = type("_E", (), {"_lock": threading.RLock(), "_positions": [consumer]})()
+        ee_mod.APExitEngine.apply_quote_snapshots(eng, [{
+            "position_id": "pos-BADTS",
+            "hard_exit_reference_price": 0.55,
+            "hard_exit_reference_source": "last",
+            "hard_exit_reference_pnl_pct": -0.45,
+            "hard_exit_reference_ts": "not-a-date",
+            "hard_exit_reference_validity": "proven",
+            "hard_exit_reference_refresh_needed": False,
+        }])
+
+        assert consumer.hard_exit_reference_validity == "unproven"
+        assert consumer.hard_exit_reference_ts is None
+        assert consumer.hard_exit_reference_refresh_needed is True
+
+    def test_quote_authority_last_without_provider_timestamp_is_unproven(self):
+        import ap_exit_engine as ee_mod
+        pos = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol="ABT260731C00150000",
+            side="CALL", quantity=2, quantity_remaining=2,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=datetime.now(_UTC) - timedelta(minutes=5),
+        )
+
+        ee_mod._apply_option_quote_for_decision(
+            pos,
+            bid=0.0,
+            ask=0.0,
+            mark=0.0,
+            last=0.55,
+            quote_ts=datetime.now(_UTC),
+            last_ts=None,
+            mark_ts=None,
+        )
+
+        assert pos.hard_exit_reference_price == pytest.approx(0.55)
+        assert pos.hard_exit_reference_validity == "unproven"
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2625,7 +2809,8 @@ class TestAmendment6OverwriteProtection:
         The prior catastrophic -45% must remain."""
         pos = _qpm_pos("pos-A", execution_mode="live")
         # Cycle 1: LAST=0.55 → proven -45%
-        quotes = {"ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55},
+        _now = datetime.now(_UTC)
+        quotes = {"ABT260721P00150000": {"bid": 0, "ask": 0.60, "mark": 0, "last": 0.55, "last_trade_ts": _now},
                   "ABT": {"last": 149.0}}
         qpm = _make_qpm([pos], quotes)
         qpm._refresh_once()
