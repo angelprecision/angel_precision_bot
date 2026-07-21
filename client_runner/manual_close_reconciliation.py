@@ -40,6 +40,12 @@ def normalize_contract(value: Any) -> str:
     return str(value or "").upper().replace(" ", "").strip()
 
 
+def position_direction(position: dict) -> str:
+    return str(
+        position.get("side") or position.get("direction") or ""
+    ).upper().strip()
+
+
 def positive_float(value: Any) -> float:
     try:
         parsed = float(value)
@@ -370,6 +376,7 @@ def load_manual_close_state(client_id: str) -> tuple[list[dict], set[str]]:
                     qty,
                     quantity_remaining,
                     side,
+                    direction,
                     local_order_id,
                     entry_ts,
                     opened_at,
@@ -420,7 +427,7 @@ def _validate_adopted_exit_row(
     if not isinstance(row, dict):
         return False
     expected_contract = normalize_contract(position.get("contract"))
-    expected_side = str(position.get("side") or "").upper().strip()
+    expected_side = position_direction(position)
     actual_mode = str(row.get("execution_mode") or "").lower().strip()
     try:
         actual_fill_price = float(row.get("fill_price") or 0)
@@ -459,7 +466,7 @@ def adopt_external_exit_fills(
     position_id = str(position.get("id") or "").strip()
     contract = normalize_contract(position.get("contract"))
     symbol = str(position.get("underlying") or "").upper().strip()
-    direction = str(position.get("side") or "").upper().strip()
+    direction = position_direction(position)
     if (
         not client_id
         or not position_id
