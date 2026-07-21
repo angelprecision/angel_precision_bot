@@ -401,15 +401,26 @@ class APPositionQuoteMonitor:
                     self._write_field(pos, "lastunderlyingquotemissingts", now_utc)
                     self._write_field(pos, "last_underlying_quote_missing_ts", now_utc)
 
+                # ── P0 (PR #385 amendment #2, blocker 1): BID is CYCLE truth ─────────
+                # current_bid/current_ask are ALWAYS overwritten from THIS cycle's
+                # broker response — including 0.0 when the bid is absent.  Retaining
+                # the previous poll's bid while a mark/last/ask-only quote refreshed
+                # the general option timestamp made a stale bid masquerade as fresh
+                # executable truth (peak updates, confirmation completion, exits).
+                # A dedicated last_option_bid_update_ts advances ONLY when a real
+                # positive bid arrives, so bid freshness can never be inherited from
+                # a mark-only quote.
+                self._write_field(pos, "currentbid", bid if bid > 0 else 0.0)
+                self._write_field(pos, "current_bid", bid if bid > 0 else 0.0)
+                self._write_field(pos, "currentask", ask if ask > 0 else 0.0)
+                self._write_field(pos, "current_ask", ask if ask > 0 else 0.0)
+                if bid > 0:
+                    self._write_field(pos, "lastoptionbidupdatets", now_utc)
+                    self._write_field(pos, "last_option_bid_update_ts", now_utc)
+
                 if opt_price > 0:
                     self._write_field(pos, "currentoptionprice", opt_price)
                     self._write_field(pos, "current_option_price", opt_price)
-                    if bid > 0:
-                        self._write_field(pos, "currentbid", bid)
-                        self._write_field(pos, "current_bid", bid)
-                    if ask > 0:
-                        self._write_field(pos, "currentask", ask)
-                        self._write_field(pos, "current_ask", ask)
                     self._write_field(pos, "lastoptionquoteupdatets", now_utc)
                     self._write_field(pos, "last_option_quote_update_ts", now_utc)
                     self._write_field(pos, "lastquoteupdatets", now_utc)
@@ -533,20 +544,21 @@ class APPositionQuoteMonitor:
                 # Separate from the display/analytics mark.  For PAPER, the existing
                 # exec_price is midpoint (kept for display), but the BID is the only
                 # valid exit authority for soft exits per spec section 3.1/5.1.
-                _bid_for_exit = _safe_float(_get_attr(pos, "currentbid", "current_bid", default=None), 0.0)
+                # AMENDMENT #2 (blocker 1): validity is derived from THIS CYCLE's
+                # broker response (`bid` local), never from a retained position field.
+                _bid_for_exit = bid if bid > 0 else 0.0
                 _opt_bid_valid = _bid_for_exit > 0
 
-                # Quote freshness: computed from the timestamp we just wrote so it
-                # always reflects this cycle's quote age, never a stale stamp.
-                _opt_ts_now = _get_attr(pos, "lastoptionquoteupdatets", "last_option_quote_update_ts", default=None)
+                # Quote freshness: bid freshness is computed from the DEDICATED bid
+                # timestamp (advanced only on real positive bids), so a mark-only
+                # quote can never launder a stale bid into "fresh" executable truth.
+                _opt_bid_ts_now = _get_attr(pos, "lastoptionbidupdatets", "last_option_bid_update_ts", default=None)
                 _und_ts_now = _get_attr(pos, "lastunderlyingquoteupdatets", "last_underlying_quote_update_ts", default=None)
-                # Use the exit engine's staleness constant (STALE_OPTION_QUOTE_MAX_AGE_SEC = 20s)
-                # as the threshold.  Import lazily to avoid circular deps.
                 _EXIT_STALE_SEC = float(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
                 _UNDERLYING_STALE_SEC = float(os.getenv("UNDERLYING_QUOTE_STALE_SEC", "40"))
                 try:
-                    _opt_age_sec = max(0.0, (now_utc - _opt_ts_now).total_seconds()) if _opt_ts_now else 999.0
-                    _opt_quote_fresh = _opt_age_sec <= _EXIT_STALE_SEC
+                    _opt_age_sec = max(0.0, (now_utc - _opt_bid_ts_now).total_seconds()) if _opt_bid_ts_now else 999.0
+                    _opt_quote_fresh = _opt_bid_valid and _opt_age_sec <= _EXIT_STALE_SEC
                 except Exception:
                     _opt_age_sec, _opt_quote_fresh = 999.0, False
                 try:
@@ -555,6 +567,8 @@ class APPositionQuoteMonitor:
                 except Exception:
                     _und_age_sec, _und_fresh = 999.0, False
 
+                # AMENDMENT #2 (blocker 2): availability is THIS CYCLE's fetch result
+                # (und_last local), never the retained position price.
                 _und_available = und_last > 0
 
                 # Display mark: always the mid/analytics mark written by existing logic.
@@ -570,6 +584,8 @@ class APPositionQuoteMonitor:
                         _display_pnl = (_display_mark - cost_basis) / cost_basis
 
                 # Write explicit truth fields onto position.
+                # AMENDMENT #2: unavailable P&L is written as None, never 0.0 —
+                # a zero sentinel is indistinguishable from a real breakeven.
                 self._write_field(pos, "option_bid_valid",        _opt_bid_valid)
                 self._write_field(pos, "optionbidvalid",          _opt_bid_valid)
                 self._write_field(pos, "option_quote_fresh",      _opt_quote_fresh)
@@ -581,9 +597,9 @@ class APPositionQuoteMonitor:
                 self._write_field(pos, "underlyingfresh",         _und_fresh)
                 self._write_field(pos, "underlying_age_sec",      _und_age_sec)
                 self._write_field(pos, "display_mark",            _display_mark)
-                self._write_field(pos, "display_pnl_pct",         _display_pnl if _display_pnl is not None else 0.0)
-                self._write_field(pos, "exit_executable_mark",    _exec_exit_mark)
-                self._write_field(pos, "exit_executable_pnl_pct", _exec_exit_pnl if _exec_exit_pnl is not None else 0.0)
+                self._write_field(pos, "display_pnl_pct",         _display_pnl)
+                self._write_field(pos, "exit_executable_mark",    _exec_exit_mark if _opt_bid_valid else None)
+                self._write_field(pos, "exit_executable_pnl_pct", _exec_exit_pnl)
 
                 # ── P0 (PR #385 amendment): Position-scoped confirmation key ─────────
                 # Durable identity: client_id|execution_mode|position_id.
