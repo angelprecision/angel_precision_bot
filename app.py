@@ -3166,7 +3166,6 @@ def create_app() -> Flask:
     def admin_overnight_reeval():
         try:
             from client_runner import _active_runners, _registry_lock
-            from ap_overnight_reeval import run_overnight_reeval
             import threading as _threading
             import time as _time
             import uuid as _uuid
@@ -3227,28 +3226,13 @@ def create_app() -> Flask:
                                 job["runners_processed"] += 1
                                 continue
                             try:
-                                _core = runner.core
-                                result = run_overnight_reeval(
-                                    client_id=email,
-                                    broker=getattr(_core, "broker", None) if _core else None,
-                                    data_broker=(
-                                        getattr(runner, "data_broker", None)
-                                        or (getattr(_core, "data_broker", None) if _core else None)
-                                    ),
-                                    master_control=runner.master_control,
-                                    contract_selector=runner.contract_selector,
-                                    order_state_machine=runner.order_state_machine,
-                                    entry_watcher=getattr(_core, "entry_watcher", None) if _core else None,
-                                    position_manager=runner.position_manager,
-                                    exit_eng=getattr(_core, "exit_eng", None) if _core else None,
+                                result = runner.run_overnight_reeval_attempt(
                                     force=force,
+                                    source="admin_background",
                                 )
-                                from ap.preopen_readiness import _trading_date as _preopen_trading_date
-                                runner._last_overnight_reeval_date = _preopen_trading_date()
                                 job["results"][email] = result
-                                job["readiness_results"][email] = {
-                                    "skipped": "async_background_readiness_not_run"
-                                }
+                                job["handoff_results"][email] = result.get("handoff_result")
+                                job["readiness_results"][email] = result.get("readiness_result")
                                 log.info(f"overnight_reeval[bg:{job_id}] [{email}]: {result}")
                             except Exception as _bg_err:
                                 import traceback as _tb
@@ -3309,37 +3293,13 @@ def create_app() -> Flask:
                     processed += 1
                     continue
                 try:
-                    _core = runner.core
-                    result = run_overnight_reeval(
-                        client_id=email,
-                        broker=getattr(_core, "broker", None) if _core else None,
-                        data_broker=(
-                            getattr(runner, "data_broker", None)
-                            or (getattr(_core, "data_broker", None) if _core else None)
-                        ),
-                        master_control=runner.master_control,
-                        contract_selector=runner.contract_selector,
-                        order_state_machine=runner.order_state_machine,
-                        entry_watcher=getattr(_core, "entry_watcher", None) if _core else None,
-                        position_manager=runner.position_manager,
-                        exit_eng=getattr(_core, "exit_eng", None) if _core else None,
+                    result = runner.run_overnight_reeval_attempt(
                         force=force,
+                        source="admin_sync",
                     )
-                    from ap.preopen_readiness import _trading_date as _preopen_trading_date
-                    runner._last_overnight_reeval_date = _preopen_trading_date()
                     results[email] = result
-                    runner_mode = _runner_execution_mode(runner)
-                    armed = int(result.get("armed", 0) or 0) if isinstance(result, dict) else 0
-                    if armed > 0 or isinstance(result, dict):
-                        handoff, readiness = _run_admin_handoff_and_readiness(
-                            runner=runner,
-                            client_id=email,
-                            execution_mode=runner_mode,
-                            stage="post_overnight_reeval",
-                            dry_run=False,
-                        )
-                        handoff_results[email] = handoff
-                        readiness_results[email] = readiness
+                    handoff_results[email] = result.get("handoff_result")
+                    readiness_results[email] = result.get("readiness_result")
                     log.info(f"overnight_reeval [{email}]: {result}")
                 except Exception as e:
                     import traceback as _tb

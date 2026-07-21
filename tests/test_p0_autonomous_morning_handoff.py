@@ -87,9 +87,11 @@ def test_helper_source_has_no_direct_submit_cancel_or_order_creation():
 
 
 def test_post_overnight_endpoint_returns_handoff_results():
-    src = (REPO_ROOT / "app.py").read_text()
-    assert '"handoff_results": handoff_results' in src
-    assert 'stage="post_overnight_reeval"' in src
+    app_src = (REPO_ROOT / "app.py").read_text()
+    runner_src = (REPO_ROOT / "client_runner.py").read_text()
+    assert '"handoff_results": handoff_results' in app_src
+    assert 'stage="post_overnight_reeval"' in runner_src
+    assert "runner.run_overnight_reeval_attempt(" in app_src
 
 
 def test_duplicate_same_stage_success_is_skipped(monkeypatch):

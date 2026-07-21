@@ -10,7 +10,7 @@ FLOW:
   4. For each WATCHING signal:
      a. Fetch prior-day high/low from Tradier history
      b. Run overnight_daily_validator (directional invalidation check)
-     c. If VALID: select contract, create OSM entry order, arm entry_watcher
+     c. If VALID: create deferred OSM entry order and arm entry_watcher
      d. If INVALID: mark REJECTED with reason code, log to ap_signals
   5. After 9:30 AM ET open: entry_watcher polls quotes, waits for breach
   6. On breach: on_trigger fires → OSM submits entry → fill monitor takes over
@@ -226,6 +226,38 @@ def _signal_date(signal: dict) -> Optional[date]:
         except ValueError:
             pass
     return None
+
+
+def _overnight_signal_sort_key(job: dict) -> tuple:
+    """Tier A, score, recency, then stable row identity."""
+    signal = job.get("payload") or {}
+    if isinstance(signal, str):
+        try:
+            import json as _json
+            signal = _json.loads(signal)
+        except Exception:
+            signal = {}
+    tier = str(signal.get("tier") or "").strip().upper()
+    tier_rank = {"A": 0, "B": 1}.get(tier, 2)
+    try:
+        score_rank = -float(signal.get("score") or 0)
+    except (TypeError, ValueError):
+        score_rank = 0.0
+    created_raw = (
+        signal.get("created_at")
+        or signal.get("timestamp_iso")
+        or signal.get("signal_date")
+        or job.get("created_ts")
+        or ""
+    )
+    try:
+        created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        created_rank = -created.timestamp()
+    except Exception:
+        created_rank = 0.0
+    return tier_rank, score_rank, created_rank, str(job.get("id") or job.get("signal_id") or "")
 
 
 def _log_overnight_watch_cleanup(
@@ -569,6 +601,92 @@ def _record_watch_arm_failure_proof(
         )
 
 
+def _classify_overnight_reeval_result(result: dict) -> dict:
+    """Attach the operational completion/retry contract to a result dict."""
+    if not isinstance(result, dict):
+        result = {}
+    fetched = int(result.get("fetched", 0) or 0)
+    errors = int(result.get("errors", 0) or 0)
+    stalled = bool(result.get("stalled"))
+    skipped = int(result.get("skipped", 0) or 0)
+    armed = int(result.get("armed", 0) or 0)
+    terminal_rejected = int(result.get("terminal_rejected", result.get("rejected", 0)) or 0)
+    terminal_errors = int(result.get("terminal_errors", errors) or 0)
+    retryable_deferred = int(
+        result.get("retryable_deferred", fetched if stalled and fetched > 0 else 0) or 0
+    )
+    already_resolved = int(result.get("already_resolved", 0) or 0)
+    unresolved = int(
+        result.get(
+            "unresolved",
+            max(
+                0,
+                fetched
+                - armed
+                - terminal_rejected
+                - terminal_errors
+                - retryable_deferred
+                - already_resolved,
+            ),
+        )
+        or 0
+    )
+
+    if skipped == -1:
+        result_class = "SKIPPED_NOT_DUE"
+        completed = False
+        retryable = False
+        retry_reason = None
+    elif errors > 0 or terminal_errors > 0:
+        result_class = "RETRYABLE_ROW_ERRORS"
+        completed = False
+        retryable = True
+        retry_reason = "row_errors"
+    elif retryable_deferred > 0:
+        if armed > 0 or terminal_rejected > 0 or already_resolved > 0:
+            result_class = "RETRYABLE_PARTIAL_DEFERRED"
+            retry_reason = "retryable_rows_remain"
+        else:
+            result_class = "RETRYABLE_ALL_DEFERRED"
+            retry_reason = "all_fetched_rows_deferred"
+        completed = False
+        retryable = True
+    elif unresolved > 0:
+        result_class = "RETRYABLE_ROW_ERRORS"
+        completed = False
+        retryable = True
+        retry_reason = "unresolved_rows"
+    elif fetched == 0:
+        result_class = "COMPLETED_NO_WORK"
+        completed = True
+        retryable = False
+        retry_reason = None
+    else:
+        result_class = "COMPLETED_WITH_DECISIONS"
+        completed = True
+        retryable = False
+        retry_reason = None
+
+    result["armed"] = armed
+    result["terminal_rejected"] = terminal_rejected
+    result["terminal_errors"] = terminal_errors
+    result["retryable_deferred"] = retryable_deferred
+    result["already_resolved"] = already_resolved
+    result["unresolved"] = unresolved
+    result["stalled"] = bool(
+        retryable_deferred > 0
+        and armed == 0
+        and terminal_rejected == 0
+        and terminal_errors == 0
+        and already_resolved == 0
+    )
+    result["result_class"] = result_class
+    result["completed"] = completed
+    result["retryable"] = retryable
+    result["retry_reason"] = retry_reason
+    return result
+
+
 def run_overnight_reeval(
     *,
     client_id: str,
@@ -586,8 +704,8 @@ def run_overnight_reeval(
     """
     Re-evaluate all WATCHING signals for client_id.
     Called during the 9:00–9:45 AM ET handoff window. Contract selection is
-    deferred when pre-market option chains are not yet ready, so this can
-    safely run before 9:30 without requiring live regular-session quotes.
+    always deferred to the breach-time execution seam, so watcher ownership
+    is established without waiting for pre-market option-chain work.
 
     Returns summary dict with core counts plus stale/fresh visibility.
     """
@@ -663,8 +781,13 @@ def run_overnight_reeval(
         "processed": 0,
         "armed": 0,
         "rejected": 0,
+        "terminal_rejected": 0,
         "skipped": 0,
         "errors": 0,
+        "terminal_errors": 0,
+        "retryable_deferred": 0,
+        "already_resolved": 0,
+        "unresolved": 0,
         "stale_skipped": 0,
         "fresh_processed": 0,
         "fresh_armed": 0,
@@ -687,24 +810,27 @@ def run_overnight_reeval(
         if not _is_trading_day(now_et):
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
             result["skipped"] = -1
-            return result
-        _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 45)
+            return _classify_overnight_reeval_result(result)
+        _in_window = (now_et.hour == 9 and 0 <= now_et.minute < 45)
         if not _in_window:
             log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
                      client_id, now_et.hour, now_et.minute)
             result["skipped"] = -1
-            return result
+            return _classify_overnight_reeval_result(result)
 
     # Fetch WATCHING signals from trade_queue
     watching_signals = _fetch_watching_signals(client_id)
+    watching_signals = sorted(watching_signals or [], key=_overnight_signal_sort_key)
     result["fetched"] = len(watching_signals or [])
     if not watching_signals:
         log.info("[%s] overnight_reeval: no WATCHING signals found", client_id)
-        return result
+        return _classify_overnight_reeval_result(result)
 
     log.info("[%s] overnight_reeval: found %d WATCHING signals to reeval", client_id, len(watching_signals))
 
     today = now_et.date()
+    prior_levels_by_ticker: dict[str, dict] = {}
+    snapshot_by_ticker: dict[str, dict] = {}
     for job in watching_signals:
         result["processed"] += 1
         job_id = job["id"]
@@ -725,6 +851,7 @@ def run_overnight_reeval(
             )
             _mark_job_rejected(job_id, client_id, "invalid_or_missing_side")
             result["rejected"] += 1
+            result["terminal_rejected"] += 1
             continue
         signal["side"] = side
         signal["direction"] = side
@@ -752,6 +879,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                     result["rejected"] += 1
+                    result["terminal_rejected"] += 1
                     result["stale_skipped"] += 1
                     continue
             result["fresh_processed"] += 1
@@ -772,6 +900,7 @@ def run_overnight_reeval(
                 )
                 _mark_job_rejected(job_id, client_id, f"intraday_timeframe_rejected:{_sig_tf}")
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
 
             _shared_watch_arm_recorded = _shared_watch_arm_failure_already_recorded(
@@ -784,20 +913,43 @@ def run_overnight_reeval(
                     "duplicate_setup:same_session_watch_arm_or_terminal_failure_proof",
                 )
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
             if job_source == "ap_signals" and _shared_watch_arm_recorded:
                 result["skipped"] = result.get("skipped", 0) + 1
+                result["already_resolved"] += 1
                 continue
 
             # Step 1: Fetch prior-day levels from broker
-            prior_levels = {}
-            if hasattr(market_data_broker, "get_prior_day_levels"):
-                prior_levels = market_data_broker.get_prior_day_levels(ticker) or {}
-            else:
-                log.warning(
-                    "[%s] market-data broker has no get_prior_day_levels — cannot validate overnight daily signal",
-                    ticker,
-                )
+            _ticker_key = str(ticker or "").upper()
+            prior_levels = prior_levels_by_ticker.get(_ticker_key)
+            if prior_levels is None:
+                prior_levels = {}
+                if hasattr(market_data_broker, "get_prior_day_levels"):
+                    try:
+                        prior_levels = market_data_broker.get_prior_day_levels(ticker) or {}
+                    except Exception as _prior_exc:
+                        log.warning(
+                            "[%s] overnight_reeval: prior-level fetch failed; retrying row later: %s",
+                            ticker,
+                            _prior_exc,
+                        )
+                        if _paper_rescue_only:
+                            _mark_job_watching_reason(
+                                job_id,
+                                client_id,
+                                "after_hours_deferred:overnight_prior_levels_fetch_failed",
+                            )
+                        result["skipped"] += 1
+                        result["retryable_deferred"] += 1
+                        continue
+                else:
+                    log.warning(
+                        "[%s] market-data broker has no get_prior_day_levels — cannot validate overnight daily signal",
+                        ticker,
+                    )
+                if prior_levels:
+                    prior_levels_by_ticker[_ticker_key] = prior_levels
 
             prior_day_high = (
                 float(signal.get("prior_day_high") or 0) or
@@ -917,6 +1069,7 @@ def run_overnight_reeval(
                         ),
                     )
                 result["skipped"] = result.get("skipped", 0) + 1
+                result["retryable_deferred"] += 1
                 continue  # leave job WATCHING for next reeval run
 
             # Step 2: Derive entry_trigger if not provided by scanner
@@ -930,13 +1083,34 @@ def run_overnight_reeval(
             if not entry_trigger and _paper_rescue_only:
                 _mark_job_rejected(job_id, client_id, "trigger_invalid")
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
             if entry_trigger:
                 signal["entry_trigger"] = entry_trigger
 
             # Step 3: Overnight daily structure validation
             # Fetch a fresh market snapshot (pre-market quote)
-            snapshot = fetch_market_snapshot(ticker, market_data_broker)
+            snapshot = snapshot_by_ticker.get(_ticker_key)
+            if snapshot is None:
+                try:
+                    snapshot = fetch_market_snapshot(ticker, market_data_broker)
+                except Exception as _snapshot_exc:
+                    log.warning(
+                        "[%s] overnight_reeval: snapshot fetch failed; retrying row later: %s",
+                        ticker,
+                        _snapshot_exc,
+                    )
+                    if _paper_rescue_only:
+                        _mark_job_watching_reason(
+                            job_id,
+                            client_id,
+                            "after_hours_deferred:overnight_snapshot_fetch_failed",
+                        )
+                    result["skipped"] += 1
+                    result["retryable_deferred"] += 1
+                    continue
+                if snapshot:
+                    snapshot_by_ticker[_ticker_key] = snapshot
             validation = validate_overnight_daily_signal(
                 ticker=ticker,
                 side=side,
@@ -965,6 +1139,7 @@ def run_overnight_reeval(
                             "after_hours_deferred:overnight_snapshot_unavailable",
                         )
                     result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
                     continue  # leave job WATCHING for next reeval run
                 # True invalidation — reject
                 log.info("[%s] overnight_reeval: OVERNIGHT_TRUE_INVALIDATION %s — %s",
@@ -987,6 +1162,7 @@ def run_overnight_reeval(
                     except Exception:
                         pass
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
 
             log.info("[%s] overnight_reeval: VALID %s — arming entry watcher | entry_trigger=%.4f",
@@ -1116,6 +1292,7 @@ def run_overnight_reeval(
                             except Exception:
                                 pass
                         result["rejected"] += 1
+                        result["terminal_rejected"] += 1
                         continue
             except Exception as mc_exc:
                 log.error("[%s] overnight_reeval: master_control.evaluate failed: %s", ticker, mc_exc)
@@ -1129,75 +1306,45 @@ def run_overnight_reeval(
                         ),
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
-            # Step 5: Contract selection — best-effort only.
-            # Pre-market option chains have zero bids (options don't trade before
-            # 9:30 AM ET). If selection fails here, we arm the watcher with
-            # contract_deferred=True so the execution core selects the contract
-            # at breach time when live quotes are available.
-            # NEVER permanently reject a valid signal because of pre-market chain data.
-            contract_deferred = False
-            _selector_failure = None
-            try:
-                selected = contract_selector.select(decision.plan)
-            except Exception as cs_exc:
-                _selector_failure = {
-                    "reason_code": "PRE_MARKET_SELECTOR_EXCEPTION",
-                    "error_type": type(cs_exc).__name__,
-                    "error": str(cs_exc),
-                }
-                log.warning(
-                    "[%s] overnight_reeval: contract selection failed pre-market (%s) "
-                    "— deferring to breach time with live quotes",
-                    ticker, cs_exc,
-                )
-                selected = None
-            if selected is None:
+            # Step 5: Establish watcher ownership before expensive option work.
+            # Contract selection remains authoritative at the existing breach-time
+            # execution seam, where live option quotes and every quality gate apply.
+            contract_deferred = True
+            log.info(
+                "[%s] overnight_reeval: deferring contract selection to breach time "
+                "and arming watcher immediately | trigger=%.4f",
+                ticker, entry_trigger or 0,
+            )
+            decision.plan.contract_symbol = f"DEFERRED:{ticker}"
+            decision.plan.limit_price = 0.01
+            if not getattr(decision.plan, "contracts", None):
+                decision.plan.contracts = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
+            if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
+                decision.plan.metadata = {}
+            decision.plan.metadata.update({
+                "contract_deferred": True,
+                "deferred_breach_selection": True,
+                "selection_context": "deferred_breach",
+                "pre_market_contract_selection_skipped": True,
+                "pre_market_contract_selection_failed": False,
+                "pre_market_selector_failure": None,
+                "pre_market_selector_reason_code": None,
+                "contract_selection_deferred_to": "breach_time",
+            })
+            if _lifecycle_ok:
                 try:
-                    if hasattr(contract_selector, "get_last_failure"):
-                        _selector_failure = contract_selector.get_last_failure() or _selector_failure
+                    from ap_lifecycle import LEDGER as _L
+                    _L.log_event(
+                        signal_id,
+                        "contract_deferred",
+                        owner="overnight_reeval",
+                        reason="watcher_first_deferred_to_breach",
+                    )
                 except Exception:
                     pass
-
-            if not selected or not str(getattr(decision.plan, "contract_symbol", "") or "").strip():
-                contract_deferred = True
-                log.info(
-                    "[%s] overnight_reeval: no pre-market contract available "
-                    "(zero bids expected before 9:30 AM ET) — "
-                    "arming watcher with contract_deferred=True | trigger=%.4f",
-                    ticker, entry_trigger or 0,
-                )
-                # Execution core will select the live contract at breach time.
-                # Set a placeholder limit so the plan passes downstream validation,
-                # and mark contracts with MIN_CONTRACTS_PER_POSITION as the minimum configured default.
-                try:
-                    decision.plan.limit_price = 0.01   # overwritten at breach by live quote
-                    if not getattr(decision.plan, "contracts", None):
-                        decision.plan.contracts = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
-                    if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
-                        decision.plan.metadata = {}
-                    decision.plan.metadata.update({
-                        "contract_deferred": True,
-                        "pre_market_contract_selection_failed": True,
-                        "pre_market_selector_failure": _selector_failure,
-                        "pre_market_selector_reason_code": (
-                            _selector_failure.get("reason_code")
-                            if isinstance(_selector_failure, dict)
-                            else None
-                        ),
-                        "contract_selection_deferred_to": "breach_time",
-                    })
-                except Exception:
-                    pass
-                if _lifecycle_ok:
-                    try:
-                        from ap_lifecycle import LEDGER as _L
-                        _L.log_event(signal_id, "contract_deferred",
-                                     owner="overnight_reeval",
-                                     reason="pre_market_zero_bids_deferred_to_breach")
-                    except Exception:
-                        pass
 
             # Propagate entry_trigger and overnight flag to the plan.
             # CRITICAL: also propagate prior_day_high, prior_day_low, and
@@ -1274,6 +1421,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                         result["rejected"] += 1
+                        result["terminal_rejected"] += 1
                         continue
             except Exception as _authz_exc:
                 try:
@@ -1290,6 +1438,7 @@ def run_overnight_reeval(
                               ticker, _authz_exc)
                     _mark_job_rejected(job_id, client_id, f"live_authorization_gate_error:{_authz_exc}")
                     result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
 
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
@@ -1343,6 +1492,7 @@ def run_overnight_reeval(
                         ),
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             if not local_order_id:
@@ -1354,6 +1504,7 @@ def run_overnight_reeval(
                         "order_materialization_failed:missing_local_order_id",
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             # Step 6b: Mark order PENDING_TRIGGER so order_monitor does not
@@ -1388,6 +1539,7 @@ def run_overnight_reeval(
                             "order_materialization_failed:pending_trigger_transition_false",
                         )
                     result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
             except Exception as _pt_exc:
                 log.error(
@@ -1403,6 +1555,7 @@ def run_overnight_reeval(
                         f"order_materialization_failed:{type(_pt_exc).__name__}",
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             # Step 7: Arm entry watcher — pass plan (not signal) and the OSM order ID
@@ -1523,6 +1676,7 @@ def run_overnight_reeval(
                         )
                         _mark_job_error(job_id, client_id, _cleanup_failed_reason)
                         result["errors"] += 1
+                        result["terminal_errors"] += 1
                         continue
                     _record_watch_arm_failure_proof(
                         signal_id=signal_id,
@@ -1544,6 +1698,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                     result["rejected"] += 1
+                    result["terminal_rejected"] += 1
             except Exception as ew_exc:
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
@@ -1589,6 +1744,7 @@ def run_overnight_reeval(
                     )
                     _mark_job_error(job_id, client_id, _cleanup_failed_reason)
                     result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
                 _record_watch_arm_failure_proof(
                     signal_id=signal_id,
@@ -1603,6 +1759,7 @@ def run_overnight_reeval(
                 _mark_job_error(job_id, client_id, _full_error)
                 log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
                 result["errors"] += 1
+                result["terminal_errors"] += 1
 
         except Exception as outer_exc:
             log.error("[%s] overnight_reeval: unexpected error for %s: %s", ticker, signal_id, outer_exc, exc_info=True)
@@ -1616,20 +1773,34 @@ def run_overnight_reeval(
                     ),
                 )
             result["errors"] += 1
+            result["terminal_errors"] += 1
 
     result["stale_inventory_only"] = bool(
         result["processed"] > 0
         and result["fresh_processed"] == 0
         and result["stale_skipped"] > 0
     )
+    result["unresolved"] = max(
+        0,
+        result["processed"]
+        - result["armed"]
+        - result["terminal_rejected"]
+        - result["terminal_errors"]
+        - result["retryable_deferred"]
+        - result["already_resolved"],
+    )
     log.info(
-        "[%s] overnight_reeval complete: processed=%d armed=%d rejected=%d skipped=%d errors=%d stale_skipped=%d fresh_processed=%d fresh_armed=%d stale_inventory_only=%s",
+        "[%s] overnight_reeval complete: processed=%d armed=%d terminal_rejected=%d "
+        "terminal_errors=%d retryable_deferred=%d unresolved=%d skipped=%d "
+        "stale_skipped=%d fresh_processed=%d fresh_armed=%d stale_inventory_only=%s",
         client_id,
         result["processed"],
         result["armed"],
-        result["rejected"],
+        result["terminal_rejected"],
+        result["terminal_errors"],
+        result["retryable_deferred"],
+        result["unresolved"],
         result["skipped"],
-        result["errors"],
         result["stale_skipped"],
         result["fresh_processed"],
         result["fresh_armed"],
@@ -1643,31 +1814,17 @@ def run_overnight_reeval(
             result["fresh_armed"],
             result["stale_inventory_only"],
         )
-    # P0 (2026-07-02): a run that fetched work but produced NO decisions —
-    # nothing armed, nothing rejected, no errors, everything deferred to
-    # "next reeval" — is a stall, not a success. This is exactly the paper
-    # signature when market data is unavailable: every row takes a
-    # RETRY_LATER continue, the queue never drains, and the run reports
-    # green. Flag it so callers persist status='partial' and operators see
-    # the pipeline is wedged the same morning, not four sessions later.
-    if (
-        result["fetched"] > 0
-        and result["armed"] == 0
-        and result["rejected"] == 0
-        and result["errors"] == 0
-        and result.get("skipped", 0) and result["skipped"] > 0
-    ):
-        result["stalled"] = True
+    if result["retryable_deferred"] > 0 and result["terminal_rejected"] == 0 and result["armed"] == 0:
         log.error(
-            "[%s] OVERNIGHT_REEVAL_STALLED fetched=%d skipped=%d armed=0 rejected=0 — "
-            "every fetched signal deferred to next run; queue is NOT draining. "
+            "[%s] OVERNIGHT_REEVAL_STALLED fetched=%d retryable_deferred=%d — "
+            "every owned signal deferred to next run; queue is NOT draining. "
             "category=SILENT_STALL severity=ERROR "
             "likely_cause=market_data_unavailable_or_all_rows_retry_later",
             client_id,
             result["fetched"],
-            result["skipped"],
+            result["retryable_deferred"],
         )
-    return result
+    return _classify_overnight_reeval_result(result)
 
 
 def _fetch_watching_signals(client_id: str) -> list:
@@ -2008,9 +2165,10 @@ def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
             with conn() as c:
                 c.execute("""
                     UPDATE trade_queue
-                    SET last_error = %s,
+                    SET status = 'ARMED',
+                        last_error = %s,
                         started_ts = COALESCE(started_ts, NOW())
-                    WHERE id = %s AND client_id = %s
+                    WHERE id = %s AND client_id = %s AND status = 'WATCHING'
                 """, (label, job_id, client_id))
         run_with_retry(_fn)
     except Exception as e:

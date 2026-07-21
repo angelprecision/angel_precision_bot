@@ -477,9 +477,9 @@ def _overnight_status(
 ) -> tuple[str, dict]:
     if _post_overnight_reeval_success_exists(client_id, execution_mode, trading_date):
         return "success", {"source": "handoff_run_locks.post_overnight_reeval"}
-    last_ran = getattr(runner, "_last_overnight_reeval_date", None)
-    if str(last_ran or "") == trading_date:
-        return "success", {"source": "runner_last_overnight_reeval_date"}
+    success_date = getattr(runner, "_overnight_reeval_success_date", None)
+    if str(success_date or "") == trading_date:
+        return "success", {"source": "runner_overnight_reeval_success_date"}
     if int(client_state.get("watching_count", 0) or 0) == 0 and not client_state.get("pending_trigger_rows"):
         return "explicit_noop", {"source": "no_watching_or_pending_trigger_rows"}
     if str(stage or "").strip().lower() == "startup" and not _overnight_reeval_due(now):

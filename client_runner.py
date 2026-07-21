@@ -45,7 +45,7 @@ import os
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from cryptography.fernet import Fernet
@@ -93,6 +93,22 @@ except Exception as _patch_exc:
 _ET = ZoneInfo("America/New_York")
 _time_module: object = time
 _members_cache: dict = {}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int(str(os.getenv(name, str(default))).strip())
+    except Exception:
+        return default
+    return value if value > 0 else default
+
+
+OVERNIGHT_REEVAL_RETRY_SEC = _positive_int_env("OVERNIGHT_REEVAL_RETRY_SEC", 90)
+OVERNIGHT_REEVAL_MAX_ATTEMPTS = _positive_int_env("OVERNIGHT_REEVAL_MAX_ATTEMPTS", 6)
+OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC = _positive_int_env(
+    "OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC",
+    5,
+)
 
 
 def _autonomy_log_context(execution_mode: str | None = None) -> dict:
@@ -693,6 +709,15 @@ class ClientRunner(threading.Thread):
         self.equity_thread = None
         self.health_thread = None
         self.failure_reason: str = ""
+        self._overnight_reeval_attempt_lock = threading.Lock()
+        self._overnight_reeval_state_date = None
+        self._overnight_reeval_success_date = None
+        self._overnight_reeval_exhausted_date = None
+        self._overnight_reeval_last_attempt_at = None
+        self._overnight_reeval_next_retry_at = None
+        self._overnight_reeval_attempt_count = 0
+        self._overnight_reeval_last_result_class = None
+        self._overnight_reeval_last_retry_reason = None
 
     def trip_kill_switch(self, reason: str = "manual_trip") -> None:
         """PR D / FIX-2 (BUG-CR-4): public setter to trip the kill switch.
@@ -1657,95 +1682,385 @@ class ClientRunner(threading.Thread):
         """Broker lives inside self.core — resolve it safely."""
         return getattr(self.core, "broker", None) if self.core else None
 
-    def _run_overnight_reeval_if_due(self) -> None:
-        """Fire overnight signal re-evaluation at 9:00-9:45 AM ET on trading days.
-        Runs once per calendar day. Processes WATCHING signals, fetches prior-day
-        levels, validates directional structure, selects contracts, arms watcher.
-        """
+    def _reset_overnight_reeval_state_for_date(self, today) -> None:
+        if self._overnight_reeval_state_date == today:
+            return
+        self._overnight_reeval_state_date = today
+        self._overnight_reeval_success_date = None
+        self._overnight_reeval_exhausted_date = None
+        self._overnight_reeval_last_attempt_at = None
+        self._overnight_reeval_next_retry_at = None
+        self._overnight_reeval_attempt_count = 0
+        self._overnight_reeval_last_result_class = None
+        self._overnight_reeval_last_retry_reason = None
+
+    def _overnight_reeval_base_result(
+        self,
+        *,
+        result_class: str,
+        completed: bool,
+        retryable: bool,
+        retry_reason: str | None = None,
+        now_et=None,
+        source: str = "scheduler",
+        next_retry_at=None,
+        errors: int = 0,
+        last_error: str | None = None,
+    ) -> dict:
+        now_et = now_et or datetime.now(_ET)
+        return {
+            "processed": 0,
+            "armed": 0,
+            "rejected": 0,
+            "terminal_rejected": 0,
+            "skipped": 0,
+            "errors": errors,
+            "terminal_errors": errors,
+            "retryable_deferred": 0,
+            "unresolved": 0,
+            "stale_skipped": 0,
+            "fresh_processed": 0,
+            "fresh_armed": 0,
+            "fetched": 0,
+            "stalled": False,
+            "result_class": result_class,
+            "completed": completed,
+            "retryable": retryable,
+            "retry_reason": retry_reason,
+            "attempt_count": self._overnight_reeval_attempt_count,
+            "attempt_source": source,
+            "attempted_at": (
+                self._overnight_reeval_last_attempt_at.isoformat()
+                if self._overnight_reeval_last_attempt_at is not None else None
+            ),
+            "next_retry_at": next_retry_at.isoformat() if next_retry_at is not None else None,
+            "post_open_attempt": bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
+            "last_error": last_error,
+            "attempt_performed": False,
+        }
+
+    def _overnight_reeval_window_start(self, today):
+        return datetime(today.year, today.month, today.day, 9, 0, 0, tzinfo=_ET)
+
+    def _overnight_reeval_window_end(self, today):
+        return datetime(today.year, today.month, today.day, 9, 45, 0, tzinfo=_ET)
+
+    def _overnight_reeval_in_window(self, now_et) -> bool:
+        today = now_et.date()
+        return self._overnight_reeval_window_start(today) <= now_et < self._overnight_reeval_window_end(today)
+
+    def _schedule_overnight_reeval_retry(self, now_et, today, result: dict) -> tuple[object | None, str | None]:
+        window_end = self._overnight_reeval_window_end(today)
+        if self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS:
+            return None, "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
+        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+            post_open = datetime(today.year, today.month, today.day, 9, 30, 5, tzinfo=_ET)
+            scheduled = max(now_et + timedelta(seconds=OVERNIGHT_REEVAL_RETRY_SEC), post_open)
+        else:
+            delay = OVERNIGHT_REEVAL_RETRY_SEC
+            if now_et.hour == 9 and now_et.minute == 30 and now_et.second < 5:
+                delay = max(delay, OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC)
+            scheduled = now_et + timedelta(seconds=delay)
+        if scheduled >= window_end:
+            return None, "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
+        return scheduled, None
+
+    def _persist_overnight_reeval_lock(
+        self,
+        result: dict,
+        *,
+        today,
+        source: str,
+        now_et,
+        last_error: str | None = None,
+    ) -> None:
         try:
-            from zoneinfo import ZoneInfo
-            import datetime as _dt
-            now_et = _dt.datetime.now(ZoneInfo("America/New_York"))
-            today = now_et.date()
+            from ap.morning_handoff import _upsert_handoff_run_lock
+            completed = bool(result.get("completed"))
+            retryable = bool(result.get("retryable"))
+            result_class = str(result.get("result_class") or "")
+            if completed:
+                status = "success"
+                lock_error = None
+            elif result_class == "SKIPPED_NOT_DUE":
+                status = "skipped"
+                lock_error = None
+            elif retryable:
+                status = "partial"
+                lock_error = last_error or (
+                    "OVERNIGHT_REEVAL_STALLED:all_fetched_rows_deferred"
+                    if result_class == "RETRYABLE_ALL_DEFERRED"
+                    else None
+                )
+            else:
+                status = "partial"
+                lock_error = last_error
+            details = {
+                "fetched": result.get("fetched"),
+                "processed": result.get("processed"),
+                "armed": result.get("armed"),
+                "rejected": result.get("rejected"),
+                "terminal_rejected": result.get("terminal_rejected"),
+                "skipped": result.get("skipped"),
+                "errors": result.get("errors"),
+                "terminal_errors": result.get("terminal_errors"),
+                "retryable_deferred": result.get("retryable_deferred"),
+                "unresolved": result.get("unresolved"),
+                "stale_skipped": result.get("stale_skipped"),
+                "fresh_processed": result.get("fresh_processed"),
+                "fresh_armed": result.get("fresh_armed"),
+                "stalled": result.get("stalled"),
+                "result_class": result.get("result_class"),
+                "completed": result.get("completed"),
+                "retryable": result.get("retryable"),
+                "retry_reason": result.get("retry_reason"),
+                "attempt_count": self._overnight_reeval_attempt_count,
+                "attempt_source": source,
+                "attempted_at": (
+                    self._overnight_reeval_last_attempt_at.isoformat()
+                    if self._overnight_reeval_last_attempt_at is not None else None
+                ),
+                "next_retry_at": (
+                    self._overnight_reeval_next_retry_at.isoformat()
+                    if self._overnight_reeval_next_retry_at is not None else None
+                ),
+                "post_open_attempt": bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
+            }
+            _upsert_handoff_run_lock(
+                client_id=self.email,
+                execution_mode=str(self.mode).lower(),
+                trading_date=today.isoformat(),
+                stage="overnight_reeval",
+                status=status,
+                last_error=lock_error,
+                details=details,
+                mark_success=completed,
+            )
+        except Exception as _lock_exc:
+            logger.warning(
+                "[%s] overnight_reeval lock write failed (non-fatal): %s",
+                self.email, _lock_exc,
+            )
 
-            # Only Mon-Fri, 9:00-9:25 AM ET — must arm watcher before 9:30 open
-            if now_et.weekday() >= 5:
-                return
-            if not (now_et.hour == 9 and 0 <= now_et.minute <= 45):
-                return
+    def run_overnight_reeval_attempt(
+        self,
+        *,
+        force: bool = False,
+        source: str = "scheduler",
+        now_et=None,
+    ) -> dict:
+        now_et = now_et or datetime.now(_ET)
+        today = now_et.date()
+        self._reset_overnight_reeval_state_for_date(today)
 
-            # Only once per day
-            last_ran = getattr(self, "_last_overnight_reeval_date", None)
-            if last_ran == today:
-                return
+        if not force:
+            if now_et.weekday() >= 5 or not self._overnight_reeval_in_window(now_et):
+                return self._overnight_reeval_base_result(
+                    result_class="SKIPPED_NOT_DUE",
+                    completed=False,
+                    retryable=False,
+                    now_et=now_et,
+                    source=source,
+                )
+            if self._overnight_reeval_success_date == today:
+                return self._overnight_reeval_base_result(
+                    result_class="ALREADY_COMPLETED",
+                    completed=False,
+                    retryable=False,
+                    now_et=now_et,
+                    source=source,
+                )
+            if self._overnight_reeval_exhausted_date == today:
+                return self._overnight_reeval_base_result(
+                    result_class="RETRY_EXHAUSTED",
+                    completed=False,
+                    retryable=False,
+                    retry_reason=self._overnight_reeval_last_retry_reason,
+                    now_et=now_et,
+                    source=source,
+                    last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
+                )
+            if (
+                self._overnight_reeval_next_retry_at is not None
+                and now_et < self._overnight_reeval_next_retry_at
+            ):
+                return self._overnight_reeval_base_result(
+                    result_class="WAITING_FOR_RETRY",
+                    completed=False,
+                    retryable=True,
+                    retry_reason=self._overnight_reeval_last_retry_reason,
+                    now_et=now_et,
+                    source=source,
+                    next_retry_at=self._overnight_reeval_next_retry_at,
+                )
 
-            self._last_overnight_reeval_date = today
-            logger.info("[%s] 🌅 Overnight daily signal reeval — %02d:%02d ET | checking WATCHING queue",
-                        self.email, now_et.hour, now_et.minute)
+            if self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS:
+                self._overnight_reeval_exhausted_date = today
+                self._overnight_reeval_next_retry_at = None
+                self._overnight_reeval_last_result_class = "RETRY_EXHAUSTED"
+                result = self._overnight_reeval_base_result(
+                    result_class="RETRY_EXHAUSTED",
+                    completed=False,
+                    retryable=False,
+                    retry_reason=self._overnight_reeval_last_retry_reason,
+                    now_et=now_et,
+                    source=source,
+                    last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
+                )
+                self._persist_overnight_reeval_lock(
+                    result,
+                    today=today,
+                    source=source,
+                    now_et=now_et,
+                    last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
+                )
+                return result
 
+        if not self._overnight_reeval_attempt_lock.acquire(blocking=False):
+            return self._overnight_reeval_base_result(
+                result_class="ATTEMPT_ALREADY_RUNNING",
+                completed=False,
+                retryable=True,
+                retry_reason="attempt_already_running",
+                now_et=now_et,
+                source=source,
+                next_retry_at=self._overnight_reeval_next_retry_at,
+            )
+
+        result: dict
+        last_error = None
+        try:
+            self._overnight_reeval_attempt_count += 1
+            self._overnight_reeval_last_attempt_at = now_et
+            logger.info(
+                "[%s] Overnight daily signal reeval attempt=%d source=%s post_open=%s -- %02d:%02d ET | checking WATCHING queue",
+                self.email,
+                self._overnight_reeval_attempt_count,
+                source,
+                bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
+                now_et.hour,
+                now_et.minute,
+            )
             broker = self._get_broker()
-            data_broker = getattr(self, "data_broker", None) or broker
-            # All of these are stored directly on the runner (not on self.core)
+            data_broker = (
+                getattr(self, "data_broker", None)
+                or (getattr(self.core, "data_broker", None) if self.core else None)
+                or broker
+            )
             entry_watcher = getattr(self.core, "entry_watcher", None) if self.core else None
             contract_selector = self.contract_selector
             exit_eng = getattr(self.core, "exit_eng", None) if self.core else None
 
-            from ap_overnight_reeval import run_overnight_reeval
-            result = run_overnight_reeval(
-                client_id=self.email,
-                broker=broker,
-                data_broker=data_broker,
-                master_control=self.master_control,
-                contract_selector=contract_selector,
-                order_state_machine=self.order_state_machine,
-                entry_watcher=entry_watcher,
-                position_manager=self.position_manager,
-                exit_eng=exit_eng,
-                force=False,
-            )
-            logger.info(
-                "[%s] Overnight reeval complete: armed=%d rejected=%d processed=%d errors=%d",
-                self.email, result["armed"], result["rejected"],
-                result["processed"], result["errors"],
-            )
-            # P0 (2026-07-02): durable, HONEST record of the reeval itself.
-            # The only handoff_run_locks row previously written for this
-            # window was stage='post_overnight_reeval' status='success' —
-            # emitted by the handoff audit regardless of whether the reeval
-            # actually drained anything. Paper ran 4 sessions with 486 rows
-            # frozen behind a green lock. This dedicated stage row carries
-            # the run counts and reports 'partial' when the run stalled
-            # (fetched work, produced zero decisions). Best-effort: a lock
-            # write failure must never take down the reeval path.
             try:
-                from ap.morning_handoff import _upsert_handoff_run_lock
-                _stalled = bool(result.get("stalled"))
-                _upsert_handoff_run_lock(
+                from ap_overnight_reeval import run_overnight_reeval
+                result = run_overnight_reeval(
                     client_id=self.email,
-                    execution_mode=str(self.mode).lower(),
-                    trading_date=datetime.now(_ET).date().isoformat(),
-                    stage="overnight_reeval",
-                    status="partial" if _stalled else "success",
-                    last_error=(
-                        "OVERNIGHT_REEVAL_STALLED:all_fetched_rows_deferred"
-                        if _stalled else None
-                    ),
-                    details={
-                        k: result.get(k)
-                        for k in (
-                            "fetched", "processed", "armed", "rejected",
-                            "skipped", "errors", "stale_skipped",
-                            "fresh_processed", "fresh_armed", "stalled",
-                        )
-                    },
-                    mark_success=not _stalled,
+                    broker=broker,
+                    data_broker=data_broker,
+                    master_control=self.master_control,
+                    contract_selector=contract_selector,
+                    order_state_machine=self.order_state_machine,
+                    entry_watcher=entry_watcher,
+                    position_manager=self.position_manager,
+                    exit_eng=exit_eng,
+                    force=force,
                 )
-            except Exception as _lock_exc:
-                logger.warning(
-                    "[%s] overnight_reeval lock write failed (non-fatal): %s",
-                    self.email, _lock_exc,
+            except Exception as exc:
+                logger.error("[%s] Overnight reeval engine exception: %s", self.email, exc, exc_info=True)
+                result = self._overnight_reeval_base_result(
+                    result_class="RETRYABLE_EXCEPTION",
+                    completed=False,
+                    retryable=True,
+                    retry_reason=f"exception:{type(exc).__name__}",
+                    now_et=now_et,
+                    source=source,
+                    errors=1,
                 )
-            self._run_post_overnight_morning_handoff(result)
+
+            retryable_deferred = int(result.get("retryable_deferred", 0) or 0)
+            unresolved = int(result.get("unresolved", 0) or 0)
+            if bool(result.get("completed")) and (retryable_deferred > 0 or unresolved > 0):
+                result["result_class"] = "RETRYABLE_PARTIAL_DEFERRED"
+                result["completed"] = False
+                result["retryable"] = True
+                result["retry_reason"] = "retryable_rows_remain"
+
+            result["attempt_count"] = self._overnight_reeval_attempt_count
+            result["attempt_source"] = source
+            result["attempted_at"] = now_et.isoformat()
+            result["post_open_attempt"] = bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30))
+            result["attempt_performed"] = True
+
+            if bool(result.get("completed")):
+                self._overnight_reeval_success_date = today
+                self._overnight_reeval_next_retry_at = None
+                self._overnight_reeval_exhausted_date = None
+            elif bool(result.get("retryable")):
+                next_retry_at, exhausted_error = self._schedule_overnight_reeval_retry(now_et, today, result)
+                self._overnight_reeval_next_retry_at = next_retry_at
+                last_error = exhausted_error
+                if exhausted_error:
+                    result["result_class"] = "RETRY_EXHAUSTED"
+                    result["retryable"] = False
+                    self._overnight_reeval_next_retry_at = None
+                    self._overnight_reeval_exhausted_date = today
+                    result["retry_exhausted"] = True
+                    result["last_error"] = exhausted_error
+            else:
+                self._overnight_reeval_next_retry_at = None
+
+            self._overnight_reeval_last_result_class = result.get("result_class")
+            self._overnight_reeval_last_retry_reason = result.get("retry_reason")
+            result["next_retry_at"] = (
+                self._overnight_reeval_next_retry_at.isoformat()
+                if self._overnight_reeval_next_retry_at is not None else None
+            )
+
+            self._persist_overnight_reeval_lock(
+                result,
+                today=today,
+                source=source,
+                now_et=now_et,
+                last_error=last_error,
+            )
+
+            if bool(result.get("completed")):
+                post = self._run_post_overnight_morning_handoff(result)
+                result["handoff_result"] = post.get("handoff_result") if isinstance(post, dict) else None
+                result["readiness_result"] = post.get("readiness_result") if isinstance(post, dict) else None
+            else:
+                logger.info(
+                    "[%s] POST_OVERNIGHT_HANDOFF_DEFERRED result_class=%s retry_reason=%s",
+                    self.email,
+                    result.get("result_class"),
+                    result.get("retry_reason"),
+                )
+                result["handoff_result"] = None
+                result["readiness_result"] = None
+
+            logger.info(
+                "[%s] Overnight reeval attempt complete: result_class=%s completed=%s retryable=%s next_retry_at=%s armed=%s rejected=%s processed=%s errors=%s",
+                self.email,
+                result.get("result_class"),
+                result.get("completed"),
+                result.get("retryable"),
+                result.get("next_retry_at"),
+                result.get("armed"),
+                result.get("rejected"),
+                result.get("processed"),
+                result.get("errors"),
+            )
+            return result
+        finally:
+            self._overnight_reeval_attempt_lock.release()
+
+    def _run_overnight_reeval_if_due(self) -> None:
+        """Fire overnight signal re-evaluation at 9:00-9:45 AM ET on trading days.
+        Processes WATCHING signals, fetches prior-day levels, validates
+        directional structure, selects contracts, arms watcher.
+        """
+        try:
+            self.run_overnight_reeval_attempt(force=False, source="scheduler")
         except Exception as exc:
             logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
 
@@ -1780,9 +2095,9 @@ class ClientRunner(threading.Thread):
         except Exception as exc:
             logger.error("[%s] Startup morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
 
-    def _run_post_overnight_morning_handoff(self, overnight_result: dict | None) -> None:
+    def _run_post_overnight_morning_handoff(self, overnight_result: dict | None) -> dict:
         if not isinstance(overnight_result, dict):
-            return
+            return {"handoff_result": None, "readiness_result": None}
         try:
             from ap.morning_handoff import run_morning_handoff_audit
             from ap.preopen_readiness import run_preopen_autonomous_readiness
@@ -1810,8 +2125,13 @@ class ClientRunner(threading.Thread):
                     )
                 elif readiness.get("ok"):
                     self._clear_degraded_reason_key("preopen_readiness_blocked")
+            return {"handoff_result": result, "readiness_result": readiness}
         except Exception as exc:
             logger.error("[%s] Post-overnight morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
+            return {
+                "handoff_result": None,
+                "readiness_result": {"ok": False, "status": "ERROR", "error": str(exc)},
+            }
 
     def _run_exit_autonomous_recovery(self):
         """
