@@ -43,48 +43,102 @@ TOUCHED_PROFIT_ARM_PCT      = float(os.getenv("TOUCHED_PROFIT_ARM_PCT", "0.05"))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AMENDMENT #5 (blocker 4): shared hard-exit reference selector.
-# Long-option liquidation policy:
-#   BID   - executable liquidation price. Best evidence.
-#   MID   - (bid + ask)/2 when BOTH available.
-#   LAST  - actual last-traded price. Strong evidence of a real market clear.
-#   MARK  - broker-computed mark. Strong evidence when LAST unavailable.
-#   ASK   - price someone wants you to PAY. NEVER a liquidation price for a
-#           long option.  Cannot certify safety.  When ONLY ASK is available,
-#           we record it with source="ask_unproven" so downstream can treat it
-#           with degraded trust (hard-stop consumers still trigger if ASK
-#           itself is below the stop — a self-proving catastrophe signal —
-#           but soft/winner logic can distinguish ask-only from proven price).
+# AMENDMENT #6 (blockers 2, 4, 5): shared hard-exit reference selector.
+# Long-option liquidation policy with provenance and freshness:
 #
-# This function is IMPORTED by every quote writer path (QPM, exit engine's
-# _apply_option_quote_for_decision, broker-position precheck, restart recovery)
-# so hard-exit truth cannot silently disappear on any code path.
+# Priority (fresh sources only):
+#   BID     - executable liquidation price. Best evidence.
+#   LAST    - actual last-traded price, but ONLY when fresh.  A stale LAST can
+#             manufacture a false loss (opposite of the original bug where
+#             stale data hid a loss).  When LAST is stale it drops in priority.
+#   MARK    - broker-computed mark.  Fresh mark used when LAST is stale/missing.
+#   ASK     - price to BUY. NEVER a liquidation price for a long option.
+#             Special rule:
+#               - May PROVE catastrophe when ASK is at/below hard_stop (self-proving).
+#               - May NEVER clear or improve a prior proven reference.
+#               - When only ASK is available and its P&L looks healthy, we
+#                 return validity="unproven" so downstream can distinguish it.
+#
+# Return: HardExitRef(price, source, validity, ts)
+#   validity: "proven"    - fresh BID / LAST / MARK / MID; safe for hard-exit auth
+#             "unproven"  - ASK-only healthy; must not clear prior proven ref
+#             "catastrophic_ask" - ASK-only but ASK itself catastrophic (self-proving)
+#             "no_data"   - nothing available; hard-exit auth explicitly unavailable
 # ══════════════════════════════════════════════════════════════════════════════
-def _select_hard_exit_reference(*, bid: float, ask: float, mark: float, last: float) -> tuple[float, str]:
-    """Return (price, source) for the hard-exit reference. Source is one of:
-    'bid', 'mid', 'last', 'mark', 'ask_unproven', or '' if no data available.
+from dataclasses import dataclass as _dc_href
 
-    Conservative long-option policy: ASK-only quotes are recorded but flagged
-    as unproven — they can prove catastrophe (ASK below stop) but cannot
-    certify a position is safe."""
+@_dc_href(frozen=True)
+class HardExitRef:
+    price: float
+    source: str
+    validity: str          # "proven" | "unproven" | "catastrophic_ask" | "no_data"
+    ts: "Optional[datetime]"
+
+
+def _select_hard_exit_reference(
+    *,
+    bid: float, ask: float, mark: float, last: float,
+    bid_ts: "Optional[datetime]" = None,
+    last_ts: "Optional[datetime]" = None,
+    mark_ts: "Optional[datetime]" = None,
+    ask_ts: "Optional[datetime]" = None,
+    now_utc: "Optional[datetime]" = None,
+    entry_price: float = 0.0,
+    hard_stop_pct: float = -0.33,
+    last_stale_sec: float = 30.0,
+) -> "HardExitRef":
+    """Provenance- and freshness-aware hard-exit reference selection.
+
+    - Only FRESH sources count for proven authority.
+    - ASK-only healthy quotes return validity='unproven'.
+    - ASK-only catastrophic quotes return validity='catastrophic_ask'.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    def _fresh(ts):
+        if ts is None: return False
+        try:
+            return (now_utc - ts).total_seconds() <= last_stale_sec
+        except Exception:
+            return False
+
     _bid = float(bid) if bid and bid > 0 else 0.0
     _ask = float(ask) if ask and ask > 0 else 0.0
     _mark = float(mark) if mark and mark > 0 else 0.0
     _last = float(last) if last and last > 0 else 0.0
 
+    # BID wins whenever present (executable liquidation truth).
     if _bid > 0:
-        return (_bid, "bid")
-    if _bid > 0 and _ask > 0:
-        return (round((_bid + _ask) / 2.0, 4), "mid")  # unreachable given branch above, kept for clarity
+        return HardExitRef(price=_bid, source="bid", validity="proven", ts=bid_ts)
+
+    # Prefer fresh LAST over MARK; stale LAST drops behind MARK.
+    _last_fresh = _last > 0 and _fresh(last_ts)
+    _mark_fresh = _mark > 0 and _fresh(mark_ts)
+
+    if _last_fresh:
+        return HardExitRef(price=_last, source="last", validity="proven", ts=last_ts)
+    if _mark_fresh:
+        return HardExitRef(price=_mark, source="mark", validity="proven", ts=mark_ts)
+    # Neither fresh — take whichever exists at all, still proven if we have ts;
+    # otherwise mark as unproven so downstream can request refresh.
     if _last > 0:
-        return (_last, "last")
+        return HardExitRef(price=_last, source="last_stale", validity="unproven", ts=last_ts)
     if _mark > 0:
-        return (_mark, "mark")
+        return HardExitRef(price=_mark, source="mark_stale", validity="unproven", ts=mark_ts)
+
+    # ASK-only path: never trusted for "healthy" but can prove catastrophe.
     if _ask > 0:
-        # ASK-only: unproven. Recorded so hard-stop can still fire if ASK
-        # itself indicates catastrophe (self-proving), but source is flagged.
-        return (_ask, "ask_unproven")
-    return (0.0, "")
+        if entry_price > 0:
+            _ask_pnl = (_ask - entry_price) / entry_price
+            if _ask_pnl <= hard_stop_pct:
+                # ASK itself is at/below hard stop — self-proving catastrophe.
+                return HardExitRef(price=_ask, source="ask_catastrophic",
+                                   validity="catastrophic_ask", ts=ask_ts)
+        # ASK-only healthy: unproven — do not use as safety certification.
+        return HardExitRef(price=_ask, source="ask_unproven",
+                           validity="unproven", ts=ask_ts)
+
+    return HardExitRef(price=0.0, source="", validity="no_data", ts=None)
 
 # PR: position-lifecycle-integrity-and-sizing (P0 FIX-2)
 # QPM must also persist live quote / PnL state to the positions table so the
@@ -477,6 +531,11 @@ class APPositionQuoteMonitor:
                     # ── Publish to QuoteAuthority so Exit Engine can consume ──
                     # QPM is the ONLY authorized writer. Exit engine reads from
                     # QUOTES.get_fresh() — never fetches independently.
+                    # AMENDMENT #6 (blocker 4): 'last' must be raw broker LAST,
+                    # never the synthetic opt_price fallback.  opt_price can
+                    # itself be an ASK-fallback which would launder ASK as LAST
+                    # for downstream hard-exit authority.
+                    _raw_broker_last = _safe_float(oq.get("last"), 0.0)
                     try:
                         from ap_quote_authority import QUOTES as _QA
                         _und_px = _safe_float(
@@ -488,7 +547,7 @@ class APPositionQuoteMonitor:
                             underlying       = t,
                             bid              = bid if bid > 0 else 0.0,
                             ask              = ask if ask > 0 else 0.0,
-                            last             = opt_price,
+                            last             = _raw_broker_last,     # raw, not opt_price
                             underlying_price = _und_px,
                             source           = price_source,
                         )
@@ -511,41 +570,71 @@ class APPositionQuoteMonitor:
                 # cur_opt is the analytics mark (mid/mark) — retained for charting only.
                 cur_opt = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
 
-                # ── P0 (PR #385 amendment #3, blocker 1): HARD-EXIT LOSS AUTHORITY ─────
-                # current_option_price is intentionally cleared on LIVE missing-bid so
-                # soft exits cannot fire off a mid/mark.  But that same clear makes
-                # option_pnl_pct return 0.0, silently disarming the HARD STOP on the
-                # real live money path.  Fix: a SEPARATE authority for catastrophic-loss
-                # detection that never zeroes when a valid market price of any kind is
-                # available.  Preference order (AMENDMENT #5, blocker 4):
-                # BID > MID (bid+ask) > MARK > LAST > ASK-as-conservative.
-                # For a LONG option, ASK is the price to BUY more, never the
-                # liquidation price.  ASK alone cannot certify "healthy" — if
-                # LAST or MARK evidence is available, they win because they
-                # reflect the last actually-traded/quoted midpoint.  If ONLY
-                # ASK is available, we still record it but flag the source as
-                # "ask_unproven" so consumers can treat it with degraded trust.
-                # ASK CAN prove catastrophe (if ASK itself is below the hard
-                # stop, the position is unquestionably impaired) — this is
-                # captured naturally because the pnl calc runs regardless.
+                # ── P0 HARD-EXIT LOSS AUTHORITY (amendment #6) ────────────────────
+                # Provenance-and-freshness-aware. See _select_hard_exit_reference.
+                # - Fresh BID/LAST/MARK/MID: proven; safe to record as hard-loss auth.
+                # - ASK-only healthy: unproven; must NOT overwrite a prior proven ref.
+                # - ASK-only catastrophic: self-proving; allowed as authority.
                 _mark_for_ref = _safe_float(oq.get("mark"), 0.0)
                 _last_for_ref = _safe_float(oq.get("last"), 0.0)
-                _hard_ref_price, _hard_ref_source = _select_hard_exit_reference(
-                    bid=bid, ask=ask, mark=_mark_for_ref, last=_last_for_ref,
-                )
-                _hard_ref_pnl = None  # AMENDMENT #4: ensure defined for snapshot dict
+                # Provenance timestamps: when the broker doesn't stamp per-field
+                # trade times, the QUOTE ARRIVAL is the freshness signal (the
+                # broker returned this LAST value on this cycle, so it is at
+                # least as fresh as the cycle).  Only downgrade LAST to stale
+                # when the broker explicitly says it's older via last_trade_ts.
+                _last_trade_ts = oq.get("last_trade_ts") or oq.get("trade_date") or (now_utc if _last_for_ref > 0 else None)
+                _mark_ts = oq.get("mark_ts") or (now_utc if _mark_for_ref > 0 else None)
+                _bid_ts = oq.get("bid_ts") or (now_utc if bid > 0 else None)
+                _ask_ts = oq.get("ask_ts") or (now_utc if ask > 0 else None)
 
-                if _hard_ref_price > 0:
-                    self._write_field_unconditional(pos, "hard_exit_reference_price",  _hard_ref_price)
-                    self._write_field_unconditional(pos, "hardexitreferenceprice",     _hard_ref_price)
-                    self._write_field_unconditional(pos, "hard_exit_reference_source", _hard_ref_source)
-                    self._write_field_unconditional(pos, "hardexitreferencesource",    _hard_ref_source)
-                    self._write_field_unconditional(pos, "hard_exit_reference_ts",     now_utc)
-                    self._write_field_unconditional(pos, "hardexitreferencets",        now_utc)
+                _href = _select_hard_exit_reference(
+                    bid=bid, ask=ask, mark=_mark_for_ref, last=_last_for_ref,
+                    bid_ts=_bid_ts, last_ts=_last_trade_ts,
+                    mark_ts=_mark_ts, ask_ts=_ask_ts,
+                    now_utc=now_utc,
+                    entry_price=cost_basis,
+                    hard_stop_pct=-0.33,   # global hard-stop for catastrophic-ASK test
+                    last_stale_sec=float(os.getenv("LAST_TRADE_STALE_SEC", "30.0")),
+                )
+                _hard_ref_price  = _href.price
+                _hard_ref_source = _href.source
+                _hard_ref_validity = _href.validity
+                _hard_ref_pnl = None
+
+                # Prior proven-ref preservation: if we already have a proven ref on
+                # the position and this new ref is unproven, DO NOT overwrite —
+                # instead record a "refresh_needed" signal so downstream can act.
+                _prior_validity = str(
+                    _get_attr(pos, "hard_exit_reference_validity",
+                              "hardexitreferencevalidity", default="") or ""
+                )
+                _prior_price = _safe_float(
+                    _get_attr(pos, "hard_exit_reference_price",
+                              "hardexitreferenceprice", default=None), 0.0
+                )
+                _overwrite_allowed = True
+                if _hard_ref_validity == "unproven" and _prior_validity == "proven" and _prior_price > 0:
+                    _overwrite_allowed = False
+                    self._write_field_unconditional(pos, "hard_exit_reference_refresh_needed", True)
+                    self._write_field_unconditional(pos, "hardexitreferencerefreshneeded",     True)
+
+                if _overwrite_allowed and _hard_ref_price > 0:
+                    self._write_field_unconditional(pos, "hard_exit_reference_price",    _hard_ref_price)
+                    self._write_field_unconditional(pos, "hardexitreferenceprice",       _hard_ref_price)
+                    self._write_field_unconditional(pos, "hard_exit_reference_source",   _hard_ref_source)
+                    self._write_field_unconditional(pos, "hardexitreferencesource",      _hard_ref_source)
+                    self._write_field_unconditional(pos, "hard_exit_reference_validity", _hard_ref_validity)
+                    self._write_field_unconditional(pos, "hardexitreferencevalidity",    _hard_ref_validity)
+                    self._write_field_unconditional(pos, "hard_exit_reference_ts",       now_utc)
+                    self._write_field_unconditional(pos, "hardexitreferencets",          now_utc)
                     if cost_basis > 0:
                         _hard_ref_pnl = (_hard_ref_price - cost_basis) / cost_basis
                         self._write_field_unconditional(pos, "hard_exit_reference_pnl_pct", _hard_ref_pnl)
                         self._write_field_unconditional(pos, "hardexitreferencepnlpct",     _hard_ref_pnl)
+                    # Clear the refresh flag when we do write a proven ref.
+                    if _hard_ref_validity == "proven":
+                        self._write_field_unconditional(pos, "hard_exit_reference_refresh_needed", False)
+                        self._write_field_unconditional(pos, "hardexitreferencerefreshneeded",     False)
 
                 # ── Blocker 1: Three-tier execution mode classification ────────
                 # Only exact "paper" may use midpoint/mark simulation.
