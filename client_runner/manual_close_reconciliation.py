@@ -238,6 +238,14 @@ def order_fill_price(order: dict) -> float:
     return 0.0
 
 
+def order_created_at(order: dict) -> datetime | None:
+    for key in ("create_date", "created_at", "submitted_at"):
+        parsed = parse_timestamp(order.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def order_filled_at(order: dict) -> datetime | None:
     for key in (
         "last_fill_date",
@@ -246,9 +254,6 @@ def order_filled_at(order: dict) -> datetime | None:
         "transaction_date",
         "update_date",
         "updated_at",
-        "create_date",
-        "created_at",
-        "submitted_at",
     ):
         parsed = parse_timestamp(order.get(key))
         if parsed is not None:
@@ -317,6 +322,7 @@ def select_external_close_fills(
             "filled_qty": filled_qty,
             "fill_price": fill_price,
             "filled_at": filled_at,
+            "created_at": order_created_at(order),
             "raw_status": order_status(order),
             "raw_side": order_side(order),
         }
@@ -485,6 +491,7 @@ def adopt_external_exit_fills(
         filled_qty = positive_int(fill.get("filled_qty"))
         fill_price = positive_float(fill.get("fill_price"))
         filled_at = parse_timestamp(fill.get("filled_at"))
+        created_at = parse_timestamp(fill.get("created_at"))
         if not broker_order_id or filled_qty <= 0 or fill_price <= 0 or filled_at is None:
             return False, "external_exit_adoption_fill_invalid"
 
@@ -496,6 +503,7 @@ def adopt_external_exit_fills(
                 "external_broker_order": True,
                 "broker_order_side": str(fill.get("raw_side") or "sell_to_close"),
                 "broker_order_status": str(fill.get("raw_status") or "filled"),
+                "broker_create_date_present": created_at is not None,
                 "adopted_without_submit": True,
                 "position_id": position_id,
                 "client_id": client_id,
@@ -579,9 +587,9 @@ def adopt_external_exit_fills(
                         filled_qty,
                         filled_qty,
                         fill_price,
-                        filled_at,
-                        filled_at,
-                        filled_at,
+                        created_at or filled_at,
+                        datetime.now(timezone.utc),
+                        created_at,
                         filled_at,
                         meta,
                         execution_mode,
