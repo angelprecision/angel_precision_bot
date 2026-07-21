@@ -410,13 +410,13 @@ class APPositionQuoteMonitor:
                 # A dedicated last_option_bid_update_ts advances ONLY when a real
                 # positive bid arrives, so bid freshness can never be inherited from
                 # a mark-only quote.
-                self._write_field(pos, "currentbid", bid if bid > 0 else 0.0)
-                self._write_field(pos, "current_bid", bid if bid > 0 else 0.0)
-                self._write_field(pos, "currentask", ask if ask > 0 else 0.0)
-                self._write_field(pos, "current_ask", ask if ask > 0 else 0.0)
+                self._write_field_unconditional(pos, "currentbid", bid if bid > 0 else 0.0)
+                self._write_field_unconditional(pos, "current_bid", bid if bid > 0 else 0.0)
+                self._write_field_unconditional(pos, "currentask", ask if ask > 0 else 0.0)
+                self._write_field_unconditional(pos, "current_ask", ask if ask > 0 else 0.0)
                 if bid > 0:
-                    self._write_field(pos, "lastoptionbidupdatets", now_utc)
-                    self._write_field(pos, "last_option_bid_update_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastoptionbidupdatets", now_utc)
+                    self._write_field_unconditional(pos, "last_option_bid_update_ts", now_utc)
 
                 if opt_price > 0:
                     self._write_field(pos, "currentoptionprice", opt_price)
@@ -465,6 +465,44 @@ class APPositionQuoteMonitor:
                 )
                 # cur_opt is the analytics mark (mid/mark) — retained for charting only.
                 cur_opt = _safe_float(_get_attr(pos, "currentoptionprice", "current_option_price", default=None), 0.0)
+
+                # ── P0 (PR #385 amendment #3, blocker 1): HARD-EXIT LOSS AUTHORITY ─────
+                # current_option_price is intentionally cleared on LIVE missing-bid so
+                # soft exits cannot fire off a mid/mark.  But that same clear makes
+                # option_pnl_pct return 0.0, silently disarming the HARD STOP on the
+                # real live money path.  Fix: a SEPARATE authority for catastrophic-loss
+                # detection that never zeroes when a valid market price of any kind is
+                # available.  Preference order: bid > mid > mark > ask > last.
+                # ONLY consumed by hard exits (HARD STOP, EOD FORCE CLOSE) — never by
+                # soft-exit branches — so it does not re-open the soft-exit midpoint hole.
+                _mark_for_ref = _safe_float(oq.get("mark"), 0.0)
+                _last_for_ref = _safe_float(oq.get("last"), 0.0)
+                _hard_mid = round((bid + ask) / 2.0, 4) if (bid > 0 and ask > 0) else 0.0
+                _hard_ref_price = 0.0
+                _hard_ref_source = ""
+                for _cand, _src in (
+                    (bid,           "bid"),
+                    (_hard_mid,     "mid"),
+                    (_mark_for_ref, "mark"),
+                    (ask,           "ask"),
+                    (_last_for_ref, "last"),
+                ):
+                    if _cand > 0:
+                        _hard_ref_price = _cand
+                        _hard_ref_source = _src
+                        break
+
+                if _hard_ref_price > 0:
+                    self._write_field_unconditional(pos, "hard_exit_reference_price",  _hard_ref_price)
+                    self._write_field_unconditional(pos, "hardexitreferenceprice",     _hard_ref_price)
+                    self._write_field_unconditional(pos, "hard_exit_reference_source", _hard_ref_source)
+                    self._write_field_unconditional(pos, "hardexitreferencesource",    _hard_ref_source)
+                    self._write_field_unconditional(pos, "hard_exit_reference_ts",     now_utc)
+                    self._write_field_unconditional(pos, "hardexitreferencets",        now_utc)
+                    if cost_basis > 0:
+                        _hard_ref_pnl = (_hard_ref_price - cost_basis) / cost_basis
+                        self._write_field_unconditional(pos, "hard_exit_reference_pnl_pct", _hard_ref_pnl)
+                        self._write_field_unconditional(pos, "hardexitreferencepnlpct",     _hard_ref_pnl)
 
                 # ── Blocker 1: Three-tier execution mode classification ────────
                 # Only exact "paper" may use midpoint/mark simulation.
@@ -586,20 +624,20 @@ class APPositionQuoteMonitor:
                 # Write explicit truth fields onto position.
                 # AMENDMENT #2: unavailable P&L is written as None, never 0.0 —
                 # a zero sentinel is indistinguishable from a real breakeven.
-                self._write_field(pos, "option_bid_valid",        _opt_bid_valid)
-                self._write_field(pos, "optionbidvalid",          _opt_bid_valid)
-                self._write_field(pos, "option_quote_fresh",      _opt_quote_fresh)
-                self._write_field(pos, "optionquotefresh",        _opt_quote_fresh)
-                self._write_field(pos, "option_quote_age_sec",    _opt_age_sec)
-                self._write_field(pos, "underlying_available",    _und_available)
-                self._write_field(pos, "underlyingavailable",     _und_available)
-                self._write_field(pos, "underlying_fresh",        _und_fresh)
-                self._write_field(pos, "underlyingfresh",         _und_fresh)
-                self._write_field(pos, "underlying_age_sec",      _und_age_sec)
-                self._write_field(pos, "display_mark",            _display_mark)
-                self._write_field(pos, "display_pnl_pct",         _display_pnl)
-                self._write_field(pos, "exit_executable_mark",    _exec_exit_mark if _opt_bid_valid else None)
-                self._write_field(pos, "exit_executable_pnl_pct", _exec_exit_pnl)
+                self._write_field_unconditional(pos, "option_bid_valid",        _opt_bid_valid)
+                self._write_field_unconditional(pos, "optionbidvalid",          _opt_bid_valid)
+                self._write_field_unconditional(pos, "option_quote_fresh",      _opt_quote_fresh)
+                self._write_field_unconditional(pos, "optionquotefresh",        _opt_quote_fresh)
+                self._write_field_unconditional(pos, "option_quote_age_sec",    _opt_age_sec)
+                self._write_field_unconditional(pos, "underlying_available",    _und_available)
+                self._write_field_unconditional(pos, "underlyingavailable",     _und_available)
+                self._write_field_unconditional(pos, "underlying_fresh",        _und_fresh)
+                self._write_field_unconditional(pos, "underlyingfresh",         _und_fresh)
+                self._write_field_unconditional(pos, "underlying_age_sec",      _und_age_sec)
+                self._write_field_unconditional(pos, "display_mark",            _display_mark)
+                self._write_field_unconditional(pos, "display_pnl_pct",         _display_pnl)
+                self._write_field_unconditional(pos, "exit_executable_mark",    _exec_exit_mark if _opt_bid_valid else None)
+                self._write_field_unconditional(pos, "exit_executable_pnl_pct", _exec_exit_pnl)
 
                 # ── P0 (PR #385 amendment): Position-scoped confirmation key ─────────
                 # Durable identity: client_id|execution_mode|position_id.
@@ -770,6 +808,22 @@ class APPositionQuoteMonitor:
             setattr(pos, name, value)
         except Exception as exc:
             log.debug("[%s] write %s failed: %s", self.client_id, name, exc)
+
+    # ── P0 (PR #385 amendment #3, blocker 3): UNCONDITIONAL money-safety writer ─
+    # DIRECT_POSITION_WRITES=0 turns _write_field() into a no-op, which was the
+    # intended migration path away from direct mutation.  But it silently erases
+    # every money-safety truth field the exit engine now depends on
+    # (option_bid_valid, underlying_available, hard_exit_reference_*, dedicated
+    # bid timestamp).  Under that toggle, the stale-retained-bid bug this PR
+    # exists to close came back.  These specific writes are money-critical and
+    # cannot be gated by a migration toggle — the apply_quote_snapshots() path
+    # does not carry them (would require a schema expansion elsewhere), and a
+    # missing money-safety field fails OPEN, not closed.
+    def _write_field_unconditional(self, pos, name: str, value) -> None:
+        try:
+            setattr(pos, name, value)
+        except Exception as exc:
+            log.debug("[%s] unconditional write %s failed: %s", self.client_id, name, exc)
 
     # ── P0 FIX-2: persist live quote/PnL fields to positions table ───────────
     # The exit engine reads ManagedPosition (in memory) and remains the source
