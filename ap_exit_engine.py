@@ -59,6 +59,7 @@ import os
 import time
 import threading
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
@@ -5535,6 +5536,7 @@ class APExitEngine:
                             mp.hard_exit_reference_source   = str(_persisted_href.get("source", ""))
                             mp.hardexitreferencesource      = mp.hard_exit_reference_source
                             _persisted_validity = str(_persisted_href.get("validity", "") or "")
+                            _persisted_refresh_needed = bool(_persisted_href.get("refresh_needed", True))
                             _persisted_ts = _persisted_href.get("ts")
                             # AMENDMENT #6 blocker 3: age-check the persisted ts.
                             # "Merely having a timestamp" was not a real age check.
@@ -5554,8 +5556,8 @@ class APExitEngine:
                             if _persisted_trusted:
                                 mp.hard_exit_reference_validity = _persisted_validity
                                 mp.hardexitreferencevalidity    = _persisted_validity
-                                mp.hard_exit_reference_refresh_needed = False
-                                mp.hardexitreferencerefreshneeded    = False
+                                mp.hard_exit_reference_refresh_needed = _persisted_refresh_needed
+                                mp.hardexitreferencerefreshneeded    = _persisted_refresh_needed
                             else:
                                 mp.hard_exit_reference_validity = "unproven"
                                 mp.hardexitreferencevalidity    = "unproven"
@@ -5565,8 +5567,23 @@ class APExitEngine:
                             mp.hardexitreferencets    = _ts_parsed
                             if mp.entry_price > 0:
                                 _hr_pnl_r = (mp.hard_exit_reference_price - mp.entry_price) / mp.entry_price
-                                mp.hard_exit_reference_pnl_pct = _hr_pnl_r
-                                mp.hardexitreferencepnlpct     = _hr_pnl_r
+                                _persisted_pnl_raw = _persisted_href.get("pnl_pct", None)
+                                _persisted_pnl = None
+                                try:
+                                    _persisted_pnl_candidate = float(_persisted_pnl_raw)
+                                    if math.isfinite(_persisted_pnl_candidate):
+                                        _persisted_pnl = _persisted_pnl_candidate
+                                except Exception:
+                                    _persisted_pnl = None
+                                if _persisted_pnl is not None and abs(_persisted_pnl - _hr_pnl_r) > 1e-6:
+                                    log.warning(
+                                        "[exit_eng] SEED_HARD_REF_PNL_MISMATCH client=%s position_id=%s "
+                                        "persisted=%.6f recomputed=%.6f",
+                                        mp.client_id, mp.position_id, _persisted_pnl, _hr_pnl_r,
+                                    )
+                                _hr_pnl_final = _persisted_pnl if _persisted_pnl is not None else _hr_pnl_r
+                                mp.hard_exit_reference_pnl_pct = _hr_pnl_final
+                                mp.hardexitreferencepnlpct     = _hr_pnl_final
                             log.info(
                                 "[exit_eng] SEED_HARD_REF_RESTORED client=%s position_id=%s "
                                 "price=%.4f source=%s validity=%s",

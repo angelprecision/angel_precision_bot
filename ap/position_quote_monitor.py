@@ -935,6 +935,21 @@ class APPositionQuoteMonitor:
                         source         = ("bid" if _pricing_mode != "paper" else price_source),
                     )
                 elif cost_basis > 0 and (exec_price <= 0 or not _exec_quote_valid):
+                    self._persist_quote_to_db(
+                        position_id=pid,
+                        option_price=0.0,
+                        underlying_price=und_last,
+                        option_pnl_pct=None,
+                        now_utc=now_utc,
+                        hard_ref={
+                            "price": _final_href_price if _final_href_price > 0 else None,
+                            "pnl_pct": _final_href_pnl,
+                            "source": _final_href_source,
+                            "validity": _final_href_validity,
+                            "ts": _final_href_ts.isoformat() if _final_href_ts else None,
+                            "refresh_needed": _final_href_refresh,
+                        },
+                    )
                     self._mark_mfe_mae_unavailable(
                         position_id = pid,
                         contract = c,
@@ -1089,7 +1104,7 @@ class APPositionQuoteMonitor:
         position_id: str,
         option_price: float,
         underlying_price: float,
-        option_pnl_pct: float,
+        option_pnl_pct: Optional[float],
         now_utc=None,
         hard_ref: Optional[dict] = None,
     ) -> bool:
@@ -1122,9 +1137,9 @@ class APPositionQuoteMonitor:
                     c.execute(
                         """
                         UPDATE positions
-                        SET current_option_price = %s,
+                        SET current_option_price = COALESCE(%s, current_option_price),
                             current_underlying   = COALESCE(NULLIF(%s, 0), current_underlying),
-                            option_pnl_pct       = %s,
+                            option_pnl_pct       = COALESCE(%s, option_pnl_pct),
                             meta                 = CASE
                                 WHEN %s::jsonb IS NULL THEN meta
                                 ELSE jsonb_set(COALESCE(meta, '{}'::jsonb), '{hard_exit_reference}', %s::jsonb, true)
@@ -1132,12 +1147,12 @@ class APPositionQuoteMonitor:
                             updated_at           = NOW()
                         WHERE id        = %s
                           AND client_id = %s
-                          AND status   IN ('OPEN', 'CLOSING')
+                          AND UPPER(status) IN ('OPEN', 'CLOSING')
                         """,
                         (
                             float(option_price) if option_price > 0 else None,
                             float(underlying_price) if underlying_price > 0 else 0.0,
-                            float(option_pnl_pct),
+                            float(option_pnl_pct) if option_pnl_pct is not None else None,
                             json.dumps(hard_ref_payload, default=str) if hard_ref_payload is not None else None,
                             json.dumps(hard_ref_payload, default=str) if hard_ref_payload is not None else None,
                             position_id,
@@ -1152,7 +1167,7 @@ class APPositionQuoteMonitor:
                 self._last_db_persist_price[position_id] = float(option_price)
             if hard_ref_fingerprint:
                 self._last_db_persist_hard_ref[position_id] = hard_ref_fingerprint
-            return rowcount > 0
+            return rowcount == 1
         except Exception as exc:
             log.debug(
                 "[%s] _persist_quote_to_db non-fatal failure for pos=%s: %s",

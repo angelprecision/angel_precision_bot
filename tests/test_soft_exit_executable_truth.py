@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
@@ -840,6 +841,26 @@ def _make_qpm(positions, quotes):
         client_id="test@client.com",
         exit_engine=_FakeExitEngine(positions),
     )
+
+
+class _CaptureConn:
+    def __init__(self):
+        self.calls = []
+        self.rowcount = 1
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        return False
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params or ()))
+
+
+def _patch_qpm_db(monkeypatch):
+    import ap.db as db_mod
+    capture = _CaptureConn()
+    monkeypatch.setattr(db_mod, "conn", lambda: capture)
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn, *a, **k: fn())
+    return capture
 
 
 _QUOTE_MID_INFLATED = {
@@ -2656,6 +2677,324 @@ class TestAmendment6ApplyQuoteSnapshotsDistinctObjects:
         assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) is None
 
 
+class TestAmendment7HardRefPersistenceRoundTrip:
+    def _hard_ref_payload_from_db_call(self, capture):
+        assert capture.calls, "expected positions update"
+        sql, params = capture.calls[-1]
+        assert "jsonb_set" in sql
+        assert "hard_exit_reference" in sql
+        return json.loads(params[4])
+
+    def test_qpm_trusted_reference_persists_positions_meta_json(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        now = datetime.now(_UTC)
+        pos = _qpm_pos("pos-PERSIST", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {
+                "bid": 0, "ask": 0, "mark": 0, "last": 0.55,
+                "last_trade_ts": now,
+            },
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        payload = self._hard_ref_payload_from_db_call(capture)
+        assert payload == {
+            "price": pytest.approx(0.55),
+            "pnl_pct": pytest.approx(-0.45),
+            "source": "last",
+            "validity": "proven",
+            "ts": now.isoformat(),
+            "refresh_needed": False,
+        }
+
+    def test_qpm_missing_bid_fresh_mark_persists_positions_meta_json(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        now = datetime.now(_UTC)
+        pos = _qpm_pos("pos-MARK-PERSIST", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {
+                "bid": 0, "ask": 0, "mark": 0.55, "last": 0,
+                "mark_ts": now,
+            },
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        payload = self._hard_ref_payload_from_db_call(capture)
+        assert payload["price"] == pytest.approx(0.55)
+        assert payload["pnl_pct"] == pytest.approx(-0.45)
+        assert payload["source"] == "mark"
+        assert payload["validity"] == "proven"
+        assert payload["ts"] == now.isoformat()
+        assert payload["refresh_needed"] is False
+
+    def test_qpm_missing_bid_catastrophic_ask_persists_catastrophic_validity(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        pos = _qpm_pos("pos-ASK-CAT-PERSIST", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0, "ask": 0.55, "mark": 0, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        payload = self._hard_ref_payload_from_db_call(capture)
+        assert payload["price"] == pytest.approx(0.55)
+        assert payload["pnl_pct"] == pytest.approx(-0.45)
+        assert payload["source"] == "ask_catastrophic"
+        assert payload["validity"] == "catastrophic_ask"
+        assert payload["refresh_needed"] is True
+
+    def test_healthy_ask_preservation_survives_snapshot_and_persistence(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        original_ts = datetime.now(_UTC) - timedelta(seconds=10)
+        pos = _qpm_pos("pos-ASK-PERSIST", execution_mode="live")
+        pos.hard_exit_reference_price = 0.55
+        pos.hardexitreferenceprice = 0.55
+        pos.hard_exit_reference_pnl_pct = -0.45
+        pos.hardexitreferencepnlpct = -0.45
+        pos.hard_exit_reference_source = "last"
+        pos.hardexitreferencesource = "last"
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = original_ts
+        pos.hardexitreferencets = original_ts
+
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0, "ask": 1.20, "mark": 0, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        payload = self._hard_ref_payload_from_db_call(capture)
+        assert payload["price"] == pytest.approx(0.55)
+        assert payload["pnl_pct"] == pytest.approx(-0.45)
+        assert payload["validity"] == "proven"
+        assert payload["ts"] == original_ts.isoformat()
+        assert payload["refresh_needed"] is True
+
+    def test_no_data_preservation_sets_refresh_needed_in_persistence(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        original_ts = datetime.now(_UTC) - timedelta(seconds=10)
+        pos = _qpm_pos("pos-NODATA-PERSIST", execution_mode="live")
+        pos.hard_exit_reference_price = 0.55
+        pos.hardexitreferenceprice = 0.55
+        pos.hard_exit_reference_pnl_pct = -0.45
+        pos.hardexitreferencepnlpct = -0.45
+        pos.hard_exit_reference_source = "last"
+        pos.hardexitreferencesource = "last"
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = original_ts
+        pos.hardexitreferencets = original_ts
+
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0, "ask": 0, "mark": 0, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+
+        payload = self._hard_ref_payload_from_db_call(capture)
+        assert payload["price"] == pytest.approx(0.55)
+        assert payload["ts"] == original_ts.isoformat()
+        assert payload["refresh_needed"] is True
+        sql, params = capture.calls[-1]
+        assert "current_option_price = COALESCE(%s, current_option_price)" in sql
+        assert "option_pnl_pct       = COALESCE(%s, option_pnl_pct)" in sql
+        assert params[0] is None
+        assert params[2] is None
+
+    def test_metadata_only_hard_ref_change_bypasses_price_time_throttle(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+        qpm._last_db_persist_ts["pos-THROTTLE"] = time.time()
+        qpm._last_db_persist_price["pos-THROTTLE"] = 1.00
+        qpm._last_db_persist_hard_ref["pos-THROTTLE"] = json.dumps({
+            "price": 0.55, "pnl_pct": -0.45, "source": "last",
+            "validity": "proven", "ts": "2026-07-21T15:00:00+00:00",
+            "refresh_needed": False,
+        }, sort_keys=True)
+
+        changed = qpm._persist_quote_to_db(
+            position_id="pos-THROTTLE",
+            option_price=1.00,
+            underlying_price=149.0,
+            option_pnl_pct=0.0,
+            now_utc=datetime.now(_UTC),
+            hard_ref={
+                "price": 0.55, "pnl_pct": -0.45, "source": "last",
+                "validity": "proven", "ts": "2026-07-21T15:00:00+00:00",
+                "refresh_needed": True,
+            },
+        )
+
+        assert changed is True
+        assert len(capture.calls) == 1
+
+    def test_positions_meta_update_is_jsonb_merge_not_overwrite(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+
+        qpm._persist_quote_to_db(
+            position_id="pos-MERGE",
+            option_price=0.0,
+            underlying_price=149.0,
+            option_pnl_pct=None,
+            now_utc=datetime.now(_UTC),
+            hard_ref={
+                "price": 0.55, "pnl_pct": -0.45, "source": "last",
+                "validity": "proven", "ts": datetime.now(_UTC).isoformat(),
+                "refresh_needed": False,
+            },
+        )
+
+        sql, _ = capture.calls[-1]
+        assert "jsonb_set(COALESCE(meta, '{}'::jsonb), '{hard_exit_reference}'" in sql
+        assert "SET meta = %s" not in sql
+
+    def test_zero_row_update_reports_failure(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        capture.rowcount = 0
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+
+        changed = qpm._persist_quote_to_db(
+            position_id="pos-MISS",
+            option_price=0.0,
+            underlying_price=149.0,
+            option_pnl_pct=None,
+            now_utc=datetime.now(_UTC),
+            hard_ref={
+                "price": 0.55, "pnl_pct": -0.45, "source": "last",
+                "validity": "proven", "ts": datetime.now(_UTC).isoformat(),
+                "refresh_needed": False,
+            },
+        )
+
+        assert changed is False
+
+
+class TestAmendment7SeedResolverAndDecisionUse:
+    def _seeded_pos(self, ts, validity="proven", refresh_needed=False):
+        eng = TestAmendment6RestartHydration()._make_engine()
+
+        class _PM:
+            def get_active_positions(self_inner):
+                return [{
+                    "id": "pos-seed", "client_id": "test@x",
+                    "underlying": "ABT", "contract": "ABT260731C00150000",
+                    "direction": "CALL", "qty": 2, "quantity_remaining": 2,
+                    "avg_fill": 1.00, "underlying_entry": 150.0,
+                    "target_underlying": 155.0, "stop_underlying": 145.0,
+                    "execution_mode": "live",
+                    "meta": {
+                        "keep_me": "survives",
+                        "hard_exit_reference": {
+                            "price": 0.55, "pnl_pct": -0.45,
+                            "source": "last", "validity": validity,
+                            "ts": ts, "refresh_needed": refresh_needed,
+                        },
+                    },
+                }]
+
+        eng.seed_from_db(_PM())
+        return eng._positions[0]
+
+    def test_seed_from_db_restores_iso_timestamp_as_aware_datetime_and_resolver_accepts(self):
+        import ap_exit_engine as ee_mod
+        ts = datetime.now(_UTC).isoformat()
+        pos = self._seeded_pos(ts)
+        assert pos.hard_exit_reference_ts.tzinfo is not None
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) == pytest.approx(-0.45)
+
+    def test_seed_from_db_preserves_persisted_refresh_needed_for_trusted_ref(self):
+        import ap_exit_engine as ee_mod
+        pos = self._seeded_pos(datetime.now(_UTC).isoformat(), refresh_needed=True)
+        assert pos.hard_exit_reference_validity == "proven"
+        assert pos.hard_exit_reference_refresh_needed is True
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) == pytest.approx(-0.45)
+
+    def test_seed_from_db_rejects_expired_persisted_timestamp(self):
+        import ap_exit_engine as ee_mod
+        ts = (datetime.now(_UTC) - timedelta(seconds=ee_mod.HARD_REF_MAX_AGE_SEC + 60)).isoformat()
+        pos = self._seeded_pos(ts)
+        assert pos.hard_exit_reference_validity == "unproven"
+        assert pos.hard_exit_reference_refresh_needed is True
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) is None
+
+    def test_seed_from_db_rejects_future_skew_timestamp(self):
+        import ap_exit_engine as ee_mod
+        ts = (datetime.now(_UTC) + timedelta(seconds=120)).isoformat()
+        pos = self._seeded_pos(ts)
+        assert pos.hard_exit_reference_validity == "unproven"
+        assert pos.hard_exit_reference_refresh_needed is True
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) is None
+
+    def test_seed_from_db_rejects_malformed_timestamp(self):
+        import ap_exit_engine as ee_mod
+        pos = self._seeded_pos("not-a-date")
+        assert pos.hard_exit_reference_validity == "unproven"
+        assert pos.hard_exit_reference_refresh_needed is True
+        assert ee_mod.get_effective_hard_exit_reference(pos, datetime.now(_UTC)) is None
+
+    def test_target_and_stop_use_shared_resolver_not_direct_hard_ref_read(self):
+        target_pos = _make_pos(
+            side="CALL", current_underlying=156.0, underlying_target=155.0,
+            underlying_stop=140.0, current_bid=1.20, current_option_price=1.20,
+            option_bid_valid=True, option_quote_fresh=True,
+        )
+        target_pos.last_option_bid_update_ts = _fresh_ts()
+        target_pos.hard_exit_reference_pnl_pct = -0.45
+        target_pos.hard_exit_reference_validity = "proven"
+        target_pos.hard_exit_reference_ts = "malformed"
+        target_decision = evaluate_exit(target_pos, _et_noon().replace(hour=10))
+        assert target_decision.action == "CLOSE_ALL"
+        assert target_decision.pnl_pct == pytest.approx(0.20)
+
+        stop_pos = _make_pos(
+            side="CALL", current_underlying=144.0, underlying_target=155.0,
+            underlying_stop=145.0, current_bid=0.90, current_option_price=0.90,
+            option_bid_valid=True, option_quote_fresh=True,
+        )
+        stop_pos.last_option_bid_update_ts = _fresh_ts()
+        stop_pos._underlying_stop_breach_ts = datetime.now(_UTC) - timedelta(seconds=45)
+        stop_pos.hard_exit_reference_pnl_pct = -0.45
+        stop_pos.hard_exit_reference_validity = "proven"
+        stop_pos.hard_exit_reference_ts = "malformed"
+        stop_decision = evaluate_exit(stop_pos, _et_noon().replace(hour=10))
+        assert stop_decision.action == "STOP"
+        assert stop_decision.pnl_pct == pytest.approx(-0.10)
+
+    def test_evaluate_exit_has_no_direct_target_stop_hard_ref_reads(self):
+        import inspect
+        import ap_exit_engine as ee_mod
+        source = inspect.getsource(ee_mod.evaluate_exit)
+        assert 'getattr(pos, "hard_exit_reference_pnl_pct"' not in source
+        assert "hardexitreferencepnlpct" not in source
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PR #385 AMENDMENT #6 FINAL TESTS — blockers 1-5 + overwrite
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2803,6 +3142,29 @@ class TestAmendment6AskCatastrophicPerDTE:
 
 class TestAmendment6OverwriteProtection:
     """Overwrite bug: prior catastrophic_ask must be protected same as proven."""
+
+    def test_real_catastrophic_ask_then_healthy_ask_preserves_prior_authority(self):
+        pos = _qpm_pos("pos-REAL-CAT", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0, "ask": 0.55, "mark": 0, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._persist_quote_to_db = lambda **kwargs: False
+        qpm._mark_mfe_mae_unavailable = lambda **kwargs: False
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_validity == "catastrophic_ask"
+        original_ts = pos.hard_exit_reference_ts
+        original_pnl = pos.hard_exit_reference_pnl_pct
+
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {"bid": 0, "ask": 1.20, "mark": 0, "last": 0}
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_validity == "catastrophic_ask"
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(original_pnl)
+        assert pos.hard_exit_reference_ts == original_ts
+        assert pos.hard_exit_reference_refresh_needed is True
 
     def test_healthy_ask_does_not_overwrite_prior_catastrophic_ask(self):
         """Cycle 1: catastrophic_ask (-45%).  Cycle 2: healthy-only ASK (+20%).
