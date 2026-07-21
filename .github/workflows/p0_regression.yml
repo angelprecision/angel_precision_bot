@@ -66,11 +66,26 @@ jobs:
             | grep -qx 2
           dropdb -h localhost -U postgres position_mode_migration_test
 
-      - name: Run P0 plus cohesion tests
+      - name: Run focused soft-exit truth tests
+        id: focused
+        continue-on-error: true
+        env:
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
+        run: |
+          set -o pipefail
+          python -m pytest \
+            tests/test_p0_soft_exit_quote_truth.py \
+            tests/test_p0_underlying_level_truth_guard.py \
+            -v --tb=short --color=yes 2>&1 | tee focused-soft-exit-tests.log
+
+      - name: Run authoritative P0 plus cohesion tests
+        id: authoritative
+        continue-on-error: true
         env:
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
         run: |
+          set -o pipefail
           python -m pytest \
             tests/test_osm_retry_idempotency.py \
             tests/test_force_close_breaker.py \
@@ -113,8 +128,6 @@ jobs:
             tests/test_p0_exit_closed_guard_and_circuit_breaker.py \
             tests/test_p0_unknown_execution_mode_fail_closed.py \
             tests/test_p0_live_executable_bid_pnl.py \
-            tests/test_p0_soft_exit_quote_truth.py \
-            tests/test_p0_underlying_level_truth_guard.py \
             tests/test_p0_canonical_exit_fill_truth.py \
             tests/test_p0_partial_exit_ownership_guard.py \
             tests/test_p0_exit_position_ambiguity_guard.py \
@@ -131,12 +144,42 @@ jobs:
             tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
-            -v --tb=short --color=yes
+            -v --tb=short --color=yes 2>&1 | tee authoritative-p0-tests.log
 
       - name: Run PEP LULU ABT exit replays
+        id: replays
+        continue-on-error: true
         env:
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
-        run: python -m ap.soft_exit_replay
+        run: |
+          set -o pipefail
+          python -m ap.soft_exit_replay 2>&1 | tee soft-exit-replays.log
+
+      - name: Upload P0 diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p0-soft-exit-verification
+          path: |
+            focused-soft-exit-tests.log
+            authoritative-p0-tests.log
+            soft-exit-replays.log
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce all verification results
+        if: always()
+        env:
+          FOCUSED_OUTCOME: ${{ steps.focused.outcome }}
+          AUTHORITATIVE_OUTCOME: ${{ steps.authoritative.outcome }}
+          REPLAY_OUTCOME: ${{ steps.replays.outcome }}
+        run: |
+          echo "focused=${FOCUSED_OUTCOME}"
+          echo "authoritative=${AUTHORITATIVE_OUTCOME}"
+          echo "replays=${REPLAY_OUTCOME}"
+          test "${FOCUSED_OUTCOME}" = "success"
+          test "${AUTHORITATIVE_OUTCOME}" = "success"
+          test "${REPLAY_OUTCOME}" = "success"
 
       - name: Summary
         if: always()
