@@ -349,25 +349,36 @@ def _build_exit_decision_snapshot(
     exit_executable_mark: Optional[float] = bid if opt_bid_valid else None
 
     # ── Option quote freshness ────────────────────────────────────────────────
-    # Prefer the explicit QPM field (computed from the dedicated BID timestamp);
-    # fall back to the dedicated bid ts, then the general option ts.
+    # AMENDMENT #3 (blocker 2): freshness is ALWAYS recomputed from the bid
+    # timestamp at evaluation time.  QPM's stored explicit boolean can VETO
+    # freshness (writing False forces False regardless of timestamp) but can
+    # never PROVE it forever — if QPM stalls or its thread dies, a five-minute-
+    # old True must not survive.  Cached option_quote_age_sec is also not
+    # trusted; the age is (now - stored_bid_ts) at THIS moment.
     opt_quote_fresh_direct = _attr(pos, "option_quote_fresh", "optionquotefresh")
-    opt_age_direct = _attr(pos, "option_quote_age_sec")
     opt_ts = _attr(pos, "last_option_bid_update_ts", "lastoptionbidupdatets",
                    "last_option_quote_update_ts", "lastoptionquoteupdatets")
     _exit_stale_sec = float(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", str(STALE_OPTION_QUOTE_MAX_AGE_SEC)))
 
-    if opt_quote_fresh_direct is not None:
-        opt_quote_fresh: bool = bool(opt_quote_fresh_direct)
-        opt_age_sec: Optional[float] = float(opt_age_direct) if opt_age_direct is not None else None
-    elif opt_ts is not None:
+    opt_age_sec: Optional[float] = None
+    if opt_ts is not None:
         try:
             opt_age_sec = max(0.0, (now_utc - opt_ts).total_seconds())
-            opt_quote_fresh = opt_age_sec <= _exit_stale_sec
         except Exception:
-            opt_age_sec, opt_quote_fresh = None, False
+            opt_age_sec = None
+
+    # Timestamp-derived freshness (always current):
+    if opt_age_sec is None:
+        _ts_fresh = False
     else:
-        opt_age_sec, opt_quote_fresh = None, False
+        _ts_fresh = opt_age_sec <= _exit_stale_sec
+
+    # Effective freshness: bid must be valid AND timestamp fresh AND explicit
+    # boolean must not veto.  A missing explicit boolean means "no veto".
+    if opt_quote_fresh_direct is False:
+        opt_quote_fresh: bool = False
+    else:
+        opt_quote_fresh = opt_bid_valid and _ts_fresh
 
     # ── Underlying truth ──────────────────────────────────────────────────────
     # AMENDMENT #2 (blocker 2): explicit underlying_available is AUTHORITATIVE.
@@ -384,21 +395,22 @@ def _build_exit_decision_snapshot(
         und_available = und_price is not None and und_price > 0.0
 
     und_fresh_direct = _attr(pos, "underlying_fresh", "underlyingfresh")
-    und_age_direct = _attr(pos, "underlying_age_sec")
     und_ts = _attr(pos, "last_underlying_quote_update_ts", "lastunderlyingquoteupdatets")
     _und_stale_sec = float(os.getenv("UNDERLYING_QUOTE_STALE_SEC", str(_exit_stale_sec * 2)))
 
-    if und_fresh_direct is not None:
-        und_fresh: bool = bool(und_fresh_direct)
-        und_age_sec: Optional[float] = float(und_age_direct) if und_age_direct is not None else None
-    elif und_ts is not None:
+    und_age_sec: Optional[float] = None
+    if und_ts is not None:
         try:
             und_age_sec = max(0.0, (now_utc - und_ts).total_seconds())
-            und_fresh = und_age_sec <= _und_stale_sec
         except Exception:
-            und_age_sec, und_fresh = None, False
+            und_age_sec = None
+    _und_ts_fresh = (und_age_sec is not None and und_age_sec <= _und_stale_sec)
+
+    # AMENDMENT #3 (blocker 2): explicit False vetoes; True cannot survive without ts proof.
+    if und_fresh_direct is False:
+        und_fresh: bool = False
     else:
-        und_age_sec, und_fresh = None, False
+        und_fresh = und_available and _und_ts_fresh
 
     # ── P&L ──────────────────────────────────────────────────────────────────
     entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
@@ -1092,23 +1104,38 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             pos._underlying_stop_breach_ts = None
             log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
 
-    # ══ P0 (PR #385 amendment #2, blocker 3): HARD-EXIT PRE-EVALUATION ════════
-    # Hard exits are evaluated BEFORE every soft branch, matching the declared
-    # EXIT_RULE_PRECEDENCE (STOP_HIT, HARD_STOP, EOD_FORCE_CLOSE first).
-    # Previously the touched-profit / runner / small-win / soft-loss branches ran
-    # first and could return a SOFT_EXIT_DEFERRED_* HOLD when bid/underlying was
-    # missing — trapping a touched_profit=True position at -45% with no exit path,
-    # and letting a 3:55pm deferral return before EOD was ever reached.
-    # These fire on option_pnl (mode-specific last-known truth) regardless of
-    # bid or underlying availability.  The original later blocks remain as
-    # redundant safety.
+    # ══ P0 (PR #385 amendment #3, blocker 1): HARD-EXIT PRE-EVALUATION ════════
+    # Hard exits fire BEFORE every soft branch AND every soft truth gate.
+    # AMENDMENT #3: they consume a DEDICATED loss authority
+    # (hard_exit_reference_pnl_pct / price) written by QPM from the last-known
+    # best-available option price (bid → mid → mark → ask → last).  This is
+    # separate from the soft-exit executable authority: when LIVE loses its bid,
+    # QPM correctly zeroes current_option_price so soft exits cannot fire from
+    # a mid/mark — but option_pnl_pct then returns 0.0, silently disarming any
+    # hard-stop check that reads it.  The dedicated authority never zeroes when
+    # ANY market price is available, closing the catastrophic-loser trap.
+    #
+    # Fallback: when the dedicated reference is absent (pre-amendment positions),
+    # fall back to option_pnl_pct — behavior identical to prior amendment.
+    _hard_ref_pnl = getattr(pos, "hard_exit_reference_pnl_pct",
+                    getattr(pos, "hardexitreferencepnlpct", None))
+    if _hard_ref_pnl is not None:
+        try:
+            _hard_loss_pnl = float(_hard_ref_pnl)
+        except Exception:
+            _hard_loss_pnl = option_pnl
+    else:
+        _hard_loss_pnl = option_pnl
 
-    # HARD STOP (pre-evaluated)
-    if option_pnl <= _hard_stop:
+    # HARD STOP (pre-evaluated, using dedicated loss authority)
+    if _hard_loss_pnl <= _hard_stop:
         return ExitDecision(
             action="STOP", quantity=qty_rem,
-            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
+            reason=(
+                f"HARD STOP -- {_hard_loss_pnl*100:.0f}% (hard-exit ref) exceeded "
+                f"-{abs(_hard_stop)*100:.0f}% max loss"
+            ),
+            urgency="IMMEDIATE", pnl_pct=_hard_loss_pnl,
         )
 
     # EOD FORCE CLOSE (pre-evaluated)
@@ -1119,7 +1146,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET {'(market closed)' if _pre_market_closed else f'past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}'}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
+            urgency="IMMEDIATE", pnl_pct=_hard_loss_pnl,
         )
     # ══════════════════════════════════════════════════════════════════════════
 
