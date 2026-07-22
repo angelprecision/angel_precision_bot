@@ -553,6 +553,8 @@ class TestAdoptionContaminationCleanse:
             lastoptionbidupdatets     = fresh_bid_ts,
             option_bid_valid = True,
             optionbidvalid   = True,
+            option_quote_fresh = True,
+            optionquotefresh   = True,
         )
         engine._positions.append(pos)
         engine._positions_by_id[repair_id] = pos
@@ -605,6 +607,10 @@ class TestAdoptionContaminationCleanse:
         # Set current_bid = 0 (no fresh bid)
         engine._positions[0].current_bid = 0.0
         engine._positions[0].currentbid  = 0.0
+        engine._positions[0].last_option_bid_update_ts = None
+        engine._positions[0].lastoptionbidupdatets = None
+        engine._positions[0].option_bid_valid = False
+        engine._positions[0].optionbidvalid = False
         engine.adopt_canonical_position_identity(
             contract=_CONTRACT, canonical_position_id="x",
             local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
