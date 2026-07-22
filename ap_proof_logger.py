@@ -475,6 +475,9 @@ class APProofLogger:
         exit_pricing_tier:   str  = "",
         exit_attempt:        int  = 0,
         seconds_to_fill:     float = 0.0,
+        # Exactly-once proof identity (PR exactly-once-proof)
+        proof_event_key:     str  = "",
+        proof_diagnostics:   Optional[dict] = None,
     ) -> dict:
         now = datetime.now(timezone.utc)
         # execution_mode is COPIED from the originating entry order (source of
@@ -540,6 +543,8 @@ class APProofLogger:
             "exit_pricing_tier":  exit_pricing_tier or None,
             "exit_attempt":       exit_attempt if exit_attempt else None,
             "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
+            # Exactly-once identity — only written when nonempty
+            "proof_event_key":    str(proof_event_key).strip() or None,
         }
 
         # Cache for convenience — not source of truth
@@ -587,7 +592,47 @@ class APProofLogger:
                 log.debug("[PROOF] %s written to Supabase (full row)", ticker)
             except Exception as e1:
                 emsg1 = str(e1).lower()
-                if not any(k in emsg1 for k in ("column", "schema", "field", "violat", "null", "type")):
+                # ── Unique violation on proof_event_key → idempotent success ─────
+                # uq_proof_trades_event_key conflict means this economic event already
+                # has a canonical proof row. Return it as idempotent success — never
+                # fall through to generic schema-drift handling.
+                _is_event_key_conflict = (
+                    proof_event_key
+                    and ("uq_proof_trades_event_key" in emsg1
+                         or ("unique" in emsg1 and "proof_event_key" in emsg1))
+                )
+                if _is_event_key_conflict:
+                    try:
+                        _existing = (
+                            self.sb.table("proof_trades")
+                            .select("id, proof_event_key")
+                            .eq("proof_event_key", str(proof_event_key).strip())
+                            .limit(1)
+                            .execute()
+                        )
+                        _existing_rows = (_existing.data or []) if _existing else []
+                        if _existing_rows:
+                            _persisted = True
+                            log.info(
+                                "[PROOF] TERMINAL_PROOF_EVENT_KEY_CONFLICT_ADOPTED %s "
+                                "event_key=%s existing_id=%s",
+                                ticker,
+                                proof_event_key,
+                                _existing_rows[0].get("id"),
+                            )
+                            result = dict(row)
+                            result["_proof_persisted"] = True
+                            result["_proof_existing"] = True
+                            result["_proof_persistence_error"] = None
+                            return result
+                    except Exception as _ek_exc:
+                        _persistence_error = f"event_key_conflict_lookup_failed: {_ek_exc}"
+                        log.error("[PROOF] event_key conflict lookup failed: %s", _ek_exc)
+                    # If lookup also fails, fall through to error
+                    if not _persisted:
+                        _persistence_error = str(e1)
+                        log.error("[PROOF] Supabase write failed (event_key conflict unresolvable): %s", e1)
+                elif not any(k in emsg1 for k in ("column", "schema", "field", "violat", "null", "type")):
                     _persistence_error = str(e1)
                     log.error("[PROOF] Supabase write failed (non-schema error): %s", e1)
                 else:

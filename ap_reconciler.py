@@ -253,6 +253,13 @@ def _empty_summary(client_id: str, run: int = 0) -> dict:
         "broker_positions_hidden_by_closed_status_count": 0,
         "reconciler_partial_close_preserved_count":     0,
         "reconciler_full_close_count":                  0,
+        # ── Exactly-once terminal proof counters ──────────────────────────────
+        "proof_existing_canonical":   0,
+        "proof_repair_bound":         0,
+        "proof_inserted":             0,
+        "proof_duplicate_merged":     0,
+        "proof_quarantined":          0,
+        "proof_write_failures":       0,
     }
 
 
@@ -3348,137 +3355,69 @@ class APBrokerReconciler:
             )
             return
 
-        # ── Auto-log to proof_trades so manual/reconciler closes appear in ledger ──
-        # Without this, any position closed outside the exit engine (manual broker
-        # close, overnight expiry, emergency flatten) is invisible in the trade ledger.
-        _proof_write_failed = False
+        # ── Route terminal proof through the canonical single authority ─────────
+        # APPositionManager.ensure_terminal_close_proof() is the ONLY proof writer.
+        # The reconciler must NOT have an independent APProofLogger.log_trade() call —
+        # that is what produced the duplicate proof_trades rows on 2026-07-20.
+        _reconciler_reason = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing"
         try:
-            from ap_proof_logger import APProofLogger as _APProofLogger
+            from ap.position_manager import APPositionManager as _APM
+            _proof_pm = _APM(self.client_id)
+            _proof_result = _proof_pm.ensure_terminal_close_proof(
+                position_id=str(pos_id or ""),
+                local_order_id=str(pos.get("local_order_id") or ""),
+                contract=contract,
+                underlying=self._norm_underlying(underlying or contract),
+                side=side or "CALL",
+                opened_at=str(pos.get("entry_ts") or pos.get("opened_at") or _now),
+                closed_at=str(_now),
+                entry_option_price=float(entry_px),
+                exit_option_price=float(exit_px),
+                contracts=int(close_qty or 1),
+                exit_reason=_reconciler_reason,
+                option_pnl_pct=float(pnl_pct),
+                setup_status="reconciler_auto_close",
+                execution_mode=str(self.execution_mode or ""),
+                exit_fill_price=float(exit_px),
+                reconciliation_reason=_reconciler_reason,
+                allow_fallback_insert=True,
+                missing_reason_code="RECONCILER_PROOF_WRITE_FAILED",
+            )
+            _proof_status = _proof_result.get("status", "FAILED")
+            _proof_persisted = _proof_result.get("persisted", False)
 
-            if not self.supabase_client:
-                # Missing client → operator-visible error, never silently discard.
-                log.error(
-                    "[%s] RECONCILER_PROOF_WRITE_BLOCKED contract=%s position_id=%s "
-                    "reason=missing_supabase_client",
-                    self.client_id, contract, pos_id,
+            # Update exactly-once proof counters
+            _proof_counter_map = {
+                "EXISTING_CANONICAL": "proof_existing_canonical",
+                "BOUND_REPAIR":       "proof_repair_bound",
+                "INSERTED_CANONICAL": "proof_inserted",
+                "MERGED_DUPLICATE":   "proof_duplicate_merged",
+                "QUARANTINED":        "proof_quarantined",
+            }
+            _counter_key = _proof_counter_map.get(_proof_status)
+            if _counter_key:
+                summary[_counter_key] = int(summary.get(_counter_key, 0)) + 1
+
+            if _proof_persisted or _proof_status in {"EXISTING_CANONICAL", "MERGED_DUPLICATE"}:
+                log.info(
+                    "[%s] RECONCILER_PROOF_LOGGED contract=%s position_id=%s pnl=%.1f%% status=%s",
+                    self.client_id, contract, pos_id, pnl_pct, _proof_status,
                 )
-                _proof_write_failed = True
             else:
-                _local_order_id = str(pos.get("local_order_id") or "")
-                _pos_id_str     = str(pos_id or "")
-
-                # ── Idempotency: three-state lookup ───────────────────────────
-                # IDEMPOTENCY_EXISTS  — existing row confirmed → skip, no failure
-                # IDEMPOTENCY_CLEAR   — no existing row       → proceed with insert
-                # IDEMPOTENCY_UNKNOWN — lookup failed          → block insert, log error
-                _IDEM_EXISTS  = "EXISTS"
-                _IDEM_CLEAR   = "CLEAR"
-                _IDEM_UNKNOWN = "UNKNOWN"
-                _idem_state   = _IDEM_UNKNOWN   # default: treat uncertainty as block
-                _idem_err_str = None
-
-                try:
-                    _existing = (
-                        self.supabase_client
-                        .table("proof_trades")
-                        .select("id")
-                        .eq("position_id", _pos_id_str)
-                        .limit(1)
-                        .execute()
-                    )
-                    _existing_rows = (_existing.data or []) if _existing else []
-                    if not _existing_rows and _local_order_id:
-                        _existing2 = (
-                            self.supabase_client
-                            .table("proof_trades")
-                            .select("id")
-                            .eq("local_order_id", _local_order_id)
-                            .limit(1)
-                            .execute()
-                        )
-                        _existing_rows = (_existing2.data or []) if _existing2 else []
-                    _idem_state = _IDEM_EXISTS if _existing_rows else _IDEM_CLEAR
-                except Exception as _idem_exc:
-                    _idem_state   = _IDEM_UNKNOWN
-                    _idem_err_str = str(_idem_exc)
-
-                if _idem_state == _IDEM_EXISTS:
-                    log.info(
-                        "[%s] RECONCILER_PROOF_ALREADY_EXISTS contract=%s position_id=%s "
-                        "local_order_id=%s — skipping duplicate insert",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
-                    )
-                    # safe no-op — not a write failure
-
-                elif _idem_state == _IDEM_UNKNOWN:
-                    # Lookup failed → do NOT insert (fail closed, not open).
-                    log.error(
-                        "[%s] RECONCILER_PROOF_IDEMPOTENCY_UNVERIFIED contract=%s "
-                        "position_id=%s local_order_id=%s client=%s "
-                        "error=%s — insert blocked to prevent duplicates",
-                        self.client_id, contract, _pos_id_str, _local_order_id,
-                        self.client_id, _idem_err_str,
-                    )
-                    _proof_write_failed = True
-
-                else:
-                    # IDEMPOTENCY_CLEAR — proceed with proof insert
-                    _proof = _APProofLogger(
-                        supabase_client=self.supabase_client,
-                        client_email=self.client_id,
-                        mode=self.execution_mode or "unknown",
-                    )
-                    _proof_result = _proof.log_trade(
-                        ticker             = self._norm_underlying(underlying or contract),
-                        pattern            = "",
-                        side               = side or "CALL",
-                        timeframe          = "1d",
-                        score              = 0,
-                        tier               = "A",
-                        context_score      = 0,
-                        setup_status       = "reconciler_auto_close",
-                        entry_trigger      = entry_px,
-                        entry_option_price = entry_px,
-                        exit_option_price  = exit_px,
-                        underlying_entry   = 0.0,
-                        underlying_exit    = 0.0,
-                        contracts          = close_qty or 1,
-                        exit_reason        = f"RECONCILER_AUTO_CLOSE | {close_confidence} | broker_position_missing",
-                        option_pnl_pct     = pnl_pct,
-                        underlying_pnl_pct = 0.0,
-                        win                = exit_px > entry_px,
-                        spread_pct         = 0.0,
-                        chain_grade        = "",
-                        synthetic_entry    = False,
-                        position_id        = _pos_id_str,
-                        local_order_id     = _local_order_id,
-                        execution_mode     = self.execution_mode or "",
-                    )
-                    # Check confirmed persistence — never emit PROOF_LOGGED on cache-only write.
-                    if _proof_result.get("_proof_persisted") is True:
-                        log.info(
-                            "[%s] RECONCILER_PROOF_LOGGED contract=%s position_id=%s pnl=%.1f%%",
-                            self.client_id, contract, _pos_id_str, pnl_pct,
-                        )
-                    else:
-                        _proof_write_failed = True
-                        log.error(
-                            "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
-                            "error=%s (non-fatal — position close is complete)",
-                            self.client_id, contract, _pos_id_str,
-                            _proof_result.get("_proof_persistence_error") or "persistence_not_confirmed",
-                        )
-
+                summary["proof_write_failures"] = int(summary.get("proof_write_failures", 0)) + 1
+                log.error(
+                    "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
+                    "status=%s reason=%s (non-fatal — position close is complete)",
+                    self.client_id, contract, pos_id, _proof_status,
+                    _proof_result.get("reason_code", "unknown"),
+                )
         except Exception as _proof_err:
-            _proof_write_failed = True
+            summary["proof_write_failures"] = int(summary.get("proof_write_failures", 0)) + 1
             log.error(
                 "[%s] RECONCILER_PROOF_WRITE_FAILED contract=%s position_id=%s "
                 "error=%s (non-fatal — position close is complete)",
                 self.client_id, contract, pos_id, _proof_err,
             )
-        if _proof_write_failed:
-            summary.setdefault("proof_write_failures", 0)
-            summary["proof_write_failures"] += 1
         try:
             from ap_proof_logger import funnel as _funnel_r
             _funnel_r.inc("reconciler_corrections")

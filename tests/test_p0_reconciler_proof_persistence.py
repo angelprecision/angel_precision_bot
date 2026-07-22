@@ -565,6 +565,60 @@ class TestPartialCloseBehavior:
 
 
 # =============================================================================
+# Test — Reconciler has no independent APProofLogger terminal proof call (PR exactly-once)
+# =============================================================================
+
+class TestReconcilerNoDirectProofLogger:
+    """Structural assertion: ap_reconciler._execute_reconciler_close must NOT
+    contain a direct APProofLogger instantiation for terminal proof writes.
+    That pattern was the root cause of the 2026-07-20 duplicate proof incident.
+    The reconciler must delegate to self.pm.ensure_terminal_close_proof instead.
+    """
+
+    def test_execute_reconciler_close_has_no_direct_approoflogger_call(self):
+        src = open(_REPO / "ap_reconciler.py").read()
+        # Extract only _execute_reconciler_close body
+        start = src.find("def _execute_reconciler_close(")
+        assert start != -1, "_execute_reconciler_close not found"
+        end = src.find("
+    def _import_broker", start)
+        body = src[start:end] if end != -1 else src[start:]
+
+        assert "APProofLogger(" not in body, (
+            "ap_reconciler._execute_reconciler_close must NOT contain a direct "
+            "APProofLogger instantiation. This pattern caused the 2026-07-20 "
+            "duplicate proof_trades incident. Delegate to pm.ensure_terminal_close_proof."
+        )
+        assert "ensure_terminal_close_proof" in body, (
+            "ap_reconciler._execute_reconciler_close must call pm.ensure_terminal_close_proof"
+        )
+
+    def test_reconciler_proof_counters_in_empty_summary(self):
+        import ap_reconciler as _r
+        summary = _r._empty_summary("test@example.com", 0)
+        for counter in (
+            "proof_existing_canonical", "proof_repair_bound", "proof_inserted",
+            "proof_duplicate_merged", "proof_quarantined", "proof_write_failures",
+        ):
+            assert counter in summary, f"Counter {counter!r} missing from _empty_summary"
+            assert summary[counter] == 0, f"Counter {counter!r} should start at 0"
+
+    def test_reconciler_proof_source_code_structure(self):
+        """The three-state idempotency guard (IDEM_EXISTS/CLEAR/UNKNOWN) must be
+        removed from the reconciler — that logic belongs in ensure_terminal_close_proof."""
+        src = open(_REPO / "ap_reconciler.py").read()
+        start = src.find("def _execute_reconciler_close(")
+        end = src.find("
+    def _import_broker", start)
+        body = src[start:end] if (start != -1 and end != -1) else ""
+        # The old idempotency guard pattern must not exist in the reconciler anymore
+        assert "_IDEM_EXISTS" not in body, (
+            "Old Supabase idempotency guard (_IDEM_EXISTS) must not be in reconciler; "
+            "it belongs in ensure_terminal_close_proof"
+        )
+
+
+# =============================================================================
 # Test — APBrokerReconciler constructor backward compatibility
 # =============================================================================
 

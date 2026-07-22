@@ -369,6 +369,74 @@ def _persist_stamp(proof_logger: Any, result: dict, stamp: dict) -> None:
         )
 
 
+def restamp_proof_row(
+    *,
+    proof_id: int,
+    client_id: str,
+    position_id: str,
+    local_order_id: str,
+) -> dict:
+    """Restamp an exact proof_trades row by its proof_id.
+
+    Uses WHERE id = %s AND client_email = %s — never a broad update by position_id,
+    because historical production data already contains multiple proof rows sharing
+    one position ID.
+
+    Returns:
+        {"updated": bool, "rows_affected": int, "reason": str}
+    """
+    client_id = str(client_id or "").strip().lower()
+    position_id = str(position_id or "").strip()
+    local_order_id = str(local_order_id or "").strip()
+
+    if not proof_id or not client_id:
+        return {"updated": False, "rows_affected": 0, "reason": "missing_proof_id_or_client_id"}
+
+    identity = resolve_originating_entry_identity(
+        client_id=client_id,
+        position_id=position_id,
+        supplied_local_order_id=local_order_id,
+    )
+    stamp = _lifecycle_proof_stamp(identity)
+
+    def _update() -> int:
+        with db.conn() as c:
+            columns = {
+                str(dict(row).get("column_name") or "")
+                for row in c.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name='proof_trades'"
+                ).fetchall()
+            }
+            updates = {key: value for key, value in stamp.items() if key in columns}
+            if not updates:
+                return 0
+            set_sql = ", ".join(f"{key}=%s" for key in updates)
+            cur = c.execute(
+                f"UPDATE proof_trades SET {set_sql} "
+                "WHERE id = %s AND client_email = %s",
+                tuple(updates.values()) + (int(proof_id), client_id),
+            )
+            return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+    try:
+        rows_affected = db.run_with_retry(_update)
+        if rows_affected:
+            return {"updated": True, "rows_affected": rows_affected, "reason": "stamped"}
+        log.critical(
+            "[PROOF] restamp_proof_row matched zero rows proof_id=%s client=%s",
+            proof_id, client_id,
+        )
+        return {"updated": False, "rows_affected": 0, "reason": "no_row_matched"}
+    except Exception as exc:
+        log.critical(
+            "[PROOF] restamp_proof_row failed proof_id=%s client=%s error=%s "
+            "run migrations/20260716_proof_performance_taxonomy.sql",
+            proof_id, client_id, exc,
+        )
+        return {"updated": False, "rows_affected": 0, "reason": f"error: {exc}"}
+
+
 def wrap_log_trade(original: Callable[..., dict]) -> Callable[..., dict]:
     signature = inspect.signature(original)
 
