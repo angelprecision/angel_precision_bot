@@ -133,6 +133,7 @@ jobs:
             tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
+            tests/test_p0_shared_ap_signals_retry_idempotency.py \
             -v --tb=short --color=yes
 
       - name: Summary

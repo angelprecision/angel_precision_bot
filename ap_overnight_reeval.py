@@ -37,7 +37,7 @@ import os
 import inspect
 import time
 from datetime import date, datetime, timezone, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ap_signal_store import canonical_client_email, canonical_signal_id, upsert_ap_signal_row_with_fallback
 
@@ -451,51 +451,168 @@ def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
     )
 
 
-def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> tuple[str, Optional[dict]]:
-    canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
-    if not canonical_signal_id or not client_id:
-        return canonical_signal_id, None
+# ── Lookup result ─────────────────────────────────────────────────────────────
+
+class _LookupResult(NamedTuple):
+    """Explicit result from _get_client_opportunity_row.
+
+    lookup_status values:
+      FOUND        — a valid matching row was returned in .row
+      NOT_FOUND    — query succeeded; definitively zero matching rows
+      LOOKUP_FAILED — truth could not be established (Supabase unavailable,
+                      exception, malformed response, missing identity, etc.)
+    """
+    canonical_signal_id: str
+    lookup_status: str   # "FOUND" | "NOT_FOUND" | "LOOKUP_FAILED"
+    row: Optional[dict]
+    error: Optional[str]
+
+
+_LS_FOUND         = "FOUND"
+_LS_NOT_FOUND     = "NOT_FOUND"
+_LS_LOOKUP_FAILED = "LOOKUP_FAILED"
+
+
+def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> _LookupResult:
+    """Query the opportunity ledger for this client/canonical-signal pair.
+
+    Returns an explicit _LookupResult — FOUND, NOT_FOUND, or LOOKUP_FAILED.
+    LOOKUP_FAILED is NEVER collapsed into NOT_FOUND: a backing-store outage
+    must not allow a second ENTRY order to be created.
+    """
+    canonical = _resolve_canonical_signal_id(signal_id, signal)
+    if not canonical or not client_id:
+        return _LookupResult(
+            canonical or "",
+            _LS_LOOKUP_FAILED,
+            None,
+            "missing_canonical_or_client_id",
+        )
 
     try:
         from ap.opportunity_ledger import _get_sb
         sb = _get_sb()
         if not sb:
-            return canonical_signal_id, None
+            return _LookupResult(canonical, _LS_LOOKUP_FAILED, None, "supabase_client_unavailable")
+
         res = (
             sb.table("client_signal_opportunities")
-            .select("opportunity_status, miss_stage, miss_reason, metadata")
-            .eq("canonical_signal_id", canonical_signal_id)
+            .select("opportunity_status, miss_stage, miss_reason, metadata, order_local_id")
+            .eq("canonical_signal_id", canonical)
             .eq("client_id", client_id)
             .limit(1)
             .execute()
         )
-        rows = getattr(res, "data", None) or []
-        if rows:
-            row = rows[0] if isinstance(rows[0], dict) else dict(rows[0])
-            return canonical_signal_id, row
+        rows = getattr(res, "data", None)
+        if rows is None:
+            # Malformed response — cannot distinguish zero rows from error.
+            return _LookupResult(canonical, _LS_LOOKUP_FAILED, None, "malformed_response_data_none")
+
+        if not rows:
+            return _LookupResult(canonical, _LS_NOT_FOUND, None, None)
+
+        row = rows[0] if isinstance(rows[0], dict) else dict(rows[0])
+        return _LookupResult(canonical, _LS_FOUND, row, None)
+
     except Exception as exc:
         log.debug(
-            "[%s] overnight_reeval: client opportunity lookup failed for %s: %s",
-            client_id,
-            canonical_signal_id,
-            exc,
+            "[%s] overnight_reeval: opportunity lookup failed canonical=%s: %s",
+            client_id, canonical, exc,
         )
-    return canonical_signal_id, None
+        return _LookupResult(canonical, _LS_LOOKUP_FAILED, None, str(exc))
 
 
-_DISPOSITION_ALREADY_ARMED    = "ALREADY_ARMED"
-_DISPOSITION_ALREADY_TERMINAL = "ALREADY_TERMINAL"
-_DISPOSITION_RETRYABLE        = "RETRYABLE"
-_DISPOSITION_NEW              = "NEW"
-_DISPOSITION_LOOKUP_FAILED    = "LOOKUP_FAILED"
+# ── Active-order statuses that prove entry ownership ──────────────────────────
+# PENDING_TRIGGER / SUBMITTED / ACKNOWLEDGED / PARTIAL_FILL → order exists and
+# may need a watcher reattached (Cases A/B) or is in-flight (Case C).
+# FILLED → already entered; must not enter again.
+_ACTIVE_ENTRY_OWN_STATUSES = frozenset({
+    "PENDING_TRIGGER", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED",
+})
 
-# opportunity_ledger statuses that prove a prior successful arm for this client/mode.
-_WATCHER_ARMED_STATUSES = {"WATCHER_ARMED"}
 
-# opportunity_ledger statuses that are per-client terminal (should not be retried).
-_TERMINAL_OPPORTUNITY_STATUSES = {
-    "MISSED", "INTERNAL_ERROR", "CLIENT_SKIPPED",
-}
+def _query_active_entry_order(
+    client_id: str,
+    execution_mode: str,
+    canonical_sig_id: str,
+) -> tuple[str, Optional[dict]]:
+    """Query for an exact active ENTRY order for this client/mode/canonical-signal.
+
+    Uses direct DB query with exact 5-tuple identity:
+      client_id + execution_mode (exact, lower-normalized) + canonical_signal_id
+      + kind='ENTRY' + status in _ACTIVE_ENTRY_OWN_STATUSES.
+
+    Returns:
+      (_LS_FOUND,         row)  — active order exists; row is a dict
+      (_LS_NOT_FOUND,    None)  — definitively no matching order
+      (_LS_LOOKUP_FAILED, None) — query failed; truth unknown
+    """
+    if not client_id or not canonical_sig_id:
+        return _LS_LOOKUP_FAILED, None
+
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] _query_active_entry_order: unknown execution_mode=%r canonical=%s — LOOKUP_FAILED",
+            client_id, execution_mode, canonical_sig_id,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+    statuses = tuple(_ACTIVE_ENTRY_OWN_STATUSES)
+    placeholders = ", ".join(["%s"] * len(statuses))
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    f"SELECT * FROM orders "
+                    f"WHERE client_id = %s "
+                    f"AND kind = 'ENTRY' "
+                    f"AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                    f"AND canonical_signal_id = %s "
+                    f"AND status IN ({placeholders}) "
+                    f"ORDER BY created_ts DESC LIMIT 1",
+                    (client_id, mode, canonical_sig_id, *statuses),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+        if row is None:
+            return _LS_NOT_FOUND, None
+        return _LS_FOUND, (dict(row) if not isinstance(row, dict) else row)
+
+    except Exception as exc:
+        log.warning(
+            "[%s] _query_active_entry_order: DB query failed canonical=%s mode=%s: %s",
+            client_id, canonical_sig_id, mode, exc,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+
+# ── Disposition constants ─────────────────────────────────────────────────────
+
+_DISPOSITION_ALREADY_ARMED       = "ALREADY_ARMED"
+_DISPOSITION_ALREADY_OWNED       = "ALREADY_OWNED"       # broker-submitted / filled
+_DISPOSITION_ALREADY_TERMINAL    = "ALREADY_TERMINAL"
+_DISPOSITION_REATTACH_WATCHER    = "REATTACH_WATCHER"    # PENDING_TRIGGER order exists, no watcher proof
+_DISPOSITION_RETRYABLE           = "RETRYABLE"
+_DISPOSITION_NEW                 = "NEW"
+_DISPOSITION_LOOKUP_FAILED       = "LOOKUP_FAILED"
+_DISPOSITION_AMBIGUOUS_OWNERSHIP = "AMBIGUOUS_OWNERSHIP"  # fail closed as retryable
+
+
+class _DispositionResult(NamedTuple):
+    """Full disposition result for a shared ap_signals row.
+
+    .disposition            — one of the _DISPOSITION_* constants
+    .existing_local_order_id — set for REATTACH_WATCHER; the order to reuse
+    .existing_order_row     — set for REATTACH_WATCHER; full order dict
+    """
+    disposition: str
+    existing_local_order_id: Optional[str] = None
+    existing_order_row: Optional[dict] = None
 
 
 def _resolve_shared_setup_disposition(
@@ -505,86 +622,204 @@ def _resolve_shared_setup_disposition(
     execution_mode: str,
     *,
     session_key: Optional[str] = None,
-) -> str:
+) -> _DispositionResult:
     """Return the per-client disposition for a shared ap_signals row.
 
     Called ONLY for rows whose source is ap_signals (job_id starts 'sup:').
     Must run before master_control, OSM, selector, or broker calls.
 
-    ALREADY_ARMED    — durable proof that this client/mode/session already armed.
-    ALREADY_TERMINAL — durable proof of a terminal decision for this client/session.
-    RETRYABLE        — prior state explicitly left the row unresolved/retryable.
-    NEW              — no prior per-client/session record exists.
-    LOOKUP_FAILED    — backing store error; callers must fail closed (not treat as NEW).
+    Processing order (10 steps per spec):
+      1. Normalize canonical signal identity.
+      2. Normalize exact execution mode.
+      3. Determine overnight session key.
+      4. Query opportunity ledger → FOUND / NOT_FOUND / LOOKUP_FAILED.
+      5. If FOUND: inspect durable evidence (mode, session, status).
+      6. Query exact active local ENTRY ownership.
+      7. Resolve disposition from active order if found.
+      8. Resolve NEW vs RETRYABLE from opportunity evidence.
+      9. Ambiguous → fail closed.
+     10. Return _DispositionResult.
 
-    Identity key: canonical_signal_id | client_id | execution_mode | session_date.
+    Mode isolation: blank stored mode never establishes ownership.
+    Session isolation: blank stored session never counts as current session.
+    Terminal coverage: uses canonical sets imported from opportunity_ledger.
     """
-    canonical_signal_id, row = _get_client_opportunity_row(signal_id, client_id, signal)
-    if not canonical_signal_id:
-        return _DISPOSITION_NEW
+    from ap.opportunity_ledger import (
+        WATCHER_ARMED            as _OL_WATCHER_ARMED,
+        BROKER_SUBMITTED         as _OL_BROKER_SUBMITTED,
+        BROKER_ACKED             as _OL_BROKER_ACKED,
+        FILLED                   as _OL_FILLED,
+        TERMINAL_STATUSES        as _OL_TERMINAL_STATUSES,
+    )
 
-    if row is None:
-        # _get_client_opportunity_row returns None on both "not found" and DB errors.
-        # We cannot distinguish them here, so we treat absent rows as NEW.
-        # Lookup exceptions are logged inside _get_client_opportunity_row.
-        return _DISPOSITION_NEW
+    # Step 1: Normalize canonical signal identity.
+    lookup = _get_client_opportunity_row(signal_id, client_id, signal)
+    canonical = lookup.canonical_signal_id
 
-    _status = str(row.get("opportunity_status") or "").upper()
-    _stage  = str(row.get("miss_stage") or "").upper()
-    _reason = str(row.get("miss_reason") or "")
-    _meta   = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    _session_key = session_key or _overnight_reeval_session_key()
-    _recorded_session = str(_meta.get("overnight_reeval_session_key") or "")
-
-    # Execution-mode isolation: the row must belong to the exact same mode.
-    # Different modes produce different orders and watchers.
-    _recorded_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").lower()
-    _req_mode = str(execution_mode or "").lower()
-    if _recorded_mode and _req_mode and _recorded_mode != _req_mode:
-        # Mode mismatch — this row belongs to a different mode; treat as NEW for this mode.
-        return _DISPOSITION_NEW
-
-    # Session isolation: only rows from this session count as durable proof.
-    if _recorded_session and _recorded_session != _session_key:
-        return _DISPOSITION_NEW
-
-    # ALREADY_ARMED: a successful watcher arm was already persisted for this client.
-    if _status in _WATCHER_ARMED_STATUSES:
-        log.info(
-            "[%s] reeval disposition=ALREADY_ARMED canonical=%s session=%s status=%s",
-            client_id, canonical_signal_id, _session_key, _status,
+    if not canonical:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED cannot resolve canonical_signal_id signal=%s",
+            client_id, signal_id,
         )
-        return _DISPOSITION_ALREADY_ARMED
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
 
-    # ALREADY_TERMINAL: a terminal per-client decision exists for this session.
-    if _status in _TERMINAL_OPPORTUNITY_STATUSES:
-        # Distinguish same-session terminal from a prior-session record.
-        if not _recorded_session or _recorded_session == _session_key:
-            log.info(
-                "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
-                "status=%s stage=%s reason=%s",
-                client_id, canonical_signal_id, _session_key, _status, _stage, _reason,
-            )
-            return _DISPOSITION_ALREADY_TERMINAL
+    # Step 2: Normalize exact execution mode (blank = unknown = fail closed).
+    _req_mode = str(execution_mode or "").strip().lower()
+    if not _req_mode or _req_mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED unknown execution_mode=%r canonical=%s",
+            client_id, execution_mode, canonical,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
 
-    # Legacy terminal watcher-arm failure check (same-session only).
-    if _recorded_session == _session_key:
-        if _status == "MISSED" and _stage == "WATCHER_ARM" and _is_terminal_watch_arm_failure_reason(_reason):
-            log.info(
-                "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
-                "canonical=%s session=%s",
-                client_id, canonical_signal_id, _session_key,
-            )
-            return _DISPOSITION_ALREADY_TERMINAL
-        if _status == "INTERNAL_ERROR" and _is_terminal_watch_arm_failure_reason(_reason):
-            log.info(
-                "[%s] reeval disposition=ALREADY_TERMINAL (internal-error) "
-                "canonical=%s session=%s",
-                client_id, canonical_signal_id, _session_key,
-            )
-            return _DISPOSITION_ALREADY_TERMINAL
+    # Step 3: Determine overnight session key.
+    _session_key = session_key or _overnight_reeval_session_key()
 
-    return _DISPOSITION_RETRYABLE
+    # Step 4: Query opportunity ledger.
+    if lookup.lookup_status == _LS_LOOKUP_FAILED:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED opportunity-store error canonical=%s err=%s",
+            client_id, canonical, lookup.error,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
+    # Step 5: If FOUND, inspect durable evidence with exact mode + session guards.
+    _has_current_session_proof = False
+    if lookup.lookup_status == _LS_FOUND:
+        row = lookup.row
+        _status = str(row.get("opportunity_status") or "").upper()
+        _stage  = str(row.get("miss_stage") or "").upper()
+        _reason = str(row.get("miss_reason") or "")
+        _meta   = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+
+        # Mode isolation: blank stored mode NEVER establishes ownership.
+        _recorded_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
+        _mode_match = bool(_recorded_mode and _recorded_mode == _req_mode)
+
+        # Session isolation: blank stored session NEVER counts as current.
+        _recorded_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
+        _session_match = bool(_recorded_session and _recorded_session == _session_key)
+
+        if _mode_match and _session_match:
+            _has_current_session_proof = True
+
+            # ALREADY_ARMED: durable WATCHER_ARMED proof for this client/mode/session.
+            if _status == _OL_WATCHER_ARMED:
+                log.info(
+                    "[%s] reeval disposition=ALREADY_ARMED canonical=%s session=%s",
+                    client_id, canonical, _session_key,
+                )
+                return _DispositionResult(_DISPOSITION_ALREADY_ARMED)
+
+            # ALREADY_OWNED: broker-submitted, acked, or filled — entry is in flight.
+            if _status in {_OL_BROKER_SUBMITTED, _OL_BROKER_ACKED, _OL_FILLED}:
+                log.info(
+                    "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s status=%s",
+                    client_id, canonical, _session_key, _status,
+                )
+                return _DispositionResult(_DISPOSITION_ALREADY_OWNED)
+
+            # ALREADY_TERMINAL: canonical terminal set from opportunity_ledger.
+            if _status in _OL_TERMINAL_STATUSES:
+                log.info(
+                    "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
+                    "status=%s stage=%s reason=%s",
+                    client_id, canonical, _session_key, _status, _stage, _reason,
+                )
+                return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+            # Legacy terminal watcher-arm failure recorded in same-session.
+            if (_status == "MISSED" and _stage == "WATCHER_ARM"
+                    and _is_terminal_watch_arm_failure_reason(_reason)):
+                log.info(
+                    "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
+                    "canonical=%s session=%s",
+                    client_id, canonical, _session_key,
+                )
+                return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+            if (_status == "INTERNAL_ERROR"
+                    and _is_terminal_watch_arm_failure_reason(_reason)):
+                log.info(
+                    "[%s] reeval disposition=ALREADY_TERMINAL (internal-error) "
+                    "canonical=%s session=%s",
+                    client_id, canonical, _session_key,
+                )
+                return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+        # Different mode or session: fall through to active-order check below.
+
+    # Step 6: Query exact active local ENTRY ownership (durable DB truth).
+    _order_status, _order_row = _query_active_entry_order(client_id, _req_mode, canonical)
+
+    # Active-order lookup failure → fail closed (do not assume no order exists).
+    if _order_status == _LS_LOOKUP_FAILED:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED active-order query failed canonical=%s mode=%s",
+            client_id, canonical, _req_mode,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
+    # Step 7: Resolve from active order.
+    if _order_status == _LS_FOUND and _order_row:
+        _active_status = str(_order_row.get("status") or "").upper()
+        _existing_local_id = str(_order_row.get("local_order_id") or "").strip()
+
+        if _active_status == "PENDING_TRIGGER":
+            # Case B: exact order exists but durable WATCHER_ARMED proof is absent.
+            # Reuse the existing local_order_id; caller must reattach watcher.
+            log.info(
+                "[%s] reeval disposition=REATTACH_WATCHER canonical=%s session=%s "
+                "local_order_id=%s",
+                client_id, canonical, _session_key, _existing_local_id,
+            )
+            return _DispositionResult(
+                _DISPOSITION_REATTACH_WATCHER, _existing_local_id, _order_row
+            )
+
+        if _active_status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
+            # Case C: entry is already in flight or completed.
+            log.info(
+                "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s "
+                "order_status=%s",
+                client_id, canonical, _session_key, _active_status,
+            )
+            return _DispositionResult(_DISPOSITION_ALREADY_OWNED)
+
+        # Case D: terminal order status — do not auto-create; classify retryable.
+        log.info(
+            "[%s] reeval disposition=RETRYABLE (terminal-order) canonical=%s "
+            "order_status=%s",
+            client_id, canonical, _active_status,
+        )
+        return _DispositionResult(_DISPOSITION_RETRYABLE)
+
+    # Step 8: No active order — resolve from opportunity evidence.
+    if lookup.lookup_status == _LS_NOT_FOUND:
+        # Both opportunity AND order queries definitively returned zero rows.
+        log.debug(
+            "[%s] reeval disposition=NEW canonical=%s session=%s",
+            client_id, canonical, _session_key,
+        )
+        return _DispositionResult(_DISPOSITION_NEW)
+
+    if _has_current_session_proof:
+        # Had current-session opportunity evidence but it wasn't classified above
+        # (e.g. unrecognised status) — do not guess; fail closed.
+        log.warning(
+            "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP canonical=%s session=%s",
+            client_id, canonical, _session_key,
+        )
+        return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
+
+    # Step 9: Old-session or different-mode row with no active order.
+    # Safe to treat as NEW for this session + mode.
+    log.debug(
+        "[%s] reeval disposition=NEW (prior-session/mode record, no active order) "
+        "canonical=%s session=%s mode=%s",
+        client_id, canonical, _session_key, _req_mode,
+    )
+    return _DispositionResult(_DISPOSITION_NEW)
 
 
 def _shared_watch_arm_failure_already_recorded(
@@ -600,12 +835,12 @@ def _shared_watch_arm_failure_already_recorded(
     preserving callers that used the old boolean interface.
     Do not add new callers; prefer _resolve_shared_setup_disposition directly.
     """
-    disp = _resolve_shared_setup_disposition(
+    disp_result = _resolve_shared_setup_disposition(
         signal_id, client_id, signal,
-        execution_mode="",  # legacy callers do not pass mode; mode isolation skipped
+        execution_mode="paper",   # legacy callers don't pass mode; default paper avoids LOOKUP_FAILED
         session_key=session_key,
     )
-    return disp in (_DISPOSITION_ALREADY_ARMED, _DISPOSITION_ALREADY_TERMINAL)
+    return disp_result.disposition in (_DISPOSITION_ALREADY_ARMED, _DISPOSITION_ALREADY_TERMINAL)
 
 
 def _record_watch_arm_failure_proof(
@@ -989,13 +1224,17 @@ def run_overnight_reeval(
             # Shared ap_signals rows stay WATCHING for all clients; this lookup
             # checks whether this exact client + mode + session already has durable
             # proof before touching master_control, OSM, selector, or broker.
+            # _disp_result is set here for ap_signals rows; cleared for trade_queue.
+            _disp_result: Optional[_DispositionResult] = None
             if job_source == "ap_signals":
-                _disposition = _resolve_shared_setup_disposition(
+                _disp_result = _resolve_shared_setup_disposition(
                     signal_id, client_id, signal,
                     execution_mode=_execution_mode,
                     session_key=session_key,
                 )
-                if _disposition == _DISPOSITION_ALREADY_ARMED:
+                _disp = _disp_result.disposition
+
+                if _disp == _DISPOSITION_ALREADY_ARMED:
                     log.info(
                         "[%s] overnight_reeval: ALREADY_ARMED %s — skip repeat arm",
                         ticker, signal_id,
@@ -1003,7 +1242,17 @@ def run_overnight_reeval(
                     result["skipped"] = result.get("skipped", 0) + 1
                     result["already_resolved"] += 1
                     continue
-                if _disposition == _DISPOSITION_ALREADY_TERMINAL:
+
+                if _disp == _DISPOSITION_ALREADY_OWNED:
+                    log.info(
+                        "[%s] overnight_reeval: ALREADY_OWNED %s — entry in-flight or filled",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+
+                if _disp == _DISPOSITION_ALREADY_TERMINAL:
                     log.info(
                         "[%s] overnight_reeval: ALREADY_TERMINAL %s — skip re-evaluation",
                         ticker, signal_id,
@@ -1011,17 +1260,166 @@ def run_overnight_reeval(
                     result["skipped"] = result.get("skipped", 0) + 1
                     result["already_resolved"] += 1
                     continue
-                if _disposition == _DISPOSITION_LOOKUP_FAILED:
-                    # Fail closed: preserve as retryable, do not create a second order
-                    # while truth is unavailable.
+
+                if _disp in (_DISPOSITION_LOOKUP_FAILED, _DISPOSITION_AMBIGUOUS_OWNERSHIP):
+                    # Fail closed: truth is unavailable or ambiguous.
+                    # Do NOT create an order while ownership is unresolved.
                     log.warning(
-                        "[%s] overnight_reeval: disposition lookup FAILED for %s — "
-                        "preserving as retryable (fail-closed)",
-                        ticker, signal_id,
+                        "[%s] overnight_reeval: disposition=%s for %s — "
+                        "fail-closed as retryable_deferred",
+                        ticker, _disp, signal_id,
                     )
                     result["skipped"] = result.get("skipped", 0) + 1
                     result["retryable_deferred"] += 1
                     continue
+
+                if _disp == _DISPOSITION_REATTACH_WATCHER:
+                    # Case B: PENDING_TRIGGER order exists but watcher proof is missing.
+                    # Reuse existing local_order_id; reattach watcher without creating a
+                    # new order.  No master_control, no selector, no broker.
+                    _existing_oid = _disp_result.existing_local_order_id or ""
+                    _existing_ord = _disp_result.existing_order_row or {}
+                    log.info(
+                        "[%s] overnight_reeval: REATTACH_WATCHER %s local_order_id=%s — "
+                        "reusing existing PENDING_TRIGGER order",
+                        ticker, signal_id, _existing_oid,
+                    )
+                    if not _existing_oid:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_WATCHER missing local_order_id "
+                            "signal=%s — failing closed as retryable",
+                            ticker, signal_id,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    # Reconstruct a minimal plan from the order row so entry_watcher
+                    # has the fields it expects.  Contract is already DEFERRED.
+                    import types as _types_mod
+                    _ord_meta = _existing_ord.get("meta") or {}
+                    if isinstance(_ord_meta, str):
+                        try:
+                            import json as _json
+                            _ord_meta = _json.loads(_ord_meta)
+                        except Exception:
+                            _ord_meta = {}
+                    _reattach_plan = _types_mod.SimpleNamespace(
+                        ticker          = str(_existing_ord.get("symbol") or ticker),
+                        side            = str(_existing_ord.get("direction") or side).upper(),
+                        direction       = str(_existing_ord.get("direction") or side).upper(),
+                        score           = float(_existing_ord.get("score") or signal.get("score") or 0),
+                        timeframe       = str(_existing_ord.get("timeframe") or signal.get("timeframe") or "1d"),
+                        entry_trigger   = float(_existing_ord.get("trigger_price") or entry_trigger or 0) or None,
+                        trigger_price   = float(_existing_ord.get("trigger_price") or entry_trigger or 0) or None,
+                        trigger_type    = "breach",
+                        prior_day_high  = signal.get("prior_day_high"),
+                        prior_day_low   = signal.get("prior_day_low"),
+                        pattern         = _existing_ord.get("pattern") or signal.get("pattern"),
+                        tier            = _existing_ord.get("tier") or signal.get("tier"),
+                        contract_symbol = str(_existing_ord.get("contract") or f"DEFERRED:{ticker}"),
+                        contracts       = int(_existing_ord.get("qty") or 1),
+                        limit_price     = float(_existing_ord.get("limit_price") or 0.01),
+                        plan_id         = str(_existing_ord.get("plan_id") or ""),
+                        signal_id       = str(_existing_ord.get("signal_id") or signal_id),
+                        canonical_signal_id = str(
+                            _existing_ord.get("canonical_signal_id")
+                            or _resolve_canonical_signal_id(signal_id, signal)
+                        ),
+                        metadata        = {
+                            "overnight": True,
+                            "reattach_watcher": True,
+                            "contract_deferred": True,
+                            "contract_selection_deferred_to": "breach_time",
+                            "overnight_reeval_session_key": session_key,
+                            "execution_mode": _execution_mode,
+                            **(dict(_ord_meta) if isinstance(_ord_meta, dict) else {}),
+                        },
+                    )
+                    try:
+                        _reattach_armed = entry_watcher.watch(_reattach_plan, _existing_oid)
+                    except Exception as _reat_exc:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_WATCHER watch() exception "
+                            "signal=%s local_order_id=%s: %s",
+                            ticker, signal_id, _existing_oid, _reat_exc,
+                        )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
+                        continue
+
+                    if not _reattach_armed:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_WATCHER watch() returned False "
+                            "signal=%s local_order_id=%s",
+                            ticker, signal_id, _existing_oid,
+                        )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
+                        continue
+
+                    # Persist durable WATCHER_ARMED proof after successful reattachment.
+                    _canonical_for_proof = _resolve_canonical_signal_id(signal_id, signal)
+                    try:
+                        from ap.opportunity_ledger import (
+                            create_opportunities as _create_opps,
+                            mark_watcher_armed as _mark_wa,
+                        )
+                        _signal_payload = dict(signal or {})
+                        _signal_payload.setdefault("signal_id", signal_id)
+                        _create_opps(
+                            signal_id, [client_id], _signal_payload,
+                            canonical_signal_id=_canonical_for_proof,
+                        )
+                        _reat_proof_ok = _mark_wa(
+                            _canonical_for_proof,
+                            client_id,
+                            canonical_signal_id=_canonical_for_proof,
+                            order_local_id=str(_existing_oid),
+                            extra_meta={
+                                "overnight_reeval_session_key": session_key,
+                                "execution_mode": _execution_mode,
+                                "source_table": "ap_signals",
+                                "source_job_id": str(job_id),
+                                "ticker": ticker,
+                                "side": side,
+                                "contract_deferred": True,
+                                "contract_selection_deferred_to": "breach_time",
+                                "original_signal_id": signal_id,
+                                "reattach_watcher": True,
+                                "armed_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                    except Exception as _reat_proof_exc:
+                        _reat_proof_ok = False
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_WATCHER proof write exception "
+                            "signal=%s local_order_id=%s: %s",
+                            ticker, signal_id, _existing_oid, _reat_proof_exc,
+                        )
+
+                    if not _reat_proof_ok:
+                        log.critical(
+                            "OVERNIGHT_REEVAL_REATTACH_PROOF_WRITE_FAILED | "
+                            "client=%s mode=%s canonical=%s local_order_id=%s session=%s | "
+                            "watcher reattached but WATCHER_ARMED proof NOT persisted — "
+                            "next retry will REATTACH again (idempotent)",
+                            client_id, _execution_mode, _canonical_for_proof,
+                            _existing_oid, session_key,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    log.info(
+                        "[%s] ✅ REATTACH_WATCHER ARMED — local_order_id=%s canonical=%s",
+                        ticker, _existing_oid, _canonical_for_proof,
+                    )
+                    _mark_job_watching_armed(job_id, client_id, f"reattached:{_existing_oid}")
+                    result["armed"] += 1
+                    result["fresh_armed"] += 1
+                    continue
+
                 # RETRYABLE or NEW — fall through to normal processing.
             else:
                 # trade_queue rows are genuinely per-client; use legacy boolean fence.
@@ -1714,6 +2112,70 @@ def run_overnight_reeval(
                     # would bypass the trigger-breach rule and enter prematurely.
                     # PENDING_TRIGGER was already set in Step 6b (pre-arm).
                     # Second call removed — duplicate transition on same local_order_id.
+
+                    # ── Durable WATCHER_ARMED proof write (shared ap_signals rows) ──
+                    # For ap_signals source rows _mark_job_watching_armed() only logs
+                    # (correctly leaves shared row WATCHING for other clients).
+                    # We MUST persist an explicit WATCHER_ARMED record in
+                    # client_signal_opportunities so that the next retry can find
+                    # ALREADY_ARMED instead of creating a second order.
+                    # If the write fails: fail as retryable — the watcher is armed
+                    # in memory but the next retry must discover the existing order
+                    # via the active-order fence (REATTACH_WATCHER path) rather than
+                    # creating a duplicate.
+                    _arm_proof_ok = True
+                    if job_source == "ap_signals":
+                        _canonical_for_arm = _resolve_canonical_signal_id(signal_id, signal)
+                        try:
+                            from ap.opportunity_ledger import (
+                                create_opportunities as _create_opps_arm,
+                                mark_watcher_armed as _mark_wa_arm,
+                            )
+                            _arm_signal_payload = dict(signal or {})
+                            _arm_signal_payload.setdefault("signal_id", signal_id)
+                            _create_opps_arm(
+                                signal_id, [client_id], _arm_signal_payload,
+                                canonical_signal_id=_canonical_for_arm,
+                            )
+                            _arm_proof_ok = _mark_wa_arm(
+                                _canonical_for_arm,
+                                client_id,
+                                canonical_signal_id=_canonical_for_arm,
+                                order_local_id=str(local_order_id),
+                                extra_meta={
+                                    "overnight_reeval_session_key": session_key,
+                                    "execution_mode": _execution_mode,
+                                    "source_table": "ap_signals",
+                                    "source_job_id": str(job_id),
+                                    "ticker": ticker,
+                                    "side": side,
+                                    "contract_deferred": contract_deferred,
+                                    "contract_selection_deferred_to": "breach_time",
+                                    "original_signal_id": signal_id,
+                                    "armed_at": datetime.now(timezone.utc).isoformat(),
+                                },
+                            )
+                        except Exception as _arm_proof_exc:
+                            _arm_proof_ok = False
+                            log.error(
+                                "[%s] overnight_reeval: WATCHER_ARMED proof write exception "
+                                "signal=%s local_order_id=%s: %s",
+                                ticker, signal_id, local_order_id, _arm_proof_exc,
+                            )
+
+                        if not _arm_proof_ok:
+                            log.critical(
+                                "OVERNIGHT_REEVAL_ARM_PROOF_WRITE_FAILED | "
+                                "client=%s mode=%s canonical=%s local_order_id=%s session=%s | "
+                                "watcher armed in-memory but WATCHER_ARMED NOT persisted — "
+                                "classifying as retryable_deferred; next retry will find "
+                                "PENDING_TRIGGER order via active-order fence (REATTACH path)",
+                                client_id, _execution_mode, _canonical_for_arm,
+                                local_order_id, session_key,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
                     log.info(
