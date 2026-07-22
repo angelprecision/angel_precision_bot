@@ -535,6 +535,7 @@ class TestAdoptionContaminationCleanse:
         engine._positions_by_id = {}
 
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        fresh_bid_ts = datetime.now(timezone.utc)
         pos = _Pos(
             position_id   = repair_id,
             execution_mode = "",         # unknown
@@ -548,6 +549,10 @@ class TestAdoptionContaminationCleanse:
             maxprofitseen   = peak,
             touched_profit  = touched,
             touchedprofit   = touched,
+            last_option_bid_update_ts = fresh_bid_ts,
+            lastoptionbidupdatets     = fresh_bid_ts,
+            option_bid_valid = True,
+            optionbidvalid   = True,
         )
         engine._positions.append(pos)
         engine._positions_by_id[repair_id] = pos
