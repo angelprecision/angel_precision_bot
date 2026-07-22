@@ -1268,10 +1268,10 @@ class TestAmendment2HardExitPrecedence:
 
 
 class TestAmendment2EntryGrace:
-    """Blocker 4: the grace contract is actually enforced."""
+    """Entry grace protects young loss exits without suppressing winners."""
 
-    def test_one_minute_old_sixteen_pct_bid_returns_entry_grace(self):
-        """The reviewer's exact case: 1-min-old, fresh BID +16% → ENTRY_GRACE."""
+    def test_one_minute_old_sixteen_pct_bid_remains_scale_out_eligible(self):
+        """1-min-old, fresh BID +16% → winner scale-out remains eligible."""
         pos = _make_pos(
             entry_price=1.00,
             current_bid=1.16, current_ask=1.20, current_option_price=1.18,
@@ -1279,6 +1279,36 @@ class TestAmendment2EntryGrace:
             exit_executable_pnl_pct=0.16,
             underlying_available=True, underlying_fresh=True,
             scale_outs_done=0, quantity=3, quantity_remaining=3,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "SCALE_OUT", f"{decision.action}: {decision.reason}"
+
+    def test_one_minute_touched_winner_giveback_still_profit_protects(self):
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=1.02, current_ask=1.06, current_option_price=1.04,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=0.02,
+            touched_profit=True, max_profit_seen=0.20, peak_pnl_pct=0.20,
+            current_underlying=149.0,
+            underlying_available=True, underlying_fresh=True,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+        )
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action == "CLOSE_ALL", f"{decision.action}: {decision.reason}"
+        assert "LOCK" in decision.reason or "TOUCHED PROFIT STOP" in decision.reason
+
+    def test_one_minute_soft_loss_remains_entry_grace_protected(self):
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.87, current_ask=0.90, current_option_price=0.88,
+            option_bid_valid=True, option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.13,
+            touched_profit=False,
+            underlying_available=True, underlying_fresh=True,
             opened_at=datetime.now(_UTC) - timedelta(minutes=1),
         )
         now_et = _et_noon().replace(hour=10)
@@ -3001,7 +3031,8 @@ class TestAmendment7HardRefPersistenceRoundTrip:
         }
         qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
         qpm._last_db_persist_ts["pos-STABLE"] = time.time()
-        qpm._last_db_persist_hard_ref["pos-STABLE"] = json.dumps(payload, sort_keys=True)
+        from ap.position_quote_monitor import hard_ref_authority_fingerprint
+        qpm._last_db_persist_hard_ref["pos-STABLE"] = hard_ref_authority_fingerprint(payload)
 
         changed = qpm._persist_quote_to_db(
             position_id="pos-STABLE",
@@ -3014,6 +3045,35 @@ class TestAmendment7HardRefPersistenceRoundTrip:
 
         assert changed is False
         assert capture.calls == []
+
+    def test_hard_ref_timestamp_churn_inside_throttle_window_does_not_write(self, monkeypatch):
+        capture = _patch_qpm_db(monkeypatch)
+        from ap.position_quote_monitor import APPositionQuoteMonitor
+        qpm = APPositionQuoteMonitor(_FakeBroker({}), "test@client.com", _FakeExitEngine([]))
+        base = {
+            "price": 0.55, "pnl_pct": -0.45, "source": "last",
+            "validity": "proven", "refresh_needed": False,
+        }
+        assert qpm._persist_quote_to_db(
+            position_id="pos-TS-CHURN",
+            option_price=0.0,
+            underlying_price=149.0,
+            option_pnl_pct=None,
+            now_utc=datetime.now(_UTC),
+            hard_ref={**base, "ts": "2026-07-21T15:00:00+00:00"},
+        ) is True
+
+        changed = qpm._persist_quote_to_db(
+            position_id="pos-TS-CHURN",
+            option_price=0.0,
+            underlying_price=149.0,
+            option_pnl_pct=None,
+            now_utc=datetime.now(_UTC),
+            hard_ref={**base, "ts": "2026-07-21T15:00:02+00:00"},
+        )
+
+        assert changed is False
+        assert len(capture.calls) == 1
 
     def test_positive_option_price_movement_bypasses_time_throttle(self, monkeypatch):
         capture = _patch_qpm_db(monkeypatch)
@@ -3218,6 +3278,100 @@ class TestAmendment7SeedResolverAndDecisionUse:
         source = inspect.getsource(ee_mod.evaluate_exit)
         assert 'getattr(pos, "hard_exit_reference_pnl_pct"' not in source
         assert "hardexitreferencepnlpct" not in source
+
+
+class TestAmendment8HardRefChronology:
+    def test_qpm_newer_catastrophic_bid_not_overwritten_by_older_healthy_last(self, monkeypatch):
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        pos = _qpm_pos("pos-QPM-NEWER-BID", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 0.55, "ask": 0.60, "mark": 0, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+        prior_ts = pos.hard_exit_reference_ts
+
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {
+            "bid": 0, "ask": 0, "mark": 0, "last": 1.00,
+            "last_trade_ts": prior_ts - timedelta(seconds=10),
+        }
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_source == "bid"
+        assert pos.hard_exit_reference_price == pytest.approx(0.55)
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.45)
+
+    def test_qpm_newer_healthy_bid_not_overwritten_by_older_catastrophic_last(self, monkeypatch):
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        pos = _qpm_pos("pos-QPM-NEWER-HEALTHY", execution_mode="live")
+        qpm = _make_qpm([pos], {
+            "ABT260721P00150000": {"bid": 1.10, "ask": 1.15, "mark": 0, "last": 0},
+            "ABT": {"last": 149.0},
+        })
+        qpm._refresh_once()
+        prior_ts = pos.hard_exit_reference_ts
+
+        _clear_qpm_shared_cache()
+        qpm.broker.quotes["ABT260721P00150000"] = {
+            "bid": 0, "ask": 0, "mark": 0, "last": 0.55,
+            "last_trade_ts": prior_ts - timedelta(seconds=10),
+        }
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_source == "bid"
+        assert pos.hard_exit_reference_price == pytest.approx(1.10)
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(0.10)
+
+    def test_apply_quote_newer_bid_not_overwritten_by_older_healthy_last(self):
+        import ap_exit_engine as ee_mod
+        now = datetime.now(_UTC)
+        pos = ManagedPosition(
+            ticker="ABT", option_symbol="ABT260721P00150000",
+            side="CALL", quantity=1, quantity_remaining=1,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=now - timedelta(minutes=10),
+        )
+        ee_mod._apply_option_quote_for_decision(pos, bid=0.55, ask=0.60, mark=0, last=0, quote_ts=now)
+        ee_mod._apply_option_quote_for_decision(
+            pos, bid=0, ask=0, mark=0, last=1.00,
+            quote_ts=now + timedelta(seconds=2),
+            last_ts=now - timedelta(seconds=10),
+        )
+        assert pos.hard_exit_reference_source == "bid"
+        assert pos.hard_exit_reference_price == pytest.approx(0.55)
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.45)
+
+    def test_apply_quote_newer_healthy_bid_not_overwritten_by_older_catastrophic_last(self):
+        import ap_exit_engine as ee_mod
+        now = datetime.now(_UTC)
+        pos = ManagedPosition(
+            ticker="ABT", option_symbol="ABT260721P00150000",
+            side="CALL", quantity=1, quantity_remaining=1,
+            entry_price=1.00, underlying_entry=150.0,
+            underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="live",
+            opened_at=now - timedelta(minutes=10),
+        )
+        ee_mod._apply_option_quote_for_decision(pos, bid=1.10, ask=1.15, mark=0, last=0, quote_ts=now)
+        ee_mod._apply_option_quote_for_decision(
+            pos, bid=0, ask=0, mark=0, last=0.55,
+            quote_ts=now + timedelta(seconds=2),
+            last_ts=now - timedelta(seconds=10),
+        )
+        assert pos.hard_exit_reference_source == "bid"
+        assert pos.hard_exit_reference_price == pytest.approx(1.10)
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(0.10)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

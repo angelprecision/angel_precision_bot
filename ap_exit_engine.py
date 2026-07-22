@@ -469,24 +469,10 @@ def _soft_exit_option_truth_gate(
 
     Must be called before EVERY soft exit branch.  Never call before hard exits.
 
-    AMENDMENT #2 (blocker 4): the entry-grace contract is enforced HERE, as the
-    first check, so it applies globally to every soft exit (all soft branches
-    route through this gate).  Hard exits are pre-evaluated before any gate and
-    are never affected by grace.
+    Entry grace is intentionally not enforced here. This gate protects soft
+    exits from stale or non-executable option truth only; loss-specific grace
+    is applied by the loss branches that need breathing room.
     """
-    if snap.in_grace_window:
-        return ExitDecision(
-            action="HOLD", quantity=0,
-            reason=(
-                "SOFT_EXIT_DEFERRED — inside post-entry grace window "
-                f"({_MIN_HOLD_BEFORE_EXIT_MIN:.0f}min); soft exits deferred, hard exits unaffected"
-            ),
-            urgency="NORMAL",
-            pnl_pct=(snap.exit_executable_pnl_pct
-                     if snap.exit_executable_pnl_pct is not None
-                     else (snap.display_pnl_pct or 0.0)),
-            reason_code=SOFT_EXIT_DEFERRED_ENTRY_GRACE,
-        )
     if not snap.option_bid_valid:
         return ExitDecision(
             action="HOLD", quantity=0,
@@ -513,6 +499,23 @@ def _soft_exit_option_truth_gate(
             reason_code=SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
         )
     return None
+
+
+def _soft_exit_entry_grace_decision(snap: ExitDecisionSnapshot) -> "Optional[ExitDecision]":
+    if not snap.in_grace_window:
+        return None
+    return ExitDecision(
+        action="HOLD", quantity=0,
+        reason=(
+            "SOFT_EXIT_DEFERRED — inside post-entry grace window "
+            f"({_MIN_HOLD_BEFORE_EXIT_MIN:.0f}min); loss exits deferred, winner protection unaffected"
+        ),
+        urgency="NORMAL",
+        pnl_pct=(snap.exit_executable_pnl_pct
+                 if snap.exit_executable_pnl_pct is not None
+                 else (snap.display_pnl_pct or 0.0)),
+        reason_code=SOFT_EXIT_DEFERRED_ENTRY_GRACE,
+    )
 
 
 def _soft_exit_underlying_truth_gate(
@@ -690,6 +693,8 @@ def _reclassify_hard_ref_for_entry(pos) -> None:
 
     _pnl = (_price - _entry) / _entry
     _validity = "catastrophic_ask" if _pnl <= _hard_stop else "unproven"
+    _source = "ask_catastrophic" if _validity == "catastrophic_ask" else "ask_unproven"
+    _set_position_attr_pair(pos, "hard_exit_reference_source", _source)
     _set_position_attr_pair(pos, "hard_exit_reference_validity", _validity)
     _set_position_attr_pair(pos, "hard_exit_reference_pnl_pct", _pnl)
     _refresh_needed = not _hard_ref_is_authoritative(_validity)
@@ -743,6 +748,49 @@ def _merge_hard_exit_reference_for_collapse(dst, src, *, now_utc: datetime) -> N
             return
         if _src_ts is not None and (_dst_ts is None or _src_ts > _dst_ts):
             _copy_hard_exit_reference(dst, src)
+
+
+def _should_replace_hard_ref(
+    *,
+    prior_validity,
+    prior_ts,
+    prior_price,
+    candidate_validity,
+    candidate_ts,
+    now_utc: "Optional[datetime]" = None,
+) -> bool:
+    try:
+        from ap.position_quote_monitor import should_replace_hard_ref
+        return should_replace_hard_ref(
+            prior_validity=prior_validity,
+            prior_ts=prior_ts,
+            prior_price=prior_price,
+            candidate_validity=candidate_validity,
+            candidate_ts=candidate_ts,
+            now_utc=now_utc or datetime.now(timezone.utc),
+        )
+    except Exception:
+        return False
+
+
+def _has_fresh_dedicated_bid(pos: "ManagedPosition", *, now_utc: "Optional[datetime]" = None) -> bool:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    try:
+        bid = float(getattr(pos, "current_bid", getattr(pos, "currentbid", 0.0)) or 0.0)
+    except Exception:
+        return False
+    if bid <= 0:
+        return False
+    ts = _normalize_hard_ref_ts(
+        getattr(pos, "last_option_bid_update_ts", getattr(pos, "lastoptionbidupdatets", None)),
+        now_utc=now_utc,
+    )
+    if ts is None:
+        return False
+    try:
+        return 0 <= (now_utc - ts).total_seconds() <= float(STALE_OPTION_QUOTE_MAX_AGE_SEC)
+    except Exception:
+        return False
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -967,27 +1015,36 @@ def _apply_option_quote_for_decision(
             _pos_hs, _, _ = _effective_thresholds(pos)
         except Exception:
             _pos_hs = -0.33
+        _raw_mark_ts = mark_ts
+        _mark_ts = _normalize_hard_ref_ts(_raw_mark_ts, now_utc=_now)
+        if (mark or 0) > 0 and _raw_mark_ts in (None, ""):
+            _mark_ts = _normalize_hard_ref_ts(quote_ts, now_utc=_now)
         _href = _sel_href(
             bid=float(bid or 0.0), ask=float(ask or 0.0),
             mark=float(mark or 0.0), last=float(last or 0.0),
             bid_ts=(_normalize_hard_ref_ts(quote_ts, now_utc=_now) if (bid or 0) > 0 else None),
             ask_ts=(_normalize_hard_ref_ts(quote_ts, now_utc=_now) if (ask or 0) > 0 else None),
-            mark_ts=_normalize_hard_ref_ts(mark_ts, now_utc=_now),
+            mark_ts=_mark_ts,
             last_ts=last_ts,
             now_utc=_now,
             entry_price=_cost_basis,
             hard_stop_pct=_pos_hs,
             last_stale_sec=float(os.getenv("LAST_TRADE_STALE_SEC", "30.0")),
         )
-        # ASK-only-healthy must not clobber a prior proven ref.
+        # Authoritative refs are monotonic by quote timestamp; stale authority
+        # cannot erase a newer catastrophic or healthy reference.
         _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
         _prior_price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
-        _overwrite = True
-        if (
-            (_href.validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0)
-            or (_href.validity == "no_data" and _prior_price > 0)
-        ):
-            _overwrite = False
+        _prior_ts = getattr(pos, "hard_exit_reference_ts", getattr(pos, "hardexitreferencets", None))
+        _overwrite = _should_replace_hard_ref(
+            prior_validity=_prior_validity,
+            prior_ts=_prior_ts,
+            prior_price=_prior_price,
+            candidate_validity=_href.validity,
+            candidate_ts=_href.ts,
+            now_utc=_now,
+        )
+        if not _overwrite:
             pos.hard_exit_reference_refresh_needed = True
             pos.hardexitreferencerefreshneeded = True
         if _overwrite and _href.price > 0:
@@ -1672,6 +1729,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         _sl_und_gate = _soft_exit_underlying_truth_gate(snap)
         if _sl_und_gate is not None:
             return _sl_und_gate
+        _sl_grace_gate = _soft_exit_entry_grace_decision(snap)
+        if _sl_grace_gate is not None:
+            return _sl_grace_gate
 
         _soft_age       = _position_age_minutes(pos)
         _soft_confirm, _soft_reason = _underlying_still_confirming(pos)
@@ -1841,6 +1901,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             _ng_und_gate = _soft_exit_underlying_truth_gate(snap)
             if _ng_und_gate is not None:
                 return _ng_und_gate
+            _ng_grace_gate = _soft_exit_entry_grace_decision(snap)
+            if _ng_grace_gate is not None:
+                return _ng_grace_gate
 
             _ng_age_min = _position_age_minutes(pos)
             _ng_confirming, _ng_confirm_reason = _underlying_still_confirming(pos)
@@ -2894,13 +2957,23 @@ class APExitEngine:
                         reason="canonical_object_mismatch",
                     )
 
-                # Merge every active broker-repair for this client/contract into canonical.
-                _repairs_to_remove = [
-                    p for p in self._positions
-                    if str(getattr(p, "position_id", "") or "").startswith("broker-repair-")
-                    and str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
-                    and not getattr(p, "closed", False)
-                ]
+                # Merge every active broker-repair for this exact client/mode/contract
+                # into canonical. Foreign-client or wrong-mode repairs are not touched.
+                _repairs_to_remove = []
+                for p in self._positions:
+                    if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
+                        continue
+                    if str(getattr(p, "option_symbol", "") or "").upper().strip() != _contract:
+                        continue
+                    if getattr(p, "closed", False):
+                        continue
+                    _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
+                    if _client and _rp_cli and _rp_cli != _client:
+                        continue
+                    _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
+                    if _rp_mode in {"live", "paper"} and _rp_mode != _norm_canonical:
+                        continue
+                    _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
                     _merge_now = datetime.now(timezone.utc)
                     _accepted_repair_bid = None
@@ -2916,6 +2989,16 @@ class APExitEngine:
                         _cn_ts = getattr(_existing_canon, _ts_attr, None)
                         _rp_ts_norm = _normalize_hard_ref_ts(_rp_ts, now_utc=_merge_now)
                         _cn_ts_norm = _normalize_hard_ref_ts(_cn_ts, now_utc=_merge_now)
+                        if _price_attr == "current_bid":
+                            try:
+                                _bid_age_ok = (
+                                    _rp_ts_norm is not None
+                                    and 0 <= (_merge_now - _rp_ts_norm).total_seconds() <= float(STALE_OPTION_QUOTE_MAX_AGE_SEC)
+                                )
+                            except Exception:
+                                _bid_age_ok = False
+                            if not _bid_age_ok:
+                                continue
                         if (_rp_v > 0 and _rp_ts_norm is not None
                                 and (_cn_ts_norm is None or _rp_ts_norm > _cn_ts_norm)):
                             _set_position_attr_pair(_existing_canon, _price_attr, _rp_v)
@@ -2966,6 +3049,8 @@ class APExitEngine:
                         "canonical=%s repair=%s contract=%s",
                         _canon_id, _rp_id, _contract,
                     )
+
+                _reclassify_hard_ref_for_entry(_existing_canon)
 
                 # Assert exactly one nonclosed active object for this contract.
                 _active_for_contract = [
@@ -3045,7 +3130,8 @@ class APExitEngine:
 
                 if entry_fill > 0:
                     _set_position_attr_pair(pos, "entry_price", entry_fill)
-                    _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    _bid_is_fresh = _has_fresh_dedicated_bid(pos)
+                    _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0) if _bid_is_fresh else 0.0
                     if _fresh_bid > 0:
                         _rebased_pnl = (_fresh_bid - entry_fill) / entry_fill
                     else:

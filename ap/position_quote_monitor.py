@@ -76,6 +76,9 @@ class HardExitRef:
     ts: "Optional[datetime]"
 
 
+_AUTHORITATIVE_HARD_REF_VALIDITIES = {"proven", "catastrophic_ask"}
+
+
 def normalize_hard_ref_ts(
     ts,
     *,
@@ -111,6 +114,52 @@ def normalize_hard_ref_ts(
     except Exception:
         return None
     return parsed
+
+
+def hard_ref_authority_fingerprint(hard_ref) -> str:
+    """Fingerprint only authority-state changes that may bypass DB throttling."""
+    if not isinstance(hard_ref, dict):
+        return ""
+    payload = {
+        "source": str(hard_ref.get("source") or ""),
+        "validity": str(hard_ref.get("validity") or ""),
+        "refresh_needed": bool(hard_ref.get("refresh_needed", False)),
+    }
+    return json.dumps(payload, sort_keys=True, default=str)
+
+
+def should_replace_hard_ref(
+    *,
+    prior_validity,
+    prior_ts,
+    prior_price,
+    candidate_validity,
+    candidate_ts,
+    now_utc: "Optional[datetime]" = None,
+) -> bool:
+    """Chronology-aware hard-reference replacement contract."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    try:
+        prior_price_f = float(prior_price or 0.0)
+    except Exception:
+        prior_price_f = 0.0
+    prior_authoritative = (
+        str(prior_validity or "") in _AUTHORITATIVE_HARD_REF_VALIDITIES
+        and prior_price_f > 0
+    )
+    candidate_authoritative = str(candidate_validity or "") in _AUTHORITATIVE_HARD_REF_VALIDITIES
+    if not prior_authoritative:
+        return True
+    if not candidate_authoritative:
+        return False
+
+    prior_dt = normalize_hard_ref_ts(prior_ts, now_utc=now_utc)
+    candidate_dt = normalize_hard_ref_ts(candidate_ts, now_utc=now_utc)
+    if prior_dt is None:
+        return candidate_dt is not None
+    if candidate_dt is None:
+        return False
+    return candidate_dt > prior_dt
 
 
 def _select_hard_exit_reference(
@@ -675,11 +724,15 @@ class APPositionQuoteMonitor:
                               "hardexitreferenceprice", default=None), 0.0
                 )
                 _prior_ts = _get_attr(pos, "hard_exit_reference_ts", "hardexitreferencets", default=None)
-                _overwrite_allowed = True
-                if (
-                    (_hard_ref_validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0)
-                    or (_hard_ref_validity == "no_data" and _prior_price > 0)
-                ):
+                _overwrite_allowed = should_replace_hard_ref(
+                    prior_validity=_prior_validity,
+                    prior_ts=_prior_ts,
+                    prior_price=_prior_price,
+                    candidate_validity=_hard_ref_validity,
+                    candidate_ts=_href.ts,
+                    now_utc=now_utc,
+                )
+                if not _overwrite_allowed:
                     _overwrite_allowed = False
                     self._write_field_unconditional(pos, "hard_exit_reference_refresh_needed", True)
                     self._write_field_unconditional(pos, "hardexitreferencerefreshneeded",     True)
@@ -1130,7 +1183,7 @@ class APPositionQuoteMonitor:
             else:
                 price_ok = False
             hard_ref_payload = hard_ref if isinstance(hard_ref, dict) else None
-            hard_ref_fingerprint = json.dumps(hard_ref_payload, sort_keys=True, default=str) if hard_ref_payload is not None else ""
+            hard_ref_fingerprint = hard_ref_authority_fingerprint(hard_ref_payload)
             hard_ref_ok = bool(hard_ref_fingerprint and hard_ref_fingerprint != self._last_db_persist_hard_ref.get(position_id, ""))
             if not (time_ok or price_ok or hard_ref_ok):
                 return False

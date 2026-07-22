@@ -970,6 +970,105 @@ class TestCanonicalPlusRepairCollapse:
         assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
         assert result.adopted is True
 
+    def test_existing_canonical_stale_repair_bid_cannot_raise_peak(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        repair = engine._positions_by_id[repair_id]
+        repair.live_executable_price_source = "bid"
+        repair.liveexecutablepricesource = "bid"
+        repair.current_bid = 2.40
+        repair.currentbid = 2.40
+        repair.peak_pnl_pct = 0.50
+        repair.max_profit_seen = 0.50
+        old_ts = datetime.now(timezone.utc) - timedelta(seconds=90)
+        repair.last_option_bid_update_ts = old_ts
+        repair.lastoptionbidupdatets = old_ts
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        canonical = engine._positions_by_id[canon_id]
+        assert canonical.peak_pnl_pct == pytest.approx(0.025)
+        assert canonical.max_profit_seen == pytest.approx(0.0)
+
+    def test_existing_canonical_reclassifies_repair_ask_against_canonical_entry(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        canonical = engine._positions_by_id[canon_id]
+        canonical.entry_price = 1.20
+        repair = engine._positions_by_id[repair_id]
+        now = datetime.now(timezone.utc)
+        repair.hard_exit_reference_price = 0.75
+        repair.hardexitreferenceprice = 0.75
+        repair.hard_exit_reference_source = "ask_unproven"
+        repair.hardexitreferencesource = "ask_unproven"
+        repair.hard_exit_reference_validity = "unproven"
+        repair.hardexitreferencevalidity = "unproven"
+        repair.hard_exit_reference_ts = now
+        repair.hardexitreferencets = now
+        repair.hard_exit_reference_pnl_pct = -0.25
+        repair.hardexitreferencepnlpct = -0.25
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert canonical.hard_exit_reference_validity == "catastrophic_ask"
+        assert canonical.hard_exit_reference_source == "ask_catastrophic"
+        assert canonical.hard_exit_reference_pnl_pct == pytest.approx((0.75 - 1.20) / 1.20)
+
+    def test_existing_canonical_demotes_false_catastrophic_ask_against_canonical_entry(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        canonical = engine._positions_by_id[canon_id]
+        canonical.entry_price = 0.80
+        repair = engine._positions_by_id[repair_id]
+        now = datetime.now(timezone.utc)
+        repair.hard_exit_reference_price = 0.75
+        repair.hardexitreferenceprice = 0.75
+        repair.hard_exit_reference_source = "ask_catastrophic"
+        repair.hardexitreferencesource = "ask_catastrophic"
+        repair.hard_exit_reference_validity = "catastrophic_ask"
+        repair.hardexitreferencevalidity = "catastrophic_ask"
+        repair.hard_exit_reference_ts = now
+        repair.hardexitreferencets = now
+        repair.hard_exit_reference_pnl_pct = -0.40
+        repair.hardexitreferencepnlpct = -0.40
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert canonical.hard_exit_reference_validity == "unproven"
+        assert canonical.hard_exit_reference_source == "ask_unproven"
+        assert canonical.hard_exit_reference_pnl_pct == pytest.approx((0.75 - 0.80) / 0.80)
+
+    def test_existing_canonical_does_not_remove_foreign_client_or_wrong_mode_repairs(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        foreign_id = f"broker-repair-other@client.com-{_CONTRACT}"
+        wrong_mode_id = f"broker-repair-{_CLIENT}-paper-{_CONTRACT}"
+        foreign = _Pos(position_id=foreign_id, option_symbol=_CONTRACT,
+                       client_id="other@client.com", execution_mode="live")
+        wrong_mode = _Pos(position_id=wrong_mode_id, option_symbol=_CONTRACT,
+                          client_id=_CLIENT, execution_mode="paper")
+        engine._positions.extend([foreign, wrong_mode])
+        engine._positions_by_id[foreign_id] = foreign
+        engine._positions_by_id[wrong_mode_id] = wrong_mode
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert repair_id not in engine._positions_by_id
+        assert foreign_id in engine._positions_by_id
+        assert wrong_mode_id in engine._positions_by_id
+
 
 class TestCanonicalCollapseRiskReferenceRegression:
     """Regression coverage for canonical+repair collapse money-safety state."""
@@ -1260,6 +1359,32 @@ class TestStructuredAdoptionResult:
         )
         assert r.disposition == "RETRY_MODE_MISMATCH"
         assert r.safe_to_seed is False
+
+    def test_upgrade_in_place_stale_repair_bid_cannot_seed_peak(self):
+        engine = self._engine()
+        self._add_repair(engine, mode="live")
+        repair = engine._positions[0]
+        repair.live_executable_price_source = "bid"
+        repair.liveexecutablepricesource = "bid"
+        repair.current_bid = 2.40
+        repair.currentbid = 2.40
+        repair.peak_pnl_pct = 0.50
+        repair.max_profit_seen = 0.50
+        old_ts = datetime.now(timezone.utc) - timedelta(seconds=90)
+        repair.last_option_bid_update_ts = old_ts
+        repair.lastoptionbidupdatets = old_ts
+
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.00, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert r.disposition == "ADOPTED"
+        pos = engine._positions_by_id["canon1"]
+        assert pos.peak_pnl_pct == pytest.approx(0.0)
+        assert pos.max_profit_seen == pytest.approx(0.0)
+        assert pos.touched_profit is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
