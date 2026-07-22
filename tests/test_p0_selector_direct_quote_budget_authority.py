@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import logging
 import os
-import sys
 import time
 from datetime import date, timedelta
 from types import SimpleNamespace
@@ -12,17 +11,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
-sys.modules.setdefault(
-    "ap.observability",
-    SimpleNamespace(
-        emit_decision_event=lambda *args, **kwargs: None,
-        get_git_commit=lambda: "test",
-        make_config_hash=lambda payload: "hash",
-    ),
-)
-sys.modules.setdefault("psycopg2", MagicMock())
-sys.modules.setdefault("psycopg2.extras", MagicMock())
-sys.modules.setdefault("psycopg2.pool", MagicMock())
 
 from ap.contract_quote_revalidator import (
     clear_quote_cache,
@@ -205,6 +193,7 @@ def _select_with_chain(monkeypatch, chain: list[dict], valid_symbol: str, direct
     monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "20")
     monkeypatch.setenv("PRO_CONTRACT_QUALITY", "true")
     monkeypatch.setattr("ap.contract_quote_revalidator.is_market_open", lambda *args, **kwargs: True)
+    monkeypatch.setattr(APContractSelectionEngine, "_emit_selector_event", lambda *args, **kwargs: None)
     broker = _DirectQuoteBroker(chain, valid_symbol, valid_quote=quote)
     selector = APContractSelectionEngine(
         broker,
