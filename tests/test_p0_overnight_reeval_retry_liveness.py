@@ -31,7 +31,10 @@ def _bind_reloaded_overnight_module():
 
 
 def _dt(hour, minute=0, second=0):
-    return datetime(2026, 7, 21, hour, minute, second, tzinfo=cr._ET)
+    # Use today's date in ET so tests pass on any CI run date.
+    # All scheduler/session logic is relative to the injected time's date, not a fixed date.
+    _today = datetime.now(cr._ET).date()
+    return datetime(_today.year, _today.month, _today.day, hour, minute, second, tzinfo=cr._ET)
 
 
 def _result(**overrides):
@@ -112,13 +115,25 @@ def test_first_all_deferred_stall_schedules_retry_and_skips_post_handoff(monkeyp
     assert len(calls) == 1
 
 
-def test_stalled_9am_attempt_preserves_post_open_retry(monkeypatch):
+def test_premarket_9am_attempt_retries_on_interval_not_post_open(monkeypatch):
+    """Blocker 2 fix: a 9:00 retry must be scheduled at now+RETRY_SEC, NOT at 9:30:05.
+    PR #388 deferred contract selection to breach time; premarket work (prior-levels,
+    snapshot, MC, OSM, watcher arm) can and must complete before open."""
     monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: _result())
     runner = _runner()
 
     runner.run_overnight_reeval_attempt(now_et=_dt(9), source="scheduler")
 
-    assert runner._overnight_reeval_next_retry_at >= _dt(9, 30, 5)
+    expected = _dt(9) + cr.timedelta(seconds=cr.OVERNIGHT_REEVAL_RETRY_SEC)
+    assert runner._overnight_reeval_next_retry_at == expected, (
+        f"9:00 retry must schedule at {expected} (now + interval), "
+        f"not at post-open 9:30:05; got {runner._overnight_reeval_next_retry_at}"
+    )
+    # Explicitly confirm it does NOT land at or after 9:30:05
+    post_open = _dt(9, 30, 5)
+    assert runner._overnight_reeval_next_retry_at < post_open, (
+        "premarket retry must not be forced to post-open — that recreates arm_already_through_trigger"
+    )
 
 
 def test_stalled_931_attempt_uses_retry_interval(monkeypatch):
