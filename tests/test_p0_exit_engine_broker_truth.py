@@ -1,14 +1,15 @@
 """
 tests/test_p0_exit_engine_broker_truth.py
 P0: exit-engine broker-truth visibility repair.
-All tests run against the fixed ap_exit_engine.py source without real DB/broker.
 """
-import re, sqlite3, pytest, types, sys
+import os, re, sqlite3, pytest, types, sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 _REPO = Path(__file__).resolve().parents[1]
 EE_SRC = (_REPO / "ap_exit_engine.py").read_text()
+_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
 # ── Source checks ─────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ def test_upsert_no_source_column():
     )
 
 def test_upsert_on_conflict_requery():
-    """Fix 1: ON CONFLICT fallback re-queries existing row by client_id+contract."""
+    """Fix 1: ON CONFLICT fallback re-queries existing row by client_id+contract+mode."""
     # Find the ON CONFLICT in the _upsert function (skip any earlier occurrences)
     upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
     upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
@@ -32,7 +33,23 @@ def test_upsert_on_conflict_requery():
     assert "SELECT id FROM positions" in upsert_body, (
         "ON CONFLICT fallback must re-query by client_id+contract to return existing id"
     )
+    assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in upsert_body
     assert "ORDER BY entry_ts" in upsert_body
+
+def test_load_db_row_exact_mode_filter_present():
+    """Mode-scoped DB load must select and filter execution_mode."""
+    load_start = EE_SRC.find("def _load_db_position_row")
+    load_end   = EE_SRC.find("\n    def ", load_start + 1)
+    load_body  = EE_SRC[load_start:load_end]
+    assert "signal_id, execution_mode" in load_body
+    assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in load_body
+
+def test_upsert_persists_execution_mode_column():
+    """Broker-repair insert must persist execution_mode explicitly."""
+    upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
+    upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
+    upsert_body  = EE_SRC[upsert_start:upsert_end]
+    assert "execution_mode," in upsert_body
 
 def test_managed_position_from_row_has_prefer_qty_override():
     """Fix 2: _managed_position_from_row must accept prefer_qty_override kwarg."""
@@ -113,6 +130,89 @@ _skip_if_no_mod = pytest.mark.skipif(
 )
 
 
+@contextmanager
+def _postgres_positions_table(monkeypatch):
+    if not _DATABASE_URL:
+        pytest.skip("DATABASE_URL not configured for PostgreSQL coverage")
+    psycopg2 = pytest.importorskip("psycopg2")
+    import importlib
+
+    monkeypatch.delitem(sys.modules, "ap.db", raising=False)
+    monkeypatch.delitem(sys.modules, "ap", raising=False)
+    importlib.invalidate_caches()
+
+    pg_conn = psycopg2.connect(_DATABASE_URL)
+    pg_conn.autocommit = False
+    cur = pg_conn.cursor()
+    cur.execute(
+        """
+        CREATE TEMP TABLE positions (
+            id TEXT PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+            client_id TEXT,
+            underlying TEXT,
+            contract TEXT,
+            option_symbol TEXT,
+            execution_mode TEXT,
+            side TEXT,
+            direction TEXT,
+            qty INTEGER,
+            quantity_remaining INTEGER,
+            avg_fill DOUBLE PRECISION,
+            entry_price DOUBLE PRECISION,
+            entry_ts TIMESTAMPTZ,
+            status TEXT,
+            signal_id TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        ) ON COMMIT DROP
+        """
+    )
+    pg_conn.commit()
+
+    class _ConnWrapper:
+        def __init__(self, connection, cursor):
+            self._conn = connection
+            self._cur = cursor
+
+        def execute(self, sql, params=()):
+            self._cur.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            return self._cur.fetchone()
+
+        def fetchall(self):
+            return self._cur.fetchall()
+
+        @property
+        def description(self):
+            return self._cur.description
+
+        @property
+        def rowcount(self):
+            return self._cur.rowcount
+
+    @contextmanager
+    def fake_conn():
+        local_cur = pg_conn.cursor()
+        try:
+            yield _ConnWrapper(pg_conn, local_cur)
+            pg_conn.commit()
+        except Exception:
+            pg_conn.rollback()
+            raise
+        finally:
+            local_cur.close()
+
+    fake_db = types.SimpleNamespace(conn=fake_conn, run_with_retry=lambda fn, **_: fn())
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+    try:
+        yield pg_conn
+    finally:
+        pg_conn.rollback()
+        cur.close()
+        pg_conn.close()
+
+
 @_skip_if_no_mod
 def test_prefer_qty_override_overrides_stale_zero():
     """
@@ -146,6 +246,88 @@ def test_prefer_qty_override_overrides_stale_zero():
     mp = eng._managed_position_from_row(row, qty_override=3, prefer_qty_override=True)
     assert mp.quantity == 3, f"Expected quantity=3, got {mp.quantity}"
     assert mp.quantity_remaining == 3, f"Expected quantity_remaining=3, got {mp.quantity_remaining}"
+
+
+@_skip_if_no_mod
+def test_load_db_position_row_is_exact_mode_scoped_in_postgres(monkeypatch):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "SPY260821C00650000"
+        client = "mode-scope@example.com"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol, execution_mode,
+                    side, direction, qty, quantity_remaining, avg_fill, entry_price,
+                    entry_ts, status, signal_id
+                ) VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s),
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() - INTERVAL '1 minute', %s, %s)
+                """,
+                (
+                    "live-db-position-id", client, "SPY", contract, contract, "live",
+                    "CALL", "CALL", 1, 1, 1.25, 1.25, "OPEN", "sig-live",
+                    "paper-db-position-id", client, "SPY", contract, contract, "paper",
+                    "CALL", "CALL", 1, 1, 1.15, 1.15, "OPEN", "sig-paper",
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="paper")
+
+        paper_row = eng._load_db_position_row(contract)
+        assert paper_row is not None
+        assert paper_row["id"] == "paper-db-position-id"
+        assert paper_row["execution_mode"] == "paper"
+
+        eng.broker = types.SimpleNamespace(mode="live")
+        live_row = eng._load_db_position_row(contract)
+        assert live_row is not None
+        assert live_row["id"] == "live-db-position-id"
+        assert live_row["execution_mode"] == "live"
+
+
+@_skip_if_no_mod
+def test_upsert_broker_position_to_db_persists_exact_mode_in_postgres(monkeypatch):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "QQQ260821P00450000"
+        client = "mode-upsert@example.com"
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="paper")
+
+        row_id = eng._upsert_broker_position_to_db(
+            contract,
+            {"quantity": 2, "cost_basis": 150.0, "date_acquired": "2026-07-22T13:00:00Z"},
+        )
+
+        assert row_id
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, execution_mode FROM positions WHERE client_id = %s AND contract = %s",
+                (client, contract),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        assert row[0] == row_id
+        assert row[1] == "paper"
 
 
 @_skip_if_no_mod
@@ -298,10 +480,12 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
     eng._email      = "jasoncosby1@gmail.com"
     eng._lock       = threading.Lock()
     eng._positions  = []
+    eng._positions_by_id = {}
 
     # Stub broker: returns one position with qty=3
     mock_broker = MagicMock()
     mock_broker.account_id   = "VA23856850"
+    mock_broker.mode = "live"
     mock_broker.list_positions.return_value = [{
         "symbol":     CONTRACT,
         "quantity":   3,
@@ -325,12 +509,15 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
         "entry_ts":           None,
         "status":             "OPEN",
         "signal_id":          None,
+        "execution_mode":     "live",
     }
 
     added_positions = []
 
     def _fake_add_position(pos):
         added_positions.append(pos)
+        eng._positions.append(pos)
+        eng._positions_by_id[getattr(pos, "position_id", "")] = pos
 
     def _fake_load_db_row(sym):
         return db_row if sym.upper() == CONTRACT else None

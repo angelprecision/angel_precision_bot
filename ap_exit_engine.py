@@ -6044,6 +6044,19 @@ class APExitEngine:
         m = _re.match(r'^([A-Z]+)\d{6}[CP]\d+$', symbol.strip().upper())
         return m.group(1) if m else symbol.strip().upper()[:5]
 
+    def _resolved_execution_mode(self) -> str:
+        def _known_mode(value) -> str:
+            _mode = str(value or "").strip().lower()
+            return _mode if _mode in {"live", "paper"} else ""
+
+        return (
+            _known_mode(getattr(getattr(self, "master_control", None), "mode", ""))
+            or _known_mode(getattr(getattr(self, "broker", None), "execution_mode", ""))
+            or _known_mode(getattr(getattr(self, "broker", None), "mode", ""))
+            or _known_mode(getattr(getattr(getattr(self, "broker", None), "cfg", None), "execution_mode", ""))
+            or _known_mode(getattr(getattr(getattr(self, "broker", None), "cfg", None), "mode", ""))
+        )
+
     def _load_db_position_row(self, sym: str) -> dict | None:
         """Look up an active positions row for this client + contract symbol.
 
@@ -6051,6 +6064,13 @@ class APExitEngine:
         AND adds a quantity_remaining safety guard so a row incorrectly marked
         CLOSED but with remaining qty is still found and managed.
         """
+        _mode = self._resolved_execution_mode()
+        if _mode not in {"live", "paper"}:
+            log.critical(
+                "[exit_eng] _load_db_position_row %s blocked: execution mode unproven for client=%s",
+                sym, self._email,
+            )
+            return None
         try:
             from ap.db import conn, run_with_retry
             def _q():
@@ -6059,9 +6079,10 @@ class APExitEngine:
                         """
                         SELECT id, underlying, contract, option_symbol, side, direction,
                                qty, quantity_remaining, avg_fill, entry_price,
-                               entry_ts, status, signal_id
+                               entry_ts, status, signal_id, execution_mode
                         FROM positions
                         WHERE client_id = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND (
                             UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
                             OR COALESCE(quantity_remaining, 0) > 0
@@ -6073,7 +6094,7 @@ class APExitEngine:
                         ORDER BY entry_ts DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self._email, sym, sym),
+                        (self._email, _mode, sym, sym),
                     )
                     row = c.fetchone()
                     if row:
@@ -6094,6 +6115,13 @@ class APExitEngine:
         ON CONFLICT fallback: if INSERT returns None (row already exists), re-query
         by client_id + contract so repair can proceed with the existing id.
         """
+        _mode = self._resolved_execution_mode()
+        if _mode not in {"live", "paper"}:
+            log.critical(
+                "[exit_eng] _upsert_broker_position_to_db %s blocked: execution mode unproven for client=%s",
+                sym, self._email,
+            )
+            return None
         try:
             from ap.db import conn, run_with_retry
             underlying = self._underlying_from_occ(sym)
@@ -6109,12 +6137,14 @@ class APExitEngine:
                         """
                         INSERT INTO positions (
                             client_id, underlying, contract, option_symbol,
+                            execution_mode,
                             side, direction,
                             qty, quantity_remaining,
                             entry_price, avg_fill,
                             status, entry_ts, updated_at
                         ) VALUES (
                             %s, %s, %s, %s,
+                            %s,
                             %s, %s,
                             %s, %s,
                             %s, %s,
@@ -6124,6 +6154,7 @@ class APExitEngine:
                         RETURNING id
                         """,
                         (self._email, underlying, sym, sym,
+                         _mode,
                          side, side,
                          qty, qty,
                          entry_px, entry_px,
@@ -6137,6 +6168,7 @@ class APExitEngine:
                         """
                         SELECT id FROM positions
                         WHERE client_id = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND (
                             UPPER(contract)         = UPPER(%s)
                             OR UPPER(option_symbol) = UPPER(%s)
@@ -6144,7 +6176,7 @@ class APExitEngine:
                         ORDER BY entry_ts DESC NULLS LAST, updated_at DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self._email, sym, sym),
+                        (self._email, _mode, sym, sym),
                     )
                     existing = c.fetchone()
                     if existing:
@@ -6210,19 +6242,8 @@ class APExitEngine:
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
         _now = datetime.now(timezone.utc)
-        def _known_mode(value) -> str:
-            _mode = str(value or "").strip().lower()
-            return _mode if _mode in {"live", "paper"} else ""
-
-        _execution_mode = (
-            _known_mode(row.get("execution_mode"))
-            or _known_mode(row.get("executionmode"))
-            or _known_mode(getattr(getattr(self, "master_control", None), "mode", ""))
-            or _known_mode(getattr(getattr(self, "broker", None), "execution_mode", ""))
-            or _known_mode(getattr(getattr(self, "broker", None), "mode", ""))
-            or _known_mode(getattr(getattr(getattr(self, "broker", None), "cfg", None), "execution_mode", ""))
-            or _known_mode(getattr(getattr(getattr(self, "broker", None), "cfg", None), "mode", ""))
-        )
+        _row_mode = str(row.get("execution_mode") or row.get("executionmode") or "").strip().lower()
+        _execution_mode = _row_mode if _row_mode in {"live", "paper"} else self._resolved_execution_mode()
         mp = ManagedPosition(
             ticker           = ticker,
             option_symbol    = sym,
