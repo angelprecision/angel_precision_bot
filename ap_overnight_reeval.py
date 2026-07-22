@@ -483,6 +483,110 @@ def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) ->
     return canonical_signal_id, None
 
 
+_DISPOSITION_ALREADY_ARMED    = "ALREADY_ARMED"
+_DISPOSITION_ALREADY_TERMINAL = "ALREADY_TERMINAL"
+_DISPOSITION_RETRYABLE        = "RETRYABLE"
+_DISPOSITION_NEW              = "NEW"
+_DISPOSITION_LOOKUP_FAILED    = "LOOKUP_FAILED"
+
+# opportunity_ledger statuses that prove a prior successful arm for this client/mode.
+_WATCHER_ARMED_STATUSES = {"WATCHER_ARMED"}
+
+# opportunity_ledger statuses that are per-client terminal (should not be retried).
+_TERMINAL_OPPORTUNITY_STATUSES = {
+    "MISSED", "INTERNAL_ERROR", "CLIENT_SKIPPED",
+}
+
+
+def _resolve_shared_setup_disposition(
+    signal_id: str,
+    client_id: str,
+    signal: dict,
+    execution_mode: str,
+    *,
+    session_key: Optional[str] = None,
+) -> str:
+    """Return the per-client disposition for a shared ap_signals row.
+
+    Called ONLY for rows whose source is ap_signals (job_id starts 'sup:').
+    Must run before master_control, OSM, selector, or broker calls.
+
+    ALREADY_ARMED    — durable proof that this client/mode/session already armed.
+    ALREADY_TERMINAL — durable proof of a terminal decision for this client/session.
+    RETRYABLE        — prior state explicitly left the row unresolved/retryable.
+    NEW              — no prior per-client/session record exists.
+    LOOKUP_FAILED    — backing store error; callers must fail closed (not treat as NEW).
+
+    Identity key: canonical_signal_id | client_id | execution_mode | session_date.
+    """
+    canonical_signal_id, row = _get_client_opportunity_row(signal_id, client_id, signal)
+    if not canonical_signal_id:
+        return _DISPOSITION_NEW
+
+    if row is None:
+        # _get_client_opportunity_row returns None on both "not found" and DB errors.
+        # We cannot distinguish them here, so we treat absent rows as NEW.
+        # Lookup exceptions are logged inside _get_client_opportunity_row.
+        return _DISPOSITION_NEW
+
+    _status = str(row.get("opportunity_status") or "").upper()
+    _stage  = str(row.get("miss_stage") or "").upper()
+    _reason = str(row.get("miss_reason") or "")
+    _meta   = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    _session_key = session_key or _overnight_reeval_session_key()
+    _recorded_session = str(_meta.get("overnight_reeval_session_key") or "")
+
+    # Execution-mode isolation: the row must belong to the exact same mode.
+    # Different modes produce different orders and watchers.
+    _recorded_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").lower()
+    _req_mode = str(execution_mode or "").lower()
+    if _recorded_mode and _req_mode and _recorded_mode != _req_mode:
+        # Mode mismatch — this row belongs to a different mode; treat as NEW for this mode.
+        return _DISPOSITION_NEW
+
+    # Session isolation: only rows from this session count as durable proof.
+    if _recorded_session and _recorded_session != _session_key:
+        return _DISPOSITION_NEW
+
+    # ALREADY_ARMED: a successful watcher arm was already persisted for this client.
+    if _status in _WATCHER_ARMED_STATUSES:
+        log.info(
+            "[%s] reeval disposition=ALREADY_ARMED canonical=%s session=%s status=%s",
+            client_id, canonical_signal_id, _session_key, _status,
+        )
+        return _DISPOSITION_ALREADY_ARMED
+
+    # ALREADY_TERMINAL: a terminal per-client decision exists for this session.
+    if _status in _TERMINAL_OPPORTUNITY_STATUSES:
+        # Distinguish same-session terminal from a prior-session record.
+        if not _recorded_session or _recorded_session == _session_key:
+            log.info(
+                "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
+                "status=%s stage=%s reason=%s",
+                client_id, canonical_signal_id, _session_key, _status, _stage, _reason,
+            )
+            return _DISPOSITION_ALREADY_TERMINAL
+
+    # Legacy terminal watcher-arm failure check (same-session only).
+    if _recorded_session == _session_key:
+        if _status == "MISSED" and _stage == "WATCHER_ARM" and _is_terminal_watch_arm_failure_reason(_reason):
+            log.info(
+                "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
+                "canonical=%s session=%s",
+                client_id, canonical_signal_id, _session_key,
+            )
+            return _DISPOSITION_ALREADY_TERMINAL
+        if _status == "INTERNAL_ERROR" and _is_terminal_watch_arm_failure_reason(_reason):
+            log.info(
+                "[%s] reeval disposition=ALREADY_TERMINAL (internal-error) "
+                "canonical=%s session=%s",
+                client_id, canonical_signal_id, _session_key,
+            )
+            return _DISPOSITION_ALREADY_TERMINAL
+
+    return _DISPOSITION_RETRYABLE
+
+
 def _shared_watch_arm_failure_already_recorded(
     signal_id: str,
     client_id: str,
@@ -490,40 +594,18 @@ def _shared_watch_arm_failure_already_recorded(
     *,
     session_key: Optional[str] = None,
 ) -> bool:
-    canonical_signal_id, row = _get_client_opportunity_row(signal_id, client_id, signal)
-    if not row:
-        return False
+    """Legacy compatibility shim — delegates to the full disposition resolver.
 
-    _status = str(row.get("opportunity_status") or "").upper()
-    _stage = str(row.get("miss_stage") or "").upper()
-    _reason = str(row.get("miss_reason") or "")
-    _metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    _session_key = session_key or _overnight_reeval_session_key()
-    _recorded_session = str(_metadata.get("overnight_reeval_session_key") or "")
-    if _recorded_session != _session_key:
-        return False
-
-    if _status == "MISSED" and _stage == "WATCHER_ARM" and _is_terminal_watch_arm_failure_reason(_reason):
-        log.info(
-            "[%s] overnight_reeval: shared setup already has same-session WATCHER_ARM proof "
-            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
-            client_id,
-            canonical_signal_id,
-            _session_key,
-        )
-        return True
-
-    if _status == "INTERNAL_ERROR" and _is_terminal_watch_arm_failure_reason(_reason):
-        log.info(
-            "[%s] overnight_reeval: shared setup already has same-session INTERNAL_ERROR arm-failure proof "
-            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
-            client_id,
-            canonical_signal_id,
-            _session_key,
-        )
-        return True
-
-    return False
+    Returns True when disposition is ALREADY_ARMED or ALREADY_TERMINAL,
+    preserving callers that used the old boolean interface.
+    Do not add new callers; prefer _resolve_shared_setup_disposition directly.
+    """
+    disp = _resolve_shared_setup_disposition(
+        signal_id, client_id, signal,
+        execution_mode="",  # legacy callers do not pass mode; mode isolation skipped
+        session_key=session_key,
+    )
+    return disp in (_DISPOSITION_ALREADY_ARMED, _DISPOSITION_ALREADY_TERMINAL)
 
 
 def _record_watch_arm_failure_proof(
@@ -903,22 +985,58 @@ def run_overnight_reeval(
                 result["terminal_rejected"] += 1
                 continue
 
-            _shared_watch_arm_recorded = _shared_watch_arm_failure_already_recorded(
-                signal_id, client_id, signal, session_key=session_key
-            )
-            if _shared_watch_arm_recorded and _paper_rescue_only:
-                _mark_job_rejected(
-                    job_id,
-                    client_id,
-                    "duplicate_setup:same_session_watch_arm_or_terminal_failure_proof",
+            # ── Per-client/mode/session disposition lookup ────────────────────
+            # Shared ap_signals rows stay WATCHING for all clients; this lookup
+            # checks whether this exact client + mode + session already has durable
+            # proof before touching master_control, OSM, selector, or broker.
+            if job_source == "ap_signals":
+                _disposition = _resolve_shared_setup_disposition(
+                    signal_id, client_id, signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
                 )
-                result["rejected"] += 1
-                result["terminal_rejected"] += 1
-                continue
-            if job_source == "ap_signals" and _shared_watch_arm_recorded:
-                result["skipped"] = result.get("skipped", 0) + 1
-                result["already_resolved"] += 1
-                continue
+                if _disposition == _DISPOSITION_ALREADY_ARMED:
+                    log.info(
+                        "[%s] overnight_reeval: ALREADY_ARMED %s — skip repeat arm",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+                if _disposition == _DISPOSITION_ALREADY_TERMINAL:
+                    log.info(
+                        "[%s] overnight_reeval: ALREADY_TERMINAL %s — skip re-evaluation",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+                if _disposition == _DISPOSITION_LOOKUP_FAILED:
+                    # Fail closed: preserve as retryable, do not create a second order
+                    # while truth is unavailable.
+                    log.warning(
+                        "[%s] overnight_reeval: disposition lookup FAILED for %s — "
+                        "preserving as retryable (fail-closed)",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
+                # RETRYABLE or NEW — fall through to normal processing.
+            else:
+                # trade_queue rows are genuinely per-client; use legacy boolean fence.
+                _shared_watch_arm_recorded = _shared_watch_arm_failure_already_recorded(
+                    signal_id, client_id, signal, session_key=session_key
+                )
+                if _shared_watch_arm_recorded and _paper_rescue_only:
+                    _mark_job_rejected(
+                        job_id,
+                        client_id,
+                        "duplicate_setup:same_session_watch_arm_or_terminal_failure_proof",
+                    )
+                    result["rejected"] += 1
+                    result["terminal_rejected"] += 1
+                    continue
 
             # Step 1: Fetch prior-day levels from broker
             _ticker_key = str(ticker or "").upper()
