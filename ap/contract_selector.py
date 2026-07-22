@@ -173,6 +173,7 @@ class SelectorRequestContext:
     direct_quote_eligible_candidates: int = 0
     direct_quote_attempted_symbols: list[str] = field(default_factory=list)
     direct_quote_unattempted_symbols: list[str] = field(default_factory=list)
+    direct_quote_unattempted_set: set[str] = field(default_factory=set)
     direct_quote_unattempted_count: int = 0
     direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
     max_total_elapsed_ms: int = 15000

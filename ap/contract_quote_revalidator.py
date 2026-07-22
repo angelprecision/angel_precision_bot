@@ -273,11 +273,17 @@ def _ctx_note_attempted_symbol(request_context, occ_symbol: str) -> None:
 def _ctx_note_unattempted_symbol(request_context, occ_symbol: str) -> None:
     if request_context is None:
         return
-    current = int(getattr(request_context, "direct_quote_unattempted_count", 0) or 0)
-    setattr(request_context, "direct_quote_unattempted_count", current + 1)
+    seen = getattr(request_context, "direct_quote_unattempted_set", None)
+    if isinstance(seen, set):
+        if occ_symbol in seen:
+            _ctx_update_sink(request_context)
+            return
+        seen.add(occ_symbol)
     symbols = getattr(request_context, "direct_quote_unattempted_symbols", None)
     if isinstance(symbols, list) and occ_symbol not in symbols and len(symbols) < 25:
         symbols.append(occ_symbol)
+    current = len(seen) if isinstance(seen, set) else len(symbols or [])
+    setattr(request_context, "direct_quote_unattempted_count", current)
     _ctx_update_sink(request_context)
 
 
