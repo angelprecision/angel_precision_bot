@@ -801,6 +801,27 @@ def _mark_adoption_identity_quarantined(pos, reason: str) -> None:
         log.debug("[exit_eng] mark adoption identity quarantine failed: %s", _e)
 
 
+def _clear_adoption_identity_quarantine(pos) -> None:
+    try:
+        pos.adoption_identity_quarantined = False
+        pos.adoptionidentityquarantined = False
+        pos.adoption_identity_quarantine_reason = ""
+        pos.adoptionidentityquarantinereason = ""
+    except Exception as _e:
+        log.debug("[exit_eng] clear adoption identity quarantine failed: %s", _e)
+
+
+def _is_behavior_active_position(pos) -> bool:
+    try:
+        return (
+            not getattr(pos, "closed", False)
+            and int(getattr(pos, "quantity_remaining", 0) or 0) > 0
+            and not _is_adoption_identity_quarantined(pos)
+        )
+    except Exception:
+        return False
+
+
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
 
 
@@ -864,6 +885,7 @@ class CanonicalAdoptionResult:
       NO_REPAIR_FOUND                  - no broker-repair; caller should seed normally.
       RETRY_CLIENT_MISMATCH            - client IDs do not match; retain protective monitoring.
       RETRY_MODE_MISMATCH              - execution modes incompatible; retain monitoring.
+      RETRY_REPAIR_IDENTITY_UNPROVEN   - retained same-contract repair is diagnostic only.
       RETRY_IDENTITY_CONFLICT          - canonical object mismatch; retain monitoring.
       RETRY_ADOPTION_ERROR             - unexpected exception; retain monitoring.
     """
@@ -3295,6 +3317,7 @@ class APExitEngine:
                 # Update O(1) index atomically
                 self._positions_by_id.pop(old_id, None)
                 self._positions_by_id[_canon_id] = pos
+                _clear_adoption_identity_quarantine(pos)
 
                 log.info(
                     "[exit_eng] CANONICAL_POSITION_ADOPTED "
@@ -3344,6 +3367,29 @@ class APExitEngine:
                     and not existing.closed
                 )
                 if same_id or same_sym:
+                    _incoming_id = str(getattr(pos, "position_id", "") or "")
+                    _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                    _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                    _incoming_is_proven_canonical = (
+                        _incoming_id
+                        and not _incoming_id.startswith("broker-repair-")
+                        and _incoming_client
+                        and _incoming_mode in {"live", "paper"}
+                    )
+                    if (
+                        same_sym
+                        and not same_id
+                        and _is_adoption_identity_quarantined(existing)
+                        and _incoming_is_proven_canonical
+                    ):
+                        log.warning(
+                            "[exit_eng] ADD_POSITION_CANONICAL_BYPASSES_QUARANTINED_REPAIR "
+                            "| canonical=%s repair=%s contract=%s",
+                            _incoming_id,
+                            getattr(existing, "position_id", ""),
+                            getattr(pos, "option_symbol", ""),
+                        )
+                        continue
                     log.debug(
                         "[%s] Exit engine already tracking %s | pos_id=%s",
                         self._email or pos.ticker,
@@ -3382,12 +3428,7 @@ class APExitEngine:
 
     def active_positions(self) -> list[ManagedPosition]:
         with self._lock:
-            return [
-                p for p in self._positions
-                if not p.closed
-                and int(p.quantity_remaining or 0) > 0
-                and not _is_adoption_identity_quarantined(p)
-            ]
+            return [p for p in self._positions if _is_behavior_active_position(p)]
 
     def attach_quote_monitor(self, monitor) -> None:
         """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
@@ -4223,9 +4264,7 @@ class APExitEngine:
             with self._lock:
                 snapshot = [
                     p for p in self._positions
-                    if not getattr(p, "closed", False)
-                    and int(getattr(p, "quantity_remaining", 0) or 0) > 0
-                    and not _is_adoption_identity_quarantined(p)
+                    if _is_behavior_active_position(p)
                 ]
 
             for pos in snapshot:
@@ -4896,9 +4935,7 @@ class APExitEngine:
         with self._lock:
             snapshot = list(self._positions)
         for pos in snapshot:
-            if pos.closed or int(pos.quantity_remaining or 0) <= 0:
-                continue
-            if _is_adoption_identity_quarantined(pos):
+            if not _is_behavior_active_position(pos):
                 continue
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
             # AMENDMENT #4 (blocker 2): sentinels are the LAST-CHANCE money-safety
@@ -6173,6 +6210,18 @@ class APExitEngine:
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
         _now = datetime.now(timezone.utc)
+        _row_mode = str(row.get("execution_mode") or row.get("executionmode") or "").strip().lower()
+        _engine_mode = str(
+            getattr(getattr(self, "master_control", None), "mode", "")
+            or getattr(getattr(self, "broker", None), "execution_mode", "")
+            or getattr(getattr(self, "broker", None), "mode", "")
+            or getattr(getattr(getattr(self, "broker", None), "cfg", None), "execution_mode", "")
+            or getattr(getattr(getattr(self, "broker", None), "cfg", None), "mode", "")
+            or ""
+        ).strip().lower()
+        _execution_mode = _row_mode if _row_mode in {"live", "paper"} else (
+            _engine_mode if _engine_mode in {"live", "paper"} else ("live" if prefer_qty_override else "")
+        )
         mp = ManagedPosition(
             ticker           = ticker,
             option_symbol    = sym,
@@ -6185,6 +6234,7 @@ class APExitEngine:
             position_id      = pos_id,
             client_id        = self._email,
             signal_id        = sig_id,
+            execution_mode    = _execution_mode,
             quantity_remaining = qty,
             opened_at        = opened_at or _now,
         )
@@ -6290,7 +6340,7 @@ class APExitEngine:
         with self._lock:
             _local_count = sum(
                 1 for p in self._positions
-                if not p.closed and int(p.quantity_remaining or 0) > 0
+                if _is_behavior_active_position(p)
             )
 
         # ── 1. Fetch broker positions ─────────────────────────────────────────
@@ -6321,7 +6371,7 @@ class APExitEngine:
             engine_syms = {
                 str(getattr(p, "option_symbol", "") or "").upper()
                 for p in self._positions
-                if not p.closed and int(p.quantity_remaining or 0) > 0
+                if _is_behavior_active_position(p)
             }
 
         missing_from_engine = broker_syms - engine_syms
@@ -6428,6 +6478,12 @@ class APExitEngine:
                         prefer_qty_override=True,
                     )
                     self.add_position(pos)
+                    _loaded_active = (
+                        self._positions_by_id.get(getattr(pos, "position_id", "")) is pos
+                        or pos in self.active_positions()
+                    )
+                    if not _loaded_active:
+                        raise RuntimeError("add_position did not install behavior-active DB owner")
                     loaded_db_syms.append(sym)
                 except Exception as _le:
                     log.warning(
@@ -6474,6 +6530,7 @@ class APExitEngine:
                         "entry_price":        entry_px,
                         "avg_fill":           entry_px,
                         "entry_ts":           bp.get("date_acquired"),
+                        "execution_mode":     "live",
                     }
                     pos = self._managed_position_from_row(
                         minimal_row,
@@ -6481,6 +6538,12 @@ class APExitEngine:
                         prefer_qty_override=True,
                     )
                     self.add_position(pos)
+                    _loaded_active = (
+                        self._positions_by_id.get(getattr(pos, "position_id", "")) is pos
+                        or pos in self.active_positions()
+                    )
+                    if not _loaded_active:
+                        raise RuntimeError("add_position did not install behavior-active broker owner")
                     if new_id:
                         repaired_syms.append(sym)              # confirmed DB row
                     else:
@@ -7286,6 +7349,8 @@ class APExitEngine:
             stale_underlying_quotes    = []
             stale_option_quotes        = []
             missing_callback_identity  = []
+            adoption_identity_quarantined = []
+            behavior_active_count = 0
 
             for pos in self._positions:
                 flight_sec                  = None
@@ -7322,6 +7387,11 @@ class APExitEngine:
 
                 if getattr(pos, "last_callback_identity_missing", False) and pos.exit_in_flight:
                     missing_callback_identity.append(pos.position_id or pos.option_symbol or pos.ticker)
+                adoption_quarantined = _is_adoption_identity_quarantined(pos)
+                if adoption_quarantined:
+                    adoption_identity_quarantined.append(ident)
+                if _is_behavior_active_position(pos):
+                    behavior_active_count += 1
 
                 positions.append({
                     "position_id":                     pos.position_id,
@@ -7347,6 +7417,11 @@ class APExitEngine:
                     "last_option_quote_missing_ts":    pos.last_option_quote_missing_ts.isoformat() if pos.last_option_quote_missing_ts else "",
                     "last_callback_identity_missing":  getattr(pos, "last_callback_identity_missing", False),
                     "exit_identity_quarantine":        getattr(pos, "exit_identity_quarantine", False),
+                    "adoption_identity_quarantined":   adoption_quarantined,
+                    "adoption_identity_quarantine_reason": (
+                        getattr(pos, "adoption_identity_quarantine_reason", "")
+                        or getattr(pos, "adoptionidentityquarantinereason", "")
+                    ),
                     "exit_identity_quarantine_alert_count": getattr(pos, "exit_identity_quarantine_alert_count", 0),
                     "last_exit_identity_quarantine_alert_ts": (
                         pos.last_exit_identity_quarantine_alert_ts.isoformat()
@@ -7370,6 +7445,10 @@ class APExitEngine:
                 "thread_alive":                   thread_alive,
                 "thread_name":                    self._thread.name if self._thread else "",
                 "position_count":                 len(positions),
+                "tracked_position_count":         len(positions),
+                "behavior_active_position_count": behavior_active_count,
+                "adoption_identity_quarantined_count": len(adoption_identity_quarantined),
+                "adoption_identity_quarantined":  adoption_identity_quarantined,
                 "stale_inflight_count":           len(stale_inflight),
                 "stale_inflight":                 stale_inflight,
                 "stale_quote_count":              len(stale_quotes),

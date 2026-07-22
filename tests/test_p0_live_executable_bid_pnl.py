@@ -1061,6 +1061,201 @@ class TestCanonicalPlusRepairCollapse:
         assert getattr(repair, "adoption_identity_quarantined", False) is True
         assert engine.active_positions() == [canonical]
 
+    def test_quarantined_repair_can_recover_canonical_owner_via_broker_precheck(self):
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "acct-1"
+            mode = "live"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id="", execution_mode="",
+            quantity=1, quantity_remaining=1,
+        )
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_identity_unproven"
+        engine._positions = [repair]
+        engine._positions_by_id[repair.position_id] = repair
+
+        db_row = {
+            "id": "canon-recovered",
+            "contract": _CONTRACT,
+            "option_symbol": _CONTRACT,
+            "underlying": _TICKER,
+            "side": "CALL",
+            "qty": 1,
+            "quantity_remaining": 1,
+            "entry_price": 1.59,
+            "execution_mode": "live",
+            "status": "OPEN",
+            "signal_id": _SIG,
+        }
+        engine._load_db_position_row = lambda sym: db_row if sym == _CONTRACT else None
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine.active_positions() == []
+        assert engine._broker_position_precheck() is True
+
+        canonical = engine._positions_by_id["canon-recovered"]
+        assert canonical.position_id == "canon-recovered"
+        assert canonical.execution_mode == "live"
+        assert engine.active_positions() == [canonical]
+        assert repair in engine._positions
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+
+    def test_broker_precheck_repair_then_fill_seed_adopts_canonical_owner(self, monkeypatch):
+        from ap import fill_monitor as fm
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "acct-1"
+            mode = "live"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: None
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine._broker_position_precheck() is True
+        repairs = [
+            p for p in engine._positions
+            if str(getattr(p, "position_id", "")).startswith("broker-repair-")
+        ]
+        assert len(repairs) == 1
+        assert repairs[0].execution_mode == "live"
+
+        fm._seed_exit_engine(
+            engine,
+            "canon-live",
+            {
+                "contract": _CONTRACT,
+                "symbol": _CONTRACT,
+                "client_id": _CLIENT,
+                "local_order_id": "ord-1",
+                "broker_order_id": "brk-1",
+                "execution_mode": "live",
+                "stop_underlying": 215.0,
+                "target_underlying": 230.0,
+                "direction": "CALL",
+            },
+            {"filled_qty": 1, "avg_fill": 1.59},
+            _SIG,
+        )
+
+        assert "canon-live" in engine._positions_by_id
+        adopted = engine._positions_by_id["canon-live"]
+        assert adopted.execution_mode == "live"
+        assert adopted.underlying_stop == pytest.approx(215.0)
+        assert adopted.underlying_target == pytest.approx(230.0)
+        assert getattr(adopted, "adoption_identity_quarantined", False) is False
+        assert engine.active_positions() == [adopted]
+        assert not any(
+            str(pid).startswith("broker-repair-")
+            for pid in engine._positions_by_id
+        )
+
+    def test_broker_precheck_with_only_quarantined_repair_installs_broker_owner(self):
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "acct-1"
+            mode = "live"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id="", execution_mode="",
+            quantity=1, quantity_remaining=1,
+        )
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_identity_unproven"
+        engine._positions = [repair]
+        engine._positions_by_id[repair.position_id] = repair
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: "canon-from-broker"
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine.active_positions() == []
+        assert engine._broker_position_precheck() is True
+
+        active = engine.active_positions()
+        assert len(active) == 1
+        assert active[0].position_id == "canon-from-broker"
+        assert active[0].execution_mode == "live"
+        assert repair in engine._positions
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+
+    def test_successful_re_adoption_clears_prior_quarantine_flags(self):
+        from ap_exit_engine import APExitEngine, ManagedPosition
+
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        repair = ManagedPosition(
+            ticker=_TICKER, option_symbol=_CONTRACT,
+            side="CALL", quantity=1, quantity_remaining=1, entry_price=1.59,
+            underlying_entry=220.0, underlying_target=230.0, underlying_stop=215.0,
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            client_id=_CLIENT, execution_mode="live",
+            opened_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        repair.adoption_identity_quarantined = True
+        repair.adoptionidentityquarantined = True
+        repair.adoption_identity_quarantine_reason = "previously_unknown"
+        repair.adoptionidentityquarantinereason = "previously_unknown"
+        repair.exit_in_flight = False
+        repair.pending_exit_reason = ""
+        engine._positions.append(repair)
+        engine._positions_by_id[repair.position_id] = repair
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon-recovered",
+            local_order_id="ord-1", broker_order_id="brk-1",
+            signal_id=_SIG, canonical_signal_id=_SIG,
+            entry_fill=1.59, entry_ts=None,
+            execution_mode="live", client_id=_CLIENT,
+        )
+
+        adopted = engine._positions_by_id["canon-recovered"]
+        assert result.disposition == "ADOPTED"
+        assert getattr(adopted, "adoption_identity_quarantined", True) is False
+        assert getattr(adopted, "adoptionidentityquarantined", True) is False
+        assert getattr(adopted, "adoption_identity_quarantine_reason", None) == ""
+        assert engine.active_positions() == [adopted]
+        assert engine._can_submit_exit(adopted, datetime.now(timezone.utc), reason="test") is True
+
     def test_existing_canonical_stale_repair_bid_cannot_raise_peak(self):
         engine, canon_id, repair_id = self._make_engine_with_both()
         repair = engine._positions_by_id[repair_id]

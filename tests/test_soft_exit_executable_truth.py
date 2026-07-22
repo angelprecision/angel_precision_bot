@@ -1854,6 +1854,34 @@ class TestAmendment4EmergencyFlatten:
         assert submitted_pos.position_id == canonical.position_id
         assert decision.action == "CLOSE_ALL"
 
+    def test_health_snapshot_exposes_adoption_quarantine_counts(self):
+        import ap_exit_engine as ee_mod
+        from datetime import datetime, timedelta, timezone as _tz
+
+        eng = self._make_engine()
+        expiry = datetime.now(_tz.utc) + timedelta(days=5)
+        _exp = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
+        repair = ee_mod.ManagedPosition(
+            ticker="ABT", option_symbol=f"ABT{_exp}C00150000",
+            side="CALL", quantity=1, quantity_remaining=1, entry_price=1.00,
+            underlying_entry=150.0, underlying_target=155.0, underlying_stop=145.0,
+            execution_mode="",
+            opened_at=datetime.now(_tz.utc) - timedelta(minutes=5),
+        )
+        repair.position_id = f"broker-repair-test@client.com-{repair.option_symbol}"
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_mode='' canonical_mode='live'"
+        eng._positions = [repair]
+        eng._positions_by_id = {repair.position_id: repair}
+
+        snapshot = eng.health_snapshot()
+
+        assert snapshot["tracked_position_count"] == 1
+        assert snapshot["behavior_active_position_count"] == 0
+        assert snapshot["adoption_identity_quarantined_count"] == 1
+        assert snapshot["positions"][0]["adoption_identity_quarantined"] is True
+        assert "repair_mode" in snapshot["positions"][0]["adoption_identity_quarantine_reason"]
+
 
 class TestAmendment4SnapshotPathCarriesMoneySafety:
     """Blocker 4: QPM snapshot dict carries all money-safety fields."""
@@ -2172,7 +2200,7 @@ class TestAmendment4HardRiskPreGate:
 
         eng._check_all_positions(now_et=self._test_now_et())
 
-        assert len(eng._submitted) <= 1
+        assert len(eng._submitted) == 1
         assert all(pos.position_id == canonical.position_id for pos, _, _ in eng._submitted)
 
     def test_real_check_all_positions_forces_eval_for_equity_0dte_at_minus_23pct(self):
