@@ -1753,14 +1753,20 @@ class ClientRunner(threading.Thread):
         window_end = self._overnight_reeval_window_end(today)
         if self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS:
             return None, "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
-        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
-            post_open = datetime(today.year, today.month, today.day, 9, 30, 5, tzinfo=_ET)
-            scheduled = max(now_et + timedelta(seconds=OVERNIGHT_REEVAL_RETRY_SEC), post_open)
-        else:
-            delay = OVERNIGHT_REEVAL_RETRY_SEC
-            if now_et.hour == 9 and now_et.minute == 30 and now_et.second < 5:
-                delay = max(delay, OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC)
-            scheduled = now_et + timedelta(seconds=delay)
+
+        # P0 FIX (Blocker 2): premarket retries use the normal retry interval directly.
+        # Previously, any retry before 9:30 ET was forced to max(now+interval, 9:30:05),
+        # which meant a 9:00 failure retried at 9:30:05 — past the point where watchers
+        # could be armed before breach. PR #388 deferred contract selection to breach time,
+        # so premarket work (prior-level fetch, snapshot, MC check, OSM, watcher arm) can
+        # all complete before open. Forcing retries to post-open recreates
+        # arm_already_through_trigger incidents.
+        #
+        # Optionally a single post-open fallback is still available: if the result
+        # remains RETRYABLE at/after 9:30, we schedule one more bounded attempt.
+        # This is additive — it does NOT suppress premarket attempts.
+        scheduled = now_et + timedelta(seconds=OVERNIGHT_REEVAL_RETRY_SEC)
+
         if scheduled >= window_end:
             return None, "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
         return scheduled, None
