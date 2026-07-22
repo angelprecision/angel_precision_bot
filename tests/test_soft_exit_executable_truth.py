@@ -452,38 +452,58 @@ class TestEvaluateExitExecutableTruth:
         ), f"Got deferred code: {decision.reason_code}"
 
     """
-    Test 8: Entry grace suppresses soft exit but NOT hard stop.
+    Test 8: Entry grace protects young loss exits without suppressing winners
+            or hard stops.
     """
-    def test_entry_grace_suppresses_soft_but_not_hard_stop(self):
-        # Very new position — inside grace window (< _MIN_HOLD_BEFORE_EXIT_MIN)
-        pos_soft = _make_pos(
+    def test_entry_grace_policy_young_winners_losses_and_hard_stops(self):
+        now_et = _et_noon().replace(hour=10)
+
+        pos_winner = _make_pos(
             entry_price=1.00,
-            current_bid=1.18,
+            current_bid=1.16,
+            current_ask=1.20,
             current_option_price=1.18,
             option_bid_valid=True,
             option_quote_fresh=True,
-            exit_executable_pnl_pct=0.18,
-            opened_at=datetime.now(_UTC) - timedelta(minutes=1),  # very new
+            exit_executable_pnl_pct=0.16,
+            underlying_available=True,
+            underlying_fresh=True,
+            scale_outs_done=0,
+            quantity=3,
+            quantity_remaining=3,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
         )
-        now_et = _et_noon().replace(hour=10)
+        decision_winner = evaluate_exit(pos_winner, now_et)
+        assert decision_winner.action == "SCALE_OUT", (
+            f"Young profitable BID must remain scale-out eligible: "
+            f"{decision_winner.action}: {decision_winner.reason}"
+        )
+
+        pos_soft = _make_pos(
+            entry_price=1.00,
+            current_bid=0.87,
+            current_ask=0.90,
+            current_option_price=0.88,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.13,
+            touched_profit=False,
+            underlying_available=True,
+            underlying_fresh=True,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=1),
+        )
         decision_soft = evaluate_exit(pos_soft, now_et)
-        # AMENDMENT #2 (blocker 4): the grace contract is now enforced in the
-        # soft-exit gate — a 1-minute-old position with fresh +18% bid must
-        # return the explicit ENTRY_GRACE deferral, not scale out.
         assert decision_soft.action == "HOLD", (
-            f"Soft exit must defer inside grace: {decision_soft.action}: {decision_soft.reason}"
+            f"Young soft loss must defer inside grace: "
+            f"{decision_soft.action}: {decision_soft.reason}"
         )
         assert decision_soft.reason_code == SOFT_EXIT_DEFERRED_ENTRY_GRACE, (
             f"Got {decision_soft.reason_code}: {decision_soft.reason}"
         )
 
-        # Hard stop should fire even when young.
-        # AUDIT FIX: a catastrophic loss (past _hard_stop) now SKIPS the soft-loss
-        # branch entirely, so the HARD STOP is reachable on the first evaluation —
-        # no 45s breach-confirmation delay for losses at/past the hard threshold.
         pos_hard = _make_pos(
             entry_price=1.00,
-            current_bid=0.55,           # -45% — past hard stop threshold (-33%)
+            current_bid=0.55,
             current_option_price=0.55,
             option_bid_valid=True,
             option_quote_fresh=True,
