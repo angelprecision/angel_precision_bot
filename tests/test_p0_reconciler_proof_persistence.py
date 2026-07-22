@@ -580,8 +580,7 @@ class TestReconcilerNoDirectProofLogger:
         # Extract only _execute_reconciler_close body
         start = src.find("def _execute_reconciler_close(")
         assert start != -1, "_execute_reconciler_close not found"
-        end = src.find("
-    def _import_broker", start)
+        end = src.find("\n    def _import_broker", start)
         body = src[start:end] if end != -1 else src[start:]
 
         assert "APProofLogger(" not in body, (
@@ -608,8 +607,7 @@ class TestReconcilerNoDirectProofLogger:
         removed from the reconciler — that logic belongs in ensure_terminal_close_proof."""
         src = open(_REPO / "ap_reconciler.py").read()
         start = src.find("def _execute_reconciler_close(")
-        end = src.find("
-    def _import_broker", start)
+        end = src.find("\n    def _import_broker", start)
         body = src[start:end] if (start != -1 and end != -1) else ""
         # The old idempotency guard pattern must not exist in the reconciler anymore
         assert "_IDEM_EXISTS" not in body, (
@@ -1194,3 +1192,68 @@ class TestPersistenceMetadataNotInPayload:
         row = sb.inserts[0]
         assert "_proof_persisted" not in row
         assert "_proof_persistence_error" not in row
+
+
+# =============================================================================
+# P1 fix: proof_diagnostics persisted on canonical insert
+# =============================================================================
+
+class TestProofDiagnosticsPersistence:
+    """Verify that proof_diagnostics passed to log_trade() reaches the inserted
+    row on the canonical (Stage 1) path. Prior to the fix, the field was
+    accepted as a parameter but silently dropped from the row dict, producing
+    the JSONB column default {} on every insert."""
+
+    def _log_with_diagnostics(self, sb, diagnostics):
+        from ap_proof_logger import APProofLogger
+        from unittest.mock import patch
+        proof = APProofLogger(supabase_client=sb, client_email="test@x.com", mode="live")
+        with patch("ap.proof_taxonomy_guard.resolve_originating_entry_identity", return_value=None):
+            proof.log_trade(
+                ticker="AAPL", pattern="3-1-2", side="CALL", timeframe="5m",
+                score=85, tier="A", context_score=80, setup_status="complete",
+                entry_trigger=1.00, entry_option_price=1.00, exit_option_price=1.20,
+                underlying_entry=150.0, underlying_exit=155.0,
+                contracts=2, exit_reason="TARGET_HIT",
+                option_pnl_pct=20.0, underlying_pnl_pct=3.3, win=True,
+                local_order_id="order-diag-1", execution_mode="live",
+                proof_diagnostics=diagnostics,
+            )
+
+    def test_proof_diagnostics_populated_in_canonical_insert(self):
+        """proof_diagnostics must appear in the Stage-1 (full-row) insert payload."""
+        sb = _InsertCapture()
+        diag = {"trigger_crossed_at": "2026-07-21T10:05:00Z", "quote_age_ms": 120}
+        self._log_with_diagnostics(sb, diag)
+        assert len(sb.inserts) == 1, "expected exactly one insert"
+        row = sb.inserts[0]
+        assert "proof_diagnostics" in row, (
+            "proof_diagnostics must be in the insert row — it was missing before the fix "
+            "causing the JSONB column to default to {}"
+        )
+        assert row["proof_diagnostics"] == diag, (
+            f"proof_diagnostics value mismatch: expected {diag!r}, got {row['proof_diagnostics']!r}"
+        )
+
+    def test_none_proof_diagnostics_inserts_null(self):
+        """None diagnostics must insert as SQL NULL (not {}) so the column
+        can be filtered as IS NULL for rows without evidence."""
+        sb = _InsertCapture()
+        self._log_with_diagnostics(sb, None)
+        assert len(sb.inserts) == 1
+        row = sb.inserts[0]
+        assert "proof_diagnostics" in row
+        assert row["proof_diagnostics"] is None, (
+            f"None diagnostics must persist as SQL NULL, got {row['proof_diagnostics']!r}"
+        )
+
+    def test_empty_dict_proof_diagnostics_inserts_null(self):
+        """An empty dict is not meaningful evidence; it must persist as NULL
+        so consumers can distinguish 'no diagnostics' from 'empty diagnostics'."""
+        sb = _InsertCapture()
+        self._log_with_diagnostics(sb, {})
+        assert len(sb.inserts) == 1
+        row = sb.inserts[0]
+        assert row.get("proof_diagnostics") is None, (
+            f"Empty dict diagnostics must persist as NULL, got {row['proof_diagnostics']!r}"
+        )
