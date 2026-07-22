@@ -6335,7 +6335,7 @@ class APExitEngine:
 
         return len(repair_failed_syms) == 0
 
-    def _check_all_positions(self):
+    def _check_all_positions(self, now_et: Optional[datetime] = None):
         today_et = _et_session_date()
 
         # Broker truth precheck: verify engine positions match broker before evaluating exits.
@@ -6462,7 +6462,7 @@ class APExitEngine:
         except Exception:
             pass
 
-        now_et = datetime.now(ET)
+        now_et = now_et or datetime.now(ET)
         active = self.active_positions()
         if not active:
             return

@@ -1911,6 +1911,7 @@ class TestAmendment4HardRiskPreGate:
 
         eng = ee_mod.APExitEngine(broker=_MinimalBroker(), email="test@client.com")
         # Stub external boundaries
+        eng._broker_position_precheck = lambda: True
         eng._persist_peak_state_to_db = lambda pos: None
         eng._emit_exit_decision_stamp = lambda *a, **kw: None
         # Capture submission attempts
@@ -1926,13 +1927,25 @@ class TestAmendment4HardRiskPreGate:
         eng._emit_exit_event = lambda *a, **kw: None
         return eng
 
+    @staticmethod
+    def _test_now_et():
+        # These tests target hard-risk pre-gate ordering, not EOD behavior.
+        # Use a deterministic in-session clock so CI start time cannot make
+        # the EOD pre-gate short-circuit the assertion.
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        return datetime.now(et).replace(hour=10, minute=0, second=0, microsecond=0)
+
     def _make_managed_position(self, *, side="CALL", entry=1.00,
                                 hard_ref_pnl=-0.45, dte=5,
                                 age_minutes=1, current_option_price=0.0,
                                 current_bid=0.0, current_underlying=0.0):
         import ap_exit_engine as ee_mod
         from datetime import datetime, timedelta, timezone as _tz
-        expiry = datetime.now(_tz.utc) + timedelta(days=dte)
+        # Derive OCC expiry from the same ET session date used by the fixed
+        # test clock.  Using datetime.now(UTC) makes a nominal 0DTE fixture
+        # become 1DTE after midnight UTC while it is still the prior ET session.
+        expiry = self._test_now_et().astimezone(_tz.utc) + timedelta(days=dte)
         # Proper OCC symbol: 6-digit YYMMDD
         _exp_str = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
         ticker = "SPY" if dte == 0 else "ABT"
@@ -1983,7 +1996,7 @@ class TestAmendment4HardRiskPreGate:
         eng._positions = [pos]
         eng._positions_by_id[pos.position_id] = pos
 
-        eng._check_all_positions()
+        eng._check_all_positions(now_et=self._test_now_et())
 
         # The pre-gate must have forced evaluate_exit() which produced a HARD STOP,
         # which was then routed to _submit_exit_decision.
@@ -2010,7 +2023,7 @@ class TestAmendment4HardRiskPreGate:
         eng._positions = [pos]
         eng._positions_by_id[pos.position_id] = pos
 
-        eng._check_all_positions()
+        eng._check_all_positions(now_et=self._test_now_et())
 
         assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted), (
             f"expected 1 submission, got {len(eng._submitted)} for equity 0DTE at -23%"
@@ -2028,7 +2041,7 @@ class TestAmendment4HardRiskPreGate:
         eng._positions = [pos]
         eng._positions_by_id[pos.position_id] = pos
 
-        eng._check_all_positions()
+        eng._check_all_positions(now_et=self._test_now_et())
         assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted)
 
     def test_real_check_all_positions_forces_eval_for_longer_dated_at_minus_34pct(self):
@@ -2043,7 +2056,7 @@ class TestAmendment4HardRiskPreGate:
         eng._positions = [pos]
         eng._positions_by_id[pos.position_id] = pos
 
-        eng._check_all_positions()
+        eng._check_all_positions(now_et=self._test_now_et())
         assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted)
 
     def test_real_check_all_positions_skips_healthy_hard_ref(self):
@@ -2059,7 +2072,7 @@ class TestAmendment4HardRiskPreGate:
         eng._positions = [pos]
         eng._positions_by_id[pos.position_id] = pos
 
-        eng._check_all_positions()
+        eng._check_all_positions(now_et=self._test_now_et())
         assert len(eng._submitted) == 0, (
             "healthy hard-ref must not force evaluation (would waste cycles + risk false action)"
         )
@@ -2077,7 +2090,7 @@ class TestAmendment4HardRiskPreGate:
         eng._positions = [pos]
         eng._positions_by_id[pos.position_id] = pos
 
-        eng._check_all_positions()
+        eng._check_all_positions(now_et=self._test_now_et())
         assert len(eng._submitted) == 0, "exit_in_flight must suppress double-fire"
 
 
