@@ -1029,9 +1029,14 @@ class TestCanonicalPlusRepairCollapse:
         )
 
         canonical = engine._positions_by_id[canon_id]
-        assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+        assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+        assert result.adopted is False
+        assert result.safe_to_seed is False
+        assert result.retryable is True
         assert repair_id in engine._positions_by_id
         assert repair in engine._positions
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == [canonical]
         assert getattr(canonical, "hard_exit_reference_validity", "") != "proven"
 
     def test_blank_client_repair_is_quarantined_from_matching_mode_canonical(self):
@@ -1045,9 +1050,16 @@ class TestCanonicalPlusRepairCollapse:
             entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
         )
 
-        assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
+        canonical = engine._positions_by_id[canon_id]
+        repair = engine._positions_by_id[repair_id]
+        assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+        assert result.adopted is False
+        assert result.safe_to_seed is False
+        assert result.retryable is True
         assert repair_id in engine._positions_by_id
         assert any(getattr(p, "position_id", "") == repair_id for p in engine._positions)
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == [canonical]
 
     def test_existing_canonical_stale_repair_bid_cannot_raise_peak(self):
         engine, canon_id, repair_id = self._make_engine_with_both()

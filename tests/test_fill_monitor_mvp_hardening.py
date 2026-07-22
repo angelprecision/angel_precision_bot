@@ -201,6 +201,41 @@ def test_exit_engine_seed_uses_occ_resolved_put(monkeypatch):
     assert ee.added[0].signal["side"] == "PUT"
 
 
+def test_seed_exit_engine_retry_adoption_does_not_seed_duplicate_owner(monkeypatch):
+    from ap import fill_monitor as fm
+    from ap_exit_engine import CanonicalAdoptionResult
+
+    class _RetryExitEngine(_ExitEngine):
+        def __init__(self):
+            super().__init__()
+            self.adoption_result = None
+
+        def adopt_canonical_position_identity(self, **kwargs):
+            self.adoption_result = CanonicalAdoptionResult(
+                disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
+                adopted=False,
+                safe_to_seed=False,
+                retryable=True,
+                reason="active_count=2",
+            )
+            return self.adoption_result
+
+    monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+    ee = _RetryExitEngine()
+
+    fm._seed_exit_engine(
+        ee,
+        "pos-1",
+        _base_order(direction=None, contract="AAPL260626P00195000"),
+        {"filled_qty": 1, "avg_fill": 1.10},
+        "sig-1",
+    )
+
+    assert ee.adoption_result is not None
+    assert ee.adoption_result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+    assert ee.added == []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PR #235 additional parity coverage — helper unit tests + shim-removal lock.
 # ─────────────────────────────────────────────────────────────────────────────

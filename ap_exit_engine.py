@@ -784,6 +784,23 @@ def _has_fresh_dedicated_bid(pos: "ManagedPosition", *, now_utc: "Optional[datet
         return False
 
 
+def _is_adoption_identity_quarantined(pos) -> bool:
+    return bool(
+        getattr(pos, "adoption_identity_quarantined", False)
+        or getattr(pos, "adoptionidentityquarantined", False)
+    )
+
+
+def _mark_adoption_identity_quarantined(pos, reason: str) -> None:
+    try:
+        pos.adoption_identity_quarantined = True
+        pos.adoptionidentityquarantined = True
+        pos.adoption_identity_quarantine_reason = reason
+        pos.adoptionidentityquarantinereason = reason
+    except Exception as _e:
+        log.debug("[exit_eng] mark adoption identity quarantine failed: %s", _e)
+
+
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
 
 
@@ -2976,6 +2993,7 @@ class APExitEngine:
                 # into canonical. Unknown-client, foreign-client, blank-mode, or
                 # wrong-mode repairs stay quarantined and cannot donate quote authority.
                 _repairs_to_remove = []
+                _identity_unproven_repairs = []
                 for p in self._positions:
                     if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
                         continue
@@ -2985,9 +3003,17 @@ class APExitEngine:
                         continue
                     _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
                     if not _client or _rp_cli != _client:
+                        _mark_adoption_identity_quarantined(
+                            p, f"repair_client={_rp_cli!r} canonical_client={_client!r}",
+                        )
+                        _identity_unproven_repairs.append(p)
                         continue
                     _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
                     if _rp_mode not in {"live", "paper"} or _rp_mode != _norm_canonical:
+                        _mark_adoption_identity_quarantined(
+                            p, f"repair_mode={_rp_mode!r} canonical_mode={_norm_canonical!r}",
+                        )
+                        _identity_unproven_repairs.append(p)
                         continue
                     _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
@@ -3079,6 +3105,23 @@ class APExitEngine:
                         "[exit_eng] CANONICAL_COLLAPSE_INVARIANT_VIOLATED | "
                         "contract=%s active_count=%d — expected exactly 1",
                         _contract, len(_active_for_contract),
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
+                        adopted=False, safe_to_seed=False, retryable=True,
+                        reason=f"active_count={len(_active_for_contract)}",
+                    )
+
+                if _identity_unproven_repairs:
+                    log.critical(
+                        "[exit_eng] RETRY_REPAIR_IDENTITY_UNPROVEN | "
+                        "canonical=%s contract=%s retained_repairs=%d",
+                        _canon_id, _contract, len(_identity_unproven_repairs),
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
+                        adopted=False, safe_to_seed=False, retryable=True,
+                        reason=f"retained_repairs={len(_identity_unproven_repairs)}",
                     )
 
                 return CanonicalAdoptionResult(
@@ -3339,7 +3382,12 @@ class APExitEngine:
 
     def active_positions(self) -> list[ManagedPosition]:
         with self._lock:
-            return [p for p in self._positions if not p.closed and int(p.quantity_remaining or 0) > 0]
+            return [
+                p for p in self._positions
+                if not p.closed
+                and int(p.quantity_remaining or 0) > 0
+                and not _is_adoption_identity_quarantined(p)
+            ]
 
     def attach_quote_monitor(self, monitor) -> None:
         """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
@@ -4177,6 +4225,7 @@ class APExitEngine:
                     p for p in self._positions
                     if not getattr(p, "closed", False)
                     and int(getattr(p, "quantity_remaining", 0) or 0) > 0
+                    and not _is_adoption_identity_quarantined(p)
                 ]
 
             for pos in snapshot:
@@ -4849,6 +4898,8 @@ class APExitEngine:
         for pos in snapshot:
             if pos.closed or int(pos.quantity_remaining or 0) <= 0:
                 continue
+            if _is_adoption_identity_quarantined(pos):
+                continue
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
             # AMENDMENT #4 (blocker 2): sentinels are the LAST-CHANCE money-safety
             # net for a stuck exit. They MUST NOT read option_pnl_pct — that property
@@ -5396,6 +5447,16 @@ class APExitEngine:
     ) -> bool:
         """Centralized gate for every path that can submit an exit order."""
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
+            return False
+        if _is_adoption_identity_quarantined(pos):
+            log.error(
+                "[%s] ADOPTION IDENTITY QUARANTINE BLOCK | pos=%s contract=%s reason=%s",
+                getattr(pos, "ticker", "?"),
+                getattr(pos, "position_id", "?"),
+                getattr(pos, "option_symbol", "?"),
+                getattr(pos, "adoption_identity_quarantine_reason", "")
+                or getattr(pos, "adoptionidentityquarantinereason", ""),
+            )
             return False
 
         if (

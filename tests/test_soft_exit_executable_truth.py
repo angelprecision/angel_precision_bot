@@ -1815,6 +1815,45 @@ class TestAmendment4EmergencyFlatten:
         )
         assert dec.action == "CLOSE_ALL"
 
+    def test_emergency_flatten_skips_adoption_quarantined_repair(self):
+        import ap_exit_engine as ee_mod
+        from datetime import datetime, timedelta, timezone as _tz
+
+        eng = self._make_engine()
+        expiry = datetime.now(_tz.utc) + timedelta(days=5)
+        _exp = f"{expiry.year % 100:02d}{expiry.month:02d}{expiry.day:02d}"
+        contract = f"ABT{_exp}C00150000"
+
+        def _pos(pid):
+            pos = ee_mod.ManagedPosition(
+                ticker="ABT", option_symbol=contract,
+                side="CALL", quantity=2, quantity_remaining=2, entry_price=1.00,
+                underlying_entry=150.0, underlying_target=155.0, underlying_stop=145.0,
+                execution_mode="live",
+                opened_at=datetime.now(_tz.utc) - timedelta(minutes=5),
+            )
+            pos.position_id = pid
+            pos.current_option_price = 0.0
+            pos.hard_exit_reference_price = 0.55
+            pos.hard_exit_reference_pnl_pct = -0.45
+            pos.hard_exit_reference_validity = "proven"
+            pos.hard_exit_reference_ts = datetime.now(_UTC)
+            return pos
+
+        canonical = _pos("canon-live")
+        repair = _pos(f"broker-repair-test@client.com-{contract}")
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_mode='' canonical_mode='live'"
+        eng._positions = [canonical, repair]
+        eng._positions_by_id = {canonical.position_id: canonical, repair.position_id: repair}
+
+        eng.emergency_flatten(reason="test_quarantined_repair", force=True)
+
+        assert len(eng._submitted) == 1
+        submitted_pos, decision, _ = eng._submitted[0]
+        assert submitted_pos.position_id == canonical.position_id
+        assert decision.action == "CLOSE_ALL"
+
 
 class TestAmendment4SnapshotPathCarriesMoneySafety:
     """Blocker 4: QPM snapshot dict carries all money-safety fields."""
@@ -2099,6 +2138,42 @@ class TestAmendment4HardRiskPreGate:
         _, dec, _ = eng._submitted[0]
         assert dec.action == "STOP", f"expected STOP, got {dec.action}: {dec.reason}"
         assert "HARD STOP" in dec.reason
+
+    def test_real_check_all_positions_skips_adoption_quarantined_repair(self):
+        eng = self._make_engine()
+        eng._submitted = []
+
+        def _capture_submit(pos, decision, **kw):
+            pos.exit_in_flight = True
+            eng._submitted.append((pos, decision, kw))
+            return True
+
+        eng._submit_exit_decision = _capture_submit
+        canonical = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.45, dte=5, age_minutes=5,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        canonical.position_id = "canon-live"
+        repair = self._make_managed_position(
+            side="CALL", entry=1.00,
+            hard_ref_pnl=-0.45, dte=5, age_minutes=5,
+            current_option_price=0.0, current_bid=0.0, current_underlying=0.0,
+        )
+        repair.position_id = f"broker-repair-test@client.com-{canonical.option_symbol}"
+        repair.option_symbol = canonical.option_symbol
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_client='' canonical_client='test@client.com'"
+        eng._positions = [canonical, repair]
+        eng._positions_by_id = {
+            canonical.position_id: canonical,
+            repair.position_id: repair,
+        }
+
+        eng._check_all_positions(now_et=self._test_now_et())
+
+        assert len(eng._submitted) <= 1
+        assert all(pos.position_id == canonical.position_id for pos, _, _ in eng._submitted)
 
     def test_real_check_all_positions_forces_eval_for_equity_0dte_at_minus_23pct(self):
         """Equity 0DTE hard stop is -22%. -23% must force eval (past -22%, not past -33%)."""
