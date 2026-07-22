@@ -1720,7 +1720,8 @@ class TestAmendment4EmergencyFlatten:
         )
         pos.expiry = expiry
         pos.current_option_price = 0.0          # LIVE missing-bid → option_pnl=0
-        pos.hard_exit_reference_pnl_pct = -0.45  # true loss
+        pos.hard_exit_reference_price = 0.55     # true loss vs canonical entry
+        pos.hard_exit_reference_pnl_pct = -0.45  # observability only
         pos.hard_exit_reference_validity = "proven"
         pos.hard_exit_reference_ts = datetime.now(_UTC)   # fresh — required by shared resolver
         pos.closed = False
@@ -3259,6 +3260,7 @@ class TestAmendment6HardRefExpiry:
             execution_mode="live",
             opened_at=datetime.now(_UTC) - timedelta(minutes=5),
         )
+        pos.hard_exit_reference_price = 0.55
         pos.hard_exit_reference_pnl_pct = -0.45
         pos.hard_exit_reference_validity = "proven"
         pos.hard_exit_reference_ts = datetime.now(_UTC)  # fresh

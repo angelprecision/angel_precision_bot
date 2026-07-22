@@ -668,8 +668,11 @@ def _recompute_hard_ref_cached_pnl(pos) -> None:
 def _reclassify_hard_ref_for_entry(pos) -> None:
     """Reclassify ASK-only hard refs after canonical entry-price adoption."""
     _source = str(getattr(pos, "hard_exit_reference_source", "") or "").lower()
-    if "ask" not in _source:
+    if _source not in ("ask_unproven", "ask_catastrophic"):
         _recompute_hard_ref_cached_pnl(pos)
+        if _source == "ask_stale":
+            _set_position_attr_pair(pos, "hard_exit_reference_validity", "unproven")
+            _set_position_attr_pair(pos, "hard_exit_reference_refresh_needed", True)
         return
 
     try:

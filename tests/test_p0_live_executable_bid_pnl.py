@@ -1131,6 +1131,53 @@ class TestCanonicalAdoptionHardReferenceRebase:
         assert repair.hard_exit_reference_pnl_pct == pytest.approx(-0.375)
         assert get_effective_hard_exit_reference(repair, now) == pytest.approx(-0.375)
 
+    def test_stale_ask_hard_reference_stays_unproven_after_entry_correction(self):
+        from ap_exit_engine import APExitEngine, get_effective_hard_exit_reference
+        now = datetime.now(timezone.utc)
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(
+            position_id=repair_id,
+            option_symbol=_CONTRACT,
+            client_id=_CLIENT,
+            execution_mode="live",
+            entry_price=1.00,
+            entryprice=1.00,
+            current_ask=0.75,
+            currentask=0.75,
+            hard_exit_reference_price=0.75,
+            hard_exit_reference_source="ask_stale",
+            hard_exit_reference_validity="unproven",
+            hard_exit_reference_ts=now - timedelta(seconds=90),
+            hard_exit_reference_pnl_pct=-0.25,
+        )
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT,
+            canonical_position_id="canon1",
+            local_order_id="l1",
+            broker_order_id="b1",
+            signal_id=_SIG,
+            canonical_signal_id=_SIG,
+            entry_fill=1.20,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=_CLIENT,
+        )
+
+        assert result.disposition == "ADOPTED"
+        assert repair.hard_exit_reference_validity == "unproven"
+        assert repair.hard_exit_reference_refresh_needed is True
+        assert repair.hard_exit_reference_pnl_pct == pytest.approx(-0.375)
+        assert get_effective_hard_exit_reference(repair, now) is None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Final Blocker 2 — Structured CanonicalAdoptionResult + RETRY cannot fall through
