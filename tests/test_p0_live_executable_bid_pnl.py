@@ -1175,6 +1175,104 @@ class TestCanonicalPlusRepairCollapse:
             for pid in engine._positions_by_id
         )
 
+    def test_paper_broker_precheck_repair_then_fill_seed_adopts_canonical_owner(self, monkeypatch):
+        from ap import fill_monitor as fm
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "paper-acct-1"
+            mode = "paper"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: None
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine._broker_position_precheck() is True
+        repairs = [
+            p for p in engine._positions
+            if str(getattr(p, "position_id", "")).startswith("broker-repair-")
+        ]
+        assert len(repairs) == 1
+        assert repairs[0].execution_mode == "paper"
+        assert getattr(repairs[0], "adoption_identity_quarantined", False) is False
+
+        fm._seed_exit_engine(
+            engine,
+            "canon-paper",
+            {
+                "contract": _CONTRACT,
+                "symbol": _CONTRACT,
+                "client_id": _CLIENT,
+                "local_order_id": "ord-paper-1",
+                "broker_order_id": "brk-paper-1",
+                "execution_mode": "paper",
+                "canonical_signal_id": _SIG,
+                "stop_underlying": 215.0,
+                "target_underlying": 230.0,
+                "direction": "CALL",
+            },
+            {"filled_qty": 1, "avg_fill": 1.59},
+            _SIG,
+        )
+
+        assert "canon-paper" in engine._positions_by_id
+        adopted = engine._positions_by_id["canon-paper"]
+        assert adopted.position_id == "canon-paper"
+        assert adopted.execution_mode == "paper"
+        assert adopted.underlying_stop == pytest.approx(215.0)
+        assert adopted.underlying_target == pytest.approx(230.0)
+        assert adopted.signal_id == _SIG
+        assert getattr(adopted, "canonical_signal_id", "") == _SIG
+        assert getattr(adopted, "entry_local_order_id", "") == "ord-paper-1"
+        assert getattr(adopted, "entry_broker_order_id", "") == "brk-paper-1"
+        assert getattr(adopted, "adoption_identity_quarantined", False) is False
+        assert engine.active_positions() == [adopted]
+        assert not any(
+            str(pid).startswith("broker-repair-")
+            for pid in engine._positions_by_id
+        )
+
+    def test_broker_precheck_unknown_mode_quarantines_without_live_default(self):
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "unknown-acct-1"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: None
+
+        assert engine._broker_position_precheck() is False
+        repairs = [
+            p for p in engine._positions
+            if str(getattr(p, "position_id", "")).startswith("broker-repair-")
+        ]
+        assert len(repairs) == 1
+        assert repairs[0].execution_mode == ""
+        assert getattr(repairs[0], "adoption_identity_quarantined", False) is True
+        assert "execution_mode_unproven" in getattr(
+            repairs[0], "adoption_identity_quarantine_reason", ""
+        )
+        assert engine.active_positions() == []
+
     def test_broker_precheck_with_only_quarantined_repair_installs_broker_owner(self):
         from ap_exit_engine import APExitEngine
 

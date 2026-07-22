@@ -6210,17 +6210,18 @@ class APExitEngine:
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
         _now = datetime.now(timezone.utc)
-        _row_mode = str(row.get("execution_mode") or row.get("executionmode") or "").strip().lower()
-        _engine_mode = str(
-            getattr(getattr(self, "master_control", None), "mode", "")
-            or getattr(getattr(self, "broker", None), "execution_mode", "")
-            or getattr(getattr(self, "broker", None), "mode", "")
-            or getattr(getattr(getattr(self, "broker", None), "cfg", None), "execution_mode", "")
-            or getattr(getattr(getattr(self, "broker", None), "cfg", None), "mode", "")
-            or ""
-        ).strip().lower()
-        _execution_mode = _row_mode if _row_mode in {"live", "paper"} else (
-            _engine_mode if _engine_mode in {"live", "paper"} else ("live" if prefer_qty_override else "")
+        def _known_mode(value) -> str:
+            _mode = str(value or "").strip().lower()
+            return _mode if _mode in {"live", "paper"} else ""
+
+        _execution_mode = (
+            _known_mode(row.get("execution_mode"))
+            or _known_mode(row.get("executionmode"))
+            or _known_mode(getattr(getattr(self, "master_control", None), "mode", ""))
+            or _known_mode(getattr(getattr(self, "broker", None), "execution_mode", ""))
+            or _known_mode(getattr(getattr(self, "broker", None), "mode", ""))
+            or _known_mode(getattr(getattr(getattr(self, "broker", None), "cfg", None), "execution_mode", ""))
+            or _known_mode(getattr(getattr(getattr(self, "broker", None), "cfg", None), "mode", ""))
         )
         mp = ManagedPosition(
             ticker           = ticker,
@@ -6238,6 +6239,18 @@ class APExitEngine:
             quantity_remaining = qty,
             opened_at        = opened_at or _now,
         )
+        if prefer_qty_override and not _execution_mode:
+            _mark_adoption_identity_quarantined(
+                mp,
+                "broker_repair_execution_mode_unproven",
+            )
+            log.critical(
+                "[exit_eng] EXIT_BROKER_POSITION_REPAIR_MODE_UNPROVEN "
+                "client=%s contract=%s position_id=%s — broker repair retained "
+                "for diagnostics but blocked from behavior until LIVE/PAPER mode "
+                "is proven by DB row or account configuration",
+                self._email, sym, pos_id or "unknown",
+            )
         # Final broker-truth enforcement: if prefer_qty_override is active,
         # ensure both quantity fields match broker qty regardless of constructor defaults.
         if prefer_qty_override and qty_override and int(qty_override) > 0:
@@ -6479,8 +6492,7 @@ class APExitEngine:
                     )
                     self.add_position(pos)
                     _loaded_active = (
-                        self._positions_by_id.get(getattr(pos, "position_id", "")) is pos
-                        or pos in self.active_positions()
+                        pos in self.active_positions()
                     )
                     if not _loaded_active:
                         raise RuntimeError("add_position did not install behavior-active DB owner")
@@ -6530,7 +6542,6 @@ class APExitEngine:
                         "entry_price":        entry_px,
                         "avg_fill":           entry_px,
                         "entry_ts":           bp.get("date_acquired"),
-                        "execution_mode":     "live",
                     }
                     pos = self._managed_position_from_row(
                         minimal_row,
@@ -6539,8 +6550,7 @@ class APExitEngine:
                     )
                     self.add_position(pos)
                     _loaded_active = (
-                        self._positions_by_id.get(getattr(pos, "position_id", "")) is pos
-                        or pos in self.active_positions()
+                        pos in self.active_positions()
                     )
                     if not _loaded_active:
                         raise RuntimeError("add_position did not install behavior-active broker owner")
