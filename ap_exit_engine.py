@@ -419,14 +419,10 @@ def _build_exit_decision_snapshot(
     disp_pnl: Optional[float] = None
 
     if entry_price > 0.0:
-        # Prefer the explicit QPM-written field for exec P&L
-        exec_pnl_direct = getattr(pos, "exit_executable_pnl_pct", None)
-        if exec_pnl_direct is not None and exit_executable_mark is not None:
-            try:
-                exec_pnl = float(exec_pnl_direct)
-            except Exception:
-                pass
-        elif exit_executable_mark is not None:
+        # Decision authority is the current executable BID against the current
+        # canonical entry fill.  QPM's persisted percentage is observability
+        # only; it can be stale across entry-fill correction/adoption.
+        if exit_executable_mark is not None:
             try:
                 exec_pnl = (exit_executable_mark - entry_price) / entry_price
             except Exception:
@@ -1773,14 +1769,6 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                     ),
                     urgency="HIGH", pnl_pct=_ng_pnl,
                 )
-
-    # ── HARD STOP ─────────────────────────────────────────────────────────────
-    if option_pnl <= _hard_stop:
-        return ExitDecision(
-            action="STOP", quantity=qty_rem,
-            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
 
     # ── PROFIT LOCK / TRAILING STOP ───────────────────────────────────────────
     # P0: gate on executable bid truth; use exec_pnl for comparisons.

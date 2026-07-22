@@ -166,6 +166,21 @@ class TestBuildExitDecisionSnapshot:
         assert snap.exit_executable_pnl_pct == pytest.approx(0.18, abs=1e-4)
         assert snap.display_pnl_pct == pytest.approx(0.20, abs=1e-4)
 
+    def test_exec_pnl_recomputes_after_canonical_entry_adoption(self):
+        """A cached QPM percentage cannot survive an entry-fill correction."""
+        pos = _make_pos(
+            entry_price=1.20,            # canonical fill adopted after QPM poll
+            current_bid=1.16,            # current executable BID is unchanged
+            current_ask=1.20,
+            current_option_price=1.18,
+            exit_executable_pnl_pct=0.16,  # stale provisional-basis value
+        )
+
+        snap = _build_exit_decision_snapshot(pos)
+
+        assert snap.exit_executable_pnl_pct == pytest.approx(-1 / 30, abs=1e-4)
+        assert snap.exit_executable_pnl_pct != pytest.approx(0.16)
+
     def test_underlying_available_when_positive(self):
         pos = _make_pos(current_underlying=149.0, underlying_available=True, underlying_fresh=True)
         snap = _build_exit_decision_snapshot(pos)
