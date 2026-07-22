@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import runpy
 import time
 from datetime import date, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -209,6 +211,22 @@ def _select_with_chain(monkeypatch, chain: list[dict], valid_symbol: str, direct
 
 
 class TestConfigurationAuthority:
+    def test_malformed_contract_revalidate_alias_does_not_crash_module_load(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "20")
+        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "abc")
+        caplog.set_level(logging.WARNING)
+
+        module_globals = runpy.run_path(
+            str(Path(__file__).resolve().parents[1] / "ap" / "contract_quote_revalidator.py")
+        )
+
+        assert module_globals["DEFAULT_REVALIDATE_TOP_N"] == 5
+        assert "DIRECT_QUOTE_ENV_PARSE_ERROR key=CONTRACT_REVALIDATE_TOP_N" in caplog.text
+
     def test_canonical_conflict_does_not_reduce_limit(self, caplog):
         caplog.set_level(logging.CRITICAL, logger="ap.contract_selector")
         cfg = _resolve_direct_quote_budget_config({

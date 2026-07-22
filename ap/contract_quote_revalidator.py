@@ -62,7 +62,30 @@ log = logging.getLogger("angel.contract_quote_revalidator")
 # ── Configuration ───────────────────────────────────────────────────────────
 # Top N candidate option symbols to fetch direct quotes for when chain rows
 # look bad.  Keeping this small keeps the Tradier rate-limit budget bounded.
-DEFAULT_REVALIDATE_TOP_N = int(os.getenv("CONTRACT_REVALIDATE_TOP_N", "5"))
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "DIRECT_QUOTE_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int default=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        log.warning(
+            "DIRECT_QUOTE_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int default=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+DEFAULT_REVALIDATE_TOP_N = _positive_int_env("CONTRACT_REVALIDATE_TOP_N", 5)
 
 # Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
 # Cleared per process; tests can reset by calling clear_quote_cache().
