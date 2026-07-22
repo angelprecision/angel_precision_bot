@@ -545,6 +545,9 @@ class APProofLogger:
             "seconds_to_fill":    round(seconds_to_fill, 1) if seconds_to_fill else None,
             # Exactly-once identity — only written when nonempty
             "proof_event_key":    str(proof_event_key).strip() or None,
+            # Diagnostic payload — structured evidence attached to the proof row.
+            # Stored as JSONB; absent/None written as SQL NULL (not {}).
+            "proof_diagnostics":  proof_diagnostics if isinstance(proof_diagnostics, dict) and proof_diagnostics else None,
         }
 
         # Cache for convenience — not source of truth
