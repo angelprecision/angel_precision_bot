@@ -641,6 +641,107 @@ def get_effective_hard_exit_reference(
     return (reference_price - entry_price) / entry_price
 
 
+def _set_position_attr_pair(pos, canonical_name: str, value) -> None:
+    """Write canonical snake_case field and its legacy compressed alias."""
+    setattr(pos, canonical_name, value)
+    setattr(pos, canonical_name.replace("_", ""), value)
+
+
+def _hard_ref_is_authoritative(validity: str) -> bool:
+    return str(validity or "") in ("proven", "catastrophic_ask")
+
+
+def _recompute_hard_ref_cached_pnl(pos) -> None:
+    try:
+        _price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
+        _entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        if _price > 0 and _entry > 0:
+            _set_position_attr_pair(
+                pos,
+                "hard_exit_reference_pnl_pct",
+                (_price - _entry) / _entry,
+            )
+    except Exception as _e:
+        log.debug("[exit_eng] hard-ref pnl rebase skipped: %s", _e)
+
+
+def _reclassify_hard_ref_for_entry(pos) -> None:
+    """Reclassify ASK-only hard refs after canonical entry-price adoption."""
+    _source = str(getattr(pos, "hard_exit_reference_source", "") or "").lower()
+    if "ask" not in _source:
+        _recompute_hard_ref_cached_pnl(pos)
+        return
+
+    try:
+        _price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
+        _entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return
+    if _price <= 0 or _entry <= 0:
+        return
+
+    try:
+        _hard_stop, _, _ = _effective_thresholds(pos)
+    except Exception:
+        _hard_stop = HARD_STOP_PCT
+
+    _pnl = (_price - _entry) / _entry
+    _validity = "catastrophic_ask" if _pnl <= _hard_stop else "unproven"
+    _set_position_attr_pair(pos, "hard_exit_reference_validity", _validity)
+    _set_position_attr_pair(pos, "hard_exit_reference_pnl_pct", _pnl)
+    _refresh_needed = not _hard_ref_is_authoritative(_validity)
+    _set_position_attr_pair(pos, "hard_exit_reference_refresh_needed", _refresh_needed)
+
+
+def _copy_hard_exit_reference(dst, src) -> None:
+    for _attr in (
+        "hard_exit_reference_price",
+        "hard_exit_reference_source",
+        "hard_exit_reference_validity",
+        "hard_exit_reference_ts",
+        "hard_exit_reference_pnl_pct",
+        "hard_exit_reference_refresh_needed",
+    ):
+        if hasattr(src, _attr):
+            _set_position_attr_pair(dst, _attr, getattr(src, _attr, None))
+    _recompute_hard_ref_cached_pnl(dst)
+
+
+def _merge_hard_exit_reference_for_collapse(dst, src, *, now_utc: datetime) -> None:
+    """Merge repair hard-ref into canonical using QPM's authority ranking."""
+    try:
+        _src_price = float(getattr(src, "hard_exit_reference_price", 0.0) or 0.0)
+        _dst_price = float(getattr(dst, "hard_exit_reference_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return
+
+    _src_validity = str(getattr(src, "hard_exit_reference_validity", "") or "")
+    _dst_validity = str(getattr(dst, "hard_exit_reference_validity", "") or "")
+    _src_ts = _normalize_hard_ref_ts(
+        getattr(src, "hard_exit_reference_ts", None), now_utc=now_utc
+    )
+    _dst_ts = _normalize_hard_ref_ts(
+        getattr(dst, "hard_exit_reference_ts", None), now_utc=now_utc
+    )
+
+    if _src_validity == "no_data" or _src_price <= 0:
+        if _dst_price > 0:
+            _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
+        return
+
+    if _hard_ref_is_authoritative(_src_validity):
+        if _src_ts is not None and (_dst_ts is None or _src_ts > _dst_ts):
+            _copy_hard_exit_reference(dst, src)
+        return
+
+    if _src_validity == "unproven":
+        if _hard_ref_is_authoritative(_dst_validity) and _dst_price > 0:
+            _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
+            return
+        if _src_ts is not None and (_dst_ts is None or _src_ts > _dst_ts):
+            _copy_hard_exit_reference(dst, src)
+
+
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
 
 
@@ -2798,42 +2899,59 @@ class APExitEngine:
                     and not getattr(p, "closed", False)
                 ]
                 for _rp in _repairs_to_remove:
+                    _merge_now = datetime.now(timezone.utc)
+                    _accepted_repair_bid = None
                     # Quote values and their timestamps are one snapshot.  Never
                     # copy a price unless that repair observation is newer.
                     for _price_attr, _ts_attr in (
-                        ("current_bid", "last_option_quote_update_ts"),
+                        ("current_bid", "last_option_bid_update_ts"),
                         ("current_ask", "last_option_quote_update_ts"),
                         ("current_underlying", "last_underlying_quote_update_ts"),
                     ):
                         _rp_v = getattr(_rp, _price_attr, 0.0) or 0.0
                         _rp_ts = getattr(_rp, _ts_attr, None)
                         _cn_ts = getattr(_existing_canon, _ts_attr, None)
-                        if _rp_v > 0 and _rp_ts and (not _cn_ts or _rp_ts > _cn_ts):
-                            setattr(_existing_canon, _price_attr, _rp_v)
-                            setattr(_existing_canon, _ts_attr, _rp_ts)
+                        _rp_ts_norm = _normalize_hard_ref_ts(_rp_ts, now_utc=_merge_now)
+                        _cn_ts_norm = _normalize_hard_ref_ts(_cn_ts, now_utc=_merge_now)
+                        if (_rp_v > 0 and _rp_ts_norm is not None
+                                and (_cn_ts_norm is None or _rp_ts_norm > _cn_ts_norm)):
+                            _set_position_attr_pair(_existing_canon, _price_attr, _rp_v)
+                            _set_position_attr_pair(_existing_canon, _ts_attr, _rp_ts_norm)
+                            if _price_attr == "current_bid":
+                                _accepted_repair_bid = float(_rp_v)
+                                _set_position_attr_pair(_existing_canon, "option_bid_valid", True)
+                                _set_position_attr_pair(_existing_canon, "option_quote_fresh", True)
+                            elif _price_attr == "current_underlying":
+                                _set_position_attr_pair(_existing_canon, "underlying_available", True)
+                                _set_position_attr_pair(_existing_canon, "underlying_fresh", True)
                     # Transfer the complete hard-reference record before the
                     # repair is removed; the cached P&L is recomputed by the
                     # resolver and is never the authority.
-                    _rp_ref_ts = getattr(_rp, "hard_exit_reference_ts", None)
-                    _cn_ref_ts = getattr(_existing_canon, "hard_exit_reference_ts", None)
-                    _rp_ref_price = float(getattr(_rp, "hard_exit_reference_price", 0.0) or 0.0)
-                    _rp_validity = str(getattr(_rp, "hard_exit_reference_validity", "") or "")
-                    if (_rp_ref_price > 0 and _rp_ref_ts and
-                            (not _cn_ref_ts or _rp_ref_ts > _cn_ref_ts)):
-                        for _attr in ("hard_exit_reference_price", "hard_exit_reference_source",
-                                      "hard_exit_reference_validity", "hard_exit_reference_ts",
-                                      "hard_exit_reference_refresh_needed"):
-                            setattr(_existing_canon, _attr, getattr(_rp, _attr, None))
-                    # Merge bid-proven peak only
+                    _merge_hard_exit_reference_for_collapse(
+                        _existing_canon, _rp, now_utc=_merge_now,
+                    )
+                    # Merge bid-proven peak only.  Never copy the repair's
+                    # stored percentage; it may have used a provisional entry
+                    # denominator.  A newly accepted repair BID is rebased
+                    # against the canonical entry price before comparison.
                     _rp_src = str(getattr(_rp, "live_executable_price_source", "") or "").lower()
-                    if _rp_src == "bid":
-                        _rp_peak = float(getattr(_rp, "peak_pnl_pct", 0.0) or 0.0)
+                    if _rp_src == "bid" and _accepted_repair_bid is not None:
                         _cn_peak = float(getattr(_existing_canon, "peak_pnl_pct", 0.0) or 0.0)
-                        if _rp_peak > _cn_peak:
+                        _cn_entry = float(getattr(_existing_canon, "entry_price", 0.0) or 0.0)
+                        _rp_rebased_pnl = (
+                            (_accepted_repair_bid - _cn_entry) / _cn_entry
+                            if _cn_entry > 0 else 0.0
+                        )
+                        if _rp_rebased_pnl > _cn_peak:
                             try:
-                                _existing_canon.peak_pnl_pct   = _rp_peak
-                                _existing_canon.max_profit_seen = _rp_peak
+                                _set_position_attr_pair(
+                                    _existing_canon, "peak_pnl_pct", _rp_rebased_pnl,
+                                )
+                                _set_position_attr_pair(
+                                    _existing_canon, "max_profit_seen", _rp_rebased_pnl,
+                                )
                                 _existing_canon.touched_profit  = False
+                                _existing_canon.touchedprofit   = False
                             except Exception as _e:
                                 log.debug("[exit_eng] merge peak from repair: %s", _e)
 
@@ -2923,7 +3041,7 @@ class APExitEngine:
                 _prior_peak_is_bid_proven = (_prior_peak_source == "bid")
 
                 if entry_fill > 0:
-                    pos.entry_price = entry_fill
+                    _set_position_attr_pair(pos, "entry_price", entry_fill)
                     _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
                     if _fresh_bid > 0:
                         _rebased_pnl = (_fresh_bid - entry_fill) / entry_fill
@@ -2934,9 +3052,11 @@ class APExitEngine:
                     # canonical adoption, only the current BID is valid until
                     # QPM supplies a new two-observation confirmation.
                     _rebased_peak = max(0.0, _rebased_pnl)
-                    pos.peak_pnl_pct = _rebased_peak
-                    pos.max_profit_seen = _rebased_peak
+                    _set_position_attr_pair(pos, "peak_pnl_pct", _rebased_peak)
+                    _set_position_attr_pair(pos, "max_profit_seen", _rebased_peak)
                     pos.touched_profit = False
+                    pos.touchedprofit = False
+                    _reclassify_hard_ref_for_entry(pos)
 
                 # ── Canonical identity fields ──────────────────────────────────
                 pos.position_id = _canon_id

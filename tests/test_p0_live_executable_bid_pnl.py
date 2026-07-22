@@ -19,7 +19,7 @@ import os
 import sys
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -86,8 +86,30 @@ class _Pos:
     scale_outs_done:  int  = 0
     last_option_quote_update_ts: Optional[datetime] = None
     lastoptionquoteupdatets: Optional[datetime] = None
+    last_option_bid_update_ts: Optional[datetime] = None
+    lastoptionbidupdatets: Optional[datetime] = None
     last_underlying_quote_update_ts: Optional[datetime] = None
     lastunderlyingquoteupdatets: Optional[datetime] = None
+    option_bid_valid: Optional[bool] = None
+    optionbidvalid: Optional[bool] = None
+    option_quote_fresh: Optional[bool] = None
+    optionquotefresh: Optional[bool] = None
+    underlying_available: Optional[bool] = None
+    underlyingavailable: Optional[bool] = None
+    underlying_fresh: Optional[bool] = None
+    underlyingfresh: Optional[bool] = None
+    hard_exit_reference_price: float = 0.0
+    hardexitreferenceprice: float = 0.0
+    hard_exit_reference_source: str = ""
+    hardexitreferencesource: str = ""
+    hard_exit_reference_validity: str = "no_data"
+    hardexitreferencevalidity: str = "no_data"
+    hard_exit_reference_ts: Optional[datetime] = None
+    hardexitreferencets: Optional[datetime] = None
+    hard_exit_reference_pnl_pct: Optional[float] = None
+    hardexitreferencepnlpct: Optional[float] = None
+    hard_exit_reference_refresh_needed: bool = True
+    hardexitreferencerefreshneeded: bool = True
     live_executable_price_source: str = ""
     liveexecutablepricesource: str = ""
     analytics_mark_price: float = 0.0
@@ -947,6 +969,167 @@ class TestCanonicalPlusRepairCollapse:
         assert isinstance(result, CanonicalAdoptionResult)
         assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
         assert result.adopted is True
+
+
+class TestCanonicalCollapseRiskReferenceRegression:
+    """Regression coverage for canonical+repair collapse money-safety state."""
+
+    def _engine_with_canon_and_repair(self, canon: _Pos, repair: _Pos, *, canon_id="canon1"):
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = [canon, repair]
+        engine._positions_by_id = {
+            canon_id: canon,
+            repair.position_id: repair,
+        }
+        return engine
+
+    def _collapse(self, engine, *, canon_id="canon1"):
+        return engine.adopt_canonical_position_identity(
+            contract=_CONTRACT,
+            canonical_position_id=canon_id,
+            local_order_id="l1",
+            broker_order_id="b1",
+            signal_id=_SIG,
+            canonical_signal_id=_SIG,
+            entry_fill=1.20,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=_CLIENT,
+        )
+
+    def test_existing_canonical_does_not_copy_raw_repair_peak_percentage(self):
+        now = datetime.now(timezone.utc)
+        canon = _Pos(
+            position_id="canon1", option_symbol=_CONTRACT, client_id=_CLIENT,
+            execution_mode="live", entry_price=1.20, entryprice=1.20,
+            current_bid=1.10, currentbid=1.10, peak_pnl_pct=0.0,
+            last_option_bid_update_ts=now - timedelta(seconds=20),
+        )
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id=_CLIENT, execution_mode="live",
+            entry_price=1.00, entryprice=1.00,
+            current_bid=1.16, currentbid=1.16,
+            peak_pnl_pct=0.16, max_profit_seen=0.16,
+            touched_profit=True, live_executable_price_source="bid",
+            last_option_bid_update_ts=now,
+            last_option_quote_update_ts=now,
+        )
+        engine = self._engine_with_canon_and_repair(canon, repair)
+
+        self._collapse(engine)
+
+        assert canon.current_bid == pytest.approx(1.16)
+        assert canon.peak_pnl_pct == pytest.approx(0.0)
+        assert canon.max_profit_seen == pytest.approx(0.0)
+        assert canon.touched_profit is False
+
+    def test_unproven_repair_hard_reference_cannot_replace_proven_canonical(self):
+        now = datetime.now(timezone.utc)
+        canon = _Pos(
+            position_id="canon1", option_symbol=_CONTRACT, client_id=_CLIENT,
+            execution_mode="live", entry_price=1.20, entryprice=1.20,
+            hard_exit_reference_price=0.70,
+            hard_exit_reference_source="bid",
+            hard_exit_reference_validity="proven",
+            hard_exit_reference_ts=now - timedelta(seconds=20),
+            hard_exit_reference_refresh_needed=False,
+        )
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id=_CLIENT, execution_mode="live",
+            hard_exit_reference_price=1.30,
+            hard_exit_reference_source="ask_unproven",
+            hard_exit_reference_validity="unproven",
+            hard_exit_reference_ts=now,
+        )
+        engine = self._engine_with_canon_and_repair(canon, repair)
+
+        self._collapse(engine)
+
+        assert canon.hard_exit_reference_price == pytest.approx(0.70)
+        assert canon.hard_exit_reference_validity == "proven"
+        assert canon.hard_exit_reference_refresh_needed is True
+
+    def test_repair_bid_requires_dedicated_newer_bid_timestamp(self):
+        now = datetime.now(timezone.utc)
+        canon = _Pos(
+            position_id="canon1", option_symbol=_CONTRACT, client_id=_CLIENT,
+            execution_mode="live", entry_price=1.20, entryprice=1.20,
+            current_bid=1.10, currentbid=1.10,
+            last_option_bid_update_ts=now,
+            last_option_quote_update_ts=now,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+        )
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id=_CLIENT, execution_mode="live",
+            current_bid=1.16, currentbid=1.16,
+            peak_pnl_pct=0.16, live_executable_price_source="bid",
+            last_option_bid_update_ts=now - timedelta(seconds=90),
+            last_option_quote_update_ts=now + timedelta(seconds=5),
+            option_bid_valid=True,
+            option_quote_fresh=True,
+        )
+        engine = self._engine_with_canon_and_repair(canon, repair)
+
+        self._collapse(engine)
+
+        assert canon.current_bid == pytest.approx(1.10)
+        assert canon.last_option_bid_update_ts == now
+        assert canon.peak_pnl_pct == pytest.approx(0.0)
+
+
+class TestCanonicalAdoptionHardReferenceRebase:
+    def test_ask_hard_reference_reclassified_after_entry_correction(self):
+        from ap_exit_engine import APExitEngine, get_effective_hard_exit_reference
+        now = datetime.now(timezone.utc)
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(
+            position_id=repair_id,
+            option_symbol=_CONTRACT,
+            client_id=_CLIENT,
+            execution_mode="live",
+            entry_price=1.00,
+            entryprice=1.00,
+            current_ask=0.75,
+            currentask=0.75,
+            hard_exit_reference_price=0.75,
+            hard_exit_reference_source="ask_unproven",
+            hard_exit_reference_validity="unproven",
+            hard_exit_reference_ts=now,
+            hard_exit_reference_pnl_pct=-0.25,
+        )
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT,
+            canonical_position_id="canon1",
+            local_order_id="l1",
+            broker_order_id="b1",
+            signal_id=_SIG,
+            canonical_signal_id=_SIG,
+            entry_fill=1.20,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=_CLIENT,
+        )
+
+        assert result.disposition == "ADOPTED"
+        assert repair.hard_exit_reference_validity == "catastrophic_ask"
+        assert repair.hard_exit_reference_pnl_pct == pytest.approx(-0.375)
+        assert get_effective_hard_exit_reference(repair, now) == pytest.approx(-0.375)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
