@@ -10,6 +10,8 @@ from datetime import datetime, timezone, time as dtime
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
 
+from ap.exit_thresholds import effective_thresholds
+
 log = logging.getLogger("ap.position_quote_monitor")
 ET = ZoneInfo("America/New_York")
 
@@ -692,11 +694,7 @@ class APPositionQuoteMonitor:
                 # AMENDMENT #6 blocker 4: pass per-position hard stop.
                 # ASK-only at -25% on SPY 0DTE is catastrophic (stop=-18%),
                 # but the global -0.33 check would call it unproven.
-                # Get the position's actual threshold if possible.
-                try:
-                    _pos_hard_stop_for_href, _, _ = _effective_thresholds(pos)
-                except Exception:
-                    _pos_hard_stop_for_href = -0.33
+                _pos_hard_stop_for_href, _, _ = effective_thresholds(pos)
 
                 _href = _select_hard_exit_reference(
                     bid=bid, ask=ask, mark=_mark_for_ref, last=_last_for_ref,
@@ -916,6 +914,19 @@ class APPositionQuoteMonitor:
                         str(pid),
                     ])
 
+                _tp_qualifies = (
+                    _tp_key
+                    and _opt_bid_valid
+                    and _opt_quote_fresh
+                    and _exec_exit_pnl is not None
+                    and _exec_exit_pnl >= TOUCHED_PROFIT_ARM_PCT
+                )
+                if _tp_key and not _tp_qualifies:
+                    # Bid unavailable, stale, or below threshold on THIS cycle
+                    # breaks consecutive confirmation for THIS position only.
+                    # touched_profit, once True, is never reset here.
+                    self._tp_pending_confirm[_tp_key] = False
+
                 if cost_basis > 0 and exec_price > 0 and _exec_quote_valid:
                     pnl_pct = (exec_price - cost_basis) / cost_basis
                     # ── DISPLAY / HARD-EXIT AUTHORITY (mode-specific) ────────────────
@@ -949,13 +960,7 @@ class APPositionQuoteMonitor:
                     # see constant docstring; NOT the immediate-TP trail threshold).
                     # Any interruption (bid missing, stale, or below threshold) resets
                     # pending state for THIS position only.
-                    if (
-                        _tp_key
-                        and _opt_bid_valid
-                        and _opt_quote_fresh
-                        and _exec_exit_pnl is not None
-                        and _exec_exit_pnl >= TOUCHED_PROFIT_ARM_PCT
-                    ):
+                    if _tp_qualifies:
                         if not self._tp_pending_confirm.get(_tp_key, False):
                             # First qualifying observation — set pending, do NOT arm yet.
                             self._tp_pending_confirm[_tp_key] = True
@@ -963,10 +968,6 @@ class APPositionQuoteMonitor:
                             # Second consecutive qualifying observation — arm touched_profit.
                             self._write_field_unconditional(pos, "touchedprofit", True)
                             self._write_field_unconditional(pos, "touched_profit", True)
-                    elif _tp_key:
-                        # Bid unavailable, stale, or below threshold → reset pending.
-                        # touched_profit, once True, is never reset here (only close clears it).
-                        self._tp_pending_confirm[_tp_key] = False
 
                     self._persist_quote_to_db(
                         position_id     = pid,

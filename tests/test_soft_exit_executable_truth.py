@@ -795,6 +795,7 @@ class TestRegressionCoverage:
             f"Scenario A: midpoint at +18% but bid at +8% should not trigger exit. "
             f"Got: {decision.action} | {decision.reason}"
         )
+        assert decision.reason_code == SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED
 
 
 # ── Deferred reason code taxonomy ────────────────────────────────────────────
@@ -1403,6 +1404,31 @@ def _mp_from_qpm_pos(qpm_pos, *, entry_price=1.00, underlying_entry=150.0,
 
 class TestAmendment3HardExitAuthority:
     """Blocker 1: real LIVE missing-bid transition → HARD STOP must still fire."""
+
+    def test_qpm_spy_0dte_ask_only_below_profile_stop_is_catastrophic(self, monkeypatch):
+        """Real QPM path must use per-DTE hard stop, not global -33% fallback."""
+        from ap.exit_thresholds import et_session_date
+
+        _patch_qpm_db(monkeypatch)
+        monkeypatch.setattr(
+            "ap.position_quote_monitor.APPositionQuoteMonitor._mark_mfe_mae_unavailable",
+            lambda self, **kwargs: False,
+        )
+        session_date = et_session_date()
+        contract = f"SPY{session_date:%y%m%d}P00500000"
+        pos = _qpm_pos(
+            "pos-SPY-0DTE-ASK", contract=contract, ticker="SPY",
+            execution_mode="live", entry_price=1.00,
+        )
+        qpm = _make_qpm([pos], {
+            contract: {"bid": 0, "ask": 0.75, "mark": 0, "last": 0},
+            "SPY": {"last": 500.0},
+        })
+        qpm._refresh_once()
+
+        assert pos.hard_exit_reference_validity == "catastrophic_ask"
+        assert pos.hard_exit_reference_source == "ask_catastrophic"
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.25)
 
     def test_live_missing_bid_catastrophic_loss_hard_stops_via_qpm(self):
         """Full production seam: valid bid → LIVE missing-bid clears

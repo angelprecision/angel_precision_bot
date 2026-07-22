@@ -67,6 +67,11 @@ from enum import Enum
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
 
+from ap.exit_thresholds import (
+    effective_thresholds as _shared_effective_thresholds,
+    option_profile as _shared_option_profile,
+)
+
 
 try:
     from ap.observability import (
@@ -245,14 +250,7 @@ def _normalize_ticker(ticker: str, option_symbol: str = "") -> str:
 
 
 def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
-    symbol = (pos.option_symbol or "").upper()
-    ticker = (pos.ticker or "").upper()
-    root   = _option_root(symbol)
-    dte    = _option_dte(symbol)
-    index_roots = _INDEX_ETFS | {"SPXW", "NDX", "NDXP", "RUT", "RUTW"}
-    is_index = root in index_roots or ticker in index_roots or any(root.startswith(t) for t in _INDEX_ETFS)
-    profile  = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
-    return dte, is_index, profile
+    return _shared_option_profile(pos)
 
 
 @dataclass(frozen=True)
@@ -550,14 +548,7 @@ def _soft_exit_underlying_truth_gate(
 
 def _effective_thresholds(pos: "ManagedPosition") -> tuple:
     """Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument."""
-    dte, is_index, _ = _option_profile(pos)
-    if dte == 0 and is_index:
-        return -0.18, 0.20, 0.08
-    if dte == 0:
-        return -0.22, 0.22, 0.10
-    if dte <= 2:
-        return -0.26, 0.25, 0.12
-    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
+    return _shared_effective_thresholds(pos)
 
 # TRAILING STOP — fires when position drops N points from its peak
 # Wide enough to let winners run to 25-30%, tight enough to protect gains
@@ -2081,6 +2072,30 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         if _soft_territory:
             return _final_gate
 
+    _display_pnl = snap.display_pnl_pct
+    _soft_loss_pct = float(os.getenv("SOFT_LOSS_STOP_PCT", "-0.12"))
+    if _display_pnl is not None and exec_pnl is not None:
+        _display_crossed_tp = (
+            _display_pnl >= SCALE_OUT_1_THRESHOLD
+            and exec_pnl < SCALE_OUT_1_THRESHOLD
+            and pos.scale_outs_done < 1
+        )
+        _display_crossed_loss = (
+            _display_pnl <= _soft_loss_pct
+            and exec_pnl > _soft_loss_pct
+        )
+        if _display_crossed_tp or _display_crossed_loss:
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=(
+                    "SOFT_EXIT_DEFERRED — display crossed soft threshold but "
+                    "fresh executable BID did not confirm"
+                ),
+                urgency="NORMAL",
+                pnl_pct=exec_pnl,
+                reason_code=SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED,
+            )
+
     return ExitDecision(
         action="HOLD", quantity=0,
         reason="No exit condition met", urgency="NORMAL", pnl_pct=option_pnl,
@@ -2958,7 +2973,8 @@ class APExitEngine:
                     )
 
                 # Merge every active broker-repair for this exact client/mode/contract
-                # into canonical. Foreign-client or wrong-mode repairs are not touched.
+                # into canonical. Unknown-client, foreign-client, blank-mode, or
+                # wrong-mode repairs stay quarantined and cannot donate quote authority.
                 _repairs_to_remove = []
                 for p in self._positions:
                     if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
@@ -2968,10 +2984,10 @@ class APExitEngine:
                     if getattr(p, "closed", False):
                         continue
                     _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
-                    if _client and _rp_cli and _rp_cli != _client:
+                    if not _client or _rp_cli != _client:
                         continue
                     _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
-                    if _rp_mode in {"live", "paper"} and _rp_mode != _norm_canonical:
+                    if _rp_mode not in {"live", "paper"} or _rp_mode != _norm_canonical:
                         continue
                     _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
@@ -3080,14 +3096,14 @@ class APExitEngine:
                     continue
 
                 # ── Blocker 5: Client and mode fencing ────────────────────────
-                # The repair position must belong to the same client and a
-                # compatible execution mode before we overwrite identity fields.
+                # The repair position must belong to the exact same client and
+                # exact known execution mode before we overwrite identity fields.
                 _repair_client = str(getattr(pos, "client_id", "") or "").strip().lower()
-                if _client and _repair_client and _repair_client != _client:
+                if not _client or _repair_client != _client:
                     log.critical(
                         "[exit_eng] RETRY_CLIENT_MISMATCH | "
                         "contract=%s repair_client=%s canonical_client=%s — "
-                        "refusing cross-client adoption",
+                        "refusing unknown/cross-client adoption",
                         _contract, _repair_client, _client,
                     )
                     return CanonicalAdoptionResult(
@@ -3098,17 +3114,15 @@ class APExitEngine:
 
                 _repair_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                 _mode_ok = (
-                    not _repair_mode
-                    or not _mode
-                    or _repair_mode == _mode
-                    or _repair_mode in ("", "unknown")
-                    or (_mode == "live" and _repair_mode in ("", "unknown"))
+                    _repair_mode in {"live", "paper"}
+                    and _mode in {"live", "paper"}
+                    and _repair_mode == _mode
                 )
                 if not _mode_ok:
                     log.critical(
                         "[exit_eng] RETRY_MODE_MISMATCH | "
                         "contract=%s repair_mode=%s canonical_mode=%s — "
-                        "refusing incompatible mode adoption",
+                        "refusing unknown/incompatible mode adoption",
                         _contract, _repair_mode, _mode,
                     )
                     return CanonicalAdoptionResult(
