@@ -1,4 +1,4 @@
-# P0: Canonical regime advisory and setup-specific evidence admission
+# P0: Canonical regime advisory without adding a new trade-flow gate
 
 ## Status
 
@@ -6,11 +6,19 @@ Implementation contract only. No production behavior is implemented by this comm
 
 Base SHA: `ffd22ca37ab0dcf874c2b463e61bee16337772fa`
 
+## Amendment rationale
+
+The initial specification proposed blocking legacy regime-mismatch setups when `ev_score=0` and named setup-quality evidence was absent. That blocking proposal is removed.
+
+July 23 produced only two economic entries despite a large candidate pool. Adding another admission gate before repairing watcher readiness and selector exhaustion would repeat the exact pattern that collapsed trade flow. PEP can already be prevented at the correct seam by PR #391 because its ticker-specific PUT trigger was no longer valid immediately before broker submission.
+
+This PR now has one job: repair the structured regime-advisory contract from PR #382 and preserve evidence. It does not decide whether PEP, BAC, or any other setup is otherwise tradeable.
+
 ## Production evidence
 
 Current main is the merge commit for PR #382, whose contract says broad SPY regime disagreement is advisory and structured hard-risk findings remain authoritative.
 
-Production rows created on that exact commit nevertheless carried legacy risk payloads for both Tradefluence BAC and PEP:
+Production rows created on that exact commit nevertheless carried legacy risk payloads for both BAC and PEP:
 
 ```text
 approved=false
@@ -21,26 +29,7 @@ intel_status=RISK_VETO_OVERRIDE
 contracts=1
 ```
 
-Execution then ignored the metadata's one-contract research shape and submitted normal account-sized PAPER quantities. More importantly, the broad SPY label hid a useful setup-specific difference:
-
-### BAC PUT
-
-- scanner score: `72`
-- timeframe/pattern: `1d / 3-2-2`
-- EV score: `44.5`
-- quality evidence: `spread_score=3`, `liquidity_score=3`
-- later option move observed near `+20%`
-
-### PEP PUT
-
-- scanner score: `72`
-- timeframe/pattern: `1d / 3-2-2`
-- EV score: `0.0`
-- quality evidence: empty
-- final ticker-specific PUT trigger was already reversed at submit
-- trade became an immediate loser
-
-A blanket rule that rejects every PUT while SPY is bullish would reject BAC along with PEP. That is the wrong abstraction. Broad regime is context. The admission decision must use ticker-specific market truth and actual setup evidence.
+The broad label failed to distinguish market context from genuine account safety. BAC later produced a strong move, while PEP entered only because PAPER ignored its ticker-specific final market-validity failure. A blanket PUT ban would lose BAC; a zero-EV admission gate could suppress still more independent setups. Neither belongs here.
 
 ## Root-cause questions implementation must answer
 
@@ -53,13 +42,13 @@ Before editing behavior, trace and document why an exact-PR-#382 runtime still p
 5. Did master control or durable metadata overwrite the structured payload with stale legacy evidence?
 6. Was the process running a different imported module than the repository path implied by `git_commit`?
 
-Persist producer module, class, source file, policy version, and structured/legacy classification in diagnostics so this cannot become another invisible import-path séance.
+Persist producer module, class, source file, policy version, and structured/legacy classification in diagnostics.
 
 ## Required behavior
 
 ### 1. Broad SPY mismatch can never become a hard veto by legacy accident
 
-At the final admission boundary, normalize a payload whose only negative reason is a broad SPY direction mismatch into:
+At the final intelligence-admission boundary, normalize a payload whose only negative reason is a broad SPY direction mismatch into:
 
 ```text
 reason_code=APPROVED_WITH_REGIME_MISMATCH
@@ -68,7 +57,7 @@ intel_status=REGIME_MISMATCH_ADVISORY
 authoritative=false
 ```
 
-This compatibility normalization is allowed only for the closed set of known broad-regime mismatch reasons. It must not reinterpret VIX extreme, buying-power, contract-quality, exposure, kill-switch, or malformed structured hard vetoes.
+This compatibility normalization is allowed only for the closed set of known broad-regime mismatch reasons. It must not reinterpret VIX extreme, buying power, contract quality, account exposure, kill switch, daily loss, malformed identity, or any structured hard veto.
 
 A genuine hard risk rejection must carry:
 
@@ -80,52 +69,49 @@ reason_code=<closed-set hard-veto code>
 
 Unknown or contradictory structured risk payloads fail closed with explicit diagnostics.
 
-### 2. Eliminate the misleading regime data-collection override
+### 2. Remove the misleading regime data-collection override
 
-A broad regime mismatch must not become `RISK_VETO_OVERRIDE` or claim `contracts=1`. It is advisory context and should proceed through normal setup-specific admission and normal sizing if every actual quality gate passes.
+A broad regime mismatch must not become `RISK_VETO_OVERRIDE`, must not claim `contracts=1`, and must not route through a special research-size execution lane.
 
-A genuine hard risk veto must block. Do not convert a real hard veto into a larger PAPER trade merely because the account is PAPER.
+It is advisory context. The setup proceeds through the ordinary downstream contracts:
 
-This removes the current dishonest state where metadata says one-contract research but execution submits seven contracts.
+- existing scanner/master-control policy;
+- ranked candidate selection;
+- contract selection;
+- PR #391 ticker-specific final market validity;
+- ordinary account sizing and hard risk limits.
 
-### 3. Require setup-specific evidence when the legacy compatibility path is used
+A genuine hard risk veto blocks in both PAPER and LIVE. PAPER mode is not permission to override actual account safety.
 
-For daily single-name setups entering through a legacy regime-mismatch payload, require at least one positive, attributable setup-specific evidence source before broker authority is granted.
+### 3. Evidence is diagnostic, not a new P0 admission gate
 
-Minimum compatibility contract:
+Persist scanner score, EV score, quality components, regime context, producer identity, and final outcome for analysis.
 
-- finite `ev_score > 0`; and
-- at least one named positive quality component or completed setup-quality packet; and
-- ticker-specific final market validity passes under PR #391.
+For this PR:
 
-When all are absent or zero:
+- `ev_score=0` does not independently block;
+- missing quality components do not independently block;
+- no new tier, score, pattern, liquidity, or daily-count threshold is introduced;
+- no counterfactual-only execution lane is created;
+- no existing valid setup is removed from the ranked candidate pool solely because the legacy payload lacks evidence fields.
 
-```text
-reason_code=INTEL_SETUP_EVIDENCE_INSUFFICIENT
-allowed=false
-authoritative=false
-action=COUNTERFACTUAL_ONLY
-```
-
-Do not create a broker order, position, or proof trade. Preserve the row for counterfactual outcome tracking.
-
-This narrow compatibility rule blocks the observed PEP shape (`ev_score=0`, empty quality evidence) while allowing BAC's positive setup evidence to continue to normal ticker-specific validation. It is not a universal EV threshold and must not be applied to structured modern approvals that carry a complete quality packet under a newer policy version.
+The evidence may support a later data-backed calibration PR after sufficient sessions. It cannot be promoted to live authority from one losing PEP trade and one winning BAC trade. Humanity has tried inventing universal laws from samples of two before. Results remain mixed.
 
 ### 4. Preserve truth downstream
 
-Every order and decision event must retain:
+Every intelligence decision event and relevant order metadata must retain:
 
 - exact client ID and execution mode;
 - raw risk payload;
 - normalized structured payload;
-- producer module/class/policy version;
+- producer module/class/source file/policy version;
 - scanner score and EV score separately;
-- named quality components;
+- named quality components when available;
 - regime context as advisory evidence;
-- ticker-specific market-validity result;
-- final authority and reason code.
+- final authority and reason code;
+- downstream PR #391 market-validity outcome by reference, not duplicated logic.
 
-Do not rewrite historical proof trades or classify blocked counterfactual rows as PAPER losses/wins.
+Do not rewrite historical proof trades or classify advisory regime context as a win/loss label.
 
 ## Expected production files
 
@@ -133,24 +119,24 @@ Do not rewrite historical proof trades or classify blocked counterfactual rows a
 - `ap_intelligence/ap_signal_pipeline.py` only if transport drops fields
 - `intelligence_bridge.py`
 - `ap/intelligence_admission_policy.py`
-- `ap_master_control.py` only for final compatibility/evidence authority
+- `ap_master_control.py` only for final compatibility normalization
 - `.github/workflows/p0_regression.yml`
-- `tests/test_p0_setup_evidence_admission.py`
+- `tests/test_p0_regime_advisory_compatibility.py`
 
-Do not change broker submit/cancel mechanics, exit logic, contract selection, scanner score thresholds, position sizing percentage, proof-trade writes, or queue fanout.
+Do not change broker submit/cancel mechanics, exit logic, contract selection, scanner thresholds, EV thresholds, position sizing percentages, proof writes, queue fanout, watcher caps, or final market-validity logic.
 
 ## Required tests
 
-1. Exact structured PR #382 advisory payload: BAC PUT in BULL SPY, `hard_veto=false`, positive sizing. Expected normal advisory allow.
-2. Legacy BAC replay: reason is only SPY regime mismatch, EV `44.5`, positive spread/liquidity evidence. Expected normalized advisory, then normal ticker-specific admission.
-3. Legacy PEP replay: reason is only SPY regime mismatch, EV `0`, empty evidence. Expected counterfactual-only, no broker order.
-4. PEP with positive setup evidence but final PUT trigger reversed. Expected blocked/re-armed by PR #391, proving this PR does not duplicate market-validity logic.
-5. Genuine hard veto with `hard_veto=true`. Expected block in both PAPER and LIVE.
-6. Contradictory `approved=true, hard_veto=true`. Expected fail closed.
-7. Legacy VIX extreme / buying-power / exposure failure. Expected no regime-advisory normalization.
-8. Raw and normalized payloads preserved with exact client/mode.
-9. Blocked counterfactual row does not create position, proof trade, or filled-trade count.
-10. No broad SPY mismatch produces `RISK_VETO_OVERRIDE` or `contracts=1` metadata after repair.
+1. Exact structured PR #382 advisory payload: BAC PUT in BULL SPY, `hard_veto=false`. Expected advisory allow.
+2. Legacy BAC replay: reason is only SPY regime mismatch. Expected normalized advisory with no size override.
+3. Legacy PEP replay: reason is only SPY regime mismatch, EV `0`, empty evidence. Expected normalized advisory at this layer; PR #391 later blocks/re-arms it because ticker-specific PUT direction is reversed.
+4. Genuine hard veto with `hard_veto=true`. Expected block in both PAPER and LIVE.
+5. Contradictory `approved=true, hard_veto=true`. Expected fail closed.
+6. Legacy VIX extreme, buying-power, exposure, kill-switch, or daily-loss rejection. Expected no regime-advisory normalization.
+7. Raw and normalized payloads preserve exact client and mode.
+8. No broad SPY mismatch produces `RISK_VETO_OVERRIDE`, `contracts=1`, or a special PAPER override after repair.
+9. EV and quality-evidence values are persisted but do not alter admission.
+10. The compatibility layer makes no broker, order, position, proof, or queue mutation.
 
 ## Merge gates
 
@@ -158,5 +144,5 @@ Do not change broker submit/cancel mechanics, exit logic, contract selection, sc
 - Production implementation added.
 - Focused exact-head tests green.
 - Exact-head P0 workflow green.
-- Controlled BAC/PEP replay attached.
+- Controlled BAC/PEP replay proves the regime layer is advisory and PR #391 owns final ticker truth.
 - No merge without explicit approval from Angel.
