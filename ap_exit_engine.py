@@ -850,54 +850,40 @@ def _resolve_hard_stop_pnl_authority(
 ) -> "Optional[float]":
     """Single authority for hard-stop P&L across evaluate_exit() and sentinels.
 
-    Two authoritative sources may exist at the same time:
+    Strict source priority (PR #385 contract: fresh BID > fresh LAST > fresh MARK):
 
-      A. `get_effective_hard_exit_reference()` — provenance-aware persisted
+      1. Fresh, un-vetoed dedicated executable BID (via `_dedicated_bid_pnl`).
+         BID is the PR's primary hard-exit source; a persisted reference is
+         only useful when the current cycle has no executable BID.
+      2. `get_effective_hard_exit_reference()` — provenance-aware persisted
          hard-exit reference (validity ∈ {"proven","catastrophic_ask"},
-         age ≤ HARD_REF_MAX_AGE_SEC, written by QPM from the last-known
-         best-available option price).
+         age ≤ HARD_REF_MAX_AGE_SEC).
+      3. None — no price-based hard-stop authority this cycle.
 
-      B. Fresh executable BID (bid > 0, un-vetoed, dedicated bid timestamp
-         within STALE_OPTION_QUOTE_MAX_AGE_SEC).
-
-    AMENDMENT (PR #385 review P0-1): a two-minute-old persisted reference
-    must not hide a newer executable BID at −40% (false safety), and an
-    older catastrophic reference must not force an exit after a newer BID
-    has recovered (false forced exit).  When both sources are available we
-    pick the newest observation by timestamp.  Ties break to the executable
-    BID, which is the freshest form of market truth.
+    AMENDMENT (PR #385 review): the earlier timestamp-comparison approach
+    let a persisted reference derived from LAST / MARK / ASK outrank a fresh
+    executable BID whenever its cached provider clock happened to be newer
+    than the BID's dedicated timestamp.  Those clocks come from different
+    sources with different receipt semantics and cannot be compared safely.
+    The PR contract explicitly ranks fresh BID above LAST / MARK / ASK, so
+    the priority is strict and unconditional, not chronological.
 
     Never falls back to midpoint, mark, LAST, ASK, current_option_price,
-    or option_pnl_pct — those may derive from unproven PAPER pricing.
-    Missing authority → None → caller must not fire a hard stop.  Zero
-    would falsely certify safety and is prohibited.
+    or option_pnl_pct directly — those may derive from unproven PAPER
+    pricing.  Missing authority → None → caller must not fire a hard stop.
+    Zero would falsely certify safety and is prohibited.
     """
     now_utc = now_utc or datetime.now(timezone.utc)
 
+    bid_pnl, _bid_ts = _dedicated_bid_pnl(pos, now_utc=now_utc)
+    if bid_pnl is not None:
+        return bid_pnl
+
     ref_pnl = get_effective_hard_exit_reference(pos, now_utc)
-    bid_pnl, bid_ts = _dedicated_bid_pnl(pos, now_utc=now_utc)
-
-    if ref_pnl is None and bid_pnl is None:
-        return None
-    if ref_pnl is None:
-        return bid_pnl
-    if bid_pnl is None:
+    if ref_pnl is not None:
         return ref_pnl
 
-    # Both authoritative — pick the newest observation.  Fresh BID wins ties.
-    ref_ts = _normalize_hard_ref_ts(
-        getattr(pos, "hard_exit_reference_ts",
-                getattr(pos, "hardexitreferencets", None)),
-        now_utc=now_utc,
-    )
-    if ref_ts is None:
-        # Reference validity was accepted but its timestamp is unusable for
-        # ordering.  Prefer the observation whose timestamp we can actually
-        # verify — the fresh BID.
-        return bid_pnl
-    if bid_ts is None:
-        return ref_pnl
-    return bid_pnl if bid_ts >= ref_ts else ref_pnl
+    return None
 
 
 def _is_adoption_identity_quarantined(pos) -> bool:
@@ -1143,16 +1129,16 @@ def _apply_option_quote_for_decision(
         except Exception as _e:
             log.debug("_aqfd: quote_ts write failed: %s", _e)
 
-    # AMENDMENT (PR #385 review P1-1): the QuoteAuthority bridge feeds this
-    # helper with a fresh BID after QPM may have previously written
-    # option_bid_valid=False (or option_quote_fresh=False, or a stale
-    # last_option_bid_update_ts).  Without also rewriting the FULL bid
-    # truth tuple here, `_build_exit_decision_snapshot` and
-    # `_has_fresh_dedicated_bid` would still see the prior invalid vetoes
-    # and refuse to trust the new BID — soft winner protection and the
-    # hard-stop fresh-BID fallback would stay disabled despite fresh
-    # executable data.  We restore ALL three fields on every call so this
-    # helper is the single seam for BID truth as well as the price itself.
+    # AMENDMENT (PR #385 review P1-1 + BID-timestamp contract): keep the
+    # full BID truth tuple in sync with the numeric bid this call is
+    # writing.  A fresh positive BID must clear a prior invalid veto so
+    # downstream soft-winner protection and the fresh-BID hard-stop
+    # fallback re-arm; a zero/missing BID must never MASQUERADE as a
+    # successful BID observation — it does not advance the dedicated
+    # last-positive-BID timestamp.  Advancing the timestamp on a bid=0
+    # cycle would let a later flaky consumer misread the position as
+    # having a fresh executable BID and re-arm the fresh-BID path on
+    # stale numeric data.
     _bid_positive = False
     try:
         _bid_positive = float(bid or 0.0) > 0.0
@@ -1163,25 +1149,27 @@ def _apply_option_quote_for_decision(
         pos.optionbidvalid   = _bid_positive
     except Exception as _e:
         log.debug("_aqfd: option_bid_valid write failed: %s", _e)
-    if quote_ts is not None:
-        # Stamp the dedicated BID timestamp on every observation so
-        # freshness gates can distinguish "producer wrote invalid this
-        # cycle" from "producer stopped writing".  A cycle whose BID is
-        # zero still gets its dedicated timestamp; _has_fresh_dedicated_bid
-        # requires bid > 0 in addition to freshness so this is safe.
+
+    # option_quote_fresh is derived from bid_valid AND ts_fresh in the
+    # snapshot builder.  Set here so a positive bid clears a prior False
+    # veto and a zero bid re-asserts False.
+    try:
+        pos.option_quote_fresh = _bid_positive
+        pos.optionquotefresh   = _bid_positive
+    except Exception as _e:
+        log.debug("_aqfd: option_quote_fresh write failed: %s", _e)
+
+    # Advance the dedicated last-positive-BID timestamp ONLY when we
+    # actually observed a positive bid this cycle.  A zero/missing bid
+    # leaves the prior stamp untouched — the freshness gate will then
+    # correctly age it out, rather than restart the freshness clock on
+    # what is really an invalid observation.
+    if quote_ts is not None and _bid_positive:
         try:
             pos.last_option_bid_update_ts = quote_ts
             pos.lastoptionbidupdatets     = quote_ts
         except Exception as _e:
             log.debug("_aqfd: last_option_bid_update_ts write failed: %s", _e)
-        # option_quote_fresh is derived from bid_valid AND ts_fresh in the
-        # snapshot builder.  Here we clear any prior explicit False veto
-        # when a positive bid arrives — otherwise the veto sticks forever.
-        try:
-            pos.option_quote_fresh = _bid_positive
-            pos.optionquotefresh   = _bid_positive
-        except Exception as _e:
-            log.debug("_aqfd: option_quote_fresh write failed: %s", _e)
 
     # ── HARD-EXIT REFERENCE (amendment #6) ───────────────────────────────────
     # QPM is not the only writer path.  Broker-position repair and startup

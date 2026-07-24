@@ -3913,33 +3913,108 @@ class TestJasonBacReplay:
                 f"BAC replay must not exit for reason {term!r}; got: {decision.reason}"
             )
 
-    def test_bac_zero_broker_submissions_via_check_all_positions(self):
-        """Route the BAC-shape position through _check_all_positions() with
-        a mocked _submit_exit_decision seam.  Zero submissions must occur.
+    def test_bac_zero_broker_submissions_via_sentinel_path(self):
+        """Sentinel-path guard for the BAC shape.
+
+        `_run_sentinels()` is the last-chance money-safety net.  It must
+        not submit an exit for the touched-profit BAC shape (no fresh
+        underlying, bid at −3%, peak +2%, age < 3 min).  This is
+        deliberately isolated from `_check_all_positions()` so a
+        regression in either seam is attributable.
         """
         pos = _bac_pos(
             touched_profit=True,
             peak_pnl_pct=0.02,
             max_profit_seen=0.02,
         )
+        pos.position_id = "bac-sentinel-1"
         from ap_exit_engine import APExitEngine as _APExitEngine
         eng = _APExitEngine.__new__(_APExitEngine)
         eng._email = "jasoncosby1@gmail.com"
         eng._lock = threading.Lock()
         eng._positions = [pos]
-        eng._positions_by_id = {getattr(pos, "position_id", ""): pos}
+        eng._positions_by_id = {pos.position_id: pos}
 
         submissions = []
-        def _capture_submit(_p, _decision, **_kw):
-            submissions.append((_p, _decision, _kw))
-            return None
-        eng._submit_exit_decision = _capture_submit
-        # _run_sentinels is a self-contained path; call it directly.  No
-        # broker submission may occur when the BAC-shape holds.
+        eng._submit_exit_decision = (
+            lambda _p, _d, **_kw: submissions.append((_p, _d, _kw))
+        )
         eng._run_sentinels()
         assert submissions == [], (
             f"BAC replay must not submit any exit through the sentinel path; "
             f"got: {submissions}"
+        )
+
+    def test_bac_check_all_positions_holds_with_zero_submissions(self):
+        """AMENDMENT (PR #385 review): drive the BAC touched_profit shape
+        through the REAL `_check_all_positions()` — the same production
+        seam that fired the July 23 exit.  Capture every
+        `_submit_exit_decision` call and every decision stamp emitted.
+
+        The amended engine must:
+          - route through evaluate_exit (bid=0.94 satisfies the price gate);
+          - return HOLD with reason_code
+            SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE / _STALE;
+          - never invoke _submit_exit_decision.
+        """
+        import ap_exit_engine as ee_mod
+
+        class _MinimalBroker:
+            def get_quotes(self, symbols): return []
+
+        eng = ee_mod.APExitEngine(
+            broker=_MinimalBroker(), email="jasoncosby1@gmail.com",
+        )
+        # Stub external boundaries; keep the real evaluate_exit /
+        # _run_sentinels / eligibility logic untouched.
+        eng._broker_position_precheck = lambda: True
+        eng._persist_peak_state_to_db = lambda _pos: None
+        eng._emit_exit_event = lambda *a, **kw: None
+
+        submissions = []
+        eng._submit_exit_decision = (
+            lambda _p, _d, **_kw: submissions.append((_p, _d, _kw)) or True
+        )
+        stamps = []
+        eng._emit_exit_decision_stamp = (
+            lambda _p, _d, **_kw: stamps.append((_p, _d, _kw))
+        )
+
+        pos = _bac_pos(
+            touched_profit=True,
+            peak_pnl_pct=0.02,
+            max_profit_seen=0.02,
+        )
+        pos.position_id = "bac-check-all-1"
+        eng._positions = [pos]
+        eng._positions_by_id = {pos.position_id: pos}
+
+        # 10 AM ET — safely outside any EOD pre-gate window.
+        from zoneinfo import ZoneInfo as _ZI
+        now_et = datetime.now(_ZI("America/New_York")).replace(
+            hour=10, minute=0, second=0, microsecond=0,
+        )
+        eng._check_all_positions(now_et=now_et)
+
+        assert submissions == [], (
+            f"BAC replay must not submit any exit through _check_all_positions; "
+            f"got: {[(getattr(p, 'position_id', '?'), d.reason) for p, d, _ in submissions]}"
+        )
+        assert stamps, "evaluate_exit should have been called and stamped a decision"
+        _, decision, _ = stamps[-1]
+        assert decision.action == "HOLD", (
+            f"_check_all_positions BAC replay must stamp HOLD; got "
+            f"{decision.action} / {decision.reason}"
+        )
+        assert decision.reason_code in {
+            SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+            SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
+        }, (
+            f"Expected SOFT_EXIT_DEFERRED_UNDERLYING_*; got code="
+            f"{decision.reason_code!r} reason={decision.reason!r}"
+        )
+        assert "TOUCHED PROFIT" not in (decision.reason or ""), (
+            "Must not fire TOUCHED PROFIT STOP under _check_all_positions"
         )
 
     def test_bac_no_hard_stop_when_authority_unavailable(self):
@@ -4545,3 +4620,150 @@ class TestSessionDateReplayDeterminism:
             f"0DTE SPY at -21% (past -18%) must HARD STOP under replayed "
             f"session_date; got: {decision.reason}"
         )
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — strict source priority + BID-ts contract)
+# =============================================================================
+
+
+class TestHardStopStrictSourcePriority:
+    """PR #385 review: fresh executable BID always outranks a persisted
+    hard reference derived from LAST / MARK / ASK.  Timestamp comparisons
+    across provider/receipt clocks are not safe; the PR contract declares
+    BID the primary hard-exit source unconditionally."""
+
+    @staticmethod
+    def _stamp_proven_ref(pos, *, price, source, age_sec):
+        pos.hard_exit_reference_price = price
+        pos.hardexitreferenceprice = price
+        pos.hard_exit_reference_source = source
+        pos.hardexitreferencesource = source
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        ts = datetime.now(_UTC) - timedelta(seconds=age_sec)
+        pos.hard_exit_reference_ts = ts
+        pos.hardexitreferencets = ts
+
+    def test_fresh_catastrophic_bid_beats_newer_healthy_mark_ref(self):
+        """Fresh executable BID at -40% must fire HARD STOP even when a
+        NEWER persisted MARK-derived reference sits at +5%."""
+        pos = _fresh_bid_pos(entry_price=1.00, bid=0.60, bid_age_sec=10)
+        # MARK-derived reference is more recent (age 1s vs bid age 10s).
+        self._stamp_proven_ref(pos, price=1.05, source="mark", age_sec=1)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(-0.40, abs=1e-4), (
+            f"Fresh BID must win over newer MARK ref; got {auth}"
+        )
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" in (decision.reason or ""), (
+            f"Fresh -40% BID must trigger HARD STOP; got: {decision.reason}"
+        )
+
+    def test_fresh_recovered_bid_beats_newer_catastrophic_last_ref(self):
+        """Fresh executable BID at +5% must NOT hard-stop even when a
+        NEWER persisted LAST-derived reference sits at -45%."""
+        pos = _fresh_bid_pos(entry_price=1.00, bid=1.05, bid_age_sec=10)
+        self._stamp_proven_ref(pos, price=0.55, source="last", age_sec=1)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(0.05, abs=1e-4), (
+            f"Fresh recovered BID must win over newer LAST ref; got {auth}"
+        )
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" not in (decision.reason or ""), (
+            f"Recovered BID must not HARD STOP; got: {decision.reason}"
+        )
+
+    def test_fresh_bid_beats_future_skewed_ref(self):
+        """A future-timestamped stored ref cannot outrank a fresh BID.
+        Provider clock skew must never manufacture a phantom exit."""
+        pos = _fresh_bid_pos(entry_price=1.00, bid=1.05, bid_age_sec=2)
+        # 30 seconds in the future.
+        _future_ts = datetime.now(_UTC) + timedelta(seconds=30)
+        pos.hard_exit_reference_price = 0.55
+        pos.hardexitreferenceprice = 0.55
+        pos.hard_exit_reference_source = "mark"
+        pos.hardexitreferencesource = "mark"
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = _future_ts
+        pos.hardexitreferencets = _future_ts
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(0.05, abs=1e-4), (
+            f"Fresh BID must win over future-skewed stored ref; got {auth}"
+        )
+
+    def test_persisted_ref_still_used_when_no_fresh_bid(self):
+        """No fresh BID at all → valid LAST/MARK-derived reference still
+        drives the hard stop (fallback is not disabled)."""
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.0,
+            option_bid_valid=False,
+            option_quote_fresh=False,
+        )
+        self._stamp_proven_ref(pos, price=0.55, source="last", age_sec=5)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(-0.45, abs=1e-4), (
+            f"Fallback ref must still drive authority when no fresh BID; got {auth}"
+        )
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" in (decision.reason or "")
+
+
+class TestDedicatedBidTimestampContract:
+    """PR #385 review: zero-BID observations must not advance the
+    dedicated last-positive-BID timestamp.  Otherwise a bug elsewhere
+    could later misread stale numeric data as fresh executable BID."""
+
+    def test_zero_bid_observation_does_not_advance_bid_ts(self):
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=1.10,
+            current_ask=1.15,
+            current_option_price=1.10,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+        )
+        _older = datetime.now(_UTC) - timedelta(seconds=45)
+        pos.last_option_bid_update_ts = _older
+        pos.lastoptionbidupdatets = _older
+
+        _newer = datetime.now(_UTC)
+        _apply_option_quote_for_decision(
+            pos, bid=0.0, ask=1.20, mark=1.175, last=1.16,
+            quote_ts=_newer, source="quote_authority",
+        )
+        # The prior-positive BID timestamp must be untouched.
+        assert pos.last_option_bid_update_ts == _older, (
+            "Zero-bid observation must not advance the dedicated bid ts"
+        )
+        # And explicit vetoes are correctly asserted.
+        assert pos.option_bid_valid is False
+        assert pos.option_quote_fresh is False
+        # Freshness gate sees an old ts + zero bid → not fresh.
+        assert _has_fresh_dedicated_bid(pos) is False
+
+    def test_positive_bid_observation_advances_bid_ts(self):
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.0,
+            option_bid_valid=False,
+            option_quote_fresh=False,
+        )
+        _older = datetime.now(_UTC) - timedelta(seconds=60)
+        pos.last_option_bid_update_ts = _older
+        pos.lastoptionbidupdatets = _older
+
+        _newer = datetime.now(_UTC)
+        _apply_option_quote_for_decision(
+            pos, bid=1.15, ask=1.20, mark=1.175, last=1.16,
+            quote_ts=_newer, source="quote_authority",
+        )
+        assert pos.last_option_bid_update_ts == _newer
+        assert pos.option_bid_valid is True
+        assert pos.option_quote_fresh is True
+        assert _has_fresh_dedicated_bid(pos) is True
