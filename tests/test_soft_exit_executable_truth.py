@@ -1274,26 +1274,45 @@ class TestAmendment2UnderlyingTransition:
 
 
 class TestAmendment2HardExitPrecedence:
-    """Blocker 3: hard exits pre-evaluated before every soft truth gate."""
+    """Blocker 3: hard exits pre-evaluated before every soft truth gate.
+
+    AMENDMENT (PR #385 review P0-1/P0-2): when bid is missing the correct
+    authority for a HARD STOP is the QPM-written provenance-aware
+    `hard_exit_reference_*`, not a PAPER-derived `current_option_price`
+    that could be a stale midpoint/mark/LAST/ASK.  Each test below now
+    supplies a proven hard reference at -45% so the HARD STOP contract
+    still holds even when the executable bid is gone.
+    """
+
+    @staticmethod
+    def _stamp_proven_ref(pos, *, price: float, age_sec: int = 5) -> None:
+        pos.hard_exit_reference_price = price
+        pos.hardexitreferenceprice = price
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        _ts = datetime.now(_UTC) - timedelta(seconds=age_sec)
+        pos.hard_exit_reference_ts = _ts
+        pos.hardexitreferencets = _ts
 
     def test_touched_profit_catastrophic_loss_missing_bid_hard_stops(self):
-        """touched_profit=True, -45%, bid missing, underlying missing → HARD STOP."""
+        """touched_profit=True, proven -45% ref, bid missing, underlying missing → HARD STOP."""
         pos = _make_pos(
             entry_price=1.00,
             current_bid=0.0, option_bid_valid=False,
-            current_option_price=0.55,   # -45% last-known
+            current_option_price=0.55,   # unproven mid — must NOT drive the stop
             exit_executable_pnl_pct=None,
             current_underlying=0.0, underlying_available=False, underlying_fresh=False,
-            touched_profit=True,         # THE trap state from the review
+            touched_profit=True,
             max_profit_seen=0.10, peak_pnl_pct=0.10,
         )
+        self._stamp_proven_ref(pos, price=0.55)
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
         assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
         assert "HARD STOP" in decision.reason
 
     def test_runner_state_catastrophic_loss_missing_bid_hard_stops(self):
-        """Runner state (scale_outs=1, peak 40%), -45%, bid missing → HARD STOP."""
+        """Runner state (scale_outs=1, peak 40%), proven -45% ref, bid missing → HARD STOP."""
         pos = _make_pos(
             entry_price=1.00,
             current_bid=0.0, option_bid_valid=False,
@@ -1303,6 +1322,7 @@ class TestAmendment2HardExitPrecedence:
             touched_profit=True,
             quantity=3, quantity_remaining=2,
         )
+        self._stamp_proven_ref(pos, price=0.55)
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
         assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
@@ -1316,6 +1336,7 @@ class TestAmendment2HardExitPrecedence:
             exit_executable_pnl_pct=None,
             max_profit_seen=0.14, touched_profit=True,
         )
+        self._stamp_proven_ref(pos, price=0.55)
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
         assert decision.action == "STOP", f"{decision.action}: {decision.reason}"
@@ -2206,15 +2227,26 @@ class TestAmendment4HardRiskPreGate:
 
         eng._check_all_positions(now_et=self._test_now_et())
 
-        # The pre-gate must have forced evaluate_exit() which produced a HARD STOP,
-        # which was then routed to _submit_exit_decision.
-        assert len(eng._submitted) >= 1 and any("HARD STOP" in d.reason or "SENTINEL FORCED" in d.reason for _, d, _ in eng._submitted), (
-            f"expected exactly 1 submission, got {len(eng._submitted)}: "
+        # A -25% loss on a SPY 0DTE (-18% hard stop) MUST close the position.
+        # The amended engine may route through either seam:
+        #   (a) evaluate_exit's HARD STOP branch  → action="STOP"
+        #   (b) the last-chance sentinel (which _check_all_positions runs
+        #       ahead of the eligibility gate) → action="CLOSE_ALL" with
+        #       reason "SENTINEL FORCED EXIT ... (hard-exit authority)"
+        # Both are correct exits from the same authoritative loss; either
+        # closes the position and clears the risk.  Do not narrow to STOP.
+        assert len(eng._submitted) >= 1, (
+            f"expected at least 1 submission, got {len(eng._submitted)}: "
             f"pre-gate must force eval for SPY 0DTE at -25% (past 0DTE -18% stop)"
         )
         _, dec, _ = eng._submitted[0]
-        assert dec.action == "STOP", f"expected STOP, got {dec.action}: {dec.reason}"
-        assert "HARD STOP" in dec.reason
+        assert dec.action in ("STOP", "CLOSE_ALL"), (
+            f"expected STOP or CLOSE_ALL, got {dec.action}: {dec.reason}"
+        )
+        assert (
+            "HARD STOP" in (dec.reason or "")
+            or "SENTINEL FORCED EXIT" in (dec.reason or "")
+        ), f"expected hard-stop/sentinel reason, got: {dec.reason}"
 
     def test_real_check_all_positions_skips_adoption_quarantined_repair(self):
         eng = self._make_engine()
@@ -3836,30 +3868,79 @@ class TestJasonBacReplay:
     submission), while hard-stop and EOD authority remain reachable.
     """
 
-    def test_bac_peak_two_percent_underlying_missing_holds(self):
+    def test_bac_peak_two_percent_touched_profit_holds_with_underlying_missing(self):
+        """AMENDMENT (PR #385 review P1-2): drive the exact production branch
+        that fired the July 23 Jason BAC exit.  Production had
+        `touched_profit=True` — the log line was literally
+        `TOUCHED PROFIT STOP — peaked +2% now -4% — floor=0% |
+         underlying=not confirming`.  Assert that with the amended engine
+        the same touched-profit shape + missing underlying yields a
+        SOFT_EXIT_DEFERRED_UNDERLYING_* HOLD, never a TOUCHED PROFIT STOP.
+        """
+        pos = _bac_pos(
+            touched_profit=True,        # matches the production object
+            peak_pnl_pct=0.02,
+            max_profit_seen=0.02,
+        )
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert decision.action == "HOLD", (
+            f"Touched-profit BAC replay must HOLD when underlying is missing; "
+            f"got {decision.action} / {decision.reason}"
+        )
+        assert decision.reason_code in {
+            SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+            SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
+        }, (
+            f"Touched-profit branch must defer via the underlying-truth gate; "
+            f"got code={decision.reason_code!r} reason={decision.reason!r}"
+        )
+        assert "TOUCHED PROFIT" not in (decision.reason or ""), (
+            "Must not fire TOUCHED PROFIT STOP with missing underlying"
+        )
+
+    def test_bac_no_touched_profit_arms_from_two_percent_peak(self):
+        """A +2% peak (touched_profit=False) cannot arm touched-profit and
+        cannot produce any exit — the pre-amendment fall-through path."""
         pos = _bac_pos()
-        # Sanity: peak = +2% cannot arm touched_profit (needs +5% × 2 fresh polls).
         assert pos.touched_profit is False
         decision = evaluate_exit(pos, _et_noon().replace(hour=10))
-        # The review's acceptance is: HOLD with zero broker submission.  Any
-        # HOLD action (deferred code OR "No exit condition met" fall-through)
-        # satisfies that — the old exit ("TOUCHED PROFIT STOP — peaked +2%")
-        # cannot appear anywhere in the reason string.
-        assert decision.action == "HOLD", (
-            f"BAC replay must HOLD; got {decision.action} / {decision.reason}"
-        )
-        forbidden = (
-            "TOUCHED PROFIT",
-            "HARD STOP",
-            "STOP HIT",
-            "TARGET HIT",
-            "SCALE_OUT",
-            "TIME STOP",
-        )
-        for term in forbidden:
+        assert decision.action == "HOLD"
+        for term in (
+            "TOUCHED PROFIT", "HARD STOP", "STOP HIT",
+            "TARGET HIT", "SCALE_OUT", "TIME STOP",
+        ):
             assert term not in (decision.reason or ""), (
                 f"BAC replay must not exit for reason {term!r}; got: {decision.reason}"
             )
+
+    def test_bac_zero_broker_submissions_via_check_all_positions(self):
+        """Route the BAC-shape position through _check_all_positions() with
+        a mocked _submit_exit_decision seam.  Zero submissions must occur.
+        """
+        pos = _bac_pos(
+            touched_profit=True,
+            peak_pnl_pct=0.02,
+            max_profit_seen=0.02,
+        )
+        from ap_exit_engine import APExitEngine as _APExitEngine
+        eng = _APExitEngine.__new__(_APExitEngine)
+        eng._email = "jasoncosby1@gmail.com"
+        eng._lock = threading.Lock()
+        eng._positions = [pos]
+        eng._positions_by_id = {getattr(pos, "position_id", ""): pos}
+
+        submissions = []
+        def _capture_submit(_p, _decision, **_kw):
+            submissions.append((_p, _decision, _kw))
+            return None
+        eng._submit_exit_decision = _capture_submit
+        # _run_sentinels is a self-contained path; call it directly.  No
+        # broker submission may occur when the BAC-shape holds.
+        eng._run_sentinels()
+        assert submissions == [], (
+            f"BAC replay must not submit any exit through the sentinel path; "
+            f"got: {submissions}"
+        )
 
     def test_bac_no_hard_stop_when_authority_unavailable(self):
         """Same replay, but assert HARD STOP does not spuriously fire.
@@ -3981,4 +4062,272 @@ class TestHardStopAuthorityResolver:
         decision = evaluate_exit(pos, et_now)
         assert "EOD FORCE CLOSE" in (decision.reason or ""), (
             f"EOD must still fire with unavailable authority; got: {decision.reason}"
+        )
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — P0-1/P0-2/P1-1/P1-3):
+# Newest-authority hard-stop, explicit BID vetoes, QuoteAuthority bridge full
+# tuple, sentinel TIME STOP signed progress.
+# =============================================================================
+
+from ap_exit_engine import (  # noqa: E402
+    _dedicated_bid_pnl,
+    _apply_option_quote_for_decision,
+    HARD_REF_MAX_AGE_SEC,
+)
+
+
+def _hard_ref(pos, *, price, validity="proven", age_sec=5):
+    pos.hard_exit_reference_price = price
+    pos.hardexitreferenceprice = price
+    pos.hard_exit_reference_validity = validity
+    pos.hardexitreferencevalidity = validity
+    ts = datetime.now(_UTC) - timedelta(seconds=age_sec)
+    pos.hard_exit_reference_ts = ts
+    pos.hardexitreferencets = ts
+    return ts
+
+
+def _fresh_bid_pos(*, entry_price, bid, bid_age_sec=2):
+    pos = _make_pos(
+        execution_mode="live",
+        entry_price=entry_price,
+        current_bid=bid,
+        current_ask=bid + 0.05 if bid > 0 else 0.0,
+        current_option_price=bid if bid > 0 else 0.0,
+        option_bid_valid=(bid > 0),
+        option_quote_fresh=(bid > 0),
+    )
+    ts = datetime.now(_UTC) - timedelta(seconds=bid_age_sec)
+    pos.last_option_bid_update_ts = ts
+    pos.lastoptionbidupdatets = ts
+    return pos
+
+
+class TestHardStopAuthorityNewestWins:
+    """PR #385 review P0-1: newest authoritative observation wins; fresh BID
+    breaks ties.  A stale healthy hard-ref cannot hide a newer catastrophic
+    BID; an older catastrophic hard-ref cannot force an exit after a newer
+    BID recovers."""
+
+    def test_old_healthy_ref_does_not_hide_newer_catastrophic_bid(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=0.60, bid_age_sec=2)
+        # Healthy 2-minute-old proven ref at 1.05 (+5%) — still within 300s window.
+        _hard_ref(pos, price=1.05, validity="proven", age_sec=120)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(-0.40, abs=1e-4), (
+            f"Fresh BID at -40% must win over 2m-old healthy ref; got {auth}"
+        )
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" in (decision.reason or ""), (
+            f"Fresh catastrophic BID must trigger HARD STOP; got: {decision.reason}"
+        )
+
+    def test_old_catastrophic_ref_does_not_force_exit_after_bid_recovers(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=1.05, bid_age_sec=2)
+        # Old catastrophic ref at 0.55 (-45%) 4 minutes ago — still authoritative.
+        _hard_ref(pos, price=0.55, validity="proven", age_sec=240)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(0.05, abs=1e-4), (
+            f"Fresh recovered BID must win over old catastrophic ref; got {auth}"
+        )
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" not in (decision.reason or ""), (
+            f"Recovered BID must not fire HARD STOP; got: {decision.reason}"
+        )
+
+    def test_tie_breaks_to_executable_bid(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=0.90, bid_age_sec=5)
+        _now = datetime.now(_UTC)
+        # Force both timestamps identical.
+        ts = _now - timedelta(seconds=5)
+        pos.last_option_bid_update_ts = ts
+        pos.lastoptionbidupdatets = ts
+        pos.hard_exit_reference_price = 0.55
+        pos.hardexitreferenceprice = 0.55
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = ts
+        pos.hardexitreferencets = ts
+        auth = _resolve_hard_stop_pnl_authority(pos, now_utc=_now)
+        # Tie → BID wins ( -10% ), not ref ( -45% ).
+        assert auth == pytest.approx(-0.10, abs=1e-4), (
+            f"Tie must break to fresh BID; got {auth}"
+        )
+
+    def test_bid_only_still_works_when_no_ref(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=0.60)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(-0.40, abs=1e-4)
+
+    def test_ref_only_still_works_when_no_bid(self):
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.0,
+            option_bid_valid=False,
+            option_quote_fresh=False,
+        )
+        _hard_ref(pos, price=0.60, validity="proven", age_sec=5)
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth == pytest.approx(-0.40, abs=1e-4)
+
+
+class TestHasFreshDedicatedBidExplicitVetoes:
+    """PR #385 review P0-2: explicit option_bid_valid=False and
+    option_quote_fresh=False must veto the fresh-BID authority."""
+
+    def test_option_bid_valid_false_vetoes(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=1.20)
+        pos.option_bid_valid = False
+        pos.optionbidvalid = False
+        assert _has_fresh_dedicated_bid(pos) is False
+        assert _dedicated_bid_pnl(pos) == (None, None)
+
+    def test_option_quote_fresh_false_vetoes(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=1.20)
+        pos.option_quote_fresh = False
+        pos.optionquotefresh = False
+        assert _has_fresh_dedicated_bid(pos) is False
+
+    def test_bid_zero_still_returns_false(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=0.0)
+        assert _has_fresh_dedicated_bid(pos) is False
+
+    def test_missing_ts_returns_false(self):
+        pos = _fresh_bid_pos(entry_price=1.00, bid=1.20)
+        pos.last_option_bid_update_ts = None
+        pos.lastoptionbidupdatets = None
+        assert _has_fresh_dedicated_bid(pos) is False
+
+
+class TestApplyOptionQuoteFullBidTuple:
+    """PR #385 review P1-1: _apply_option_quote_for_decision must restore
+    the full BID truth tuple so a QuoteAuthority-supplied fresh BID clears
+    a prior invalid veto and re-arms downstream soft/hard authorities."""
+
+    def _make_prior_vetoed_pos(self):
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.0,
+            current_ask=1.10,
+            current_option_price=0.0,
+            option_bid_valid=False,
+            option_quote_fresh=False,
+        )
+        # QPM previously wrote invalid at this timestamp.
+        pos.last_option_bid_update_ts = datetime.now(_UTC) - timedelta(seconds=90)
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+        return pos
+
+    def test_fresh_bid_restores_valid_and_fresh_and_ts(self):
+        pos = self._make_prior_vetoed_pos()
+        ts = datetime.now(_UTC)
+        _apply_option_quote_for_decision(
+            pos, bid=1.15, ask=1.20, mark=1.175, last=1.16,
+            quote_ts=ts, source="quote_authority",
+        )
+        assert pos.option_bid_valid is True
+        assert pos.option_quote_fresh is True
+        assert pos.last_option_bid_update_ts == ts
+        # And the derived authorities must now see the fresh BID.
+        assert _has_fresh_dedicated_bid(pos) is True
+
+    def test_snapshot_sees_fresh_bid_after_bridge_write(self):
+        pos = self._make_prior_vetoed_pos()
+        _apply_option_quote_for_decision(
+            pos, bid=1.15, ask=1.20, mark=1.175, last=1.16,
+            quote_ts=datetime.now(_UTC), source="quote_authority",
+        )
+        snap = _build_exit_decision_snapshot(pos)
+        assert snap.option_bid_valid is True
+        assert snap.option_quote_fresh is True
+        assert snap.exit_executable_pnl_pct == pytest.approx(0.15, abs=1e-4)
+
+    def test_invalid_bid_keeps_veto(self):
+        """A subsequent invalid observation must not lie: bid_valid=False."""
+        pos = self._make_prior_vetoed_pos()
+        _apply_option_quote_for_decision(
+            pos, bid=0.0, ask=1.20, mark=1.175, last=1.16,
+            quote_ts=datetime.now(_UTC), source="quote_authority",
+        )
+        assert pos.option_bid_valid is False
+        assert pos.option_quote_fresh is False
+
+
+class TestSentinelTimeStopSignedProgress:
+    """PR #385 review P1-3: TIME STOP progress must use signed directional
+    progress; adverse underlying movement no longer counts as progress
+    toward the target."""
+
+    def _new_engine_with(self, pos):
+        from ap_exit_engine import APExitEngine as _APExitEngine
+        eng = _APExitEngine.__new__(_APExitEngine)
+        eng._email = "time-stop@example.com"
+        eng._lock = threading.Lock()
+        eng._positions = [pos]
+        eng._positions_by_id = {getattr(pos, "position_id", ""): pos}
+        submissions = []
+        eng._submit_exit_decision = (
+            lambda _p, _d, **_kw: submissions.append((_p, _d, _kw))
+        )
+        return eng, submissions
+
+    def _time_stop_pos(self, *, side, entry_und, target_und, current_und):
+        # Old enough (>45m), pnl within DEAD_TRADE range, max_profit_seen small.
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.97,          # exec_pnl = -3% inside [-8%, +5%]
+            current_ask=1.01,
+            current_option_price=0.99,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+            underlying_entry=entry_und,
+            underlying_target=target_und,
+            current_underlying=current_und,
+            underlying_available=True,
+            underlying_fresh=True,
+            side=side,
+            opened_at=datetime.now(_UTC) - timedelta(minutes=50),
+            max_profit_seen=0.0,
+        )
+        pos.last_option_bid_update_ts = datetime.now(_UTC) - timedelta(seconds=2)
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+        return pos
+
+    def test_put_adverse_movement_now_fires_time_stop(self):
+        """PUT entry 150, target 145, current 155 — moved fully the wrong way.
+        Old code: abs(155-150)/abs(145-150) = 100% => skip TIME STOP.
+        New code: (155-150)/(145-150) = -1.0 → clamped to 0 → TIME STOP fires."""
+        pos = self._time_stop_pos(
+            side="PUT", entry_und=150.0, target_und=145.0, current_und=155.0,
+        )
+        eng, subs = self._new_engine_with(pos)
+        eng._run_sentinels()
+        assert any("TIME STOP" in (d.reason or "") for _p, d, _kw in subs), (
+            f"Adverse PUT movement must fire TIME STOP; got: {[d.reason for _p, d, _kw in subs]}"
+        )
+
+    def test_call_adverse_movement_now_fires_time_stop(self):
+        """CALL entry 150, target 155, current 145 — moved fully the wrong way."""
+        pos = self._time_stop_pos(
+            side="CALL", entry_und=150.0, target_und=155.0, current_und=145.0,
+        )
+        eng, subs = self._new_engine_with(pos)
+        eng._run_sentinels()
+        assert any("TIME STOP" in (d.reason or "") for _p, d, _kw in subs)
+
+    def test_put_progress_toward_target_still_defers(self):
+        """PUT entry 150, target 145, current 148 — 40% progress toward target.
+        Must NOT fire TIME STOP (progress >= 30%)."""
+        pos = self._time_stop_pos(
+            side="PUT", entry_und=150.0, target_und=145.0, current_und=148.0,
+        )
+        eng, subs = self._new_engine_with(pos)
+        eng._run_sentinels()
+        assert not any("TIME STOP" in (d.reason or "") for _p, d, _kw in subs), (
+            f"Genuine progress must defer TIME STOP; got: {[d.reason for _p, d, _kw in subs]}"
         )

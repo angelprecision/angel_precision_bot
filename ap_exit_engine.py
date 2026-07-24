@@ -765,7 +765,28 @@ def _should_replace_hard_ref(
 
 
 def _has_fresh_dedicated_bid(pos: "ManagedPosition", *, now_utc: "Optional[datetime]" = None) -> bool:
+    """True when the position holds a fresh, executable, un-vetoed dedicated BID.
+
+    AMENDMENT (PR #385 review P0-2): explicit producer vetoes must be honored.
+    QPM writes `option_bid_valid=False` when this cycle's raw bid failed its
+    truth check, and `option_quote_fresh=False` when the quote is stale.  A
+    retained numeric bid must not regain hard-stop authority merely because
+    the timestamp is still within the freshness window.  Elsewhere in the
+    engine (`_build_exit_decision_snapshot`) these booleans are already
+    treated as authoritative vetoes; the hard-stop fallback must match.
+    """
     now_utc = now_utc or datetime.now(timezone.utc)
+
+    # Producer vetoes: explicit False overrides any numeric reading.
+    _bid_valid_direct = getattr(pos, "option_bid_valid",
+                                getattr(pos, "optionbidvalid", None))
+    if _bid_valid_direct is False:
+        return False
+    _quote_fresh_direct = getattr(pos, "option_quote_fresh",
+                                   getattr(pos, "optionquotefresh", None))
+    if _quote_fresh_direct is False:
+        return False
+
     try:
         bid = float(getattr(pos, "current_bid", getattr(pos, "currentbid", 0.0)) or 0.0)
     except Exception:
@@ -784,50 +805,89 @@ def _has_fresh_dedicated_bid(pos: "ManagedPosition", *, now_utc: "Optional[datet
         return False
 
 
+def _dedicated_bid_pnl(
+    pos: "ManagedPosition",
+    *,
+    now_utc: "Optional[datetime]" = None,
+) -> "tuple[Optional[float], Optional[datetime]]":
+    """Return (bid_pnl_pct, dedicated_bid_ts) when fresh + valid, else (None, None).
+
+    Callers use the timestamp to compare against other authoritative sources
+    (e.g. the persisted hard-exit reference) so the newest observation wins.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if not _has_fresh_dedicated_bid(pos, now_utc=now_utc):
+        return None, None
+    try:
+        bid = float(getattr(pos, "current_bid",
+                            getattr(pos, "currentbid", 0.0)) or 0.0)
+        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None, None
+    if bid <= 0.0 or entry <= 0.0:
+        return None, None
+    bid_ts = _normalize_hard_ref_ts(
+        getattr(pos, "last_option_bid_update_ts",
+                getattr(pos, "lastoptionbidupdatets", None)),
+        now_utc=now_utc,
+    )
+    return (bid - entry) / entry, bid_ts
+
+
 def _resolve_hard_stop_pnl_authority(
     pos: "ManagedPosition",
     now_utc: "Optional[datetime]" = None,
 ) -> "Optional[float]":
     """Single authority for hard-stop P&L across evaluate_exit() and sentinels.
 
-    Authority order (strict, no cross-pollination with soft-exit sources):
+    Two authoritative sources may exist at the same time:
 
-      1. `get_effective_hard_exit_reference()` — the provenance-aware,
-         age-gated hard-exit reference written by QPM. Already validated
-         to be "proven" / "catastrophic_ask" and within HARD_REF_MAX_AGE_SEC.
+      A. `get_effective_hard_exit_reference()` — provenance-aware persisted
+         hard-exit reference (validity ∈ {"proven","catastrophic_ask"},
+         age ≤ HARD_REF_MAX_AGE_SEC, written by QPM from the last-known
+         best-available option price).
 
-      2. Fresh executable BID computed directly from `current_bid` against
-         `entry_price`, gated by `_has_fresh_dedicated_bid()`. This exists
-         so a hard stop is not disabled merely because the persisted
-         hard-reference object is absent (fresh restart, first cycle).
+      B. Fresh executable BID (bid > 0, un-vetoed, dedicated bid timestamp
+         within STALE_OPTION_QUOTE_MAX_AGE_SEC).
 
-      3. None — no price-based hard-stop authority for this cycle.
+    AMENDMENT (PR #385 review P0-1): a two-minute-old persisted reference
+    must not hide a newer executable BID at −40% (false safety), and an
+    older catastrophic reference must not force an exit after a newer BID
+    has recovered (false forced exit).  When both sources are available we
+    pick the newest observation by timestamp.  Ties break to the executable
+    BID, which is the freshest form of market truth.
 
-    Never falls back to midpoint, mark, LAST, ASK, `current_option_price`,
-    or `option_pnl_pct`. Those may be derived from unproven / stale PAPER
-    pricing and would let the hard stop fire on noise or spread math after
-    the authoritative resolver correctly rejected the reference.
-
-    Returning None means the caller MUST NOT fire a price-based hard stop
-    this cycle. Zero is not safe — zero would falsely certify safety.
+    Never falls back to midpoint, mark, LAST, ASK, current_option_price,
+    or option_pnl_pct — those may derive from unproven PAPER pricing.
+    Missing authority → None → caller must not fire a hard stop.  Zero
+    would falsely certify safety and is prohibited.
     """
     now_utc = now_utc or datetime.now(timezone.utc)
 
-    resolved = get_effective_hard_exit_reference(pos, now_utc)
-    if resolved is not None:
-        return resolved
+    ref_pnl = get_effective_hard_exit_reference(pos, now_utc)
+    bid_pnl, bid_ts = _dedicated_bid_pnl(pos, now_utc=now_utc)
 
-    if _has_fresh_dedicated_bid(pos, now_utc=now_utc):
-        try:
-            bid = float(getattr(pos, "current_bid",
-                                 getattr(pos, "currentbid", 0.0)) or 0.0)
-            entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return None
-        if bid > 0.0 and entry > 0.0:
-            return (bid - entry) / entry
+    if ref_pnl is None and bid_pnl is None:
+        return None
+    if ref_pnl is None:
+        return bid_pnl
+    if bid_pnl is None:
+        return ref_pnl
 
-    return None
+    # Both authoritative — pick the newest observation.  Fresh BID wins ties.
+    ref_ts = _normalize_hard_ref_ts(
+        getattr(pos, "hard_exit_reference_ts",
+                getattr(pos, "hardexitreferencets", None)),
+        now_utc=now_utc,
+    )
+    if ref_ts is None:
+        # Reference validity was accepted but its timestamp is unusable for
+        # ordering.  Prefer the observation whose timestamp we can actually
+        # verify — the fresh BID.
+        return bid_pnl
+    if bid_ts is None:
+        return ref_pnl
+    return bid_pnl if bid_ts >= ref_ts else ref_pnl
 
 
 def _is_adoption_identity_quarantined(pos) -> bool:
@@ -1072,6 +1132,46 @@ def _apply_option_quote_for_decision(
             pos.lastoptionquoteupdatets     = quote_ts
         except Exception as _e:
             log.debug("_aqfd: quote_ts write failed: %s", _e)
+
+    # AMENDMENT (PR #385 review P1-1): the QuoteAuthority bridge feeds this
+    # helper with a fresh BID after QPM may have previously written
+    # option_bid_valid=False (or option_quote_fresh=False, or a stale
+    # last_option_bid_update_ts).  Without also rewriting the FULL bid
+    # truth tuple here, `_build_exit_decision_snapshot` and
+    # `_has_fresh_dedicated_bid` would still see the prior invalid vetoes
+    # and refuse to trust the new BID — soft winner protection and the
+    # hard-stop fresh-BID fallback would stay disabled despite fresh
+    # executable data.  We restore ALL three fields on every call so this
+    # helper is the single seam for BID truth as well as the price itself.
+    _bid_positive = False
+    try:
+        _bid_positive = float(bid or 0.0) > 0.0
+    except Exception:
+        _bid_positive = False
+    try:
+        pos.option_bid_valid = _bid_positive
+        pos.optionbidvalid   = _bid_positive
+    except Exception as _e:
+        log.debug("_aqfd: option_bid_valid write failed: %s", _e)
+    if quote_ts is not None:
+        # Stamp the dedicated BID timestamp on every observation so
+        # freshness gates can distinguish "producer wrote invalid this
+        # cycle" from "producer stopped writing".  A cycle whose BID is
+        # zero still gets its dedicated timestamp; _has_fresh_dedicated_bid
+        # requires bid > 0 in addition to freshness so this is safe.
+        try:
+            pos.last_option_bid_update_ts = quote_ts
+            pos.lastoptionbidupdatets     = quote_ts
+        except Exception as _e:
+            log.debug("_aqfd: last_option_bid_update_ts write failed: %s", _e)
+        # option_quote_fresh is derived from bid_valid AND ts_fresh in the
+        # snapshot builder.  Here we clear any prior explicit False veto
+        # when a positive bid arrives — otherwise the veto sticks forever.
+        try:
+            pos.option_quote_fresh = _bid_positive
+            pos.optionquotefresh   = _bid_positive
+        except Exception as _e:
+            log.debug("_aqfd: option_quote_fresh write failed: %s", _e)
 
     # ── HARD-EXIT REFERENCE (amendment #6) ───────────────────────────────────
     # QPM is not the only writer path.  Broker-position repair and startup
@@ -5227,7 +5327,20 @@ class APExitEngine:
                     )
                     continue
 
-                progress = abs(_u_now - _u_entry) / _denom
+                # AMENDMENT (PR #385 review P1-3): the previous
+                # `abs(current - entry) / abs(target - entry)` counted
+                # adverse movement as "progress toward target" and skipped
+                # the TIME STOP even when the underlying had moved
+                # entirely the wrong way (e.g. PUT entry 150, target 145,
+                # current 155 → 100% "progress").  Use signed directional
+                # progress: (current - entry) / (target - entry).  The
+                # sign of the denominator matches the intended direction,
+                # so both CALL (target above entry) and PUT (target below
+                # entry) yield a positive fraction only when the trade is
+                # actually moving toward its target.  Adverse movement
+                # clamps to 0 and the TIME STOP fires as designed.
+                raw_progress = (_u_now - _u_entry) / (_u_target - _u_entry)
+                progress = max(0.0, raw_progress)
                 if progress < 0.30:
                     decision = ExitDecision(
                         action="CLOSE_ALL", quantity=pos.quantity_remaining,
