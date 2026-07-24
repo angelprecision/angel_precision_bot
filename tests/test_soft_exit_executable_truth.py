@@ -4331,3 +4331,217 @@ class TestSentinelTimeStopSignedProgress:
         assert not any("TIME STOP" in (d.reason or "") for _p, d, _kw in subs), (
             f"Genuine progress must defer TIME STOP; got: {[d.reason for _p, d, _kw in subs]}"
         )
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — full-PR audit round):
+#   - snapshot chronology in apply_quote_snapshots()
+#   - index-prefix misclassification (SPXL/SPXS/SPXU)
+#   - DTE session_date honors evaluate_exit's now_et
+# =============================================================================
+
+from ap.exit_thresholds import (  # noqa: E402
+    effective_thresholds as _shared_effective_thresholds_direct,
+    option_profile as _option_profile_direct,
+)
+
+
+class TestApplyQuoteSnapshotsChronology:
+    """PR #385 review P0: older authoritative snapshots must not overwrite a
+    newer authoritative hard-exit reference.  Delegates to the shared
+    _should_replace_hard_ref chronology gate."""
+
+    def _new_engine_with_pos(self, pos):
+        from ap_exit_engine import APExitEngine as _APExitEngine
+        eng = _APExitEngine.__new__(_APExitEngine)
+        eng._email = "chrono@example.com"
+        eng._lock = threading.Lock()
+        eng._positions = [pos]
+        eng._positions_by_id = {getattr(pos, "position_id", ""): pos}
+        return eng
+
+    def test_older_proven_snapshot_does_not_overwrite_newer_catastrophic(self):
+        """Position holds a newer catastrophic proven ref at T2 (-40%).
+        An older proven snapshot at T1 (-10%) arrives.  Prior must survive.
+        """
+        pos = _make_pos(execution_mode="live", entry_price=1.00)
+        pos.position_id = "chrono-1"
+        t2 = datetime.now(_UTC) - timedelta(seconds=10)
+        pos.hard_exit_reference_price = 0.60      # -40%
+        pos.hardexitreferenceprice = 0.60
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = t2
+        pos.hardexitreferencets = t2
+        pos.hard_exit_reference_pnl_pct = -0.40
+        pos.hardexitreferencepnlpct = -0.40
+
+        eng = self._new_engine_with_pos(pos)
+        t1 = t2 - timedelta(seconds=120)
+        eng.apply_quote_snapshots([{
+            "position_id": "chrono-1",
+            "hard_exit_reference_price": 0.90,
+            "hard_exit_reference_source": "last",
+            "hard_exit_reference_ts": t1,
+            "hard_exit_reference_pnl_pct": -0.10,
+            "hard_exit_reference_validity": "proven",
+        }])
+
+        # Prior newer catastrophic ref survives.
+        assert pos.hard_exit_reference_price == 0.60
+        assert pos.hard_exit_reference_ts == t2
+        assert pos.hard_exit_reference_pnl_pct == pytest.approx(-0.40)
+        assert pos.hard_exit_reference_refresh_needed is True
+        # And the resolver still sees -40% as the hard-stop authority.
+        assert _resolve_hard_stop_pnl_authority(pos) == pytest.approx(-0.40, abs=1e-4)
+
+    def test_newer_proven_snapshot_does_overwrite_older_healthy(self):
+        """Position holds an old healthy proven ref at T1 (+5%).
+        A newer proven catastrophic snapshot at T2 (-40%) arrives.
+        The newer authority must replace the older."""
+        pos = _make_pos(execution_mode="live", entry_price=1.00)
+        pos.position_id = "chrono-2"
+        t1 = datetime.now(_UTC) - timedelta(seconds=120)
+        pos.hard_exit_reference_price = 1.05
+        pos.hardexitreferenceprice = 1.05
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = t1
+        pos.hardexitreferencets = t1
+        pos.hard_exit_reference_pnl_pct = 0.05
+        pos.hardexitreferencepnlpct = 0.05
+
+        eng = self._new_engine_with_pos(pos)
+        t2 = datetime.now(_UTC) - timedelta(seconds=5)
+        eng.apply_quote_snapshots([{
+            "position_id": "chrono-2",
+            "hard_exit_reference_price": 0.60,
+            "hard_exit_reference_source": "bid",
+            "hard_exit_reference_ts": t2,
+            "hard_exit_reference_pnl_pct": -0.40,
+            "hard_exit_reference_validity": "proven",
+        }])
+        assert pos.hard_exit_reference_price == 0.60
+        assert pos.hard_exit_reference_ts == t2
+
+    def test_unproven_snapshot_never_erases_positive_authoritative_prior(self):
+        """Even without chronology, unproven / no_data payloads must not
+        wipe an authoritative reference (legacy safety net)."""
+        pos = _make_pos(execution_mode="live", entry_price=1.00)
+        pos.position_id = "chrono-3"
+        t2 = datetime.now(_UTC) - timedelta(seconds=5)
+        pos.hard_exit_reference_price = 0.60
+        pos.hardexitreferenceprice = 0.60
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = t2
+        pos.hardexitreferencets = t2
+
+        eng = self._new_engine_with_pos(pos)
+        eng.apply_quote_snapshots([{
+            "position_id": "chrono-3",
+            "hard_exit_reference_price": 0.55,
+            "hard_exit_reference_source": "ask_stale",
+            "hard_exit_reference_ts": datetime.now(_UTC),
+            "hard_exit_reference_pnl_pct": -0.45,
+            "hard_exit_reference_validity": "unproven",
+        }])
+        assert pos.hard_exit_reference_price == 0.60
+        assert pos.hard_exit_reference_validity == "proven"
+
+
+class TestIndexRootExactMatch:
+    """PR #385 review P1: index membership must be exact-root, never prefix.
+    SPXL / SPXS / SPXU start with "SPX" but are 3× leveraged equity ETFs."""
+
+    def _pos(self, symbol):
+        return _make_pos(option_symbol=symbol)
+
+    def test_spxw_is_index(self):
+        _, is_index, _ = _option_profile_direct(self._pos("SPXW260721P00650000"))
+        assert is_index is True
+
+    def test_spx_is_index(self):
+        _, is_index, _ = _option_profile_direct(self._pos("SPX260721P00650000"))
+        assert is_index is True
+
+    def test_spy_is_index(self):
+        _, is_index, _ = _option_profile_direct(self._pos("SPY260721P00650000"))
+        assert is_index is True
+
+    def test_spxl_is_equity(self):
+        _, is_index, _ = _option_profile_direct(self._pos("SPXL260721P00050000"))
+        assert is_index is False, "SPXL is a 3× equity ETF, not an index product"
+
+    def test_spxs_is_equity(self):
+        _, is_index, _ = _option_profile_direct(self._pos("SPXS260721P00010000"))
+        assert is_index is False
+
+    def test_spxu_is_equity(self):
+        _, is_index, _ = _option_profile_direct(self._pos("SPXU260721P00030000"))
+        assert is_index is False
+
+    def test_spxl_0dte_uses_equity_hard_stop(self):
+        """SPXL 0DTE must resolve to the -22% equity hard stop, not -18%."""
+        # Build an option symbol whose expiry equals today (ET session date).
+        from zoneinfo import ZoneInfo as _ZI
+        _today = datetime.now(_ZI("America/New_York")).date()
+        _exp = f"{_today.year % 100:02d}{_today.month:02d}{_today.day:02d}"
+        pos = _make_pos(option_symbol=f"SPXL{_exp}P00050000")
+        _hard, _, _ = _shared_effective_thresholds_direct(pos)
+        assert _hard == pytest.approx(-0.22), (
+            f"SPXL 0DTE must use equity -22% hard stop, got {_hard}"
+        )
+
+
+class TestSessionDateReplayDeterminism:
+    """PR #385 review P1: DTE profile must follow the supplied evaluation
+    clock, not the host wall-clock date.  Otherwise historical replays and
+    after-midnight-UTC runs can pick a different threshold profile than the
+    session they claim to evaluate."""
+
+    def test_option_profile_honors_supplied_session_date(self):
+        # Option expires 2026-07-24.  Evaluated on 2026-07-24 => 0DTE.
+        # Evaluated on 2026-07-25 => -1DTE.  The wall clock is irrelevant.
+        pos = _make_pos(option_symbol="SPY260724C00650000")
+        _dte_zero, _, _prof_zero = _option_profile_direct(
+            pos, session_date=datetime(2026, 7, 24).date(),
+        )
+        _dte_neg, _, _prof_neg = _option_profile_direct(
+            pos, session_date=datetime(2026, 7, 25).date(),
+        )
+        assert _dte_zero == 0
+        assert _prof_zero.startswith("0DTE")
+        assert _dte_neg == -1
+        assert _prof_neg == "-1DTE"
+
+    def test_effective_thresholds_honors_supplied_session_date(self):
+        pos = _make_pos(option_symbol="SPY260724C00650000")
+        _hard_0dte, _, _ = _shared_effective_thresholds_direct(
+            pos, session_date=datetime(2026, 7, 24).date(),
+        )
+        _hard_2dte, _, _ = _shared_effective_thresholds_direct(
+            pos, session_date=datetime(2026, 7, 22).date(),
+        )
+        # 0DTE index equity (SPY is INDEX_ETFS) → -18%.
+        assert _hard_0dte == pytest.approx(-0.18)
+        # 2DTE → -0.26 profile.
+        assert _hard_2dte == pytest.approx(-0.26)
+
+    def test_evaluate_exit_uses_supplied_now_et_for_dte(self):
+        """Feed evaluate_exit a `now_et` from the replayed session date and
+        verify the DTE-profile-derived HARD STOP threshold applies at that
+        session, not at the host wall clock.
+        """
+        # Option expires 2026-07-24. Evaluate on 2026-07-24 (0DTE, SPY→index).
+        pos = _fresh_bid_pos(entry_price=1.00, bid=0.79)  # -21% via bid
+        pos.option_symbol = "SPY260724C00650000"
+        pos.ticker = "SPY"
+        # 0DTE SPY index hard stop is -18%.  -21% is past it → HARD STOP fires.
+        from zoneinfo import ZoneInfo as _ZI
+        now_et = datetime(2026, 7, 24, 10, 0, 0, tzinfo=_ZI("America/New_York"))
+        decision = evaluate_exit(pos, now_et)
+        assert "HARD STOP" in (decision.reason or ""), (
+            f"0DTE SPY at -21% (past -18%) must HARD STOP under replayed "
+            f"session_date; got: {decision.reason}"
+        )

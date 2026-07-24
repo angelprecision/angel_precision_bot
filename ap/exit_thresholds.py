@@ -45,20 +45,39 @@ def option_root(option_symbol: str) -> str:
     return sym[:match.start()].strip()
 
 
-def option_profile(pos) -> tuple[int, bool, str]:
+def option_profile(pos, *, session_date=None) -> tuple[int, bool, str]:
+    """Return (dte, is_index, profile_label) for a position.
+
+    AMENDMENT (PR #385 review — index-prefix misclassification):
+    the previous `any(root.startswith(t) for t in INDEX_ETFS)` matched
+    SPXL / SPXS / SPXU (all begin with "SPX") and misclassified those
+    3× leveraged equity ETFs as index products.  Under the amended
+    engine index membership is exact-root only.
+
+    AMENDMENT (PR #385 review — replay determinism):
+    `session_date` is now propagated from the caller (e.g. the ET
+    session date derived from evaluate_exit's `now_et`) so historical
+    replays cannot silently swap 0DTE for negative-DTE just because the
+    host wall-clock has rolled past the replayed date.
+    """
     symbol = str(getattr(pos, "option_symbol", getattr(pos, "optionsymbol", "")) or "").upper()
     ticker = str(getattr(pos, "ticker", "") or "").upper()
     root = option_root(symbol)
-    dte = option_dte(symbol)
+    dte = option_dte(symbol, session_date=session_date)
     index_roots = INDEX_ETFS | {"SPXW", "NDX", "NDXP", "RUT", "RUTW"}
-    is_index = root in index_roots or ticker in index_roots or any(root.startswith(t) for t in INDEX_ETFS)
+    is_index = root in index_roots or ticker in index_roots
     profile = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
     return dte, is_index, profile
 
 
-def effective_thresholds(pos) -> tuple[float, float, float]:
-    """Return (hard_stop, immediate_tp, profit_lock) adjusted for DTE/instrument."""
-    dte, is_index, _ = option_profile(pos)
+def effective_thresholds(pos, *, session_date=None) -> tuple[float, float, float]:
+    """Return (hard_stop, immediate_tp, profit_lock) adjusted for DTE/instrument.
+
+    `session_date` forwards to `option_profile` so evaluate_exit callers
+    can pin DTE to their supplied evaluation clock rather than the host
+    wall-clock date.
+    """
+    dte, is_index, _ = option_profile(pos, session_date=session_date)
     if dte == 0 and is_index:
         return -0.18, 0.20, 0.08
     if dte == 0:

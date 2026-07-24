@@ -546,9 +546,19 @@ def _soft_exit_underlying_truth_gate(
     return None
 
 
-def _effective_thresholds(pos: "ManagedPosition") -> tuple:
-    """Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument."""
-    return _shared_effective_thresholds(pos)
+def _effective_thresholds(
+    pos: "ManagedPosition",
+    *,
+    session_date=None,
+) -> tuple:
+    """Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument.
+
+    AMENDMENT (PR #385 review): `session_date` forwards to the shared
+    thresholds helper so evaluate_exit()'s caller-supplied `now_et` can
+    pin DTE profile lookup to the evaluation clock rather than the host
+    wall-clock date (deterministic replay).
+    """
+    return _shared_effective_thresholds(pos, session_date=session_date)
 
 # TRAILING STOP — fires when position drops N points from its peak
 # Wide enough to let winners run to 25-30%, tight enough to protect gains
@@ -1511,7 +1521,17 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     """
     if now_et is None:
         now_et = datetime.now(ET)
-    _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
+    # AMENDMENT (PR #385 review): pin DTE / threshold profile lookup to the
+    # caller-supplied ET evaluation clock.  Without this, historical replays
+    # and after-midnight-UTC runs would silently pick a different threshold
+    # profile than the session they claim to evaluate.
+    try:
+        _session_date = now_et.astimezone(ET).date()
+    except Exception:
+        _session_date = None
+    _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(
+        pos, session_date=_session_date,
+    )
 
     # ── Build canonical decision snapshot ────────────────────────────────────
     # One snapshot per evaluation; all soft exit branches consume it.
@@ -4331,10 +4351,11 @@ class APExitEngine:
 
                     # Hard-exit reference (LIVE-money HARD STOP consumer)
                     if "hard_exit_reference_validity" in snap or "hard_exit_reference_price" in snap:
+                        _now_utc = datetime.now(timezone.utc)
                         _incoming_validity = str(snap.get("hard_exit_reference_validity") or "no_data")
                         _incoming_ts = _normalize_hard_ref_ts(
                             snap.get("hard_exit_reference_ts"),
-                            now_utc=datetime.now(timezone.utc),
+                            now_utc=_now_utc,
                         )
                         _incoming_price = snap.get("hard_exit_reference_price")
                         _incoming_refresh = bool(snap.get("hard_exit_reference_refresh_needed", True))
@@ -4347,11 +4368,38 @@ class APExitEngine:
                             _prior_price = float(_prior_price)
                         except Exception:
                             _prior_price = 0.0
-                        _preserve_prior = (
-                            (_incoming_validity == "unproven" and _prior_validity in ("proven", "catastrophic_ask") and _prior_price > 0)
-                            or (_incoming_validity == "no_data" and _prior_price > 0)
+                        _prior_ts = getattr(
+                            pos, "hard_exit_reference_ts",
+                            getattr(pos, "hardexitreferencets", None),
                         )
-                        if _preserve_prior:
+                        # AMENDMENT (PR #385 review — snapshot chronology):
+                        # older authoritative snapshots may arrive AFTER a newer
+                        # authoritative reference was written by another path
+                        # (broker-precheck adoption, QuoteAuthority bridge,
+                        # or a later QPM cycle applied first).  The previous
+                        # `_preserve_prior` guard only rejected `unproven` /
+                        # `no_data` incoming refs; an OLDER `proven` /
+                        # `catastrophic_ask` snapshot would silently overwrite
+                        # the newer money-safety truth.  Delegate to the
+                        # shared `_should_replace_hard_ref` chronology gate
+                        # (already used by `_apply_option_quote_for_decision`
+                        # and by QPM itself) so the newest authoritative
+                        # observation always wins and `refresh_needed` is set
+                        # instead when we keep the prior reference.
+                        _apply_incoming = _should_replace_hard_ref(
+                            prior_validity=_prior_validity,
+                            prior_ts=_prior_ts,
+                            prior_price=_prior_price,
+                            candidate_validity=_incoming_validity,
+                            candidate_ts=_incoming_ts,
+                            now_utc=_now_utc,
+                        )
+                        # Legacy safety net: even if the shared gate would
+                        # accept the incoming, an unproven / no_data payload
+                        # must never erase a positive authoritative reference.
+                        if _incoming_validity in ("unproven", "no_data") and _prior_price > 0:
+                            _apply_incoming = False
+                        if not _apply_incoming:
                             pos.hard_exit_reference_refresh_needed = True
                             pos.hardexitreferencerefreshneeded = True
                         else:
@@ -7395,7 +7443,17 @@ class APExitEngine:
                 )
                 if _force_hard_eval:
                     try:
-                        _pos_hard_stop, _, _ = _effective_thresholds(pos)
+                        # AMENDMENT (PR #385 review): pin the pre-gate DTE
+                        # profile to the caller-supplied evaluation clock so
+                        # replays and after-midnight-UTC runs see the same
+                        # threshold profile evaluate_exit() will apply.
+                        try:
+                            _gate_session_date = now_et.astimezone(ET).date()
+                        except Exception:
+                            _gate_session_date = None
+                        _pos_hard_stop, _, _ = _effective_thresholds(
+                            pos, session_date=_gate_session_date,
+                        )
                         _force_hard_eval = _hard_ref_pnl_early <= _pos_hard_stop
                     except Exception:
                         _force_hard_eval = False
