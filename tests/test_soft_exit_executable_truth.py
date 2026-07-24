@@ -109,6 +109,14 @@ def _make_pos(
     pos.analyticsmarkprice = current_option_price
     pos.last_option_quote_update_ts = opt_ts or _fresh_ts()
     pos.lastoptionquoteupdatets = pos.last_option_quote_update_ts
+    # AMENDMENT (Jason BAC): the amended hard-stop authority reads the
+    # dedicated BID timestamp via _has_fresh_dedicated_bid().  Prior tests
+    # only populated the generic quote timestamp; without a fresh dedicated
+    # BID ts the fresh-BID fallback would refuse to arm even when the caller
+    # supplied option_bid_valid=True.  Mirror QPM's write pattern so the
+    # helper sees the same shape it does in production.
+    pos.last_option_bid_update_ts = opt_ts or _fresh_ts()
+    pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
     pos.last_underlying_quote_update_ts = und_ts or _fresh_ts()
     pos.lastunderlyingquoteupdatets = pos.last_underlying_quote_update_ts
     pos.underlying_available = underlying_available
@@ -3721,3 +3729,207 @@ class TestAmendment6OverwriteProtection:
             "healthy ASK must NOT overwrite prior catastrophic_ask reference"
         )
         assert getattr(pos, "hard_exit_reference_refresh_needed") is True
+
+
+# =============================================================================
+# AMENDMENT (Jason BAC): PR #385 final hard-stop-authority + BAC replay tests.
+#
+# These tests drive real evaluate_exit() through the amended helper.  They
+# cover the exact class of exit that fired against Jason's BAC260724P00062000
+# — a synthetic broker-repair peaked at only +2% and exited at 0.98 while
+# the option later traded near 1.17.
+# =============================================================================
+
+from ap_exit_engine import (  # noqa: E402
+    _resolve_hard_stop_pnl_authority,
+    _has_fresh_dedicated_bid,
+    get_effective_hard_exit_reference,
+    _effective_thresholds,
+)
+
+
+def _bac_pos(
+    *,
+    entry_price: float = 0.97,
+    current_bid: float = 0.94,
+    current_ask: float = 0.96,
+    current_option_price: float = 0.95,
+    underlying_available: bool = False,
+    underlying_fresh: bool = False,
+    current_underlying: float = 0.0,
+    age_minutes: float = 2.5,
+    touched_profit: bool = False,
+    peak_pnl_pct: float = 0.02,
+    max_profit_seen: float = 0.02,
+    option_symbol: str = "BAC260724P00062000",
+) -> ManagedPosition:
+    opened = datetime.now(_UTC) - timedelta(minutes=age_minutes)
+    pos = _make_pos(
+        execution_mode="live",
+        entry_price=entry_price,
+        current_bid=current_bid,
+        current_ask=current_ask,
+        current_option_price=current_option_price,
+        current_underlying=current_underlying,
+        underlying_available=underlying_available,
+        underlying_fresh=underlying_fresh,
+        opened_at=opened,
+        option_symbol=option_symbol,
+        side="PUT",
+        touched_profit=touched_profit,
+        peak_pnl_pct=peak_pnl_pct,
+        max_profit_seen=max_profit_seen,
+        option_bid_valid=(current_bid > 0),
+        option_quote_fresh=(current_bid > 0),
+    )
+    pos.client_id = "jasoncosby1@gmail.com"
+    pos.last_option_bid_update_ts = _fresh_ts()
+    pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+    return pos
+
+
+class TestJasonBacReplay:
+    """Production-shaped replay of the July 23 Jason BAC premature exit.
+
+    Under the amended engine the same inputs must resolve to HOLD (no broker
+    submission), while hard-stop and EOD authority remain reachable.
+    """
+
+    def test_bac_peak_two_percent_underlying_missing_holds(self):
+        pos = _bac_pos()
+        # Sanity: peak = +2% cannot arm touched_profit (needs +5% × 2 fresh polls).
+        assert pos.touched_profit is False
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert decision.action == "HOLD", (
+            f"BAC replay must HOLD; got {decision.action} / {decision.reason}"
+        )
+        # And the reason must be an explicit soft-exit deferral, never an exit.
+        assert "SOFT_EXIT_DEFERRED" in (decision.reason or "") or decision.reason_code in {
+            SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
+            SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE,
+            SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+            SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
+            SOFT_EXIT_DEFERRED_ENTRY_GRACE,
+        }, f"Expected SOFT_EXIT_DEFERRED, got reason={decision.reason!r} code={decision.reason_code!r}"
+
+    def test_bac_no_hard_stop_when_authority_unavailable(self):
+        """Same replay, but assert HARD STOP does not spuriously fire.
+
+        PAPER-style midpoint would have shown ≈ -2% here, well above -33%
+        anyway — but the point is the resolver must be authoritative.  With
+        no fresh hard-ref and a healthy bid at -3%, authority=−3.09%, not
+        below the -33% hard stop, so no HARD STOP.
+        """
+        pos = _bac_pos()
+        pnl_auth = _resolve_hard_stop_pnl_authority(pos)
+        _hard, _, _ = _effective_thresholds(pos)
+        assert pnl_auth is not None
+        assert pnl_auth > _hard, (
+            f"BAC bid P&L {pnl_auth} must be above hard stop {_hard}"
+        )
+
+
+class TestHardStopAuthorityResolver:
+    """_resolve_hard_stop_pnl_authority is the single seam every hard-stop
+    consumer must use.  Never falls back to midpoint / mark / LAST / ASK /
+    option_pnl_pct — those may derive from unproven PAPER pricing."""
+
+    def _paper_pos_stale_last(self):
+        # PAPER: midpoint would say -45%; no bid; no hard ref.
+        pos = _make_pos(
+            execution_mode="paper",
+            entry_price=1.00,
+            current_bid=0.0,             # missing bid
+            current_ask=0.60,
+            current_option_price=0.55,   # mid ≈ -45%
+            option_bid_valid=False,
+            option_quote_fresh=False,
+        )
+        # No hard_exit_reference_* set → get_effective_hard_exit_reference() → None.
+        return pos
+
+    def test_paper_stale_last_no_bid_no_ref_returns_none(self):
+        pos = self._paper_pos_stale_last()
+        assert get_effective_hard_exit_reference(pos) is None
+        assert _has_fresh_dedicated_bid(pos) is False
+        assert _resolve_hard_stop_pnl_authority(pos) is None
+
+    def test_paper_stale_last_no_hard_stop_via_evaluate_exit(self):
+        """PAPER at apparent -45% mid, no bid, no ref must NOT hard-stop."""
+        pos = self._paper_pos_stale_last()
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" not in (decision.reason or ""), (
+            f"Unproven PAPER pricing must not drive a hard stop; got: {decision.reason}"
+        )
+
+    def test_fresh_bid_below_hard_stop_returns_bid_pnl(self):
+        """No persisted ref, but fresh executable BID below threshold: authority = bid P&L."""
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.60,            # -40% via bid
+            current_ask=0.65,
+            current_option_price=0.625,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+        )
+        pos.last_option_bid_update_ts = _fresh_ts()
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth is not None
+        assert auth == pytest.approx(-0.40, abs=1e-4)
+
+    def test_fresh_bid_below_hard_stop_fires_hard_stop_in_evaluate_exit(self):
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.60,
+            current_ask=0.65,
+            current_option_price=0.625,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+            underlying_available=True,
+            underlying_fresh=True,
+        )
+        pos.last_option_bid_update_ts = _fresh_ts()
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" in (decision.reason or ""), (
+            f"Fresh BID below hard stop must HARD STOP; got: {decision.reason}"
+        )
+
+    def test_authoritative_hard_ref_below_threshold_fires_hard_stop(self):
+        pos = _make_pos(
+            execution_mode="live",
+            entry_price=1.00,
+            current_bid=0.0,
+            current_ask=0.0,
+            current_option_price=0.0,
+            option_bid_valid=False,
+            option_quote_fresh=False,
+        )
+        # Simulate a proven hard-exit reference at 0.55 (-45%).
+        pos.hard_exit_reference_price = 0.55
+        pos.hardexitreferenceprice = 0.55
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = datetime.now(_UTC) - timedelta(seconds=5)
+        pos.hardexitreferencets = pos.hard_exit_reference_ts
+        auth = _resolve_hard_stop_pnl_authority(pos)
+        assert auth is not None
+        assert auth == pytest.approx(-0.45, abs=1e-4)
+        decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        assert "HARD STOP" in (decision.reason or "")
+
+    def test_eod_still_fires_when_hard_stop_authority_unavailable(self):
+        """EOD force close is independent of quote availability."""
+        pos = self._paper_pos_stale_last()
+        # Push past 3:50 PM ET.
+        from zoneinfo import ZoneInfo
+        et_now = datetime.now(ZoneInfo("America/New_York")).replace(
+            hour=15, minute=55, second=0, microsecond=0
+        )
+        decision = evaluate_exit(pos, et_now)
+        assert "EOD FORCE CLOSE" in (decision.reason or ""), (
+            f"EOD must still fire with unavailable authority; got: {decision.reason}"
+        )
