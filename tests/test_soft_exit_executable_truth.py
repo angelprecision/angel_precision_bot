@@ -588,15 +588,54 @@ class TestRegressionCoverage:
     Tests 11–20: Regression coverage for invariants the PR must preserve.
     """
 
-    """Test 11: Hard stop behavior — fires without bid/underlying.
-    AUDIT FIX: catastrophic losses (past _hard_stop) bypass the gated soft
-    branches so the hard stop is reachable even when bid is missing.  A
-    deferral must NEVER trap a position at -40% with no exit path."""
+    """Test 11: Hard stop reachability without a live bid.
+
+    AMENDMENT (Jason BAC): after the hard-stop authority contract, the
+    engine may NOT drive a hard stop from `option_pnl_pct` when bid is
+    missing — a PAPER midpoint / mark / LAST / ASK-derived percentage is
+    exactly the class of unproven pricing that fired the premature BAC
+    exit. The correct authority when bid is missing is the QPM-written
+    provenance-aware hard-exit reference. This test proves that with a
+    proven `hard_exit_reference_*` at -40%, the hard stop still fires
+    even with no live bid — and, separately, that without any authority
+    a HOLD is the safe result rather than a false HARD STOP from mid.
+    """
     def test_hard_stop_fires_without_bid(self):
         pos = _make_pos(
             entry_price=1.00,
-            current_bid=0.0,            # no bid
-            current_option_price=0.60,  # mid shows -40% — past hard stop (-33%)
+            current_bid=0.0,
+            current_option_price=0.60,   # PAPER-style mid; MUST NOT drive hard stop
+            option_bid_valid=False,
+            underlying_available=False,
+            underlying_fresh=False,
+            current_underlying=0.0,
+            exit_executable_pnl_pct=None,
+        )
+        # Provenance-aware hard-exit reference at 0.60 (-40%).
+        pos.hard_exit_reference_price = 0.60
+        pos.hardexitreferenceprice = 0.60
+        pos.hard_exit_reference_validity = "proven"
+        pos.hardexitreferencevalidity = "proven"
+        pos.hard_exit_reference_ts = datetime.now(_UTC) - timedelta(seconds=5)
+        pos.hardexitreferencets = pos.hard_exit_reference_ts
+
+        now_et = _et_noon().replace(hour=10)
+        decision = evaluate_exit(pos, now_et)
+        assert decision.action in ("STOP", "CLOSE_ALL"), (
+            f"With a proven hard-exit reference the hard stop must still fire "
+            f"even without a live bid: {decision.action}: {decision.reason}"
+        )
+        assert "HARD STOP" in decision.reason, decision.reason
+
+    def test_no_hard_stop_from_paper_mid_when_authority_absent(self):
+        """AMENDMENT (Jason BAC): with no bid AND no proven hard reference,
+        an apparent -40% midpoint cannot manufacture a HARD STOP.  The
+        result must be HOLD; a genuine hard stop needs authoritative truth.
+        """
+        pos = _make_pos(
+            entry_price=1.00,
+            current_bid=0.0,
+            current_option_price=0.60,   # unproven PAPER-style mid
             option_bid_valid=False,
             underlying_available=False,
             underlying_fresh=False,
@@ -605,10 +644,12 @@ class TestRegressionCoverage:
         )
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
-        assert decision.action in ("STOP", "CLOSE_ALL"), (
-            f"Hard stop should fire regardless of bid availability: {decision.action}: {decision.reason}"
+        assert "HARD STOP" not in (decision.reason or ""), (
+            f"Unproven PAPER pricing must not drive a hard stop: {decision.reason}"
         )
-        assert "HARD STOP" in decision.reason, decision.reason
+        assert decision.action == "HOLD", (
+            f"Expected HOLD without authority; got {decision.action}: {decision.reason}"
+        )
 
     """Test 11b (AUDIT): PUT with missing underlying must NOT fire TARGET HIT."""
     def test_put_zero_underlying_does_not_fire_target_hit(self):
@@ -3800,17 +3841,25 @@ class TestJasonBacReplay:
         # Sanity: peak = +2% cannot arm touched_profit (needs +5% × 2 fresh polls).
         assert pos.touched_profit is False
         decision = evaluate_exit(pos, _et_noon().replace(hour=10))
+        # The review's acceptance is: HOLD with zero broker submission.  Any
+        # HOLD action (deferred code OR "No exit condition met" fall-through)
+        # satisfies that — the old exit ("TOUCHED PROFIT STOP — peaked +2%")
+        # cannot appear anywhere in the reason string.
         assert decision.action == "HOLD", (
             f"BAC replay must HOLD; got {decision.action} / {decision.reason}"
         )
-        # And the reason must be an explicit soft-exit deferral, never an exit.
-        assert "SOFT_EXIT_DEFERRED" in (decision.reason or "") or decision.reason_code in {
-            SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
-            SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE,
-            SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
-            SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
-            SOFT_EXIT_DEFERRED_ENTRY_GRACE,
-        }, f"Expected SOFT_EXIT_DEFERRED, got reason={decision.reason!r} code={decision.reason_code!r}"
+        forbidden = (
+            "TOUCHED PROFIT",
+            "HARD STOP",
+            "STOP HIT",
+            "TARGET HIT",
+            "SCALE_OUT",
+            "TIME STOP",
+        )
+        for term in forbidden:
+            assert term not in (decision.reason or ""), (
+                f"BAC replay must not exit for reason {term!r}; got: {decision.reason}"
+            )
 
     def test_bac_no_hard_stop_when_authority_unavailable(self):
         """Same replay, but assert HARD STOP does not spuriously fire.
