@@ -20,6 +20,7 @@ frozen at after_hours_deferred:awaiting_overnight_reeval. Two defects:
 These tests are source-level and pure-logic; they do not require Postgres.
 """
 
+import inspect
 import pathlib
 import re
 
@@ -41,23 +42,31 @@ def test_fetched_is_set_from_fetch_before_early_return():
 
 
 def test_stall_condition_requires_work_and_zero_decisions():
-    """
-    Stall = fetched>0 AND armed==0 AND rejected==0 AND errors==0 AND
-    skipped>0. A run that armed or rejected ANYTHING is not a stall; a run
-    that fetched nothing is not a stall; a run with errors already reports
-    through the error path.
-    """
-    block = re.search(
-        r'result\["fetched"\] > 0(.*?)result\["stalled"\] = True',
-        OV_SRC,
-        re.S,
+    all_deferred = ov._classify_overnight_reeval_result(
+        {
+            "fetched": 3,
+            "armed": 0,
+            "terminal_rejected": 0,
+            "terminal_errors": 0,
+            "retryable_deferred": 3,
+            "unresolved": 0,
+        }
     )
-    assert block, "stall detection block missing"
-    body = block.group(1)
-    assert 'result["armed"] == 0' in body
-    assert 'result["rejected"] == 0' in body
-    assert 'result["errors"] == 0' in body
-    assert 'result["skipped"] > 0' in body
+    assert all_deferred["stalled"] is True
+    assert all_deferred["result_class"] == "RETRYABLE_ALL_DEFERRED"
+
+    mixed = ov._classify_overnight_reeval_result(
+        {
+            "fetched": 3,
+            "armed": 1,
+            "terminal_rejected": 1,
+            "terminal_errors": 0,
+            "retryable_deferred": 1,
+            "unresolved": 0,
+        }
+    )
+    assert mixed["stalled"] is False
+    assert mixed["result_class"] == "RETRYABLE_PARTIAL_DEFERRED"
 
 
 def test_stall_logs_structured_error_marker():
@@ -88,14 +97,14 @@ def test_runner_writes_dedicated_overnight_reeval_stage_row():
 
 
 def test_runner_reports_partial_on_stall_and_never_marks_success():
-    assert '"partial" if _stalled else "success"' in CR_SRC
-    assert "mark_success=not _stalled" in CR_SRC
+    assert 'status = "partial"' in CR_SRC
+    assert "mark_success=completed" in CR_SRC
     assert "OVERNIGHT_REEVAL_STALLED:all_fetched_rows_deferred" in CR_SRC
 
 
 def test_lock_write_is_best_effort_never_fatal():
     m = re.search(
-        r"try:\s*\n\s*from ap\.morning_handoff import _upsert_handoff_run_lock(.*?)except Exception as _lock_exc",
+        r"def _persist_overnight_reeval_lock\(.*?try:\s*\n\s*from ap\.morning_handoff import _upsert_handoff_run_lock(.*?)except Exception as _lock_exc",
         CR_SRC,
         re.S,
     )
@@ -103,7 +112,22 @@ def test_lock_write_is_best_effort_never_fatal():
 
 
 def test_lock_details_carry_all_run_counts():
-    for key in ("fetched", "armed", "rejected", "skipped", "errors", "stalled"):
+    for key in (
+        "fetched",
+        "armed",
+        "terminal_rejected",
+        "terminal_errors",
+        "retryable_deferred",
+        "unresolved",
+        "result_class",
+        "completed",
+        "retryable",
+        "retry_reason",
+        "attempt_count",
+        "attempted_at",
+        "next_retry_at",
+        "post_open_attempt",
+    ):
         assert f'"{key}"' in CR_SRC
 
 
@@ -117,12 +141,7 @@ def test_row_markers_untouched():
     """
     assert OV_SRC.count("awaiting_overnight_reeval") == \
         pathlib.Path(ov.__file__).with_suffix(".py").read_text().count("awaiting_overnight_reeval")
-    # The stall path must not call any _mark_job* writer.
-    stall_block = re.search(
-        r'result\["stalled"\] = True.*?return result', OV_SRC, re.S
-    )
-    assert stall_block
-    assert "_mark_job" not in stall_block.group(0)
+    assert "_mark_job" not in inspect.getsource(ov._classify_overnight_reeval_result)
 
 
 def test_early_returns_before_fetch_cannot_stall():

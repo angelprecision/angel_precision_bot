@@ -237,14 +237,9 @@ def test_already_pending_trigger_row_still_arms(monkeypatch):
     state.entry_watcher.watch.assert_called_once()
 
 
-def test_deferred_contract_preserves_selector_failure_metadata(monkeypatch):
+def test_watcher_first_materialization_skips_premarket_selector(monkeypatch):
     plan = _plan(contract_symbol=None, metadata=None)
     contract_selector = MagicMock()
-    contract_selector.select.side_effect = RuntimeError("zero bids")
-    contract_selector.get_last_failure.return_value = {
-        "reason_code": "PRE_MARKET_ZERO_BID",
-        "detail": "all quotes empty",
-    }
 
     state = _run(
         monkeypatch,
@@ -254,15 +249,17 @@ def test_deferred_contract_preserves_selector_failure_metadata(monkeypatch):
 
     assert state.result["armed"] == 1
     watched_plan = state.entry_watcher.watch.call_args.args[0]
+    contract_selector.select.assert_not_called()
+    assert watched_plan.contract_symbol == "DEFERRED:AAPL"
     assert watched_plan.metadata["contract_deferred"] is True
-    assert watched_plan.metadata["pre_market_contract_selection_failed"] is True
-    assert watched_plan.metadata["pre_market_selector_failure"] == {
-        "reason_code": "PRE_MARKET_ZERO_BID",
-        "detail": "all quotes empty",
-    }
-    assert watched_plan.metadata["pre_market_selector_reason_code"] == "PRE_MARKET_ZERO_BID"
+    assert watched_plan.metadata["deferred_breach_selection"] is True
+    assert watched_plan.metadata["selection_context"] == "deferred_breach"
+    assert watched_plan.metadata["pre_market_contract_selection_skipped"] is True
+    assert watched_plan.metadata["pre_market_contract_selection_failed"] is False
+    assert watched_plan.metadata["pre_market_selector_failure"] is None
+    assert watched_plan.metadata["pre_market_selector_reason_code"] is None
     assert watched_plan.metadata["contract_selection_deferred_to"] == "breach_time"
-    assert state.osm.create_calls[0]["meta"]["pre_market_selector_reason_code"] == "PRE_MARKET_ZERO_BID"
+    assert state.osm.create_calls[0]["meta"]["deferred_breach_selection"] is True
 
 
 def test_no_broker_submit_before_breach(monkeypatch):
@@ -281,6 +278,7 @@ def test_no_broker_submit_before_breach(monkeypatch):
 
     assert state.result["armed"] == 1
     assert broker.get_prior_day_levels_calls == ["AAPL"]
+    contract_selector.select.assert_not_called()
     state.entry_watcher.watch.assert_called_once()
 
 

@@ -317,4 +317,4 @@ def test_callsites_pass_data_broker_when_available():
     runner_src = (REPO_ROOT / "client_runner.py").read_text()
     assert "data_broker=data_broker" in runner_src
     assert "data_broker=comps[\"data_broker\"]" in rescue_src
-    assert app_src.count("data_broker=(") >= 2
+    assert "runner.run_overnight_reeval_attempt(" in app_src

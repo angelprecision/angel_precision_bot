@@ -285,6 +285,35 @@ def test_overnight_status_accepts_post_overnight_handoff_success(monkeypatch):
     assert details["source"] == "handoff_run_locks.post_overnight_reeval"
 
 
+def test_overnight_status_ignores_legacy_last_reeval_date(monkeypatch):
+    _stub_common(monkeypatch, handoff=True, client_state={
+        "stale_processing_ids": [],
+        "watching_orphans": [],
+        "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+        "watching_count": 1,
+    })
+    runner = _Runner(mode="live")
+    runner._last_overnight_reeval_date = "2026-06-22"
+    monkeypatch.setattr(pr, "_post_overnight_reeval_success_exists", lambda *args, **kwargs: False)
+
+    status, details = pr._overnight_status(
+        runner,
+        {
+            "stale_processing_ids": [],
+            "watching_orphans": [],
+            "pending_trigger_rows": [{"local_order_id": "L-1", "signal_id": "sig-1"}],
+            "watching_count": 1,
+        },
+        "2026-06-22",
+        client_id="jason@example.com",
+        execution_mode="live",
+        stage="manual",
+        now=datetime(2026, 6, 22, 9, 30, tzinfo=pr.ET),
+    )
+    assert status == "missing"
+    assert details["source"] == "watching_or_pending_trigger_present_without_overnight_success"
+
+
 def test_startup_handoff_success_does_not_count_as_post_overnight_success(monkeypatch):
     _stub_common(monkeypatch, handoff=True, client_state={
         "stale_processing_ids": [],
@@ -382,8 +411,9 @@ def test_degraded_mode_path_only_clears_entries_not_exits():
 
 def test_source_marks_runner_overnight_success_date_after_admin_reeval():
     src = (REPO_ROOT / "app.py").read_text()
-    assert 'from ap.preopen_readiness import _trading_date as _preopen_trading_date' in src
-    assert 'runner._last_overnight_reeval_date = _preopen_trading_date()' in src
+    assert "runner.run_overnight_reeval_attempt(" in src
+    assert 'source="admin_sync"' in src
+    assert 'source="admin_background"' in src
 
 
 def test_source_wires_runner_endpoint_and_health():

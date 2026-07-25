@@ -10,7 +10,7 @@ FLOW:
   4. For each WATCHING signal:
      a. Fetch prior-day high/low from Tradier history
      b. Run overnight_daily_validator (directional invalidation check)
-     c. If VALID: select contract, create OSM entry order, arm entry_watcher
+     c. If VALID: create deferred OSM entry order and arm entry_watcher
      d. If INVALID: mark REJECTED with reason code, log to ap_signals
   5. After 9:30 AM ET open: entry_watcher polls quotes, waits for breach
   6. On breach: on_trigger fires → OSM submits entry → fill monitor takes over
@@ -37,7 +37,7 @@ import os
 import inspect
 import time
 from datetime import date, datetime, timezone, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ap_signal_store import canonical_client_email, canonical_signal_id, upsert_ap_signal_row_with_fallback
 
@@ -69,34 +69,69 @@ _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
 )
 
 
-def _hydrate_plan_from_signal(signal):
+def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
     """Build a minimal TradePlan-compatible namespace from a WATCHING signal.
     Used when MC rejects on intel/second-score but recheck is disabled —
     the signal was already scanner-approved and has all the fields needed
     for contract deferment + watcher arming.
+
+    P0-5: the plan MUST carry identity + risk fields the watcher reads
+    directly (signal_id, canonical_signal_id, client_id, execution_mode,
+    stop_underlying, target_underlying). Prior implementation dropped these,
+    letting the watcher generate a random signal identity, a blank
+    client_id, and no stop/target — silently manufacturing an identity-free,
+    stop-free watcher when master_control returned an observe-only reject.
     """
     import types as _types
     _trig = float(signal.get("entry_trigger") or 0) or None
+    def _coerce_float(v):
+        try:
+            f = float(v) if v is not None else None
+            return f if f and f > 0 else None
+        except (TypeError, ValueError):
+            return None
+    _stop   = _coerce_float(signal.get("stop_price"))
+    _target = _coerce_float(signal.get("target_price"))
+    _sid    = str(signal.get("signal_id") or "").strip()
+    _canon  = str(
+        signal.get("canonical_signal_id")
+        or _resolve_canonical_signal_id(_sid, signal)
+        or ""
+    ).strip()
+    _mode = str(execution_mode or "").strip().lower() or None
     return _types.SimpleNamespace(
-        ticker          = signal.get("ticker") or signal.get("symbol"),
-        side            = (signal.get("side") or "").upper(),
-        direction       = (signal.get("side") or "").upper(),
-        score           = float(signal.get("score") or 0),
-        timeframe       = str(signal.get("timeframe") or "1d"),
-        entry_trigger   = _trig,
-        trigger_price   = _trig,
-        trigger_type    = "breach",
-        prior_day_high  = signal.get("prior_day_high"),
-        prior_day_low   = signal.get("prior_day_low"),
-        pattern         = signal.get("pattern"),
-        tier            = signal.get("tier"),
-        contract_symbol = None,
-        contracts       = None,
-        limit_price     = None,
-        metadata        = {
+        ticker              = signal.get("ticker") or signal.get("symbol"),
+        side                = (signal.get("side") or "").upper(),
+        direction           = (signal.get("side") or "").upper(),
+        score               = float(signal.get("score") or 0),
+        timeframe           = str(signal.get("timeframe") or "1d"),
+        entry_trigger       = _trig,
+        trigger_price       = _trig,
+        trigger_type        = "breach",
+        prior_day_high      = signal.get("prior_day_high"),
+        prior_day_low       = signal.get("prior_day_low"),
+        pattern             = signal.get("pattern"),
+        tier                = signal.get("tier"),
+        contract_symbol     = None,
+        contracts           = None,
+        limit_price         = None,
+        # Identity + risk fields the watcher reads from the plan.
+        signal_id           = _sid,
+        canonical_signal_id = _canon,
+        client_id           = client_id,
+        execution_mode      = _mode,
+        stop_underlying     = _stop,
+        target_underlying   = _target,
+        metadata            = {
             "overnight":             True,
             "hydrated_from_signal":  True,
             "second_score_mode":     "observe_only",
+            "signal_id":             _sid,
+            "canonical_signal_id":   _canon,
+            "client_id":             client_id,
+            "execution_mode":        _mode,
+            "stop_underlying":       _stop,
+            "target_underlying":     _target,
         },
     )
 
@@ -110,10 +145,19 @@ def _normalize_overnight_side(value) -> str:
     return "UNKNOWN"
 
 
-# SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
-# OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
-# Default 18h — covers signals from previous session's close to pre-market.
-_SIGNALS_LOOKBACK_HOURS = int(os.getenv("SIGNALS_LOOKBACK", "18"))
+# SIGNALS_LOOKBACK: hours-based override. Only applied when explicitly set.
+# Without the env var, the cutoff is computed session-aware (see below) so a
+# Friday scanner setup remains visible on Monday morning without every
+# deployment having to override the environment to survive the weekend.
+def _signals_lookback_hours_env() -> Optional[int]:
+    raw = os.getenv("SIGNALS_LOOKBACK")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
 
 
 def _et_now() -> datetime:
@@ -159,6 +203,42 @@ def _prior_trading_session_date(ref: Optional[datetime] = None) -> date:
         while d.weekday() >= 5:  # Sat/Sun
             d = d - timedelta(days=1)
         return d
+
+
+def _signals_lookback_cutoff_iso(now: Optional[datetime] = None) -> str:
+    """Return the ISO-8601 UTC cutoff to use for the ap_signals/trade_queue
+    created_at filter.
+
+    Rules (in order):
+      1. If SIGNALS_LOOKBACK is explicitly set to a positive integer,
+         cutoff = now - SIGNALS_LOOKBACK hours (backwards-compat override).
+      2. Otherwise cutoff = start (00:00 ET) of the PRIOR TRADING SESSION.
+         On Monday morning this reaches back to Friday 00:00 ET so a Friday
+         scanner setup remains visible through the entire Monday morning
+         reeval window. Skips weekends and NYSE full-closure holidays via
+         the canonical calendar in _prior_trading_session_date.
+
+    The prior default of 18 hours defeats the exact Friday-to-Monday recovery
+    this PR was written to guarantee; that is why the default is now session-
+    aware. The env var remains honored so operators can pin an explicit
+    window for A/B experiments — but correctness does not depend on it.
+    """
+    _now = now or datetime.now(timezone.utc)
+    hours = _signals_lookback_hours_env()
+    if hours is not None:
+        return (_now - timedelta(hours=hours)).isoformat()
+    # Session-aware default. Compute prior-trading-session date in ET, then
+    # anchor cutoff at 00:00 ET of that date and convert to UTC.
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _et = _ZI("America/New_York")
+        prior = _prior_trading_session_date(_now.astimezone(_et))
+        prior_start_et = datetime(prior.year, prior.month, prior.day, 0, 0, 0, tzinfo=_et)
+        return prior_start_et.astimezone(timezone.utc).isoformat()
+    except Exception:
+        # Fail safe: 96h (Friday-to-Tuesday round-trip covers every weekend
+        # + a Monday holiday). Never fall back to the old 18h default.
+        return (_now - timedelta(hours=96)).isoformat()
 
 
 # ── PR4 (prior-day-level cache fallback) ─────────────────────────────────────
@@ -226,6 +306,38 @@ def _signal_date(signal: dict) -> Optional[date]:
         except ValueError:
             pass
     return None
+
+
+def _overnight_signal_sort_key(job: dict) -> tuple:
+    """Tier A, score, recency, then stable row identity."""
+    signal = job.get("payload") or {}
+    if isinstance(signal, str):
+        try:
+            import json as _json
+            signal = _json.loads(signal)
+        except Exception:
+            signal = {}
+    tier = str(signal.get("tier") or "").strip().upper()
+    tier_rank = {"A": 0, "B": 1}.get(tier, 2)
+    try:
+        score_rank = -float(signal.get("score") or 0)
+    except (TypeError, ValueError):
+        score_rank = 0.0
+    created_raw = (
+        signal.get("created_at")
+        or signal.get("timestamp_iso")
+        or signal.get("signal_date")
+        or job.get("created_ts")
+        or ""
+    )
+    try:
+        created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        created_rank = -created.timestamp()
+    except Exception:
+        created_rank = 0.0
+    return tier_rank, score_rank, created_rank, str(job.get("id") or job.get("signal_id") or "")
 
 
 def _log_overnight_watch_cleanup(
@@ -416,39 +528,1101 @@ def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
     return (
         reason.startswith("overnight_watch_arm_failed:")
         or reason.startswith("overnight_watch_arm_failed_cleanup_failed:")
+        # PR #388: durable REATTACH ambiguity marker (see
+        # _persist_reattach_post_watch_ambiguity). Written when watch()
+        # returns False AND the post-watch verify cannot prove the order
+        # is preserved — treat as terminal on the next reeval so no
+        # replacement ENTRY is ever created.
+        or reason.startswith("reattach_post_watch_")
     )
 
 
-def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> tuple[str, Optional[dict]]:
-    canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
-    if not canonical_signal_id or not client_id:
-        return canonical_signal_id, None
+# ── Lookup result ─────────────────────────────────────────────────────────────
+
+class _LookupResult(NamedTuple):
+    """Explicit result from _get_client_opportunity_row.
+
+    lookup_status values:
+      FOUND        — a valid matching row was returned in .row
+      NOT_FOUND    — query succeeded; definitively zero matching rows
+      LOOKUP_FAILED — truth could not be established (Supabase unavailable,
+                      exception, malformed response, missing identity, etc.)
+    """
+    canonical_signal_id: str
+    lookup_status: str   # "FOUND" | "NOT_FOUND" | "LOOKUP_FAILED"
+    row: Optional[dict]
+    error: Optional[str]
+
+
+_LS_FOUND         = "FOUND"
+_LS_NOT_FOUND     = "NOT_FOUND"
+_LS_LOOKUP_FAILED = "LOOKUP_FAILED"
+
+
+def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) -> _LookupResult:
+    """Query the opportunity ledger for this client/canonical-signal pair.
+
+    Returns an explicit _LookupResult — FOUND, NOT_FOUND, or LOOKUP_FAILED.
+    LOOKUP_FAILED is NEVER collapsed into NOT_FOUND: a backing-store outage
+    must not allow a second ENTRY order to be created.
+    """
+    canonical = _resolve_canonical_signal_id(signal_id, signal)
+    if not canonical or not client_id:
+        return _LookupResult(
+            canonical or "",
+            _LS_LOOKUP_FAILED,
+            None,
+            "missing_canonical_or_client_id",
+        )
 
     try:
         from ap.opportunity_ledger import _get_sb
         sb = _get_sb()
         if not sb:
-            return canonical_signal_id, None
+            return _LookupResult(canonical, _LS_LOOKUP_FAILED, None, "supabase_client_unavailable")
+
         res = (
             sb.table("client_signal_opportunities")
-            .select("opportunity_status, miss_stage, miss_reason, metadata")
-            .eq("canonical_signal_id", canonical_signal_id)
+            .select(
+                "canonical_signal_id, client_id, opportunity_status, miss_stage, "
+                "miss_reason, metadata, order_local_id"
+            )
+            .eq("canonical_signal_id", canonical)
             .eq("client_id", client_id)
             .limit(1)
             .execute()
         )
-        rows = getattr(res, "data", None) or []
-        if rows:
-            row = rows[0] if isinstance(rows[0], dict) else dict(rows[0])
-            return canonical_signal_id, row
+        rows = getattr(res, "data", None)
+        if rows is None:
+            # Malformed response — cannot distinguish zero rows from error.
+            return _LookupResult(canonical, _LS_LOOKUP_FAILED, None, "malformed_response_data_none")
+
+        if not rows:
+            return _LookupResult(canonical, _LS_NOT_FOUND, None, None)
+
+        row = rows[0] if isinstance(rows[0], dict) else dict(rows[0])
+        return _LookupResult(canonical, _LS_FOUND, row, None)
+
     except Exception as exc:
         log.debug(
-            "[%s] overnight_reeval: client opportunity lookup failed for %s: %s",
-            client_id,
-            canonical_signal_id,
-            exc,
+            "[%s] overnight_reeval: opportunity lookup failed canonical=%s: %s",
+            client_id, canonical, exc,
         )
-    return canonical_signal_id, None
+        return _LookupResult(canonical, _LS_LOOKUP_FAILED, None, str(exc))
+
+
+# ── Active-order statuses that prove entry ownership ──────────────────────────
+# PENDING_TRIGGER / SUBMITTED / ACKNOWLEDGED / PARTIAL_FILL → order exists and
+# may need a watcher reattached (Cases A/B) or is in-flight (Case C).
+# FILLED → already entered; must not enter again.
+# PR #388 amendment: full nonterminal ENTRY family. Prior amendment only
+# recognized PENDING_TRIGGER/SUBMITTED/ACKNOWLEDGED/PARTIAL_FILL/FILLED,
+# which meant CREATED/ACCEPTED/OPEN/PARTIALLY_FILLED slipped through the
+# active-order fence and produced duplicate create_entry_order calls on
+# retry. The set matches the repository's existing durable duplicate logic.
+_ACTIVE_ENTRY_OWN_STATUSES = frozenset({
+    "CREATED",
+    "PENDING_TRIGGER",
+    "SUBMITTED",
+    "ACCEPTED",
+    "ACKNOWLEDGED",
+    "OPEN",
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+    "FILLED",
+})
+
+# Statuses that mean the order is in flight / done (never re-create).
+_ALREADY_OWNED_STATUSES = frozenset({
+    "SUBMITTED", "ACCEPTED", "ACKNOWLEDGED", "OPEN",
+    "PARTIAL_FILL", "PARTIALLY_FILLED", "FILLED",
+})
+
+
+def _query_active_entry_order(
+    client_id: str,
+    execution_mode: str,
+    canonical_sig_id: str,
+) -> tuple[str, Optional[dict]]:
+    """Query for an exact active ENTRY order for this client/mode/canonical-signal.
+
+    Uses direct DB query with exact 5-tuple identity:
+      client_id + execution_mode (exact, lower-normalized) + canonical_signal_id
+      + kind='ENTRY' + status in _ACTIVE_ENTRY_OWN_STATUSES.
+
+    Returns:
+      (_LS_FOUND,         row)  — active order exists; row is a dict
+      (_LS_NOT_FOUND,    None)  — definitively no matching order
+      (_LS_LOOKUP_FAILED, None) — query failed; truth unknown
+    """
+    if not client_id or not canonical_sig_id:
+        return _LS_LOOKUP_FAILED, None
+
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] _query_active_entry_order: unknown execution_mode=%r canonical=%s — LOOKUP_FAILED",
+            client_id, execution_mode, canonical_sig_id,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+    statuses = tuple(_ACTIVE_ENTRY_OWN_STATUSES)
+    placeholders = ", ".join(["%s"] * len(statuses))
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    f"SELECT * FROM orders "
+                    f"WHERE client_id = %s "
+                    f"AND kind = 'ENTRY' "
+                    f"AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                    f"AND canonical_signal_id = %s "
+                    f"AND status IN ({placeholders}) "
+                    f"ORDER BY created_ts DESC LIMIT 1",
+                    (client_id, mode, canonical_sig_id, *statuses),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+        if row is None:
+            return _LS_NOT_FOUND, None
+        return _LS_FOUND, (dict(row) if not isinstance(row, dict) else row)
+
+    except Exception as exc:
+        log.warning(
+            "[%s] _query_active_entry_order: DB query failed canonical=%s mode=%s: %s",
+            client_id, canonical_sig_id, mode, exc,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+
+def _query_exact_entry_order_by_local_id(
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+) -> tuple[str, Optional[dict]]:
+    """Post-watch exact-order lookup with NO status filter.
+
+    _query_active_entry_order() is the active-ownership fence and filters
+    to _ACTIVE_ENTRY_OWN_STATUSES — it CANNOT see CANCELED / EXPIRED /
+    REJECTED / ERROR rows. That is correct for the fence, but a REATTACH
+    watch() that terminalizes the order needs a lookup that CAN see the
+    terminal state so the caller can classify already_resolved rather
+    than incorrectly labeling retryable and enabling a replacement.
+
+    This helper queries by exact 4-tuple identity with NO status filter:
+      local_order_id + client_id + execution_mode + canonical_signal_id + kind='ENTRY'.
+
+    Returns (_LS_FOUND, row) / (_LS_NOT_FOUND, None) / (_LS_LOOKUP_FAILED, None).
+    """
+    if not local_order_id or not client_id or not canonical_signal_id:
+        return _LS_LOOKUP_FAILED, None
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] _query_exact_entry_order_by_local_id: unknown mode=%r local_order_id=%s"
+            " — LOOKUP_FAILED",
+            client_id, execution_mode, local_order_id,
+        )
+        return _LS_LOOKUP_FAILED, None
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM orders "
+                    "WHERE local_order_id = %s "
+                    "AND client_id = %s "
+                    "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                    "AND canonical_signal_id = %s "
+                    "AND kind = 'ENTRY' "
+                    "LIMIT 1",
+                    (local_order_id, client_id, mode, canonical_signal_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+        if row is None:
+            return _LS_NOT_FOUND, None
+        return _LS_FOUND, (dict(row) if not isinstance(row, dict) else row)
+
+    except Exception as exc:
+        log.warning(
+            "[%s] _query_exact_entry_order_by_local_id: DB query failed "
+            "local_order_id=%s canonical=%s mode=%s: %s",
+            client_id, local_order_id, canonical_signal_id, mode, exc,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+
+def _query_latest_entry_order_no_status(
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+) -> tuple[str, Optional[dict]]:
+    """Resolver-level latest ENTRY fence with no status filter.
+
+    This is deliberately separate from _query_active_entry_order(), which
+    remains the active ownership fence. This helper is the final resurrection
+    guard before NEW: if an exact terminal ENTRY exists for this
+    client/mode/canonical, a retry must not create a replacement just because
+    the active-only fence cannot see terminal statuses.
+    """
+    if not client_id or not canonical_signal_id:
+        return _LS_LOOKUP_FAILED, None
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] _query_latest_entry_order_no_status: unknown mode=%r canonical=%s"
+            " — LOOKUP_FAILED",
+            client_id, execution_mode, canonical_signal_id,
+        )
+        return _LS_LOOKUP_FAILED, None
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM orders "
+                    "WHERE client_id = %s "
+                    "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                    "AND canonical_signal_id = %s "
+                    "AND kind = 'ENTRY' "
+                    "ORDER BY created_ts DESC LIMIT 1",
+                    (client_id, mode, canonical_signal_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+        if row is None:
+            return _LS_NOT_FOUND, None
+        return _LS_FOUND, (dict(row) if not isinstance(row, dict) else row)
+
+    except Exception as exc:
+        log.warning(
+            "[%s] _query_latest_entry_order_no_status: DB query failed "
+            "canonical=%s mode=%s: %s",
+            client_id, canonical_signal_id, mode, exc,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+
+# Terminal ENTRY statuses the post-watch verifier recognises. Anything not in
+# _ACTIVE_ENTRY_OWN_STATUSES and not in this set is treated as ambiguous.
+_TERMINAL_ENTRY_STATUSES = frozenset({
+    "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "ERROR", "FAILED",
+    "TERMINAL", "CLOSED",
+})
+
+
+def _entry_order_disposition_from_status(
+    *,
+    client_id: str,
+    canonical_signal_id: str,
+    session_key: str,
+    status: str,
+    local_order_id: str,
+    order_row: Optional[dict] = None,
+    source: str,
+) -> Optional[_DispositionResult]:
+    _status = str(status or "").upper()
+    _local_id = str(local_order_id or "").strip()
+    if _status == "PENDING_TRIGGER":
+        log.info(
+            "[%s] reeval disposition=REATTACH_WATCHER canonical=%s session=%s "
+            "local_order_id=%s source=%s",
+            client_id, canonical_signal_id, session_key, _local_id, source,
+        )
+        return _DispositionResult(_DISPOSITION_REATTACH_WATCHER, _local_id, order_row)
+    if _status == "CREATED":
+        log.info(
+            "[%s] reeval disposition=ACTIVE_CREATED_RETRY canonical=%s session=%s "
+            "local_order_id=%s source=%s",
+            client_id, canonical_signal_id, session_key, _local_id, source,
+        )
+        return _DispositionResult(_DISPOSITION_ACTIVE_CREATED_RETRY, _local_id, order_row)
+    if _status in _ALREADY_OWNED_STATUSES:
+        log.info(
+            "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s "
+            "order_status=%s source=%s",
+            client_id, canonical_signal_id, session_key, _status, source,
+        )
+        return _DispositionResult(_DISPOSITION_ALREADY_OWNED)
+    if _status in _TERMINAL_ENTRY_STATUSES:
+        log.info(
+            "[%s] reeval disposition=ALREADY_TERMINAL (latest-entry-order) "
+            "canonical=%s session=%s order_status=%s local_order_id=%s source=%s",
+            client_id, canonical_signal_id, session_key, _status, _local_id, source,
+        )
+        return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+    return None
+
+
+def _persist_reattach_in_progress_fence(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+) -> bool:
+    """Persist and verify current-session REATTACH ownership before watch().
+
+    If watch() later terminalizes the order but the terminal suppression marker
+    fails, this verified metadata keeps the next resolver attempt out of NEW.
+    """
+    _mode = str(execution_mode or "").strip().lower()
+    _session = str(session_key or _overnight_reeval_session_key()).strip()
+    if not (
+        client_id and _mode in {"live", "paper"} and canonical_signal_id
+        and signal_id and local_order_id and _session
+    ):
+        log.critical(
+            "REATTACH_IN_PROGRESS_FENCE_INVALID_INPUT client=%s mode=%s "
+            "canonical=%s signal=%s local_order_id=%s session=%s",
+            client_id, execution_mode, canonical_signal_id,
+            signal_id, local_order_id, session_key,
+        )
+        return False
+    try:
+        from ap.opportunity_ledger import (
+            CREATED as _OL_CREATED,
+            create_opportunities as _create_opps,
+            update_opportunity as _update_opportunity,
+        )
+
+        _sig_payload = dict(signal_payload or {})
+        _sig_payload.setdefault("signal_id", signal_id)
+        _created = _create_opps(
+            signal_id, [client_id], _sig_payload,
+            canonical_signal_id=canonical_signal_id,
+        )
+        if int(_created or 0) < 1:
+            log.critical(
+                "REATTACH_IN_PROGRESS_FENCE_CREATE_FAILED client=%s mode=%s "
+                "canonical=%s local_order_id=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+            )
+            return False
+
+        _fence_meta = {
+            "reattach_in_progress": True,
+            "execution_mode": _mode,
+            "overnight_reeval_session_key": _session,
+            "source_table": "ap_signals",
+            "original_signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "local_order_id": str(local_order_id),
+            "reattach_fenced_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _updated = _update_opportunity(
+            signal_id,
+            client_id,
+            _OL_CREATED,
+            canonical_signal_id=canonical_signal_id,
+            order_local_id=str(local_order_id),
+            extra_meta=_fence_meta,
+        )
+        if not _updated:
+            log.critical(
+                "REATTACH_IN_PROGRESS_FENCE_UPDATE_FAILED client=%s mode=%s "
+                "canonical=%s local_order_id=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+            )
+            return False
+
+        _readback = _get_client_opportunity_row(signal_id, client_id, _sig_payload)
+        if _readback.lookup_status != _LS_FOUND or not isinstance(_readback.row, dict):
+            log.critical(
+                "REATTACH_IN_PROGRESS_FENCE_READBACK_MISSING client=%s mode=%s "
+                "canonical=%s local_order_id=%s status=%s err=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+                _readback.lookup_status, _readback.error,
+            )
+            return False
+
+        _row = _readback.row
+        _meta = _row.get("metadata") if isinstance(_row.get("metadata"), dict) else {}
+        _verified = (
+            str(_row.get("canonical_signal_id") or _readback.canonical_signal_id or "") == canonical_signal_id
+            and str(_row.get("client_id") or client_id) == client_id
+            and str(_row.get("order_local_id") or _meta.get("local_order_id") or "") == str(local_order_id)
+            and str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower() == _mode
+            and str(_meta.get("overnight_reeval_session_key") or "").strip() == _session
+            and bool(_meta.get("reattach_in_progress")) is True
+        )
+        if not _verified:
+            log.critical(
+                "REATTACH_IN_PROGRESS_FENCE_READBACK_MISMATCH client=%s mode=%s "
+                "canonical=%s local_order_id=%s row=%s metadata=%s",
+                client_id, _mode, canonical_signal_id, local_order_id, _row, _meta,
+            )
+            return False
+        return True
+    except Exception as _fence_exc:
+        log.critical(
+            "REATTACH_IN_PROGRESS_FENCE_EXCEPTION client=%s mode=%s canonical=%s "
+            "local_order_id=%s err=%s",
+            client_id, execution_mode, canonical_signal_id,
+            local_order_id, _fence_exc,
+        )
+        return False
+
+
+def _persist_reattach_terminal_suppression_marker(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+    reason: str,
+    post_status: str,
+    post_row_status: str,
+) -> bool:
+    """Persist and verify a durable terminal marker for a REATTACH outcome.
+
+    The caller may have proved the exact order is terminal, or may be unable
+    to prove whether watch() terminalized it. In both cases, a retry must not
+    classify the setup as NEW just because the active-order fence no longer
+    sees a nonterminal ENTRY row.
+    """
+    _mode = str(execution_mode or "").strip().lower()
+    _session = str(session_key or _overnight_reeval_session_key()).strip()
+    _reason = str(reason or "reattach_post_watch_unknown").strip()
+    if not (
+        client_id and _mode in {"live", "paper"} and canonical_signal_id
+        and signal_id and local_order_id and _session
+    ):
+        log.critical(
+            "REATTACH_TERMINAL_SUPPRESSION_MARKER_INVALID_INPUT "
+            "client=%s mode=%s canonical=%s signal=%s local_order_id=%s session=%s",
+            client_id, execution_mode, canonical_signal_id,
+            signal_id, local_order_id, session_key,
+        )
+        return False
+
+    try:
+        from ap.opportunity_ledger import (
+            create_opportunities as _create_opps,
+            mark_watcher_invalidated as _mark_watcher_invalidated,
+        )
+
+        _sig_payload = dict(signal_payload or {})
+        _sig_payload.setdefault("signal_id", signal_id)
+        _created = _create_opps(
+            signal_id, [client_id], _sig_payload,
+            canonical_signal_id=canonical_signal_id,
+        )
+        if int(_created or 0) < 1:
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_CREATE_FAILED "
+                "client=%s mode=%s canonical=%s local_order_id=%s reason=%s",
+                client_id, _mode, canonical_signal_id, local_order_id, _reason,
+            )
+            return False
+
+        _marker_meta = {
+            "reattach_terminal_suppression": True,
+            "execution_mode": _mode,
+            "overnight_reeval_session_key": _session,
+            "source_table": "ap_signals",
+            "original_signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "local_order_id": str(local_order_id),
+            "reattach_post_watch_status": str(post_status or ""),
+            "reattach_post_watch_row_status": str(post_row_status or ""),
+            "reattach_terminal_suppressed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _marked = _mark_watcher_invalidated(
+            signal_id,
+            client_id,
+            _reason,
+            canonical_signal_id=canonical_signal_id,
+            order_local_id=str(local_order_id),
+            extra_meta=_marker_meta,
+        )
+        if not _marked:
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_MARK_FAILED "
+                "client=%s mode=%s canonical=%s local_order_id=%s reason=%s",
+                client_id, _mode, canonical_signal_id, local_order_id, _reason,
+            )
+            return False
+
+        _readback = _get_client_opportunity_row(signal_id, client_id, _sig_payload)
+        if _readback.lookup_status != _LS_FOUND or not isinstance(_readback.row, dict):
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_READBACK_MISSING "
+                "client=%s mode=%s canonical=%s local_order_id=%s status=%s err=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+                _readback.lookup_status, _readback.error,
+            )
+            return False
+
+        _row = _readback.row
+        _meta = _row.get("metadata") if isinstance(_row.get("metadata"), dict) else {}
+        _row_canonical = str(_row.get("canonical_signal_id") or _readback.canonical_signal_id or "")
+        _row_client = str(_row.get("client_id") or client_id)
+        _row_status = str(_row.get("opportunity_status") or "").upper()
+        _row_stage = str(_row.get("miss_stage") or "").upper()
+        _row_reason = str(_row.get("miss_reason") or "")
+        _row_order = str(_row.get("order_local_id") or _meta.get("local_order_id") or "")
+        _row_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
+        _row_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
+
+        _verified = (
+            _row_canonical == canonical_signal_id
+            and _row_client == client_id
+            and _row_status == "MISSED"
+            and _row_stage == "WATCHER_ARM"
+            and _row_reason == _reason
+            and _row_mode == _mode
+            and _row_session == _session
+            and _row_order == str(local_order_id)
+        )
+        if not _verified:
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_READBACK_MISMATCH "
+                "client=%s mode=%s canonical=%s local_order_id=%s "
+                "row_canonical=%s row_client=%s row_status=%s row_stage=%s "
+                "row_reason=%s row_mode=%s row_session=%s row_order=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+                _row_canonical, _row_client, _row_status, _row_stage,
+                _row_reason, _row_mode, _row_session, _row_order,
+            )
+            return False
+
+        return True
+    except Exception as _marker_exc:
+        log.critical(
+            "REATTACH_TERMINAL_SUPPRESSION_MARKER_EXCEPTION "
+            "client=%s mode=%s canonical=%s local_order_id=%s reason=%s err=%s",
+            client_id, execution_mode, canonical_signal_id,
+            local_order_id, _reason, _marker_exc,
+        )
+        return False
+
+
+def _persist_watcher_armed_proof(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+    extra_meta: Optional[dict] = None,
+    clear_reattach_in_progress: bool = False,
+) -> bool:
+    """Persist WATCHER_ARMED and verify the row actually transitioned.
+
+    opportunity_ledger.update_opportunity() returns True when the update
+    query succeeds, even if its monotonic guard preserved a prior terminal
+    status and only merged metadata. This helper treats the write as durable
+    proof only after readback shows WATCHER_ARMED for the exact
+    client/mode/session/order.
+    """
+    _mode = str(execution_mode or "").strip().lower()
+    _session = str(session_key or _overnight_reeval_session_key()).strip()
+    if not (
+        client_id and _mode in {"live", "paper"} and canonical_signal_id
+        and signal_id and local_order_id and _session
+    ):
+        log.critical(
+            "WATCHER_ARMED_PROOF_INVALID_INPUT client=%s mode=%s canonical=%s "
+            "signal=%s local_order_id=%s session=%s",
+            client_id, execution_mode, canonical_signal_id,
+            signal_id, local_order_id, session_key,
+        )
+        return False
+
+    try:
+        from ap.opportunity_ledger import (
+            WATCHER_ARMED as _OL_WATCHER_ARMED,
+            create_opportunities as _create_opps,
+            mark_watcher_armed as _mark_watcher_armed,
+        )
+
+        _sig_payload = dict(signal_payload or {})
+        _sig_payload.setdefault("signal_id", signal_id)
+        _created = _create_opps(
+            signal_id, [client_id], _sig_payload,
+            canonical_signal_id=canonical_signal_id,
+        )
+        if int(_created or 0) < 1:
+            log.critical(
+                "WATCHER_ARMED_PROOF_CREATE_FAILED client=%s mode=%s "
+                "canonical=%s local_order_id=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+            )
+            return False
+
+        _proof_meta = dict(extra_meta or {})
+        _proof_meta.update({
+            "overnight_reeval_session_key": _session,
+            "execution_mode": _mode,
+            "original_signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "local_order_id": str(local_order_id),
+        })
+        _marked = _mark_watcher_armed(
+            canonical_signal_id,
+            client_id,
+            canonical_signal_id=canonical_signal_id,
+            order_local_id=str(local_order_id),
+            extra_meta=_proof_meta,
+        )
+        if not _marked:
+            log.critical(
+                "WATCHER_ARMED_PROOF_MARK_FAILED client=%s mode=%s "
+                "canonical=%s local_order_id=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+            )
+            return False
+
+        def _readback_verified(*, expect_reattach_cleared: bool) -> bool:
+            _readback = _get_client_opportunity_row(signal_id, client_id, _sig_payload)
+            if _readback.lookup_status != _LS_FOUND or not isinstance(_readback.row, dict):
+                log.critical(
+                    "WATCHER_ARMED_PROOF_READBACK_MISSING client=%s mode=%s "
+                    "canonical=%s local_order_id=%s status=%s err=%s",
+                    client_id, _mode, canonical_signal_id, local_order_id,
+                    _readback.lookup_status, _readback.error,
+                )
+                return False
+
+            _row = _readback.row
+            _meta = _row.get("metadata") if isinstance(_row.get("metadata"), dict) else {}
+            _row_canonical = str(_row.get("canonical_signal_id") or _readback.canonical_signal_id or "")
+            _row_client = str(_row.get("client_id") or client_id)
+            _row_status = str(_row.get("opportunity_status") or "").upper()
+            _row_order = str(_row.get("order_local_id") or _meta.get("local_order_id") or "")
+            _row_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
+            _row_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
+            _reattach_flag = bool(_meta.get("reattach_in_progress"))
+            _verified = (
+                _row_canonical == canonical_signal_id
+                and _row_client == client_id
+                and _row_status == _OL_WATCHER_ARMED
+                and _row_order == str(local_order_id)
+                and _row_mode == _mode
+                and _row_session == _session
+                and (not expect_reattach_cleared or not _reattach_flag)
+            )
+            if not _verified:
+                log.critical(
+                    "WATCHER_ARMED_PROOF_READBACK_MISMATCH client=%s mode=%s "
+                    "canonical=%s local_order_id=%s row_status=%s row_order=%s "
+                    "row_mode=%s row_session=%s reattach_in_progress=%s row=%s metadata=%s",
+                    client_id, _mode, canonical_signal_id, local_order_id,
+                    _row_status, _row_order, _row_mode, _row_session,
+                    _reattach_flag, _row, _meta,
+                )
+                return False
+            return True
+
+        if not _readback_verified(expect_reattach_cleared=False):
+            return False
+
+        if clear_reattach_in_progress:
+            _clear_meta = dict(_proof_meta)
+            _clear_meta.update({
+                "reattach_in_progress": False,
+                "reattach_in_progress_cleared_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _cleared = _mark_watcher_armed(
+                canonical_signal_id,
+                client_id,
+                canonical_signal_id=canonical_signal_id,
+                order_local_id=str(local_order_id),
+                extra_meta=_clear_meta,
+            )
+            if not _cleared:
+                log.critical(
+                    "WATCHER_ARMED_PROOF_CLEAR_FAILED client=%s mode=%s "
+                    "canonical=%s local_order_id=%s",
+                    client_id, _mode, canonical_signal_id, local_order_id,
+                )
+                return False
+            return _readback_verified(expect_reattach_cleared=True)
+
+        return True
+    except Exception as _proof_exc:
+        log.critical(
+            "WATCHER_ARMED_PROOF_EXCEPTION client=%s mode=%s canonical=%s "
+            "local_order_id=%s err=%s",
+            client_id, execution_mode, canonical_signal_id,
+            local_order_id, _proof_exc,
+        )
+        return False
+
+
+def _persist_reattach_post_watch_ambiguity(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+    post_status: str,
+    post_row_status: str,
+) -> bool:
+    """Persist a durable AMBIGUOUS opportunity so the NEXT reeval attempt
+    cannot classify the setup as NEW and create a replacement ENTRY.
+
+    Returns True only after create, terminal mark, and read-back verification.
+    A False return is a hard failure that MUST be treated as fail-closed
+    retryable by the caller.
+    """
+    return _persist_reattach_terminal_suppression_marker(
+        client_id=client_id,
+        execution_mode=execution_mode,
+        canonical_signal_id=canonical_signal_id,
+        signal_id=signal_id,
+        signal_payload=signal_payload,
+        local_order_id=local_order_id,
+        session_key=session_key,
+        reason="reattach_post_watch_ambiguous_terminal_or_missing",
+        post_status=post_status,
+        post_row_status=post_row_status,
+    )
+
+
+# ── Disposition constants ─────────────────────────────────────────────────────
+
+_DISPOSITION_ALREADY_ARMED       = "ALREADY_ARMED"
+_DISPOSITION_ALREADY_OWNED       = "ALREADY_OWNED"       # broker-submitted / filled
+_DISPOSITION_ALREADY_TERMINAL    = "ALREADY_TERMINAL"
+_DISPOSITION_REATTACH_WATCHER    = "REATTACH_WATCHER"    # PENDING_TRIGGER order exists, no watcher proof
+_DISPOSITION_ACTIVE_CREATED_RETRY = "ACTIVE_CREATED_RETRY"  # exact CREATED order — retry, never re-enter
+_DISPOSITION_RETRYABLE           = "RETRYABLE"
+_DISPOSITION_NEW                 = "NEW"
+_DISPOSITION_LOOKUP_FAILED       = "LOOKUP_FAILED"
+_DISPOSITION_AMBIGUOUS_OWNERSHIP = "AMBIGUOUS_OWNERSHIP"  # fail closed as retryable
+
+
+class _DispositionResult(NamedTuple):
+    """Full disposition result for a shared ap_signals row.
+
+    .disposition            — one of the _DISPOSITION_* constants
+    .existing_local_order_id — set for REATTACH_WATCHER; the order to reuse
+    .existing_order_row     — set for REATTACH_WATCHER; full order dict
+    """
+    disposition: str
+    existing_local_order_id: Optional[str] = None
+    existing_order_row: Optional[dict] = None
+
+
+def _resolve_shared_setup_disposition(
+    signal_id: str,
+    client_id: str,
+    signal: dict,
+    execution_mode: str,
+    *,
+    session_key: Optional[str] = None,
+) -> _DispositionResult:
+    """Return the per-client disposition for a shared ap_signals row.
+
+    Called ONLY for rows whose source is ap_signals (job_id starts 'sup:').
+    Must run before master_control, OSM, selector, or broker calls.
+
+    Processing order (10 steps per spec):
+      1. Normalize canonical signal identity.
+      2. Normalize exact execution mode.
+      3. Determine overnight session key.
+      4. Query opportunity ledger → FOUND / NOT_FOUND / LOOKUP_FAILED.
+      5. If FOUND: inspect durable evidence (mode, session, status).
+      6. Query exact active local ENTRY ownership.
+      7. Resolve disposition from active order if found.
+      8. Resolve NEW vs RETRYABLE from opportunity evidence.
+      9. Ambiguous → fail closed.
+     10. Return _DispositionResult.
+
+    Mode isolation: blank stored mode never establishes ownership.
+    Session isolation: blank stored session never counts as current session.
+    Terminal coverage: uses canonical sets imported from opportunity_ledger.
+    """
+    from ap.opportunity_ledger import (
+        WATCHER_ARMED            as _OL_WATCHER_ARMED,
+        BROKER_SUBMITTED         as _OL_BROKER_SUBMITTED,
+        BROKER_ACKED             as _OL_BROKER_ACKED,
+        FILLED                   as _OL_FILLED,
+        TERMINAL_STATUSES        as _OL_TERMINAL_STATUSES,
+    )
+
+    # Step 1: Normalize canonical signal identity.
+    lookup = _get_client_opportunity_row(signal_id, client_id, signal)
+    canonical = lookup.canonical_signal_id
+
+    if not canonical:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED cannot resolve canonical_signal_id signal=%s",
+            client_id, signal_id,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
+    # Step 2: Normalize exact execution mode (blank = unknown = fail closed).
+    _req_mode = str(execution_mode or "").strip().lower()
+    if not _req_mode or _req_mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED unknown execution_mode=%r canonical=%s",
+            client_id, execution_mode, canonical,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
+    # Step 3: Determine overnight session key.
+    _session_key = session_key or _overnight_reeval_session_key()
+
+    # Step 4: Query opportunity ledger.
+    if lookup.lookup_status == _LS_LOOKUP_FAILED:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED opportunity-store error canonical=%s err=%s",
+            client_id, canonical, lookup.error,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
+    # Step 5: If FOUND, inspect durable evidence with exact mode + session guards.
+    _has_current_session_proof = False
+    if lookup.lookup_status == _LS_FOUND:
+        row = lookup.row
+        _status = str(row.get("opportunity_status") or "").upper()
+        _stage  = str(row.get("miss_stage") or "").upper()
+        _reason = str(row.get("miss_reason") or "")
+        _meta   = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+
+        # Mode isolation: blank stored mode NEVER establishes ownership.
+        _recorded_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
+        _mode_match = bool(_recorded_mode and _recorded_mode == _req_mode)
+
+        # Session isolation: blank stored session NEVER counts as current.
+        _recorded_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
+        _session_match = bool(_recorded_session and _recorded_session == _session_key)
+        _reattach_in_progress = bool(_meta.get("reattach_in_progress"))
+
+        if _mode_match and _session_match:
+            _has_current_session_proof = True
+
+            # PR #388 nonterminal-ownership-poisoning amendment
+            # ────────────────────────────────────────────────
+            # opportunity_ledger.update_opportunity() blocks lifecycle
+            # regression but continues to write identifier + metadata fields
+            # and returns True. That means a prior WATCHER_ARMED /
+            # BROKER_SUBMITTED / BROKER_ACKED / FILLED row can retain its
+            # stale lifecycle status while accepting current-session
+            # metadata (mode, session key, local_order_id, and
+            # reattach_in_progress=true) from _persist_reattach_in_progress_
+            # fence(). Trusting that stale status immediately here would
+            # return ALREADY_ARMED or ALREADY_OWNED before the exact
+            # active-order fence runs, stranding a live PENDING_TRIGGER
+            # order when watch() later fails and the marker stays set.
+            #
+            # Contract: when reattach_in_progress=true for the exact
+            # current mode/session/order, defer ALL opportunity-based
+            # ownership conclusions — WATCHER_ARMED, broker-owned,
+            # terminal — and let the exact active-order fence decide.
+            # The marker itself must remain until watch() succeeds and
+            # _persist_watcher_armed_proof() explicitly clears it.
+
+            # ALREADY_ARMED: durable WATCHER_ARMED proof for this client/mode/session.
+            if _status == _OL_WATCHER_ARMED:
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session WATCHER_ARMED opportunity "
+                        "carries reattach_in_progress=true; deferring ALREADY_ARMED "
+                        "disposition until exact active-order fence runs canonical=%s "
+                        "session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_ARMED canonical=%s session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_ARMED)
+
+            # ALREADY_OWNED: broker-submitted, acked, or filled — entry is in flight.
+            if _status in {_OL_BROKER_SUBMITTED, _OL_BROKER_ACKED, _OL_FILLED}:
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session broker-owned opportunity "
+                        "(status=%s) carries reattach_in_progress=true; deferring "
+                        "ALREADY_OWNED disposition until exact active-order fence "
+                        "runs canonical=%s session=%s",
+                        client_id, _status, canonical, _session_key,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s status=%s",
+                        client_id, canonical, _session_key, _status,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_OWNED)
+
+            # ALREADY_TERMINAL: canonical terminal set from opportunity_ledger.
+            if _status in _OL_TERMINAL_STATUSES:
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session terminal opportunity carries "
+                        "reattach_in_progress=true; deferring terminal disposition "
+                        "until exact active-order fence runs canonical=%s session=%s "
+                        "status=%s stage=%s reason=%s",
+                        client_id, canonical, _session_key, _status, _stage, _reason,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
+                        "status=%s stage=%s reason=%s",
+                        client_id, canonical, _session_key, _status, _stage, _reason,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+            # Legacy terminal watcher-arm failure recorded in same-session.
+            if (_status == "MISSED" and _stage == "WATCHER_ARM"
+                    and _is_terminal_watch_arm_failure_reason(_reason)):
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session watcher-arm terminal marker "
+                        "carries reattach_in_progress=true; deferring terminal "
+                        "disposition until exact active-order fence runs canonical=%s "
+                        "session=%s reason=%s",
+                        client_id, canonical, _session_key, _reason,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
+                        "canonical=%s session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+            if (_status == "INTERNAL_ERROR"
+                    and _is_terminal_watch_arm_failure_reason(_reason)):
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session internal-error terminal marker "
+                        "carries reattach_in_progress=true; deferring terminal "
+                        "disposition until exact active-order fence runs canonical=%s "
+                        "session=%s reason=%s",
+                        client_id, canonical, _session_key, _reason,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_TERMINAL (internal-error) "
+                        "canonical=%s session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+        # Different mode or session: fall through to active-order check below.
+
+    # Step 6: Query exact active local ENTRY ownership (durable DB truth).
+    _order_status, _order_row = _query_active_entry_order(client_id, _req_mode, canonical)
+
+    # Active-order lookup failure → fail closed (do not assume no order exists).
+    if _order_status == _LS_LOOKUP_FAILED:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED active-order query failed canonical=%s mode=%s",
+            client_id, canonical, _req_mode,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
+    # Step 7: Resolve from active order.
+    if _order_status == _LS_FOUND and _order_row:
+        _active_status = str(_order_row.get("status") or "").upper()
+        _existing_local_id = str(_order_row.get("local_order_id") or "").strip()
+
+        _active_disp = _entry_order_disposition_from_status(
+            client_id=client_id,
+            canonical_signal_id=canonical,
+            session_key=_session_key,
+            status=_active_status,
+            local_order_id=_existing_local_id,
+            order_row=_order_row,
+            source="active-entry-fence",
+        )
+        if _active_disp is not None:
+            return _active_disp
+
+        log.warning(
+            "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP active order has "
+            "unrecognized status canonical=%s status=%s",
+            client_id, canonical, _active_status,
+        )
+        return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
+
+    # Step 7b: No active order. Check latest exact ENTRY without a status
+    # filter before any path can return NEW. Terminal order history is durable
+    # no-replacement truth even when opportunity marker storage failed.
+    _latest_status, _latest_row = _query_latest_entry_order_no_status(
+        client_id, _req_mode, canonical,
+    )
+    if _latest_status == _LS_LOOKUP_FAILED:
+        log.warning(
+            "[%s] reeval disposition=LOOKUP_FAILED latest-entry query failed "
+            "canonical=%s mode=%s",
+            client_id, canonical, _req_mode,
+        )
+        return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+    if _latest_status == _LS_FOUND and _latest_row:
+        _latest_order_status = str(_latest_row.get("status") or "").upper()
+        _latest_local_id = str(_latest_row.get("local_order_id") or "").strip()
+        _latest_disp = _entry_order_disposition_from_status(
+            client_id=client_id,
+            canonical_signal_id=canonical,
+            session_key=_session_key,
+            status=_latest_order_status,
+            local_order_id=_latest_local_id,
+            order_row=_latest_row,
+            source="latest-entry-no-status-fence",
+        )
+        if _latest_disp is not None:
+            return _latest_disp
+        log.warning(
+            "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP latest entry has "
+            "unrecognized status canonical=%s status=%s",
+            client_id, canonical, _latest_order_status,
+        )
+        return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
+
+    # Step 8: No active order — resolve from opportunity evidence.
+    if lookup.lookup_status == _LS_NOT_FOUND:
+        # Both opportunity AND order queries definitively returned zero rows.
+        log.debug(
+            "[%s] reeval disposition=NEW canonical=%s session=%s",
+            client_id, canonical, _session_key,
+        )
+        return _DispositionResult(_DISPOSITION_NEW)
+
+    if _has_current_session_proof:
+        # Had current-session opportunity evidence but it wasn't classified above
+        # (e.g. unrecognised status) — do not guess; fail closed.
+        log.warning(
+            "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP canonical=%s session=%s",
+            client_id, canonical, _session_key,
+        )
+        return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
+
+    # Step 9: Old-session or different-mode row with no active order.
+    # Safe to treat as NEW for this session + mode.
+    log.debug(
+        "[%s] reeval disposition=NEW (prior-session/mode record, no active order) "
+        "canonical=%s session=%s mode=%s",
+        client_id, canonical, _session_key, _req_mode,
+    )
+    return _DispositionResult(_DISPOSITION_NEW)
 
 
 def _shared_watch_arm_failure_already_recorded(
@@ -458,40 +1632,18 @@ def _shared_watch_arm_failure_already_recorded(
     *,
     session_key: Optional[str] = None,
 ) -> bool:
-    canonical_signal_id, row = _get_client_opportunity_row(signal_id, client_id, signal)
-    if not row:
-        return False
+    """Legacy compatibility shim — delegates to the full disposition resolver.
 
-    _status = str(row.get("opportunity_status") or "").upper()
-    _stage = str(row.get("miss_stage") or "").upper()
-    _reason = str(row.get("miss_reason") or "")
-    _metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    _session_key = session_key or _overnight_reeval_session_key()
-    _recorded_session = str(_metadata.get("overnight_reeval_session_key") or "")
-    if _recorded_session != _session_key:
-        return False
-
-    if _status == "MISSED" and _stage == "WATCHER_ARM" and _is_terminal_watch_arm_failure_reason(_reason):
-        log.info(
-            "[%s] overnight_reeval: shared setup already has same-session WATCHER_ARM proof "
-            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
-            client_id,
-            canonical_signal_id,
-            _session_key,
-        )
-        return True
-
-    if _status == "INTERNAL_ERROR" and _is_terminal_watch_arm_failure_reason(_reason):
-        log.info(
-            "[%s] overnight_reeval: shared setup already has same-session INTERNAL_ERROR arm-failure proof "
-            "for canonical_signal_id=%s session_key=%s — skipping repeat local order creation",
-            client_id,
-            canonical_signal_id,
-            _session_key,
-        )
-        return True
-
-    return False
+    Returns True when disposition is ALREADY_ARMED or ALREADY_TERMINAL,
+    preserving callers that used the old boolean interface.
+    Do not add new callers; prefer _resolve_shared_setup_disposition directly.
+    """
+    disp_result = _resolve_shared_setup_disposition(
+        signal_id, client_id, signal,
+        execution_mode="paper",   # legacy callers don't pass mode; default paper avoids LOOKUP_FAILED
+        session_key=session_key,
+    )
+    return disp_result.disposition in (_DISPOSITION_ALREADY_ARMED, _DISPOSITION_ALREADY_TERMINAL)
 
 
 def _record_watch_arm_failure_proof(
@@ -569,6 +1721,102 @@ def _record_watch_arm_failure_proof(
         )
 
 
+def _classify_overnight_reeval_result(result: dict) -> dict:
+    """Attach the operational completion/retry contract to a result dict."""
+    if not isinstance(result, dict):
+        result = {}
+    fetched = int(result.get("fetched", 0) or 0)
+    errors = int(result.get("errors", 0) or 0)
+    stalled = bool(result.get("stalled"))
+    skipped = int(result.get("skipped", 0) or 0)
+    armed = int(result.get("armed", 0) or 0)
+    terminal_rejected = int(result.get("terminal_rejected", result.get("rejected", 0)) or 0)
+    terminal_errors = int(result.get("terminal_errors", errors) or 0)
+    retryable_deferred = int(
+        result.get("retryable_deferred", fetched if stalled and fetched > 0 else 0) or 0
+    )
+    already_resolved = int(result.get("already_resolved", 0) or 0)
+    unresolved = int(
+        result.get(
+            "unresolved",
+            max(
+                0,
+                fetched
+                - armed
+                - terminal_rejected
+                - terminal_errors
+                - retryable_deferred
+                - already_resolved,
+            ),
+        )
+        or 0
+    )
+
+    if skipped == -1:
+        result_class = "SKIPPED_NOT_DUE"
+        completed = False
+        retryable = False
+        retry_reason = None
+    elif errors > 0 or terminal_errors > 0:
+        result_class = "RETRYABLE_ROW_ERRORS"
+        completed = False
+        retryable = True
+        retry_reason = "row_errors"
+    elif retryable_deferred > 0:
+        if armed > 0 or terminal_rejected > 0 or already_resolved > 0:
+            result_class = "RETRYABLE_PARTIAL_DEFERRED"
+            retry_reason = "retryable_rows_remain"
+        else:
+            result_class = "RETRYABLE_ALL_DEFERRED"
+            retry_reason = "all_fetched_rows_deferred"
+        completed = False
+        retryable = True
+    elif unresolved > 0:
+        result_class = "RETRYABLE_ROW_ERRORS"
+        completed = False
+        retryable = True
+        retry_reason = "unresolved_rows"
+    elif fetched == 0:
+        result_class = "COMPLETED_NO_WORK"
+        completed = True
+        retryable = False
+        retry_reason = None
+    else:
+        result_class = "COMPLETED_WITH_DECISIONS"
+        completed = True
+        retryable = False
+        retry_reason = None
+
+    result["armed"] = armed
+    result["terminal_rejected"] = terminal_rejected
+    result["terminal_errors"] = terminal_errors
+    result["retryable_deferred"] = retryable_deferred
+    result["already_resolved"] = already_resolved
+    result["unresolved"] = unresolved
+    result["stalled"] = bool(
+        retryable_deferred > 0
+        and armed == 0
+        and terminal_rejected == 0
+        and terminal_errors == 0
+        and already_resolved == 0
+    )
+    # PR #388 P0-2: partial-source inventory override. If either source
+    # lookup failed, we cannot certify the run complete — even when every
+    # observed row was processed. Downgrade to a retryable classification so
+    # the runner never sets success_date on incomplete truth.
+    if bool(result.get("source_lookup_partial")) and completed:
+        result_class = "RETRYABLE_PARTIAL_SOURCE_INVENTORY"
+        completed = False
+        retryable = True
+        retry_reason = "partial_source_inventory"
+
+    result["result_class"] = result_class
+    result["completed"] = completed
+    result["retryable"] = retryable
+    result["retry_reason"] = retry_reason
+    return result
+
+
 def run_overnight_reeval(
     *,
     client_id: str,
@@ -586,8 +1834,8 @@ def run_overnight_reeval(
     """
     Re-evaluate all WATCHING signals for client_id.
     Called during the 9:00–9:45 AM ET handoff window. Contract selection is
-    deferred when pre-market option chains are not yet ready, so this can
-    safely run before 9:30 without requiring live regular-session quotes.
+    always deferred to the breach-time execution seam, so watcher ownership
+    is established without waiting for pre-market option-chain work.
 
     Returns summary dict with core counts plus stale/fresh visibility.
     """
@@ -663,8 +1911,13 @@ def run_overnight_reeval(
         "processed": 0,
         "armed": 0,
         "rejected": 0,
+        "terminal_rejected": 0,
         "skipped": 0,
         "errors": 0,
+        "terminal_errors": 0,
+        "retryable_deferred": 0,
+        "already_resolved": 0,
+        "unresolved": 0,
         "stale_skipped": 0,
         "fresh_processed": 0,
         "fresh_armed": 0,
@@ -687,24 +1940,73 @@ def run_overnight_reeval(
         if not _is_trading_day(now_et):
             log.info("[%s] overnight_reeval: skipping — not a trading day", client_id)
             result["skipped"] = -1
-            return result
-        _in_window = (now_et.hour == 9 and 0 <= now_et.minute <= 45)
+            return _classify_overnight_reeval_result(result)
+        _in_window = (now_et.hour == 9 and 0 <= now_et.minute < 45)
         if not _in_window:
             log.info("[%s] overnight_reeval: skipping — outside 9:00-9:45 AM ET window (now=%02d:%02d)",
                      client_id, now_et.hour, now_et.minute)
             result["skipped"] = -1
-            return result
+            return _classify_overnight_reeval_result(result)
 
-    # Fetch WATCHING signals from trade_queue
-    watching_signals = _fetch_watching_signals(client_id)
+    # Fetch WATCHING signals from both sources of truth AND their status.
+    # Source failure must NEVER be interpreted as "completed no work" — that
+    # was the exact silent-success bug in the prior amendment where a Postgres
+    # or Supabase outage produced zero rows and the runner marked the day
+    # successful.
+    _fetch_result = _fetch_watching_signals_with_status(client_id)
+    watching_signals = sorted(_fetch_result.rows or [], key=_overnight_signal_sort_key)
     result["fetched"] = len(watching_signals or [])
+    result["trade_queue_status"] = _fetch_result.trade_queue_status
+    result["ap_signals_status"]  = _fetch_result.ap_signals_status
+    result["trade_queue_error"]  = _fetch_result.trade_queue_error
+    result["ap_signals_error"]   = _fetch_result.ap_signals_error
+
+    _tq_failed  = _fetch_result.trade_queue_status != _SOURCE_STATUS_SUCCESS
+    _sup_failed = _fetch_result.ap_signals_status  != _SOURCE_STATUS_SUCCESS
+
+    if _tq_failed and _sup_failed and not watching_signals:
+        # Both sources failed and no rows visible → cannot certify empty
+        # inventory. Explicit retryable classification; do NOT let this
+        # collapse into COMPLETED_NO_WORK.
+        log.error(
+            "[%s] overnight_reeval: SOURCE_LOOKUP_FAILED trade_queue=%s ap_signals=%s "
+            "tq_err=%r sup_err=%r — refusing to certify empty inventory",
+            client_id,
+            _fetch_result.trade_queue_status, _fetch_result.ap_signals_status,
+            _fetch_result.trade_queue_error, _fetch_result.ap_signals_error,
+        )
+        result["result_class"] = "RETRYABLE_SOURCE_LOOKUP_FAILED"
+        result["completed"]    = False
+        result["retryable"]    = True
+        result["retry_reason"] = "source_lookup_failed"
+        result["source_lookup_failed"] = True
+        # Preserve counters and skip the classifier's COMPLETED_NO_WORK
+        # branch; return this exact shape so the runner never sets
+        # success_date and never runs post-overnight handoff.
+        return result
+
+    if _tq_failed or _sup_failed:
+        # Partial inventory. Process the rows we did see, but mark the run
+        # retryable so the runner does not set success_date on incomplete
+        # truth. This is applied after the loop as an override below.
+        log.warning(
+            "[%s] overnight_reeval: PARTIAL_SOURCE_INVENTORY trade_queue=%s ap_signals=%s "
+            "processing %d rows but classifying run retryable",
+            client_id,
+            _fetch_result.trade_queue_status, _fetch_result.ap_signals_status,
+            len(watching_signals),
+        )
+        result["source_lookup_partial"] = True
+
     if not watching_signals:
         log.info("[%s] overnight_reeval: no WATCHING signals found", client_id)
-        return result
+        return _classify_overnight_reeval_result(result)
 
     log.info("[%s] overnight_reeval: found %d WATCHING signals to reeval", client_id, len(watching_signals))
 
     today = now_et.date()
+    prior_levels_by_ticker: dict[str, dict] = {}
+    snapshot_by_ticker: dict[str, dict] = {}
     for job in watching_signals:
         result["processed"] += 1
         job_id = job["id"]
@@ -725,6 +2027,7 @@ def run_overnight_reeval(
             )
             _mark_job_rejected(job_id, client_id, "invalid_or_missing_side")
             result["rejected"] += 1
+            result["terminal_rejected"] += 1
             continue
         signal["side"] = side
         signal["direction"] = side
@@ -752,6 +2055,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                     result["rejected"] += 1
+                    result["terminal_rejected"] += 1
                     result["stale_skipped"] += 1
                     continue
             result["fresh_processed"] += 1
@@ -772,32 +2076,508 @@ def run_overnight_reeval(
                 )
                 _mark_job_rejected(job_id, client_id, f"intraday_timeframe_rejected:{_sig_tf}")
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
 
-            _shared_watch_arm_recorded = _shared_watch_arm_failure_already_recorded(
-                signal_id, client_id, signal, session_key=session_key
-            )
-            if _shared_watch_arm_recorded and _paper_rescue_only:
-                _mark_job_rejected(
-                    job_id,
-                    client_id,
-                    "duplicate_setup:same_session_watch_arm_or_terminal_failure_proof",
+            # ── Per-client/mode/session disposition lookup ────────────────────
+            # Shared ap_signals rows stay WATCHING for all clients; this lookup
+            # checks whether this exact client + mode + session already has durable
+            # proof before touching master_control, OSM, selector, or broker.
+            # _disp_result is set here for ap_signals rows; cleared for trade_queue.
+            _disp_result: Optional[_DispositionResult] = None
+            if job_source == "ap_signals":
+                _disp_result = _resolve_shared_setup_disposition(
+                    signal_id, client_id, signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
                 )
-                result["rejected"] += 1
-                continue
-            if job_source == "ap_signals" and _shared_watch_arm_recorded:
-                result["skipped"] = result.get("skipped", 0) + 1
-                continue
+                _disp = _disp_result.disposition
+
+                if _disp == _DISPOSITION_ALREADY_ARMED:
+                    log.info(
+                        "[%s] overnight_reeval: ALREADY_ARMED %s — skip repeat arm",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+
+                if _disp == _DISPOSITION_ALREADY_OWNED:
+                    log.info(
+                        "[%s] overnight_reeval: ALREADY_OWNED %s — entry in-flight or filled",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+
+                if _disp == _DISPOSITION_ALREADY_TERMINAL:
+                    log.info(
+                        "[%s] overnight_reeval: ALREADY_TERMINAL %s — skip re-evaluation",
+                        ticker, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+
+                if _disp in (_DISPOSITION_LOOKUP_FAILED, _DISPOSITION_AMBIGUOUS_OWNERSHIP):
+                    # Fail closed: truth is unavailable or ambiguous.
+                    # Do NOT create an order while ownership is unresolved.
+                    log.warning(
+                        "[%s] overnight_reeval: disposition=%s for %s — "
+                        "fail-closed as retryable_deferred",
+                        ticker, _disp, signal_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
+
+                if _disp == _DISPOSITION_REATTACH_WATCHER:
+                    # Case B: PENDING_TRIGGER order exists but WATCHER_ARMED
+                    # proof is missing. Reuse the existing local_order_id;
+                    # never create a new order.  No master_control, no
+                    # selector, no broker.
+                    #
+                    # P0-3/P0-4: reattachment must be idempotent (never
+                    # cancel a valid order) and must preserve exact identity
+                    # + risk levels for THIS row only (no cross-row leakage
+                    # from outer-loop variables).
+                    _existing_oid = _disp_result.existing_local_order_id or ""
+                    _existing_ord = _disp_result.existing_order_row or {}
+                    log.info(
+                        "[%s] overnight_reeval: REATTACH_WATCHER %s local_order_id=%s — "
+                        "reusing existing PENDING_TRIGGER order",
+                        ticker, signal_id, _existing_oid,
+                    )
+                    if not _existing_oid:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_WATCHER missing local_order_id "
+                            "signal=%s — failing closed as retryable",
+                            ticker, signal_id,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    # Explicit per-row locals — never fall back to outer-loop
+                    # variables. `entry_trigger` is set later in the normal
+                    # processing path, so referencing it here could either
+                    # raise UnboundLocalError on the first affected row or
+                    # (worse) reuse the previous ticker's trigger on a later
+                    # iteration.
+                    _reattach_trigger = None
+                    _trig_raw = _existing_ord.get("trigger_price")
+                    if _trig_raw is None:
+                        _trig_raw = signal.get("entry_trigger")
+                    try:
+                        _reattach_trigger = float(_trig_raw) if _trig_raw is not None else None
+                    except (TypeError, ValueError):
+                        _reattach_trigger = None
+                    if not _reattach_trigger or _reattach_trigger <= 0:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_WATCHER cannot prove trigger "
+                            "for signal=%s local_order_id=%s — failing closed as retryable "
+                            "(never inherit trigger from a prior loop iteration)",
+                            ticker, signal_id, _existing_oid,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    def _reattach_price(order_key, signal_key):
+                        v = _existing_ord.get(order_key)
+                        if v is None:
+                            v = signal.get(signal_key)
+                        try:
+                            return float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            return None
+
+                    _reattach_stop   = _reattach_price("stop_underlying",   "stop_price")
+                    _reattach_target = _reattach_price("target_underlying", "target_price")
+                    _reattach_client = client_id
+                    _reattach_mode   = _execution_mode
+                    _reattach_side   = str(_existing_ord.get("direction") or side).upper()
+                    _reattach_signal_id = str(_existing_ord.get("signal_id") or signal_id)
+                    _reattach_canonical = str(
+                        _existing_ord.get("canonical_signal_id")
+                        or _resolve_canonical_signal_id(signal_id, signal)
+                    )
+
+                    # Parse existing order metadata (best-effort).
+                    _ord_meta = _existing_ord.get("meta") or {}
+                    if isinstance(_ord_meta, str):
+                        try:
+                            import json as _json
+                            _ord_meta = _json.loads(_ord_meta)
+                        except Exception:
+                            _ord_meta = {}
+                    if not isinstance(_ord_meta, dict):
+                        _ord_meta = {}
+
+                    # Metadata merge: existing FIRST, canonical values LAST
+                    # so proven session/mode/client/canonical always win over
+                    # any stale or blank stored metadata.
+                    _reattach_metadata = {
+                        **_ord_meta,
+                        "overnight":                        True,
+                        "reattach_watcher":                 True,
+                        "contract_deferred":                True,
+                        "contract_selection_deferred_to":   "breach_time",
+                        "client_id":                        _reattach_client,
+                        "execution_mode":                   _reattach_mode,
+                        "overnight_reeval_session_key":     session_key,
+                        "signal_id":                        _reattach_signal_id,
+                        "canonical_signal_id":              _reattach_canonical,
+                        # PR #388 Blocker 1: REATTACH is a proven PR#388
+                        # seam and opts in to the late-attachment classifier.
+                        "late_attachment_policy_eligible":  True,
+                    }
+
+                    import types as _types_mod
+                    _reattach_plan = _types_mod.SimpleNamespace(
+                        ticker            = str(_existing_ord.get("symbol") or ticker),
+                        side              = _reattach_side,
+                        direction         = _reattach_side,
+                        score             = float(_existing_ord.get("score") or signal.get("score") or 0),
+                        timeframe         = str(_existing_ord.get("timeframe") or signal.get("timeframe") or "1d"),
+                        entry_trigger     = _reattach_trigger,
+                        trigger_price     = _reattach_trigger,
+                        stop_underlying   = _reattach_stop,
+                        target_underlying = _reattach_target,
+                        trigger_type      = "breach",
+                        prior_day_high    = signal.get("prior_day_high"),
+                        prior_day_low     = signal.get("prior_day_low"),
+                        pattern           = _existing_ord.get("pattern") or signal.get("pattern"),
+                        tier              = _existing_ord.get("tier") or signal.get("tier"),
+                        contract_symbol   = str(_existing_ord.get("contract") or f"DEFERRED:{ticker}"),
+                        contracts         = int(_existing_ord.get("qty") or 1),
+                        limit_price       = float(_existing_ord.get("limit_price") or 0.01),
+                        plan_id           = str(_existing_ord.get("plan_id") or ""),
+                        signal_id         = _reattach_signal_id,
+                        canonical_signal_id = _reattach_canonical,
+                        client_id         = _reattach_client,
+                        execution_mode    = _reattach_mode,
+                        late_attachment_policy_eligible = True,
+                        metadata          = _reattach_metadata,
+                    )
+
+                    # P0-3 precheck: if the existing watcher already owns
+                    # this exact local_order_id, do NOT call watch() again.
+                    # A second watch() would hit add_signal() dedup, return
+                    # False, and (without the recovery flags) attempt to
+                    # cancel the valid PENDING_TRIGGER order. Just retry the
+                    # durable proof write below.
+                    _already_owned = False
+                    try:
+                        _has_order_fn = getattr(entry_watcher, "has_order", None)
+                        if callable(_has_order_fn):
+                            _already_owned = bool(_has_order_fn(_existing_oid))
+                    except Exception as _has_exc:
+                        log.warning(
+                            "[%s] REATTACH_WATCHER has_order() check failed for %s: %s "
+                            "— proceeding with recovery_rearm watch() (safe)",
+                            ticker, _existing_oid, _has_exc,
+                        )
+                        _already_owned = False
+
+                    if _already_owned:
+                        log.info(
+                            "[%s] REATTACH_WATCHER watcher already owns local_order_id=%s "
+                            "— skipping second watch() call; retrying durable proof only",
+                            ticker, _existing_oid,
+                        )
+                        _reattach_armed = True
+                    else:
+                        _pre_watch_fenced = _persist_reattach_in_progress_fence(
+                            client_id=client_id,
+                            execution_mode=_reattach_mode,
+                            canonical_signal_id=_reattach_canonical,
+                            signal_id=signal_id,
+                            signal_payload=signal,
+                            local_order_id=_existing_oid,
+                            session_key=session_key,
+                        )
+                        if not _pre_watch_fenced:
+                            log.critical(
+                                "[%s] overnight_reeval: REATTACH_WATCHER pre-watch "
+                                "ownership fence failed signal=%s local_order_id=%s "
+                                "— watcher not called; classifying retryable_deferred",
+                                ticker, signal_id, _existing_oid,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        try:
+                            _reattach_armed = entry_watcher.watch(
+                                _reattach_plan, _existing_oid,
+                                recovery_rearm=True,
+                                no_cancel_on_reject=True,
+                            )
+                        except Exception as _reat_exc:
+                            log.error(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch() exception "
+                                "signal=%s local_order_id=%s: %s",
+                                ticker, signal_id, _existing_oid, _reat_exc,
+                            )
+                            # Retryable, not terminal: the existing
+                            # PENDING_TRIGGER order is untouched and the
+                            # next retry can attempt reattach again.
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+
+                    if not _reattach_armed:
+                        # PR #388 truthful accounting on watch() False.
+                        # Use the NO-STATUS-FILTER exact-order lookup so
+                        # terminal statuses (CANCELED / EXPIRED / REJECTED
+                        # / ERROR) are visible. The active-ownership fence
+                        # helper _query_active_entry_order filters those
+                        # out and would incorrectly return NOT_FOUND, which
+                        # would cascade into a replacement ENTRY on the
+                        # next reeval.
+                        _post_status, _post_row = _query_exact_entry_order_by_local_id(
+                            _existing_oid, client_id, _reattach_mode, _reattach_canonical,
+                        )
+                        _post_active_status = ""
+                        if _post_status == _LS_FOUND and isinstance(_post_row, dict):
+                            _post_active_status = str(_post_row.get("status") or "").upper()
+
+                        # Case 1: row found, still preserved.
+                        if _post_status == _LS_FOUND and _post_active_status in ("PENDING_TRIGGER", "CREATED"):
+                            log.warning(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False signal=%s local_order_id=%s"
+                                " — VERIFIED PRESERVED (order still %s);"
+                                " classifying retryable_deferred",
+                                ticker, signal_id, _existing_oid, _post_active_status,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+
+                        # Case 2: row found in active-ownership family
+                        # (submitted / accepted / open / partial / filled)
+                        # — already owned, no further reeval work.
+                        if _post_status == _LS_FOUND and _post_active_status in _ALREADY_OWNED_STATUSES:
+                            log.warning(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False signal=%s local_order_id=%s"
+                                " — order in-flight/filled (%s);"
+                                " classifying already_resolved",
+                                ticker, signal_id, _existing_oid, _post_active_status,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["already_resolved"] += 1
+                            continue
+
+                        # Case 3: row found in an explicit terminal status.
+                        if _post_status == _LS_FOUND and _post_active_status in _TERMINAL_ENTRY_STATUSES:
+                            _terminal_marker_persisted = _persist_reattach_terminal_suppression_marker(
+                                client_id=client_id,
+                                execution_mode=_reattach_mode,
+                                canonical_signal_id=_reattach_canonical,
+                                signal_id=signal_id,
+                                signal_payload=signal,
+                                local_order_id=_existing_oid,
+                                session_key=session_key,
+                                reason=f"reattach_post_watch_terminal:{_post_active_status}",
+                                post_status=_post_status,
+                                post_row_status=_post_active_status,
+                            )
+                            if not _terminal_marker_persisted:
+                                log.critical(
+                                    "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                    " returned False signal=%s local_order_id=%s"
+                                    " — order terminalized (%s) but durable"
+                                    " terminal marker persist FAILED;"
+                                    " classifying retryable_deferred (fail closed)",
+                                    ticker, signal_id, _existing_oid, _post_active_status,
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
+                            log.warning(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False signal=%s local_order_id=%s"
+                                " — order terminalized (%s); durable marker"
+                                " persisted; classifying already_resolved"
+                                " (no replacement now or on next attempt)",
+                                ticker, signal_id, _existing_oid, _post_active_status,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["already_resolved"] += 1
+                            continue
+
+                        # Case 4: row found in an UNRECOGNISED status —
+                        # persist ambiguity so the next reeval sees terminal.
+                        # Case 5: row missing (NOT_FOUND) — persist ambiguity.
+                        # Case 6: lookup failed — persist ambiguity.
+                        # In every one of these, `retryable_deferred` alone
+                        # is not enough: the next reeval could see no
+                        # active order and classify NEW, creating a
+                        # replacement ENTRY. Write a durable AMBIGUITY
+                        # record via the opportunity ledger so the
+                        # disposition resolver returns ALREADY_TERMINAL.
+                        _ambiguity_persisted = _persist_reattach_post_watch_ambiguity(
+                            client_id=client_id,
+                            execution_mode=_reattach_mode,
+                            canonical_signal_id=_reattach_canonical,
+                            signal_id=signal_id,
+                            signal_payload=signal,
+                            local_order_id=_existing_oid,
+                            session_key=session_key,
+                            post_status=_post_status,
+                            post_row_status=_post_active_status,
+                        )
+                        if _ambiguity_persisted:
+                            log.critical(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False AND post-verify=%s row_status=%r"
+                                " signal=%s local_order_id=%s"
+                                " — durable ambiguity marker persisted;"
+                                " next reeval will classify ALREADY_TERMINAL"
+                                " (no replacement ENTRY)",
+                                ticker, _post_status, _post_active_status,
+                                signal_id, _existing_oid,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["already_resolved"] += 1
+                            continue
+
+                        # Ambiguity marker persist failed — fail closed
+                        # by classifying the run RETRYABLE with an explicit
+                        # unresolved counter so this attempt cannot mark
+                        # success and the next attempt retries the whole
+                        # path (which will hit the same ambiguity and
+                        # attempt to persist again).
+                        log.critical(
+                            "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                            " returned False AND post-verify=%s row_status=%r"
+                            " AND ambiguity marker persist FAILED;"
+                            " signal=%s local_order_id=%s"
+                            " — classifying retryable_deferred (fail closed;"
+                            " next reeval may still see this row)",
+                            ticker, _post_status, _post_active_status,
+                            signal_id, _existing_oid,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    # Persist durable WATCHER_ARMED proof after successful reattachment.
+                    _canonical_for_proof = _resolve_canonical_signal_id(signal_id, signal)
+                    _reat_proof_ok = _persist_watcher_armed_proof(
+                        client_id=client_id,
+                        execution_mode=_execution_mode,
+                        canonical_signal_id=_canonical_for_proof,
+                        signal_id=signal_id,
+                        signal_payload=signal,
+                        local_order_id=str(_existing_oid),
+                        session_key=session_key,
+                        clear_reattach_in_progress=True,
+                        extra_meta={
+                            "source_table": "ap_signals",
+                            "source_job_id": str(job_id),
+                            "ticker": ticker,
+                            "side": side,
+                            "contract_deferred": True,
+                            "contract_selection_deferred_to": "breach_time",
+                            "reattach_watcher": True,
+                            "armed_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+
+                    if not _reat_proof_ok:
+                        log.critical(
+                            "OVERNIGHT_REEVAL_REATTACH_PROOF_WRITE_FAILED | "
+                            "client=%s mode=%s canonical=%s local_order_id=%s session=%s | "
+                            "watcher reattached but WATCHER_ARMED proof NOT persisted — "
+                            "next retry will REATTACH again (idempotent)",
+                            client_id, _execution_mode, _canonical_for_proof,
+                            _existing_oid, session_key,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    log.info(
+                        "[%s] ✅ REATTACH_WATCHER ARMED — local_order_id=%s canonical=%s",
+                        ticker, _existing_oid, _canonical_for_proof,
+                    )
+                    _mark_job_watching_armed(job_id, client_id, f"reattached:{_existing_oid}")
+                    result["armed"] += 1
+                    result["fresh_armed"] += 1
+                    continue
+
+                if _disp == _DISPOSITION_ACTIVE_CREATED_RETRY:
+                    # PR #388 Blocker #6: an exact active ENTRY order in
+                    # CREATED status already exists for this client + mode
+                    # + canonical_signal_id. Preserve it. Do NOT run
+                    # master_control, contract selector, OSM
+                    # create_entry_order, or the broker. The next reeval
+                    # (or the row's established owner) can transition it
+                    # to PENDING_TRIGGER and take the REATTACH_WATCHER
+                    # path; a duplicate create_entry_order here would
+                    # defeat the whole active-order fence.
+                    _created_oid = (_disp_result.existing_local_order_id or "")
+                    log.info(
+                        "[%s] overnight_reeval: ACTIVE_CREATED_RETRY %s "
+                        "local_order_id=%s — preserving CREATED order; "
+                        "classifying run retryable_deferred",
+                        ticker, signal_id, _created_oid,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
+
+                # RETRYABLE or NEW — fall through to normal processing.
+            else:
+                # trade_queue rows are genuinely per-client; use legacy boolean fence.
+                _shared_watch_arm_recorded = _shared_watch_arm_failure_already_recorded(
+                    signal_id, client_id, signal, session_key=session_key
+                )
+                if _shared_watch_arm_recorded and _paper_rescue_only:
+                    _mark_job_rejected(
+                        job_id,
+                        client_id,
+                        "duplicate_setup:same_session_watch_arm_or_terminal_failure_proof",
+                    )
+                    result["rejected"] += 1
+                    result["terminal_rejected"] += 1
+                    continue
 
             # Step 1: Fetch prior-day levels from broker
-            prior_levels = {}
-            if hasattr(market_data_broker, "get_prior_day_levels"):
-                prior_levels = market_data_broker.get_prior_day_levels(ticker) or {}
-            else:
-                log.warning(
-                    "[%s] market-data broker has no get_prior_day_levels — cannot validate overnight daily signal",
-                    ticker,
-                )
+            _ticker_key = str(ticker or "").upper()
+            prior_levels = prior_levels_by_ticker.get(_ticker_key)
+            if prior_levels is None:
+                prior_levels = {}
+                if hasattr(market_data_broker, "get_prior_day_levels"):
+                    try:
+                        prior_levels = market_data_broker.get_prior_day_levels(ticker) or {}
+                    except Exception as _prior_exc:
+                        log.warning(
+                            "[%s] overnight_reeval: prior-level fetch failed; retrying row later: %s",
+                            ticker,
+                            _prior_exc,
+                        )
+                        if _paper_rescue_only:
+                            _mark_job_watching_reason(
+                                job_id,
+                                client_id,
+                                "after_hours_deferred:overnight_prior_levels_fetch_failed",
+                            )
+                        result["skipped"] += 1
+                        result["retryable_deferred"] += 1
+                        continue
+                else:
+                    log.warning(
+                        "[%s] market-data broker has no get_prior_day_levels — cannot validate overnight daily signal",
+                        ticker,
+                    )
+                if prior_levels:
+                    prior_levels_by_ticker[_ticker_key] = prior_levels
 
             prior_day_high = (
                 float(signal.get("prior_day_high") or 0) or
@@ -917,6 +2697,7 @@ def run_overnight_reeval(
                         ),
                     )
                 result["skipped"] = result.get("skipped", 0) + 1
+                result["retryable_deferred"] += 1
                 continue  # leave job WATCHING for next reeval run
 
             # Step 2: Derive entry_trigger if not provided by scanner
@@ -930,13 +2711,34 @@ def run_overnight_reeval(
             if not entry_trigger and _paper_rescue_only:
                 _mark_job_rejected(job_id, client_id, "trigger_invalid")
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
             if entry_trigger:
                 signal["entry_trigger"] = entry_trigger
 
             # Step 3: Overnight daily structure validation
             # Fetch a fresh market snapshot (pre-market quote)
-            snapshot = fetch_market_snapshot(ticker, market_data_broker)
+            snapshot = snapshot_by_ticker.get(_ticker_key)
+            if snapshot is None:
+                try:
+                    snapshot = fetch_market_snapshot(ticker, market_data_broker)
+                except Exception as _snapshot_exc:
+                    log.warning(
+                        "[%s] overnight_reeval: snapshot fetch failed; retrying row later: %s",
+                        ticker,
+                        _snapshot_exc,
+                    )
+                    if _paper_rescue_only:
+                        _mark_job_watching_reason(
+                            job_id,
+                            client_id,
+                            "after_hours_deferred:overnight_snapshot_fetch_failed",
+                        )
+                    result["skipped"] += 1
+                    result["retryable_deferred"] += 1
+                    continue
+                if snapshot:
+                    snapshot_by_ticker[_ticker_key] = snapshot
             validation = validate_overnight_daily_signal(
                 ticker=ticker,
                 side=side,
@@ -965,6 +2767,7 @@ def run_overnight_reeval(
                             "after_hours_deferred:overnight_snapshot_unavailable",
                         )
                     result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
                     continue  # leave job WATCHING for next reeval run
                 # True invalidation — reject
                 log.info("[%s] overnight_reeval: OVERNIGHT_TRUE_INVALIDATION %s — %s",
@@ -987,6 +2790,7 @@ def run_overnight_reeval(
                     except Exception:
                         pass
                 result["rejected"] += 1
+                result["terminal_rejected"] += 1
                 continue
 
             log.info("[%s] overnight_reeval: VALID %s — arming entry watcher | entry_trigger=%.4f",
@@ -1065,7 +2869,11 @@ def run_overnight_reeval(
                             "— intel/second-score ignored, using scanner-approved signal",
                             ticker, signal_id, decision.reason,
                         )
-                        _hydrated = _hydrate_plan_from_signal(signal)
+                        _hydrated = _hydrate_plan_from_signal(
+                            signal,
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                        )
                         try:
                             if getattr(decision, "plan", None) is None:
                                 decision.plan = _hydrated
@@ -1116,7 +2924,43 @@ def run_overnight_reeval(
                             except Exception:
                                 pass
                         result["rejected"] += 1
+                        result["terminal_rejected"] += 1
                         continue
+                # ── PR #388 P0-5 plan normalization ──────────────────────
+                # Regardless of whether the plan came from MC or _hydrate_
+                # plan_from_signal, force identity + risk fields to the
+                # canonical scanner values so the watcher never inherits a
+                # random REEVAL: id, a blank client_id, or a missing stop.
+                if getattr(decision, "plan", None) is not None:
+                    _plan = decision.plan
+                    _canon_for_norm = _resolve_canonical_signal_id(signal_id, signal)
+                    _sid_for_norm = str(signal.get("signal_id") or signal_id or "").strip()
+                    setattr(_plan, "signal_id", _sid_for_norm)
+                    setattr(_plan, "canonical_signal_id", _canon_for_norm)
+                    setattr(_plan, "client_id", client_id)
+                    setattr(_plan, "execution_mode", str(_execution_mode).strip().lower())
+                    for _plan_attr, _sig_key in (
+                        ("stop_underlying",   "stop_price"),
+                        ("target_underlying", "target_price"),
+                    ):
+                        if getattr(_plan, _plan_attr, None) in (None, 0, 0.0):
+                            _sv = signal.get(_sig_key)
+                            try:
+                                _sv_f = float(_sv) if _sv is not None else None
+                                if _sv_f and _sv_f > 0:
+                                    setattr(_plan, _plan_attr, _sv_f)
+                            except (TypeError, ValueError):
+                                pass
+                    _meta = getattr(_plan, "metadata", None) or {}
+                    if not isinstance(_meta, dict):
+                        _meta = {}
+                    _meta.update({
+                        "signal_id":           _sid_for_norm,
+                        "canonical_signal_id": _canon_for_norm,
+                        "client_id":           client_id,
+                        "execution_mode":      str(_execution_mode).strip().lower(),
+                    })
+                    setattr(_plan, "metadata", _meta)
             except Exception as mc_exc:
                 log.error("[%s] overnight_reeval: master_control.evaluate failed: %s", ticker, mc_exc)
                 if _paper_rescue_only:
@@ -1129,75 +2973,54 @@ def run_overnight_reeval(
                         ),
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
-            # Step 5: Contract selection — best-effort only.
-            # Pre-market option chains have zero bids (options don't trade before
-            # 9:30 AM ET). If selection fails here, we arm the watcher with
-            # contract_deferred=True so the execution core selects the contract
-            # at breach time when live quotes are available.
-            # NEVER permanently reject a valid signal because of pre-market chain data.
-            contract_deferred = False
-            _selector_failure = None
-            try:
-                selected = contract_selector.select(decision.plan)
-            except Exception as cs_exc:
-                _selector_failure = {
-                    "reason_code": "PRE_MARKET_SELECTOR_EXCEPTION",
-                    "error_type": type(cs_exc).__name__,
-                    "error": str(cs_exc),
-                }
-                log.warning(
-                    "[%s] overnight_reeval: contract selection failed pre-market (%s) "
-                    "— deferring to breach time with live quotes",
-                    ticker, cs_exc,
-                )
-                selected = None
-            if selected is None:
+            # Step 5: Establish watcher ownership before expensive option work.
+            # Contract selection remains authoritative at the existing breach-time
+            # execution seam, where live option quotes and every quality gate apply.
+            contract_deferred = True
+            log.info(
+                "[%s] overnight_reeval: deferring contract selection to breach time "
+                "and arming watcher immediately | trigger=%.4f",
+                ticker, entry_trigger or 0,
+            )
+            decision.plan.contract_symbol = f"DEFERRED:{ticker}"
+            decision.plan.limit_price = 0.01
+            if not getattr(decision.plan, "contracts", None):
+                decision.plan.contracts = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
+            if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
+                decision.plan.metadata = {}
+            decision.plan.metadata.update({
+                "contract_deferred": True,
+                "deferred_breach_selection": True,
+                "selection_context": "deferred_breach",
+                "pre_market_contract_selection_skipped": True,
+                "pre_market_contract_selection_failed": False,
+                "pre_market_selector_failure": None,
+                "pre_market_selector_reason_code": None,
+                "contract_selection_deferred_to": "breach_time",
+                # PR #388 Blocker 1: only PR#388 seams opt in to the
+                # late-attachment continuation/reset classifier. Ordinary
+                # intraday/direct arms keep committed-main's strict
+                # arm_already_through_trigger invariant.
+                "late_attachment_policy_eligible": True,
+            })
+            # Also expose the flag as a top-level plan attribute so
+            # APEntryWatcher.watch() can read it without descending into
+            # metadata (matches how client_id / execution_mode are wired).
+            setattr(decision.plan, "late_attachment_policy_eligible", True)
+            if _lifecycle_ok:
                 try:
-                    if hasattr(contract_selector, "get_last_failure"):
-                        _selector_failure = contract_selector.get_last_failure() or _selector_failure
+                    from ap_lifecycle import LEDGER as _L
+                    _L.log_event(
+                        signal_id,
+                        "contract_deferred",
+                        owner="overnight_reeval",
+                        reason="watcher_first_deferred_to_breach",
+                    )
                 except Exception:
                     pass
-
-            if not selected or not str(getattr(decision.plan, "contract_symbol", "") or "").strip():
-                contract_deferred = True
-                log.info(
-                    "[%s] overnight_reeval: no pre-market contract available "
-                    "(zero bids expected before 9:30 AM ET) — "
-                    "arming watcher with contract_deferred=True | trigger=%.4f",
-                    ticker, entry_trigger or 0,
-                )
-                # Execution core will select the live contract at breach time.
-                # Set a placeholder limit so the plan passes downstream validation,
-                # and mark contracts with MIN_CONTRACTS_PER_POSITION as the minimum configured default.
-                try:
-                    decision.plan.limit_price = 0.01   # overwritten at breach by live quote
-                    if not getattr(decision.plan, "contracts", None):
-                        decision.plan.contracts = int(os.getenv("MIN_CONTRACTS_PER_POSITION", "2"))
-                    if not hasattr(decision.plan, "metadata") or decision.plan.metadata is None:
-                        decision.plan.metadata = {}
-                    decision.plan.metadata.update({
-                        "contract_deferred": True,
-                        "pre_market_contract_selection_failed": True,
-                        "pre_market_selector_failure": _selector_failure,
-                        "pre_market_selector_reason_code": (
-                            _selector_failure.get("reason_code")
-                            if isinstance(_selector_failure, dict)
-                            else None
-                        ),
-                        "contract_selection_deferred_to": "breach_time",
-                    })
-                except Exception:
-                    pass
-                if _lifecycle_ok:
-                    try:
-                        from ap_lifecycle import LEDGER as _L
-                        _L.log_event(signal_id, "contract_deferred",
-                                     owner="overnight_reeval",
-                                     reason="pre_market_zero_bids_deferred_to_breach")
-                    except Exception:
-                        pass
 
             # Propagate entry_trigger and overnight flag to the plan.
             # CRITICAL: also propagate prior_day_high, prior_day_low, and
@@ -1274,6 +3097,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                         result["rejected"] += 1
+                        result["terminal_rejected"] += 1
                         continue
             except Exception as _authz_exc:
                 try:
@@ -1290,6 +3114,7 @@ def run_overnight_reeval(
                               ticker, _authz_exc)
                     _mark_job_rejected(job_id, client_id, f"live_authorization_gate_error:{_authz_exc}")
                     result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
 
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
@@ -1343,6 +3168,7 @@ def run_overnight_reeval(
                         ),
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             if not local_order_id:
@@ -1354,6 +3180,7 @@ def run_overnight_reeval(
                         "order_materialization_failed:missing_local_order_id",
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             # Step 6b: Mark order PENDING_TRIGGER so order_monitor does not
@@ -1388,6 +3215,7 @@ def run_overnight_reeval(
                             "order_materialization_failed:pending_trigger_transition_false",
                         )
                     result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
             except Exception as _pt_exc:
                 log.error(
@@ -1403,6 +3231,7 @@ def run_overnight_reeval(
                         f"order_materialization_failed:{type(_pt_exc).__name__}",
                     )
                 result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             # Step 7: Arm entry watcher — pass plan (not signal) and the OSM order ID
@@ -1443,6 +3272,52 @@ def run_overnight_reeval(
                     # would bypass the trigger-breach rule and enter prematurely.
                     # PENDING_TRIGGER was already set in Step 6b (pre-arm).
                     # Second call removed — duplicate transition on same local_order_id.
+
+                    # ── Durable WATCHER_ARMED proof write (shared ap_signals rows) ──
+                    # For ap_signals source rows _mark_job_watching_armed() only logs
+                    # (correctly leaves shared row WATCHING for other clients).
+                    # We MUST persist an explicit WATCHER_ARMED record in
+                    # client_signal_opportunities so that the next retry can find
+                    # ALREADY_ARMED instead of creating a second order.
+                    # If the write fails: fail as retryable — the watcher is armed
+                    # in memory but the next retry must discover the existing order
+                    # via the active-order fence (REATTACH_WATCHER path) rather than
+                    # creating a duplicate.
+                    _arm_proof_ok = True
+                    if job_source == "ap_signals":
+                        _canonical_for_arm = _resolve_canonical_signal_id(signal_id, signal)
+                        _arm_proof_ok = _persist_watcher_armed_proof(
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                            canonical_signal_id=_canonical_for_arm,
+                            signal_id=signal_id,
+                            signal_payload=signal,
+                            local_order_id=str(local_order_id),
+                            session_key=session_key,
+                            extra_meta={
+                                "source_table": "ap_signals",
+                                "source_job_id": str(job_id),
+                                "ticker": ticker,
+                                "side": side,
+                                "contract_deferred": contract_deferred,
+                                "contract_selection_deferred_to": "breach_time",
+                                "armed_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+
+                        if not _arm_proof_ok:
+                            log.critical(
+                                "OVERNIGHT_REEVAL_ARM_PROOF_WRITE_FAILED | "
+                                "client=%s mode=%s canonical=%s local_order_id=%s session=%s | "
+                                "watcher armed in-memory but WATCHER_ARMED NOT persisted — "
+                                "classifying as retryable_deferred; next retry will find "
+                                "PENDING_TRIGGER order via active-order fence (REATTACH path)",
+                                client_id, _execution_mode, _canonical_for_arm,
+                                local_order_id, session_key,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
                     log.info(
@@ -1523,6 +3398,7 @@ def run_overnight_reeval(
                         )
                         _mark_job_error(job_id, client_id, _cleanup_failed_reason)
                         result["errors"] += 1
+                        result["terminal_errors"] += 1
                         continue
                     _record_watch_arm_failure_proof(
                         signal_id=signal_id,
@@ -1544,6 +3420,7 @@ def run_overnight_reeval(
                         except Exception:
                             pass
                     result["rejected"] += 1
+                    result["terminal_rejected"] += 1
             except Exception as ew_exc:
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
@@ -1589,6 +3466,7 @@ def run_overnight_reeval(
                     )
                     _mark_job_error(job_id, client_id, _cleanup_failed_reason)
                     result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
                 _record_watch_arm_failure_proof(
                     signal_id=signal_id,
@@ -1603,6 +3481,7 @@ def run_overnight_reeval(
                 _mark_job_error(job_id, client_id, _full_error)
                 log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
                 result["errors"] += 1
+                result["terminal_errors"] += 1
 
         except Exception as outer_exc:
             log.error("[%s] overnight_reeval: unexpected error for %s: %s", ticker, signal_id, outer_exc, exc_info=True)
@@ -1616,20 +3495,34 @@ def run_overnight_reeval(
                     ),
                 )
             result["errors"] += 1
+            result["terminal_errors"] += 1
 
     result["stale_inventory_only"] = bool(
         result["processed"] > 0
         and result["fresh_processed"] == 0
         and result["stale_skipped"] > 0
     )
+    result["unresolved"] = max(
+        0,
+        result["processed"]
+        - result["armed"]
+        - result["terminal_rejected"]
+        - result["terminal_errors"]
+        - result["retryable_deferred"]
+        - result["already_resolved"],
+    )
     log.info(
-        "[%s] overnight_reeval complete: processed=%d armed=%d rejected=%d skipped=%d errors=%d stale_skipped=%d fresh_processed=%d fresh_armed=%d stale_inventory_only=%s",
+        "[%s] overnight_reeval complete: processed=%d armed=%d terminal_rejected=%d "
+        "terminal_errors=%d retryable_deferred=%d unresolved=%d skipped=%d "
+        "stale_skipped=%d fresh_processed=%d fresh_armed=%d stale_inventory_only=%s",
         client_id,
         result["processed"],
         result["armed"],
-        result["rejected"],
+        result["terminal_rejected"],
+        result["terminal_errors"],
+        result["retryable_deferred"],
+        result["unresolved"],
         result["skipped"],
-        result["errors"],
         result["stale_skipped"],
         result["fresh_processed"],
         result["fresh_armed"],
@@ -1643,65 +3536,157 @@ def run_overnight_reeval(
             result["fresh_armed"],
             result["stale_inventory_only"],
         )
-    # P0 (2026-07-02): a run that fetched work but produced NO decisions —
-    # nothing armed, nothing rejected, no errors, everything deferred to
-    # "next reeval" — is a stall, not a success. This is exactly the paper
-    # signature when market data is unavailable: every row takes a
-    # RETRY_LATER continue, the queue never drains, and the run reports
-    # green. Flag it so callers persist status='partial' and operators see
-    # the pipeline is wedged the same morning, not four sessions later.
-    if (
-        result["fetched"] > 0
-        and result["armed"] == 0
-        and result["rejected"] == 0
-        and result["errors"] == 0
-        and result.get("skipped", 0) and result["skipped"] > 0
-    ):
-        result["stalled"] = True
+    if result["retryable_deferred"] > 0 and result["terminal_rejected"] == 0 and result["armed"] == 0:
         log.error(
-            "[%s] OVERNIGHT_REEVAL_STALLED fetched=%d skipped=%d armed=0 rejected=0 — "
-            "every fetched signal deferred to next run; queue is NOT draining. "
+            "[%s] OVERNIGHT_REEVAL_STALLED fetched=%d retryable_deferred=%d — "
+            "every owned signal deferred to next run; queue is NOT draining. "
             "category=SILENT_STALL severity=ERROR "
             "likely_cause=market_data_unavailable_or_all_rows_retry_later",
             client_id,
             result["fetched"],
-            result["skipped"],
+            result["retryable_deferred"],
         )
-    return result
+    return _classify_overnight_reeval_result(result)
+
+
+_SOURCE_STATUS_SUCCESS = "SUCCESS"
+_SOURCE_STATUS_FAILED  = "FAILED"
+
+
+class _FetchWatchingSignalsResult(NamedTuple):
+    """Source-truth result of _fetch_watching_signals.
+
+    .rows                — list of job dicts (may be non-empty even if one
+                           source failed; caller must inspect the statuses).
+    .trade_queue_status  — SUCCESS / FAILED
+    .ap_signals_status   — SUCCESS / FAILED
+    .trade_queue_error   — short error string if FAILED
+    .ap_signals_error    — short error string if FAILED
+
+    A FAILED status must never be interpreted as "zero rows / completed no
+    work". The caller must classify the run retryable when any source is
+    FAILED (partial inventory) and RETRYABLE_SOURCE_LOOKUP_FAILED when both
+    sources are FAILED and rows==0.
+    """
+    rows: list
+    trade_queue_status: str
+    ap_signals_status:  str
+    trade_queue_error:  Optional[str]
+    ap_signals_error:   Optional[str]
 
 
 def _fetch_watching_signals(client_id: str) -> list:
+    """Backward-compatible wrapper that returns rows only.
+
+    Retained for callers that already expect a list AND for existing test
+    harnesses that monkey-patch this function to inject fixture rows. The
+    real reeval path calls _fetch_watching_signals_with_status which, when
+    this function is patched, wraps the patched result with SUCCESS status
+    so P0-2 source-truth behavior stays consistent for legacy fixtures."""
+    return _fetch_watching_signals_with_status_impl(client_id).rows
+
+
+# Sentinel attribute stamped on the built-in wrapper so
+# _fetch_watching_signals_with_status can detect a monkey-patched
+# replacement (which will not carry the sentinel) even across
+# importlib.reload cycles, where an is-comparison against a captured
+# original can fail because reload creates a new function object.
+_fetch_watching_signals._is_original_wrapper = True
+
+
+def _fetch_watching_signals_with_status(client_id: str) -> _FetchWatchingSignalsResult:
+    """Public status-aware entry point used by run_overnight_reeval.
+
+    Two-tier dispatch so legacy tests keep working:
+      * If a test has monkey-patched _fetch_watching_signals (list-returning),
+        call it and wrap the list in a SUCCESS status result.
+      * Otherwise run the real implementation which captures per-source
+        status alongside rows.
+
+    A test that wants to inject a source FAILURE must monkey-patch this
+    function directly (or _fetch_watching_signals_with_status_impl).
+
+    Detection strategy: the built-in wrapper carries a sentinel attribute
+    _is_original_wrapper=True. Any test-supplied replacement will not
+    have that attribute. This is robust to importlib.reload cycles used
+    by other tests (e.g. test_p0_paper_overnight_rescue_materialization
+    reloads this module twice, which invalidates a captured-object
+    identity check).
+
+    We use globals() rather than sys.modules[__name__] because
+    importlib.reload creates a NEW module object registered at the same
+    name; a test file that imported this module BEFORE the reload holds
+    an OLD reference and applies monkeypatch.setattr(ov, ...) to the OLD
+    module, while sys.modules[__name__] returns the NEW post-reload
+    module. globals() always returns the namespace of the module this
+    function was DEFINED in — the same one whose _fetch_watching_signals
+    the test just patched.
     """
-    Fetch WATCHING signals from both sources of truth.
+    _current_legacy = globals().get("_fetch_watching_signals")
+    _is_patched = (
+        _current_legacy is not None
+        and not getattr(_current_legacy, "_is_original_wrapper", False)
+    )
+    if _is_patched:
+        # A test has replaced the legacy wrapper with its own function.
+        # Call it and wrap the list result as SUCCESS from both sources.
+        try:
+            rows = list(_current_legacy(client_id) or [])
+        except Exception as _pexc:
+            log.error("patched _fetch_watching_signals raised: %s", _pexc)
+            return _FetchWatchingSignalsResult(
+                rows=[],
+                trade_queue_status=_SOURCE_STATUS_FAILED,
+                ap_signals_status=_SOURCE_STATUS_FAILED,
+                trade_queue_error=str(_pexc),
+                ap_signals_error=str(_pexc),
+            )
+        return _FetchWatchingSignalsResult(
+            rows=rows,
+            trade_queue_status=_SOURCE_STATUS_SUCCESS,
+            ap_signals_status=_SOURCE_STATUS_SUCCESS,
+            trade_queue_error=None,
+            ap_signals_error=None,
+        )
+    return _fetch_watching_signals_with_status_impl(client_id)
+
+
+# Captured at module import so _fetch_watching_signals_with_status can detect
+# a test-time replacement of the legacy wrapper.
+_ORIGINAL_FETCH_WATCHING_SIGNALS = _fetch_watching_signals
+
+
+def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSignalsResult:
+    """
+    Fetch WATCHING signals from both sources of truth AND report per-source
+    lookup status. See _FetchWatchingSignalsResult docstring.
 
     1. trade_queue.status='WATCHING' for locally queued in-session jobs.
     2. ap_signals.decision_status='WATCHING' for scanner/audit signals written
        by APSignalStore.
-
-    This fixes the production bug where the overnight reeval ran correctly but
-    saw zero jobs because it only queried trade_queue while the scanner stored
-    WATCHING state in Supabase ap_signals.decision_status.
     """
     results: list[dict] = []
     seen_signal_ids: set[str] = set()
+    trade_queue_status: str = _SOURCE_STATUS_SUCCESS
+    trade_queue_error:  Optional[str] = None
+    ap_signals_status:  str = _SOURCE_STATUS_SUCCESS
+    ap_signals_error:   Optional[str] = None
+
+    # PR #388 P0-8: SINGLE fetch limit for BOTH sources. Previously the
+    # shared ap_signals query was hardcoded at .limit(300) while trade_queue
+    # honored OVERNIGHT_FETCH_LIMIT (default 500). Once the shared inventory
+    # exceeded 300 rows, the newest 300 could permanently occupy every fetch
+    # and older rows never entered the per-client disposition resolver.
+    try:
+        _fetch_limit = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "500"))
+    except (TypeError, ValueError):
+        _fetch_limit = 500
+    _fetch_limit = max(100, min(_fetch_limit, 2000))
 
     # Source 1: local Postgres trade_queue.
     try:
         from ap.db import conn, run_with_retry
         import json as _j
-
-        # P0 (2026-07-02): backlog starvation fix. The hardcoded LIMIT 100
-        # starved the queue when the paper WATCHING backlog exceeded 100 rows
-        # per client (observed: 248–258/client). DESC ordering meant only the
-        # newest 100 were ever fetched; anything older was never re-evaluated
-        # and never expired — rows from 2026-06-22 were still WATCHING on
-        # 2026-07-02. Env-tunable with a hard floor (never below the old 100)
-        # and ceiling (bounded per-run work).
-        try:
-            _fetch_limit = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "500"))
-        except (TypeError, ValueError):
-            _fetch_limit = 500
-        _fetch_limit = max(100, min(_fetch_limit, 2000))
 
         def _fn():
             with conn() as c:
@@ -1729,6 +3714,8 @@ def _fetch_watching_signals(client_id: str) -> list:
                 seen_signal_ids.add(str(d["signal_id"]))
     except Exception as e:
         log.error("_fetch_watching_signals[trade_queue] failed: %s", e)
+        trade_queue_status = _SOURCE_STATUS_FAILED
+        trade_queue_error = str(e)
 
     # Source 2: Supabase ap_signals.
     try:
@@ -1742,19 +3729,18 @@ def _fetch_watching_signals(client_id: str) -> list:
             or os.getenv("SUPABASE_ANON_KEY", "")
         )
         if not sb_url or not sb_key:
-            log.warning("_fetch_watching_signals[ap_signals]: missing Supabase credentials")
+            log.error(
+                "_fetch_watching_signals[ap_signals]: missing Supabase credentials "
+                "— source lookup cannot proceed, treating as FAILED (not zero-rows)"
+            )
+            ap_signals_status = _SOURCE_STATUS_FAILED
+            ap_signals_error = "missing_supabase_credentials"
         else:
-            # Use SIGNALS_LOOKBACK (hours) when set; fall back to day-based
-            _lookback_hours = _SIGNALS_LOOKBACK_HOURS
-            if _lookback_hours and _lookback_hours > 0:
-                cutoff = (
-                    datetime.now(timezone.utc) - timedelta(hours=_lookback_hours)
-                ).isoformat()
-            else:
-                cutoff = (
-                    datetime.now(timezone.utc)
-                    - timedelta(days=OVERNIGHT_SIGNAL_MAX_AGE_DAYS + 1)
-                ).isoformat()
+            # Session-aware cutoff (see _signals_lookback_cutoff_iso). A
+            # Friday scanner setup remains visible on Monday morning without
+            # requiring an explicit SIGNALS_LOOKBACK override on every
+            # deployment. Env var still honored when explicitly set.
+            cutoff = _signals_lookback_cutoff_iso()
             sb = _cc(sb_url, sb_key)
             # ── MULTI-CLIENT FAN-OUT FIX ──────────────────────────────────
             # Do NOT filter ap_signals by client_email here. WATCHING rows in
@@ -1784,7 +3770,7 @@ def _fetch_watching_signals(client_id: str) -> list:
                 .eq("decision_status", "WATCHING")
                 .gte("created_at", cutoff)
                 .order("created_at", desc=True)
-                .limit(300)
+                .limit(_fetch_limit)  # P0-8: unified with trade_queue limit
                 .execute()
             )
 
@@ -1832,6 +3818,8 @@ def _fetch_watching_signals(client_id: str) -> list:
                 seen_signal_ids.add(sid)
     except Exception as e:
         log.error("_fetch_watching_signals[ap_signals] failed: %s", e)
+        ap_signals_status = _SOURCE_STATUS_FAILED
+        ap_signals_error = str(e)
 
     # ── SETUP-IDENTITY DEDUP ──────────────────────────────────────────────
     # Now that ap_signals is fetched WITHOUT a client_email filter, the same
@@ -1872,10 +3860,18 @@ def _fetch_watching_signals(client_id: str) -> list:
     sup_count = sum(1 for r in results if r.get("_source") == "ap_signals")
     log.info(
         "[%s] _fetch_watching_signals: total=%d trade_queue=%d ap_signals=%d "
+        "trade_queue_status=%s ap_signals_status=%s "
         "(fan-out: all clients see same scanner setups)",
         client_id, len(results), tq_count, sup_count,
+        trade_queue_status, ap_signals_status,
     )
-    return results
+    return _FetchWatchingSignalsResult(
+        rows=results,
+        trade_queue_status=trade_queue_status,
+        ap_signals_status=ap_signals_status,
+        trade_queue_error=trade_queue_error,
+        ap_signals_error=ap_signals_error,
+    )
 
 
 def _mark_job_rejected(job_id, client_id: str, reason: str) -> None:
@@ -2008,9 +4004,10 @@ def _mark_job_watching_armed(job_id, client_id: str, contract: str) -> None:
             with conn() as c:
                 c.execute("""
                     UPDATE trade_queue
-                    SET last_error = %s,
+                    SET status = 'ARMED',
+                        last_error = %s,
                         started_ts = COALESCE(started_ts, NOW())
-                    WHERE id = %s AND client_id = %s
+                    WHERE id = %s AND client_id = %s AND status = 'WATCHING'
                 """, (label, job_id, client_id))
         run_with_retry(_fn)
     except Exception as e:

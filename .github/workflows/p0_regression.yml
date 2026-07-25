@@ -68,8 +68,15 @@ jobs:
 
       - name: Run P0 plus cohesion tests
         env:
-          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
-          INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test"
+          # PR #388 CI fix: PGSSLMODE=disable so ap.db never tries SSL
+          # against CI's localhost Postgres. Prior runs hit
+          # "server does not support SSL, but SSL was required" on every
+          # DB access, which caused source-truth tests that legitimately
+          # patch _fetch_watching_signals to instead fail because the
+          # compat layer's fallback path attempted an SSL connect.
+          PGSSLMODE: "disable"
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+          INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
           python -m pytest \
             tests/test_osm_retry_idempotency.py \
@@ -103,6 +110,22 @@ jobs:
             tests/test_p0_setup_lifecycle_owner.py \
             tests/test_p0_autonomous_startup_scheduler_contract.py \
             tests/test_p0_autonomous_morning_handoff.py \
+            tests/test_p0_overnight_reeval_retry_liveness.py \
+            tests/test_p0_overnight_mixed_inventory_watcher_first.py \
+            tests/test_p0_late_attachment_continuation.py \
+            tests/test_p0_late_attachment_watcher_integration.py \
+            tests/test_p0_july23_late_attachment_replay.py \
+            tests/test_p0_signals_lookback_session_aware.py \
+            tests/test_p0_source_lookup_failure.py \
+            tests/test_p0_open_revalidation_late_attachment.py \
+            tests/test_p0_hydration_identity_and_target_complete.py \
+            tests/test_p0_shared_fetch_limit_unified.py \
+            tests/test_p0_active_order_fence_full_family.py \
+            tests/test_p0_classifier_import_failure_fail_closed.py \
+            tests/test_p0_decisive_drift_wired.py \
+            tests/test_p0_late_attachment_provenance_gate.py \
+            tests/test_p0_reattach_no_cancel_on_missing_quote.py \
+            tests/test_p0_reattach_two_attempt_order_preservation.py \
             tests/test_p0_deferred_due_retry_ownership.py \
             tests/test_p0_watcher_materialization_ownership.py \
             tests/test_p0_fenced_retry_terminalization.py \
@@ -131,6 +154,10 @@ jobs:
             tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
             tests/test_p0_paper_recovery_restart_guard_bypass.py \
+            tests/test_p0_shared_ap_signals_retry_idempotency.py \
+            tests/test_p0_nonterminal_ownership_poisoning.py \
+            tests/test_p0_live_readiness_blocked_keys.py \
+            tests/test_p0_readiness_deadline_enforcement.py \
             -v --tb=short --color=yes
 
       - name: Summary

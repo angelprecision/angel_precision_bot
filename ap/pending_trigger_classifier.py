@@ -45,12 +45,458 @@ USAGE
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
-from typing import Optional
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Union
 
 from ap.logger import get_logger
 
 log = get_logger("ap.pending_trigger_classifier")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger-continuation policy (PR #388 Block-2)
+#
+# When the watcher attaches to a live opportunity slightly after the underlying
+# has already touched its entry trigger, the setup is not automatically dead —
+# a small continuation window is an ordinary trade-flow event, not a missed
+# move. This module owns the *only* canonical definitions of that window.
+# Duplicating the formula in the watcher or elsewhere is forbidden.
+#
+# Defaults are the operator-tuned values from the Block-2 spec; override via
+# env only for A/B experiments — production must run at the defaults unless a
+# change is reviewed and merged.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DEC_ZERO   = Decimal("0")
+_DEC_TEN_K  = Decimal("10000")
+_DEC_HALF   = Decimal("0.5")
+_DEC_MIN_RESET = Decimal("0.01")
+
+
+def _positive_decimal_env(name: str, default: str) -> Decimal:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return Decimal(default)
+    try:
+        value = Decimal(str(raw).strip())
+    except (InvalidOperation, ValueError):
+        return Decimal(default)
+    return value if value > _DEC_ZERO else Decimal(default)
+
+
+ENTRY_TRIGGER_CONTINUATION_MAX_ABS: Decimal = _positive_decimal_env(
+    "ENTRY_TRIGGER_CONTINUATION_MAX_ABS", "0.15"
+)
+ENTRY_TRIGGER_CONTINUATION_MAX_BPS: Decimal = _positive_decimal_env(
+    "ENTRY_TRIGGER_CONTINUATION_MAX_BPS", "7.5"
+)
+
+
+def _safe_decimal(value) -> Optional[Decimal]:
+    """Coerce numeric input to Decimal. Returns None for missing/invalid.
+
+    Accepts int, float, str, Decimal. Rejects None, empty string, NaN,
+    non-numeric values. Never raises.
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value if value.is_finite() else None
+    if isinstance(value, bool):
+        return None
+    try:
+        s = str(value).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    try:
+        d = Decimal(s)
+    except (InvalidOperation, ValueError):
+        return None
+    return d if d.is_finite() else None
+
+
+def compute_allowed_continuation(trigger_price) -> Optional[Decimal]:
+    """Canonical formula for the late-attachment continuation window.
+
+    allowed = min(MAX_ABS, trigger * MAX_BPS / 10000)
+
+    Returns None when trigger_price is missing, non-numeric, or non-positive.
+    Callers must never inline this formula; always route through here so the
+    watcher, restart recovery, and diagnostics can never drift into
+    conflicting policies.
+    """
+    trigger = _safe_decimal(trigger_price)
+    if trigger is None or trigger <= _DEC_ZERO:
+        return None
+    bps_component = (trigger * ENTRY_TRIGGER_CONTINUATION_MAX_BPS) / _DEC_TEN_K
+    return min(ENTRY_TRIGGER_CONTINUATION_MAX_ABS, bps_component)
+
+
+def compute_reset_tolerance(trigger_price) -> Optional[Decimal]:
+    """Reset tolerance used by the WAITING_RESET rebreach path.
+
+    reset_tolerance = max(0.01, allowed_continuation * 0.5)
+
+    Derived from compute_allowed_continuation so the arm-time,
+    waiting-reset, and rebreach checks share one source of truth.
+    Returns None when trigger_price is invalid.
+    """
+    allowed = compute_allowed_continuation(trigger_price)
+    if allowed is None:
+        return None
+    return max(_DEC_MIN_RESET, allowed * _DEC_HALF)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical trigger-quote lane
+#
+# CALL executes only when the market ASK is at/above the CALL trigger.
+# PUT  executes only when the market BID is at/below the PUT  trigger.
+#
+# The watcher's ordinary breach check AND the new continuation / reset /
+# rebreach checks MUST route through this helper — routing the old breach
+# path through one lane while the continuation code selects another would
+# reintroduce the exact drift this module exists to prevent.
+#
+# Missing truth is retryable — never fall back to mid, mark, last, or the
+# opposite side. A missing canonical quote must never be interpreted as a
+# breach, reset, stop failure, or missed move.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TRIGGER_QUOTE_AVAILABLE       = "TRIGGER_QUOTE_AVAILABLE"
+TRIGGER_QUOTE_UNAVAILABLE     = "TRIGGER_QUOTE_UNAVAILABLE"
+TRIGGER_SIDE_INVALID          = "TRIGGER_SIDE_INVALID"
+TRIGGER_TRIGGER_INVALID       = "TRIGGER_TRIGGER_INVALID"
+
+
+@dataclass(frozen=True)
+class TriggerQuoteResult:
+    """Canonical result of a per-side trigger-quote lookup.
+
+    .available    — True only when a positive quote was found on the correct side.
+    .value        — the selected quote (Decimal) or None.
+    .source       — "ask" for CALL, "bid" for PUT, or None on side error.
+    .reason_code  — TRIGGER_QUOTE_AVAILABLE / _UNAVAILABLE / SIDE_INVALID.
+    """
+    available:   bool
+    value:       Optional[Decimal]
+    source:      Optional[str]
+    reason_code: str
+
+
+def _canonical_trigger_quote(*, side, bid, ask) -> TriggerQuoteResult:
+    """Return the per-side canonical trigger quote (CALL=ask, PUT=bid).
+
+    Never fetches quotes. Only selects from the fresh underlying bid/ask the
+    caller already read from the watcher's existing quote lane. No fallback
+    to mid/mark/last/opposite side — missing truth is retryable.
+    """
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side == "CALL":
+        quote = _safe_decimal(ask)
+        source = "ask"
+    elif normalized_side == "PUT":
+        quote = _safe_decimal(bid)
+        source = "bid"
+    else:
+        return TriggerQuoteResult(
+            available=False,
+            value=None,
+            source=None,
+            reason_code=TRIGGER_SIDE_INVALID,
+        )
+
+    if quote is None or quote <= _DEC_ZERO:
+        return TriggerQuoteResult(
+            available=False,
+            value=None,
+            source=source,
+            reason_code=TRIGGER_QUOTE_UNAVAILABLE,
+        )
+
+    return TriggerQuoteResult(
+        available=True,
+        value=quote,
+        source=source,
+        reason_code=TRIGGER_QUOTE_AVAILABLE,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Late-attachment classification (PR #388 Block-2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Non-terminal lifecycle labels (watcher continues to own the setup).
+LATE_ATTACHMENT_AWAITING_FIRST_TRUTH          = "LATE_ATTACHMENT_AWAITING_FIRST_TRUTH"
+LATE_ATTACHMENT_WITHIN_CONTINUATION           = "LATE_ATTACHMENT_WITHIN_CONTINUATION"
+LATE_CONTINUATION_CONFIRMED                   = "LATE_CONTINUATION_CONFIRMED"
+MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET  = "MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET"
+LATE_ATTACHMENT_RESET_CONFIRMED               = "LATE_ATTACHMENT_RESET_CONFIRMED"
+LATE_ATTACHMENT_REBREACH_CONFIRMED            = "LATE_ATTACHMENT_REBREACH_CONFIRMED"
+WATCHER_ARMED_BEFORE_OPEN                     = "WATCHER_ARMED_BEFORE_OPEN"
+
+# Terminal decisions.
+LATE_ATTACHMENT_MOVE_MISSED_TERMINAL          = "LATE_ATTACHMENT_MOVE_MISSED_TERMINAL"
+STOP_ALREADY_BROKEN_TERMINAL                  = "STOP_ALREADY_BROKEN_TERMINAL"
+TARGET_ALREADY_COMPLETE_TERMINAL              = "TARGET_ALREADY_COMPLETE_TERMINAL"
+
+# Retryable (truth unavailable — try again next poll, never terminalize).
+TRIGGER_TRUTH_UNAVAILABLE_RETRY               = "TRIGGER_TRUTH_UNAVAILABLE_RETRY"
+
+
+@dataclass(frozen=True)
+class LateAttachmentDecision:
+    """Result of a single late-attachment classification call.
+
+    .classification — one of the LATE_* / STOP_* / TARGET_* / TRIGGER_* constants above.
+    .allowed_continuation — the applicable window (Decimal) or None if not computable.
+    .quote — the canonical trigger quote used, or None if unavailable.
+    .quote_source — "ask" / "bid" / None.
+    .detail — short human-readable diagnostic (never used for control flow).
+    """
+    classification:       str
+    allowed_continuation: Optional[Decimal]
+    quote:                Optional[Decimal]
+    quote_source:         Optional[str]
+    detail:               str = ""
+
+
+_STOP_BROKEN     = "STOP_BROKEN"
+_STOP_NOT_BROKEN = "STOP_NOT_BROKEN"
+_STOP_UNKNOWN    = "STOP_UNKNOWN"
+_STOP_NO_STOP    = "STOP_NO_STOP"
+
+
+def _evaluate_stop(side: str, stop, bid, ask) -> str:
+    """Tri-state stop-broken evaluator returning one of:
+      _STOP_NO_STOP      — no stop configured (or invalid); nothing to check
+      _STOP_UNKNOWN      — valid stop exists but the STOP-SIDE quote is missing
+      _STOP_BROKEN       — actionable exit-side price crossed the stop
+      _STOP_NOT_BROKEN   — actionable exit-side price is on the safe side
+
+    Stop invalidation uses the OPPOSITE side from trigger evaluation:
+      CALL: stop broken when bid <= stop
+      PUT:  stop broken when ask >= stop
+
+    _STOP_UNKNOWN is the critical distinction from the old boolean
+    signature. When a valid stop exists but the required stop-side quote is
+    missing, the caller MUST NOT interpret this as 'not broken' and continue
+    into WITHIN_CONTINUATION / WAITING_RESET / ordinary pre-trigger. The
+    stop-side truth is unavailable — the whole classifier call is retryable.
+    """
+    stop_d = _safe_decimal(stop)
+    if stop_d is None or stop_d <= _DEC_ZERO:
+        return _STOP_NO_STOP
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side == "CALL":
+        stop_quote = _safe_decimal(bid)
+        if stop_quote is None or stop_quote <= _DEC_ZERO:
+            return _STOP_UNKNOWN
+        return _STOP_BROKEN if stop_quote <= stop_d else _STOP_NOT_BROKEN
+    if normalized_side == "PUT":
+        stop_quote = _safe_decimal(ask)
+        if stop_quote is None or stop_quote <= _DEC_ZERO:
+            return _STOP_UNKNOWN
+        return _STOP_BROKEN if stop_quote >= stop_d else _STOP_NOT_BROKEN
+    return _STOP_NO_STOP
+
+
+def _stop_broken(side: str, stop, bid, ask) -> bool:
+    """Legacy boolean shim — True only when definitively BROKEN.
+
+    Kept only for callers that still expect a boolean; classify_late_attachment
+    uses _evaluate_stop directly so it can propagate _STOP_UNKNOWN as retry.
+    """
+    return _evaluate_stop(side, stop, bid=bid, ask=ask) == _STOP_BROKEN
+
+
+def classify_late_attachment(
+    *,
+    side: str,
+    trigger_price,
+    bid,
+    ask,
+    stop=None,
+    target_complete: bool = False,
+    decisive_drift_exceeded: bool = False,
+) -> LateAttachmentDecision:
+    """Classify a late-attachment observation.
+
+    Called at the arm-time already-through-trigger site AND at each fresh poll
+    while the watcher is in LATE_ATTACHMENT_WITHIN_CONTINUATION or
+    MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET state.
+
+    Terminal outputs (caller must terminalize):
+      STOP_ALREADY_BROKEN_TERMINAL
+      TARGET_ALREADY_COMPLETE_TERMINAL
+      LATE_ATTACHMENT_MOVE_MISSED_TERMINAL   (decisive drift exceeded)
+
+    Retryable output (caller waits for next poll — never terminalizes):
+      TRIGGER_TRUTH_UNAVAILABLE_RETRY
+
+    Non-terminal lifecycle outputs:
+      LATE_ATTACHMENT_WITHIN_CONTINUATION           (inside continuation zone)
+      MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET  (past zone, structurally valid, awaiting reset)
+    """
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side not in ("CALL", "PUT"):
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=None,
+            quote=None,
+            quote_source=None,
+            detail=f"invalid_side:{side!r}",
+        )
+
+    if target_complete:
+        return LateAttachmentDecision(
+            classification=TARGET_ALREADY_COMPLETE_TERMINAL,
+            allowed_continuation=None,
+            quote=None,
+            quote_source=None,
+            detail="target_already_complete",
+        )
+
+    allowed = compute_allowed_continuation(trigger_price)
+    if allowed is None:
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=None,
+            quote=None,
+            quote_source=None,
+            detail="invalid_or_missing_trigger",
+        )
+    trigger = _safe_decimal(trigger_price)  # non-None (allowed already computed)
+
+    quote_result = _canonical_trigger_quote(side=normalized_side, bid=bid, ask=ask)
+    if not quote_result.available or quote_result.value is None:
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=allowed,
+            quote=None,
+            quote_source=quote_result.source,
+            detail=quote_result.reason_code,
+        )
+
+    canonical_quote = quote_result.value
+
+    _stop_state = _evaluate_stop(normalized_side, stop, bid=bid, ask=ask)
+    if _stop_state == _STOP_BROKEN:
+        return LateAttachmentDecision(
+            classification=STOP_ALREADY_BROKEN_TERMINAL,
+            allowed_continuation=allowed,
+            quote=canonical_quote,
+            quote_source=quote_result.source,
+            detail=f"stop_broken_at_{quote_result.source}={canonical_quote}",
+        )
+    if _stop_state == _STOP_UNKNOWN:
+        # Valid stop exists but the STOP-SIDE quote is missing (CALL: bid=0;
+        # PUT: ask=0). We cannot prove the stop is safe, so we must NOT let
+        # the classifier continue into WITHIN_CONTINUATION / WAITING_RESET
+        # / pre-trigger. Return the retry shape with quote=None so the
+        # watcher seeds/preserves AWAITING_FIRST_TRUTH and blocks the
+        # ordinary breach path until both sides have truth.
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=allowed,
+            quote=None,
+            quote_source=quote_result.source,
+            detail=f"stop_side_quote_unavailable_{normalized_side}",
+        )
+
+    if decisive_drift_exceeded:
+        return LateAttachmentDecision(
+            classification=LATE_ATTACHMENT_MOVE_MISSED_TERMINAL,
+            allowed_continuation=allowed,
+            quote=canonical_quote,
+            quote_source=quote_result.source,
+            detail="decisive_drift_exceeded",
+        )
+
+    if normalized_side == "CALL":
+        upper = trigger + allowed
+        if trigger <= canonical_quote <= upper:
+            return LateAttachmentDecision(
+                classification=LATE_ATTACHMENT_WITHIN_CONTINUATION,
+                allowed_continuation=allowed,
+                quote=canonical_quote,
+                quote_source=quote_result.source,
+                detail=f"call_within_continuation:{canonical_quote}<={upper}",
+            )
+        # canonical_quote < trigger → not yet breached; watcher's ordinary
+        # breach path owns this. canonical_quote > upper → beyond zone.
+        if canonical_quote > upper:
+            return LateAttachmentDecision(
+                classification=MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET,
+                allowed_continuation=allowed,
+                quote=canonical_quote,
+                quote_source=quote_result.source,
+                detail=f"call_beyond_continuation:{canonical_quote}>{upper}",
+            )
+        # canonical_quote < trigger — not yet through; ordinary breach path applies.
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=allowed,
+            quote=canonical_quote,
+            quote_source=quote_result.source,
+            detail="call_below_trigger_ordinary_breach_path",
+        )
+
+    # PUT
+    lower = trigger - allowed
+    if lower <= canonical_quote <= trigger:
+        return LateAttachmentDecision(
+            classification=LATE_ATTACHMENT_WITHIN_CONTINUATION,
+            allowed_continuation=allowed,
+            quote=canonical_quote,
+            quote_source=quote_result.source,
+            detail=f"put_within_continuation:{lower}<={canonical_quote}",
+        )
+    if canonical_quote < lower:
+        return LateAttachmentDecision(
+            classification=MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET,
+            allowed_continuation=allowed,
+            quote=canonical_quote,
+            quote_source=quote_result.source,
+            detail=f"put_beyond_continuation:{canonical_quote}<{lower}",
+        )
+    return LateAttachmentDecision(
+        classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+        allowed_continuation=allowed,
+        quote=canonical_quote,
+        quote_source=quote_result.source,
+        detail="put_above_trigger_ordinary_breach_path",
+    )
+
+
+def is_reset_confirmed(*, side: str, trigger_price, canonical_quote) -> bool:
+    """True when the current canonical quote satisfies the reset condition.
+
+    CALL: canonical_quote (ask) <= trigger - reset_tolerance
+    PUT:  canonical_quote (bid) >= trigger + reset_tolerance
+
+    Reset requires two consecutive fresh polls returning True — the poll-count
+    bookkeeping is the caller's responsibility. This helper checks a single
+    poll only. Returns False when inputs are missing/invalid.
+    """
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side not in ("CALL", "PUT"):
+        return False
+    trigger = _safe_decimal(trigger_price)
+    quote = _safe_decimal(canonical_quote)
+    tolerance = compute_reset_tolerance(trigger_price)
+    if trigger is None or quote is None or tolerance is None:
+        return False
+    if normalized_side == "CALL":
+        return quote <= (trigger - tolerance)
+    return quote >= (trigger + tolerance)
+
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +559,10 @@ WATCHER_INVALIDATION_TAXONOMY: dict[str, str] = {
     "overnight_live_quote_unavailable_timeout":  WatcherInvalidationClass.TERMINAL,
     "overnight_open_recheck_data_timeout":       WatcherInvalidationClass.TERMINAL,
     "on_trigger_exhausted_3_attempts":           WatcherInvalidationClass.TERMINAL,
+    # PR #388 Block-2 late-attachment terminal reasons
+    "late_attachment_move_missed_terminal":      WatcherInvalidationClass.TERMINAL,
+    "stop_already_broken_terminal":              WatcherInvalidationClass.TERMINAL,
+    "target_already_complete_terminal":          WatcherInvalidationClass.TERMINAL,
     # ── INVALIDATED_RETRYABLE ────────────────────────────────────────────────
     "overnight_live_quote_unavailable":          WatcherInvalidationClass.RETRYABLE,
     "overnight_open_data_unavailable_retry_later": WatcherInvalidationClass.RETRYABLE,
@@ -122,6 +572,7 @@ WATCHER_INVALIDATION_TAXONOMY: dict[str, str] = {
     "quote_fetch_failed":                        WatcherInvalidationClass.RETRYABLE,
     "validator_provider_timeout":                WatcherInvalidationClass.RETRYABLE,
     "temporary_database_failure":                WatcherInvalidationClass.RETRYABLE,
+    "trigger_truth_unavailable_retry":           WatcherInvalidationClass.RETRYABLE,
     # ── INVALIDATED_REARMABLE ────────────────────────────────────────────────
     "temporary_wrong_side_of_stop":              WatcherInvalidationClass.REARMABLE,
     "arm_below_stop_reclaim_wait":               WatcherInvalidationClass.REARMABLE,
