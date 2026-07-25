@@ -859,6 +859,93 @@ def test_postgres_broker_repair_claim_cardinality_and_cas(monkeypatch):
         db.close()
 
 
+def test_postgres_null_local_order_id_repair_claim_works(monkeypatch):
+    """
+    REGRESSION: The old _claim_recent_broker_repair_proof required
+    local_order_id = canonical_entry_id in the WHERE clause, which failed when
+    the repair proof had local_order_id=NULL (production shape on 2026-07-20).
+
+    This test uses real PostgreSQL and proves the fixed SQL allows NULL.
+    It would have FAILED against the old WHERE clause:
+        AND local_order_id = %s  (when stored value is NULL)
+    """
+    db = _postgres_connection_or_skip()
+    try:
+        import psycopg2.extras
+        with db.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS proof_trades")
+            cur.execute(
+                """
+                CREATE TABLE proof_trades (
+                    id SERIAL PRIMARY KEY,
+                    client_email TEXT NOT NULL,
+                    position_id TEXT,
+                    local_order_id TEXT,
+                    execution_mode TEXT,
+                    mode TEXT,
+                    side TEXT,
+                    contracts INTEGER,
+                    entry_option_price NUMERIC,
+                    closed_at TIMESTAMPTZ DEFAULT NOW(),
+                    proof_event_key TEXT,
+                    proof_diagnostics JSONB NOT NULL DEFAULT '{}'::jsonb
+                )
+                """
+            )
+            # Insert repair row with NULL local_order_id and execution_mode='unknown'
+            # This is the EXACT production shape that caused the 2026-07-20 incident
+            cur.execute(
+                """
+                INSERT INTO proof_trades (
+                    client_email, position_id, local_order_id, execution_mode,
+                    mode, side, contracts, entry_option_price
+                )
+                VALUES (
+                    'client@example.com',
+                    'broker-repair-client@example.com-ABT260731C00098000',
+                    NULL,          -- production shape: local_order_id IS NULL
+                    'unknown',     -- production shape: execution_mode='unknown'
+                    'paper',       -- mode='paper' IS valid
+                    'CALL', 3, 5.00
+                )
+                """
+            )
+        db.commit()
+
+        pm = APPositionManager("client@example.com")
+        monkeypatch.setattr(pm_mod, "conn", _RealPostgresConn(db))
+        monkeypatch.setattr(pm_mod, "run_with_retry", lambda fn: fn())
+
+        # This MUST return True with the fixed SQL (NULL local_order_id allowed)
+        # It would return False with the old SQL that required local_order_id = entry_id
+        assert pm._claim_recent_broker_repair_proof(
+            position_id="f40c1b44-8391-44bd-a25e-fbce780a282d",
+            contract="ABT260731C00098000",
+            closed_at="2026-07-20T15:27:35.873253Z",
+            local_order_id="39f156b0-dce4-4a5e-a99e-f3b499ead39d",
+            execution_mode="paper",
+            side="CALL",
+            contracts=3,
+            entry_option_price=5.00,
+        ) is True, (
+            "NULL local_order_id repair row must be claimable by the fixed SQL. "
+            "The old SQL required `AND local_order_id = %s` which always fails for NULL."
+        )
+
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT position_id, local_order_id, execution_mode, mode "
+                "FROM proof_trades WHERE client_email='client@example.com'"
+            )
+            row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "f40c1b44-8391-44bd-a25e-fbce780a282d", "position_id must be canonical"
+        assert row[1] == "39f156b0-dce4-4a5e-a99e-f3b499ead39d", "local_order_id must be set"
+        assert row[2] in ("paper", "unknown"), f"execution_mode={row[2]}"
+    finally:
+        db.close()
+
+
 def test_expiry_cleanup_remains_non_fabricating():
     body = _func_body(PM_SRC, "close_expired_position")
     assert "allow_fallback_insert=False" in body

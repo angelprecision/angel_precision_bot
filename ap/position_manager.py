@@ -85,6 +85,19 @@ def _normalize_proof_contract(contract) -> str:
     return str(contract or "").strip().upper().replace(" ", "")
 
 
+def _build_proof_event_key(client_id: str, entry_local_order_id: str) -> str:
+    """Canonical economic identity key for exactly-once terminal proof binding.
+
+    Format: entry:<normalized-client-id>:<originating-entry-local-order-id>
+    Returns "" when either component is missing — no partial keys.
+    """
+    c = str(client_id or "").strip().lower()
+    o = str(entry_local_order_id or "").strip()
+    if not c or not o:
+        return ""
+    return f"entry:{c}:{o}"
+
+
 class PositionStatus:
     OPEN = "OPEN"
     CLOSING = "CLOSING"
@@ -874,7 +887,25 @@ class APPositionManager:
         side: str = "",
         contracts: int = 0,
         entry_option_price: float = 0.0,
+        exit_option_price: float = 0.0,
+        reconciliation_reason: str = "",
+        proof_diagnostics: Optional[dict] = None,
     ) -> bool:
+        """Claim an existing broker-repair proof row in place for the canonical position.
+
+        Production-shape fixes (PR exactly-once-proof):
+        - Allows local_order_id IS NULL or empty in the repair row (canonical entry
+          local_order_id is NOT required to pre-exist on the repair row).
+        - Resolves effective execution_mode via CASE, not COALESCE, so the literal
+          string 'unknown' in execution_mode does not shadow a valid mode in mode.
+        - Enforces closed_at proximity window (5 minutes) to prevent stale repair rows
+          from an earlier trade in the same option contract from being claimed.
+        - Uses SELECT ... FOR UPDATE inside the binding transaction to serialize
+          concurrent callers on the same repair row.
+        - Sets proof_event_key, execution_mode, mode, and appends reconciliation_reason
+          to the repair row's exit_reason without duplicating it on retries.
+        - Returns BROKER_REPAIR_PROOF_BINDING_AMBIGUOUS reason code on 2+ candidates.
+        """
         normalized_contract = _normalize_proof_contract(contract)
         repair_position_id = f"broker-repair-{self.client_id}-{normalized_contract}"
         entry_local_order_id = str(local_order_id or "").strip()
@@ -903,26 +934,76 @@ class APPositionManager:
             )
             return False
 
+        # Build canonical proof_event_key and diagnostics payload
+        _proof_event_key = _build_proof_event_key(self.client_id, entry_local_order_id)
+        _reconciliation_reason = str(reconciliation_reason or "").strip()
+        _diag_payload = dict(proof_diagnostics or {})
+        if _reconciliation_reason and "reconciliation_reason" not in _diag_payload:
+            _diag_payload["reconciliation_reason"] = _reconciliation_reason
+        if "binding_source" not in _diag_payload:
+            _diag_payload["binding_source"] = "terminal_close_exactly_once"
+
+        import json as _json
+        _diag_json = _json.dumps(_diag_payload)
+
         def _fn():
             with conn() as c:
+                # Acquire transaction-level advisory lock keyed on canonical identity.
+                # Serializes concurrent terminal proof writers for the same trade.
+                _lock_key = f"terminal-proof:{self.client_id}:{entry_local_order_id}"
+                c.execute(
+                    "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
+                    (_lock_key,),
+                )
+
+                # ── Check if canonical proof already exists (canonical-won-race) ────
                 c.execute(
                     """
-                    SELECT id
+                    SELECT id, exit_reason, proof_diagnostics
                     FROM proof_trades
                     WHERE client_email = %s
                       AND position_id = %s
-                      AND local_order_id = %s
-                      AND LOWER(COALESCE(NULLIF(BTRIM(execution_mode), ''), NULLIF(BTRIM(mode), ''), '')) = %s
+                    LIMIT 1
+                    """,
+                    (self.client_id, position_id),
+                )
+                canonical_row = c.fetchone()
+
+                # Also check for repair row
+                c.execute(
+                    """
+                    SELECT id, exit_reason
+                    FROM proof_trades
+                    WHERE client_email = %s
+                      AND position_id = %s
+                      AND (
+                          local_order_id IS NULL
+                          OR BTRIM(local_order_id) = ''
+                          OR local_order_id = %s
+                      )
+                      AND CASE
+                          WHEN LOWER(BTRIM(COALESCE(execution_mode,''))) IN ('live','paper')
+                              THEN LOWER(BTRIM(execution_mode))
+                          WHEN LOWER(BTRIM(COALESCE(mode,''))) IN ('live','paper')
+                              THEN LOWER(BTRIM(mode))
+                          ELSE 'unknown'
+                      END = %s
                       AND UPPER(COALESCE(side, '')) = %s
                       AND (
-                            %s <= 0
-                         OR COALESCE(contracts, %s) = %s
+                          %s <= 0
+                          OR COALESCE(contracts, %s) = %s
                       )
                       AND (
-                            %s <= 0
-                         OR COALESCE(entry_option_price, 0) <= 0
-                         OR ABS(COALESCE(entry_option_price, 0) - %s) < 0.0001
+                          %s <= 0
+                          OR COALESCE(entry_option_price, 0) <= 0
+                          OR ABS(COALESCE(entry_option_price, 0) - %s) < 0.0001
                       )
+                      AND (
+                          closed_at IS NULL
+                          OR %s IS NULL
+                          OR ABS(EXTRACT(EPOCH FROM (closed_at - %s::timestamptz))) < 300
+                      )
+                    FOR UPDATE
                     LIMIT 2
                     """,
                     (
@@ -936,60 +1017,138 @@ class APPositionManager:
                         expected_contracts,
                         expected_entry_price,
                         expected_entry_price,
+                        closed_at or None,
+                        closed_at or None,
                     ),
                 )
                 candidates = c.fetchall() or []
-                if len(candidates) != 1:
-                    return {"claimed": False, "candidate_count": len(candidates)}
-                candidate = dict(candidates[0] or {})
-                c.execute(
-                    """
+
+                # ── Canonical-won-race: canonical exists AND repair row exists ──────
+                if canonical_row and len(candidates) == 1:
+                    canonical_id = dict(canonical_row).get("id")
+                    repair_id = dict(candidates[0]).get("id")
+                    repair_exit_reason = str(dict(candidates[0]).get("exit_reason") or "")
+                    # Merge repair diagnostics into canonical proof
+                    _merge_diag = dict(_diag_payload)
+                    _merge_diag["repair_proof_id"] = repair_id
+                    _merge_diag["repair_position_id"] = repair_position_id
+                    if repair_exit_reason:
+                        _merge_diag["exit_decision_reason"] = repair_exit_reason
+                    import datetime as _dt_mod
+                    _merge_diag["bound_at"] = _dt_mod.datetime.now(
+                        _dt_mod.timezone.utc
+                    ).isoformat()
+                    _merge_json = _json.dumps(_merge_diag)
+                    # Update canonical proof diagnostics
+                    c.execute(
+                        """
+                        UPDATE proof_trades
+                        SET proof_diagnostics = COALESCE(proof_diagnostics, '{}'::jsonb)
+                            || %s::jsonb
+                        WHERE id = %s AND client_email = %s
+                        """,
+                        (_merge_json, canonical_id, self.client_id),
+                    )
+                    # Delete exact repair row after its diagnostics are preserved
+                    c.execute(
+                        """
+                        DELETE FROM proof_trades
+                        WHERE id = %s
+                          AND client_email = %s
+                          AND position_id = %s
+                        """,
+                        (repair_id, self.client_id, repair_position_id),
+                    )
+                    log.info(
+                        "[%s] TERMINAL_PROOF_DUPLICATE_MERGED | pos=%s contract=%s "
+                        "canonical_id=%s repair_id=%s",
+                        self.client_id, position_id, contract, canonical_id, repair_id,
+                    )
+                    return {"claimed": True, "candidate_count": 1, "updated_count": 1, "status": "MERGED_DUPLICATE"}
+
+                if len(candidates) == 0:
+                    log.critical(
+                        "[%s] BROKER_REPAIR_PROOF_BINDING_NOT_FOUND pos=%s contract=%s "
+                        "closed_at=%s",
+                        self.client_id, position_id, contract, closed_at,
+                    )
+                    return {"claimed": False, "candidate_count": 0, "reason": "BROKER_REPAIR_PROOF_BINDING_NOT_FOUND"}
+
+                if len(candidates) > 1:
+                    log.critical(
+                        "[%s] BROKER_REPAIR_PROOF_BINDING_AMBIGUOUS pos=%s contract=%s "
+                        "candidate_count=%s",
+                        self.client_id, position_id, contract, len(candidates),
+                    )
+                    return {"claimed": False, "candidate_count": len(candidates), "reason": "BROKER_REPAIR_PROOF_BINDING_AMBIGUOUS"}
+
+                # ── Exactly one repair candidate — bind it in place ───────────────
+                candidate = dict(candidates[0])
+                cand_id = candidate.get("id")
+                cand_exit_reason = str(candidate.get("exit_reason") or "")
+
+                # Build final exit_reason: preserve decision reason, append reconciler reason
+                if _reconciliation_reason and _reconciliation_reason not in cand_exit_reason:
+                    if cand_exit_reason:
+                        final_exit_reason_sql = f"exit_reason || ' | ' || %s"
+                        _exit_reason_val = _reconciliation_reason
+                    else:
+                        final_exit_reason_sql = "%s"
+                        _exit_reason_val = _reconciliation_reason
+                else:
+                    final_exit_reason_sql = "exit_reason"
+                    _exit_reason_val = None
+
+                import datetime as _dt_mod
+                _diag_payload["repair_proof_id"] = cand_id
+                _diag_payload["bound_at"] = _dt_mod.datetime.now(
+                    _dt_mod.timezone.utc
+                ).isoformat()
+                _diag_json_final = _json.dumps(_diag_payload)
+
+                # Bind the repair row in place, preserving its proof ID
+                update_sql = f"""
                     UPDATE proof_trades
-                       SET position_id = %s,
-                           local_order_id = CASE
-                               WHEN COALESCE(local_order_id, '') = '' AND %s <> ''
-                               THEN %s
-                               ELSE local_order_id
+                       SET position_id       = %s,
+                           local_order_id    = %s,
+                           execution_mode    = %s,
+                           mode              = %s,
+                           proof_event_key   = CASE
+                               WHEN %s <> '' THEN %s
+                               ELSE COALESCE(proof_event_key, '')
+                           END,
+                           proof_diagnostics = COALESCE(proof_diagnostics, '{{}}'::jsonb)
+                               || %s::jsonb,
+                           exit_reason       = CASE
+                               WHEN %s IS NULL THEN exit_reason
+                               ELSE {final_exit_reason_sql}
                            END
                      WHERE id = %s
                        AND client_email = %s
                        AND position_id = %s
-                       AND local_order_id = %s
-                       AND LOWER(COALESCE(NULLIF(BTRIM(execution_mode), ''), NULLIF(BTRIM(mode), ''), '')) = %s
-                       AND UPPER(COALESCE(side, '')) = %s
-                       AND (
-                             %s <= 0
-                          OR COALESCE(contracts, %s) = %s
-                       )
-                       AND (
-                             %s <= 0
-                          OR COALESCE(entry_option_price, 0) <= 0
-                          OR ABS(COALESCE(entry_option_price, 0) - %s) < 0.0001
-                       )
                     RETURNING id
-                    """,
-                    (
-                        position_id,
-                        entry_local_order_id,
-                        entry_local_order_id,
-                        candidate.get("id"),
-                        self.client_id,
-                        repair_position_id,
-                        entry_local_order_id,
-                        resolved_mode,
-                        resolved_side,
-                        expected_contracts,
-                        expected_contracts,
-                        expected_contracts,
-                        expected_entry_price,
-                        expected_entry_price,
-                    ),
-                )
+                """
+                bind_params = [
+                    position_id,
+                    entry_local_order_id,
+                    resolved_mode,
+                    resolved_mode,
+                    _proof_event_key,
+                    _proof_event_key,
+                    _diag_json_final,
+                    _exit_reason_val,  # NULL sentinel check
+                ]
+                if _exit_reason_val is not None:
+                    bind_params.append(_exit_reason_val)
+                bind_params.extend([cand_id, self.client_id, repair_position_id])
+
+                c.execute(update_sql, tuple(bind_params))
                 rows = c.fetchall() or []
                 return {
                     "claimed": len(rows) == 1,
-                    "candidate_count": len(candidates),
+                    "candidate_count": 1,
                     "updated_count": len(rows),
+                    "status": "BOUND_REPAIR",
                 }
 
         try:
@@ -1003,22 +1162,164 @@ class APPositionManager:
 
         claimed = bool(outcome.get("claimed"))
         if not claimed:
+            reason = outcome.get("reason", "UNKNOWN")
             log.critical(
-                "[%s] BROKER_REPAIR_PROOF_QUARANTINED pos=%s contract=%s candidate_count=%s updated_count=%s",
+                "[%s] %s pos=%s contract=%s candidate_count=%s",
                 self.client_id,
+                reason,
                 position_id,
                 contract,
                 outcome.get("candidate_count"),
-                outcome.get("updated_count"),
             )
             return False
 
-        if claimed:
-            log.info(
-                "[%s] broker repair proof claimed | pos=%s contract=%s",
-                self.client_id, position_id, contract,
+        log.info(
+            "[%s] TERMINAL_PROOF_REPAIR_BOUND pos=%s contract=%s status=%s",
+            self.client_id, position_id, contract, outcome.get("status", "BOUND_REPAIR"),
+        )
+        return True
+
+    def ensure_terminal_close_proof(
+        self,
+        *,
+        position_id: str,
+        local_order_id: str,
+        contract: str,
+        underlying: str,
+        side: str,
+        opened_at: str,
+        closed_at: str,
+        entry_option_price: float,
+        exit_option_price: float,
+        contracts: int,
+        exit_reason: str,
+        option_pnl_pct: float,
+        setup_status: str,
+        execution_mode: str = "",
+        exit_fill_price: Optional[float] = None,
+        reconciliation_reason: str = "",
+        allow_fallback_insert: bool,
+        missing_reason_code: str,
+    ) -> dict:
+        """Public single-authority for all terminal proof writes.
+
+        All callers (OSM fill path, reconciler auto-close, expired-contract cleanup)
+        must route through this method. There must be exactly one implementation of
+        the exactly-once proof binding logic.
+
+        Returns:
+            {
+                "status": (
+                    "EXISTING_CANONICAL" | "BOUND_REPAIR" | "INSERTED_CANONICAL" |
+                    "MERGED_DUPLICATE" | "QUARANTINED" | "FAILED"
+                ),
+                "proof_id": int | None,
+                "persisted": bool,
+                "reason_code": str,
+            }
+        """
+        identity = self._resolve_terminal_proof_identity(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            side=side,
+        )
+        entry_local_order_id = str(identity.get("entry_local_order_id") or "")
+
+        if identity.get("invalid_origin"):
+            log.critical(
+                "[%s] TERMINAL_CLOSE_PROOF_ORIGIN_INVALID pos=%s local_order_id=%s source=%s",
+                self.client_id, position_id, local_order_id, setup_status,
             )
-        return claimed
+            # Still check if a proof exists before failing
+            proof_exists = self._proof_row_exists(position_id=position_id)
+            if proof_exists is True:
+                return {"status": "EXISTING_CANONICAL", "proof_id": None, "persisted": True, "reason_code": "TERMINAL_PROOF_EXISTING_CANONICAL"}
+            return {"status": "QUARANTINED", "proof_id": None, "persisted": False, "reason_code": "BROKER_REPAIR_PROOF_IDENTITY_UNPROVEN"}
+
+        proof_state = self._proof_row_binding_state(
+            position_id=position_id,
+            local_order_id=entry_local_order_id,
+        )
+        if proof_state == "bound_position":
+            return {"status": "EXISTING_CANONICAL", "proof_id": None, "persisted": True, "reason_code": "TERMINAL_PROOF_EXISTING_CANONICAL"}
+
+        if proof_state is None:
+            log.critical(
+                "[%s] TERMINAL_CLOSE_PROOF_UNVERIFIED pos=%s local_order_id=%s source=%s",
+                self.client_id, position_id, entry_local_order_id, setup_status,
+            )
+            return {"status": "FAILED", "proof_id": None, "persisted": False, "reason_code": "TERMINAL_PROOF_TAXONOMY_RESTAMP_FAILED"}
+
+        # Build diagnostics payload for repair binding
+        _proof_diagnostics: dict = {}
+        if reconciliation_reason:
+            _proof_diagnostics["reconciliation_reason"] = reconciliation_reason
+        _proof_diagnostics["binding_source"] = "terminal_close_exactly_once"
+
+        claimed = self._claim_recent_broker_repair_proof(
+            position_id=position_id,
+            contract=contract,
+            closed_at=closed_at,
+            local_order_id=entry_local_order_id,
+            execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or ""),
+            side=str(identity.get("resolved_side") or side or ""),
+            contracts=contracts,
+            entry_option_price=entry_option_price,
+            exit_option_price=exit_option_price,
+            reconciliation_reason=reconciliation_reason,
+            proof_diagnostics=_proof_diagnostics,
+        )
+        if claimed:
+            return {"status": "BOUND_REPAIR", "proof_id": None, "persisted": True, "reason_code": "TERMINAL_PROOF_REPAIR_BOUND"}
+
+        if proof_state == "local_order_only":
+            log.critical(
+                "[%s] TERMINAL_CLOSE_PROOF_REPAIR_BIND_FAILED pos=%s local_order_id=%s source=%s",
+                self.client_id, position_id, entry_local_order_id, setup_status,
+            )
+            return {"status": "FAILED", "proof_id": None, "persisted": False, "reason_code": "BROKER_REPAIR_PROOF_BINDING_NOT_FOUND"}
+
+        if not allow_fallback_insert:
+            log.critical(
+                "[%s] %s pos=%s contract=%s source=%s",
+                self.client_id, missing_reason_code, position_id, contract, setup_status,
+            )
+            return {"status": "QUARANTINED", "proof_id": None, "persisted": False, "reason_code": missing_reason_code}
+
+        # Build proof_event_key for the new canonical insert
+        _proof_event_key = _build_proof_event_key(self.client_id, entry_local_order_id)
+
+        persisted = self._write_missing_terminal_proof(
+            position_id=position_id,
+            local_order_id=entry_local_order_id,
+            contract=contract,
+            underlying=underlying,
+            side=str(identity.get("resolved_side") or side),
+            opened_at=opened_at,
+            closed_at=closed_at,
+            entry_option_price=entry_option_price,
+            exit_option_price=exit_option_price,
+            contracts=contracts,
+            exit_reason=exit_reason,
+            option_pnl_pct=option_pnl_pct,
+            setup_status=setup_status,
+            execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or "unknown"),
+            exit_fill_price=exit_fill_price,
+            synthetic_entry=bool(identity.get("side_quarantined")) or str(identity.get("resolved_execution_mode") or "") not in {"live", "paper"},
+            proof_event_key=_proof_event_key,
+        )
+        if persisted:
+            log.info(
+                "[%s] TERMINAL_PROOF_CANONICAL_INSERTED pos=%s source=%s event_key=%s",
+                self.client_id, position_id, setup_status, _proof_event_key or "(none)",
+            )
+            return {"status": "INSERTED_CANONICAL", "proof_id": None, "persisted": True, "reason_code": "TERMINAL_PROOF_CANONICAL_INSERTED"}
+
+        log.error(
+            "[%s] %s pos=%s contract=%s source=%s",
+            self.client_id, missing_reason_code, position_id, contract, setup_status,
+        )
+        return {"status": "FAILED", "proof_id": None, "persisted": False, "reason_code": missing_reason_code}
 
     def _write_missing_terminal_proof(
         self,
@@ -1039,6 +1340,7 @@ class APPositionManager:
         execution_mode: str = "",
         exit_fill_price: Optional[float] = None,
         synthetic_entry: bool = False,
+        proof_event_key: str = "",
     ) -> bool:
         identity = self._resolve_terminal_proof_identity(
             position_id=position_id,
@@ -1127,6 +1429,7 @@ class APPositionManager:
                 local_order_id=local_order_id or "",
                 execution_mode=resolved_mode,
                 exit_fill_price=(float(exit_fill_price) if exit_fill_price is not None else None),
+                proof_event_key=proof_event_key or "",
             )
         except Exception as exc:
             log.error(
@@ -1168,69 +1471,13 @@ class APPositionManager:
         allow_fallback_insert: bool,
         missing_reason_code: str,
     ) -> bool:
-        identity = self._resolve_terminal_proof_identity(
+        """Private compatibility shim — delegates to the public ensure_terminal_close_proof."""
+        result = self.ensure_terminal_close_proof(
             position_id=position_id,
             local_order_id=local_order_id,
-            side=side,
-        )
-        entry_local_order_id = str(identity.get("entry_local_order_id") or "")
-        if identity.get("invalid_origin"):
-            log.critical(
-                "[%s] TERMINAL_CLOSE_PROOF_ORIGIN_INVALID pos=%s local_order_id=%s source=%s",
-                self.client_id, position_id, local_order_id, setup_status,
-            )
-            proof_exists = self._proof_row_exists(position_id=position_id)
-            if proof_exists is True:
-                return True
-            return False
-
-        proof_state = self._proof_row_binding_state(
-            position_id=position_id,
-            local_order_id=entry_local_order_id,
-        )
-        if proof_state == "bound_position":
-            return True
-
-        if proof_state is None:
-            log.critical(
-                "[%s] TERMINAL_CLOSE_PROOF_UNVERIFIED pos=%s local_order_id=%s source=%s",
-                self.client_id, position_id, entry_local_order_id, setup_status,
-            )
-            return False
-
-        claimed = self._claim_recent_broker_repair_proof(
-            position_id=position_id,
-            contract=contract,
-            closed_at=closed_at,
-            local_order_id=entry_local_order_id,
-            execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or ""),
-            side=str(identity.get("resolved_side") or side or ""),
-            contracts=contracts,
-            entry_option_price=entry_option_price,
-        )
-        if claimed:
-            return True
-
-        if proof_state == "local_order_only":
-            log.critical(
-                "[%s] TERMINAL_CLOSE_PROOF_REPAIR_BIND_FAILED pos=%s local_order_id=%s source=%s",
-                self.client_id, position_id, entry_local_order_id, setup_status,
-            )
-            return False
-
-        if not allow_fallback_insert:
-            log.critical(
-                "[%s] %s pos=%s contract=%s source=%s",
-                self.client_id, missing_reason_code, position_id, contract, setup_status,
-            )
-            return False
-
-        persisted = self._write_missing_terminal_proof(
-            position_id=position_id,
-            local_order_id=entry_local_order_id,
             contract=contract,
             underlying=underlying,
-            side=str(identity.get("resolved_side") or side),
+            side=side,
             opened_at=opened_at,
             closed_at=closed_at,
             entry_option_price=entry_option_price,
@@ -1239,22 +1486,13 @@ class APPositionManager:
             exit_reason=exit_reason,
             option_pnl_pct=option_pnl_pct,
             setup_status=setup_status,
-            execution_mode=str(identity.get("resolved_execution_mode") or execution_mode or "unknown"),
+            execution_mode=execution_mode,
             exit_fill_price=exit_fill_price,
-            synthetic_entry=bool(identity.get("side_quarantined")) or str(identity.get("resolved_execution_mode") or "") not in {"live", "paper"},
+            reconciliation_reason="",
+            allow_fallback_insert=allow_fallback_insert,
+            missing_reason_code=missing_reason_code,
         )
-        if persisted:
-            log.info(
-                "[%s] proof_trades logged via APProofLogger | pos=%s source=%s",
-                self.client_id, position_id, setup_status,
-            )
-            return True
-
-        log.error(
-            "[%s] %s pos=%s contract=%s source=%s",
-            self.client_id, missing_reason_code, position_id, contract, setup_status,
-        )
-        return False
+        return bool(result.get("persisted") or result.get("status") in {"EXISTING_CANONICAL", "MERGED_DUPLICATE"})
 
     # ------------------------------------------------------------------
     # Market/session-day helpers
