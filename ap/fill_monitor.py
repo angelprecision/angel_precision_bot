@@ -1371,21 +1371,27 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             # been misled about safety; emit a distinct _NO_OWNER reason
             # so recovery / reconciliation can escalate rather than
             # silently accept a zero-owner state.
+            # AMENDMENT (PR #385 review): count an existing protective
+            # owner only when the position's client identity matches
+            # this order's client EXACTLY after normalization.  A blank
+            # position.client_id is unproven identity, not exact match;
+            # counting it would let unknown-owner positions establish
+            # "protective monitoring retained" for the wrong tenant in
+            # a multi-client service.
+            _expected_client = _client_id.strip().lower()
             _owner_count = 0
             try:
                 _active_fn = getattr(exit_engine, "active_positions", None)
-                if callable(_active_fn):
+                if callable(_active_fn) and _expected_client:
                     _actives = _active_fn() or []
-                    _owner_count = sum(
-                        1 for _p in _actives
-                        if str(getattr(_p, "option_symbol", "") or "").upper().strip()
-                           == _contract_for_adopt
-                        and (
-                            not getattr(_p, "client_id", "")
-                            or str(getattr(_p, "client_id", "")).strip().lower()
-                               == _client_id.strip().lower()
-                        )
-                    )
+                    for _p in _actives:
+                        _sym = str(getattr(_p, "option_symbol", "") or "").upper().strip()
+                        if _sym != _contract_for_adopt:
+                            continue
+                        _p_client = str(getattr(_p, "client_id", "") or "").strip().lower()
+                        if not _p_client or _p_client != _expected_client:
+                            continue
+                        _owner_count += 1
             except Exception as _owner_err:
                 log.warning(
                     "[%s] owner-existence check failed for %s: %s",
@@ -1553,13 +1559,17 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     # AMENDMENT (PR #385 review): both fall-through seeding paths
     # (seed_position and the ManagedPosition/add_position path below)
     # must consume the SAME _resolved_mode the adoption call would
-    # have used.  A blank order.execution_mode reaching here means the
-    # engine already proved live/paper; we must not re-read the raw
-    # nullable field and store an empty string.
-    _seed_order = order
-    if _resolved_mode and str(order.get("execution_mode") or "").strip().lower() != _resolved_mode:
+    # have used.  Whenever a canonical mode is proven, ALWAYS pass a
+    # normalized copy — including cases like "LIVE" / " LIVE " /
+    # "Paper" that would normalize to _resolved_mode but still hand
+    # non-canonical text into any downstream seed_position payload
+    # that inspects the raw string.  The original order dict is never
+    # mutated.
+    if _resolved_mode:
         _seed_order = dict(order)
         _seed_order["execution_mode"] = _resolved_mode
+    else:
+        _seed_order = order
 
     try:
         if hasattr(exit_engine, "seed_position"):

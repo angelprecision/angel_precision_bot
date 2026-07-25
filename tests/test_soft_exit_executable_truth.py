@@ -5657,3 +5657,211 @@ class TestSeedExitEngineNoOwnerDiagnostic:
         _expl = [e["explanation"] for e in emits
                  if e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
         assert "NO protective exit owner" in _expl
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — seed_position normalization + exact-client owner)
+# =============================================================================
+
+
+class TestSeedPositionAlwaysReceivesNormalizedMode:
+    """Whenever `_resolved_mode` is proven, seed_position() must receive
+    an order copy whose execution_mode is the canonical lowercase form,
+    even when the raw order text ("LIVE", " LIVE ", "Paper") would
+    normalize to the same value.  The original order must not mutate."""
+
+    def _order(self, *, exec_mode):
+        return {
+            "client_id": "jasoncosby1@gmail.com",
+            "contract": "BAC260724P00062000",
+            "symbol": "BAC260724P00062000",
+            "local_order_id": "L1", "broker_order_id": "B1",
+            "signal_id": "sig-1",
+            "execution_mode": exec_mode,
+            "qty": 1,
+        }
+
+    def _engine_with_seed_position(self, seeded):
+        def _fake_adopt(**_kw):
+            class _R: disposition = "NO_REPAIR_FOUND"
+            return _R()
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "live", "status": "PROVEN", "sources": {}}
+            def _resolved_execution_mode(self):
+                return "live"
+            adopt_canonical_position_identity = staticmethod(_fake_adopt)
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return []
+            def add_position(self_, pos): pass
+            def seed_position(self_, pid, seed_order, result):
+                seeded.append((pid, dict(seed_order), dict(result)))
+            _email = "jasoncosby1@gmail.com"
+        return _E()
+
+    def _run(self, monkeypatch, *, exec_mode):
+        import ap.fill_monitor as fm
+        monkeypatch.setattr(fm, "audit", lambda *a, **kw: None)
+        monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **kw: True)
+        seeded = []
+        eng = self._engine_with_seed_position(seeded)
+        original = self._order(exec_mode=exec_mode)
+        fm._seed_exit_engine(
+            eng, "canon-p", original,
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        return seeded, original
+
+    def test_uppercase_live_is_normalized(self, monkeypatch):
+        seeded, original = self._run(monkeypatch, exec_mode="LIVE")
+        assert seeded, "seed_position must be called"
+        assert seeded[-1][1]["execution_mode"] == "live"
+        assert original["execution_mode"] == "LIVE"
+
+    def test_padded_live_is_normalized(self, monkeypatch):
+        seeded, original = self._run(monkeypatch, exec_mode=" LIVE ")
+        assert seeded[-1][1]["execution_mode"] == "live"
+        assert original["execution_mode"] == " LIVE "
+
+    def test_titlecase_paper_is_normalized(self, monkeypatch):
+        # Engine proves "paper" here so resolver returns "paper".
+        import ap.fill_monitor as fm
+        monkeypatch.setattr(fm, "audit", lambda *a, **kw: None)
+        monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **kw: True)
+        seeded = []
+        def _fake_adopt(**_kw):
+            class _R: disposition = "NO_REPAIR_FOUND"
+            return _R()
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "paper", "status": "PROVEN", "sources": {}}
+            def _resolved_execution_mode(self): return "paper"
+            adopt_canonical_position_identity = staticmethod(_fake_adopt)
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return []
+            def add_position(self_, pos): pass
+            def seed_position(self_, pid, seed_order, result):
+                seeded.append((pid, dict(seed_order), dict(result)))
+            _email = "jasoncosby1@gmail.com"
+        original = self._order(exec_mode="Paper")
+        fm._seed_exit_engine(_E(), "canon-p", original,
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert seeded[-1][1]["execution_mode"] == "paper"
+        assert original["execution_mode"] == "Paper"
+
+    def test_blank_order_is_normalized(self, monkeypatch):
+        seeded, original = self._run(monkeypatch, exec_mode=None)
+        assert seeded[-1][1]["execution_mode"] == "live"
+        assert original["execution_mode"] is None
+
+
+class TestOwnerCheckRequiresExactClientMatch:
+    """A blank position.client_id is unproven identity and must never
+    establish exact ownership.  In a multi-client service, matching by
+    contract alone would let one tenant's unknown-owner position
+    silently satisfy another tenant's protective-monitoring check."""
+
+    def _install(self, monkeypatch, actives):
+        import ap.fill_monitor as fm
+        audits = []
+        emits = []
+        monkeypatch.setattr(fm, "audit",
+                            lambda cid, lvl, evt, payload: audits.append((evt, payload)))
+        monkeypatch.setattr(fm, "emit_fill_event",
+                            lambda o, **kw: emits.append(kw) or True)
+        adopt_calls = []
+        added = []
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "", "status": "UNPROVEN", "sources": {}}
+            def _resolved_execution_mode(self): return ""
+            def adopt_canonical_position_identity(self_, **kw):
+                adopt_calls.append(kw)
+                class _R: disposition = "ADOPTED"
+                return _R()
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return list(actives)
+            def add_position(self_, pos): added.append(pos)
+            _email = "jasoncosby1@gmail.com"
+        return fm, _E(), audits, emits, adopt_calls, added
+
+    def _order(self):
+        return {
+            "client_id": "jasoncosby1@gmail.com",
+            "contract": "BAC260724P00062000",
+            "symbol": "BAC260724P00062000",
+            "local_order_id": "L1", "broker_order_id": "B1",
+            "signal_id": "sig-1",
+            "execution_mode": None,
+            "qty": 1,
+        }
+
+    def test_blank_client_position_does_not_count_as_owner(self, monkeypatch):
+        class _Position:
+            option_symbol = "BAC260724P00062000"
+            client_id = ""          # unproven identity
+            closed = False
+        fm, eng, audits, emits, adopt_calls, added = self._install(
+            monkeypatch, [_Position()],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert adopt_calls == []
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" in _reasons, (
+            f"blank-client position must not satisfy exact ownership; got {_reasons}"
+        )
+        _payload = [a[1] for a in audits
+                    if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
+        assert _payload["existing_owner_count"] == 0
+
+    def test_exact_matching_client_counts_as_owner(self, monkeypatch):
+        class _Position:
+            option_symbol = "BAC260724P00062000"
+            client_id = "jasoncosby1@gmail.com"
+            closed = False
+        fm, eng, audits, emits, adopt_calls, added = self._install(
+            monkeypatch, [_Position()],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        # Base reason, not _NO_OWNER.
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN" in _reasons
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" not in _reasons
+        _payload = [a[1] for a in audits
+                    if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN"][0]
+        assert _payload["existing_owner_count"] == 1
+
+    def test_same_client_different_contract_does_not_count(self, monkeypatch):
+        class _Position:
+            option_symbol = "AAPL260724C00200000"   # different contract
+            client_id = "jasoncosby1@gmail.com"
+            closed = False
+        fm, eng, audits, emits, adopt_calls, added = self._install(
+            monkeypatch, [_Position()],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" in _reasons
+        _payload = [a[1] for a in audits
+                    if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
+        assert _payload["existing_owner_count"] == 0
+
+    def test_different_client_same_contract_does_not_count(self, monkeypatch):
+        class _Position:
+            option_symbol = "BAC260724P00062000"
+            client_id = "other@example.com"
+            closed = False
+        fm, eng, audits, emits, adopt_calls, added = self._install(
+            monkeypatch, [_Position()],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" in _reasons
