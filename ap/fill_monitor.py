@@ -151,8 +151,15 @@ def emit_fill_event(
     stage: str = "fill_monitor",
     extra_inputs: dict | None = None,
     extra_context: dict | None = None,
-):
-    """Emit structured fill-monitor observability without blocking reconciliation."""
+) -> bool:
+    """Emit structured fill-monitor observability without blocking reconciliation.
+
+    Returns True on successful emit, False if the underlying observability
+    write failed.  Failures are logged at WARNING level (not debug) so
+    identity-critical events like CANONICAL_ADOPTION_MODE_CONFLICT stay
+    visible even when the downstream ledger is degraded.  The function
+    remains non-fatal and never re-raises.
+    """
     try:
         result = result or {}
         emit_decision_event(
@@ -182,8 +189,22 @@ def emit_fill_event(
             },
             context=extra_context or {},
         )
-    except Exception as e:
-        log.debug("Fill monitor observability emit failed (non-critical): %s", e)
+        return True
+    except Exception as exc:
+        # AMENDMENT (PR #385 review — observability contract): promote
+        # from log.debug to log.warning and return False.  A silent
+        # debug-only failure hid critical identity events; callers now
+        # get a real signal without needing (or getting fooled by) an
+        # outer try/except that never runs.
+        log.warning(
+            "Fill monitor observability emit failed | "
+            "reason_code=%s client=%s local_order_id=%s error=%s",
+            reason_code,
+            order.get("client_id"),
+            order.get("local_order_id"),
+            exc,
+        )
+        return False
 
 
 # =============================================================================
@@ -1378,23 +1399,20 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                     "[%s] audit write failed for %s: %s",
                     _client_id, _reason_code, _audit_err,
                 )
-            try:
-                emit_fill_event(
-                    order,
-                    decision="ERROR",
-                    reason_code=_reason_code,
-                    explanation=(
-                        "Canonical adoption execution mode could not be proven; "
-                        "no new exit owner created."
-                    ),
-                    result=result or {},
-                    extra_context=_payload,
-                )
-            except Exception as _emit_err:
-                log.warning(
-                    "[%s] emit_fill_event failed for %s: %s",
-                    _client_id, _reason_code, _emit_err,
-                )
+            # emit_fill_event is best-effort and never re-raises; it now
+            # returns False and logs at WARNING on internal failure, so a
+            # redundant outer try/except would never actually fire.
+            emit_fill_event(
+                order,
+                decision="ERROR",
+                reason_code=_reason_code,
+                explanation=(
+                    "Canonical adoption execution mode could not be proven; "
+                    "no new exit owner created."
+                ),
+                result=result or {},
+                extra_context=_payload,
+            )
             return
         try:
             _entry_fill_for_adopt = _safe_float(

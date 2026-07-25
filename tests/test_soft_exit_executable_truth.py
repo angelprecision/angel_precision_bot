@@ -5336,3 +5336,86 @@ class TestCollapseMergeSourcePriority:
         _merge_hard_exit_reference_for_collapse(canonical, repair, now_utc=newer)
         assert canonical.hard_exit_reference_source == "mark"
         assert canonical.hard_exit_reference_price  == 1.05
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — emit_fill_event observability contract)
+# =============================================================================
+
+
+class TestEmitFillEventReturnsBoolAndWarns:
+    """emit_fill_event() must be non-fatal, return True on success and
+    False on internal failure, and log at WARNING (not debug) when the
+    underlying observability write raises.  Identity-critical events
+    like CANONICAL_ADOPTION_MODE_CONFLICT must stay visible even when
+    the downstream ledger is degraded."""
+
+    def test_returns_true_on_successful_emit(self, monkeypatch, caplog):
+        import ap.fill_monitor as fm
+        monkeypatch.setattr(fm, "emit_decision_event",
+                            lambda **kw: None)
+        with caplog.at_level("WARNING", logger="ap.fill_monitor"):
+            ok = fm.emit_fill_event(
+                {"client_id": "obs@example.com",
+                 "local_order_id": "L1", "signal_id": "sig"},
+                decision="ERROR",
+                reason_code="CANONICAL_ADOPTION_MODE_CONFLICT",
+                explanation="test",
+                result={},
+                extra_context={"engine_status": "CONFLICT"},
+            )
+        assert ok is True
+        assert not any(
+            "observability emit failed" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_returns_false_and_warns_on_internal_failure(self, monkeypatch, caplog):
+        import ap.fill_monitor as fm
+        import logging as _logging
+        def _raise(**kw):
+            raise RuntimeError("ledger unreachable")
+        monkeypatch.setattr(fm, "emit_decision_event", _raise)
+        # Ensure the module logger propagates so caplog captures its records.
+        _fm_logger = _logging.getLogger("ap.fill_monitor")
+        monkeypatch.setattr(_fm_logger, "propagate", True)
+        caplog.set_level(_logging.WARNING, logger="ap.fill_monitor")
+        ok = fm.emit_fill_event(
+            {"client_id": "obs@example.com",
+             "local_order_id": "L1", "signal_id": "sig"},
+            decision="ERROR",
+            reason_code="CANONICAL_ADOPTION_MODE_CONFLICT",
+            explanation="test",
+            result={},
+            extra_context={"engine_status": "CONFLICT"},
+        )
+        assert ok is False
+        matched = [
+            rec for rec in caplog.records
+            if rec.name == "ap.fill_monitor"
+            and rec.levelno == _logging.WARNING
+            and "observability emit failed" in rec.getMessage()
+            and "CANONICAL_ADOPTION_MODE_CONFLICT" in rec.getMessage()
+        ]
+        assert matched, (
+            f"Expected WARNING with reason_code; captured "
+            f"{[(r.name, r.levelname, r.getMessage()) for r in caplog.records]}"
+        )
+
+    def test_caller_continues_when_emit_returns_false(self, monkeypatch):
+        """A downstream ledger failure must not raise from emit_fill_event
+        and must not prevent the caller from finishing its work."""
+        import ap.fill_monitor as fm
+        monkeypatch.setattr(
+            fm, "emit_decision_event",
+            lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        ok = fm.emit_fill_event(
+            {"client_id": "obs@example.com",
+             "local_order_id": "L1", "signal_id": "sig"},
+            decision="ERROR",
+            reason_code="CANONICAL_ADOPTION_MODE_UNPROVEN",
+            explanation="test",
+            result={},
+        )
+        assert ok is False  # explicitly non-fatal
