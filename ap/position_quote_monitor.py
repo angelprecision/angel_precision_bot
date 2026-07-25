@@ -118,14 +118,76 @@ def normalize_hard_ref_ts(
     return parsed
 
 
+# AMENDMENT (PR #385 review — equal-timestamp source priority):
+# One canonical ranking used everywhere hard-reference replacement /
+# merge / persistence decisions occur.  Lower number = higher authority.
+# Do NOT rank by price severity; a worse price is not inherently more
+# authoritative.  This mirrors the PR contract:
+#   fresh BID > fresh LAST > fresh MARK/MID > catastrophic-ASK >
+#   stale/unproven bid > stale/unproven last > stale/unproven mark >
+#   ask_unproven / ask_stale > no_data / blank.
+_HARD_REF_SOURCE_RANK = {
+    "bid":              10,
+    "last":             20,
+    "mark":             30,
+    "mid":              30,
+    "ask_catastrophic": 40,
+    "bid_stale":        50,
+    "last_stale":       60,
+    "mark_stale":       70,
+    "ask_unproven":     80,
+    "ask_stale":        80,
+    "no_data":          99,
+    "":                 99,
+}
+
+
+def hard_ref_source_rank(source, validity) -> int:
+    """Canonical hard-reference source-quality rank (lower = better).
+
+    Callers may pass validity ∈ {"proven","catastrophic_ask","unproven",
+    "no_data"} together with the semantic source label written by
+    _select_hard_exit_reference.  Unknown sources are ranked as no_data.
+    """
+    _src = str(source or "").strip().lower()
+    _val = str(validity or "").strip().lower()
+    # Validity overrides map bare "ask" sources onto their catastrophic
+    # / unproven ranks when the selector labelled them that way.
+    if _val == "catastrophic_ask":
+        return _HARD_REF_SOURCE_RANK["ask_catastrophic"]
+    if _val in ("unproven", "no_data") and _src.startswith("ask"):
+        return _HARD_REF_SOURCE_RANK["ask_unproven"]
+    return _HARD_REF_SOURCE_RANK.get(_src, _HARD_REF_SOURCE_RANK["no_data"])
+
+
 def hard_ref_authority_fingerprint(hard_ref) -> str:
-    """Fingerprint only authority-state changes that may bypass DB throttling."""
+    """Fingerprint MATERIAL authority-state changes that may bypass DB throttling.
+
+    AMENDMENT (PR #385 review — restart-safe persistence): includes the
+    normalized authoritative price so that at equal timestamp a source
+    upgrade (e.g. MARK→BID with the same or different price) reliably
+    changes the fingerprint and immediately persists.  Does NOT include
+    the raw observation timestamp; a timestamp-only advance would then
+    hammer the DB on every QPM poll.  Restart lag on a timestamp-only
+    change is bounded by the ordinary throttle interval and the next
+    complete write carries the newest timestamp known at write time.
+    """
     if not isinstance(hard_ref, dict):
         return ""
+    _raw_price = hard_ref.get("price")
+    try:
+        _price_f = float(_raw_price) if _raw_price is not None else 0.0
+        if not (_price_f == _price_f) or _price_f in (float("inf"), float("-inf")):
+            _price_norm = ""  # NaN / inf
+        else:
+            _price_norm = f"{round(_price_f, 6):.6f}"
+    except Exception:
+        _price_norm = ""
     payload = {
         "source": str(hard_ref.get("source") or ""),
         "validity": str(hard_ref.get("validity") or ""),
         "refresh_needed": bool(hard_ref.get("refresh_needed", False)),
+        "price": _price_norm,
     }
     return json.dumps(payload, sort_keys=True, default=str)
 
@@ -137,9 +199,21 @@ def should_replace_hard_ref(
     prior_price,
     candidate_validity,
     candidate_ts,
+    prior_source=None,
+    candidate_source=None,
     now_utc: "Optional[datetime]" = None,
 ) -> bool:
-    """Chronology-aware hard-reference replacement contract."""
+    """Chronology-aware hard-reference replacement contract.
+
+    AMENDMENT (PR #385 review — equal-timestamp source priority): when both
+    prior and candidate are authoritative and their normalized timestamps
+    are equal, the higher-quality source wins.  Previously the strict
+    `candidate_dt > prior_dt` inequality let an equal-time MARK/LAST/ASK
+    reference survive a same-time BID upgrade, which then meant the
+    persisted restart record lost BID authority.  Source rank is via the
+    canonical `hard_ref_source_rank` helper; source args default to None
+    for backward compatibility with older call sites.
+    """
     now_utc = now_utc or datetime.now(timezone.utc)
     try:
         prior_price_f = float(prior_price or 0.0)
@@ -161,7 +235,18 @@ def should_replace_hard_ref(
         return candidate_dt is not None
     if candidate_dt is None:
         return False
-    return candidate_dt > prior_dt
+    if candidate_dt > prior_dt:
+        return True
+    if candidate_dt < prior_dt:
+        return False
+    # Equal normalized timestamps → break by source quality.  When source
+    # info was not supplied (older call sites), preserve the historical
+    # "prior wins" behavior to remain idempotent.
+    if prior_source is None and candidate_source is None:
+        return False
+    _prior_rank = hard_ref_source_rank(prior_source, prior_validity)
+    _cand_rank = hard_ref_source_rank(candidate_source, candidate_validity)
+    return _cand_rank < _prior_rank
 
 
 def _select_hard_exit_reference(

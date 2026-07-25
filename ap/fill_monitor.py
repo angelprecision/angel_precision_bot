@@ -1213,6 +1213,58 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _normalize_execution_mode_token(value) -> str:
+    """Recognize only lowercase "live" / "paper".  Never infer, never default."""
+    _tok = str(value or "").strip().lower()
+    return _tok if _tok in {"live", "paper"} else ""
+
+
+def _resolve_canonical_adoption_execution_mode(exit_engine, order: dict):
+    """Resolve the exact execution_mode to pass into
+    adopt_canonical_position_identity, or fail closed.
+
+    AMENDMENT (PR #385 review — Fix 1): the previous seed path passed
+    `str(order.get("execution_mode") or "")` unchanged, which meant any
+    canonical order row with a NULL execution_mode (historical rows,
+    recovery-created rows) would attempt adoption as "" and be rejected
+    by the exit engine's mode-mismatch guard even when the engine and
+    existing broker-repair position were already proven LIVE (or PAPER).
+
+    Resolution policy (fail closed on any ambiguity):
+      1. Normalize order mode; only lowercase live/paper are recognized.
+      2. Ask the exit engine for its fail-closed resolved mode.
+      3. If both known and equal → return that mode.
+      4. If exactly one is known → return the known mode.
+      5. If both known and disagree → conflict (fail closed).
+      6. If neither known → unproven (fail closed).
+
+    Returns a 3-tuple (mode, disposition, diagnostics):
+      mode        — "live" | "paper" | ""  ("" means "do not adopt")
+      disposition — "OK" | "CONFLICT" | "UNPROVEN"
+      diagnostics — dict with order_mode / engine_mode for logs.
+    """
+    order_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+    engine_mode = ""
+    _resolver = getattr(exit_engine, "_resolved_execution_mode", None)
+    if callable(_resolver):
+        try:
+            engine_mode = _normalize_execution_mode_token(_resolver())
+        except Exception:
+            engine_mode = ""
+
+    diag = {"order_mode": order_mode, "engine_mode": engine_mode}
+
+    if order_mode and engine_mode:
+        if order_mode == engine_mode:
+            return order_mode, "OK", diag
+        return "", "CONFLICT", diag
+    if order_mode and not engine_mode:
+        return order_mode, "OK", diag
+    if engine_mode and not order_mode:
+        return engine_mode, "OK", diag
+    return "", "UNPROVEN", diag
+
+
 def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str):
     """Seed the exit engine after confirmed ENTRY fill without faking live quote state.
 
@@ -1244,6 +1296,46 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     _contract_for_adopt = str(order.get("contract") or order.get("symbol") or "").upper().strip()
     _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
     if callable(_adopt_fn) and _contract_for_adopt and position_id:
+        # AMENDMENT (PR #385 review — Fix 1): resolve execution_mode via
+        # the fail-closed helper.  A NULL order.execution_mode against a
+        # proven engine mode must adopt as the engine mode; a genuine
+        # conflict or unproven pair must NOT adopt.
+        _resolved_mode, _mode_disp, _mode_diag = _resolve_canonical_adoption_execution_mode(
+            exit_engine, order,
+        )
+        if _mode_disp != "OK":
+            _reason_code = (
+                "CANONICAL_ADOPTION_MODE_CONFLICT"
+                if _mode_disp == "CONFLICT"
+                else "CANONICAL_ADOPTION_MODE_UNPROVEN"
+            )
+            log.critical(
+                "[%s] %s | contract=%s position_id=%s local=%s broker=%s "
+                "order_mode=%s engine_mode=%s — protective monitoring retained; "
+                "no new exit owner created",
+                order.get("client_id"), _reason_code,
+                _contract_for_adopt, position_id,
+                order.get("local_order_id"), order.get("broker_order_id"),
+                _mode_diag.get("order_mode"), _mode_diag.get("engine_mode"),
+            )
+            try:
+                _emit = globals().get("emit_fill_event")
+                if callable(_emit):
+                    _emit(
+                        client_id=order.get("client_id") or "",
+                        event=_reason_code,
+                        payload={
+                            "contract": _contract_for_adopt,
+                            "position_id": position_id,
+                            "local_order_id": order.get("local_order_id"),
+                            "broker_order_id": order.get("broker_order_id"),
+                            "order_mode": _mode_diag.get("order_mode"),
+                            "engine_mode": _mode_diag.get("engine_mode"),
+                        },
+                    )
+            except Exception:
+                pass
+            return
         try:
             _entry_fill_for_adopt = _safe_float(
                 result.get("avg_fill") or order.get("fill_price") or 0.0
@@ -1279,7 +1371,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 entry_fill            = _entry_fill_for_adopt,
                 entry_ts              = _entry_ts_for_adopt,
                 order_filled_ts       = order.get("filled_ts"),
-                execution_mode        = str(order.get("execution_mode") or ""),
+                execution_mode        = _resolved_mode,
                 client_id             = str(order.get("client_id") or ""),
                 underlying_entry      = _underlying_entry_for_adopt,
                 score                 = _safe_float(order.get("score") or 0.0),

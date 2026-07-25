@@ -249,8 +249,12 @@ def _normalize_ticker(ticker: str, option_symbol: str = "") -> str:
     return t
 
 
-def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
-    return _shared_option_profile(pos)
+def _option_profile(pos: "ManagedPosition", *, session_date=None) -> tuple[int, bool, str]:
+    """AMENDMENT (PR #385 review): forwards `session_date` so every
+    DTE-dependent branch inside evaluate_exit — hard-stop AND never-green
+    — consumes the SAME session-date derived from the caller's `now_et`.
+    """
+    return _shared_option_profile(pos, session_date=session_date)
 
 
 @dataclass(frozen=True)
@@ -758,8 +762,17 @@ def _should_replace_hard_ref(
     prior_price,
     candidate_validity,
     candidate_ts,
+    prior_source=None,
+    candidate_source=None,
     now_utc: "Optional[datetime]" = None,
 ) -> bool:
+    """Passthrough to the canonical QPM policy.
+
+    AMENDMENT (PR #385 review): forwards source labels so the shared
+    helper can break equal-timestamp ties by source quality (BID > LAST
+    > MARK > catastrophic ASK).  Older callers that omit source args get
+    the pre-amendment behavior (prior wins at equal ts).
+    """
     try:
         from ap.position_quote_monitor import should_replace_hard_ref
         return should_replace_hard_ref(
@@ -768,6 +781,8 @@ def _should_replace_hard_ref(
             prior_price=prior_price,
             candidate_validity=candidate_validity,
             candidate_ts=candidate_ts,
+            prior_source=prior_source,
+            candidate_source=candidate_source,
             now_utc=now_utc or datetime.now(timezone.utc),
         )
     except Exception:
@@ -1210,12 +1225,15 @@ def _apply_option_quote_for_decision(
         _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
         _prior_price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
         _prior_ts = getattr(pos, "hard_exit_reference_ts", getattr(pos, "hardexitreferencets", None))
+        _prior_source = str(getattr(pos, "hard_exit_reference_source", "") or "")
         _overwrite = _should_replace_hard_ref(
             prior_validity=_prior_validity,
             prior_ts=_prior_ts,
             prior_price=_prior_price,
             candidate_validity=_href.validity,
             candidate_ts=_href.ts,
+            prior_source=_prior_source,
+            candidate_source=_href.source,
             now_utc=_now,
         )
         if not _overwrite:
@@ -2054,7 +2072,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
             if pos.opened_at else 0
         )
-        _dte_ng, _is_idx_ng, _profile_ng = _option_profile(pos)
+        # AMENDMENT (PR #385 review): use the SAME session date that
+        # _effective_thresholds consumed above.  Without this, one
+        # evaluate_exit() call could pick its hard-stop profile from the
+        # supplied now_et and its never-green profile from the host's
+        # wall-clock date — deterministic replays would misclassify DTE.
+        _dte_ng, _is_idx_ng, _profile_ng = _option_profile(
+            pos, session_date=_session_date,
+        )
 
         if _dte_ng == 0 and _is_idx_ng:
             if _age_min < 3:    _ng_stop = -0.12
@@ -4374,12 +4399,18 @@ class APExitEngine:
                         # and by QPM itself) so the newest authoritative
                         # observation always wins and `refresh_needed` is set
                         # instead when we keep the prior reference.
+                        _prior_source = str(
+                            getattr(pos, "hard_exit_reference_source", "") or ""
+                        )
+                        _incoming_source = str(snap.get("hard_exit_reference_source") or "")
                         _apply_incoming = _should_replace_hard_ref(
                             prior_validity=_prior_validity,
                             prior_ts=_prior_ts,
                             prior_price=_prior_price,
                             candidate_validity=_incoming_validity,
                             candidate_ts=_incoming_ts,
+                            prior_source=_prior_source,
+                            candidate_source=_incoming_source,
                             now_utc=_now_utc,
                         )
                         # Legacy safety net: even if the shared gate would
