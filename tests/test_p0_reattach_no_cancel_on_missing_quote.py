@@ -184,31 +184,26 @@ def test_reattach_with_valid_quotes_still_proceeds(monkeypatch):
     assert cancel_spy.call_count == 0
 
 
-def test_legacy_recovery_without_no_cancel_flag_keeps_old_behavior(monkeypatch):
-    """Callers that did NOT request no-cancel protection retain the
-    pre-existing terminalization. This isolates the fix to the explicit
-    #388 REATTACH contract — no global behavior change."""
+def test_non_recovery_arm_does_not_enter_recovery_classifier_at_all(monkeypatch):
+    """Scope documentation: with recovery_rearm=False the LIVE recovery
+    classifier branch (which is where _terminalize_recovery_rearm_candidate
+    lives) is never entered. This test does NOT prove anything about legacy
+    recovery callers — it only documents that the fix is confined to the
+    explicit no-cancel contract path. See
+    test_reattach_with_missing_live_quote_does_not_cancel_existing_order
+    for the actual runtime proof of the fix."""
     w, cancel_spy, add_spy = _make_watcher_for_reattach(
         monkeypatch, quote_bid=0, quote_ask=0,
     )
 
     plan = _reattach_plan()
-    # Do NOT pass no_cancel_on_reject=True. recovery_rearm alone is used.
-    # (Note: the module also normalizes _no_cancel_on_reject to True when
-    # recovery_rearm=True. So to test the truly legacy branch we set
-    # recovery_rearm=False and simulate the older direct rearm caller.)
     plan.metadata["reattach_watcher"] = False
     result = w.watch(
         plan,
-        local_order_id="local-legacy-1",
+        local_order_id="local-non-recovery-1",
         recovery_rearm=False,
         no_cancel_on_reject=False,
     )
-    # The legacy path here does NOT reach the LIVE recovery classifier
-    # (that branch is only entered when recovery_rearm=True). This test
-    # documents that the fix is SCOPED — it does not affect the ordinary
-    # arm-time flow of non-recovery callers.
-    # Verify the fix's target site was NOT reached: cancel_pending_entry
-    # would only be called by _terminalize_recovery_rearm_candidate, which
-    # is unreachable without recovery_rearm=True.
+    # recovery_rearm=False → the whole LIVE recovery classifier branch is
+    # unreachable; _terminalize_recovery_rearm_candidate cannot be called.
     assert cancel_spy.call_count == 0

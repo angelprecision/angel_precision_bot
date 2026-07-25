@@ -2819,10 +2819,17 @@ def _fetch_watching_signals_with_status(client_id: str) -> _FetchWatchingSignals
     by other tests (e.g. test_p0_paper_overnight_rescue_materialization
     reloads this module twice, which invalidates a captured-object
     identity check).
+
+    We use globals() rather than sys.modules[__name__] because
+    importlib.reload creates a NEW module object registered at the same
+    name; a test file that imported this module BEFORE the reload holds
+    an OLD reference and applies monkeypatch.setattr(ov, ...) to the OLD
+    module, while sys.modules[__name__] returns the NEW post-reload
+    module. globals() always returns the namespace of the module this
+    function was DEFINED in — the same one whose _fetch_watching_signals
+    the test just patched.
     """
-    import sys as _sys
-    _mod = _sys.modules[__name__]
-    _current_legacy = getattr(_mod, "_fetch_watching_signals", None)
+    _current_legacy = globals().get("_fetch_watching_signals")
     _is_patched = (
         _current_legacy is not None
         and not getattr(_current_legacy, "_is_original_wrapper", False)
