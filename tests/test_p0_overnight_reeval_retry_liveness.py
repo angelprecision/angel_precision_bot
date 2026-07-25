@@ -327,6 +327,55 @@ def test_already_completed_retries_readiness_after_deadline_when_enforcement_fai
     assert not runner._has_degraded_reason_key("preopen_readiness_enforcement_failed")
 
 
+def test_already_completed_retries_readiness_after_deadline_when_only_blocked_reason_exists(monkeypatch):
+    engine_calls = []
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: engine_calls.append(kwargs)
+        or _result(
+            stalled=False,
+            completed=True,
+            retryable=False,
+            retry_reason=None,
+            result_class="COMPLETED_WITH_DECISIONS",
+        ),
+    )
+    handoff_mod = types.ModuleType("ap.morning_handoff")
+    handoff_mod.run_morning_handoff_audit = lambda **kwargs: {"ok": True}
+    readiness_responses = iter(
+        [
+            {"ok": False, "status": "BLOCKED", "errors": ["watcher_missing"]},
+            {"ok": True, "status": "OK", "errors": []},
+        ]
+    )
+    readiness_mod = types.ModuleType("ap.preopen_readiness")
+    readiness_mod.run_preopen_autonomous_readiness = lambda *args, **kwargs: next(readiness_responses)
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff_mod)
+    monkeypatch.setitem(sys.modules, "ap.preopen_readiness", readiness_mod)
+
+    runner = _runner()
+    runner.mode = "LIVE"
+    runner._run_post_overnight_morning_handoff = cr.ClientRunner._run_post_overnight_morning_handoff.__get__(runner, cr.ClientRunner)
+
+    completed = runner.run_overnight_reeval_attempt(now_et=_dt(9, 30), source="scheduler")
+
+    assert completed["completed"] is True
+    assert completed["readiness_result"]["status"] == "BLOCKED"
+    assert runner.degraded_reasons == {"preopen_readiness_blocked:watcher_missing"}
+    assert len(engine_calls) == 1
+
+    recovered = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert recovered["result_class"] == "ALREADY_COMPLETED"
+    assert recovered["attempt_performed"] is False
+    assert recovered["readiness_result"]["status"] == "OK"
+    assert not runner._has_degraded_reason_key("preopen_readiness_enforcement_failed")
+    assert not runner._has_degraded_reason_key("preopen_readiness_blocked")
+    assert runner.entries_allowed.is_set() is True
+    assert len(engine_calls) == 1
+
+
 def test_recovered_ok_readiness_clears_enforcement_failure_and_blocked(monkeypatch):
     readiness_mod = types.ModuleType("ap.preopen_readiness")
     readiness_mod.run_preopen_autonomous_readiness = lambda *args, **kwargs: {

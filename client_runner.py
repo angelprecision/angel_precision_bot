@@ -2204,7 +2204,10 @@ class ClientRunner(threading.Thread):
                     source=source,
                 )
                 if (
-                    self._has_degraded_reason_key("preopen_readiness_enforcement_failed")
+                    (
+                        self._has_degraded_reason_key("preopen_readiness_enforcement_failed")
+                        or self._has_degraded_reason_key("preopen_readiness_blocked")
+                    )
                     and self._post_overnight_readiness_deadline_reached(now_et)
                 ):
                     result["handoff_result"] = None
