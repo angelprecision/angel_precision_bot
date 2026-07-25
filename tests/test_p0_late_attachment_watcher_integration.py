@@ -37,7 +37,7 @@ def _signal(**overrides):
     return base
 
 
-def _make_watcher(*, side="CALL", trigger=100.0, stop=95.0, state=None):
+def _make_watcher(*, side="CALL", trigger=100.0, stop=95.0, state=None, target=None):
     seed = None
     if state is not None:
         seed = {
@@ -49,7 +49,17 @@ def _make_watcher(*, side="CALL", trigger=100.0, stop=95.0, state=None):
             "raw_bid":              float(trigger) - 0.05,
             "raw_ask":              float(trigger) + 0.05,
         }
-    signal = _signal(side=side, entry_price=trigger, stop_price=stop)
+    # Default target to a value on the correct side of the trigger so the
+    # P0-7 target_complete check does not spuriously fire in tests that
+    # don't care about target. Tests that DO care pass an explicit target.
+    if target is None:
+        if str(side).upper() == "CALL":
+            target = float(trigger) * 1.5     # far above trigger
+        else:
+            target = max(0.01, float(trigger) * 0.5)  # far below trigger
+    signal = _signal(
+        side=side, entry_price=trigger, stop_price=stop, target_price=target,
+    )
     if seed is not None:
         signal["_late_attachment_seed"] = seed
     return ew.WatchedSignal(signal, overnight=False)

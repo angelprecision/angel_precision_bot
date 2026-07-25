@@ -69,34 +69,69 @@ _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
 )
 
 
-def _hydrate_plan_from_signal(signal):
+def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
     """Build a minimal TradePlan-compatible namespace from a WATCHING signal.
     Used when MC rejects on intel/second-score but recheck is disabled —
     the signal was already scanner-approved and has all the fields needed
     for contract deferment + watcher arming.
+
+    P0-5: the plan MUST carry identity + risk fields the watcher reads
+    directly (signal_id, canonical_signal_id, client_id, execution_mode,
+    stop_underlying, target_underlying). Prior implementation dropped these,
+    letting the watcher generate a random signal identity, a blank
+    client_id, and no stop/target — silently manufacturing an identity-free,
+    stop-free watcher when master_control returned an observe-only reject.
     """
     import types as _types
     _trig = float(signal.get("entry_trigger") or 0) or None
+    def _coerce_float(v):
+        try:
+            f = float(v) if v is not None else None
+            return f if f and f > 0 else None
+        except (TypeError, ValueError):
+            return None
+    _stop   = _coerce_float(signal.get("stop_price"))
+    _target = _coerce_float(signal.get("target_price"))
+    _sid    = str(signal.get("signal_id") or "").strip()
+    _canon  = str(
+        signal.get("canonical_signal_id")
+        or _resolve_canonical_signal_id(_sid, signal)
+        or ""
+    ).strip()
+    _mode = str(execution_mode or "").strip().lower() or None
     return _types.SimpleNamespace(
-        ticker          = signal.get("ticker") or signal.get("symbol"),
-        side            = (signal.get("side") or "").upper(),
-        direction       = (signal.get("side") or "").upper(),
-        score           = float(signal.get("score") or 0),
-        timeframe       = str(signal.get("timeframe") or "1d"),
-        entry_trigger   = _trig,
-        trigger_price   = _trig,
-        trigger_type    = "breach",
-        prior_day_high  = signal.get("prior_day_high"),
-        prior_day_low   = signal.get("prior_day_low"),
-        pattern         = signal.get("pattern"),
-        tier            = signal.get("tier"),
-        contract_symbol = None,
-        contracts       = None,
-        limit_price     = None,
-        metadata        = {
+        ticker              = signal.get("ticker") or signal.get("symbol"),
+        side                = (signal.get("side") or "").upper(),
+        direction           = (signal.get("side") or "").upper(),
+        score               = float(signal.get("score") or 0),
+        timeframe           = str(signal.get("timeframe") or "1d"),
+        entry_trigger       = _trig,
+        trigger_price       = _trig,
+        trigger_type        = "breach",
+        prior_day_high      = signal.get("prior_day_high"),
+        prior_day_low       = signal.get("prior_day_low"),
+        pattern             = signal.get("pattern"),
+        tier                = signal.get("tier"),
+        contract_symbol     = None,
+        contracts           = None,
+        limit_price         = None,
+        # Identity + risk fields the watcher reads from the plan.
+        signal_id           = _sid,
+        canonical_signal_id = _canon,
+        client_id           = client_id,
+        execution_mode      = _mode,
+        stop_underlying     = _stop,
+        target_underlying   = _target,
+        metadata            = {
             "overnight":             True,
             "hydrated_from_signal":  True,
             "second_score_mode":     "observe_only",
+            "signal_id":             _sid,
+            "canonical_signal_id":   _canon,
+            "client_id":             client_id,
+            "execution_mode":        _mode,
+            "stop_underlying":       _stop,
+            "target_underlying":     _target,
         },
     )
 
@@ -1955,7 +1990,11 @@ def run_overnight_reeval(
                             "— intel/second-score ignored, using scanner-approved signal",
                             ticker, signal_id, decision.reason,
                         )
-                        _hydrated = _hydrate_plan_from_signal(signal)
+                        _hydrated = _hydrate_plan_from_signal(
+                            signal,
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                        )
                         try:
                             if getattr(decision, "plan", None) is None:
                                 decision.plan = _hydrated
@@ -2008,6 +2047,41 @@ def run_overnight_reeval(
                         result["rejected"] += 1
                         result["terminal_rejected"] += 1
                         continue
+                # ── PR #388 P0-5 plan normalization ──────────────────────
+                # Regardless of whether the plan came from MC or _hydrate_
+                # plan_from_signal, force identity + risk fields to the
+                # canonical scanner values so the watcher never inherits a
+                # random REEVAL: id, a blank client_id, or a missing stop.
+                if getattr(decision, "plan", None) is not None:
+                    _plan = decision.plan
+                    _canon_for_norm = _resolve_canonical_signal_id(signal_id, signal)
+                    _sid_for_norm = str(signal.get("signal_id") or signal_id or "").strip()
+                    setattr(_plan, "signal_id", _sid_for_norm)
+                    setattr(_plan, "canonical_signal_id", _canon_for_norm)
+                    setattr(_plan, "client_id", client_id)
+                    setattr(_plan, "execution_mode", str(_execution_mode).strip().lower())
+                    for _plan_attr, _sig_key in (
+                        ("stop_underlying",   "stop_price"),
+                        ("target_underlying", "target_price"),
+                    ):
+                        if getattr(_plan, _plan_attr, None) in (None, 0, 0.0):
+                            _sv = signal.get(_sig_key)
+                            try:
+                                _sv_f = float(_sv) if _sv is not None else None
+                                if _sv_f and _sv_f > 0:
+                                    setattr(_plan, _plan_attr, _sv_f)
+                            except (TypeError, ValueError):
+                                pass
+                    _meta = getattr(_plan, "metadata", None) or {}
+                    if not isinstance(_meta, dict):
+                        _meta = {}
+                    _meta.update({
+                        "signal_id":           _sid_for_norm,
+                        "canonical_signal_id": _canon_for_norm,
+                        "client_id":           client_id,
+                        "execution_mode":      str(_execution_mode).strip().lower(),
+                    })
+                    setattr(_plan, "metadata", _meta)
             except Exception as mc_exc:
                 log.error("[%s] overnight_reeval: master_control.evaluate failed: %s", ticker, mc_exc)
                 if _paper_rescue_only:

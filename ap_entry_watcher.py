@@ -591,13 +591,25 @@ class WatchedSignal:
                 _pt_is_reset = None
 
             if _pt_classify_late is not None:
+                # PR #388 P0-7: compute target_complete from canonical side.
+                # CALL complete when ask >= target; PUT complete when bid <= target.
+                _tgt_complete = False
+                try:
+                    _tgt = float(self.target_price or 0)
+                    if _tgt > 0:
+                        if self.side == "CALL" and ask > 0 and ask >= _tgt:
+                            _tgt_complete = True
+                        elif self.side == "PUT" and bid > 0 and bid <= _tgt:
+                            _tgt_complete = True
+                except (TypeError, ValueError):
+                    _tgt_complete = False
                 _late_dec = _pt_classify_late(
                     side=self.side,
                     trigger_price=self.entry_trigger,
                     bid=bid,
                     ask=ask,
                     stop=self.stop_level,
-                    target_complete=False,
+                    target_complete=_tgt_complete,
                 )
                 self.late_attachment_last_quote = (
                     float(_late_dec.quote) if _late_dec.quote is not None else None
@@ -3059,6 +3071,8 @@ class APEntryWatcher:
         side = str(signal_dict.get("side", "CALL")).upper()
         ticker = str(signal_dict.get("ticker", "")).upper()
         stop = signal_dict.get("stop_price")
+        # PR #388 P0-7: needed by the arm-time late-attachment gate.
+        target = signal_dict.get("target_price")
 
         # Stamp the recovery flag so add_signal() suppresses cancel_pending_entry.
         if _recovery_rearm:
@@ -3563,13 +3577,24 @@ class APEntryWatcher:
                 TARGET_ALREADY_COMPLETE_TERMINAL as _PT_TARGET_COMPLETE,
                 TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_TRUTH_RETRY,
             )
+            # PR #388 P0-7: compute target_complete from canonical side.
+            _arm_tgt_complete = False
+            try:
+                _tgt = float(target or 0)
+                if _tgt > 0:
+                    if side == "CALL" and _bug_c_ask > 0 and _bug_c_ask >= _tgt:
+                        _arm_tgt_complete = True
+                    elif side == "PUT" and _bug_c_bid > 0 and _bug_c_bid <= _tgt:
+                        _arm_tgt_complete = True
+            except (TypeError, ValueError):
+                _arm_tgt_complete = False
             _late_decision = _pt_classify_late(
                 side=side,
                 trigger_price=float(trigger),
                 bid=_bug_c_bid,
                 ask=_bug_c_ask,
                 stop=stop,
-                target_complete=False,
+                target_complete=_arm_tgt_complete,
                 decisive_drift_exceeded=False,
             )
             _late_cls = _late_decision.classification
