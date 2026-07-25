@@ -124,8 +124,10 @@ def test_waiting_reset_single_poll_below_then_above_does_not_confirm():
 # ── STOP_BROKEN mid-flight ──────────────────────────────────────────────────
 
 def test_stop_broken_during_within_continuation_terminalizes():
+    # CALL stop uses BID. Give bid <= stop (broken) and ask above stop so
+    # only the correct stop-side check can catch it.
     w = _make_watcher(side="CALL", trigger=100, stop=95, state=_WITHIN)
-    st = w.check(bid=94.90, ask=94.95)
+    st = w.check(bid=94.90, ask=95.10)
     assert st == ew.WatchState.INVALIDATED
 
 
@@ -485,8 +487,9 @@ def test_put_arm_time_pre_trigger_then_first_poll_breach_uses_ordinary_path():
 
 def test_stop_broken_during_awaiting_terminalizes():
     w = _make_awaiting_call(trigger=200.0, stop=180.0)
-    # First truthful quote: ask=180.00, at stop — CALL stop broken when ask<=stop.
-    st = w.check(bid=179.95, ask=180.00)
+    # CALL stop uses BID. bid=179.90 (below stop) → broken; ask=180.10 above
+    # stop to prove the bid-side check catches it independently of ask.
+    st = w.check(bid=179.90, ask=180.10)
     assert st == ew.WatchState.INVALIDATED
 
 

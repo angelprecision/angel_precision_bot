@@ -265,20 +265,39 @@ class LateAttachmentDecision:
     detail:               str = ""
 
 
-def _stop_broken(side: str, stop, canonical_quote: Decimal) -> bool:
-    """Stop-broken check evaluated at the canonical quote.
+def _stop_broken(side: str, stop, bid, ask) -> bool:
+    """Stop-broken check evaluated at the correct market side.
 
-    CALL stop broken when canonical_quote (ask) <= stop.
-    PUT  stop broken when canonical_quote (bid) >= stop.
+    Stop invalidation uses the OPPOSITE side from trigger evaluation. Real
+    market spreads mean the trigger side and stop side can disagree:
+
+        CALL: trigger uses ASK, stop uses BID  (bid <= stop = broken)
+        PUT:  trigger uses BID, stop uses ASK  (ask >= stop = broken)
+
+    Passing the canonical trigger quote into a stop check (as the prior
+    implementation did) hides real stop breaks whenever bid/ask disagree:
+
+        CALL stop=195.00  bid=194.90 (broken)  ask=195.10 (not broken)
+        → canonical trigger quote (ask) = 195.10 → falsely reports NOT broken
+
     Missing/zero stop returns False (stop unknown — do not claim it broke).
+    Missing quote on the stop side also returns False (cannot claim a break
+    from a missing tick).
     """
     stop_d = _safe_decimal(stop)
     if stop_d is None or stop_d <= _DEC_ZERO:
         return False
-    if side == "CALL":
-        return canonical_quote <= stop_d
-    if side == "PUT":
-        return canonical_quote >= stop_d
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side == "CALL":
+        stop_quote = _safe_decimal(bid)
+        if stop_quote is None or stop_quote <= _DEC_ZERO:
+            return False
+        return stop_quote <= stop_d
+    if normalized_side == "PUT":
+        stop_quote = _safe_decimal(ask)
+        if stop_quote is None or stop_quote <= _DEC_ZERO:
+            return False
+        return stop_quote >= stop_d
     return False
 
 
@@ -352,7 +371,7 @@ def classify_late_attachment(
 
     canonical_quote = quote_result.value
 
-    if _stop_broken(normalized_side, stop, canonical_quote):
+    if _stop_broken(normalized_side, stop, bid=bid, ask=ask):
         return LateAttachmentDecision(
             classification=STOP_ALREADY_BROKEN_TERMINAL,
             allowed_continuation=allowed,
