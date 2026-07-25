@@ -1352,8 +1352,9 @@ def _classify_existing_protective_owner(
     _contract = str(contract or "").upper().strip()
     _expected_client = str(client_id or "").strip().lower()
     _expected_mode = str(expected_mode or "").strip().lower()
-    if _expected_mode not in {"live", "paper"}:
-        _expected_mode = ""   # no additional mode filter beyond exact live/paper
+    _expected_mode_proven = _expected_mode in {"live", "paper"}
+    if not _expected_mode_proven:
+        _expected_mode = ""
 
     if not _contract or not _expected_client:
         return "NO_OWNER", 0, 0
@@ -1383,18 +1384,38 @@ def _classify_existing_protective_owner(
             # ownership — do NOT count in either bucket.
             continue
         _p_mode = str(getattr(_p, "execution_mode", "") or "").strip().lower()
+        # AMENDMENT (PR #385 review — final owner classification):
+        #
+        # (1) Without a PROVEN expected_mode, we cannot say that any
+        #     same-client/same-contract candidate is THIS fill's owner
+        #     — even a valid-looking live/paper mode is not a proof of
+        #     match.  All such candidates go into the unproven bucket.
+        #
+        # (2) With a proven expected_mode, a candidate with blank /
+        #     malformed / different mode is still unproven; only an
+        #     exact live/paper match on the same mode is proven.
         if _p_mode not in {"live", "paper"}:
             _unproven += 1
             continue
-        if _expected_mode and _p_mode != _expected_mode:
+        if not _expected_mode_proven:
+            _unproven += 1
+            continue
+        if _p_mode != _expected_mode:
             _unproven += 1
             continue
         _proven += 1
 
-    if _proven > 0:
-        return "PROVEN_OWNER", _proven, _unproven
-    if _unproven > 0:
-        return "OWNER_IDENTITY_UNPROVEN", 0, _unproven
+    # AMENDMENT (PR #385 review — final owner classification):
+    # PROVEN_OWNER is only valid when a SINGLE uncontested exact owner
+    # exists.  Duplicate proven owners or mixed proven/unproven states
+    # are ownership ambiguity, not proof; they must escalate through
+    # OWNER_IDENTITY_UNPROVEN.  A protective-monitoring claim requires
+    # exactly one verified responsible party, not "at least one adult in
+    # the room."
+    if _proven == 1 and _unproven == 0:
+        return "PROVEN_OWNER", 1, 0
+    if _proven > 0 or _unproven > 0:
+        return "OWNER_IDENTITY_UNPROVEN", _proven, _unproven
     return "NO_OWNER", 0, 0
 
 

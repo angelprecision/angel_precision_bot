@@ -5545,11 +5545,13 @@ class TestSeedExitEngineResolvedModeThroughFallThrough:
         # Original order must NOT be mutated in-place.
         assert _order["execution_mode"] is None
 
-    def test_conflict_with_existing_repair_keeps_owner_and_uses_base_reason(self, monkeypatch):
-        """Test 4: engine CONFLICT + one existing active repair.  The
-        repair remains the sole owner; the diagnostic uses the base
-        CONFLICT reason (not the _NO_OWNER variant), because monitoring
-        really is retained."""
+    def test_conflict_with_existing_repair_emits_owner_identity_unproven(self, monkeypatch):
+        """Engine CONFLICT + one active same-client repair.  Because the
+        canonical mode cannot be proven, the LIVE repair cannot be
+        classified as THIS fill's owner — emit
+        CANONICAL_ADOPTION_MODE_CONFLICT_OWNER_IDENTITY_UNPROVEN, not
+        the base CONFLICT.  A valid-looking mode is not proof of
+        matching the filled order's mode."""
         import ap.fill_monitor as fm
         adopt_calls = []
         added = []
@@ -5592,9 +5594,9 @@ class TestSeedExitEngineResolvedModeThroughFallThrough:
         )
         assert adopt_calls == [], "adopt must not be called under CONFLICT"
         assert added == [], "no new canonical position must be added"
-        assert "CANONICAL_ADOPTION_MODE_CONFLICT" in audits
-        assert "CANONICAL_ADOPTION_MODE_CONFLICT_NO_OWNER" not in audits
-        assert "CANONICAL_ADOPTION_MODE_CONFLICT" in emits
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT_OWNER_IDENTITY_UNPROVEN" in audits
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT" not in audits
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT_OWNER_IDENTITY_UNPROVEN" in emits
 
 
 class TestSeedExitEngineNoOwnerDiagnostic:
@@ -5821,14 +5823,17 @@ class TestOwnerCheckRequiresExactClientMatch:
                     if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
         assert _payload["proven_owner_count"] == 0
 
-    def test_exact_matching_client_and_mode_counts_as_owner(self, monkeypatch):
-        """Under the tightened classifier, a same-client-same-contract
-        position ONLY counts as PROVEN when its execution_mode is
-        exactly "live" or "paper" too."""
+    def test_exact_client_and_mode_still_unproven_without_expected_mode(self, monkeypatch):
+        """When the resolver cannot prove a canonical mode, even a valid
+        same-client-same-contract live/paper candidate is unproven
+        against THIS fill.  Emit the _OWNER_IDENTITY_UNPROVEN suffix,
+        not the base reason.  (The base reason is reserved for the
+        singular-uncontested-and-mode-matched case, which cannot exist
+        when expected mode is blank.)"""
         class _Position:
             option_symbol = "BAC260724P00062000"
             client_id = "jasoncosby1@gmail.com"
-            execution_mode = "live"   # exact live proves ownership identity
+            execution_mode = "live"
             closed = False
         fm, eng, audits, emits, adopt_calls, added = self._install(
             monkeypatch, [_Position()],
@@ -5837,12 +5842,11 @@ class TestOwnerCheckRequiresExactClientMatch:
                              {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
         assert added == []
         _reasons = [a[0] for a in audits]
-        assert "CANONICAL_ADOPTION_MODE_UNPROVEN" in _reasons
-        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" not in _reasons
-        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_OWNER_IDENTITY_UNPROVEN" not in _reasons
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_OWNER_IDENTITY_UNPROVEN" in _reasons
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN" not in _reasons
         _payload = [a[1] for a in audits
-                    if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN"][0]
-        assert _payload["proven_owner_count"] == 1
+                    if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_OWNER_IDENTITY_UNPROVEN"][0]
+        assert _payload["unproven_owner_count"] == 1
 
     def test_same_client_different_contract_does_not_count(self, monkeypatch):
         class _Position:
@@ -5983,13 +5987,49 @@ class TestClassifyExistingProtectiveOwner:
         )])
         assert s == "NO_OWNER"
 
-    def test_no_expected_mode_accepts_either_livepaper(self):
+    def test_no_expected_mode_never_returns_proven(self):
+        """AMENDMENT: without a PROVEN expected_mode, even a valid
+        live/paper candidate cannot be classified as this fill's
+        owner — the relationship is unproven."""
         s, p, u = self._classify([_Pos(
             option_symbol="BAC260724P00062000",
             client_id="jasoncosby1@gmail.com",
             execution_mode="paper",
         )], expected_mode="")
-        assert (s, p, u) == ("PROVEN_OWNER", 1, 0)
+        assert (s, p, u) == ("OWNER_IDENTITY_UNPROVEN", 0, 1)
+
+    def test_no_expected_mode_valid_live_candidate_is_unproven(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+        )], expected_mode="")
+        assert (s, p, u) == ("OWNER_IDENTITY_UNPROVEN", 0, 1)
+
+    def test_one_proven_and_one_blank_mode_is_unproven(self):
+        """Mixed proven + unproven means ambiguity, not safety."""
+        s, p, u = self._classify([
+            _Pos(option_symbol="BAC260724P00062000",
+                 client_id="jasoncosby1@gmail.com",
+                 execution_mode="live"),
+            _Pos(option_symbol="BAC260724P00062000",
+                 client_id="jasoncosby1@gmail.com",
+                 execution_mode=""),
+        ], expected_mode="live")
+        assert (s, p, u) == ("OWNER_IDENTITY_UNPROVEN", 1, 1)
+
+    def test_two_proven_owners_is_unproven(self):
+        """Duplicate proven owners are ambiguity, not proof of one
+        verified responsible party."""
+        s, p, u = self._classify([
+            _Pos(option_symbol="BAC260724P00062000",
+                 client_id="jasoncosby1@gmail.com",
+                 execution_mode="live"),
+            _Pos(option_symbol="BAC260724P00062000",
+                 client_id="jasoncosby1@gmail.com",
+                 execution_mode="live"),
+        ], expected_mode="live")
+        assert s == "OWNER_IDENTITY_UNPROVEN" and p == 2
 
     def test_lookup_exception_yields_lookup_failed(self, monkeypatch):
         from ap.fill_monitor import _classify_existing_protective_owner
@@ -6223,3 +6263,124 @@ class TestOwnerClassifierAppliedOnEveryFailurePath:
         assert any(
             r.endswith("_OWNER_LOOKUP_FAILED") for r in _reasons
         ), f"expected _OWNER_LOOKUP_FAILED; got {_reasons}"
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — real-path OWNER_IDENTITY_UNPROVEN emissions)
+# =============================================================================
+
+
+class TestOwnerIdentityUnprovenRealPaths:
+    """A valid-looking candidate with an unresolvable / conflicting mode
+    is NOT protective monitoring for this fill.  These real-path cases
+    exercise the mode-fail branch through _seed_exit_engine and prove
+    the resulting reason code carries the _OWNER_IDENTITY_UNPROVEN
+    suffix (not the bare base reason)."""
+
+    def _order(self, exec_mode=None):
+        return {
+            "client_id": "jasoncosby1@gmail.com",
+            "contract": "BAC260724P00062000",
+            "symbol": "BAC260724P00062000",
+            "local_order_id": "L1", "broker_order_id": "B1",
+            "signal_id": "sig-1",
+            "execution_mode": exec_mode,
+            "qty": 1,
+        }
+
+    def _install(self, monkeypatch, *, mode_status, mode_value="", actives):
+        import ap.fill_monitor as fm
+        audits, emits = [], []
+        monkeypatch.setattr(fm, "audit",
+                            lambda cid, lvl, evt, payload: audits.append((evt, payload)))
+        monkeypatch.setattr(fm, "emit_fill_event",
+                            lambda o, **kw: emits.append(kw) or True)
+
+        adopt_calls, added = [], []
+        _actives = list(actives)
+        _status = mode_status
+        _value = mode_value
+
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": _value, "status": _status, "sources": {}}
+            def _resolved_execution_mode(self):
+                return _value if _status == "PROVEN" else ""
+            def adopt_canonical_position_identity(self_, **kw):
+                adopt_calls.append(kw)
+                class _R: disposition = "ADOPTED"
+                return _R()
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return list(_actives)
+            def add_position(self_, pos): added.append(pos)
+            _email = "jasoncosby1@gmail.com"
+
+        return fm, _E(), audits, emits, adopt_calls, added
+
+    def test_conflict_with_wrong_mode_owner_is_unproven(self, monkeypatch):
+        """Order LIVE, engine CONFLICT (master=paper, broker=live), PAPER
+        candidate exists.  A PAPER position cannot be this LIVE fill's
+        owner — emit _OWNER_IDENTITY_UNPROVEN, not the base CONFLICT."""
+        fm, eng, audits, emits, adopt_calls, added = self._install(
+            monkeypatch,
+            mode_status="CONFLICT", mode_value="",
+            actives=[_Pos(
+                option_symbol="BAC260724P00062000",
+                client_id="jasoncosby1@gmail.com",
+                execution_mode="paper",
+            )],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(exec_mode="live"),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert adopt_calls == []
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT_OWNER_IDENTITY_UNPROVEN" in _reasons, (
+            f"expected _OWNER_IDENTITY_UNPROVEN suffix; got {_reasons}"
+        )
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT" not in _reasons
+
+    def test_unproven_engine_with_live_candidate_is_unproven(self, monkeypatch):
+        """Order mode blank, engine UNPROVEN, a same-client LIVE candidate
+        exists.  Its mode looks valid but its relationship to this fill
+        is unproven — emit _OWNER_IDENTITY_UNPROVEN."""
+        fm, eng, audits, emits, adopt_calls, added = self._install(
+            monkeypatch,
+            mode_status="UNPROVEN", mode_value="",
+            actives=[_Pos(
+                option_symbol="BAC260724P00062000",
+                client_id="jasoncosby1@gmail.com",
+                execution_mode="live",
+            )],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(exec_mode=None),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_OWNER_IDENTITY_UNPROVEN" in _reasons, (
+            f"expected _OWNER_IDENTITY_UNPROVEN suffix; got {_reasons}"
+        )
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN" not in _reasons
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" not in _reasons
+
+    def test_one_exact_and_one_blank_mode_owner_is_unproven(self, monkeypatch):
+        """Even under a proven-mode failure path, a mixed candidate set
+        (one exact live + one blank-mode) is ambiguity, not proof."""
+        fm, eng, audits, emits, _adopt, added = self._install(
+            monkeypatch,
+            mode_status="CONFLICT", mode_value="",
+            actives=[
+                _Pos(option_symbol="BAC260724P00062000",
+                     client_id="jasoncosby1@gmail.com",
+                     execution_mode="live"),
+                _Pos(option_symbol="BAC260724P00062000",
+                     client_id="jasoncosby1@gmail.com",
+                     execution_mode=""),
+            ],
+        )
+        fm._seed_exit_engine(eng, "canon-p", self._order(exec_mode="live"),
+                             {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
+        assert added == []
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT_OWNER_IDENTITY_UNPROVEN" in _reasons
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT" not in _reasons
