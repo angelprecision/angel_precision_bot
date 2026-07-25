@@ -1856,90 +1856,73 @@ class ClientRunner(threading.Thread):
         source: str,
         result_class: str,
     ) -> dict | None:
-        """PR #388 centralized deadline-enforced readiness.
+        """PR #388 centralized fail-closed deadline-enforced readiness.
 
         Called from every early-return path in run_overnight_reeval_attempt
         so that no incomplete or suppressed state can bypass LIVE readiness
         enforcement once the NYSE-aware deadline is active.
 
-        Skips (returns None) when any of the following is true:
+        Two hard skips (return None) — pure state reads, cannot themselves
+        fail the fail-closed contract:
           - not an NYSE trading day (weekend or observed holiday);
-          - overnight reeval already succeeded for today;
-          - the readiness enforcement window is not yet active
-            (pre-deadline retries are legitimate);
-          - preopen_readiness cannot be imported (best-effort scheduler tick).
+          - overnight reeval already succeeded for today.
 
-        Runs otherwise:
-          - LIVE + status=BLOCKED → _enter_degraded_mode with the readiness
-            error list;
-          - LIVE + status=OK → clear preopen_readiness_blocked degraded key;
-          - LIVE + readiness exception → fail closed via _enter_degraded_mode
-            with reason 'preopen_readiness_enforcement_failed:<exc>'. Merely
-            logging the exception would allow entries_allowed to remain True
-            despite unverified pre-open watcher ownership.
+        Every other step — importing preopen_readiness, evaluating the
+        deadline predicate, running readiness, validating the returned
+        object is a dict, interpreting `status` and `ok` — is wrapped in
+        one fail-closed guard. Any exception or malformed return after
+        the deadline:
+          - LIVE  → _enter_degraded_mode('preopen_readiness_enforcement_failed:<type>:<msg>')
+                    Returns a synthetic {status:'ERROR', fail_closed:True} dict.
+          - PAPER → diagnostic ERROR, no degrade transition.
 
-        Returns the readiness dict (or a synthetic ERROR dict on exception)
-        so callers can stamp it on their result payload. Returns None when
-        enforcement was skipped.
+        Six doors locked is not enough; the emergency exit at the module
+        boundary (import failure), the predicate call (_readiness_enforcement_active
+        raising), and the return-shape validation (readiness.get(...) on
+        None) must also be fail-closed for LIVE. Otherwise a supabase
+        import outage, a preopen_readiness bug that raises on the predicate
+        call, or a stub that returns None all keep entries_allowed=True
+        despite unverified pre-open watcher ownership.
+
+        Two skip cases that DO count as "enforcement happened cleanly":
+          - readiness module import succeeds AND deadline predicate returns
+            False (pre-deadline retries are legitimate) → returns None.
+          - readiness runs OK past deadline → returns the readiness dict,
+            LIVE clears any prior preopen_readiness_blocked degraded key.
         """
+        # Skip #1: non-trading day. Pure state read via NYSE calendar.
+        # Import failure here falls back to weekday-only — matches the
+        # runner's own precheck.
         try:
             from ap.flatline_alarm import is_trading_day as _nyse_is_trading_day
             if not bool(_nyse_is_trading_day(now_et.date())):
                 return None
         except Exception:
-            # Fail-safe: calendar unavailable → fall back to weekday-only so
-            # scheduler ticks during weekends still no-op.
             if now_et.weekday() >= 5:
                 return None
 
+        # Skip #2: overnight reeval already confirmed successful today.
+        # Success means watchers armed + completion path already ran
+        # readiness through _run_post_overnight_morning_handoff.
         if self._overnight_reeval_success_date == today:
             return None
 
-        try:
-            from ap.preopen_readiness import (
-                _readiness_enforcement_active as _pre_ready_active,
-                run_preopen_autonomous_readiness as _pre_ready_run,
-            )
-        except Exception as _imp_exc:
-            logger.error(
-                "[%s] POST_OVERNIGHT_READINESS_IMPORT_FAILED source=%s "
-                "result_class=%s: %s",
-                self.email, source, result_class, _imp_exc,
-            )
-            return None
-
-        if not _pre_ready_active(now_et):
-            return None
-
-        stage_label = f"post_overnight_reeval_deadline:{result_class or 'unknown'}"
-        logger.warning(
-            "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCED source=%s "
-            "result_class=%s stage=%s — running preopen_readiness despite "
-            "incomplete/suppressed overnight reeval",
-            self.email, source, result_class, stage_label,
-        )
         is_live = str(self.mode).lower() == "live"
-        try:
-            readiness = _pre_ready_run(
-                self.email,
-                self.mode,
-                dry_run=False,
-                stage=stage_label,
-                runner=self,
-            )
-        except Exception as _ready_exc:
+        stage_label = f"post_overnight_reeval_deadline:{result_class or 'unknown'}"
+
+        def _fail_closed(exc_kind: str, exc_msg: str, *, exc_info=None) -> dict:
+            """Common fail-closed exit: log CRITICAL, degrade LIVE, return
+            synthetic ERROR readiness dict."""
             logger.error(
-                "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCEMENT_RAISED "
-                "source=%s result_class=%s: %s",
-                self.email, source, result_class, _ready_exc, exc_info=True,
+                "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCEMENT_FAILED "
+                "source=%s result_class=%s kind=%s: %s",
+                self.email, source, result_class, exc_kind, exc_msg,
+                exc_info=exc_info,
             )
-            # Fail closed on LIVE: an enforcement raise cannot be allowed to
-            # leave entries_allowed=True. Enter degraded mode explicitly.
             if is_live:
                 try:
                     self._enter_degraded_mode(
-                        "preopen_readiness_enforcement_failed:"
-                        f"{type(_ready_exc).__name__}:{_ready_exc}"
+                        f"preopen_readiness_enforcement_failed:{exc_kind}:{exc_msg}"
                     )
                 except Exception as _deg_exc:
                     logger.critical(
@@ -1950,20 +1933,117 @@ class ClientRunner(threading.Thread):
             return {
                 "ok": False,
                 "status": "ERROR",
-                "error": str(_ready_exc),
+                "error": exc_msg,
                 "enforcement_stage": stage_label,
                 "fail_closed": is_live,
+                "failure_kind": exc_kind,
             }
 
-        if is_live:
-            if readiness.get("status") == "BLOCKED":
-                self._enter_degraded_mode(
-                    "preopen_readiness_blocked:"
-                    + ",".join(readiness.get("errors") or ["unknown"])
+        # ── Single fail-closed guard covering import, predicate, run, and
+        #    return-shape validation. Any raise, any None return, any dict
+        #    missing status/ok — all funnel through _fail_closed for LIVE.
+        try:
+            # Step A: import readiness module.
+            try:
+                from ap.preopen_readiness import (
+                    _readiness_enforcement_active as _pre_ready_active,
+                    run_preopen_autonomous_readiness as _pre_ready_run,
                 )
-            elif readiness.get("ok"):
-                self._clear_degraded_reason_key("preopen_readiness_blocked")
-        return readiness
+            except Exception as _imp_exc:
+                return _fail_closed(
+                    "preopen_readiness_import_failed",
+                    f"{type(_imp_exc).__name__}:{_imp_exc}",
+                    exc_info=True,
+                )
+
+            # Step B: evaluate the deadline predicate. Must not escape.
+            try:
+                _active = _pre_ready_active(now_et)
+            except Exception as _pred_exc:
+                return _fail_closed(
+                    "readiness_deadline_predicate_raised",
+                    f"{type(_pred_exc).__name__}:{_pred_exc}",
+                    exc_info=True,
+                )
+            if not _active:
+                # Legitimate pre-deadline retry window. This is NOT a fail
+                # case — return None so the caller records
+                # POST_OVERNIGHT_HANDOFF_DEFERRED instead of an ERROR.
+                return None
+
+            logger.warning(
+                "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCED source=%s "
+                "result_class=%s stage=%s — running preopen_readiness despite "
+                "incomplete/suppressed overnight reeval",
+                self.email, source, result_class, stage_label,
+            )
+
+            # Step C: run readiness. Exceptions handled inline below.
+            try:
+                readiness = _pre_ready_run(
+                    self.email,
+                    self.mode,
+                    dry_run=False,
+                    stage=stage_label,
+                    runner=self,
+                )
+            except Exception as _run_exc:
+                return _fail_closed(
+                    "run_preopen_autonomous_readiness_raised",
+                    f"{type(_run_exc).__name__}:{_run_exc}",
+                    exc_info=True,
+                )
+
+            # Step D: validate return shape. None or non-dict is malformed.
+            if not isinstance(readiness, dict):
+                return _fail_closed(
+                    "readiness_return_not_a_dict",
+                    f"type={type(readiness).__name__} value={readiness!r}",
+                )
+            # A dict is required to carry BOTH status and ok, or neither can
+            # be interpreted safely for the LIVE gate. Missing status is
+            # malformed.
+            if "status" not in readiness:
+                return _fail_closed(
+                    "readiness_return_missing_status",
+                    f"keys={sorted(list(readiness.keys()))!r}",
+                )
+
+            # Step E: interpret the result. Guarded because .get() on values
+            # a downstream stub may have set to non-str is fine, but the
+            # comparison itself could still raise on adversarial subclasses.
+            try:
+                _status = readiness.get("status")
+                _ok     = bool(readiness.get("ok"))
+                if is_live:
+                    if _status == "BLOCKED":
+                        _err_list = readiness.get("errors") or ["unknown"]
+                        self._enter_degraded_mode(
+                            "preopen_readiness_blocked:"
+                            + ",".join(str(e) for e in _err_list)
+                        )
+                    elif _ok:
+                        self._clear_degraded_reason_key("preopen_readiness_blocked")
+            except Exception as _interp_exc:
+                return _fail_closed(
+                    "readiness_result_interpretation_raised",
+                    f"{type(_interp_exc).__name__}:{_interp_exc}",
+                    exc_info=True,
+                )
+
+            return readiness
+
+        except Exception as _guard_exc:
+            # Belt-and-suspenders: any exception that somehow escapes the
+            # inner guards must still fail closed for LIVE. Should be
+            # unreachable given the per-step handlers above, but the
+            # contract demands that no fail-open path exist between
+            # NYSE-day/success skip and return.
+            return _fail_closed(
+                "readiness_enforcement_unhandled_exception",
+                f"{type(_guard_exc).__name__}:{_guard_exc}",
+                exc_info=True,
+            )
 
     def run_overnight_reeval_attempt(
         self,

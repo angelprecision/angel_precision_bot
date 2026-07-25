@@ -65,8 +65,13 @@ class _FakeReadiness:
         self.result_status = "BLOCKED"
         self.result_errors = ["overnight_reeval_missing"]
         self.raise_on_call = None  # Exception instance or None
+        # NEW: fail-closed audit surfaces.
+        self.raise_on_predicate = None      # Exception → _readiness_enforcement_active raises
+        self.return_shape_override = None   # (marker, value) — replace readiness return
 
     def _readiness_enforcement_active(self, now=None):
+        if self.raise_on_predicate is not None:
+            raise self.raise_on_predicate
         return self.enforcement_active
 
     def run_preopen_autonomous_readiness(self, client_id, mode, *,
@@ -76,6 +81,10 @@ class _FakeReadiness:
         })
         if self.raise_on_call is not None:
             raise self.raise_on_call
+        if self.return_shape_override is not None:
+            marker, value = self.return_shape_override
+            if marker == "value":
+                return value
         return {
             "ok":     self.result_status == "OK",
             "status": self.result_status,
@@ -369,3 +378,150 @@ def test_readiness_ok_clears_prior_preopen_readiness_blocked_key(rr_env):
     assert result["result_class"] == "RETRY_EXHAUSTED"
     assert "preopen_readiness_blocked" in runner._cleared_keys
     assert runner._entered_degraded == []
+
+
+# ─── Fail-closed guards: the entire operation is protected, not just run() ───
+
+def test_readiness_module_import_failure_after_deadline_live_fails_closed(rr_env, monkeypatch):
+    """When `import ap.preopen_readiness` fails inside the helper (supabase
+    outage, packaging bug, etc.), LIVE must still enter degraded mode via
+    _enter_degraded_mode('preopen_readiness_enforcement_failed:*'). Merely
+    returning None (prior behavior) left entries_allowed=True."""
+    cr, fake_ready, _ = rr_env
+    # Force the import statement inside the helper to raise.
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "ap.preopen_readiness", None)
+
+    runner = _mk_runner(cr, mode="live")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+
+    assert result["result_class"] == "RETRY_EXHAUSTED"
+    assert result.get("readiness_result", {}).get("status") == "ERROR"
+    assert result["readiness_result"].get("failure_kind") == "preopen_readiness_import_failed"
+    assert result["readiness_result"].get("fail_closed") is True
+    assert any(
+        r.startswith("preopen_readiness_enforcement_failed:preopen_readiness_import_failed:")
+        for r in runner._entered_degraded
+    ), (
+        f"LIVE must fail closed on readiness import failure; got "
+        f"{runner._entered_degraded!r}"
+    )
+
+
+def test_readiness_module_import_failure_paper_does_not_degrade(rr_env, monkeypatch):
+    """PAPER never degrades on import failure — diagnostic ERROR only."""
+    cr, fake_ready, _ = rr_env
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "ap.preopen_readiness", None)
+
+    runner = _mk_runner(cr, mode="paper")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+    assert result["result_class"] == "RETRY_EXHAUSTED"
+    assert result["readiness_result"].get("status") == "ERROR"
+    assert result["readiness_result"].get("fail_closed") is False
+    assert runner._entered_degraded == []
+
+
+def test_readiness_deadline_predicate_raises_live_fails_closed(rr_env):
+    """If _readiness_enforcement_active() itself raises, prior behavior let
+    the exception propagate up and be logged nonfatally by the scheduler
+    wrapper without _enter_degraded_mode. Now LIVE must degrade."""
+    cr, fake_ready, _ = rr_env
+    fake_ready.raise_on_predicate = ValueError("bad tz value")
+
+    runner = _mk_runner(cr, mode="live")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+
+    assert result["result_class"] == "RETRY_EXHAUSTED"
+    assert result.get("readiness_result", {}).get("status") == "ERROR"
+    assert result["readiness_result"].get("failure_kind") == "readiness_deadline_predicate_raised"
+    assert result["readiness_result"].get("fail_closed") is True
+    assert any(
+        r.startswith("preopen_readiness_enforcement_failed:readiness_deadline_predicate_raised:")
+        for r in runner._entered_degraded
+    )
+    # Predicate raise short-circuits: readiness function itself never runs.
+    assert fake_ready.calls == []
+
+
+def test_readiness_deadline_predicate_raises_paper_does_not_degrade(rr_env):
+    """PAPER stays diagnostic-only on predicate raise."""
+    cr, fake_ready, _ = rr_env
+    fake_ready.raise_on_predicate = RuntimeError("boom")
+
+    runner = _mk_runner(cr, mode="paper")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+    assert result["readiness_result"].get("status") == "ERROR"
+    assert runner._entered_degraded == []
+
+
+def test_readiness_returns_none_live_fails_closed(rr_env):
+    """A malformed readiness return of None was previously blown up by
+    readiness.get(...) outside any try/except, propagating out and getting
+    logged nonfatally. LIVE must now fail closed with
+    readiness_return_not_a_dict."""
+    cr, fake_ready, _ = rr_env
+    fake_ready.return_shape_override = ("value", None)
+
+    runner = _mk_runner(cr, mode="live")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+
+    assert result["result_class"] == "RETRY_EXHAUSTED"
+    assert result["readiness_result"].get("status") == "ERROR"
+    assert result["readiness_result"].get("failure_kind") == "readiness_return_not_a_dict"
+    assert result["readiness_result"].get("fail_closed") is True
+    assert any(
+        r.startswith("preopen_readiness_enforcement_failed:readiness_return_not_a_dict:")
+        for r in runner._entered_degraded
+    )
+
+
+def test_readiness_returns_dict_missing_status_live_fails_closed(rr_env):
+    """A partial-shape dict (missing 'status') is not safe to interpret.
+    LIVE must fail closed with readiness_return_missing_status."""
+    cr, fake_ready, _ = rr_env
+    fake_ready.return_shape_override = ("value", {"ok": True, "errors": []})  # no 'status'
+
+    runner = _mk_runner(cr, mode="live")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+
+    assert result["readiness_result"].get("failure_kind") == "readiness_return_missing_status"
+    assert result["readiness_result"].get("fail_closed") is True
+    assert any(
+        r.startswith("preopen_readiness_enforcement_failed:readiness_return_missing_status:")
+        for r in runner._entered_degraded
+    )
+
+
+def test_readiness_returns_wrong_type_str_live_fails_closed(rr_env):
+    """A non-dict return of any type must fail closed. This covers stubs
+    that inadvertently return a string, list, or dataclass without the
+    expected shape."""
+    cr, fake_ready, _ = rr_env
+    fake_ready.return_shape_override = ("value", "OK")  # bare string
+
+    runner = _mk_runner(cr, mode="live")
+    now_et = _et_time(9, 35, cr)
+    runner._overnight_reeval_exhausted_date = now_et.date()
+
+    result = runner.run_overnight_reeval_attempt(force=False, source="tick", now_et=now_et)
+    assert result["readiness_result"].get("failure_kind") == "readiness_return_not_a_dict"
+    assert result["readiness_result"].get("fail_closed") is True
