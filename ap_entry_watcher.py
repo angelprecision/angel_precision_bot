@@ -4095,57 +4095,158 @@ class APEntryWatcher:
                     )
                     to_remove.append(w)
                 else:
-                    # ── P0 (PR #304) Bug D fix ─────────────────────────────
-                    # Daily validator confirmed structural validity, but the
-                    # validator does NOT check whether price already crossed
-                    # the trigger premarket / before watcher armed. Fetch a
-                    # live quote and reject the arm if the setup is already
-                    # through trigger — never arm a watcher on a move that
-                    # already happened. This is the exact "trigger happened
-                    # before bot armed" scenario the audit flags as dangerous.
+                    # ── PR #388 Block-2 fix (P0-6) ────────────────────────
+                    # The daily validator confirmed structural validity. Fetch
+                    # a live quote and consult the canonical late-attachment
+                    # classifier — the SAME one used at regular-session arm
+                    # time. Never re-implement the trigger continuation policy
+                    # here. Six outcomes drive one of five actions:
+                    #   * pre-trigger (TRUTH_RETRY + valid quote): ordinary arm
+                    #   * WITHIN_CONTINUATION: seed WITHIN
+                    #   * WAITING_RESET: seed WAITING
+                    #   * TRUTH_RETRY + quote is None (missing canonical or
+                    #     both bid/ask zero): seed AWAITING_FIRST_TRUTH
+                    #   * STOP_BROKEN/TARGET_COMPLETE/MOVE_MISSED: terminal
+                    # In every non-terminal path we set overnight=False and
+                    # hand control to the normal poll loop.
                     _bug_d_quote = self._get_quote(w.ticker) or {}
                     _bug_d_bid = float(_bug_d_quote.get("bid") or 0)
                     _bug_d_ask = float(_bug_d_quote.get("ask") or 0)
-                    if self._is_already_through_trigger(
-                        w.side, w.entry_trigger, _bug_d_bid, _bug_d_ask,
-                    ):
-                        _bug_d_mid = (_bug_d_bid + _bug_d_ask) / 2.0 if (_bug_d_bid and _bug_d_ask) else max(_bug_d_bid, _bug_d_ask)
-                        _bug_d_audit = self._build_watcher_audit_payload(
+
+                    # PR #388 P0-7 wiring: target complete uses the canonical
+                    # underlying side. CALL: ask >= target. PUT: bid <= target.
+                    _bug_d_target_complete = False
+                    try:
+                        _tgt = float(w.target_price or 0)
+                        if _tgt > 0:
+                            if w.side == "CALL" and _bug_d_ask > 0 and _bug_d_ask >= _tgt:
+                                _bug_d_target_complete = True
+                            elif w.side == "PUT" and _bug_d_bid > 0 and _bug_d_bid <= _tgt:
+                                _bug_d_target_complete = True
+                    except (TypeError, ValueError):
+                        _bug_d_target_complete = False
+
+                    try:
+                        from ap.pending_trigger_classifier import (
+                            classify_late_attachment as _pt_classify_late_open,
+                            LATE_ATTACHMENT_AWAITING_FIRST_TRUTH as _PT_OPEN_AWAITING,
+                            LATE_ATTACHMENT_WITHIN_CONTINUATION as _PT_OPEN_WITHIN,
+                            MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET as _PT_OPEN_WAITING,
+                            LATE_ATTACHMENT_MOVE_MISSED_TERMINAL as _PT_OPEN_MISSED,
+                            STOP_ALREADY_BROKEN_TERMINAL as _PT_OPEN_STOP,
+                            TARGET_ALREADY_COMPLETE_TERMINAL as _PT_OPEN_TARGET,
+                            TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_OPEN_RETRY,
+                        )
+                    except Exception:
+                        _pt_classify_late_open = None
+                        _PT_OPEN_AWAITING = _PT_OPEN_WITHIN = _PT_OPEN_WAITING = None
+                        _PT_OPEN_MISSED = _PT_OPEN_STOP = _PT_OPEN_TARGET = _PT_OPEN_RETRY = None
+
+                    if _pt_classify_late_open is None:
+                        # Classifier import failed. Fail open (arm normally) —
+                        # never fall back to the old binary rule that this
+                        # amendment exists to eliminate.
+                        w.overnight = False
+                        w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
+                        log.warning(
+                            "[%s] OVERNIGHT_DAILY_ARMED (classifier import failed; arming normally) "
+                            "side=%s trigger=%.4f",
+                            w.ticker, w.side, w.entry_trigger,
+                        )
+                        continue
+
+                    _open_decision = _pt_classify_late_open(
+                        side=w.side,
+                        trigger_price=w.entry_trigger,
+                        bid=_bug_d_bid,
+                        ask=_bug_d_ask,
+                        stop=w.stop_level,
+                        target_complete=_bug_d_target_complete,
+                        decisive_drift_exceeded=False,
+                    )
+                    _open_cls = _open_decision.classification
+
+                    if _open_cls in (_PT_OPEN_STOP, _PT_OPEN_TARGET, _PT_OPEN_MISSED):
+                        _open_reason_map = {
+                            _PT_OPEN_STOP:   "stop_already_broken_terminal",
+                            _PT_OPEN_TARGET: "target_already_complete_terminal",
+                            _PT_OPEN_MISSED: "late_attachment_move_missed_terminal",
+                        }
+                        _open_reason = _open_reason_map[_open_cls]
+                        _open_mid = (_bug_d_bid + _bug_d_ask) / 2.0 if (_bug_d_bid and _bug_d_ask) else max(_bug_d_bid, _bug_d_ask)
+                        _open_audit = self._build_watcher_audit_payload(
                             w,
-                            trigger_type="overnight_revalidation",
+                            trigger_type="overnight_revalidation_late_attachment",
                             current_bid=_bug_d_bid,
                             current_ask=_bug_d_ask,
-                            current_mid=_bug_d_mid,
+                            current_mid=_open_mid,
                             arm_condition=f"trigger_{w.entry_trigger:.4f}",
-                            reason_code="overnight_daily_already_through_trigger",
+                            reason_code=_open_reason,
                             raw_reason=(
-                                f"side_{w.side}_ask_{_bug_d_ask:.4f}_bid_{_bug_d_bid:.4f}"
-                                f"_already_through_trigger_{w.entry_trigger:.4f}"
-                                f"_at_daily_valid_arm_time"
+                                f"open_revalidation:{_open_cls}:"
+                                f"{_open_decision.detail}"
                             ),
-                            extra={"is_daily": True, "validator_valid": True},
+                            extra={
+                                "is_daily": True, "validator_valid": True,
+                                "open_late_attachment_class": _open_cls,
+                            },
                         )
                         self._persist_watcher_audit(
-                            w.signal.get("local_order_id"), _bug_d_audit,
+                            w.signal.get("local_order_id"), _open_audit,
                         )
                         w.state = WatchState.EXPIRED
                         w.signal["queue_status"] = OvernightWatchState.INVALIDATED
                         log.warning(
-                            "[%s] OVERNIGHT_DAILY_ALREADY_THROUGH_TRIGGER — "
-                            "validator valid but %s already crossed trigger $%.4f "
-                            "(bid=%.4f ask=%.4f). Move done; refusing to arm.",
-                            w.ticker, w.side, w.entry_trigger, _bug_d_bid, _bug_d_ask,
+                            "[%s] OVERNIGHT_DAILY_%s — %s trigger=%.4f "
+                            "bid=%.4f ask=%.4f detail=%s",
+                            w.ticker, _open_reason.upper(),
+                            w.side, w.entry_trigger,
+                            _bug_d_bid, _bug_d_ask, _open_decision.detail,
                         )
                         to_remove.append(w)
                     else:
+                        # Non-terminal: seed the appropriate late-attachment
+                        # state so the poll loop's gate owns confirmation,
+                        # and hand off to the normal poll loop.
+                        if _open_cls == _PT_OPEN_WITHIN:
+                            w.late_attachment_state = _PT_OPEN_WITHIN
+                            w.late_confirm_polls = 0
+                            w.late_attachment_generation += 1
+                            log.info(
+                                "[%s] OVERNIGHT_DAILY_ARMED_WITHIN_CONTINUATION — "
+                                "%s trigger=%.4f quote=%s (poll loop owns confirmation)",
+                                w.ticker, w.side, w.entry_trigger, _open_decision.quote,
+                            )
+                        elif _open_cls == _PT_OPEN_WAITING:
+                            w.late_attachment_state = _PT_OPEN_WAITING
+                            w.late_reset_polls = 0
+                            w.late_attachment_generation += 1
+                            log.info(
+                                "[%s] OVERNIGHT_DAILY_ARMED_WAITING_RESET — "
+                                "%s trigger=%.4f quote=%s (poll loop owns reset+rebreach)",
+                                w.ticker, w.side, w.entry_trigger, _open_decision.quote,
+                            )
+                        elif _open_cls == _PT_OPEN_RETRY and _open_decision.quote is None:
+                            w.late_attachment_state = _PT_OPEN_AWAITING
+                            w.late_attachment_generation += 1
+                            log.info(
+                                "[%s] OVERNIGHT_DAILY_ARMED_AWAITING_FIRST_TRUTH — "
+                                "%s trigger=%.4f (canonical quote unavailable; "
+                                "poll loop stays gated until first truthful quote)",
+                                w.ticker, w.side, w.entry_trigger,
+                            )
+                        # else: pre-trigger (TRUTH_RETRY with valid quote) —
+                        # ordinary arm; no gate seeded.
                         w.overnight = False
                         w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
                         log.info(
-                            "[%s] OVERNIGHT_DAILY_ARMED | side=%s | queue_status=%s | %s",
+                            "[%s] OVERNIGHT_DAILY_ARMED | side=%s | queue_status=%s | %s | "
+                            "late_state=%s",
                             w.ticker,
                             w.side,
                             OvernightWatchState.VALID_AWAITING_BREACH,
                             getattr(result, "reason_text", "valid"),
+                            w.late_attachment_state,
                         )
                 continue
 
