@@ -19,7 +19,7 @@ import os
 import sys
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -86,8 +86,30 @@ class _Pos:
     scale_outs_done:  int  = 0
     last_option_quote_update_ts: Optional[datetime] = None
     lastoptionquoteupdatets: Optional[datetime] = None
+    last_option_bid_update_ts: Optional[datetime] = None
+    lastoptionbidupdatets: Optional[datetime] = None
     last_underlying_quote_update_ts: Optional[datetime] = None
     lastunderlyingquoteupdatets: Optional[datetime] = None
+    option_bid_valid: Optional[bool] = None
+    optionbidvalid: Optional[bool] = None
+    option_quote_fresh: Optional[bool] = None
+    optionquotefresh: Optional[bool] = None
+    underlying_available: Optional[bool] = None
+    underlyingavailable: Optional[bool] = None
+    underlying_fresh: Optional[bool] = None
+    underlyingfresh: Optional[bool] = None
+    hard_exit_reference_price: float = 0.0
+    hardexitreferenceprice: float = 0.0
+    hard_exit_reference_source: str = ""
+    hardexitreferencesource: str = ""
+    hard_exit_reference_validity: str = "no_data"
+    hardexitreferencevalidity: str = "no_data"
+    hard_exit_reference_ts: Optional[datetime] = None
+    hardexitreferencets: Optional[datetime] = None
+    hard_exit_reference_pnl_pct: Optional[float] = None
+    hardexitreferencepnlpct: Optional[float] = None
+    hard_exit_reference_refresh_needed: bool = True
+    hardexitreferencerefreshneeded: bool = True
     live_executable_price_source: str = ""
     liveexecutablepricesource: str = ""
     analytics_mark_price: float = 0.0
@@ -142,6 +164,9 @@ def _make_qpm(positions: list, *, bid: float, ask: float, und: float = 220.0) ->
     qpm._last_immediate_refresh_ts = {}
     qpm._last_db_persist_ts = {}
     qpm._last_db_persist_price = {}
+    # PR #385: position-scoped touched-profit consecutive-confirmation dict.
+    # Required attribute; tests that exercise touched_profit must init this.
+    qpm._tp_pending_confirm = {}
     qpm._orders_meta_available = None
     qpm._cycles = 0
     qpm._consecutive_failures = 0
@@ -267,9 +292,55 @@ class TestBAExactReplay:
 
 class TestRealExecutableWinner:
     def test_bid_above_5pct_arms_touched_profit(self):
+        # PR #385: touched_profit requires TWO consecutive fresh BID observations
+        # above TOUCHED_PROFIT_ARM_PCT. This test uses the SAME QPM instance
+        # across polls so the position-scoped confirmation state persists.
         pos = _Pos()
-        _run_refresh(pos, bid=1.70, ask=1.79)
-        assert pos.touched_profit is True
+        qpm = _make_qpm([pos], bid=1.70, ask=1.79)
+        # Poll 1: qualifying observation — pending set, not armed
+        qpm._test_bid = 1.70
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is False, (
+            "PR #385: one qualifying poll must NOT arm touched_profit; "
+            "requires two consecutive fresh BID observations"
+        )
+        # Poll 2: consecutive qualifying observation — armed
+        qpm._test_bid = 1.70
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is True, (
+            "PR #385: two consecutive fresh BID polls above +5% must arm touched_profit"
+        )
+
+    def test_missing_bid_cycle_resets_touched_profit_confirmation(self):
+        pos = _Pos()
+        qpm = _make_qpm([pos], bid=1.75, ask=1.79)
+
+        qpm._test_bid = 1.75
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is False
+        assert qpm._tp_pending_confirm
+
+        qpm._test_bid = 0.0
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is False
+        assert all(pending is False for pending in qpm._tp_pending_confirm.values())
+
+        qpm._test_bid = 1.75
+        qpm._test_ask = 1.79
+        _run_once(qpm)
+        assert pos.touched_profit is False, (
+            "green -> missing -> green must not arm; the green observations "
+            "are not consecutive"
+        )
+
+        _run_once(qpm)
+        assert pos.touched_profit is True, (
+            "A second consecutive green BID after the reset should arm touched_profit"
+        )
 
     def test_peak_stored_from_bid(self):
         pos = _Pos()
@@ -321,11 +392,34 @@ class TestPaperBehavior:
         )
 
     def test_paper_touched_profit_from_mid(self):
-        pos = _Pos(execution_mode="paper")
-        _run_refresh(pos, bid=1.63, ask=1.79)
-        mid_pnl = ((1.63 + 1.79) / 2.0 - _ENTRY) / _ENTRY  # ~+7.55%
-        if mid_pnl >= 0.05:
-            assert pos.touched_profit is True
+        # PR #385: PAPER midpoint MUST NOT arm touched_profit — that state feeds
+        # soft-exit decisions and midpoint is not executable.  Only two consecutive
+        # fresh BID observations above TOUCHED_PROFIT_ARM_PCT (+5%) arm it, in
+        # every execution mode.
+        # Part A: PAPER midpoint above +5%, BID below +5%, two polls → False.
+        pos_a = _Pos(execution_mode="paper")
+        qpm_a = _make_qpm([pos_a], bid=1.63, ask=1.79)  # mid=1.71 → +7.55%; bid +2.52%
+        qpm_a._test_bid = 1.63
+        qpm_a._test_ask = 1.79
+        _run_once(qpm_a)
+        _run_once(qpm_a)
+        assert pos_a.touched_profit is False, (
+            "PR #385: PAPER midpoint above +5% with BID below +5% must NEVER arm "
+            "touched_profit — even after two polls"
+        )
+
+        # Part B: PAPER with BID above +5% for two consecutive polls → True.
+        pos_b = _Pos(execution_mode="paper")
+        qpm_b = _make_qpm([pos_b], bid=1.70, ask=1.79)  # bid +6.92%
+        qpm_b._test_bid = 1.70
+        qpm_b._test_ask = 1.79
+        _run_once(qpm_b)
+        assert pos_b.touched_profit is False, "PAPER: one poll must not arm"
+        _run_once(qpm_b)
+        assert pos_b.touched_profit is True, (
+            "PR #385: PAPER with BID above +5% for two consecutive fresh polls "
+            "must arm touched_profit"
+        )
 
     def test_paper_source_labeled_simulation(self):
         pos = _Pos(execution_mode="paper")
@@ -470,9 +564,10 @@ class TestAdoptionContaminationCleanse:
         engine._positions_by_id = {}
 
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        fresh_bid_ts = datetime.now(timezone.utc)
         pos = _Pos(
             position_id   = repair_id,
-            execution_mode = "",         # unknown
+            execution_mode = "live",
             current_bid   = 1.63,
             currentbid    = 1.63,
             current_option_price = 1.71,  # contaminated midpoint
@@ -483,6 +578,12 @@ class TestAdoptionContaminationCleanse:
             maxprofitseen   = peak,
             touched_profit  = touched,
             touchedprofit   = touched,
+            last_option_bid_update_ts = fresh_bid_ts,
+            lastoptionbidupdatets     = fresh_bid_ts,
+            option_bid_valid = True,
+            optionbidvalid   = True,
+            option_quote_fresh = True,
+            optionquotefresh   = True,
         )
         engine._positions.append(pos)
         engine._positions_by_id[repair_id] = pos
@@ -535,6 +636,10 @@ class TestAdoptionContaminationCleanse:
         # Set current_bid = 0 (no fresh bid)
         engine._positions[0].current_bid = 0.0
         engine._positions[0].currentbid  = 0.0
+        engine._positions[0].last_option_bid_update_ts = None
+        engine._positions[0].lastoptionbidupdatets = None
+        engine._positions[0].option_bid_valid = False
+        engine._positions[0].optionbidvalid = False
         engine.adopt_canonical_position_identity(
             contract=_CONTRACT, canonical_position_id="x",
             local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
@@ -560,7 +665,7 @@ class TestCanonicalProductionFields:
         engine._positions = []
         engine._positions_by_id = {}
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
-        pos = _Pos(position_id=repair_id, execution_mode="",
+        pos = _Pos(position_id=repair_id, execution_mode="live",
                    current_bid=1.63, currentbid=1.63,
                    peak_pnl_pct=0.0, touched_profit=False)
         engine._positions.append(pos)
@@ -627,7 +732,7 @@ class TestAdoptionIdentityFencing:
         engine._positions_by_id = {}
         return engine
 
-    def _add_repair(self, engine, *, client=_CLIENT, mode="", contract=_CONTRACT):
+    def _add_repair(self, engine, *, client=_CLIENT, mode="live", contract=_CONTRACT):
         repair_id = f"broker-repair-{client}-{contract}"
         pos = _Pos(position_id=repair_id, execution_mode=mode,
                    client_id=client, current_bid=1.63, peak_pnl_pct=0.0)
@@ -680,7 +785,7 @@ class TestAdoptionIdentityFencing:
         assert result.disposition == "RETRY_MODE_MISMATCH"
         assert result.adopted is False
 
-    def test_blank_repair_mode_accepts_live_canonical(self):
+    def test_blank_repair_mode_refuses_live_canonical(self):
         engine = self._base_engine()
         self._add_repair(engine, mode="")  # repair mode unknown
         result = engine.adopt_canonical_position_identity(
@@ -689,8 +794,8 @@ class TestAdoptionIdentityFencing:
             entry_fill=1.59, entry_ts=None, execution_mode="live",
             client_id=_CLIENT,
         )
-        assert result.disposition == "ADOPTED"
-        assert result.adopted is True
+        assert result.disposition == "RETRY_MODE_MISMATCH"
+        assert result.adopted is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -736,7 +841,7 @@ class TestSyntheticToCanonicalAdoption:
         engine._positions = []
         engine._positions_by_id = {}
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
-        pos = _Pos(position_id=repair_id, execution_mode="",
+        pos = _Pos(position_id=repair_id, execution_mode="live",
                    current_bid=1.63, currentbid=1.63,
                    peak_pnl_pct=0.0755, touched_profit=True)
         engine._positions.append(pos)
@@ -791,7 +896,7 @@ class TestNoDuplicateAfterAdoption:
         engine._assert_position_invariants = MagicMock()
 
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
-        pos = _Pos(position_id=repair_id, execution_mode="",
+        pos = _Pos(position_id=repair_id, execution_mode="live",
                    current_bid=1.63, peak_pnl_pct=0.0)
         engine._positions.append(pos)
         engine._positions_by_id[repair_id] = pos
@@ -825,7 +930,9 @@ class TestCanonicalPlusRepairCollapse:
     """When both canonical and repair positions exist, adoption must merge
     and remove the repair so exactly one active object remains."""
 
-    def _make_engine_with_both(self):
+    def _make_engine_with_both(
+        self, *, canonical_mode="live", repair_mode="live", repair_client=_CLIENT
+    ):
         from ap_exit_engine import APExitEngine, CanonicalAdoptionResult
         engine = APExitEngine.__new__(APExitEngine)
         engine._email = _CLIENT
@@ -837,15 +944,15 @@ class TestCanonicalPlusRepairCollapse:
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
 
         # Canonical: already exists
-        canon = _Pos(position_id=canon_id, execution_mode="live",
+        canon = _Pos(position_id=canon_id, execution_mode=canonical_mode,
                      option_symbol=_CONTRACT, client_id=_CLIENT,
                      current_bid=1.63, peak_pnl_pct=0.025, touched_profit=False)
         engine._positions.append(canon)
         engine._positions_by_id[canon_id] = canon
 
         # Repair: also exists (the problem case)
-        repair = _Pos(position_id=repair_id, execution_mode="",
-                      option_symbol=_CONTRACT, client_id=_CLIENT,
+        repair = _Pos(position_id=repair_id, execution_mode=repair_mode,
+                      option_symbol=_CONTRACT, client_id=repair_client,
                       current_bid=1.64, peak_pnl_pct=0.0755,  # contaminated mid peak
                       touched_profit=True)
         engine._positions.append(repair)
@@ -905,6 +1012,655 @@ class TestCanonicalPlusRepairCollapse:
         assert result.disposition == "ALREADY_CANONICAL_REPAIR_REMOVED"
         assert result.adopted is True
 
+    def test_blank_mode_repair_is_quarantined_from_paper_canonical(self):
+        engine, canon_id, repair_id = self._make_engine_with_both(
+            canonical_mode="paper", repair_mode="", repair_client=_CLIENT,
+        )
+        repair = engine._positions_by_id[repair_id]
+        repair.hard_exit_reference_validity = "proven"
+        repair.hardexitreferencevalidity = "proven"
+        repair.hard_exit_reference_price = 0.55
+        repair.hardexitreferenceprice = 0.55
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="paper", client_id=_CLIENT,
+        )
+
+        canonical = engine._positions_by_id[canon_id]
+        assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+        assert result.adopted is False
+        assert result.safe_to_seed is False
+        assert result.retryable is True
+        assert repair_id in engine._positions_by_id
+        assert repair in engine._positions
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == [canonical]
+        assert getattr(canonical, "hard_exit_reference_validity", "") != "proven"
+
+    def test_blank_client_repair_is_quarantined_from_matching_mode_canonical(self):
+        engine, canon_id, repair_id = self._make_engine_with_both(
+            canonical_mode="live", repair_mode="live", repair_client="",
+        )
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        canonical = engine._positions_by_id[canon_id]
+        repair = engine._positions_by_id[repair_id]
+        assert result.disposition == "RETRY_REPAIR_IDENTITY_UNPROVEN"
+        assert result.adopted is False
+        assert result.safe_to_seed is False
+        assert result.retryable is True
+        assert repair_id in engine._positions_by_id
+        assert any(getattr(p, "position_id", "") == repair_id for p in engine._positions)
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+        assert engine.active_positions() == [canonical]
+
+    def test_quarantined_repair_can_recover_canonical_owner_via_broker_precheck(self):
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "acct-1"
+            mode = "live"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id="", execution_mode="",
+            quantity=1, quantity_remaining=1,
+        )
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_identity_unproven"
+        engine._positions = [repair]
+        engine._positions_by_id[repair.position_id] = repair
+
+        db_row = {
+            "id": "canon-recovered",
+            "contract": _CONTRACT,
+            "option_symbol": _CONTRACT,
+            "underlying": _TICKER,
+            "side": "CALL",
+            "qty": 1,
+            "quantity_remaining": 1,
+            "entry_price": 1.59,
+            "execution_mode": "live",
+            "status": "OPEN",
+            "signal_id": _SIG,
+        }
+        engine._load_db_position_row = lambda sym: db_row if sym == _CONTRACT else None
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine.active_positions() == []
+        assert engine._broker_position_precheck() is True
+
+        canonical = engine._positions_by_id["canon-recovered"]
+        assert canonical.position_id == "canon-recovered"
+        assert canonical.execution_mode == "live"
+        assert engine.active_positions() == [canonical]
+        assert repair in engine._positions
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+
+    def test_broker_precheck_repair_then_fill_seed_adopts_canonical_owner(self, monkeypatch):
+        from ap import fill_monitor as fm
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "acct-1"
+            mode = "live"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: None
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine._broker_position_precheck() is True
+        repairs = [
+            p for p in engine._positions
+            if str(getattr(p, "position_id", "")).startswith("broker-repair-")
+        ]
+        assert len(repairs) == 1
+        assert repairs[0].execution_mode == "live"
+
+        fm._seed_exit_engine(
+            engine,
+            "canon-live",
+            {
+                "contract": _CONTRACT,
+                "symbol": _CONTRACT,
+                "client_id": _CLIENT,
+                "local_order_id": "ord-1",
+                "broker_order_id": "brk-1",
+                "execution_mode": "live",
+                "stop_underlying": 215.0,
+                "target_underlying": 230.0,
+                "direction": "CALL",
+            },
+            {"filled_qty": 1, "avg_fill": 1.59},
+            _SIG,
+        )
+
+        assert "canon-live" in engine._positions_by_id
+        adopted = engine._positions_by_id["canon-live"]
+        assert adopted.execution_mode == "live"
+        assert adopted.underlying_stop == pytest.approx(215.0)
+        assert adopted.underlying_target == pytest.approx(230.0)
+        assert getattr(adopted, "adoption_identity_quarantined", False) is False
+        assert engine.active_positions() == [adopted]
+        assert not any(
+            str(pid).startswith("broker-repair-")
+            for pid in engine._positions_by_id
+        )
+
+    def test_paper_broker_precheck_repair_then_fill_seed_adopts_canonical_owner(self, monkeypatch):
+        from ap import fill_monitor as fm
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "paper-acct-1"
+            mode = "paper"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        monkeypatch.setattr(fm, "audit", lambda *a, **k: None)
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: None
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine._broker_position_precheck() is True
+        repairs = [
+            p for p in engine._positions
+            if str(getattr(p, "position_id", "")).startswith("broker-repair-")
+        ]
+        assert len(repairs) == 1
+        assert repairs[0].execution_mode == "paper"
+        assert getattr(repairs[0], "adoption_identity_quarantined", False) is False
+
+        fm._seed_exit_engine(
+            engine,
+            "canon-paper",
+            {
+                "contract": _CONTRACT,
+                "symbol": _CONTRACT,
+                "client_id": _CLIENT,
+                "local_order_id": "ord-paper-1",
+                "broker_order_id": "brk-paper-1",
+                "execution_mode": "paper",
+                "canonical_signal_id": _SIG,
+                "stop_underlying": 215.0,
+                "target_underlying": 230.0,
+                "direction": "CALL",
+            },
+            {"filled_qty": 1, "avg_fill": 1.59},
+            _SIG,
+        )
+
+        assert "canon-paper" in engine._positions_by_id
+        adopted = engine._positions_by_id["canon-paper"]
+        assert adopted.position_id == "canon-paper"
+        assert adopted.execution_mode == "paper"
+        assert adopted.underlying_stop == pytest.approx(215.0)
+        assert adopted.underlying_target == pytest.approx(230.0)
+        assert adopted.signal_id == _SIG
+        assert getattr(adopted, "canonical_signal_id", "") == _SIG
+        assert getattr(adopted, "entry_local_order_id", "") == "ord-paper-1"
+        assert getattr(adopted, "entry_broker_order_id", "") == "brk-paper-1"
+        assert getattr(adopted, "adoption_identity_quarantined", False) is False
+        assert engine.active_positions() == [adopted]
+        assert not any(
+            str(pid).startswith("broker-repair-")
+            for pid in engine._positions_by_id
+        )
+
+    def test_broker_precheck_unknown_mode_quarantines_without_live_default(self):
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "unknown-acct-1"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: None
+
+        assert engine._broker_position_precheck() is False
+        repairs = [
+            p for p in engine._positions
+            if str(getattr(p, "position_id", "")).startswith("broker-repair-")
+        ]
+        assert len(repairs) == 1
+        assert repairs[0].execution_mode == ""
+        assert getattr(repairs[0], "adoption_identity_quarantined", False) is True
+        assert "execution_mode_unproven" in getattr(
+            repairs[0], "adoption_identity_quarantine_reason", ""
+        )
+        assert engine.active_positions() == []
+
+    def test_broker_precheck_with_only_quarantined_repair_installs_broker_owner(self):
+        from ap_exit_engine import APExitEngine
+
+        class _Broker:
+            account_id = "acct-1"
+            mode = "live"
+            def list_positions(self):
+                return [{
+                    "symbol": _CONTRACT,
+                    "quantity": 1,
+                    "cost_basis": 159.0,
+                    "date_acquired": "2026-07-15T09:30:00Z",
+                }]
+
+        engine = APExitEngine(broker=_Broker(), email=_CLIENT)
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id="", execution_mode="",
+            quantity=1, quantity_remaining=1,
+        )
+        repair.adoption_identity_quarantined = True
+        repair.adoption_identity_quarantine_reason = "repair_identity_unproven"
+        engine._positions = [repair]
+        engine._positions_by_id[repair.position_id] = repair
+        engine._load_db_position_row = lambda sym: None
+        engine._upsert_broker_position_to_db = lambda sym, bp: "canon-from-broker"
+        engine._fetch_broker_quote = lambda sym: {
+            "bid": 1.20, "ask": 1.25, "mark": 1.22, "last": 1.20,
+        }
+
+        assert engine.active_positions() == []
+        assert engine._broker_position_precheck() is True
+
+        active = engine.active_positions()
+        assert len(active) == 1
+        assert active[0].position_id == "canon-from-broker"
+        assert active[0].execution_mode == "live"
+        assert repair in engine._positions
+        assert getattr(repair, "adoption_identity_quarantined", False) is True
+
+    def test_successful_re_adoption_clears_prior_quarantine_flags(self):
+        from ap_exit_engine import APExitEngine, ManagedPosition
+
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+        repair = ManagedPosition(
+            ticker=_TICKER, option_symbol=_CONTRACT,
+            side="CALL", quantity=1, quantity_remaining=1, entry_price=1.59,
+            underlying_entry=220.0, underlying_target=230.0, underlying_stop=215.0,
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            client_id=_CLIENT, execution_mode="live",
+            opened_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+        repair.adoption_identity_quarantined = True
+        repair.adoptionidentityquarantined = True
+        repair.adoption_identity_quarantine_reason = "previously_unknown"
+        repair.adoptionidentityquarantinereason = "previously_unknown"
+        repair.exit_in_flight = False
+        repair.pending_exit_reason = ""
+        engine._positions.append(repair)
+        engine._positions_by_id[repair.position_id] = repair
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon-recovered",
+            local_order_id="ord-1", broker_order_id="brk-1",
+            signal_id=_SIG, canonical_signal_id=_SIG,
+            entry_fill=1.59, entry_ts=None,
+            execution_mode="live", client_id=_CLIENT,
+        )
+
+        adopted = engine._positions_by_id["canon-recovered"]
+        assert result.disposition == "ADOPTED"
+        assert getattr(adopted, "adoption_identity_quarantined", True) is False
+        assert getattr(adopted, "adoptionidentityquarantined", True) is False
+        assert getattr(adopted, "adoption_identity_quarantine_reason", None) == ""
+        assert engine.active_positions() == [adopted]
+        assert engine._can_submit_exit(adopted, datetime.now(timezone.utc), reason="test") is True
+
+    def test_existing_canonical_stale_repair_bid_cannot_raise_peak(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        repair = engine._positions_by_id[repair_id]
+        repair.live_executable_price_source = "bid"
+        repair.liveexecutablepricesource = "bid"
+        repair.current_bid = 2.40
+        repair.currentbid = 2.40
+        repair.peak_pnl_pct = 0.50
+        repair.max_profit_seen = 0.50
+        old_ts = datetime.now(timezone.utc) - timedelta(seconds=90)
+        repair.last_option_bid_update_ts = old_ts
+        repair.lastoptionbidupdatets = old_ts
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        canonical = engine._positions_by_id[canon_id]
+        assert canonical.peak_pnl_pct == pytest.approx(0.025)
+        assert canonical.max_profit_seen == pytest.approx(0.0)
+
+    def test_existing_canonical_reclassifies_repair_ask_against_canonical_entry(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        canonical = engine._positions_by_id[canon_id]
+        canonical.entry_price = 1.20
+        repair = engine._positions_by_id[repair_id]
+        now = datetime.now(timezone.utc)
+        repair.hard_exit_reference_price = 0.75
+        repair.hardexitreferenceprice = 0.75
+        repair.hard_exit_reference_source = "ask_unproven"
+        repair.hardexitreferencesource = "ask_unproven"
+        repair.hard_exit_reference_validity = "unproven"
+        repair.hardexitreferencevalidity = "unproven"
+        repair.hard_exit_reference_ts = now
+        repair.hardexitreferencets = now
+        repair.hard_exit_reference_pnl_pct = -0.25
+        repair.hardexitreferencepnlpct = -0.25
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert canonical.hard_exit_reference_validity == "catastrophic_ask"
+        assert canonical.hard_exit_reference_source == "ask_catastrophic"
+        assert canonical.hard_exit_reference_pnl_pct == pytest.approx((0.75 - 1.20) / 1.20)
+
+    def test_existing_canonical_demotes_false_catastrophic_ask_against_canonical_entry(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        canonical = engine._positions_by_id[canon_id]
+        canonical.entry_price = 0.80
+        repair = engine._positions_by_id[repair_id]
+        now = datetime.now(timezone.utc)
+        repair.hard_exit_reference_price = 0.75
+        repair.hardexitreferenceprice = 0.75
+        repair.hard_exit_reference_source = "ask_catastrophic"
+        repair.hardexitreferencesource = "ask_catastrophic"
+        repair.hard_exit_reference_validity = "catastrophic_ask"
+        repair.hardexitreferencevalidity = "catastrophic_ask"
+        repair.hard_exit_reference_ts = now
+        repair.hardexitreferencets = now
+        repair.hard_exit_reference_pnl_pct = -0.40
+        repair.hardexitreferencepnlpct = -0.40
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert canonical.hard_exit_reference_validity == "unproven"
+        assert canonical.hard_exit_reference_source == "ask_unproven"
+        assert canonical.hard_exit_reference_pnl_pct == pytest.approx((0.75 - 0.80) / 0.80)
+
+    def test_existing_canonical_does_not_remove_foreign_client_or_wrong_mode_repairs(self):
+        engine, canon_id, repair_id = self._make_engine_with_both()
+        foreign_id = f"broker-repair-other@client.com-{_CONTRACT}"
+        wrong_mode_id = f"broker-repair-{_CLIENT}-paper-{_CONTRACT}"
+        foreign = _Pos(position_id=foreign_id, option_symbol=_CONTRACT,
+                       client_id="other@client.com", execution_mode="live")
+        wrong_mode = _Pos(position_id=wrong_mode_id, option_symbol=_CONTRACT,
+                          client_id=_CLIENT, execution_mode="paper")
+        engine._positions.extend([foreign, wrong_mode])
+        engine._positions_by_id[foreign_id] = foreign
+        engine._positions_by_id[wrong_mode_id] = wrong_mode
+
+        engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id=canon_id,
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.59, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert repair_id not in engine._positions_by_id
+        assert foreign_id in engine._positions_by_id
+        assert wrong_mode_id in engine._positions_by_id
+
+
+class TestCanonicalCollapseRiskReferenceRegression:
+    """Regression coverage for canonical+repair collapse money-safety state."""
+
+    def _engine_with_canon_and_repair(self, canon: _Pos, repair: _Pos, *, canon_id="canon1"):
+        from ap_exit_engine import APExitEngine
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = [canon, repair]
+        engine._positions_by_id = {
+            canon_id: canon,
+            repair.position_id: repair,
+        }
+        return engine
+
+    def _collapse(self, engine, *, canon_id="canon1"):
+        return engine.adopt_canonical_position_identity(
+            contract=_CONTRACT,
+            canonical_position_id=canon_id,
+            local_order_id="l1",
+            broker_order_id="b1",
+            signal_id=_SIG,
+            canonical_signal_id=_SIG,
+            entry_fill=1.20,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=_CLIENT,
+        )
+
+    def test_existing_canonical_does_not_copy_raw_repair_peak_percentage(self):
+        now = datetime.now(timezone.utc)
+        canon = _Pos(
+            position_id="canon1", option_symbol=_CONTRACT, client_id=_CLIENT,
+            execution_mode="live", entry_price=1.20, entryprice=1.20,
+            current_bid=1.10, currentbid=1.10, peak_pnl_pct=0.0,
+            last_option_bid_update_ts=now - timedelta(seconds=20),
+        )
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id=_CLIENT, execution_mode="live",
+            entry_price=1.00, entryprice=1.00,
+            current_bid=1.16, currentbid=1.16,
+            peak_pnl_pct=0.16, max_profit_seen=0.16,
+            touched_profit=True, live_executable_price_source="bid",
+            last_option_bid_update_ts=now,
+            last_option_quote_update_ts=now,
+        )
+        engine = self._engine_with_canon_and_repair(canon, repair)
+
+        self._collapse(engine)
+
+        assert canon.current_bid == pytest.approx(1.16)
+        assert canon.peak_pnl_pct == pytest.approx(0.0)
+        assert canon.max_profit_seen == pytest.approx(0.0)
+        assert canon.touched_profit is False
+
+    def test_unproven_repair_hard_reference_cannot_replace_proven_canonical(self):
+        now = datetime.now(timezone.utc)
+        canon = _Pos(
+            position_id="canon1", option_symbol=_CONTRACT, client_id=_CLIENT,
+            execution_mode="live", entry_price=1.20, entryprice=1.20,
+            hard_exit_reference_price=0.70,
+            hard_exit_reference_source="bid",
+            hard_exit_reference_validity="proven",
+            hard_exit_reference_ts=now - timedelta(seconds=20),
+            hard_exit_reference_refresh_needed=False,
+        )
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id=_CLIENT, execution_mode="live",
+            hard_exit_reference_price=1.30,
+            hard_exit_reference_source="ask_unproven",
+            hard_exit_reference_validity="unproven",
+            hard_exit_reference_ts=now,
+        )
+        engine = self._engine_with_canon_and_repair(canon, repair)
+
+        self._collapse(engine)
+
+        assert canon.hard_exit_reference_price == pytest.approx(0.70)
+        assert canon.hard_exit_reference_validity == "proven"
+        assert canon.hard_exit_reference_refresh_needed is True
+
+    def test_repair_bid_requires_dedicated_newer_bid_timestamp(self):
+        now = datetime.now(timezone.utc)
+        canon = _Pos(
+            position_id="canon1", option_symbol=_CONTRACT, client_id=_CLIENT,
+            execution_mode="live", entry_price=1.20, entryprice=1.20,
+            current_bid=1.10, currentbid=1.10,
+            last_option_bid_update_ts=now,
+            last_option_quote_update_ts=now,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+        )
+        repair = _Pos(
+            position_id=f"broker-repair-{_CLIENT}-{_CONTRACT}",
+            option_symbol=_CONTRACT, client_id=_CLIENT, execution_mode="live",
+            current_bid=1.16, currentbid=1.16,
+            peak_pnl_pct=0.16, live_executable_price_source="bid",
+            last_option_bid_update_ts=now - timedelta(seconds=90),
+            last_option_quote_update_ts=now + timedelta(seconds=5),
+            option_bid_valid=True,
+            option_quote_fresh=True,
+        )
+        engine = self._engine_with_canon_and_repair(canon, repair)
+
+        self._collapse(engine)
+
+        assert canon.current_bid == pytest.approx(1.10)
+        assert canon.last_option_bid_update_ts == now
+        assert canon.peak_pnl_pct == pytest.approx(0.0)
+
+
+class TestCanonicalAdoptionHardReferenceRebase:
+    def test_ask_hard_reference_reclassified_after_entry_correction(self):
+        from ap_exit_engine import APExitEngine, get_effective_hard_exit_reference
+        now = datetime.now(timezone.utc)
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(
+            position_id=repair_id,
+            option_symbol=_CONTRACT,
+            client_id=_CLIENT,
+            execution_mode="live",
+            entry_price=1.00,
+            entryprice=1.00,
+            current_ask=0.75,
+            currentask=0.75,
+            hard_exit_reference_price=0.75,
+            hard_exit_reference_source="ask_unproven",
+            hard_exit_reference_validity="unproven",
+            hard_exit_reference_ts=now,
+            hard_exit_reference_pnl_pct=-0.25,
+        )
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT,
+            canonical_position_id="canon1",
+            local_order_id="l1",
+            broker_order_id="b1",
+            signal_id=_SIG,
+            canonical_signal_id=_SIG,
+            entry_fill=1.20,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=_CLIENT,
+        )
+
+        assert result.disposition == "ADOPTED"
+        assert repair.hard_exit_reference_validity == "catastrophic_ask"
+        assert repair.hard_exit_reference_pnl_pct == pytest.approx(-0.375)
+        assert get_effective_hard_exit_reference(repair, now) == pytest.approx(-0.375)
+
+    def test_stale_ask_hard_reference_stays_unproven_after_entry_correction(self):
+        from ap_exit_engine import APExitEngine, get_effective_hard_exit_reference
+        now = datetime.now(timezone.utc)
+        engine = APExitEngine.__new__(APExitEngine)
+        engine._email = _CLIENT
+        engine._lock = threading.Lock()
+        engine._positions = []
+        engine._positions_by_id = {}
+
+        repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
+        repair = _Pos(
+            position_id=repair_id,
+            option_symbol=_CONTRACT,
+            client_id=_CLIENT,
+            execution_mode="live",
+            entry_price=1.00,
+            entryprice=1.00,
+            current_ask=0.75,
+            currentask=0.75,
+            hard_exit_reference_price=0.75,
+            hard_exit_reference_source="ask_stale",
+            hard_exit_reference_validity="unproven",
+            hard_exit_reference_ts=now - timedelta(seconds=90),
+            hard_exit_reference_pnl_pct=-0.25,
+        )
+        engine._positions.append(repair)
+        engine._positions_by_id[repair_id] = repair
+
+        result = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT,
+            canonical_position_id="canon1",
+            local_order_id="l1",
+            broker_order_id="b1",
+            signal_id=_SIG,
+            canonical_signal_id=_SIG,
+            entry_fill=1.20,
+            entry_ts=None,
+            execution_mode="live",
+            client_id=_CLIENT,
+        )
+
+        assert result.disposition == "ADOPTED"
+        assert repair.hard_exit_reference_validity == "unproven"
+        assert repair.hard_exit_reference_refresh_needed is True
+        assert repair.hard_exit_reference_pnl_pct == pytest.approx(-0.375)
+        assert get_effective_hard_exit_reference(repair, now) is None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Final Blocker 2 — Structured CanonicalAdoptionResult + RETRY cannot fall through
@@ -923,7 +1679,7 @@ class TestStructuredAdoptionResult:
         engine._positions_by_id = {}
         return engine
 
-    def _add_repair(self, engine, *, client=_CLIENT, mode="", contract=_CONTRACT):
+    def _add_repair(self, engine, *, client=_CLIENT, mode="live", contract=_CONTRACT):
         from ap_exit_engine import CanonicalAdoptionResult
         repair_id = f"broker-repair-{client}-{contract}"
         pos = _Pos(position_id=repair_id, execution_mode=mode,
@@ -987,6 +1743,32 @@ class TestStructuredAdoptionResult:
         )
         assert r.disposition == "RETRY_MODE_MISMATCH"
         assert r.safe_to_seed is False
+
+    def test_upgrade_in_place_stale_repair_bid_cannot_seed_peak(self):
+        engine = self._engine()
+        self._add_repair(engine, mode="live")
+        repair = engine._positions[0]
+        repair.live_executable_price_source = "bid"
+        repair.liveexecutablepricesource = "bid"
+        repair.current_bid = 2.40
+        repair.currentbid = 2.40
+        repair.peak_pnl_pct = 0.50
+        repair.max_profit_seen = 0.50
+        old_ts = datetime.now(timezone.utc) - timedelta(seconds=90)
+        repair.last_option_bid_update_ts = old_ts
+        repair.lastoptionbidupdatets = old_ts
+
+        r = engine.adopt_canonical_position_identity(
+            contract=_CONTRACT, canonical_position_id="canon1",
+            local_order_id="", broker_order_id="", signal_id="", canonical_signal_id="",
+            entry_fill=1.00, entry_ts=None, execution_mode="live", client_id=_CLIENT,
+        )
+
+        assert r.disposition == "ADOPTED"
+        pos = engine._positions_by_id["canon1"]
+        assert pos.peak_pnl_pct == pytest.approx(0.0)
+        assert pos.max_profit_seen == pytest.approx(0.0)
+        assert pos.touched_profit is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1058,7 +1840,7 @@ class TestNormalizeCanonicalTs:
         engine._positions = []
         engine._positions_by_id = {}
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
-        pos = _Pos(position_id=repair_id, execution_mode="",
+        pos = _Pos(position_id=repair_id, execution_mode="live",
                    current_bid=1.63, peak_pnl_pct=0.0)
         engine._positions.append(pos)
         engine._positions_by_id[repair_id] = pos
@@ -1339,7 +2121,7 @@ class TestTimestampFallbackRegression:
         engine._positions_by_id = {}
         repair_id = f"broker-repair-{_CLIENT}-{_CONTRACT}"
         pos = _Pos(position_id=repair_id, option_symbol=_CONTRACT,
-                   client_id=_CLIENT, execution_mode="",
+                   client_id=_CLIENT, execution_mode="live",
                    current_bid=1.63, peak_pnl_pct=0.0)
         engine._positions.append(pos)
         engine._positions_by_id[repair_id] = pos

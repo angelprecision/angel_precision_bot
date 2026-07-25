@@ -59,12 +59,18 @@ import os
 import time
 import threading
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
+
+from ap.exit_thresholds import (
+    effective_thresholds as _shared_effective_thresholds,
+    option_profile as _shared_option_profile,
+)
 
 
 try:
@@ -168,6 +174,17 @@ _MIN_HOLD_BEFORE_EXIT_MIN = float(os.getenv("MIN_HOLD_MINUTES_BEFORE_SOFT_EXIT",
 
 _INDEX_ETFS = {"QQQ", "SPY", "IWM", "DIA", "SPX"}
 
+# ── P0: Soft-exit deferred reason codes ──────────────────────────────────────
+# Used when a soft exit condition is met but the required truth is unavailable.
+# These are explicit stable codes; callers can distinguish real non-confirmation
+# (the underlying moved against us) from missing/stale data.
+SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE           = "SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE"
+SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE               = "SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE"
+SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE           = "SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE"
+SOFT_EXIT_DEFERRED_UNDERLYING_STALE                 = "SOFT_EXIT_DEFERRED_UNDERLYING_STALE"
+SOFT_EXIT_DEFERRED_ENTRY_GRACE                      = "SOFT_EXIT_DEFERRED_ENTRY_GRACE"
+SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED = "SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED"
+
 
 def _et_session_date():
     """Return the current market/session calendar date in America/New_York."""
@@ -232,33 +249,718 @@ def _normalize_ticker(ticker: str, option_symbol: str = "") -> str:
     return t
 
 
-def _option_profile(pos: "ManagedPosition") -> tuple[int, bool, str]:
-    symbol = (pos.option_symbol or "").upper()
-    ticker = (pos.ticker or "").upper()
-    root   = _option_root(symbol)
-    dte    = _option_dte(symbol)
-    index_roots = _INDEX_ETFS | {"SPXW", "NDX", "NDXP", "RUT", "RUTW"}
-    is_index = root in index_roots or ticker in index_roots or any(root.startswith(t) for t in _INDEX_ETFS)
-    profile  = "0DTE-idx" if (dte == 0 and is_index) else "0DTE-eq" if dte == 0 else f"{dte}DTE"
-    return dte, is_index, profile
+def _option_profile(pos: "ManagedPosition", *, session_date=None) -> tuple[int, bool, str]:
+    """AMENDMENT (PR #385 review): forwards `session_date` so every
+    DTE-dependent branch inside evaluate_exit — hard-stop AND never-green
+    — consumes the SAME session-date derived from the caller's `now_et`.
+    """
+    return _shared_option_profile(pos, session_date=session_date)
 
 
-def _effective_thresholds(pos: "ManagedPosition") -> tuple:
-    """Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument."""
-    dte, is_index, _ = _option_profile(pos)
-    if dte == 0 and is_index:
-        return -0.18, 0.20, 0.08
-    if dte == 0:
-        return -0.22, 0.22, 0.10
-    if dte <= 2:
-        return -0.26, 0.25, 0.12
-    return HARD_STOP_PCT, IMMEDIATE_TP_PCT, PROFIT_LOCK_PCT
+@dataclass(frozen=True)
+class ExitDecisionSnapshot:
+    """Canonical quote/P&L snapshot for one exit evaluation cycle.
+
+    Built once at the top of evaluate_exit() and consumed by every classifier.
+    No exit branch may independently fetch option or underlying quotes after
+    this is built.  One decision evaluation; one coherent snapshot.
+
+    Field semantics
+    ───────────────
+    option_bid / option_ask / option_mid  — raw market data from position state
+    exit_executable_mark   — bid when bid is valid; None otherwise
+                             (NEVER midpoint/ask/last for soft exit decisions)
+    option_bid_valid       — bid is a real finite positive number
+    option_quote_fresh     — quote timestamp within EXIT_ENGINE_STALE_OPTION_QUOTE_SEC
+    exit_executable_pnl_pct — bid-based P&L vs entry; None when bid unavailable
+    display_pnl_pct        — midpoint-based P&L for charting / display only
+
+    underlying_available   — current underlying price is a real positive number
+    underlying_fresh       — underlying timestamp within UNDERLYING_QUOTE_STALE_SEC
+    in_grace_window        — position is inside the soft-exit grace window
+    """
+    # Option truth
+    option_bid:               Optional[float]
+    option_ask:               Optional[float]
+    option_mid:               Optional[float]
+    exit_executable_mark:     Optional[float]
+    option_bid_valid:         bool
+    option_quote_fresh:       bool
+    option_quote_age_sec:     Optional[float]
+    option_quote_ts:          Optional[datetime]
+
+    # Underlying truth
+    underlying_price:         Optional[float]
+    underlying_available:     bool
+    underlying_fresh:         bool
+    underlying_age_sec:       Optional[float]
+
+    # Position-derived truth
+    entry_price:              float
+    exit_executable_pnl_pct:  Optional[float]
+    display_pnl_pct:          Optional[float]
+    touched_profit:           bool
+    in_grace_window:          bool
+
+
+def _build_exit_decision_snapshot(
+    pos: "ManagedPosition",
+    now_utc: Optional[datetime] = None,
+) -> ExitDecisionSnapshot:
+    """Build the canonical ExitDecisionSnapshot for one evaluation cycle.
+
+    Reads from position attributes written by QPM._refresh_once().  Falls back
+    to computing values directly from bid/ask/ts when explicit fields are absent
+    (e.g. positions seeded before this PR deployed).  Never fetches from broker
+    or market data.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    def _attr(pos_, *names):
+        """None-safe dual-name read.  `a or b` swallows meaningful False/0 —
+        this returns the FIRST attribute that exists (is not None)."""
+        for n in names:
+            v = getattr(pos_, n, None)
+            if v is not None:
+                return v
+        return None
+
+    # ── Option bid / ask / mid ────────────────────────────────────────────────
+    bid = _positive_or_none(_attr(pos, "current_bid", "currentbid"))
+    ask = _positive_or_none(_attr(pos, "current_ask", "currentask"))
+    analytics_mark = _positive_or_none(_attr(pos, "analytics_mark_price", "analyticsmarkprice"))
+    if bid is not None and ask is not None:
+        mid: Optional[float] = round((bid + ask) / 2.0, 4)
+    elif analytics_mark is not None:
+        mid = analytics_mark
+    else:
+        mid = _positive_or_none(_attr(pos, "current_option_price", "currentoptionprice"))
+
+    # ── AMENDMENT #2 (blocker 1): explicit truth fields are AUTHORITATIVE ─────
+    # QPM writes option_bid_valid from THIS cycle's broker response.  When QPM
+    # says the bid is invalid, the retained numeric bid on the position is a
+    # PREVIOUS poll's value and must be discarded — option_bid_valid=False
+    # forces bid=None.  Derived positivity is only a fallback for positions
+    # that predate the explicit fields (never overrides an explicit False).
+    bid_valid_direct = _attr(pos, "option_bid_valid", "optionbidvalid")
+    if bid_valid_direct is not None:
+        opt_bid_valid = bool(bid_valid_direct)
+        if not opt_bid_valid:
+            bid = None
+    else:
+        opt_bid_valid = bid is not None and bid > 0.0
+    exit_executable_mark: Optional[float] = bid if opt_bid_valid else None
+
+    # ── Option quote freshness ────────────────────────────────────────────────
+    # AMENDMENT #3 (blocker 2): freshness is ALWAYS recomputed from the bid
+    # timestamp at evaluation time.  QPM's stored explicit boolean can VETO
+    # freshness (writing False forces False regardless of timestamp) but can
+    # never PROVE it forever — if QPM stalls or its thread dies, a five-minute-
+    # old True must not survive.  Cached option_quote_age_sec is also not
+    # trusted; the age is (now - stored_bid_ts) at THIS moment.
+    opt_quote_fresh_direct = _attr(pos, "option_quote_fresh", "optionquotefresh")
+    opt_ts = _attr(pos, "last_option_bid_update_ts", "lastoptionbidupdatets",
+                   "last_option_quote_update_ts", "lastoptionquoteupdatets")
+    _exit_stale_sec = float(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", str(STALE_OPTION_QUOTE_MAX_AGE_SEC)))
+
+    opt_age_sec: Optional[float] = None
+    if opt_ts is not None:
+        try:
+            opt_age_sec = max(0.0, (now_utc - opt_ts).total_seconds())
+        except Exception:
+            opt_age_sec = None
+
+    # Timestamp-derived freshness (always current):
+    if opt_age_sec is None:
+        _ts_fresh = False
+    else:
+        _ts_fresh = opt_age_sec <= _exit_stale_sec
+
+    # Effective freshness: bid must be valid AND timestamp fresh AND explicit
+    # boolean must not veto.  A missing explicit boolean means "no veto".
+    if opt_quote_fresh_direct is False:
+        opt_quote_fresh: bool = False
+    else:
+        opt_quote_fresh = opt_bid_valid and _ts_fresh
+
+    # ── Underlying truth ──────────────────────────────────────────────────────
+    # AMENDMENT #2 (blocker 2): explicit underlying_available is AUTHORITATIVE.
+    # QPM writes it from THIS cycle's fetch (und_last).  When False, the numeric
+    # current_underlying on the position is the previous poll's retained price —
+    # it must be discarded, not re-derived as "available".
+    und_price = _positive_or_none(_attr(pos, "current_underlying", "currentunderlying"))
+    und_avail_direct = _attr(pos, "underlying_available", "underlyingavailable")
+    if und_avail_direct is not None:
+        und_available = bool(und_avail_direct)
+        if not und_available:
+            und_price = None
+    else:
+        und_available = und_price is not None and und_price > 0.0
+
+    und_fresh_direct = _attr(pos, "underlying_fresh", "underlyingfresh")
+    und_ts = _attr(pos, "last_underlying_quote_update_ts", "lastunderlyingquoteupdatets")
+    _und_stale_sec = float(os.getenv("UNDERLYING_QUOTE_STALE_SEC", str(_exit_stale_sec * 2)))
+
+    und_age_sec: Optional[float] = None
+    if und_ts is not None:
+        try:
+            und_age_sec = max(0.0, (now_utc - und_ts).total_seconds())
+        except Exception:
+            und_age_sec = None
+    _und_ts_fresh = (und_age_sec is not None and und_age_sec <= _und_stale_sec)
+
+    # AMENDMENT #3 (blocker 2): explicit False vetoes; True cannot survive without ts proof.
+    if und_fresh_direct is False:
+        und_fresh: bool = False
+    else:
+        und_fresh = und_available and _und_ts_fresh
+
+    # ── P&L ──────────────────────────────────────────────────────────────────
+    entry_price = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    exec_pnl: Optional[float] = None
+    disp_pnl: Optional[float] = None
+
+    if entry_price > 0.0:
+        # Decision authority is the current executable BID against the current
+        # canonical entry fill.  QPM's persisted percentage is observability
+        # only; it can be stale across entry-fill correction/adoption.
+        if exit_executable_mark is not None:
+            try:
+                exec_pnl = (exit_executable_mark - entry_price) / entry_price
+            except Exception:
+                pass
+
+        if mid is not None:
+            try:
+                disp_pnl = (mid - entry_price) / entry_price
+            except Exception:
+                pass
+
+    # ── Grace window ──────────────────────────────────────────────────────────
+    age_min = _position_age_minutes(pos)
+    in_grace = age_min < _MIN_HOLD_BEFORE_EXIT_MIN
+
+    return ExitDecisionSnapshot(
+        option_bid            = bid,
+        option_ask            = ask,
+        option_mid            = mid,
+        exit_executable_mark  = exit_executable_mark,
+        option_bid_valid      = opt_bid_valid,
+        option_quote_fresh    = opt_quote_fresh,
+        option_quote_age_sec  = opt_age_sec,
+        option_quote_ts       = opt_ts,
+        underlying_price      = und_price,
+        underlying_available  = und_available,
+        underlying_fresh      = und_fresh,
+        underlying_age_sec    = und_age_sec,
+        entry_price           = entry_price,
+        exit_executable_pnl_pct = exec_pnl,
+        display_pnl_pct       = disp_pnl,
+        touched_profit        = bool(getattr(pos, "touched_profit", False)),
+        in_grace_window       = in_grace,
+    )
+
+
+def _soft_exit_option_truth_gate(
+    snap: ExitDecisionSnapshot,
+    *,
+    qty_rem: int,
+) -> "Optional[ExitDecision]":
+    """Return a HOLD ExitDecision if option executable truth is insufficient.
+    Returns None when truth is sufficient (caller may proceed with the soft exit).
+
+    Must be called before EVERY soft exit branch.  Never call before hard exits.
+
+    Entry grace is intentionally not enforced here. This gate protects soft
+    exits from stale or non-executable option truth only; loss-specific grace
+    is applied by the loss branches that need breathing room.
+    """
+    if not snap.option_bid_valid:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason="SOFT_EXIT_DEFERRED — option bid unavailable; executable truth required for soft exits",
+            urgency="NORMAL",
+            pnl_pct=snap.display_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
+        )
+    if not snap.option_quote_fresh:
+        age_str = f"{snap.option_quote_age_sec:.0f}s" if snap.option_quote_age_sec is not None else "unknown"
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=f"SOFT_EXIT_DEFERRED — option quote stale ({age_str}); fresh executable truth required",
+            urgency="NORMAL",
+            pnl_pct=snap.display_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_OPTION_QUOTE_STALE,
+        )
+    if snap.exit_executable_pnl_pct is None:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason="SOFT_EXIT_DEFERRED — executable P&L unavailable (missing entry or valid bid)",
+            urgency="NORMAL",
+            pnl_pct=0.0,
+            reason_code=SOFT_EXIT_DEFERRED_OPTION_BID_UNAVAILABLE,
+        )
+    return None
+
+
+def _soft_exit_entry_grace_decision(snap: ExitDecisionSnapshot) -> "Optional[ExitDecision]":
+    if not snap.in_grace_window:
+        return None
+    return ExitDecision(
+        action="HOLD", quantity=0,
+        reason=(
+            "SOFT_EXIT_DEFERRED — inside post-entry grace window "
+            f"({_MIN_HOLD_BEFORE_EXIT_MIN:.0f}min); loss exits deferred, winner protection unaffected"
+        ),
+        urgency="NORMAL",
+        pnl_pct=(snap.exit_executable_pnl_pct
+                 if snap.exit_executable_pnl_pct is not None
+                 else (snap.display_pnl_pct or 0.0)),
+        reason_code=SOFT_EXIT_DEFERRED_ENTRY_GRACE,
+    )
+
+
+def _soft_exit_underlying_truth_gate(
+    snap: ExitDecisionSnapshot,
+) -> "Optional[ExitDecision]":
+    """Return a HOLD ExitDecision if underlying truth is insufficient for
+    underlying-dependent soft exits.  Returns None when truth is sufficient.
+
+    ONLY call this for exit branches that require underlying direction confirmation
+    (soft stops, never-green stops).  Take-profit / trail branches do NOT need
+    underlying confirmation and must NOT call this gate.
+    """
+    if not snap.underlying_available:
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason="SOFT_EXIT_DEFERRED — underlying price unavailable; cannot confirm thesis for soft exit",
+            urgency="NORMAL",
+            pnl_pct=snap.exit_executable_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+        )
+    if not snap.underlying_fresh:
+        age_str = f"{snap.underlying_age_sec:.0f}s" if snap.underlying_age_sec is not None else "unknown"
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=f"SOFT_EXIT_DEFERRED — underlying quote stale ({age_str}); fresh truth required",
+            urgency="NORMAL",
+            pnl_pct=snap.exit_executable_pnl_pct or 0.0,
+            reason_code=SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
+        )
+    return None
+
+
+def _effective_thresholds(
+    pos: "ManagedPosition",
+    *,
+    session_date=None,
+) -> tuple:
+    """Returns (hard_stop, immediate_tp, profit_lock) adjusted for DTE and instrument.
+
+    AMENDMENT (PR #385 review): `session_date` forwards to the shared
+    thresholds helper so evaluate_exit()'s caller-supplied `now_et` can
+    pin DTE profile lookup to the evaluation clock rather than the host
+    wall-clock date (deterministic replay).
+    """
+    return _shared_effective_thresholds(pos, session_date=session_date)
 
 # TRAILING STOP — fires when position drops N points from its peak
 # Wide enough to let winners run to 25-30%, tight enough to protect gains
 TRAIL_DROP_FROM_PEAK  = 0.10   # 10pt drop from peak fires exit (e.g. +30% → exits at +20%)
 SMALL_WIN_PCT         = 0.12   # trail kicks in once we've seen +12%
 SMALL_WIN_TRAIL       = 0.08   # floor 8pt below peak (seen +20% → floor at +12%)
+
+# ── HARD-EXIT REFERENCE EXPIRATION ───────────────────────────────────────────
+# A "proven" label cannot remain trusted forever — it was computed at a
+# specific moment.  After this threshold the label is considered expired and
+# the consumer must fall back to option_pnl_pct.  The threshold is deliberately
+# generous (5 minutes) because a freshly-proven reference should stay trusted
+# through a brief QPM gap, but not through a full QPM outage where new
+# catastrophic losses could accumulate undetected.
+HARD_REF_MAX_AGE_SEC = float(os.getenv("HARD_EXIT_REF_MAX_AGE_SEC", "300"))
+
+
+def _normalize_hard_ref_ts(ts, *, now_utc: Optional[datetime] = None) -> Optional[datetime]:
+    try:
+        from ap.position_quote_monitor import normalize_hard_ref_ts
+        return normalize_hard_ref_ts(ts, now_utc=now_utc or datetime.now(timezone.utc))
+    except Exception:
+        return None
+
+
+def get_effective_hard_exit_reference(
+    pos: "ManagedPosition",
+    now_utc: "Optional[datetime]" = None,
+) -> "Optional[float]":
+    """Single authority for resolving hard-exit P&L across all consumers.
+
+    Returns the hard-exit reference P&L when the stored reference is:
+      - validity in ("proven", "catastrophic_ask"), AND
+      - timestamp parses successfully AND age is within HARD_REF_MAX_AGE_SEC.
+
+    Returns None when:
+      - no hard-exit reference exists on the position (pre-amendment),
+      - validity is "unproven" or "no_data",
+      - the timestamp cannot be parsed,
+      - the reference has expired (age > HARD_REF_MAX_AGE_SEC).
+
+    All four consumers (evaluate_exit, _check_all_positions pre-gate,
+    _run_sentinels, emergency_flatten) MUST call this function.  None of them
+    may read hard_exit_reference_pnl_pct directly.
+
+    PR #385 amendment #6, blocker 2: consumers were trusting a validity label
+    without recomputing age.  A stale healthy reference could hide a new
+    catastrophic loss (false safety during QPM outage); a stale catastrophic
+    reference could manufacture a false forced exit.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    validity = str(getattr(pos, "hard_exit_reference_validity",
+                            getattr(pos, "hardexitreferencevalidity", "")) or "")
+    if validity not in ("proven", "catastrophic_ask"):
+        return None
+
+    reference_price = getattr(pos, "hard_exit_reference_price",
+                              getattr(pos, "hardexitreferenceprice", None))
+    entry_price = getattr(pos, "entry_price", None)
+    try:
+        reference_price = float(reference_price or 0.0)
+        entry_price = float(entry_price or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if reference_price <= 0 or entry_price <= 0:
+        return None
+
+    ts = getattr(pos, "hard_exit_reference_ts",
+                 getattr(pos, "hardexitreferencets", None))
+    if ts is None:
+        return None  # no timestamp → cannot verify freshness → fail closed
+
+    parsed_ts = _normalize_hard_ref_ts(ts, now_utc=now_utc)
+    if parsed_ts is None:
+        return None  # unparseable timestamp → fail closed
+
+    age_sec = max(0.0, (now_utc - parsed_ts).total_seconds())
+    if age_sec > HARD_REF_MAX_AGE_SEC:
+        return None  # expired — consumer must fall back to option_pnl_pct
+
+    # The cached percentage is observability/persistence only.  The hard-stop
+    # authority is the reference price divided by the current canonical entry.
+    return (reference_price - entry_price) / entry_price
+
+
+def _set_position_attr_pair(pos, canonical_name: str, value) -> None:
+    """Write canonical snake_case field and its legacy compressed alias."""
+    setattr(pos, canonical_name, value)
+    setattr(pos, canonical_name.replace("_", ""), value)
+
+
+def _hard_ref_is_authoritative(validity: str) -> bool:
+    return str(validity or "") in ("proven", "catastrophic_ask")
+
+
+def _recompute_hard_ref_cached_pnl(pos) -> None:
+    try:
+        _price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
+        _entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        if _price > 0 and _entry > 0:
+            _set_position_attr_pair(
+                pos,
+                "hard_exit_reference_pnl_pct",
+                (_price - _entry) / _entry,
+            )
+    except Exception as _e:
+        log.debug("[exit_eng] hard-ref pnl rebase skipped: %s", _e)
+
+
+def _reclassify_hard_ref_for_entry(pos) -> None:
+    """Reclassify ASK-only hard refs after canonical entry-price adoption."""
+    _source = str(getattr(pos, "hard_exit_reference_source", "") or "").lower()
+    if _source not in ("ask_unproven", "ask_catastrophic"):
+        _recompute_hard_ref_cached_pnl(pos)
+        if _source == "ask_stale":
+            _set_position_attr_pair(pos, "hard_exit_reference_validity", "unproven")
+            _set_position_attr_pair(pos, "hard_exit_reference_refresh_needed", True)
+        return
+
+    try:
+        _price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
+        _entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return
+    if _price <= 0 or _entry <= 0:
+        return
+
+    try:
+        _hard_stop, _, _ = _effective_thresholds(pos)
+    except Exception:
+        _hard_stop = HARD_STOP_PCT
+
+    _pnl = (_price - _entry) / _entry
+    _validity = "catastrophic_ask" if _pnl <= _hard_stop else "unproven"
+    _source = "ask_catastrophic" if _validity == "catastrophic_ask" else "ask_unproven"
+    _set_position_attr_pair(pos, "hard_exit_reference_source", _source)
+    _set_position_attr_pair(pos, "hard_exit_reference_validity", _validity)
+    _set_position_attr_pair(pos, "hard_exit_reference_pnl_pct", _pnl)
+    _refresh_needed = not _hard_ref_is_authoritative(_validity)
+    _set_position_attr_pair(pos, "hard_exit_reference_refresh_needed", _refresh_needed)
+
+
+def _copy_hard_exit_reference(dst, src) -> None:
+    for _attr in (
+        "hard_exit_reference_price",
+        "hard_exit_reference_source",
+        "hard_exit_reference_validity",
+        "hard_exit_reference_ts",
+        "hard_exit_reference_pnl_pct",
+        "hard_exit_reference_refresh_needed",
+    ):
+        if hasattr(src, _attr):
+            _set_position_attr_pair(dst, _attr, getattr(src, _attr, None))
+    _recompute_hard_ref_cached_pnl(dst)
+
+
+def _merge_hard_exit_reference_for_collapse(dst, src, *, now_utc: datetime) -> None:
+    """Merge repair hard-ref into canonical using the canonical replacement rule.
+
+    AMENDMENT (PR #385 review — Fix C): the previous merge did its own
+    `src_ts > dst_ts` compare and did NOT consult source quality.  An
+    equal-time repair BID therefore could not replace a canonical
+    MARK/LAST/ASK during broker-repair collapse, leaving the persisted
+    canonical authority on the inferior source.  Delegate to the shared
+    `_should_replace_hard_ref` gate (same helper that already governs
+    _apply_option_quote_for_decision and apply_quote_snapshots) and pass
+    source labels so equal-normalized-timestamp ties break by source
+    quality (BID > LAST > MARK > catastrophic ASK).
+    """
+    try:
+        _src_price = float(getattr(src, "hard_exit_reference_price", 0.0) or 0.0)
+        _dst_price = float(getattr(dst, "hard_exit_reference_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return
+
+    _src_validity = str(getattr(src, "hard_exit_reference_validity", "") or "")
+    _dst_validity = str(getattr(dst, "hard_exit_reference_validity", "") or "")
+    _src_source = str(getattr(src, "hard_exit_reference_source", "") or "")
+    _dst_source = str(getattr(dst, "hard_exit_reference_source", "") or "")
+    _src_ts = _normalize_hard_ref_ts(
+        getattr(src, "hard_exit_reference_ts", None), now_utc=now_utc
+    )
+    _dst_ts = _normalize_hard_ref_ts(
+        getattr(dst, "hard_exit_reference_ts", None), now_utc=now_utc
+    )
+
+    # Unproven / no-data source cannot erase a positive authoritative dst.
+    if _src_validity == "no_data" or _src_price <= 0:
+        if _dst_price > 0:
+            _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
+        return
+
+    # Same fail-closed guard for an unproven src over an authoritative dst.
+    if (
+        _src_validity == "unproven"
+        and _hard_ref_is_authoritative(_dst_validity)
+        and _dst_price > 0
+    ):
+        _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
+        return
+
+    _replace = _should_replace_hard_ref(
+        prior_validity=_dst_validity,
+        prior_ts=_dst_ts,
+        prior_price=_dst_price,
+        candidate_validity=_src_validity,
+        candidate_ts=_src_ts,
+        prior_source=_dst_source,
+        candidate_source=_src_source,
+        now_utc=now_utc,
+    )
+    if _replace:
+        _copy_hard_exit_reference(dst, src)
+
+
+def _should_replace_hard_ref(
+    *,
+    prior_validity,
+    prior_ts,
+    prior_price,
+    candidate_validity,
+    candidate_ts,
+    prior_source=None,
+    candidate_source=None,
+    now_utc: "Optional[datetime]" = None,
+) -> bool:
+    """Passthrough to the canonical QPM policy.
+
+    AMENDMENT (PR #385 review): forwards source labels so the shared
+    helper can break equal-timestamp ties by source quality (BID > LAST
+    > MARK > catastrophic ASK).  Older callers that omit source args get
+    the pre-amendment behavior (prior wins at equal ts).
+    """
+    try:
+        from ap.position_quote_monitor import should_replace_hard_ref
+        return should_replace_hard_ref(
+            prior_validity=prior_validity,
+            prior_ts=prior_ts,
+            prior_price=prior_price,
+            candidate_validity=candidate_validity,
+            candidate_ts=candidate_ts,
+            prior_source=prior_source,
+            candidate_source=candidate_source,
+            now_utc=now_utc or datetime.now(timezone.utc),
+        )
+    except Exception:
+        return False
+
+
+def _has_fresh_dedicated_bid(pos: "ManagedPosition", *, now_utc: "Optional[datetime]" = None) -> bool:
+    """True when the position holds a fresh, executable, un-vetoed dedicated BID.
+
+    AMENDMENT (PR #385 review P0-2): explicit producer vetoes must be honored.
+    QPM writes `option_bid_valid=False` when this cycle's raw bid failed its
+    truth check, and `option_quote_fresh=False` when the quote is stale.  A
+    retained numeric bid must not regain hard-stop authority merely because
+    the timestamp is still within the freshness window.  Elsewhere in the
+    engine (`_build_exit_decision_snapshot`) these booleans are already
+    treated as authoritative vetoes; the hard-stop fallback must match.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    # Producer vetoes: explicit False overrides any numeric reading.
+    _bid_valid_direct = getattr(pos, "option_bid_valid",
+                                getattr(pos, "optionbidvalid", None))
+    if _bid_valid_direct is False:
+        return False
+    _quote_fresh_direct = getattr(pos, "option_quote_fresh",
+                                   getattr(pos, "optionquotefresh", None))
+    if _quote_fresh_direct is False:
+        return False
+
+    try:
+        bid = float(getattr(pos, "current_bid", getattr(pos, "currentbid", 0.0)) or 0.0)
+    except Exception:
+        return False
+    if bid <= 0:
+        return False
+    ts = _normalize_hard_ref_ts(
+        getattr(pos, "last_option_bid_update_ts", getattr(pos, "lastoptionbidupdatets", None)),
+        now_utc=now_utc,
+    )
+    if ts is None:
+        return False
+    try:
+        return 0 <= (now_utc - ts).total_seconds() <= float(STALE_OPTION_QUOTE_MAX_AGE_SEC)
+    except Exception:
+        return False
+
+
+def _dedicated_bid_pnl(
+    pos: "ManagedPosition",
+    *,
+    now_utc: "Optional[datetime]" = None,
+) -> "tuple[Optional[float], Optional[datetime]]":
+    """Return (bid_pnl_pct, dedicated_bid_ts) when fresh + valid, else (None, None).
+
+    Callers use the timestamp to compare against other authoritative sources
+    (e.g. the persisted hard-exit reference) so the newest observation wins.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if not _has_fresh_dedicated_bid(pos, now_utc=now_utc):
+        return None, None
+    try:
+        bid = float(getattr(pos, "current_bid",
+                            getattr(pos, "currentbid", 0.0)) or 0.0)
+        entry = float(getattr(pos, "entry_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None, None
+    if bid <= 0.0 or entry <= 0.0:
+        return None, None
+    bid_ts = _normalize_hard_ref_ts(
+        getattr(pos, "last_option_bid_update_ts",
+                getattr(pos, "lastoptionbidupdatets", None)),
+        now_utc=now_utc,
+    )
+    return (bid - entry) / entry, bid_ts
+
+
+def _resolve_hard_stop_pnl_authority(
+    pos: "ManagedPosition",
+    now_utc: "Optional[datetime]" = None,
+) -> "Optional[float]":
+    """Single authority for hard-stop P&L across evaluate_exit() and sentinels.
+
+    Strict source priority (PR #385 contract: fresh BID > fresh LAST > fresh MARK):
+
+      1. Fresh, un-vetoed dedicated executable BID (via `_dedicated_bid_pnl`).
+         BID is the PR's primary hard-exit source; a persisted reference is
+         only useful when the current cycle has no executable BID.
+      2. `get_effective_hard_exit_reference()` — provenance-aware persisted
+         hard-exit reference (validity ∈ {"proven","catastrophic_ask"},
+         age ≤ HARD_REF_MAX_AGE_SEC).
+      3. None — no price-based hard-stop authority this cycle.
+
+    AMENDMENT (PR #385 review): the earlier timestamp-comparison approach
+    let a persisted reference derived from LAST / MARK / ASK outrank a fresh
+    executable BID whenever its cached provider clock happened to be newer
+    than the BID's dedicated timestamp.  Those clocks come from different
+    sources with different receipt semantics and cannot be compared safely.
+    The PR contract explicitly ranks fresh BID above LAST / MARK / ASK, so
+    the priority is strict and unconditional, not chronological.
+
+    Never falls back to midpoint, mark, LAST, ASK, current_option_price,
+    or option_pnl_pct directly — those may derive from unproven PAPER
+    pricing.  Missing authority → None → caller must not fire a hard stop.
+    Zero would falsely certify safety and is prohibited.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+
+    bid_pnl, _bid_ts = _dedicated_bid_pnl(pos, now_utc=now_utc)
+    if bid_pnl is not None:
+        return bid_pnl
+
+    ref_pnl = get_effective_hard_exit_reference(pos, now_utc)
+    if ref_pnl is not None:
+        return ref_pnl
+
+    return None
+
+
+def _is_adoption_identity_quarantined(pos) -> bool:
+    return bool(
+        getattr(pos, "adoption_identity_quarantined", False)
+        or getattr(pos, "adoptionidentityquarantined", False)
+    )
+
+
+def _mark_adoption_identity_quarantined(pos, reason: str) -> None:
+    try:
+        pos.adoption_identity_quarantined = True
+        pos.adoptionidentityquarantined = True
+        pos.adoption_identity_quarantine_reason = reason
+        pos.adoptionidentityquarantinereason = reason
+    except Exception as _e:
+        log.debug("[exit_eng] mark adoption identity quarantine failed: %s", _e)
+
+
+def _clear_adoption_identity_quarantine(pos) -> None:
+    try:
+        pos.adoption_identity_quarantined = False
+        pos.adoptionidentityquarantined = False
+        pos.adoption_identity_quarantine_reason = ""
+        pos.adoptionidentityquarantinereason = ""
+    except Exception as _e:
+        log.debug("[exit_eng] clear adoption identity quarantine failed: %s", _e)
+
+
+def _is_behavior_active_position(pos) -> bool:
+    try:
+        return (
+            not getattr(pos, "closed", False)
+            and int(getattr(pos, "quantity_remaining", 0) or 0) > 0
+            and not _is_adoption_identity_quarantined(pos)
+        )
+    except Exception:
+        return False
 
 
 # ── POSITION TRACKER ─────────────────────────────────────────────────────────
@@ -324,6 +1026,7 @@ class CanonicalAdoptionResult:
       NO_REPAIR_FOUND                  - no broker-repair; caller should seed normally.
       RETRY_CLIENT_MISMATCH            - client IDs do not match; retain protective monitoring.
       RETRY_MODE_MISMATCH              - execution modes incompatible; retain monitoring.
+      RETRY_REPAIR_IDENTITY_UNPROVEN   - retained same-contract repair is diagnostic only.
       RETRY_IDENTITY_CONFLICT          - canonical object mismatch; retain monitoring.
       RETRY_ADOPTION_ERROR             - unexpected exception; retain monitoring.
     """
@@ -357,7 +1060,10 @@ def _apply_option_quote_for_decision(
     bid: float,
     ask: float,
     mark: float,
+    last: float = 0.0,                          # AMENDMENT #6 (blocker 3): raw LAST
     quote_ts: "Optional[datetime]" = None,
+    last_ts: "Optional[datetime]" = None,       # AMENDMENT #6: raw last-trade ts
+    mark_ts: "Optional[datetime]" = None,       # AMENDMENT #6: raw mark ts
     source: str = "",
 ) -> ExecutableQuoteApplication:
     """Single authoritative function for writing option-price state onto a position.
@@ -461,6 +1167,121 @@ def _apply_option_quote_for_decision(
             pos.lastoptionquoteupdatets     = quote_ts
         except Exception as _e:
             log.debug("_aqfd: quote_ts write failed: %s", _e)
+
+    # AMENDMENT (PR #385 review P1-1 + BID-timestamp contract): keep the
+    # full BID truth tuple in sync with the numeric bid this call is
+    # writing.  A fresh positive BID must clear a prior invalid veto so
+    # downstream soft-winner protection and the fresh-BID hard-stop
+    # fallback re-arm; a zero/missing BID must never MASQUERADE as a
+    # successful BID observation — it does not advance the dedicated
+    # last-positive-BID timestamp.  Advancing the timestamp on a bid=0
+    # cycle would let a later flaky consumer misread the position as
+    # having a fresh executable BID and re-arm the fresh-BID path on
+    # stale numeric data.
+    _bid_positive = False
+    try:
+        _bid_positive = float(bid or 0.0) > 0.0
+    except Exception:
+        _bid_positive = False
+    try:
+        pos.option_bid_valid = _bid_positive
+        pos.optionbidvalid   = _bid_positive
+    except Exception as _e:
+        log.debug("_aqfd: option_bid_valid write failed: %s", _e)
+
+    # option_quote_fresh is derived from bid_valid AND ts_fresh in the
+    # snapshot builder.  Set here so a positive bid clears a prior False
+    # veto and a zero bid re-asserts False.
+    try:
+        pos.option_quote_fresh = _bid_positive
+        pos.optionquotefresh   = _bid_positive
+    except Exception as _e:
+        log.debug("_aqfd: option_quote_fresh write failed: %s", _e)
+
+    # Advance the dedicated last-positive-BID timestamp ONLY when we
+    # actually observed a positive bid this cycle.  A zero/missing bid
+    # leaves the prior stamp untouched — the freshness gate will then
+    # correctly age it out, rather than restart the freshness clock on
+    # what is really an invalid observation.
+    if quote_ts is not None and _bid_positive:
+        try:
+            pos.last_option_bid_update_ts = quote_ts
+            pos.lastoptionbidupdatets     = quote_ts
+        except Exception as _e:
+            log.debug("_aqfd: last_option_bid_update_ts write failed: %s", _e)
+
+    # ── HARD-EXIT REFERENCE (amendment #6) ───────────────────────────────────
+    # QPM is not the only writer path.  Broker-position repair and startup
+    # hydration route through this helper.  If we don't populate the hard-exit
+    # reference here too, a repaired LIVE position with a missing bid but a
+    # catastrophic mark/last shows 0% loss until QPM independently reaches it.
+    # Uses the SAME shared selector as QPM (single source of truth for policy).
+    # AMENDMENT #6 (blocker 3): raw LAST and last_ts are now accepted so we
+    # can pass provenance-preserved values, and the broker-precheck writer
+    # no longer collapses everything into 'mark'.
+    try:
+        from ap.position_quote_monitor import _select_hard_exit_reference as _sel_href
+        _now = datetime.now(timezone.utc)
+        _cost_basis = float(getattr(pos, "entry_price", 0.0) or 0.0)
+        # AMENDMENT #6 blocker 4: use per-position hard stop for catastrophic-ASK test
+        try:
+            _pos_hs, _, _ = _effective_thresholds(pos)
+        except Exception:
+            _pos_hs = -0.33
+        _raw_mark_ts = mark_ts
+        _mark_ts = _normalize_hard_ref_ts(_raw_mark_ts, now_utc=_now)
+        if (mark or 0) > 0 and _raw_mark_ts in (None, ""):
+            _mark_ts = _normalize_hard_ref_ts(quote_ts, now_utc=_now)
+        _href = _sel_href(
+            bid=float(bid or 0.0), ask=float(ask or 0.0),
+            mark=float(mark or 0.0), last=float(last or 0.0),
+            bid_ts=(_normalize_hard_ref_ts(quote_ts, now_utc=_now) if (bid or 0) > 0 else None),
+            ask_ts=(_normalize_hard_ref_ts(quote_ts, now_utc=_now) if (ask or 0) > 0 else None),
+            mark_ts=_mark_ts,
+            last_ts=last_ts,
+            now_utc=_now,
+            entry_price=_cost_basis,
+            hard_stop_pct=_pos_hs,
+            last_stale_sec=float(os.getenv("LAST_TRADE_STALE_SEC", "30.0")),
+        )
+        # Authoritative refs are monotonic by quote timestamp; stale authority
+        # cannot erase a newer catastrophic or healthy reference.
+        _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
+        _prior_price = float(getattr(pos, "hard_exit_reference_price", 0.0) or 0.0)
+        _prior_ts = getattr(pos, "hard_exit_reference_ts", getattr(pos, "hardexitreferencets", None))
+        _prior_source = str(getattr(pos, "hard_exit_reference_source", "") or "")
+        _overwrite = _should_replace_hard_ref(
+            prior_validity=_prior_validity,
+            prior_ts=_prior_ts,
+            prior_price=_prior_price,
+            candidate_validity=_href.validity,
+            candidate_ts=_href.ts,
+            prior_source=_prior_source,
+            candidate_source=_href.source,
+            now_utc=_now,
+        )
+        if not _overwrite:
+            pos.hard_exit_reference_refresh_needed = True
+            pos.hardexitreferencerefreshneeded = True
+        if _overwrite and _href.price > 0:
+            pos.hard_exit_reference_price = _href.price
+            pos.hardexitreferenceprice = _href.price
+            pos.hard_exit_reference_source = _href.source
+            pos.hardexitreferencesource = _href.source
+            pos.hard_exit_reference_validity = _href.validity
+            pos.hardexitreferencevalidity = _href.validity
+            _ts_to_write = _href.ts
+            pos.hard_exit_reference_ts = _ts_to_write
+            pos.hardexitreferencets = _ts_to_write
+            if _cost_basis > 0:
+                _hr_pnl = (_href.price - _cost_basis) / _cost_basis
+                pos.hard_exit_reference_pnl_pct = _hr_pnl
+                pos.hardexitreferencepnlpct = _hr_pnl
+            if _href.validity == "proven":
+                pos.hard_exit_reference_refresh_needed = False
+                pos.hardexitreferencerefreshneeded = False
+    except Exception as _e:
+        log.debug("_aqfd: hard_exit_reference write failed: %s", _e)
 
     return ExecutableQuoteApplication(
         pricing_mode     = _pricing_mode,
@@ -617,7 +1438,12 @@ class ManagedPosition:
 
     @property
     def is_at_target(self) -> bool:
-        if self.underlying_target <= 0:
+        # P0 (PR #385 audit): current_underlying must be a real positive price.
+        # With missing underlying data (0.0), a PUT's `current <= target` was
+        # ALWAYS true (0 <= target), firing TARGET HIT instantly on data gaps.
+        # This is the exact premature-PUT-exit signature (PEP PUT, LULU PUT).
+        # Missing truth is not a market signal.
+        if self.underlying_target <= 0 or self.current_underlying <= 0:
             return False
         if self.side == "CALL":
             return self.current_underlying >= self.underlying_target
@@ -625,7 +1451,10 @@ class ManagedPosition:
 
     @property
     def is_at_stop(self) -> bool:
-        if self.underlying_stop <= 0:
+        # P0 (PR #385 audit): same zero-guard as is_at_target. A CALL's
+        # `current <= stop` was always true with current_underlying=0,
+        # firing STOP HIT on data gaps for CALLs.
+        if self.underlying_stop <= 0 or self.current_underlying <= 0:
             return False
         if self.side == "CALL":
             return self.current_underlying <= self.underlying_stop
@@ -713,28 +1542,69 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     alert that previously lived here (blocking requests.post under self._lock)
     has been moved to _submit_exit_decision(), which fires it after the
     callback returns, outside both lock sections.
+
+    P0 (soft-exit executable-truth): Builds one canonical ExitDecisionSnapshot
+    at the top of evaluation.  All soft exit branches use exec_pnl from the
+    snapshot (always BID-based) rather than option_pnl_pct (which is midpoint
+    for PAPER positions).  Hard exits retain backward-compatible option_pnl_pct
+    so they fire even when bid is unavailable.
     """
     if now_et is None:
         now_et = datetime.now(ET)
-    _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(pos)
+    # AMENDMENT (PR #385 review): pin DTE / threshold profile lookup to the
+    # caller-supplied ET evaluation clock.  Without this, historical replays
+    # and after-midnight-UTC runs would silently pick a different threshold
+    # profile than the session they claim to evaluate.
+    try:
+        _session_date = now_et.astimezone(ET).date()
+    except Exception:
+        _session_date = None
+    _hard_stop, _immediate_tp, _profit_lock = _effective_thresholds(
+        pos, session_date=_session_date,
+    )
+
+    # ── Build canonical decision snapshot ────────────────────────────────────
+    # One snapshot per evaluation; all soft exit branches consume it.
+    now_utc = datetime.now(timezone.utc)
+    snap = _build_exit_decision_snapshot(pos, now_utc)
+    _effective_hard_ref = get_effective_hard_exit_reference(pos, now_utc)
 
     hour, minute = now_et.hour, now_et.minute
+    # option_pnl: backward-compatible (bid for LIVE, mid for PAPER) — ONLY used
+    # by hard exits that must fire even without a valid bid.
     option_pnl   = pos.option_pnl_pct
+    _decision_pnl = _effective_hard_ref if _effective_hard_ref is not None else option_pnl
+    # exec_pnl: always BID-based — used by ALL soft exit branches.
+    # May be None when bid is missing.  Soft exit gates will catch None.
+    exec_pnl     = snap.exit_executable_pnl_pct
     qty_rem      = pos.quantity_remaining
 
     # ── 1. TARGET HIT ────────────────────────────────────────────────────────
-    if pos.is_at_target:
+    # AMENDMENT #4 (blocker 1): pos.is_at_target already zero-guards
+    # current_underlying, but we additionally verify the snapshot's
+    # underlying_available.  Missing underlying truth is not a target hit.
+    # AMENDMENT #5 (blocker 2): underlying must be BOTH available AND fresh.
+    # A frozen at-target price left over from a QPM stall must not close a trade.
+    if snap.underlying_available and snap.underlying_fresh and pos.is_at_target:
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"TARGET HIT -- underlying ${pos.current_underlying:.2f} reached ${pos.underlying_target:.2f}",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
+            urgency="IMMEDIATE",
+            pnl_pct=_decision_pnl,
         )
 
     # ── 2. STOP HIT ──────────────────────────────────────────────────────────
-    # Require 30s confirmation before exiting on underlying stop breach.
-    # A single candle wick that immediately recovers should NOT trigger exit.
-    # Uses HIGH urgency (bid-limit) not IMMEDIATE (market).
-    if pos.is_at_stop:
+    # AMENDMENT #4 (blocker 1): STOP HIT is an underlying-driven risk-reducing
+    # exit and must NOT fire from retained underlying=0.
+    # AMENDMENT #5 (blocker 2): also requires underlying_fresh.  When underlying
+    # is stale/unavailable, we also RESET the breach timer — otherwise elapsed
+    # wall-clock on a single stale observation would satisfy the confirmation
+    # window (reviewer's "produce aging on the shelf" case).
+    if not (snap.underlying_available and snap.underlying_fresh):
+        if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
+            pos._underlying_stop_breach_ts = None
+    elif pos.is_at_stop:
+        _stop_pnl_authority = _decision_pnl
         # PR-A / BUG-2: stamp is datetime now (was time.time() float).
         _now_dt = datetime.now(timezone.utc)
         _stop_dt = pos._underlying_stop_breach_ts
@@ -760,7 +1630,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                         f"held below stop ${pos.underlying_stop:.2f} "
                         f"for {_breach_age_sec:.0f}s"
                     ),
-                    urgency="HIGH", pnl_pct=option_pnl,
+                    urgency="HIGH", pnl_pct=_stop_pnl_authority,
                 )
             else:
                 log.info(
@@ -775,9 +1645,59 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             pos._underlying_stop_breach_ts = None
             log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
 
+    # ══ P0 (PR #385 amendment #3, blocker 1): HARD-EXIT PRE-EVALUATION ════════
+    # Hard exits fire BEFORE every soft branch AND every soft truth gate.
+    # AMENDMENT #3: they consume a DEDICATED loss authority
+    # (hard_exit_reference_pnl_pct / price) written by QPM from the last-known
+    # best-available option price (bid → mid → mark → ask → last).  This is
+    # separate from the soft-exit executable authority: when LIVE loses its bid,
+    # QPM correctly zeroes current_option_price so soft exits cannot fire from
+    # a mid/mark — but option_pnl_pct then returns 0.0, silently disarming any
+    # hard-stop check that reads it.  The dedicated authority never zeroes when
+    # ANY market price is available, closing the catastrophic-loser trap.
+    #
+    # All hard-exit consumers use the shared resolver — never direct attribute reads.
+    # Blocker 2 (amendment #6+): resolver also recomputes age from the stored
+    # hard_exit_reference_ts so an expired "proven" label cannot mask new losses.
+    # AMENDMENT (Jason BAC): the hard stop must consume only authoritative
+    # hard-stop truth — provenance-aware persisted reference OR fresh
+    # executable BID. Previously `_hard_loss_pnl = _decision_pnl` allowed a
+    # PAPER midpoint/mark/LAST/ASK-derived option_pnl_pct to trigger a hard
+    # stop whenever the persisted hard reference was rejected by the resolver
+    # (unproven / expired / no_data). That is exactly the class of exit #385
+    # was designed to prevent. Missing authority => None => do not fire.
+    _hard_loss_pnl = _resolve_hard_stop_pnl_authority(pos, now_utc)
+
+    # HARD STOP (pre-evaluated, using dedicated loss authority)
+    if _hard_loss_pnl is not None and _hard_loss_pnl <= _hard_stop:
+        return ExitDecision(
+            action="STOP", quantity=qty_rem,
+            reason=(
+                f"HARD STOP -- {_hard_loss_pnl*100:.0f}% (hard-exit ref) exceeded "
+                f"-{abs(_hard_stop)*100:.0f}% max loss"
+            ),
+            urgency="IMMEDIATE", pnl_pct=_hard_loss_pnl,
+        )
+
+    # EOD FORCE CLOSE (pre-evaluated) — deliberately independent of quote
+    # authority. `_eod_audit_pnl` is display/audit only; it never certifies
+    # safety and never drives the exit decision itself.
+    _eod_audit_pnl = _hard_loss_pnl if _hard_loss_pnl is not None else _decision_pnl
+    _pre_past_eod = (hour > EOD_HARD_CLOSE_HOUR or
+                     (hour == EOD_HARD_CLOSE_HOUR and minute >= EOD_HARD_CLOSE_MIN))
+    _pre_market_closed = (hour >= 16)
+    if _pre_past_eod or (_pre_market_closed and not getattr(pos, "overnight_hold_approved", False)):
+        return ExitDecision(
+            action="CLOSE_ALL", quantity=qty_rem,
+            reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET {'(market closed)' if _pre_market_closed else f'past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}'}",
+            urgency="IMMEDIATE", pnl_pct=_eod_audit_pnl,
+        )
+    # ══════════════════════════════════════════════════════════════════════════
+
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
     # Once green, we LOCK IN a minimum profit. Never let a green trade
-    # become a loss. Average winner target = 25%.
+    # become a loss.  Uses executable BID P&L only (never midpoint).
+    # Gated on fresh executable bid truth — stale/missing bid defers.
     #
     # Floor logic (option_pnl must stay ABOVE floor or we exit):
     #   peak >= 25%  → floor +12%  (never give back more than 13pts of a big winner)
@@ -786,6 +1706,11 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     #   peak >= 5%   → floor +3%   (MINIMUM green — never turn a 5%+ win into a loss)
     #   any green    → floor  0%   (breakeven floor — touched green = never go red)
     if pos.scale_outs_done == 0 and pos.touched_profit:
+        # ── Option executable truth gate (soft exit) ─────────────────────────
+        _tp_option_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _tp_option_gate is not None:
+            return _tp_option_gate
+
         _max = pos.max_profit_seen or 0
         if _max >= 0.25:
             _floor = 0.12   # secured 12% minimum
@@ -798,12 +1723,18 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         else:
             _floor = 0.00   # any green: floor at breakeven
 
-        if option_pnl <= _floor:
-            # Before firing: check if underlying still confirming.
+        # Use exec_pnl (BID-based) for the floor comparison, not midpoint.
+        _tp_pnl = exec_pnl if exec_pnl is not None else option_pnl
+        if _tp_pnl <= _floor:
+            # Before firing: apply underlying data truth gate.
+            # Missing or stale underlying → defer (not genuine non-confirmation).
+            _tp_und_gate = _soft_exit_underlying_truth_gate(snap)
+            if _tp_und_gate is not None:
+                return _tp_und_gate
+
+            # Underlying data is fresh and available — check direction.
             # A single penny drop on a cheap contract (-9%) is not a real signal
             # if the underlying is still moving in our direction.
-            # The thesis check applies regardless of age — if underlying
-            # is still holding, we do not punish the option for spread noise.
             _age_min = _position_age_minutes(pos)
             _confirming, _confirm_reason = _underlying_still_confirming(pos)
             _MAX_THESIS_OVERRIDE = float(
@@ -813,19 +1744,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 # Underlying still in our direction — hold, don't exit on noise
                 log.info(
                     "[%s] TOUCHED_PROFIT_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin thesis window | pnl=%.1f%%",
+                    "(%s) | age=%.1fmin < %.0fmin thesis window | exec_pnl=%.1f%%",
                     pos.ticker, _confirm_reason, _age_min,
-                    _MAX_THESIS_OVERRIDE, option_pnl * 100,
+                    _MAX_THESIS_OVERRIDE, _tp_pnl * 100,
                 )
             else:
                 return ExitDecision(
                     action="CLOSE_ALL", quantity=qty_rem,
                     reason=(
                         f"TOUCHED PROFIT STOP — peaked +{_max*100:.0f}% "
-                        f"now {option_pnl*100:.0f}% — floor={_floor*100:.0f}% | "
+                        f"now {_tp_pnl*100:.0f}% (exec/bid) — floor={_floor*100:.0f}% | "
                         f"underlying={'confirming' if _confirming else 'not confirming'}"
                     ),
-                    urgency="IMMEDIATE", pnl_pct=option_pnl,
+                    urgency="IMMEDIATE", pnl_pct=_tp_pnl,
                 )
 
     # ── 33/33/34 SCALE-OUT LADDER ────────────────────────────────────────────
@@ -836,8 +1767,12 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Do NOT close everything at 15% — let winners run to 25-30%+ with trail.
     # Single-contract positions: hold until trail fires or 30%+ hit.
 
-    # Scale 1: first +10% hit → sell first third
-    if option_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+    # Scale 1: first +15% hit → sell first third
+    # Uses executable BID P&L — midpoint above threshold but bid below does NOT trigger.
+    _scale_gate_1 = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+    if exec_pnl is not None and exec_pnl >= SCALE_OUT_1_THRESHOLD and pos.scale_outs_done == 0:
+        if _scale_gate_1 is not None:
+            return _scale_gate_1
         if qty_rem <= 1:
             # 1 contract — do NOT sell here, let it run to trail
             pass  # fall through to trail/profit-lock checks
@@ -845,20 +1780,23 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             qty_s1 = max(1, round(qty_rem / 3))
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s1,
-                reason=f"SCALE_1 (+15%) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +25%",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"SCALE_1 (+15% exec/bid) -- selling {qty_s1}/{qty_rem} | running {qty_rem-qty_s1} to +25%",
+                urgency="HIGH", pnl_pct=exec_pnl,
             )
 
-    # Scale 2: +20% hit → sell second third
-    if option_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+    # Scale 2: +25% hit → sell second third
+    _scale_gate_2 = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+    if exec_pnl is not None and exec_pnl >= SCALE_OUT_2_THRESHOLD and pos.scale_outs_done == 1:
+        if _scale_gate_2 is not None:
+            return _scale_gate_2
         if qty_rem <= 1:
             pass  # 1 contract runner — let it run to +30% or trail
         else:
             qty_s2 = max(1, round(qty_rem / 2))  # half of what's left ≈ second third of original
             return ExitDecision(
                 action="SCALE_OUT", quantity=qty_s2,
-                reason=f"SCALE_2 (+25%) -- selling {qty_s2}/{qty_rem} runner | targeting +40%",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"SCALE_2 (+25% exec/bid) -- selling {qty_s2}/{qty_rem} runner | targeting +40%",
+                urgency="HIGH", pnl_pct=exec_pnl,
             )
 
     # Scale 3: +30% → close remainder (full exit for final runner)
@@ -873,27 +1811,35 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # FIX-1: Discord runner alert moved to _submit_exit_decision(). This branch
     # now returns the alert metadata on the decision object instead of calling
     # requests.post() here under self._lock.
+    # P0: Uses executable BID P&L for both peak and drawdown comparisons.
     _single_contract = (qty_rem == 1 and pos.scale_outs_done == 0)
     if (pos.scale_outs_done >= 1 or _single_contract) and pos.peak_pnl_pct >= IMMEDIATE_TP_PCT:
+        # ── Option executable truth gate ─────────────────────────────────────
+        _runner_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _runner_opt_gate is not None:
+            return _runner_opt_gate
+
+        # exec_pnl is guaranteed non-None here (gate passed above).
+        _r_pnl = exec_pnl  # type: ignore[assignment]
 
         # ── PROFIT FLOOR CHECK — fires before trail math ──────────────────────
-        # If peak crossed a floor threshold and current P&L is below that floor,
+        # If peak crossed a floor threshold and current BID P&L is below that floor,
         # sell immediately. This protects against QPM gaps missing the peak.
-        # Example: peaked at +25% (floor=10%), now at +7% → EXIT at +7%.
+        # Example: peaked at +25% (floor=10%), now bid at +7% → EXIT at +7%.
         _applicable_floor = 0.0
         for _floor_trigger, _floor_min in sorted(PROFIT_FLOOR.items(), reverse=True):
             if pos.peak_pnl_pct >= _floor_trigger:
                 _applicable_floor = _floor_min
                 break
-        if _applicable_floor > 0 and 0 < option_pnl < _applicable_floor:
+        if _applicable_floor > 0 and 0 < _r_pnl < _applicable_floor:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"PROFIT LOCK — peaked +{pos.peak_pnl_pct*100:.0f}%, "
-                    f"now +{option_pnl*100:.0f}% below floor +{_applicable_floor*100:.0f}%"
+                    f"now +{_r_pnl*100:.0f}% (exec/bid) below floor +{_applicable_floor*100:.0f}%"
                 ),
                 urgency="IMMEDIATE",
-                pnl_pct=option_pnl,
+                pnl_pct=_r_pnl,
                 reason_code="PROFIT_LOCK",
             )
         # ─────────────────────────────────────────────────────────────────────
@@ -910,8 +1856,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             _runner_trail = 0.08   # single contracts: tight 8% trail (was 12%)
         else:
             _runner_trail = 0.15   # multi-contract runner: 15% trail (was 20%)
-        runner_drop = pos.peak_pnl_pct - option_pnl
-        if runner_drop >= _runner_trail or option_pnl <= 0:
+        runner_drop = pos.peak_pnl_pct - _r_pnl
+        if runner_drop >= _runner_trail or _r_pnl <= 0:
             _dur_min = 0
             try:
                 _opened_ts = pos.opened_at.timestamp() if hasattr(pos.opened_at, "timestamp") else time.time()
@@ -922,9 +1868,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"RUNNER TRAIL EXIT -- peaked +{pos.peak_pnl_pct*100:.0f}%, "
-                    f"now +{option_pnl*100:.0f}%, protecting runner gains"
+                    f"now +{_r_pnl*100:.0f}% (exec/bid), protecting runner gains"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_r_pnl,
             )
             # FIX-1: carry alert metadata so _submit_exit_decision() can fire
             # the Discord notification after callback returns (outside lock).
@@ -935,16 +1881,21 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             return d
 
     # ── SMALL WIN CAPTURE ─────────────────────────────────────────────────────
+    # P0: gate on executable bid truth; use exec_pnl for comparison.
     if pos.max_profit_seen >= SMALL_WIN_PCT:
+        _sw_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _sw_gate is not None:
+            return _sw_gate
+        _sw_pnl = exec_pnl if exec_pnl is not None else option_pnl
         floor = max(0.03, pos.max_profit_seen - SMALL_WIN_TRAIL)
-        if 0 < option_pnl <= floor:
+        if 0 < _sw_pnl <= floor:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
                     f"SMALL WIN LOCK — peaked +{pos.max_profit_seen*100:.0f}%, "
-                    f"protecting +{option_pnl*100:.0f}%"
+                    f"protecting +{_sw_pnl*100:.0f}% (exec/bid)"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_sw_pnl,
             )
 
     # Underlying progress: if 60%+ toward scanner target, log but do NOT close.
@@ -988,7 +1939,36 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # Prevents exiting on intraday wicks that immediately recover
     _STOP_CONFIRM_SEC   = float(os.getenv("STOP_BREACH_CONFIRM_SECONDS", "45"))
 
-    if option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit:
+    # P0: Use exec_pnl (BID-based) for the soft-loss stop threshold comparison.
+    # Underlying is required for this branch — apply both gates before evaluating.
+    #
+    # P0 AUDIT FIX (PR #385): a deferral returned from inside this branch must
+    # NEVER shadow the HARD STOP below.  If the last-known loss is already at or
+    # past the hard-stop threshold, we SKIP this entire soft branch so the hard
+    # stop (which fires regardless of bid/underlying availability) is reachable.
+    # Without this, a position at -45% with a missing bid returned
+    # SOFT_EXIT_DEFERRED_* forever and had NO exit path — worse than main.
+    _sl_pnl = exec_pnl if exec_pnl is not None else option_pnl  # fallback for breach-stamp only
+    _sl_catastrophic = option_pnl <= _hard_stop  # hard stop must remain reachable
+    if not _sl_catastrophic and (
+        (exec_pnl is not None and exec_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit) or
+        (exec_pnl is None and option_pnl <= _SOFT_LOSS_PCT and not pos.touched_profit)
+    ):
+        # ── Option truth gate ────────────────────────────────────────────────
+        _sl_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _sl_opt_gate is not None:
+            return _sl_opt_gate
+        _sl_pnl = exec_pnl  # type: ignore[assignment]  # guaranteed non-None after gate
+
+        # ── Underlying truth gate ─────────────────────────────────────────────
+        # Missing or stale underlying → DEFER (not genuine non-confirmation).
+        _sl_und_gate = _soft_exit_underlying_truth_gate(snap)
+        if _sl_und_gate is not None:
+            return _sl_und_gate
+        _sl_grace_gate = _soft_exit_entry_grace_decision(snap)
+        if _sl_grace_gate is not None:
+            return _sl_grace_gate
+
         _soft_age       = _position_age_minutes(pos)
         _soft_confirm, _soft_reason = _underlying_still_confirming(pos)
 
@@ -1011,14 +1991,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             # First time we see this breach — stamp it, don't exit yet
             pos._stop_breach_ts = _now_dt
             log.info(
-                "[%s] STOP_BREACH_STARTED — %.1f%% loss | confirming=%s | "
+                "[%s] STOP_BREACH_STARTED — %.1f%% exec/bid loss | confirming=%s | "
                 "will exit if breach holds >%.0fs | age=%.1fmin",
-                pos.ticker, option_pnl * 100, _soft_confirm, _STOP_CONFIRM_SEC, _soft_age,
+                pos.ticker, _sl_pnl * 100, _soft_confirm, _STOP_CONFIRM_SEC, _soft_age,
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
-                reason=f"STOP_BREACH_STARTED — {option_pnl*100:.1f}% loss | breach stamped, waiting for confirmation window",
-                urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_STARTED",
+                reason=f"STOP_BREACH_STARTED — {_sl_pnl*100:.1f}% exec/bid loss | breach stamped, waiting for confirmation window",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_STARTED",
             )
 
         _breach_age_sec = (_now_dt - _breach_dt).total_seconds()
@@ -1030,81 +2010,84 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 pos._stop_breach_ts = None
                 log.info(
                     "[%s] STOP_BREACH_RESET — underlying recovered (%.2f%% move) "
-                    "| option=%.1f%% | breach lasted %.0fs < %.0fs confirm window",
-                    pos.ticker, _u_move * 100, option_pnl * 100,
+                    "| exec/bid=%.1f%% | breach lasted %.0fs < %.0fs confirm window",
+                    pos.ticker, _u_move * 100, _sl_pnl * 100,
                     _breach_age_sec, _STOP_CONFIRM_SEC,
                 )
                 return ExitDecision(
                     action="HOLD", quantity=0,
                     reason=f"STOP_BREACH_RESET — underlying recovered {_u_move*100:.2f}%, wick not confirmed",
-                    urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_RESET",
+                    urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_RESET",
                 )
             # Still in confirmation window — log and wait
             log.info(
-                "[%s] STOP_BREACH_CONFIRMING — %.1f%% loss | breach=%.0fs/%.0fs | "
+                "[%s] STOP_BREACH_CONFIRMING — %.1f%% exec/bid loss | breach=%.0fs/%.0fs | "
                 "underlying=%s",
-                pos.ticker, option_pnl * 100, _breach_age_sec, _STOP_CONFIRM_SEC,
+                pos.ticker, _sl_pnl * 100, _breach_age_sec, _STOP_CONFIRM_SEC,
                 _soft_reason,
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
-                reason=f"STOP_BREACH_CONFIRMING — {option_pnl*100:.1f}% loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
-                urgency="NORMAL", pnl_pct=option_pnl, reason_code="STOP_BREACH_CONFIRMING",
+                reason=f"STOP_BREACH_CONFIRMING — {_sl_pnl*100:.1f}% exec/bid loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_CONFIRMING",
             )
 
         # ── Breach confirmed (held past confirmation window) ──────────────────
         # Now evaluate whether to exit
 
         # Past -20% with confirmed breach → exit, bid-limit
-        if option_pnl <= _SOFT_LOSS_DEEP_PCT:
+        if _sl_pnl <= _SOFT_LOSS_DEEP_PCT:
             pos._stop_breach_ts = None
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
-                    f"DEEP_LOSS_STOP — {option_pnl*100:.0f}% exceeds deep floor "
+                    f"DEEP_LOSS_STOP — {_sl_pnl*100:.0f}% exec/bid exceeds deep floor "
                     f"{_SOFT_LOSS_DEEP_PCT*100:.0f}% | confirmed {_breach_age_sec:.0f}s | "
                     f"underlying={_soft_reason}"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_sl_pnl,
             )
 
         # Young position with confirming underlying → suppress, give more time
         if _soft_age < _MIN_HOLD_SOFT and (_soft_confirm or _strong_confirm):
             log.info(
-                "[%s] SOFT_STOP_SUPPRESSED — %.1f%% loss but age=%.1fmin < %.0fmin "
+                "[%s] SOFT_STOP_SUPPRESSED — %.1f%% exec/bid loss but age=%.1fmin < %.0fmin "
                 "hold floor | underlying=%s | giving thesis time to develop",
-                pos.ticker, option_pnl * 100, _soft_age, _MIN_HOLD_SOFT, _soft_reason,
+                pos.ticker, _sl_pnl * 100, _soft_age, _MIN_HOLD_SOFT, _soft_reason,
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
                 reason=f"SOFT_STOP_SUPPRESSED — age {_soft_age:.1f}min < {_MIN_HOLD_SOFT:.0f}min floor, underlying confirming",
-                urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_STOP_SUPPRESSED",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="SOFT_STOP_SUPPRESSED",
             )
 
         if not _soft_confirm:
             # Thesis confirmed broken — underlying not holding, breach confirmed
+            # NOTE: _underlying_still_confirming returning "no_underlying_data" is NOT
+            # reachable here because the underlying gate above already deferred for
+            # missing/stale data.  Any "not confirming" here is genuine adverse movement.
             pos._stop_breach_ts = None
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
                 reason=(
-                    f"THESIS_FAIL_SOFT_STOP — {option_pnl*100:.0f}% loss "
+                    f"THESIS_FAIL_SOFT_STOP — {_sl_pnl*100:.0f}% exec/bid loss "
                     f"and underlying not confirming ({_soft_reason}) | "
                     f"age={_soft_age:.1f}min | confirmed {_breach_age_sec:.0f}s"
                 ),
-                urgency="HIGH", pnl_pct=option_pnl,
+                urgency="HIGH", pnl_pct=_sl_pnl,
             )
 
         # Thesis still valid — watch, don't exit on time alone
         log.warning(
-            "[%s] SOFT_LOSS_WATCH — %.1f%% loss | underlying=%s | "
+            "[%s] SOFT_LOSS_WATCH — %.1f%% exec/bid loss | underlying=%s | "
             "age=%.1fmin | breach confirmed %.0fs | waiting for thesis to break",
-            pos.ticker, option_pnl * 100, _soft_reason,
+            pos.ticker, _sl_pnl * 100, _soft_reason,
             _soft_age, _breach_age_sec,
         )
         return ExitDecision(
             action="HOLD", quantity=0,
-            reason=f"SOFT_LOSS_WATCH — {option_pnl*100:.1f}% loss | thesis holding, underlying={_soft_reason}",
-            urgency="NORMAL", pnl_pct=option_pnl, reason_code="SOFT_LOSS_WATCH",
+            reason=f"SOFT_LOSS_WATCH — {_sl_pnl*100:.1f}% exec/bid loss | thesis holding, underlying={_soft_reason}",
+            urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="SOFT_LOSS_WATCH",
         )
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
@@ -1113,7 +2096,14 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
             if pos.opened_at else 0
         )
-        _dte_ng, _is_idx_ng, _profile_ng = _option_profile(pos)
+        # AMENDMENT (PR #385 review): use the SAME session date that
+        # _effective_thresholds consumed above.  Without this, one
+        # evaluate_exit() call could pick its hard-stop profile from the
+        # supplied now_et and its never-green profile from the host's
+        # wall-clock date — deterministic replays would misclassify DTE.
+        _dte_ng, _is_idx_ng, _profile_ng = _option_profile(
+            pos, session_date=_session_date,
+        )
 
         if _dte_ng == 0 and _is_idx_ng:
             if _age_min < 3:    _ng_stop = -0.12
@@ -1136,7 +2126,28 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             elif _age_min < 20: _ng_stop = -0.10
             else:               _ng_stop = -0.08
 
-        if option_pnl <= _ng_stop:
+        # P0: use exec_pnl (BID) for comparison — midpoint below threshold does not fire.
+        # P0 AUDIT FIX (PR #385): catastrophic losses skip this branch entirely so a
+        # deferral cannot shadow the HARD STOP below (same rescue as soft-loss branch).
+        _ng_pnl = exec_pnl if exec_pnl is not None else option_pnl
+        if _ng_pnl <= _ng_stop and not (option_pnl <= _hard_stop):
+            # ── Option truth gate ────────────────────────────────────────────
+            _ng_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+            if _ng_opt_gate is not None:
+                return _ng_opt_gate
+            _ng_pnl = exec_pnl  # type: ignore[assignment]  # non-None after gate
+
+            # ── Underlying truth gate ────────────────────────────────────────
+            # Missing/stale underlying → DEFER.  Never treat missing data as
+            # "thesis never confirmed" — that is only valid when we actually
+            # have confirming underlying price data and it says wrong direction.
+            _ng_und_gate = _soft_exit_underlying_truth_gate(snap)
+            if _ng_und_gate is not None:
+                return _ng_und_gate
+            _ng_grace_gate = _soft_exit_entry_grace_decision(snap)
+            if _ng_grace_gate is not None:
+                return _ng_grace_gate
+
             _ng_age_min = _position_age_minutes(pos)
             _ng_confirming, _ng_confirm_reason = _underlying_still_confirming(pos)
             # PR-A / BUG-4: read from unified module-level constant; previously
@@ -1152,9 +2163,9 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             if _ng_confirming and _ng_age_min < _MIN_HOLD_NG:
                 log.info(
                     "[%s] NEVER_GREEN_STOP suppressed — underlying still confirming "
-                    "(%s) | age=%.1fmin < %.0fmin hold floor | pnl=%.1f%%",
+                    "(%s) | age=%.1fmin < %.0fmin hold floor | exec_pnl=%.1f%%",
                     pos.ticker, _ng_confirm_reason, _ng_age_min,
-                    _MIN_HOLD_NG, option_pnl * 100,
+                    _MIN_HOLD_NG, _ng_pnl * 100,
                 )
             else:
                 _profile = (
@@ -1165,35 +2176,32 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 return ExitDecision(
                     action="CLOSE_ALL", quantity=qty_rem,
                     reason=(
-                        f"NEVER GREEN STOP [{_profile}] — {option_pnl*100:.0f}% "
+                        f"NEVER GREEN STOP [{_profile}] — {_ng_pnl*100:.0f}% (exec/bid) "
                         f"at {_ng_age_min:.0f}min | threshold={_ng_stop*100:.0f}% | "
                         f"thesis never confirmed | underlying:{_ng_confirm_reason}"
                     ),
-                    urgency="HIGH", pnl_pct=option_pnl,
+                    urgency="HIGH", pnl_pct=_ng_pnl,
                 )
 
-    # ── HARD STOP ─────────────────────────────────────────────────────────────
-    if option_pnl <= _hard_stop:
-        return ExitDecision(
-            action="STOP", quantity=qty_rem,
-            reason=f"HARD STOP -- {option_pnl*100:.0f}% exceeded -{abs(_hard_stop)*100:.0f}% max loss",
-            urgency="IMMEDIATE", pnl_pct=option_pnl,
-        )
-
-    # ── PROFIT LOCK ───────────────────────────────────────────────────────────
+    # ── PROFIT LOCK / TRAILING STOP ───────────────────────────────────────────
+    # P0: gate on executable bid truth; use exec_pnl for comparisons.
     if pos.peak_pnl_pct >= _immediate_tp:
-        if option_pnl <= _profit_lock:
+        _pl_opt_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _pl_opt_gate is not None:
+            return _pl_opt_gate
+        _pl_pnl = exec_pnl  # type: ignore[assignment]  # non-None after gate
+        if _pl_pnl <= _profit_lock:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
-                reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, fell to +{option_pnl*100:.0f}% — locking in",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"PROFIT LOCK -- peaked at +{pos.peak_pnl_pct*100:.0f}%, exec/bid fell to +{_pl_pnl*100:.0f}% — locking in",
+                urgency="HIGH", pnl_pct=_pl_pnl,
             )
-        drop_from_peak = pos.peak_pnl_pct - option_pnl
+        drop_from_peak = pos.peak_pnl_pct - _pl_pnl
         if drop_from_peak >= TRAIL_DROP_FROM_PEAK:
             return ExitDecision(
                 action="CLOSE_ALL", quantity=qty_rem,
-                reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, dropped {drop_from_peak*100:.0f}pts to +{option_pnl*100:.0f}%",
-                urgency="HIGH", pnl_pct=option_pnl,
+                reason=f"TRAILING STOP -- peak +{pos.peak_pnl_pct*100:.0f}%, exec/bid dropped {drop_from_peak*100:.0f}pts to +{_pl_pnl*100:.0f}%",
+                urgency="HIGH", pnl_pct=_pl_pnl,
             )
 
     # ── TREND DAY MULTIPLIERS ─────────────────────────────────────────────────
@@ -1222,15 +2230,19 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         )
 
     # ── 4. PROFIT PROTECTION -- WINDOW 3 (2:00 PM+) ──────────────────────────
+    # P0: gate on executable bid truth; use exec_pnl for profit comparison.
     past_window3 = (hour > PROFIT_PROTECT_3_HOUR or
                     (hour == PROFIT_PROTECT_3_HOUR and minute >= PROFIT_PROTECT_3_MIN))
     protect3_thresh = 0.50 if direction_aligns else PROTECT_3_THRESHOLD
-    if past_window3 and option_pnl >= protect3_thresh:
+    if past_window3 and exec_pnl is not None and exec_pnl >= protect3_thresh:
+        _w3_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _w3_gate is not None:
+            return _w3_gate
         trend_note = " [trend day -- raised to 50% threshold]" if direction_aligns else ""
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"PROFIT PROTECT W3 -- +{option_pnl*100:.0f}% at 2PM+{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl,
+            reason=f"PROFIT PROTECT W3 -- +{exec_pnl*100:.0f}% exec/bid at 2PM+{trend_note}",
+            urgency="HIGH", pnl_pct=exec_pnl,
         )
 
     # ── 5. PROFIT PROTECTION -- WINDOW 2 (1:00 PM+, or 1:30 PM on trend day) ─
@@ -1243,13 +2255,16 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w2_min  -= 60
     past_window2 = (hour > w2_hour or (hour == w2_hour and minute >= w2_min))
     scale2_threshold = SCALE_OUT_2_THRESHOLD * trend_bonus_threshold
-    if past_window2 and option_pnl >= scale2_threshold and pos.scale_outs_done < 2:
+    if past_window2 and exec_pnl is not None and exec_pnl >= scale2_threshold and pos.scale_outs_done < 2:
+        _w2_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _w2_gate is not None:
+            return _w2_gate
         qty_close  = max(1, round(qty_rem * (0.50 if direction_aligns else 0.75)))
         trend_note = " [TREND DAY -- reduced scale]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W2 -- +{option_pnl*100:.0f}% at {w2_hour}:{w2_min:02d}+ scale{trend_note}",
-            urgency="HIGH", pnl_pct=option_pnl,
+            reason=f"PROFIT PROTECT W2 -- +{exec_pnl*100:.0f}% exec/bid at {w2_hour}:{w2_min:02d}+ scale{trend_note}",
+            urgency="HIGH", pnl_pct=exec_pnl,
         )
 
     # ── 6. PROFIT PROTECTION -- WINDOW 1 (11:00 AM+, or 11:30 AM on trend day) ─
@@ -1262,23 +2277,76 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         w1_min  -= 60
     past_window1 = (hour > w1_hour or (hour == w1_hour and minute >= w1_min))
     scale1_threshold = SCALE_OUT_1_THRESHOLD * trend_bonus_threshold
-    if past_window1 and option_pnl >= scale1_threshold and pos.scale_outs_done < 1:
+    if past_window1 and exec_pnl is not None and exec_pnl >= scale1_threshold and pos.scale_outs_done < 1:
+        _w1_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _w1_gate is not None:
+            return _w1_gate
         qty_close  = max(1, round(qty_rem * (0.35 if direction_aligns else 0.50)))
         trend_note = " [TREND DAY -- let runner breathe]" if direction_aligns else ""
         return ExitDecision(
             action="SCALE_OUT", quantity=qty_close,
-            reason=f"PROFIT PROTECT W1 -- +{option_pnl*100:.0f}% at {w1_hour}:{w1_min:02d}+ scale{trend_note}",
-            urgency="NORMAL", pnl_pct=option_pnl,
+            reason=f"PROFIT PROTECT W1 -- +{exec_pnl*100:.0f}% exec/bid at {w1_hour}:{w1_min:02d}+ scale{trend_note}",
+            urgency="NORMAL", pnl_pct=exec_pnl,
         )
 
     # ── 7. THETA KILL SWITCH (past noon, down >35%) ───────────────────────────
+    # P0: gate on executable truth; use exec_pnl for loss comparison.
     past_noon = hour >= 12
-    if past_noon and option_pnl <= THETA_STOP_LOSS_PCT:
+    _theta_pnl = exec_pnl if exec_pnl is not None else option_pnl
+    if past_noon and _theta_pnl <= THETA_STOP_LOSS_PCT:
+        _theta_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+        if _theta_gate is not None:
+            return _theta_gate
         return ExitDecision(
             action="CLOSE_ALL", quantity=qty_rem,
-            reason=f"THETA STOP -- option down {option_pnl*100:.0f}% after noon, cutting losses",
-            urgency="NORMAL", pnl_pct=option_pnl,
+            reason=f"THETA STOP -- exec/bid down {_theta_pnl*100:.0f}% after noon, cutting losses",
+            urgency="NORMAL", pnl_pct=_theta_pnl,
         )
+
+    # ── P0 AUDIT FIX (PR #385): explicit deferral surfacing ──────────────────
+    # When executable truth is unavailable/stale AND the display (midpoint) P&L
+    # sits in territory where a soft exit would otherwise have been evaluated,
+    # return the explicit deferred reason instead of a silent "No exit condition
+    # met".  Operators must be able to distinguish "nothing to do" from
+    # "soft exit was possible but truth was missing" (spec §5.12).
+    _final_gate = _soft_exit_option_truth_gate(snap, qty_rem=qty_rem)
+    if _final_gate is not None:
+        _dp = snap.display_pnl_pct
+        _soft_territory = (
+            (_dp is not None and (
+                _dp >= SCALE_OUT_1_THRESHOLD
+                or _dp <= float(os.getenv("SOFT_LOSS_STOP_PCT", "-0.12"))
+            ))
+            or pos.touched_profit
+            or pos.peak_pnl_pct >= _immediate_tp
+            or pos.max_profit_seen >= SMALL_WIN_PCT
+        )
+        if _soft_territory:
+            return _final_gate
+
+    _display_pnl = snap.display_pnl_pct
+    _soft_loss_pct = float(os.getenv("SOFT_LOSS_STOP_PCT", "-0.12"))
+    if _display_pnl is not None and exec_pnl is not None:
+        _display_crossed_tp = (
+            _display_pnl >= SCALE_OUT_1_THRESHOLD
+            and exec_pnl < SCALE_OUT_1_THRESHOLD
+            and pos.scale_outs_done < 1
+        )
+        _display_crossed_loss = (
+            _display_pnl <= _soft_loss_pct
+            and exec_pnl > _soft_loss_pct
+        )
+        if _display_crossed_tp or _display_crossed_loss:
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=(
+                    "SOFT_EXIT_DEFERRED — display crossed soft threshold but "
+                    "fresh executable BID did not confirm"
+                ),
+                urgency="NORMAL",
+                pnl_pct=exec_pnl,
+                reason_code=SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED,
+            )
 
     return ExitDecision(
         action="HOLD", quantity=0,
@@ -2156,39 +3224,97 @@ class APExitEngine:
                         reason="canonical_object_mismatch",
                     )
 
-                # Merge every active broker-repair for this client/contract into canonical.
-                _repairs_to_remove = [
-                    p for p in self._positions
-                    if str(getattr(p, "position_id", "") or "").startswith("broker-repair-")
-                    and str(getattr(p, "option_symbol", "") or "").upper().strip() == _contract
-                    and not getattr(p, "closed", False)
-                ]
+                # Merge every active broker-repair for this exact client/mode/contract
+                # into canonical. Unknown-client, foreign-client, blank-mode, or
+                # wrong-mode repairs stay quarantined and cannot donate quote authority.
+                _repairs_to_remove = []
+                _identity_unproven_repairs = []
+                for p in self._positions:
+                    if not str(getattr(p, "position_id", "") or "").startswith("broker-repair-"):
+                        continue
+                    if str(getattr(p, "option_symbol", "") or "").upper().strip() != _contract:
+                        continue
+                    if getattr(p, "closed", False):
+                        continue
+                    _rp_cli = str(getattr(p, "client_id", "") or "").strip().lower()
+                    if not _client or _rp_cli != _client:
+                        _mark_adoption_identity_quarantined(
+                            p, f"repair_client={_rp_cli!r} canonical_client={_client!r}",
+                        )
+                        _identity_unproven_repairs.append(p)
+                        continue
+                    _rp_mode = str(getattr(p, "execution_mode", "") or "").strip().lower()
+                    if _rp_mode not in {"live", "paper"} or _rp_mode != _norm_canonical:
+                        _mark_adoption_identity_quarantined(
+                            p, f"repair_mode={_rp_mode!r} canonical_mode={_norm_canonical!r}",
+                        )
+                        _identity_unproven_repairs.append(p)
+                        continue
+                    _repairs_to_remove.append(p)
                 for _rp in _repairs_to_remove:
-                    # Merge freshest quote timestamps
-                    for _ts_attr in ("last_option_quote_update_ts", "last_underlying_quote_update_ts",
-                                     "lastoptionquoteupdatets", "lastunderlyingquoteupdatets"):
+                    _merge_now = datetime.now(timezone.utc)
+                    _accepted_repair_bid = None
+                    # Quote values and their timestamps are one snapshot.  Never
+                    # copy a price unless that repair observation is newer.
+                    for _price_attr, _ts_attr in (
+                        ("current_bid", "last_option_bid_update_ts"),
+                        ("current_ask", "last_option_quote_update_ts"),
+                        ("current_underlying", "last_underlying_quote_update_ts"),
+                    ):
+                        _rp_v = getattr(_rp, _price_attr, 0.0) or 0.0
                         _rp_ts = getattr(_rp, _ts_attr, None)
                         _cn_ts = getattr(_existing_canon, _ts_attr, None)
-                        if _rp_ts and (not _cn_ts or _rp_ts > _cn_ts):
-                            try: setattr(_existing_canon, _ts_attr, _rp_ts)
-                            except Exception: pass
-                    # Merge current bid/ask/underlying
-                    for _price_attr in ("current_bid", "currentbid", "current_ask", "currentask",
-                                        "current_underlying", "currentunderlying"):
-                        _rp_v = getattr(_rp, _price_attr, 0.0) or 0.0
-                        if _rp_v > 0:
-                            try: setattr(_existing_canon, _price_attr, _rp_v)
-                            except Exception: pass
-                    # Merge bid-proven peak only
-                    _rp_src = str(getattr(_rp, "live_executable_price_source", "") or "").lower()
-                    if _rp_src == "bid":
-                        _rp_peak = float(getattr(_rp, "peak_pnl_pct", 0.0) or 0.0)
-                        _cn_peak = float(getattr(_existing_canon, "peak_pnl_pct", 0.0) or 0.0)
-                        if _rp_peak > _cn_peak:
+                        _rp_ts_norm = _normalize_hard_ref_ts(_rp_ts, now_utc=_merge_now)
+                        _cn_ts_norm = _normalize_hard_ref_ts(_cn_ts, now_utc=_merge_now)
+                        if _price_attr == "current_bid":
                             try:
-                                _existing_canon.peak_pnl_pct   = _rp_peak
-                                _existing_canon.max_profit_seen = _rp_peak
-                                _existing_canon.touched_profit  = (_rp_peak >= 0.05)
+                                _bid_age_ok = (
+                                    _rp_ts_norm is not None
+                                    and 0 <= (_merge_now - _rp_ts_norm).total_seconds() <= float(STALE_OPTION_QUOTE_MAX_AGE_SEC)
+                                )
+                            except Exception:
+                                _bid_age_ok = False
+                            if not _bid_age_ok:
+                                continue
+                        if (_rp_v > 0 and _rp_ts_norm is not None
+                                and (_cn_ts_norm is None or _rp_ts_norm > _cn_ts_norm)):
+                            _set_position_attr_pair(_existing_canon, _price_attr, _rp_v)
+                            _set_position_attr_pair(_existing_canon, _ts_attr, _rp_ts_norm)
+                            if _price_attr == "current_bid":
+                                _accepted_repair_bid = float(_rp_v)
+                                _set_position_attr_pair(_existing_canon, "option_bid_valid", True)
+                                _set_position_attr_pair(_existing_canon, "option_quote_fresh", True)
+                            elif _price_attr == "current_underlying":
+                                _set_position_attr_pair(_existing_canon, "underlying_available", True)
+                                _set_position_attr_pair(_existing_canon, "underlying_fresh", True)
+                    # Transfer the complete hard-reference record before the
+                    # repair is removed; the cached P&L is recomputed by the
+                    # resolver and is never the authority.
+                    _merge_hard_exit_reference_for_collapse(
+                        _existing_canon, _rp, now_utc=_merge_now,
+                    )
+                    # Merge bid-proven peak only.  Never copy the repair's
+                    # stored percentage; it may have used a provisional entry
+                    # denominator.  A newly accepted repair BID is rebased
+                    # against the canonical entry price before comparison.
+                    _rp_src = str(getattr(_rp, "live_executable_price_source", "") or "").lower()
+                    if _rp_src == "bid" and _accepted_repair_bid is not None:
+                        _cn_peak = float(getattr(_existing_canon, "peak_pnl_pct", 0.0) or 0.0)
+                        _cn_entry = float(getattr(_existing_canon, "entry_price", 0.0) or 0.0)
+                        _rp_rebased_pnl = (
+                            (_accepted_repair_bid - _cn_entry) / _cn_entry
+                            if _cn_entry > 0 else 0.0
+                        )
+                        if _rp_rebased_pnl > _cn_peak:
+                            try:
+                                _set_position_attr_pair(
+                                    _existing_canon, "peak_pnl_pct", _rp_rebased_pnl,
+                                )
+                                _set_position_attr_pair(
+                                    _existing_canon, "max_profit_seen", _rp_rebased_pnl,
+                                )
+                                _existing_canon.touched_profit  = False
+                                _existing_canon.touchedprofit   = False
                             except Exception as _e:
                                 log.debug("[exit_eng] merge peak from repair: %s", _e)
 
@@ -2201,6 +3327,8 @@ class APExitEngine:
                         _canon_id, _rp_id, _contract,
                     )
 
+                _reclassify_hard_ref_for_entry(_existing_canon)
+
                 # Assert exactly one nonclosed active object for this contract.
                 _active_for_contract = [
                     p for p in self._positions
@@ -2212,6 +3340,23 @@ class APExitEngine:
                         "[exit_eng] CANONICAL_COLLAPSE_INVARIANT_VIOLATED | "
                         "contract=%s active_count=%d — expected exactly 1",
                         _contract, len(_active_for_contract),
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
+                        adopted=False, safe_to_seed=False, retryable=True,
+                        reason=f"active_count={len(_active_for_contract)}",
+                    )
+
+                if _identity_unproven_repairs:
+                    log.critical(
+                        "[exit_eng] RETRY_REPAIR_IDENTITY_UNPROVEN | "
+                        "canonical=%s contract=%s retained_repairs=%d",
+                        _canon_id, _contract, len(_identity_unproven_repairs),
+                    )
+                    return CanonicalAdoptionResult(
+                        disposition="RETRY_REPAIR_IDENTITY_UNPROVEN",
+                        adopted=False, safe_to_seed=False, retryable=True,
+                        reason=f"retained_repairs={len(_identity_unproven_repairs)}",
                     )
 
                 return CanonicalAdoptionResult(
@@ -2229,14 +3374,14 @@ class APExitEngine:
                     continue
 
                 # ── Blocker 5: Client and mode fencing ────────────────────────
-                # The repair position must belong to the same client and a
-                # compatible execution mode before we overwrite identity fields.
+                # The repair position must belong to the exact same client and
+                # exact known execution mode before we overwrite identity fields.
                 _repair_client = str(getattr(pos, "client_id", "") or "").strip().lower()
-                if _client and _repair_client and _repair_client != _client:
+                if not _client or _repair_client != _client:
                     log.critical(
                         "[exit_eng] RETRY_CLIENT_MISMATCH | "
                         "contract=%s repair_client=%s canonical_client=%s — "
-                        "refusing cross-client adoption",
+                        "refusing unknown/cross-client adoption",
                         _contract, _repair_client, _client,
                     )
                     return CanonicalAdoptionResult(
@@ -2247,17 +3392,15 @@ class APExitEngine:
 
                 _repair_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
                 _mode_ok = (
-                    not _repair_mode
-                    or not _mode
-                    or _repair_mode == _mode
-                    or _repair_mode in ("", "unknown")
-                    or (_mode == "live" and _repair_mode in ("", "unknown"))
+                    _repair_mode in {"live", "paper"}
+                    and _mode in {"live", "paper"}
+                    and _repair_mode == _mode
                 )
                 if not _mode_ok:
                     log.critical(
                         "[exit_eng] RETRY_MODE_MISMATCH | "
                         "contract=%s repair_mode=%s canonical_mode=%s — "
-                        "refusing incompatible mode adoption",
+                        "refusing unknown/incompatible mode adoption",
                         _contract, _repair_mode, _mode,
                     )
                     return CanonicalAdoptionResult(
@@ -2278,25 +3421,23 @@ class APExitEngine:
                 _prior_peak_is_bid_proven = (_prior_peak_source == "bid")
 
                 if entry_fill > 0:
-                    pos.entry_price = entry_fill
-                    _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    _set_position_attr_pair(pos, "entry_price", entry_fill)
+                    _bid_is_fresh = _has_fresh_dedicated_bid(pos)
+                    _fresh_bid = float(getattr(pos, "current_bid", 0.0) or 0.0) if _bid_is_fresh else 0.0
                     if _fresh_bid > 0:
                         _rebased_pnl = (_fresh_bid - entry_fill) / entry_fill
                     else:
                         _rebased_pnl = 0.0
 
-                    if _prior_peak_is_bid_proven:
-                        _keep_peak = max(
-                            float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0),
-                            _rebased_pnl,
-                        )
-                        pos.peak_pnl_pct    = _keep_peak
-                        pos.max_profit_seen = _keep_peak
-                        pos.touched_profit  = (_keep_peak >= 0.05)
-                    else:
-                        pos.peak_pnl_pct    = max(0.0, _rebased_pnl)
-                        pos.max_profit_seen = max(0.0, _rebased_pnl)
-                        pos.touched_profit  = (_rebased_pnl >= 0.05)
+                    # Peak percentages depend on the entry denominator.  After
+                    # canonical adoption, only the current BID is valid until
+                    # QPM supplies a new two-observation confirmation.
+                    _rebased_peak = max(0.0, _rebased_pnl)
+                    _set_position_attr_pair(pos, "peak_pnl_pct", _rebased_peak)
+                    _set_position_attr_pair(pos, "max_profit_seen", _rebased_peak)
+                    pos.touched_profit = False
+                    pos.touchedprofit = False
+                    _reclassify_hard_ref_for_entry(pos)
 
                 # ── Canonical identity fields ──────────────────────────────────
                 pos.position_id = _canon_id
@@ -2389,6 +3530,7 @@ class APExitEngine:
                 # Update O(1) index atomically
                 self._positions_by_id.pop(old_id, None)
                 self._positions_by_id[_canon_id] = pos
+                _clear_adoption_identity_quarantine(pos)
 
                 log.info(
                     "[exit_eng] CANONICAL_POSITION_ADOPTED "
@@ -2438,6 +3580,29 @@ class APExitEngine:
                     and not existing.closed
                 )
                 if same_id or same_sym:
+                    _incoming_id = str(getattr(pos, "position_id", "") or "")
+                    _incoming_client = str(getattr(pos, "client_id", "") or "").strip().lower()
+                    _incoming_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+                    _incoming_is_proven_canonical = (
+                        _incoming_id
+                        and not _incoming_id.startswith("broker-repair-")
+                        and _incoming_client
+                        and _incoming_mode in {"live", "paper"}
+                    )
+                    if (
+                        same_sym
+                        and not same_id
+                        and _is_adoption_identity_quarantined(existing)
+                        and _incoming_is_proven_canonical
+                    ):
+                        log.warning(
+                            "[exit_eng] ADD_POSITION_CANONICAL_BYPASSES_QUARANTINED_REPAIR "
+                            "| canonical=%s repair=%s contract=%s",
+                            _incoming_id,
+                            getattr(existing, "position_id", ""),
+                            getattr(pos, "option_symbol", ""),
+                        )
+                        continue
                     log.debug(
                         "[%s] Exit engine already tracking %s | pos_id=%s",
                         self._email or pos.ticker,
@@ -2476,7 +3641,7 @@ class APExitEngine:
 
     def active_positions(self) -> list[ManagedPosition]:
         with self._lock:
-            return [p for p in self._positions if not p.closed and int(p.quantity_remaining or 0) > 0]
+            return [p for p in self._positions if _is_behavior_active_position(p)]
 
     def attach_quote_monitor(self, monitor) -> None:
         """Wire the PositionQuoteMonitor for observability and wake-driven exits."""
@@ -3177,35 +4342,139 @@ class APExitEngine:
                     continue
 
                 try:
-                    current_underlying   = float(snap.get("current_underlying") or 0.0)
-                    current_option_price = float(snap.get("current_option_price") or 0.0)
-                    current_bid          = float(snap.get("current_bid") or 0.0)
-                    current_ask          = float(snap.get("current_ask") or 0.0)
-                    analytics_mark       = float(snap.get("analytics_mark_price") or 0.0)
+                    # ── AMENDMENT #4 (blocker 4): apply all money-safety fields ──
+                    # Prior code used `if x > 0` guards which meant a missing-bid
+                    # cycle could not INVALIDATE a retained bid — the exact stale-
+                    # retained-bid failure this PR exists to close.  Under
+                    # DIRECT_POSITION_WRITES=0 this path is the ONLY writer, so
+                    # money-safety truth transitions MUST propagate through here.
+                    # For price fields: apply the value verbatim (0.0 valid).
+                    # For explicit truth booleans: apply verbatim (False wins).
+                    # For timestamps: apply if present in the snapshot payload.
 
-                    if current_underlying > 0:
-                        pos.current_underlying = current_underlying
-                    # P0 contract: QPM already writes bid-based current_option_price
-                    # for LIVE positions. apply_quote_snapshots trusts that invariant
-                    # and propagates it. analytics_mark_price is always propagated
-                    # separately for charts.
-                    if current_option_price > 0:
-                        pos.current_option_price = current_option_price
-                    if current_bid > 0:
-                        pos.current_bid = current_bid
-                    if current_ask > 0:
-                        pos.current_ask = current_ask
-                    if analytics_mark > 0:
+                    def _apply(name, snap_key=None):
+                        k = snap_key or name
+                        if k in snap:
+                            try:
+                                setattr(pos, name, snap[k])
+                            except Exception:
+                                pass
+
+                    # Prices (0.0 must be honored — this is the invalidation)
+                    _apply("current_underlying")
+                    _apply("currentunderlying", "current_underlying")
+                    _apply("current_option_price")
+                    _apply("currentoptionprice", "current_option_price")
+                    _apply("current_bid")
+                    _apply("currentbid", "current_bid")
+                    _apply("current_ask")
+                    _apply("currentask", "current_ask")
+
+                    # Money-safety booleans / metadata
+                    _apply("option_bid_valid")
+                    _apply("optionbidvalid", "option_bid_valid")
+                    _apply("option_quote_fresh")
+                    _apply("optionquotefresh", "option_quote_fresh")
+                    _apply("option_quote_age_sec")
+                    _apply("underlying_available")
+                    _apply("underlyingavailable", "underlying_available")
+                    _apply("underlying_fresh")
+                    _apply("underlyingfresh", "underlying_fresh")
+                    _apply("underlying_age_sec")
+                    _apply("display_mark")
+                    _apply("display_pnl_pct")
+                    _apply("exit_executable_mark")
+                    _apply("exit_executable_pnl_pct")
+
+                    # Hard-exit reference (LIVE-money HARD STOP consumer)
+                    if "hard_exit_reference_validity" in snap or "hard_exit_reference_price" in snap:
+                        _now_utc = datetime.now(timezone.utc)
+                        _incoming_validity = str(snap.get("hard_exit_reference_validity") or "no_data")
+                        _incoming_ts = _normalize_hard_ref_ts(
+                            snap.get("hard_exit_reference_ts"),
+                            now_utc=_now_utc,
+                        )
+                        _incoming_price = snap.get("hard_exit_reference_price")
+                        _incoming_refresh = bool(snap.get("hard_exit_reference_refresh_needed", True))
+                        if _incoming_validity in ("proven", "catastrophic_ask") and _incoming_ts is None:
+                            _incoming_validity = "unproven"
+                            _incoming_refresh = True
+                        _prior_validity = str(getattr(pos, "hard_exit_reference_validity", "") or "")
+                        _prior_price = getattr(pos, "hard_exit_reference_price", 0.0) or 0.0
+                        try:
+                            _prior_price = float(_prior_price)
+                        except Exception:
+                            _prior_price = 0.0
+                        _prior_ts = getattr(
+                            pos, "hard_exit_reference_ts",
+                            getattr(pos, "hardexitreferencets", None),
+                        )
+                        # AMENDMENT (PR #385 review — snapshot chronology):
+                        # older authoritative snapshots may arrive AFTER a newer
+                        # authoritative reference was written by another path
+                        # (broker-precheck adoption, QuoteAuthority bridge,
+                        # or a later QPM cycle applied first).  The previous
+                        # `_preserve_prior` guard only rejected `unproven` /
+                        # `no_data` incoming refs; an OLDER `proven` /
+                        # `catastrophic_ask` snapshot would silently overwrite
+                        # the newer money-safety truth.  Delegate to the
+                        # shared `_should_replace_hard_ref` chronology gate
+                        # (already used by `_apply_option_quote_for_decision`
+                        # and by QPM itself) so the newest authoritative
+                        # observation always wins and `refresh_needed` is set
+                        # instead when we keep the prior reference.
+                        _prior_source = str(
+                            getattr(pos, "hard_exit_reference_source", "") or ""
+                        )
+                        _incoming_source = str(snap.get("hard_exit_reference_source") or "")
+                        _apply_incoming = _should_replace_hard_ref(
+                            prior_validity=_prior_validity,
+                            prior_ts=_prior_ts,
+                            prior_price=_prior_price,
+                            candidate_validity=_incoming_validity,
+                            candidate_ts=_incoming_ts,
+                            prior_source=_prior_source,
+                            candidate_source=_incoming_source,
+                            now_utc=_now_utc,
+                        )
+                        # Legacy safety net: even if the shared gate would
+                        # accept the incoming, an unproven / no_data payload
+                        # must never erase a positive authoritative reference.
+                        if _incoming_validity in ("unproven", "no_data") and _prior_price > 0:
+                            _apply_incoming = False
+                        if not _apply_incoming:
+                            pos.hard_exit_reference_refresh_needed = True
+                            pos.hardexitreferencerefreshneeded = True
+                        else:
+                            pos.hard_exit_reference_price = _incoming_price
+                            pos.hardexitreferenceprice = _incoming_price
+                            pos.hard_exit_reference_source = snap.get("hard_exit_reference_source")
+                            pos.hardexitreferencesource = snap.get("hard_exit_reference_source")
+                            pos.hard_exit_reference_ts = _incoming_ts
+                            pos.hardexitreferencets = _incoming_ts
+                            pos.hard_exit_reference_pnl_pct = snap.get("hard_exit_reference_pnl_pct")
+                            pos.hardexitreferencepnlpct = snap.get("hard_exit_reference_pnl_pct")
+                            pos.hard_exit_reference_validity = _incoming_validity
+                            pos.hardexitreferencevalidity = _incoming_validity
+                            pos.hard_exit_reference_refresh_needed = _incoming_refresh
+                            pos.hardexitreferencerefreshneeded = _incoming_refresh
+
+                    # Timestamps
+                    _apply("last_option_bid_update_ts")
+                    _apply("lastoptionbidupdatets", "last_option_bid_update_ts")
+                    _apply("last_underlying_quote_update_ts")
+                    _apply("lastunderlyingquoteupdatets", "last_underlying_quote_update_ts")
+                    _apply("last_option_quote_update_ts")
+                    _apply("lastoptionquoteupdatets", "last_option_quote_update_ts")
+
+                    # Analytics mark carried separately
+                    analytics_mark = snap.get("analytics_mark_price")
+                    if analytics_mark is not None:
                         try:
                             pos.analytics_mark_price = analytics_mark
                             pos.analyticsmarkprice   = analytics_mark
                         except Exception:
                             pass
-
-                    if snap.get("last_underlying_quote_update_ts") is not None:
-                        pos.last_underlying_quote_update_ts = snap.get("last_underlying_quote_update_ts")
-                    if snap.get("last_option_quote_update_ts") is not None:
-                        pos.last_option_quote_update_ts = snap.get("last_option_quote_update_ts")
 
                     if snap.get("price_source"):
                         setattr(pos, "last_option_price_source", snap.get("price_source"))
@@ -3242,8 +4511,7 @@ class APExitEngine:
             with self._lock:
                 snapshot = [
                     p for p in self._positions
-                    if not getattr(p, "closed", False)
-                    and int(getattr(p, "quantity_remaining", 0) or 0) > 0
+                    if _is_behavior_active_position(p)
                 ]
 
             for pos in snapshot:
@@ -3252,12 +4520,20 @@ class APExitEngine:
                     if qty <= 0:
                         continue
 
+                    # AMENDMENT #4 (blocker 3): pnl_pct on the emergency decision
+                    # must reflect true loss authority.  Reading option_pnl_pct
+                    # here returns 0.0 for LIVE missing-bid positions, misreporting
+                    # the actual risk being cleared.  The exit still fires (this
+                    # is IMMEDIATE + allow_inflight_override), but the audit trail
+                    # and downstream decisioning must see the true P&L.
+                    _ef_pnl_resolved = get_effective_hard_exit_reference(pos, datetime.now(timezone.utc))
+                    _flatten_pnl = _ef_pnl_resolved if _ef_pnl_resolved is not None else float(getattr(pos, "option_pnl_pct", 0.0) or 0.0)
                     decision = ExitDecision(
                         action="CLOSE_ALL",
                         quantity=qty,
                         reason=f"SENTINEL FORCED EXIT -- {reason}",
                         urgency="IMMEDIATE",
-                        pnl_pct=float(getattr(pos, "option_pnl_pct", 0.0) or 0.0),
+                        pnl_pct=_flatten_pnl,
                         reason_code="SENTINEL_FORCED_EXIT",
                     )
 
@@ -3906,9 +5182,19 @@ class APExitEngine:
         with self._lock:
             snapshot = list(self._positions)
         for pos in snapshot:
-            if pos.closed or int(pos.quantity_remaining or 0) <= 0:
+            if not _is_behavior_active_position(pos):
                 continue
             age_min = (now - pos.opened_at).total_seconds() / 60 if pos.opened_at else 0
+            # AMENDMENT (Jason BAC): sentinels share the SAME hard-stop truth
+            # contract as evaluate_exit().  option_pnl_pct is not authoritative
+            # — for PAPER it may be derived from midpoint / mark / LAST / ASK
+            # fallback, and letting the sentinel fire from it produces the exact
+            # false HARD STOP class #385 was built to prevent.  Use the shared
+            # resolver: provenance-aware persisted reference, else fresh
+            # executable BID, else None (no price-based hard stop this cycle).
+            _sentinel_hard_pnl = _resolve_hard_stop_pnl_authority(pos, now)
+            # `pnl` retained as a display value for MISSED-TP and EXIT-STUCK
+            # diagnostics only; it is never used to submit an exit.
             pnl     = pos.option_pnl_pct
             peak    = pos.peak_pnl_pct
 
@@ -4021,14 +5307,31 @@ class APExitEngine:
             if peak >= IMMEDIATE_TP_PCT and not pos.exit_in_flight and age_min > 1:
                 log.error(
                     "[SENTINEL] %s | MISSED TP — peaked +%.0f%% but no exit submitted | pos=%s pnl=%.1f%% age=%.0fm",
-                    pos.ticker, peak * 100, pos.position_id, pnl * 100, age_min,
+                    pos.ticker, peak * 100, pos.position_id, (pnl or 0.0) * 100, age_min,
                 )
 
-            if pnl <= HARD_STOP_PCT and not pos.exit_in_flight and age_min > 1:
+            # AMENDMENT (Jason BAC): the sentinel hard-stop uses the
+            # per-position/per-DTE threshold (not the global HARD_STOP_PCT)
+            # and consumes ONLY authoritative loss truth.  When authority is
+            # missing this cycle we skip — silently treating missing authority
+            # as 0% would falsely certify safety on the last-chance path.
+            try:
+                _sent_hard_stop, _, _ = _effective_thresholds(pos)
+            except Exception:
+                _sent_hard_stop = HARD_STOP_PCT
+            if (
+                _sentinel_hard_pnl is not None
+                and _sentinel_hard_pnl <= _sent_hard_stop
+                and not pos.exit_in_flight
+                and age_min > 1
+            ):
                 decision = ExitDecision(
                     action="CLOSE_ALL", quantity=pos.quantity_remaining,
-                    reason=f"SENTINEL FORCED EXIT — {pnl*100:.0f}% with no exit order",
-                    urgency="IMMEDIATE", pnl_pct=pnl,
+                    reason=(
+                        f"SENTINEL FORCED EXIT — {_sentinel_hard_pnl*100:.0f}% "
+                        f"(hard-exit authority) with no exit order"
+                    ),
+                    urgency="IMMEDIATE", pnl_pct=_sentinel_hard_pnl,
                 )
                 self._submit_exit_decision(pos, decision, from_sentinel=True, allow_inflight_override=True)
                 continue
@@ -4068,22 +5371,75 @@ class APExitEngine:
             if (
                 not pos.exit_in_flight
                 and age_min >= DEAD_TRADE_MIN
-                and DEAD_TRADE_LOW <= pnl <= DEAD_TRADE_HIGH
                 and pos.max_profit_seen < DEAD_TRADE_HIGH
             ):
-                progress = 0.0
-                if pos.underlying_entry and pos.underlying_target and pos.current_underlying:
-                    denom = abs(pos.underlying_target - pos.underlying_entry)
-                    if denom > 0:
-                        progress = abs(pos.current_underlying - pos.underlying_entry) / denom
+                # AMENDMENT (Jason BAC): the 45m TIME STOP is a soft exit and
+                # must obey the same executable-option and underlying truth
+                # contract as the main evaluator.  Build the real production
+                # snapshot and require every truth signal — bid available,
+                # bid fresh, executable P&L derivable, underlying available,
+                # underlying fresh, and valid underlying entry+target geometry
+                # to prove progress.  Any missing/stale signal defers.
+                snap = _build_exit_decision_snapshot(pos, now)
+                _ts_exec_pnl = snap.exit_executable_pnl_pct
+
+                if not snap.option_bid_valid or not snap.option_quote_fresh or _ts_exec_pnl is None:
+                    log.info(
+                        "[SENTINEL] %s | TIME_STOP_DEFERRED — executable option truth "
+                        "unavailable (bid_valid=%s quote_fresh=%s exec_pnl=%s) | pos=%s",
+                        pos.ticker, snap.option_bid_valid, snap.option_quote_fresh,
+                        _ts_exec_pnl, pos.position_id or "?",
+                    )
+                    continue
+
+                if not snap.underlying_available or not snap.underlying_fresh:
+                    log.info(
+                        "[SENTINEL] %s | TIME_STOP_DEFERRED — underlying truth "
+                        "unavailable (available=%s fresh=%s) | pos=%s",
+                        pos.ticker, snap.underlying_available, snap.underlying_fresh,
+                        pos.position_id or "?",
+                    )
+                    continue
+
+                if not (DEAD_TRADE_LOW <= _ts_exec_pnl <= DEAD_TRADE_HIGH):
+                    continue
+
+                # Progress requires valid geometry; missing entry/target cannot
+                # prove non-confirmation.  Defer rather than treat as 0%.
+                _u_entry  = float(getattr(pos, "underlying_entry", 0.0) or 0.0)
+                _u_target = float(getattr(pos, "underlying_target", 0.0) or 0.0)
+                _u_now    = float(snap.underlying_price or 0.0)
+                _denom    = abs(_u_target - _u_entry)
+                if _u_entry <= 0.0 or _u_target <= 0.0 or _u_now <= 0.0 or _denom <= 0.0:
+                    log.info(
+                        "[SENTINEL] %s | TIME_STOP_DEFERRED — underlying geometry "
+                        "unavailable (entry=%.2f target=%.2f now=%.2f) | pos=%s",
+                        pos.ticker, _u_entry, _u_target, _u_now, pos.position_id or "?",
+                    )
+                    continue
+
+                # AMENDMENT (PR #385 review P1-3): the previous
+                # `abs(current - entry) / abs(target - entry)` counted
+                # adverse movement as "progress toward target" and skipped
+                # the TIME STOP even when the underlying had moved
+                # entirely the wrong way (e.g. PUT entry 150, target 145,
+                # current 155 → 100% "progress").  Use signed directional
+                # progress: (current - entry) / (target - entry).  The
+                # sign of the denominator matches the intended direction,
+                # so both CALL (target above entry) and PUT (target below
+                # entry) yield a positive fraction only when the trade is
+                # actually moving toward its target.  Adverse movement
+                # clamps to 0 and the TIME STOP fires as designed.
+                raw_progress = (_u_now - _u_entry) / (_u_target - _u_entry)
+                progress = max(0.0, raw_progress)
                 if progress < 0.30:
                     decision = ExitDecision(
                         action="CLOSE_ALL", quantity=pos.quantity_remaining,
                         reason=(
                             f"TIME STOP — thesis not confirmed after {age_min:.0f}min "
-                            f"pnl={pnl*100:.1f}% progress={progress*100:.0f}% toward target"
+                            f"exec_pnl={_ts_exec_pnl*100:.1f}% progress={progress*100:.0f}% toward target"
                         ),
-                        urgency="HIGH", pnl_pct=pnl,
+                        urgency="HIGH", pnl_pct=_ts_exec_pnl,
                     )
                     self._submit_exit_decision(pos, decision, from_sentinel=True)
 
@@ -4444,6 +5800,16 @@ class APExitEngine:
         """Centralized gate for every path that can submit an exit order."""
         if pos.closed or int(pos.quantity_remaining or 0) <= 0:
             return False
+        if _is_adoption_identity_quarantined(pos):
+            log.error(
+                "[%s] ADOPTION IDENTITY QUARANTINE BLOCK | pos=%s contract=%s reason=%s",
+                getattr(pos, "ticker", "?"),
+                getattr(pos, "position_id", "?"),
+                getattr(pos, "option_symbol", "?"),
+                getattr(pos, "adoption_identity_quarantine_reason", "")
+                or getattr(pos, "adoptionidentityquarantinereason", ""),
+            )
+            return False
 
         if (
             pos.exit_in_flight
@@ -4747,7 +6113,6 @@ class APExitEngine:
                         # PR #176: carry execution_mode from positions row
                         execution_mode=str(row.get("execution_mode") or "").lower().strip(),
                     )
-                    mp.current_option_price = float(row.get("avg_fill", 0) or 0)
                     mp.scale_outs_done      = int(row.get("scale_outs_done", 0) or 0)
                     _qty_remaining = int(row.get("quantity_remaining", 0) or 0)
                     if _qty_remaining > 0:
@@ -4758,7 +6123,130 @@ class APExitEngine:
                         "seed_from_db: %s original_qty=%d qty_remaining=%d scale_outs=%d",
                         mp.ticker, mp.quantity, mp.quantity_remaining, mp.scale_outs_done,
                     )
-                    mp.current_underlying = float(row.get("underlying_entry", 0) or 0)
+                    # AMENDMENT #6 blocker 3: ALL current-quote fields are zeroed.
+                    # Entry fill is NEVER current market truth. option_pnl_pct will
+                    # return 0.0 explicitly (property guard: current_option_price<=0)
+                    # which is honest — we have no market data yet.  QPM/broker-
+                    # precheck will populate within one cycle.
+                    mp.current_option_price  = 0.0
+                    mp.currentoptionprice    = 0.0
+                    mp.current_bid           = 0.0
+                    mp.currentbid            = 0.0
+                    mp.current_ask           = 0.0
+                    mp.currentask            = 0.0
+                    mp.current_underlying    = 0.0
+                    mp.currentunderlying     = 0.0
+                    mp.option_bid_valid      = False
+                    mp.optionbidvalid        = False
+                    mp.option_quote_fresh    = False
+                    mp.optionquotefresh      = False
+                    mp.underlying_available  = False
+                    mp.underlyingavailable   = False
+                    mp.underlying_fresh      = False
+                    mp.underlyingfresh       = False
+
+                    # ── AMENDMENT #6 (blocker 1): RESTART HARD-REF HYDRATION ────
+                    # Restore persisted hard-exit reference fields from the meta
+                    # payload when available.  When absent, we mark the position
+                    # as having NO hard-exit authority (rather than treating the
+                    # entry fill as current market truth) and emit a visible
+                    # warning so operators know QPM must run before this position
+                    # has hard-stop coverage.
+                    _meta = row.get("meta") or {}
+                    if isinstance(_meta, str) and _meta.strip():
+                        try:
+                            import json as _json_m
+                            _meta = _json_m.loads(_meta)
+                        except Exception:
+                            _meta = {}
+                    _persisted_href = {}
+                    if isinstance(_meta, dict):
+                        _persisted_href = _meta.get("hard_exit_reference") or {}
+                    if isinstance(_persisted_href, dict) and _persisted_href.get("price", 0) > 0:
+                        try:
+                            mp.hard_exit_reference_price    = float(_persisted_href.get("price", 0))
+                            mp.hardexitreferenceprice       = mp.hard_exit_reference_price
+                            mp.hard_exit_reference_source   = str(_persisted_href.get("source", ""))
+                            mp.hardexitreferencesource      = mp.hard_exit_reference_source
+                            _persisted_validity = str(_persisted_href.get("validity", "") or "")
+                            _persisted_refresh_needed = bool(_persisted_href.get("refresh_needed", True))
+                            _persisted_ts = _persisted_href.get("ts")
+                            # AMENDMENT #6 blocker 3: age-check the persisted ts.
+                            # "Merely having a timestamp" was not a real age check.
+                            # A persisted proven ref written hours ago is NOT still fresh.
+                            # Use HARD_REF_MAX_AGE_SEC from the shared constant.
+                            _persisted_trusted = False
+                            _ts_parsed = None
+                            if _persisted_ts and _persisted_validity in ("proven", "catastrophic_ask"):
+                                try:
+                                    _now_seed = datetime.now(timezone.utc)
+                                    _ts_parsed = _normalize_hard_ref_ts(_persisted_ts, now_utc=_now_seed)
+                                    if _ts_parsed is not None:
+                                        _persisted_age_sec = max(0.0, (_now_seed - _ts_parsed).total_seconds())
+                                        _persisted_trusted = _persisted_age_sec <= HARD_REF_MAX_AGE_SEC
+                                except Exception:
+                                    _persisted_trusted = False
+                            if _persisted_trusted:
+                                mp.hard_exit_reference_validity = _persisted_validity
+                                mp.hardexitreferencevalidity    = _persisted_validity
+                                mp.hard_exit_reference_refresh_needed = _persisted_refresh_needed
+                                mp.hardexitreferencerefreshneeded    = _persisted_refresh_needed
+                            else:
+                                mp.hard_exit_reference_validity = "unproven"
+                                mp.hardexitreferencevalidity    = "unproven"
+                                mp.hard_exit_reference_refresh_needed = True
+                                mp.hardexitreferencerefreshneeded    = True
+                            mp.hard_exit_reference_ts = _ts_parsed
+                            mp.hardexitreferencets    = _ts_parsed
+                            if mp.entry_price > 0:
+                                _hr_pnl_r = (mp.hard_exit_reference_price - mp.entry_price) / mp.entry_price
+                                _persisted_pnl_raw = _persisted_href.get("pnl_pct", None)
+                                _persisted_pnl = None
+                                try:
+                                    _persisted_pnl_candidate = float(_persisted_pnl_raw)
+                                    if math.isfinite(_persisted_pnl_candidate):
+                                        _persisted_pnl = _persisted_pnl_candidate
+                                except Exception:
+                                    _persisted_pnl = None
+                                if _persisted_pnl is not None and abs(_persisted_pnl - _hr_pnl_r) > 1e-6:
+                                    log.warning(
+                                        "[exit_eng] SEED_HARD_REF_PNL_MISMATCH client=%s position_id=%s "
+                                        "persisted=%.6f recomputed=%.6f",
+                                        mp.client_id, mp.position_id, _persisted_pnl, _hr_pnl_r,
+                                    )
+                                mp.hard_exit_reference_pnl_pct = _hr_pnl_r
+                                mp.hardexitreferencepnlpct     = _hr_pnl_r
+                            log.info(
+                                "[exit_eng] SEED_HARD_REF_RESTORED client=%s position_id=%s "
+                                "price=%.4f source=%s validity=%s",
+                                mp.client_id, mp.position_id,
+                                mp.hard_exit_reference_price,
+                                mp.hard_exit_reference_source,
+                                mp.hard_exit_reference_validity,
+                            )
+                        except Exception as _hr_e:
+                            log.warning("seed_from_db hard-ref restore failed: %s", _hr_e)
+                            _persisted_href = {}
+                    if not (isinstance(_persisted_href, dict) and _persisted_href.get("price", 0) > 0):
+                        # No persisted hard-ref — position has NO hard-exit authority
+                        # until the first fresh quote arrives.  Mark explicitly.
+                        mp.hard_exit_reference_price = 0.0
+                        mp.hardexitreferenceprice    = 0.0
+                        mp.hard_exit_reference_source = ""
+                        mp.hardexitreferencesource   = ""
+                        mp.hard_exit_reference_validity = "no_data"
+                        mp.hardexitreferencevalidity   = "no_data"
+                        mp.hard_exit_reference_pnl_pct = None
+                        mp.hardexitreferencepnlpct     = None
+                        mp.hard_exit_reference_refresh_needed = True
+                        mp.hardexitreferencerefreshneeded    = True
+                        log.warning(
+                            "[exit_eng] SEED_HARD_REF_UNAVAILABLE client=%s position_id=%s "
+                            "contract=%s — position has NO hard-exit authority until QPM "
+                            "provides a fresh quote; sentinel/hard-stop will fall back to "
+                            "option_pnl_pct which reads 0%% during LIVE missing-bid",
+                            mp.client_id, mp.position_id, _contract_sym,
+                        )
                     _meta = row.get("meta") or {}
                     if isinstance(_meta, str) and _meta.strip():
                         try:
@@ -4871,6 +6359,84 @@ class APExitEngine:
         m = _re.match(r'^([A-Z]+)\d{6}[CP]\d+$', symbol.strip().upper())
         return m.group(1) if m else symbol.strip().upper()[:5]
 
+    def _resolved_execution_mode_detail(self) -> dict:
+        """Structured resolution of LIVE/PAPER identity for this engine.
+
+        AMENDMENT (PR #385 review): callers that must distinguish "no
+        evidence" from "contradictory evidence" (e.g. the fill-monitor
+        canonical adoption gate) need a status they can branch on.
+        `_resolved_execution_mode()` returns "" for BOTH cases; that
+        collapse would let a known-good order mode launder a genuine
+        internal engine conflict.  This helper preserves the distinction.
+
+        Returns:
+            {
+              "mode":    "live" | "paper" | "",
+              "status":  "PROVEN" | "CONFLICT" | "UNPROVEN",
+              "sources": {source_name: normalized_mode, ...},
+            }
+
+        The existing `_resolved_execution_mode()` contract is unchanged;
+        it still returns "" for both CONFLICT and UNPROVEN so all current
+        callers continue to fail closed.
+        """
+        def _known_mode(value) -> str:
+            _mode = str(value or "").strip().lower()
+            return _mode if _mode in {"live", "paper"} else ""
+
+        _mc = getattr(self, "master_control", None)
+        _br = getattr(self, "broker", None)
+        _cfg = getattr(_br, "cfg", None) if _br is not None else None
+
+        raw_sources = {
+            "master_control.mode":      getattr(_mc, "mode", ""),
+            "broker.execution_mode":    getattr(_br, "execution_mode", ""),
+            "broker.mode":              getattr(_br, "mode", ""),
+            "broker.cfg.execution_mode": getattr(_cfg, "execution_mode", ""),
+            "broker.cfg.mode":          getattr(_cfg, "mode", ""),
+        }
+
+        recognized = {
+            name: normalized
+            for name, value in raw_sources.items()
+            for normalized in (_known_mode(value),)
+            if normalized
+        }
+        unique_modes = set(recognized.values())
+
+        if len(unique_modes) == 1:
+            return {"mode": next(iter(unique_modes)), "status": "PROVEN",
+                    "sources": recognized}
+
+        if len(unique_modes) > 1:
+            return {"mode": "", "status": "CONFLICT", "sources": recognized}
+
+        return {"mode": "", "status": "UNPROVEN", "sources": recognized}
+
+    def _resolved_execution_mode(self) -> str:
+        """
+        Fail-closed resolution of LIVE/PAPER identity for this engine instance.
+
+        Collects every recognized mode source; if the sources disagree (e.g.
+        master_control.mode=paper while broker.mode=live) this returns "" and
+        emits a critical mode-conflict diagnostic. Silently preferring the
+        first hit would launder a LIVE broker under a PAPER identity (or vice
+        versa) and let cross-mode broker repair overwrite the wrong canonical
+        row.
+
+        Returns only the resolved mode string; callers that need to
+        distinguish CONFLICT from UNPROVEN should use
+        `_resolved_execution_mode_detail()`.
+        """
+        detail = self._resolved_execution_mode_detail()
+        if detail["status"] == "CONFLICT":
+            log.critical(
+                "[exit_eng] EXECUTION_MODE_CONFLICT client=%s sources=%s — "
+                "broker repair blocked; refusing LIVE/PAPER identity laundering",
+                self._email, detail["sources"],
+            )
+        return detail["mode"]
+
     def _load_db_position_row(self, sym: str) -> dict | None:
         """Look up an active positions row for this client + contract symbol.
 
@@ -4878,6 +6444,13 @@ class APExitEngine:
         AND adds a quantity_remaining safety guard so a row incorrectly marked
         CLOSED but with remaining qty is still found and managed.
         """
+        _mode = self._resolved_execution_mode()
+        if _mode not in {"live", "paper"}:
+            log.critical(
+                "[exit_eng] _load_db_position_row %s blocked: execution mode unproven for client=%s",
+                sym, self._email,
+            )
+            return None
         try:
             from ap.db import conn, run_with_retry
             def _q():
@@ -4886,9 +6459,10 @@ class APExitEngine:
                         """
                         SELECT id, underlying, contract, option_symbol, side, direction,
                                qty, quantity_remaining, avg_fill, entry_price,
-                               entry_ts, status, signal_id
+                               entry_ts, status, signal_id, execution_mode
                         FROM positions
                         WHERE client_id = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND (
                             UPPER(COALESCE(status,'')) IN ('OPEN','CLOSING','PARTIAL','ACTIVE')
                             OR COALESCE(quantity_remaining, 0) > 0
@@ -4900,12 +6474,16 @@ class APExitEngine:
                         ORDER BY entry_ts DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self._email, sym, sym),
+                        (self._email, _mode, sym, sym),
                     )
+                    # Production ap.db wraps psycopg2 RealDictCursor and returns
+                    # rows as plain dicts (see ap/db.py::_ConnWrapper.fetchone).
+                    # Rebuilding from c.description iterated the dict's KEYS as
+                    # if they were values, so every field became its own column
+                    # name string. Trust the production contract: fetchone()
+                    # already returns a dict of {column: value}.
                     row = c.fetchone()
-                    if row:
-                        cols = [d[0] for d in c.description]
-                        return dict(zip(cols, row))
+                    return dict(row) if row else None
             return run_with_retry(_q)
         except Exception as _de:
             log.warning("[exit_eng] _load_db_position_row %s failed: %s", sym, _de)
@@ -4921,6 +6499,13 @@ class APExitEngine:
         ON CONFLICT fallback: if INSERT returns None (row already exists), re-query
         by client_id + contract so repair can proceed with the existing id.
         """
+        _mode = self._resolved_execution_mode()
+        if _mode not in {"live", "paper"}:
+            log.critical(
+                "[exit_eng] _upsert_broker_position_to_db %s blocked: execution mode unproven for client=%s",
+                sym, self._email,
+            )
+            return None
         try:
             from ap.db import conn, run_with_retry
             underlying = self._underlying_from_occ(sym)
@@ -4936,12 +6521,14 @@ class APExitEngine:
                         """
                         INSERT INTO positions (
                             client_id, underlying, contract, option_symbol,
+                            execution_mode,
                             side, direction,
                             qty, quantity_remaining,
                             entry_price, avg_fill,
                             status, entry_ts, updated_at
                         ) VALUES (
                             %s, %s, %s, %s,
+                            %s,
                             %s, %s,
                             %s, %s,
                             %s, %s,
@@ -4951,19 +6538,25 @@ class APExitEngine:
                         RETURNING id
                         """,
                         (self._email, underlying, sym, sym,
+                         _mode,
                          side, side,
                          qty, qty,
                          entry_px, entry_px,
                          entry_ts),
                     )
+                    # Production ap.db returns dict rows keyed by column name;
+                    # RETURNING id therefore surfaces as {"id": ...}, not a tuple.
                     row = c.fetchone()
                     if row:
-                        return str(row[0])
+                        row_id = row.get("id")
+                        if row_id:
+                            return str(row_id)
                     # ON CONFLICT DO NOTHING — row already exists; re-query to get id
                     c.execute(
                         """
                         SELECT id FROM positions
                         WHERE client_id = %s
+                          AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND (
                             UPPER(contract)         = UPPER(%s)
                             OR UPPER(option_symbol) = UPPER(%s)
@@ -4971,16 +6564,18 @@ class APExitEngine:
                         ORDER BY entry_ts DESC NULLS LAST, updated_at DESC NULLS LAST
                         LIMIT 1
                         """,
-                        (self._email, sym, sym),
+                        (self._email, _mode, sym, sym),
                     )
                     existing = c.fetchone()
                     if existing:
-                        log.info(
-                            "[exit_eng] _upsert_broker_position_to_db ON CONFLICT re-query "
-                            "returned existing id for %s client=%s",
-                            sym, self._email,
-                        )
-                        return str(existing[0])
+                        existing_id = existing.get("id")
+                        if existing_id:
+                            log.info(
+                                "[exit_eng] _upsert_broker_position_to_db ON CONFLICT re-query "
+                                "returned existing id for %s client=%s",
+                                sym, self._email,
+                            )
+                            return str(existing_id)
                     return None
             return run_with_retry(_ins)
         except Exception as _ue:
@@ -5037,6 +6632,8 @@ class APExitEngine:
             opened_at = opened_at.replace(tzinfo=_dt.timezone.utc)
 
         _now = datetime.now(timezone.utc)
+        _row_mode = str(row.get("execution_mode") or row.get("executionmode") or "").strip().lower()
+        _execution_mode = _row_mode if _row_mode in {"live", "paper"} else self._resolved_execution_mode()
         mp = ManagedPosition(
             ticker           = ticker,
             option_symbol    = sym,
@@ -5049,9 +6646,22 @@ class APExitEngine:
             position_id      = pos_id,
             client_id        = self._email,
             signal_id        = sig_id,
+            execution_mode    = _execution_mode,
             quantity_remaining = qty,
             opened_at        = opened_at or _now,
         )
+        if prefer_qty_override and not _execution_mode:
+            _mark_adoption_identity_quarantined(
+                mp,
+                "broker_repair_execution_mode_unproven",
+            )
+            log.critical(
+                "[exit_eng] EXIT_BROKER_POSITION_REPAIR_MODE_UNPROVEN "
+                "client=%s contract=%s position_id=%s — broker repair retained "
+                "for diagnostics but blocked from behavior until LIVE/PAPER mode "
+                "is proven by DB row or account configuration",
+                self._email, sym, pos_id or "unknown",
+            )
         # Final broker-truth enforcement: if prefer_qty_override is active,
         # ensure both quantity fields match broker qty regardless of constructor defaults.
         if prefer_qty_override and qty_override and int(qty_override) > 0:
@@ -5154,7 +6764,7 @@ class APExitEngine:
         with self._lock:
             _local_count = sum(
                 1 for p in self._positions
-                if not p.closed and int(p.quantity_remaining or 0) > 0
+                if _is_behavior_active_position(p)
             )
 
         # ── 1. Fetch broker positions ─────────────────────────────────────────
@@ -5185,7 +6795,7 @@ class APExitEngine:
             engine_syms = {
                 str(getattr(p, "option_symbol", "") or "").upper()
                 for p in self._positions
-                if not p.closed and int(p.quantity_remaining or 0) > 0
+                if _is_behavior_active_position(p)
             }
 
         missing_from_engine = broker_syms - engine_syms
@@ -5292,6 +6902,11 @@ class APExitEngine:
                         prefer_qty_override=True,
                     )
                     self.add_position(pos)
+                    _loaded_active = (
+                        pos in self.active_positions()
+                    )
+                    if not _loaded_active:
+                        raise RuntimeError("add_position did not install behavior-active DB owner")
                     loaded_db_syms.append(sym)
                 except Exception as _le:
                     log.warning(
@@ -5345,6 +6960,11 @@ class APExitEngine:
                         prefer_qty_override=True,
                     )
                     self.add_position(pos)
+                    _loaded_active = (
+                        pos in self.active_positions()
+                    )
+                    if not _loaded_active:
+                        raise RuntimeError("add_position did not install behavior-active broker owner")
                     if new_id:
                         repaired_syms.append(sym)              # confirmed DB row
                     else:
@@ -5386,21 +7006,38 @@ class APExitEngine:
 
             # ── 3d. Fetch live quote and seed price state ─────────────────────
             quote       = self._fetch_broker_quote(sym)
-            # mark → mid(bid,ask) → last → bid → ask (dashboard-aligned fallback)
-            broker_mark = (quote.get("mark") or 0.0) or (quote.get("mid") or 0.0) or                           (quote.get("last") or 0.0) or (quote.get("bid") or 0.0) or                           (quote.get("ask") or 0.0)
-            broker_bid  = quote.get("bid", 0.0)
-            broker_ask  = quote.get("ask", 0.0)
-            _quote_status = "OK" if broker_mark > 0 else "QUOTE_UNAVAILABLE"
+            # AMENDMENT #6 (blocker 3): pass RAW broker fields separately.
+            # Previously we collapsed mark/mid/last/bid/ask into broker_mark and
+            # passed the collapsed value as 'mark' — which laundered ASK-only
+            # quotes as MARK and suppressed real LAST evidence.  The helper's
+            # source-aware resolver only works if we give it the real data.
+            broker_bid  = float(quote.get("bid")  or 0.0)
+            broker_ask  = float(quote.get("ask")  or 0.0)
+            broker_mark = float(quote.get("mark") or 0.0)
+            broker_last = float(quote.get("last") or 0.0)
+            # 'mid' from broker (if given) is a computed field; only use when
+            # bid+ask absent to seed mark for _apply_option_quote_for_decision's
+            # analytics_mark.  Do NOT let mid replace real mark for hard-ref.
+            if broker_mark == 0.0:
+                broker_mark = float(quote.get("mid") or 0.0)
+            _has_any_price = broker_mark > 0 or broker_bid > 0 or broker_last > 0 or broker_ask > 0
+            _quote_status = "OK" if _has_any_price else "QUOTE_UNAVAILABLE"
 
             # Position is ALWAYS added regardless of quote availability
-            if broker_mark > 0 or broker_bid > 0:
+            if _has_any_price:
                 # P0 fix: route through the authoritative quote helper so LIVE
-                # positions get bid-based current_option_price, not broker_mark.
+                # positions get bid-based current_option_price.  RAW fields are
+                # passed so the hard-ref selector can honor real provenance.
                 _broker_aqr = _apply_option_quote_for_decision(
                     pos,
                     bid  = broker_bid,
                     ask  = broker_ask,
                     mark = broker_mark,
+                    last = broker_last,
+                    quote_ts = datetime.now(timezone.utc),
+                    last_ts  = quote.get("last_trade_ts") or quote.get("trade_date"),
+                    mark_ts  = quote.get("mark_ts"),
+                    source   = "broker_precheck",
                 )
             else:
                 log.warning(
@@ -5410,16 +7047,17 @@ class APExitEngine:
                     self._email, sym,
                 )
 
-            # Seed peak P&L / touched_profit using executable price (never mid).
+            # Seed peak P&L using BID only (never mid/mark).
+            # P0 (PR #385 amendment): touched_profit is NEVER armed here — a
+            # single seed observation would defeat QPM's two-consecutive-fresh-BID
+            # confirmation contract.  QPM arms it within ~2 polls of restart.
             broker_pnl_pct = 0.0
-            _seed_exec_price = (pos.current_option_price if pos.current_option_price > 0
-                                else (broker_bid if broker_bid > 0 else 0.0))
-            if pos.entry_price > 0 and _seed_exec_price > 0:
-                broker_pnl_pct = (_seed_exec_price - pos.entry_price) / pos.entry_price
-                if broker_pnl_pct > 0:
-                    if broker_pnl_pct > pos.peak_pnl_pct:
-                        pos.peak_pnl_pct = broker_pnl_pct
-                    pos.touched_profit = True
+            if pos.entry_price > 0 and broker_bid > 0:
+                broker_pnl_pct = (broker_bid - pos.entry_price) / pos.entry_price
+                if broker_pnl_pct > 0 and broker_pnl_pct > pos.peak_pnl_pct:
+                    pos.peak_pnl_pct = broker_pnl_pct
+                    if broker_pnl_pct > pos.max_profit_seen:
+                        pos.max_profit_seen = broker_pnl_pct
 
             # ── 3e. Required structured log ────────────────────────────────────
             log.info(
@@ -5462,7 +7100,7 @@ class APExitEngine:
 
         return len(repair_failed_syms) == 0
 
-    def _check_all_positions(self):
+    def _check_all_positions(self, now_et: Optional[datetime] = None):
         today_et = _et_session_date()
 
         # Broker truth precheck: verify engine positions match broker before evaluating exits.
@@ -5589,7 +7227,7 @@ class APExitEngine:
         except Exception:
             pass
 
-        now_et = datetime.now(ET)
+        now_et = now_et or datetime.now(ET)
         active = self.active_positions()
         if not active:
             return
@@ -5657,25 +7295,40 @@ class APExitEngine:
                 if _quote_authority_available and _QUOTES is not None:
                     _snap = _QUOTES.get_fresh(pos.option_symbol, max_age_s=12)
                     if _snap is not None:
-                        if _snap.bid > 0 or _snap.ask > 0:
-                            # P0 fix: route through the single authoritative quote helper.
+                        if _snap.bid > 0 or _snap.ask > 0 or getattr(_snap, "last", 0) > 0:
+                            # P0: route through the single authoritative quote helper.
                             # LIVE positions must use bid, never _snap.mid.
+                            # AMENDMENT #6 blocker 5: pass raw LAST and its timestamp
+                            # from the QuoteAuthority snapshot so the hard-ref selector
+                            # receives real provenance, not synthetic mid-as-mark.
+                            _snap_bid = float(_snap.bid or 0.0)
+                            _snap_ask = float(_snap.ask or 0.0)
+                            _snap_last = float(getattr(_snap, "last", 0.0) or 0.0)
+                            _snap_mark = 0.0
+                            _receipt_ts = _normalize_hard_ref_ts(
+                                getattr(_snap, "timestamp_epoch", None),
+                                now_utc=now_utc,
+                            )
                             _apply_option_quote_for_decision(
                                 pos,
-                                bid      = float(_snap.bid or 0.0),
-                                ask      = float(_snap.ask or 0.0),
-                                mark     = float(getattr(_snap, "mid", 0.0)
-                                                 or getattr(_snap, "mark", 0.0)
-                                                 or 0.0),
-                                quote_ts = now_utc,
-                                source   = "",   # helper stamps bid/paper based on mode
+                                bid      = _snap_bid,
+                                ask      = _snap_ask,
+                                mark     = _snap_mark,
+                                last     = _snap_last,
+                                quote_ts = _receipt_ts,
+                                last_ts  = None,
+                                mark_ts  = None,
+                                source   = "",
                             )
                             pos.last_option_quote_missing_ts = None
-                            pos.last_quote_update_ts  = now_utc
+                            pos.last_quote_update_ts  = _receipt_ts
                             pos.last_quote_missing_ts = None
                         if _snap.underlying_price > 0:
                             pos.current_underlying              = _snap.underlying_price
-                            pos.last_underlying_quote_update_ts  = now_utc
+                            pos.last_underlying_quote_update_ts  = _normalize_hard_ref_ts(
+                                getattr(_snap, "timestamp_epoch", None),
+                                now_utc=now_utc,
+                            )
                             pos.last_underlying_quote_missing_ts = None
 
                 option_pnl = pos.option_pnl_pct
@@ -5791,34 +7444,40 @@ class APExitEngine:
                     and int(pos.quantity_remaining or 0) > 0
                 )
 
-                # ── PEAK TRACKING — runs BEFORE quote gate, always ────────────
-                # The quote gate exists to prevent false exits on stale prices.
-                # It must NOT prevent recording a new high-water mark.
-                # If QPM has a gap exactly at peak, peak_pnl_pct never updates
-                # and trail/profit-floor logic fires based on a false 0% peak.
-                # Fix: advance peak from ANY non-zero option price, stale or not.
-                # Never allow a QPM gap to erase a real peak.
-                if pos.current_option_price > 0 and pos.entry_price > 0:
-                    _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
-                    if _raw_pnl > pos.peak_pnl_pct:
-                        pos.peak_pnl_pct = _raw_pnl
-                        log.debug(
-                            "[%s] PEAK UPDATE (pre-gate) | peak=%.1f%% | option=$%.2f entry=$%.2f",
-                            pos.ticker, _raw_pnl * 100,
-                            pos.current_option_price, pos.entry_price,
-                        )
-                    if _raw_pnl > 0:
-                        pos.touched_profit = True
-                        if _raw_pnl > pos.max_profit_seen:
-                            pos.max_profit_seen = _raw_pnl
-                    # Keep in-memory option_pnl_pct fresh for the DB write
-                    # below (property-backed in some paths; setter ensures
-                    # the persistence layer sees the same value the engine
-                    # decisioned on).
-                    try:
-                        pos.option_pnl_pct = _raw_pnl
-                    except Exception:
-                        pass
+                # ── PEAK TRACKING — runs BEFORE quote gate ────────────────────
+                # P0 (PR #385 amendment): peak_pnl_pct and max_profit_seen are
+                # EXECUTABLE-BID-ONLY authority.  They feed soft-exit decisions
+                # (profit floors, runner trails, small-win capture), so a PAPER
+                # midpoint spike must never inflate them.  The engine advances
+                # peak only from a bid-derived P&L; when bid is missing this
+                # cycle, the peak simply does not advance (QPM will catch it on
+                # the next bid-valid poll — bounded by poll cadence, not lost).
+                #
+                # touched_profit: the engine NEVER arms it.  QPM is the sole
+                # arming authority via two-consecutive-fresh-BID confirmation
+                # (position-scoped).  A single engine-side observation arming
+                # touched_profit would defeat that confirmation contract.
+                if pos.entry_price > 0:
+                    _pg_bid = float(getattr(pos, "current_bid", 0.0) or 0.0)
+                    _pg_bid_valid = _pg_bid > 0.0
+                    if _pg_bid_valid:
+                        _bid_pnl = (_pg_bid - pos.entry_price) / pos.entry_price
+                        if _bid_pnl > pos.peak_pnl_pct:
+                            pos.peak_pnl_pct = _bid_pnl
+                            log.debug(
+                                "[%s] PEAK UPDATE (pre-gate, bid) | peak=%.1f%% | bid=$%.2f entry=$%.2f",
+                                pos.ticker, _bid_pnl * 100, _pg_bid, pos.entry_price,
+                            )
+                        if _bid_pnl > 0 and _bid_pnl > pos.max_profit_seen:
+                            pos.max_profit_seen = _bid_pnl
+                    # Keep in-memory option_pnl_pct fresh for the DB write below
+                    # (display/hard-exit authority — mode-specific, unchanged).
+                    if pos.current_option_price > 0:
+                        _raw_pnl = (pos.current_option_price - pos.entry_price) / pos.entry_price
+                        try:
+                            pos.option_pnl_pct = _raw_pnl
+                        except Exception:
+                            pass
                     # PR: position-lifecycle-integrity-and-sizing (P0 FIX-3)
                     # Persist peak / max_profit / touched / option_pnl_pct
                     # to positions table. Throttled, non-fatal. The exit
@@ -5844,11 +7503,41 @@ class APExitEngine:
                     (getattr(pos, "current_option_price", 0) or 0) > 0
                     or (getattr(pos, "current_bid", 0) or 0) > 0
                 )
+                # ── HARD-RISK PRE-GATE ────────────────────────────────────────
+                # Uses shared resolver: checks validity + recomputes timestamp age.
+                # An expired or unproven reference cannot force evaluation.
+                _gate_now = now_utc if now_utc else datetime.now(timezone.utc)
+                _hard_ref_pnl_early = get_effective_hard_exit_reference(pos, _gate_now)
+                _force_hard_eval = (
+                    _hard_ref_pnl_early is not None
+                    and _has_entry_price
+                    and not getattr(pos, "closed", False)
+                    and int(getattr(pos, "quantity_remaining", 0) or 0) > 0
+                    and not getattr(pos, "exit_in_flight", False)
+                )
+                if _force_hard_eval:
+                    try:
+                        # AMENDMENT (PR #385 review): pin the pre-gate DTE
+                        # profile to the caller-supplied evaluation clock so
+                        # replays and after-midnight-UTC runs see the same
+                        # threshold profile evaluate_exit() will apply.
+                        try:
+                            _gate_session_date = now_et.astimezone(ET).date()
+                        except Exception:
+                            _gate_session_date = None
+                        _pos_hard_stop, _, _ = _effective_thresholds(
+                            pos, session_date=_gate_session_date,
+                        )
+                        _force_hard_eval = _hard_ref_pnl_early <= _pos_hard_stop
+                    except Exception:
+                        _force_hard_eval = False
+
                 _should_evaluate = (
                     _has_live_quotes
                     or _has_peak_to_protect
                     or (_has_entry_price and _last_known_price)
                     or (_has_entry_price and _position_old_enough)
+                    or _force_hard_eval
                 )
                 if _should_evaluate:
                     # Gate now only controls whether evaluate_exit() is called.
@@ -6091,6 +7780,8 @@ class APExitEngine:
             stale_underlying_quotes    = []
             stale_option_quotes        = []
             missing_callback_identity  = []
+            adoption_identity_quarantined = []
+            behavior_active_count = 0
 
             for pos in self._positions:
                 flight_sec                  = None
@@ -6127,6 +7818,11 @@ class APExitEngine:
 
                 if getattr(pos, "last_callback_identity_missing", False) and pos.exit_in_flight:
                     missing_callback_identity.append(pos.position_id or pos.option_symbol or pos.ticker)
+                adoption_quarantined = _is_adoption_identity_quarantined(pos)
+                if adoption_quarantined:
+                    adoption_identity_quarantined.append(ident)
+                if _is_behavior_active_position(pos):
+                    behavior_active_count += 1
 
                 positions.append({
                     "position_id":                     pos.position_id,
@@ -6152,6 +7848,11 @@ class APExitEngine:
                     "last_option_quote_missing_ts":    pos.last_option_quote_missing_ts.isoformat() if pos.last_option_quote_missing_ts else "",
                     "last_callback_identity_missing":  getattr(pos, "last_callback_identity_missing", False),
                     "exit_identity_quarantine":        getattr(pos, "exit_identity_quarantine", False),
+                    "adoption_identity_quarantined":   adoption_quarantined,
+                    "adoption_identity_quarantine_reason": (
+                        getattr(pos, "adoption_identity_quarantine_reason", "")
+                        or getattr(pos, "adoptionidentityquarantinereason", "")
+                    ),
                     "exit_identity_quarantine_alert_count": getattr(pos, "exit_identity_quarantine_alert_count", 0),
                     "last_exit_identity_quarantine_alert_ts": (
                         pos.last_exit_identity_quarantine_alert_ts.isoformat()
@@ -6175,6 +7876,10 @@ class APExitEngine:
                 "thread_alive":                   thread_alive,
                 "thread_name":                    self._thread.name if self._thread else "",
                 "position_count":                 len(positions),
+                "tracked_position_count":         len(positions),
+                "behavior_active_position_count": behavior_active_count,
+                "adoption_identity_quarantined_count": len(adoption_identity_quarantined),
+                "adoption_identity_quarantined":  adoption_identity_quarantined,
                 "stale_inflight_count":           len(stale_inflight),
                 "stale_inflight":                 stale_inflight,
                 "stale_quote_count":              len(stale_quotes),

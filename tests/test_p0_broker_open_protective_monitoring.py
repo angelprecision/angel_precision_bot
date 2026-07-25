@@ -53,9 +53,12 @@ def _pos(**overrides) -> ManagedPosition:
         current_underlying=500.0,
         opened_at=datetime.now(timezone.utc) - timedelta(minutes=20),
         last_option_quote_update_ts=datetime.now(timezone.utc),
+        last_underlying_quote_update_ts=datetime.now(timezone.utc),
     )
     data.update(overrides)
-    return ManagedPosition(**data)
+    pos = ManagedPosition(**data)
+    pos.lastunderlyingquoteupdatets = pos.last_underlying_quote_update_ts
+    return pos
 
 
 def _decision(code="IMMEDIATE_TP", reason="IMMEDIATE TP -- +20%", qty=1) -> ExitDecision:
@@ -758,7 +761,11 @@ def test_normal_stop_evaluates_before_hard_emergency_threshold_with_valid_quote(
     )
     pos._stop_breach_ts = datetime.now(timezone.utc) - timedelta(seconds=45)
 
-    decision = evaluate_exit(pos, datetime.now(exit_engine_mod.ET))
+    # Keep this regression independent of the wall clock.  After the 3:50 PM
+    # ET EOD cutoff, evaluate_exit intentionally returns EOD FORCE CLOSE before
+    # the normal-loss assertion can exercise DEEP_LOSS_STOP.
+    fixed_now_et = datetime(2026, 7, 21, 10, 0, tzinfo=exit_engine_mod.ET)
+    decision = evaluate_exit(pos, fixed_now_et)
     decision.reason_code = exit_engine_mod._classify_exit_decision(decision)
 
     assert decision.should_act is True

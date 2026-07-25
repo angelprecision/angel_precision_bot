@@ -1,14 +1,15 @@
 """
 tests/test_p0_exit_engine_broker_truth.py
 P0: exit-engine broker-truth visibility repair.
-All tests run against the fixed ap_exit_engine.py source without real DB/broker.
 """
-import re, sqlite3, pytest, types, sys
+import os, re, sqlite3, pytest, types, sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 _REPO = Path(__file__).resolve().parents[1]
 EE_SRC = (_REPO / "ap_exit_engine.py").read_text()
+_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 
 # ── Source checks ─────────────────────────────────────────────────────────────
@@ -23,7 +24,7 @@ def test_upsert_no_source_column():
     )
 
 def test_upsert_on_conflict_requery():
-    """Fix 1: ON CONFLICT fallback re-queries existing row by client_id+contract."""
+    """Fix 1: ON CONFLICT fallback re-queries existing row by client_id+contract+mode."""
     # Find the ON CONFLICT in the _upsert function (skip any earlier occurrences)
     upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
     upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
@@ -32,7 +33,23 @@ def test_upsert_on_conflict_requery():
     assert "SELECT id FROM positions" in upsert_body, (
         "ON CONFLICT fallback must re-query by client_id+contract to return existing id"
     )
+    assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in upsert_body
     assert "ORDER BY entry_ts" in upsert_body
+
+def test_load_db_row_exact_mode_filter_present():
+    """Mode-scoped DB load must select and filter execution_mode."""
+    load_start = EE_SRC.find("def _load_db_position_row")
+    load_end   = EE_SRC.find("\n    def ", load_start + 1)
+    load_body  = EE_SRC[load_start:load_end]
+    assert "signal_id, execution_mode" in load_body
+    assert "LOWER(TRIM(COALESCE(execution_mode, ''))) = %s" in load_body
+
+def test_upsert_persists_execution_mode_column():
+    """Broker-repair insert must persist execution_mode explicitly."""
+    upsert_start = EE_SRC.find("def _upsert_broker_position_to_db")
+    upsert_end   = EE_SRC.find("\n    def ", upsert_start + 1)
+    upsert_body  = EE_SRC[upsert_start:upsert_end]
+    assert "execution_mode," in upsert_body
 
 def test_managed_position_from_row_has_prefer_qty_override():
     """Fix 2: _managed_position_from_row must accept prefer_qty_override kwarg."""
@@ -90,27 +107,171 @@ def test_quote_fallback_uses_mark():
 # ── Behavioral: _managed_position_from_row with prefer_qty_override ───────────
 
 def _load_engine_class():
-    """Dynamically load just the parts of ap_exit_engine we need."""
+    """Import ap_exit_engine without polluting sys.modules for later test files.
+
+    The earlier implementation permanently inserted stubs for ap.db,
+    ap.position_manager, and ap_tradier via sys.modules.setdefault (and
+    sys.modules["ap_exit_engine"] = mod).  When pytest then collected any
+    later P0 file that does `from ap.position_manager import APPositionManager`,
+    the stub `types.ModuleType("ap.position_manager")` had no such symbol and
+    collection blew up.  We now snapshot every module we touch, run the import
+    under the stubs, and restore the previous mapping (real module, stub, or
+    absent) once we're done — leaving the interpreter exactly as we found it.
+    """
+    import importlib
     import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "ap_exit_engine", _REPO / "ap_exit_engine.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["ap_exit_engine"] = mod
-    # Stub heavy dependencies
-    for name in ["ap.db", "ap.position_manager", "ap_tradier"]:
-        sys.modules.setdefault(name, types.ModuleType(name))
+
+    _touched = [
+        "ap_exit_engine",
+        "ap",
+        "ap.db",
+        "ap.position_manager",
+        "ap_tradier",
+    ]
+    # Snapshot the pre-existing entries (may be real modules, stubs, or absent).
+    _saved = {name: sys.modules.get(name) for name in _touched}
+    _stub_inserted = {name: False for name in _touched}
+
     try:
-        spec.loader.exec_module(mod)
-        return mod
-    except Exception:
-        return None
+        for name in ["ap.db", "ap.position_manager", "ap_tradier"]:
+            if name not in sys.modules:
+                sys.modules[name] = types.ModuleType(name)
+                _stub_inserted[name] = True
+
+        spec = importlib.util.spec_from_file_location(
+            "ap_exit_engine", _REPO / "ap_exit_engine.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["ap_exit_engine"] = mod
+        _stub_inserted["ap_exit_engine"] = True
+        try:
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception:
+            return None
+    finally:
+        # Restore whatever was there before — real module, prior stub, or
+        # nothing.  Only remove entries WE inserted; never evict a real
+        # ap.position_manager that some other test/file loaded first.
+        for name in _touched:
+            prior = _saved[name]
+            if prior is not None:
+                sys.modules[name] = prior
+            elif _stub_inserted[name]:
+                sys.modules.pop(name, None)
 
 
 _EE_MOD = _load_engine_class()
 _skip_if_no_mod = pytest.mark.skipif(
     _EE_MOD is None, reason="ap_exit_engine could not be imported in test env"
 )
+
+
+@contextmanager
+def _postgres_positions_table(monkeypatch):
+    if not _DATABASE_URL:
+        pytest.skip("DATABASE_URL not configured for PostgreSQL coverage")
+    psycopg2 = pytest.importorskip("psycopg2")
+    import importlib
+
+    monkeypatch.delitem(sys.modules, "ap.db", raising=False)
+    monkeypatch.delitem(sys.modules, "ap", raising=False)
+    importlib.invalidate_caches()
+
+    pg_conn = psycopg2.connect(_DATABASE_URL)
+    pg_conn.autocommit = False
+    cur = pg_conn.cursor()
+    # AMENDMENT (P0 test-isolation): the previous fixture created the TEMP
+    # TABLE with `ON COMMIT DROP` and then immediately committed, which
+    # destroyed the table before any test could read it (all subsequent
+    # queries raised UndefinedTable).  `ON COMMIT PRESERVE ROWS` keeps the
+    # table alive for the full session; teardown drops it explicitly below.
+    cur.execute(
+        """
+        CREATE TEMP TABLE positions (
+            id TEXT PRIMARY KEY DEFAULT md5(random()::text || clock_timestamp()::text),
+            client_id TEXT,
+            underlying TEXT,
+            contract TEXT,
+            option_symbol TEXT,
+            execution_mode TEXT,
+            side TEXT,
+            direction TEXT,
+            qty INTEGER,
+            quantity_remaining INTEGER,
+            avg_fill DOUBLE PRECISION,
+            entry_price DOUBLE PRECISION,
+            entry_ts TIMESTAMPTZ,
+            status TEXT,
+            signal_id TEXT,
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        ) ON COMMIT PRESERVE ROWS
+        """
+    )
+    pg_conn.commit()
+
+    class _ConnWrapper:
+        """Mirrors ap.db._ConnWrapper — must return dict rows via RealDictCursor.
+
+        The previous fixture returned raw psycopg2 tuples, which trained
+        production code to index by position.  Real ap.db wraps
+        psycopg2.extras.RealDictCursor and returns plain dicts, so tuple
+        indexing would explode in production.  This fixture must match
+        production, not the reverse.
+        """
+        def __init__(self, connection, cursor):
+            self._conn = connection
+            self._cur = cursor
+
+        def execute(self, sql, params=()):
+            self._cur.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            row = self._cur.fetchone()
+            return dict(row) if row else None
+
+        def fetchall(self):
+            return [dict(r) for r in (self._cur.fetchall() or [])]
+
+        @property
+        def description(self):
+            return self._cur.description
+
+        @property
+        def rowcount(self):
+            return self._cur.rowcount
+
+    @contextmanager
+    def fake_conn():
+        local_cur = pg_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            yield _ConnWrapper(pg_conn, local_cur)
+            pg_conn.commit()
+        except Exception:
+            pg_conn.rollback()
+            raise
+        finally:
+            local_cur.close()
+
+    fake_db = types.SimpleNamespace(conn=fake_conn, run_with_retry=lambda fn, **_: fn())
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
+    try:
+        yield pg_conn
+    finally:
+        try:
+            pg_conn.rollback()
+        except Exception:
+            pass
+        try:
+            _teardown_cur = pg_conn.cursor()
+            _teardown_cur.execute("DROP TABLE IF EXISTS positions")
+            pg_conn.commit()
+            _teardown_cur.close()
+        except Exception:
+            pass
+        cur.close()
+        pg_conn.close()
 
 
 @_skip_if_no_mod
@@ -146,6 +307,88 @@ def test_prefer_qty_override_overrides_stale_zero():
     mp = eng._managed_position_from_row(row, qty_override=3, prefer_qty_override=True)
     assert mp.quantity == 3, f"Expected quantity=3, got {mp.quantity}"
     assert mp.quantity_remaining == 3, f"Expected quantity_remaining=3, got {mp.quantity_remaining}"
+
+
+@_skip_if_no_mod
+def test_load_db_position_row_is_exact_mode_scoped_in_postgres(monkeypatch):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "SPY260821C00650000"
+        client = "mode-scope@example.com"
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO positions (
+                    id, client_id, underlying, contract, option_symbol, execution_mode,
+                    side, direction, qty, quantity_remaining, avg_fill, entry_price,
+                    entry_ts, status, signal_id
+                ) VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s),
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW() - INTERVAL '1 minute', %s, %s)
+                """,
+                (
+                    "live-db-position-id", client, "SPY", contract, contract, "live",
+                    "CALL", "CALL", 1, 1, 1.25, 1.25, "OPEN", "sig-live",
+                    "paper-db-position-id", client, "SPY", contract, contract, "paper",
+                    "CALL", "CALL", 1, 1, 1.15, 1.15, "OPEN", "sig-paper",
+                ),
+            )
+        pg_conn.commit()
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="paper")
+
+        paper_row = eng._load_db_position_row(contract)
+        assert paper_row is not None
+        assert paper_row["id"] == "paper-db-position-id"
+        assert paper_row["execution_mode"] == "paper"
+
+        eng.broker = types.SimpleNamespace(mode="live")
+        live_row = eng._load_db_position_row(contract)
+        assert live_row is not None
+        assert live_row["id"] == "live-db-position-id"
+        assert live_row["execution_mode"] == "live"
+
+
+@_skip_if_no_mod
+def test_upsert_broker_position_to_db_persists_exact_mode_in_postgres(monkeypatch):
+    engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+    if engine_cls is None:
+        pytest.skip("APExitEngine not found")
+
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "QQQ260821P00450000"
+        client = "mode-upsert@example.com"
+
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = client
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="paper")
+
+        row_id = eng._upsert_broker_position_to_db(
+            contract,
+            {"quantity": 2, "cost_basis": 150.0, "date_acquired": "2026-07-22T13:00:00Z"},
+        )
+
+        assert row_id
+        with pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, execution_mode FROM positions WHERE client_id = %s AND contract = %s",
+                (client, contract),
+            )
+            row = cur.fetchone()
+        assert row is not None
+        assert row[0] == row_id
+        assert row[1] == "paper"
 
 
 @_skip_if_no_mod
@@ -298,10 +541,12 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
     eng._email      = "jasoncosby1@gmail.com"
     eng._lock       = threading.Lock()
     eng._positions  = []
+    eng._positions_by_id = {}
 
     # Stub broker: returns one position with qty=3
     mock_broker = MagicMock()
     mock_broker.account_id   = "VA23856850"
+    mock_broker.mode = "live"
     mock_broker.list_positions.return_value = [{
         "symbol":     CONTRACT,
         "quantity":   3,
@@ -325,12 +570,15 @@ def test_broker_precheck_stale_db_qty_zero_loaded_with_broker_qty():
         "entry_ts":           None,
         "status":             "OPEN",
         "signal_id":          None,
+        "execution_mode":     "live",
     }
 
     added_positions = []
 
     def _fake_add_position(pos):
         added_positions.append(pos)
+        eng._positions.append(pos)
+        eng._positions_by_id[getattr(pos, "position_id", "")] = pos
 
     def _fake_load_db_row(sym):
         return db_row if sym.upper() == CONTRACT else None
@@ -435,3 +683,250 @@ def test_synthetic_path_sets_db_repaired_false():
     assert "db_upsert_returned_no_id" in region or "synthetic" in region, (
         "db_repaired=False path must be near synthetic id logic"
     )
+
+
+# =============================================================================
+# AMENDMENT (Jason BAC): PR #385 final-bounded regression tests.
+# Cover the four production defects and three test-isolation defects.
+# =============================================================================
+
+@_skip_if_no_mod
+class TestExecutionModeFailsClosed:
+    """_resolved_execution_mode must fail closed when sources disagree."""
+
+    def _new_engine(self):
+        engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+        if engine_cls is None:
+            pytest.skip("APExitEngine not found")
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = "resolver@example.com"
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        return eng
+
+    def test_only_master_control_paper_resolves_paper(self):
+        eng = self._new_engine()
+        eng.master_control = types.SimpleNamespace(mode="paper")
+        eng.broker = types.SimpleNamespace()
+        assert eng._resolved_execution_mode() == "paper"
+
+    def test_only_broker_mode_live_resolves_live(self):
+        eng = self._new_engine()
+        eng.broker = types.SimpleNamespace(mode="live")
+        assert eng._resolved_execution_mode() == "live"
+
+    def test_agreeing_sources_resolve_that_mode(self):
+        eng = self._new_engine()
+        eng.master_control = types.SimpleNamespace(mode="live")
+        eng.broker = types.SimpleNamespace(execution_mode="LIVE", mode="live")
+        assert eng._resolved_execution_mode() == "live"
+
+    def test_conflict_returns_blank_and_logs_critical(self, caplog):
+        eng = self._new_engine()
+        eng.master_control = types.SimpleNamespace(mode="paper")
+        eng.broker = types.SimpleNamespace(mode="live")
+        with caplog.at_level("CRITICAL"):
+            assert eng._resolved_execution_mode() == ""
+        assert any("EXECUTION_MODE_CONFLICT" in rec.message for rec in caplog.records), (
+            "Conflicting sources must emit a critical EXECUTION_MODE_CONFLICT log"
+        )
+
+    def test_conflict_blocks_load_db_position_row(self, caplog):
+        eng = self._new_engine()
+        eng.master_control = types.SimpleNamespace(mode="paper")
+        eng.broker = types.SimpleNamespace(mode="live")
+        with caplog.at_level("CRITICAL"):
+            assert eng._load_db_position_row("BAC260724P00062000") is None
+
+    def test_conflict_blocks_upsert(self, caplog):
+        eng = self._new_engine()
+        eng.master_control = types.SimpleNamespace(mode="paper")
+        eng.broker = types.SimpleNamespace(mode="live")
+        with caplog.at_level("CRITICAL"):
+            assert eng._upsert_broker_position_to_db(
+                "BAC260724P00062000",
+                {"quantity": 1, "cost_basis": 97.0, "date_acquired": "2026-07-24T13:00:00Z"},
+            ) is None
+
+    def test_conflict_quarantines_broker_repair(self, caplog):
+        """Broker-repair identity must be behavior-quarantined when mode unproven."""
+        eng = self._new_engine()
+        eng.master_control = types.SimpleNamespace(mode="paper")
+        eng.broker = types.SimpleNamespace(mode="live")
+        row = {
+            "id": "conflict-pos-1",
+            "contract": "BAC260724P00062000",
+            "option_symbol": "BAC260724P00062000",
+            "underlying": "BAC",
+            "side": "PUT", "direction": "PUT",
+            "qty": 1, "quantity_remaining": 1,
+            "entry_price": 0.97, "avg_fill": 0.97,
+            "entry_ts": None, "status": "OPEN",
+            "signal_id": None,
+            # Row itself has no execution_mode → must resolve through the engine.
+        }
+        with caplog.at_level("CRITICAL"):
+            mp = eng._managed_position_from_row(row, qty_override=1, prefer_qty_override=True)
+        # Under conflict, resolver returns "" → engine marks adoption identity
+        # quarantined so behavior-active checks refuse to route exits here.
+        _is_quarantined = getattr(_EE_MOD, "_is_adoption_identity_quarantined")
+        assert _is_quarantined(mp) is True
+
+
+@_skip_if_no_mod
+class TestDbDictRowContract:
+    """Production ap.db returns dict rows via RealDictCursor.
+
+    These tests exercise the exact three seams that were reading rows as
+    tuples: _load_db_position_row, INSERT ... RETURNING id, and the ON
+    CONFLICT re-query.
+    """
+
+    def _new_engine(self):
+        engine_cls = getattr(_EE_MOD, "APExitEngine", None)
+        if engine_cls is None:
+            pytest.skip("APExitEngine not found")
+        eng = engine_cls.__new__(engine_cls)
+        eng._email = "dict-shape@example.com"
+        eng._lock = __import__("threading").Lock()
+        eng._positions = []
+        eng._positions_by_id = {}
+        eng.broker = types.SimpleNamespace(mode="live")
+        return eng
+
+    def _install_dict_fake_db(self, *, row=None, insert_id=None, existing_id=None):
+        state = {"row": row, "insert_id": insert_id, "existing_id": existing_id,
+                 "call": 0, "queries": []}
+
+        class _Cur:
+            def execute(self, sql, params=()):
+                state["call"] += 1
+                state["queries"].append((state["call"], sql.strip().splitlines()[0]))
+                return self
+
+            def fetchone(self):
+                # Cycle: first fetchone on SELECT/RETURNING flow.
+                if "INSERT INTO positions" in state["queries"][-1][1]:
+                    return ({"id": state["insert_id"]}
+                            if state["insert_id"] is not None else None)
+                if "SELECT id FROM positions" in state["queries"][-1][1]:
+                    return ({"id": state["existing_id"]}
+                            if state["existing_id"] is not None else None)
+                # Regular load path.
+                return state["row"]
+
+            def fetchall(self):
+                return []
+
+            @property
+            def rowcount(self):
+                return 1
+
+        @contextmanager
+        def fake_conn():
+            yield _Cur()
+
+        fake_db = types.SimpleNamespace(conn=fake_conn, run_with_retry=lambda fn, **_: fn())
+        _prior = sys.modules.get("ap.db")
+        sys.modules["ap.db"] = fake_db
+        return _prior, state
+
+    def _restore_db(self, prior):
+        if prior is not None:
+            sys.modules["ap.db"] = prior
+        else:
+            sys.modules.pop("ap.db", None)
+
+    def test_load_returns_dict_values_not_column_names(self):
+        eng = self._new_engine()
+        row = {
+            "id": "real-uuid-42",
+            "underlying": "BAC",
+            "contract": "BAC260724P00062000",
+            "option_symbol": "BAC260724P00062000",
+            "side": "PUT", "direction": "PUT",
+            "qty": 1, "quantity_remaining": 1,
+            "avg_fill": 0.97, "entry_price": 0.97,
+            "entry_ts": None, "status": "OPEN",
+            "signal_id": "sig-1", "execution_mode": "live",
+        }
+        prior, _ = self._install_dict_fake_db(row=row)
+        try:
+            loaded = eng._load_db_position_row("BAC260724P00062000")
+        finally:
+            self._restore_db(prior)
+        assert loaded is not None
+        # Regression: previous code returned {col_name: col_name} — every value
+        # would be the string "id" / "underlying" / etc.  We want real values.
+        assert loaded["id"] == "real-uuid-42"
+        assert loaded["execution_mode"] == "live"
+        assert loaded["entry_price"] == 0.97
+
+    def test_insert_returning_id_extracts_from_dict(self):
+        eng = self._new_engine()
+        prior, _ = self._install_dict_fake_db(insert_id="inserted-id-xyz")
+        try:
+            row_id = eng._upsert_broker_position_to_db(
+                "BAC260724P00062000",
+                {"quantity": 1, "cost_basis": 97.0, "date_acquired": "2026-07-24T13:00:00Z"},
+            )
+        finally:
+            self._restore_db(prior)
+        assert row_id == "inserted-id-xyz"
+
+    def test_conflict_requery_id_extracts_from_dict(self):
+        eng = self._new_engine()
+        # INSERT returns None → ON CONFLICT DO NOTHING → re-query hits existing.
+        prior, _ = self._install_dict_fake_db(insert_id=None, existing_id="existing-uuid-99")
+        try:
+            row_id = eng._upsert_broker_position_to_db(
+                "BAC260724P00062000",
+                {"quantity": 1, "cost_basis": 97.0, "date_acquired": "2026-07-24T13:00:00Z"},
+            )
+        finally:
+            self._restore_db(prior)
+        assert row_id == "existing-uuid-99"
+
+
+def test_sys_modules_isolation_regression():
+    """After _load_engine_class() runs, real ap.position_manager must import.
+
+    The previous helper permanently replaced ap.position_manager with a bare
+    types.ModuleType(), which caused every later P0 test file that does
+    `from ap.position_manager import APPositionManager` to fail collection.
+    """
+    from ap.position_manager import APPositionManager  # noqa: F401
+    # Sanity: it's the real symbol, not a stub attribute.
+    assert isinstance(APPositionManager, type)
+
+
+def test_postgres_fixture_wrapper_returns_dict_rows(monkeypatch):
+    """The Postgres test wrapper must mirror ap.db._ConnWrapper's dict contract."""
+    if not _DATABASE_URL:
+        pytest.skip("DATABASE_URL not configured for PostgreSQL coverage")
+    with _postgres_positions_table(monkeypatch) as pg_conn:
+        contract = "AAPL260724C00200000"
+        client = "wrapper-dict@example.com"
+        with pg_conn.cursor() as raw_cur:
+            raw_cur.execute(
+                """
+                INSERT INTO positions (id, client_id, underlying, contract, option_symbol,
+                                       execution_mode, side, direction, qty, quantity_remaining,
+                                       avg_fill, entry_price, entry_ts, status, signal_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, %s)
+                """,
+                ("wrap-1", client, "AAPL", contract, contract, "live",
+                 "CALL", "CALL", 1, 1, 1.10, 1.10, "OPEN", "sig-w"),
+            )
+        pg_conn.commit()
+
+        # Route through the fake ap.db wrapper the fixture installed —
+        # fetchone/fetchall must return dicts, not tuples.
+        import ap.db as _fake_db
+        with _fake_db.conn() as c:
+            c.execute("SELECT id, execution_mode FROM positions WHERE client_id = %s", (client,))
+            row = c.fetchone()
+        assert isinstance(row, dict), f"Expected dict, got {type(row).__name__}"
+        assert row["id"] == "wrap-1"
+        assert row["execution_mode"] == "live"

@@ -151,8 +151,15 @@ def emit_fill_event(
     stage: str = "fill_monitor",
     extra_inputs: dict | None = None,
     extra_context: dict | None = None,
-):
-    """Emit structured fill-monitor observability without blocking reconciliation."""
+) -> bool:
+    """Emit structured fill-monitor observability without blocking reconciliation.
+
+    Returns True on successful emit, False if the underlying observability
+    write failed.  Failures are logged at WARNING level (not debug) so
+    identity-critical events like CANONICAL_ADOPTION_MODE_CONFLICT stay
+    visible even when the downstream ledger is degraded.  The function
+    remains non-fatal and never re-raises.
+    """
     try:
         result = result or {}
         emit_decision_event(
@@ -182,8 +189,22 @@ def emit_fill_event(
             },
             context=extra_context or {},
         )
-    except Exception as e:
-        log.debug("Fill monitor observability emit failed (non-critical): %s", e)
+        return True
+    except Exception as exc:
+        # AMENDMENT (PR #385 review — observability contract): promote
+        # from log.debug to log.warning and return False.  A silent
+        # debug-only failure hid critical identity events; callers now
+        # get a real signal without needing (or getting fooled by) an
+        # outer try/except that never runs.
+        log.warning(
+            "Fill monitor observability emit failed | "
+            "reason_code=%s client=%s local_order_id=%s error=%s",
+            reason_code,
+            order.get("client_id"),
+            order.get("local_order_id"),
+            exc,
+        )
+        return False
 
 
 # =============================================================================
@@ -1213,6 +1234,286 @@ def _safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def _normalize_execution_mode_token(value) -> str:
+    """Recognize only lowercase "live" / "paper".  Never infer, never default."""
+    _tok = str(value or "").strip().lower()
+    return _tok if _tok in {"live", "paper"} else ""
+
+
+def _resolve_canonical_adoption_execution_mode(exit_engine, order: dict):
+    """Resolve the exact execution_mode to pass into
+    adopt_canonical_position_identity, or fail closed.
+
+    AMENDMENT (PR #385 review — Fix A): consult the ENGINE's structured
+    resolution status, not a bare mode string.  The bare string is ""
+    for BOTH "no evidence" and "contradictory evidence"; treating them
+    the same lets a known-good order mode launder a genuine engine
+    conflict.  We now branch on `_resolved_execution_mode_detail()`:
+
+      engine PROVEN   → reconcile against order mode; disagree ⇒ CONFLICT
+      engine CONFLICT → fail closed regardless of order mode
+      engine UNPROVEN → a normalized known order mode may be used;
+                        otherwise UNPROVEN
+
+    The existing `_resolved_execution_mode()` contract remains unchanged
+    for all its other callers.
+
+    Returns a 3-tuple (mode, disposition, diagnostics):
+      mode        — "live" | "paper" | ""  ("" means "do not adopt")
+      disposition — "OK" | "CONFLICT" | "UNPROVEN"
+      diagnostics — dict with order_mode / engine_mode / engine_status
+                    / engine_sources for logs and audit records.
+    """
+    order_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+
+    engine_status = "UNPROVEN"
+    engine_mode = ""
+    engine_sources: dict = {}
+    _detail_fn = getattr(exit_engine, "_resolved_execution_mode_detail", None)
+    if callable(_detail_fn):
+        try:
+            _d = _detail_fn() or {}
+            engine_mode = _normalize_execution_mode_token(_d.get("mode"))
+            _s = str(_d.get("status") or "").upper()
+            if _s in {"PROVEN", "CONFLICT", "UNPROVEN"}:
+                engine_status = _s
+            engine_sources = dict(_d.get("sources") or {})
+        except Exception:
+            # Structured detail unavailable — do NOT silently downgrade
+            # to plain-mode inference; treat as UNPROVEN.
+            engine_status = "UNPROVEN"
+            engine_mode = ""
+    else:
+        # Older engine without the detail helper: fall back to the plain
+        # resolver.  Its "" cannot distinguish CONFLICT from UNPROVEN, so
+        # we conservatively treat "" as UNPROVEN here.  Real production
+        # engines always expose the detail helper.
+        _plain = getattr(exit_engine, "_resolved_execution_mode", None)
+        if callable(_plain):
+            try:
+                engine_mode = _normalize_execution_mode_token(_plain())
+            except Exception:
+                engine_mode = ""
+            engine_status = "PROVEN" if engine_mode else "UNPROVEN"
+
+    diag = {
+        "order_mode": order_mode,
+        "engine_mode": engine_mode,
+        "engine_status": engine_status,
+        "engine_sources": engine_sources,
+    }
+
+    # Engine CONFLICT must ALWAYS fail closed — a known-good order mode
+    # cannot mask contradictory engine evidence.
+    if engine_status == "CONFLICT":
+        return "", "CONFLICT", diag
+
+    if engine_status == "PROVEN":
+        if order_mode and order_mode != engine_mode:
+            return "", "CONFLICT", diag
+        return engine_mode, "OK", diag
+
+    # Engine UNPROVEN.
+    if order_mode:
+        return order_mode, "OK", diag
+    return "", "UNPROVEN", diag
+
+
+def _classify_existing_protective_owner(
+    *,
+    exit_engine,
+    contract: str,
+    client_id: str,
+    expected_mode: str,
+) -> tuple[str, int, int]:
+    """Classify whether an exact protective owner exists for this order.
+
+    AMENDMENT (PR #385 review — every-failure-path owner truthfulness):
+    used by mode-fail-closed, RETRY_* dispositions, and adoption
+    exception paths so every "protective monitoring retained" claim is
+    actually verified.
+
+    A protective owner is PROVEN only when a behavior-active position
+    matches:
+      - contract EXACTLY (already canonical uppercase);
+      - normalized nonblank client_id equal to the order's client_id;
+      - execution_mode is exactly "live" or "paper";
+      - AND, when `expected_mode` is proven ("live"/"paper"), the
+        position's execution_mode equals it (mode-scoped ownership).
+
+    Otherwise:
+      - OWNER_IDENTITY_UNPROVEN: candidates exist (same client+contract)
+        but their execution_mode is blank / malformed / mismatched.
+      - NO_OWNER: zero same-client same-contract candidates.
+      - OWNER_LOOKUP_FAILED: active_positions() raised.
+
+    Returns (state, proven_count, unproven_count).
+    """
+    _contract = str(contract or "").upper().strip()
+    _expected_client = str(client_id or "").strip().lower()
+    _expected_mode = str(expected_mode or "").strip().lower()
+    _expected_mode_proven = _expected_mode in {"live", "paper"}
+    if not _expected_mode_proven:
+        _expected_mode = ""
+
+    if not _contract or not _expected_client:
+        return "NO_OWNER", 0, 0
+
+    _active_fn = getattr(exit_engine, "active_positions", None)
+    if not callable(_active_fn):
+        return "NO_OWNER", 0, 0
+
+    try:
+        _actives = _active_fn() or []
+    except Exception as _err:
+        log.warning(
+            "[%s] owner-existence check failed for %s: %s",
+            client_id, _contract, _err,
+        )
+        return "OWNER_LOOKUP_FAILED", 0, 0
+
+    _proven = 0
+    _unproven = 0
+    for _p in _actives:
+        _sym = str(getattr(_p, "option_symbol", "") or "").upper().strip()
+        if _sym != _contract:
+            continue
+        _p_client = str(getattr(_p, "client_id", "") or "").strip().lower()
+        if not _p_client or _p_client != _expected_client:
+            # Blank / different-client contract match is not exact
+            # ownership — do NOT count in either bucket.
+            continue
+        _p_mode = str(getattr(_p, "execution_mode", "") or "").strip().lower()
+        # AMENDMENT (PR #385 review — final owner classification):
+        #
+        # (1) Without a PROVEN expected_mode, we cannot say that any
+        #     same-client/same-contract candidate is THIS fill's owner
+        #     — even a valid-looking live/paper mode is not a proof of
+        #     match.  All such candidates go into the unproven bucket.
+        #
+        # (2) With a proven expected_mode, a candidate with blank /
+        #     malformed / different mode is still unproven; only an
+        #     exact live/paper match on the same mode is proven.
+        if _p_mode not in {"live", "paper"}:
+            _unproven += 1
+            continue
+        if not _expected_mode_proven:
+            _unproven += 1
+            continue
+        if _p_mode != _expected_mode:
+            _unproven += 1
+            continue
+        _proven += 1
+
+    # AMENDMENT (PR #385 review — final owner classification):
+    # PROVEN_OWNER is only valid when a SINGLE uncontested exact owner
+    # exists.  Duplicate proven owners or mixed proven/unproven states
+    # are ownership ambiguity, not proof; they must escalate through
+    # OWNER_IDENTITY_UNPROVEN.  A protective-monitoring claim requires
+    # exactly one verified responsible party, not "at least one adult in
+    # the room."
+    if _proven == 1 and _unproven == 0:
+        return "PROVEN_OWNER", 1, 0
+    if _proven > 0 or _unproven > 0:
+        return "OWNER_IDENTITY_UNPROVEN", _proven, _unproven
+    return "NO_OWNER", 0, 0
+
+
+def _emit_seed_failure_diagnostic(
+    *,
+    order: dict,
+    result: dict,
+    contract: str,
+    position_id: str,
+    signal_id: str,
+    base_reason: str,
+    mode_diag: dict,
+    resolved_mode: str,
+    owner_state: str,
+    proven_count: int,
+    unproven_count: int,
+    tail_explanation_for_owner: str,
+    extra_payload: dict | None = None,
+) -> None:
+    """Emit a truthful CRITICAL log + audit + fill event on any seed
+    failure path.  Reason code carries the owner classification suffix
+    so operators can distinguish real "retained" states from
+    unproven-identity and no-owner cases.
+    """
+    _client_id = str(order.get("client_id") or "")
+    _reason_code = base_reason
+    if owner_state == "PROVEN_OWNER":
+        pass  # base reason means monitoring truly is retained
+    elif owner_state == "OWNER_IDENTITY_UNPROVEN":
+        _reason_code = f"{base_reason}_OWNER_IDENTITY_UNPROVEN"
+    elif owner_state == "OWNER_LOOKUP_FAILED":
+        _reason_code = f"{base_reason}_OWNER_LOOKUP_FAILED"
+    else:
+        _reason_code = f"{base_reason}_NO_OWNER"
+
+    _payload = {
+        "contract": contract,
+        "position_id": position_id,
+        "local_order_id": order.get("local_order_id"),
+        "broker_order_id": order.get("broker_order_id"),
+        "signal_id": signal_id or order.get("signal_id"),
+        "order_mode": mode_diag.get("order_mode"),
+        "engine_mode": mode_diag.get("engine_mode"),
+        "engine_status": mode_diag.get("engine_status"),
+        "engine_sources": mode_diag.get("engine_sources"),
+        "resolved_mode": resolved_mode,
+        "owner_state": owner_state,
+        "proven_owner_count": proven_count,
+        "unproven_owner_count": unproven_count,
+    }
+    if extra_payload:
+        _payload.update(extra_payload)
+
+    _tail = {
+        "PROVEN_OWNER": (
+            "protective monitoring retained; no new exit owner created"
+        ),
+        "OWNER_IDENTITY_UNPROVEN": (
+            "same-client contract candidates exist but their identity is unproven; "
+            "reconciler must resolve"
+        ),
+        "OWNER_LOOKUP_FAILED": (
+            "owner lookup failed; treat as unknown, do not create new owner"
+        ),
+        "NO_OWNER": (
+            "NO protective owner exists; escalation required"
+        ),
+    }[owner_state]
+    log.critical(
+        "[%s] %s | contract=%s position_id=%s local=%s broker=%s "
+        "resolved_mode=%s engine_status=%s owner_state=%s "
+        "proven=%d unproven=%d — %s (%s)",
+        _client_id, _reason_code,
+        contract, position_id,
+        order.get("local_order_id"), order.get("broker_order_id"),
+        resolved_mode or "", mode_diag.get("engine_status") or "",
+        owner_state, proven_count, unproven_count,
+        _tail, tail_explanation_for_owner,
+    )
+    try:
+        audit(_client_id, "CRITICAL", _reason_code, _payload)
+    except Exception as _audit_err:
+        log.warning(
+            "[%s] audit write failed for %s: %s",
+            _client_id, _reason_code, _audit_err,
+        )
+    emit_fill_event(
+        order,
+        decision="ERROR",
+        reason_code=_reason_code,
+        explanation=(
+            f"{tail_explanation_for_owner}; owner_state={owner_state}; {_tail}."
+        ),
+        result=result or {},
+        extra_context=_payload,
+    )
+
+
 def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, signal_id: str):
     """Seed the exit engine after confirmed ENTRY fill without faking live quote state.
 
@@ -1242,6 +1543,58 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     # it atomically so we never have two in-memory positions for the same open
     # trade and all subsequent exits use canonical identity.
     _contract_for_adopt = str(order.get("contract") or order.get("symbol") or "").upper().strip()
+
+    # AMENDMENT (PR #385 review — Fix 1 + NO_REPAIR_FOUND fallthrough):
+    # resolve execution_mode ONCE at the top of _seed_exit_engine so the
+    # exact lowercase live/paper flows through every downstream branch:
+    # adoption, seed_position, and ManagedPosition construction.  The
+    # previous placement inside the adoption block meant the fall-through
+    # NO_REPAIR_FOUND path silently re-read the raw nullable order value
+    # and produced a canonical position with blank execution_mode.
+    _resolved_mode, _mode_disp, _mode_diag = _resolve_canonical_adoption_execution_mode(
+        exit_engine, order,
+    )
+
+    # AMENDMENT (PR #385 review — mode gate must govern ALL seeding,
+    # not just repair adoption): the mode-fail-closed block previously
+    # lived inside `if callable(_adopt_fn) and contract and position_id`.
+    # An engine without the optional adoption API could then bypass
+    # validation and reach seed_position()/add_position() with a blank
+    # canonical mode.  Hoist the gate here so every seeding path — with
+    # or without adoption support — enforces exact live/paper before
+    # any writer sees the position.
+    if _mode_disp != "OK":
+        _owner_state, _proven_owner, _unproven_owner = (
+            _classify_existing_protective_owner(
+                exit_engine=exit_engine,
+                contract=_contract_for_adopt,
+                client_id=str(order.get("client_id") or ""),
+                expected_mode=_resolved_mode,
+            )
+        )
+        _base_reason = (
+            "CANONICAL_ADOPTION_MODE_CONFLICT"
+            if _mode_disp == "CONFLICT"
+            else "CANONICAL_ADOPTION_MODE_UNPROVEN"
+        )
+        _emit_seed_failure_diagnostic(
+            order=order,
+            result=result or {},
+            contract=_contract_for_adopt,
+            position_id=position_id,
+            signal_id=signal_id or "",
+            base_reason=_base_reason,
+            mode_diag=_mode_diag,
+            resolved_mode=_resolved_mode,
+            owner_state=_owner_state,
+            proven_count=_proven_owner,
+            unproven_count=_unproven_owner,
+            tail_explanation_for_owner=(
+                "Canonical adoption execution mode could not be proven"
+            ),
+        )
+        return
+
     _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
     if callable(_adopt_fn) and _contract_for_adopt and position_id:
         try:
@@ -1279,7 +1632,7 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 entry_fill            = _entry_fill_for_adopt,
                 entry_ts              = _entry_ts_for_adopt,
                 order_filled_ts       = order.get("filled_ts"),
-                execution_mode        = str(order.get("execution_mode") or ""),
+                execution_mode        = _resolved_mode,
                 client_id             = str(order.get("client_id") or ""),
                 underlying_entry      = _underlying_entry_for_adopt,
                 score                 = _safe_float(order.get("score") or 0.0),
@@ -1302,15 +1655,37 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             elif _disposition == "NO_REPAIR_FOUND":
                 pass  # fall through to normal seed
             elif _disposition and _disposition.startswith("RETRY_"):
-                # Adoption conflict — must NOT fall through to add_position.
-                # Retaining existing protective monitoring; do not create duplicate exit owner.
-                log.critical(
-                    "[%s] CANONICAL_ADOPTION_RETRY_REQUIRED | "
-                    "disposition=%s contract=%s position_id=%s reason=%s — "
-                    "protective monitoring retained; no new exit owner created",
-                    order.get("client_id"), _disposition,
-                    _contract_for_adopt, position_id,
-                    getattr(_adopted, "reason", ""),
+                # AMENDMENT (PR #385 review): a RETRY_* disposition means
+                # the adoption target is untrusted; do NOT falsely claim
+                # protective monitoring is retained.  Verify whether any
+                # exact protective owner (contract + client + live/paper)
+                # exists on the engine right now, then emit a truthful
+                # reason code that reflects the actual owner state.
+                _owner_state, _proven_owner, _unproven_owner = (
+                    _classify_existing_protective_owner(
+                        exit_engine=exit_engine,
+                        contract=_contract_for_adopt,
+                        client_id=str(order.get("client_id") or ""),
+                        expected_mode=_resolved_mode,
+                    )
+                )
+                _emit_seed_failure_diagnostic(
+                    order=order,
+                    result=result or {},
+                    contract=_contract_for_adopt,
+                    position_id=position_id,
+                    signal_id=signal_id or "",
+                    base_reason=f"CANONICAL_ADOPTION_{_disposition}",
+                    mode_diag=_mode_diag,
+                    resolved_mode=_resolved_mode,
+                    owner_state=_owner_state,
+                    proven_count=_proven_owner,
+                    unproven_count=_unproven_owner,
+                    tail_explanation_for_owner=(
+                        f"Adoption returned {_disposition}: "
+                        f"{getattr(_adopted, 'reason', '')}"
+                    ),
+                    extra_payload={"adoption_disposition": _disposition},
                 )
                 return
             elif _adopted is True:  # legacy bool path
@@ -1318,11 +1693,37 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             elif _adopted is False:  # legacy bool — no repair found, seed normally
                 pass
         except Exception as _adopt_err:
-            log.critical(
-                "[%s] CANONICAL_ADOPTION_RETRY_REQUIRED | "
-                "disposition=RETRY_ADOPTION_ERROR contract=%s: %s — "
-                "protective monitoring retained; NOT falling through to add_position",
-                order.get("client_id"), _contract_for_adopt, _adopt_err,
+            # AMENDMENT (PR #385 review): adoption raised.  Route through
+            # the same owner classifier so the diagnostic reflects the
+            # real owner state instead of claiming monitoring is retained.
+            _owner_state, _proven_owner, _unproven_owner = (
+                _classify_existing_protective_owner(
+                    exit_engine=exit_engine,
+                    contract=_contract_for_adopt,
+                    client_id=str(order.get("client_id") or ""),
+                    expected_mode=_resolved_mode,
+                )
+            )
+            _emit_seed_failure_diagnostic(
+                order=order,
+                result=result or {},
+                contract=_contract_for_adopt,
+                position_id=position_id,
+                signal_id=signal_id or "",
+                base_reason="CANONICAL_ADOPTION_RETRY_ADOPTION_ERROR",
+                mode_diag=_mode_diag,
+                resolved_mode=_resolved_mode,
+                owner_state=_owner_state,
+                proven_count=_proven_owner,
+                unproven_count=_unproven_owner,
+                tail_explanation_for_owner=(
+                    f"Canonical adoption raised: {type(_adopt_err).__name__}: "
+                    f"{_adopt_err}"
+                ),
+                extra_payload={
+                    "adoption_disposition": "RETRY_ADOPTION_ERROR",
+                    "exception_type": type(_adopt_err).__name__,
+                },
             )
             return
 
@@ -1333,9 +1734,24 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     except Exception as _ee_err:
         log.warning("Exit engine position check failed for %s: %s", position_id, _ee_err)
 
+    # AMENDMENT (PR #385 review): both fall-through seeding paths
+    # (seed_position and the ManagedPosition/add_position path below)
+    # must consume the SAME _resolved_mode the adoption call would
+    # have used.  Whenever a canonical mode is proven, ALWAYS pass a
+    # normalized copy — including cases like "LIVE" / " LIVE " /
+    # "Paper" that would normalize to _resolved_mode but still hand
+    # non-canonical text into any downstream seed_position payload
+    # that inspects the raw string.  The original order dict is never
+    # mutated.
+    if _resolved_mode:
+        _seed_order = dict(order)
+        _seed_order["execution_mode"] = _resolved_mode
+    else:
+        _seed_order = order
+
     try:
         if hasattr(exit_engine, "seed_position"):
-            exit_engine.seed_position(position_id, order, result)
+            exit_engine.seed_position(position_id, _seed_order, result)
             return
     except Exception as exc:
         log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
@@ -1366,10 +1782,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.position_id = position_id
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
-        # Repair 5: preserve execution_mode from the order so proof rows
-        # record "live" not "unknown".
+        # AMENDMENT (PR #385 review): use _resolved_mode (proven exact
+        # lowercase live/paper), not the raw nullable order value.  A
+        # blank order.execution_mode is exactly the historical /
+        # recovery-created shape the resolver is designed to repair;
+        # storing "" here would break exact-mode protective persistence
+        # and LIVE/PAPER isolation for the canonical position.
         try:
-            mp.execution_mode = str(order.get("execution_mode") or "")
+            mp.execution_mode = _resolved_mode
         except Exception:
             pass
 
