@@ -4821,26 +4821,32 @@ class TestEqualTimestampHardRefSourcePriority:
         assert self._call(prior_source="bid", candidate_source="last") is False
 
     def test_bid_replaces_equal_time_catastrophic_ask(self):
+        # Use ONE timestamp for both sides — two datetime.now() calls
+        # differ by microseconds and would let chronology decide instead
+        # of the equal-time source-quality tiebreak we're testing.
+        _ts = datetime.now(_UTC)
         assert _shared_should_replace_hard_ref(
-            prior_validity="catastrophic_ask", prior_ts=datetime.now(_UTC),
+            prior_validity="catastrophic_ask", prior_ts=_ts,
             prior_price=0.55, candidate_validity="proven",
-            candidate_ts=datetime.now(_UTC), prior_source="ask",
+            candidate_ts=_ts, prior_source="ask",
             candidate_source="bid",
         ) is True
 
     def test_bid_survives_equal_time_catastrophic_ask(self):
+        _ts = datetime.now(_UTC)
         assert _shared_should_replace_hard_ref(
-            prior_validity="proven", prior_ts=datetime.now(_UTC),
+            prior_validity="proven", prior_ts=_ts,
             prior_price=1.05, candidate_validity="catastrophic_ask",
-            candidate_ts=datetime.now(_UTC), prior_source="bid",
+            candidate_ts=_ts, prior_source="bid",
             candidate_source="ask",
         ) is False
 
     def test_unproven_does_not_erase_authoritative(self):
+        _ts = datetime.now(_UTC)
         assert _shared_should_replace_hard_ref(
-            prior_validity="proven", prior_ts=datetime.now(_UTC),
+            prior_validity="proven", prior_ts=_ts,
             prior_price=1.05, candidate_validity="unproven",
-            candidate_ts=datetime.now(_UTC),
+            candidate_ts=_ts,
             prior_source="bid", candidate_source="bid",
         ) is False
 
