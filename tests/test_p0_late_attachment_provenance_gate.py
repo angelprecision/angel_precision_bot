@@ -38,7 +38,17 @@ def _force_regular_session(monkeypatch):
                 return _fixed.astimezone(tz)
             return _fixed.replace(tzinfo=None)
 
-    monkeypatch.setattr(ew, "datetime", _FrozenDT)
+    # Patch the EXACT globals dict the watch() method resolves LOAD_GLOBAL
+    # against, not just the module attribute ew.datetime. Other tests in
+    # the shared pytest process may swap sys.modules["ap_entry_watcher"]
+    # or reload the module, leaving `ew` (the test's imported name)
+    # pointing to a different object than watch.__globals__ resolves
+    # through. Patching __globals__ eliminates that ambiguity.
+    watch_globals = ew.APEntryWatcher.watch.__globals__
+    monkeypatch.setitem(watch_globals, "datetime", _FrozenDT)
+    monkeypatch.setattr(ew, "datetime", _FrozenDT)   # belt-and-suspenders
+
+    assert ew.APEntryWatcher.watch.__globals__["datetime"] is _FrozenDT
 
 
 REPO = pathlib.Path(__file__).parent.parent

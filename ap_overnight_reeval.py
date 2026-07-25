@@ -528,6 +528,12 @@ def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
     return (
         reason.startswith("overnight_watch_arm_failed:")
         or reason.startswith("overnight_watch_arm_failed_cleanup_failed:")
+        # PR #388: durable REATTACH ambiguity marker (see
+        # _persist_reattach_post_watch_ambiguity). Written when watch()
+        # returns False AND the post-watch verify cannot prove the order
+        # is preserved — treat as terminal on the next reeval so no
+        # replacement ENTRY is ever created.
+        or reason.startswith("reattach_post_watch_ambiguous")
     )
 
 
@@ -688,6 +694,136 @@ def _query_active_entry_order(
             client_id, canonical_sig_id, mode, exc,
         )
         return _LS_LOOKUP_FAILED, None
+
+
+def _query_exact_entry_order_by_local_id(
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+) -> tuple[str, Optional[dict]]:
+    """Post-watch exact-order lookup with NO status filter.
+
+    _query_active_entry_order() is the active-ownership fence and filters
+    to _ACTIVE_ENTRY_OWN_STATUSES — it CANNOT see CANCELED / EXPIRED /
+    REJECTED / ERROR rows. That is correct for the fence, but a REATTACH
+    watch() that terminalizes the order needs a lookup that CAN see the
+    terminal state so the caller can classify already_resolved rather
+    than incorrectly labeling retryable and enabling a replacement.
+
+    This helper queries by exact 4-tuple identity with NO status filter:
+      local_order_id + client_id + execution_mode + canonical_signal_id + kind='ENTRY'.
+
+    Returns (_LS_FOUND, row) / (_LS_NOT_FOUND, None) / (_LS_LOOKUP_FAILED, None).
+    """
+    if not local_order_id or not client_id or not canonical_signal_id:
+        return _LS_LOOKUP_FAILED, None
+    mode = str(execution_mode or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        log.warning(
+            "[%s] _query_exact_entry_order_by_local_id: unknown mode=%r local_order_id=%s"
+            " — LOOKUP_FAILED",
+            client_id, execution_mode, local_order_id,
+        )
+        return _LS_LOOKUP_FAILED, None
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT * FROM orders "
+                    "WHERE local_order_id = %s "
+                    "AND client_id = %s "
+                    "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+                    "AND canonical_signal_id = %s "
+                    "AND kind = 'ENTRY' "
+                    "LIMIT 1",
+                    (local_order_id, client_id, mode, canonical_signal_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+        if row is None:
+            return _LS_NOT_FOUND, None
+        return _LS_FOUND, (dict(row) if not isinstance(row, dict) else row)
+
+    except Exception as exc:
+        log.warning(
+            "[%s] _query_exact_entry_order_by_local_id: DB query failed "
+            "local_order_id=%s canonical=%s mode=%s: %s",
+            client_id, local_order_id, canonical_signal_id, mode, exc,
+        )
+        return _LS_LOOKUP_FAILED, None
+
+
+# Terminal ENTRY statuses the post-watch verifier recognises. Anything not in
+# _ACTIVE_ENTRY_OWN_STATUSES and not in this set is treated as ambiguous.
+_TERMINAL_ENTRY_STATUSES = frozenset({
+    "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "ERROR", "FAILED",
+    "TERMINAL", "CLOSED",
+})
+
+
+def _persist_reattach_post_watch_ambiguity(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+    post_status: str,
+    post_row_status: str,
+) -> bool:
+    """Persist a durable AMBIGUOUS opportunity so the NEXT reeval attempt
+    cannot classify the setup as NEW and create a replacement ENTRY.
+
+    Written via the opportunity ledger with a distinctive miss_reason that
+    _is_terminal_watch_arm_failure_reason recognises as terminal — so the
+    disposition resolver returns ALREADY_TERMINAL on the next attempt.
+    Best-effort; a False return is a hard failure that MUST be treated as
+    fail-closed retryable by the caller.
+    """
+    try:
+        from ap.opportunity_ledger import (
+            create_opportunities as _create_opps_amb,
+            mark_watcher_armed as _mark_wa_amb,
+        )
+        _sig_payload = dict(signal_payload or {})
+        _sig_payload.setdefault("signal_id", signal_id)
+        _create_opps_amb(
+            signal_id, [client_id], _sig_payload,
+            canonical_signal_id=canonical_signal_id,
+        )
+        # We deliberately do NOT mark WATCHER_ARMED — the semantic is
+        # "ambiguous post-watch outcome". Instead, write a MISSED-style
+        # proof via _record_watch_arm_failure_proof using a reason that
+        # is in the terminal set.
+        _record_watch_arm_failure_proof(
+            signal_id=signal_id,
+            client_id=client_id,
+            signal=_sig_payload,
+            reason="reattach_post_watch_ambiguous_terminal_or_missing",
+            session_key=session_key,
+            extra_meta={
+                "execution_mode":                execution_mode,
+                "reattach_post_watch_status":    post_status,
+                "reattach_post_watch_row_status": post_row_status,
+                "local_order_id":                local_order_id,
+                "reattach_ambiguous_at":         datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return True
+    except Exception as _amb_exc:
+        log.critical(
+            "REATTACH_POST_WATCH_AMBIGUITY_PERSIST_FAILED "
+            "client=%s mode=%s canonical=%s local_order_id=%s err=%s",
+            client_id, execution_mode, canonical_signal_id,
+            local_order_id, _amb_exc,
+        )
+        return False
 
 
 # ── Disposition constants ─────────────────────────────────────────────────────
@@ -1629,22 +1765,22 @@ def run_overnight_reeval(
                             continue
 
                     if not _reattach_armed:
-                        # PR #388 truthful accounting: watch() returning
-                        # False does NOT by itself prove the existing order
-                        # is intact. Re-read the exact order and classify
-                        # by observed truth:
-                        #   * still PENDING_TRIGGER → retryable_deferred
-                        #   * terminal (EXPIRED/CANCELED/REJECTED/etc.)
-                        #                        → already_resolved
-                        #   * lookup fails / row missing → fail-closed
-                        #                        retryable_deferred
-                        _post_status, _post_row = _query_active_entry_order(
-                            client_id, _reattach_mode, _reattach_canonical,
+                        # PR #388 truthful accounting on watch() False.
+                        # Use the NO-STATUS-FILTER exact-order lookup so
+                        # terminal statuses (CANCELED / EXPIRED / REJECTED
+                        # / ERROR) are visible. The active-ownership fence
+                        # helper _query_active_entry_order filters those
+                        # out and would incorrectly return NOT_FOUND, which
+                        # would cascade into a replacement ENTRY on the
+                        # next reeval.
+                        _post_status, _post_row = _query_exact_entry_order_by_local_id(
+                            _existing_oid, client_id, _reattach_mode, _reattach_canonical,
                         )
                         _post_active_status = ""
                         if _post_status == _LS_FOUND and isinstance(_post_row, dict):
                             _post_active_status = str(_post_row.get("status") or "").upper()
 
+                        # Case 1: row found, still preserved.
                         if _post_status == _LS_FOUND and _post_active_status in ("PENDING_TRIGGER", "CREATED"):
                             log.warning(
                                 "[%s] overnight_reeval: REATTACH_WATCHER watch()"
@@ -1657,12 +1793,14 @@ def run_overnight_reeval(
                             result["retryable_deferred"] += 1
                             continue
 
-                        if _post_status == _LS_FOUND and _post_active_status:
-                            # Terminal or otherwise resolved: no further work.
+                        # Case 2: row found in active-ownership family
+                        # (submitted / accepted / open / partial / filled)
+                        # — already owned, no further reeval work.
+                        if _post_status == _LS_FOUND and _post_active_status in _ALREADY_OWNED_STATUSES:
                             log.warning(
                                 "[%s] overnight_reeval: REATTACH_WATCHER watch()"
                                 " returned False signal=%s local_order_id=%s"
-                                " — order transitioned to %s;"
+                                " — order in-flight/filled (%s);"
                                 " classifying already_resolved",
                                 ticker, signal_id, _existing_oid, _post_active_status,
                             )
@@ -1670,16 +1808,69 @@ def run_overnight_reeval(
                             result["already_resolved"] += 1
                             continue
 
-                        # LOOKUP_FAILED or NOT_FOUND after a False return —
-                        # fail closed as retryable so the next attempt tries
-                        # again; NEVER treat unknown as resolved.
-                        log.error(
+                        # Case 3: row found in an explicit terminal status.
+                        if _post_status == _LS_FOUND and _post_active_status in _TERMINAL_ENTRY_STATUSES:
+                            log.warning(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False signal=%s local_order_id=%s"
+                                " — order terminalized (%s);"
+                                " classifying already_resolved (no replacement)",
+                                ticker, signal_id, _existing_oid, _post_active_status,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["already_resolved"] += 1
+                            continue
+
+                        # Case 4: row found in an UNRECOGNISED status —
+                        # persist ambiguity so the next reeval sees terminal.
+                        # Case 5: row missing (NOT_FOUND) — persist ambiguity.
+                        # Case 6: lookup failed — persist ambiguity.
+                        # In every one of these, `retryable_deferred` alone
+                        # is not enough: the next reeval could see no
+                        # active order and classify NEW, creating a
+                        # replacement ENTRY. Write a durable AMBIGUITY
+                        # record via the opportunity ledger so the
+                        # disposition resolver returns ALREADY_TERMINAL.
+                        _ambiguity_persisted = _persist_reattach_post_watch_ambiguity(
+                            client_id=client_id,
+                            execution_mode=_reattach_mode,
+                            canonical_signal_id=_reattach_canonical,
+                            signal_id=signal_id,
+                            signal_payload=signal,
+                            local_order_id=_existing_oid,
+                            session_key=session_key,
+                            post_status=_post_status,
+                            post_row_status=_post_active_status,
+                        )
+                        if _ambiguity_persisted:
+                            log.critical(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False AND post-verify=%s row_status=%r"
+                                " signal=%s local_order_id=%s"
+                                " — durable ambiguity marker persisted;"
+                                " next reeval will classify ALREADY_TERMINAL"
+                                " (no replacement ENTRY)",
+                                ticker, _post_status, _post_active_status,
+                                signal_id, _existing_oid,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["already_resolved"] += 1
+                            continue
+
+                        # Ambiguity marker persist failed — fail closed
+                        # by classifying the run RETRYABLE with an explicit
+                        # unresolved counter so this attempt cannot mark
+                        # success and the next attempt retries the whole
+                        # path (which will hit the same ambiguity and
+                        # attempt to persist again).
+                        log.critical(
                             "[%s] overnight_reeval: REATTACH_WATCHER watch()"
-                            " returned False AND post-verify lookup=%s row=%s"
+                            " returned False AND post-verify=%s row_status=%r"
+                            " AND ambiguity marker persist FAILED;"
                             " signal=%s local_order_id=%s"
-                            " — cannot prove order preserved;"
-                            " classifying retryable_deferred (fail closed)",
-                            ticker, _post_status, bool(_post_row),
+                            " — classifying retryable_deferred (fail closed;"
+                            " next reeval may still see this row)",
+                            ticker, _post_status, _post_active_status,
                             signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1

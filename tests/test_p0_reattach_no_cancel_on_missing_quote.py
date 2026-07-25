@@ -45,6 +45,10 @@ def _force_regular_live_session(monkeypatch, watcher=None):
                 return _fixed.astimezone(tz)
             return _fixed.replace(tzinfo=None)
 
+    # Patch the exact globals dict watch() reads (see companion note in
+    # tests/test_p0_late_attachment_provenance_gate.py).
+    watch_globals = ew.APEntryWatcher.watch.__globals__
+    monkeypatch.setitem(watch_globals, "datetime", _FrozenDT)
     monkeypatch.setattr(ew, "datetime", _FrozenDT)
     if watcher is not None:
         monkeypatch.setattr(watcher, "_is_regular_session_now", lambda: True)
