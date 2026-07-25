@@ -242,17 +242,44 @@ def test_put_stop_not_broken_when_ask_below_stop_even_if_bid_above():
     assert d.classification != ptc.STOP_ALREADY_BROKEN_TERMINAL
 
 
-def test_call_stop_missing_stop_side_quote_does_not_terminalize():
-    """Missing bid (stop side for CALL) must not claim a stop break."""
-    d = _decide(side="CALL", trigger_price=200, bid=0, ask=195.10,
+def test_call_stop_missing_stop_side_quote_returns_truth_retry_with_quote_none():
+    """Missing bid (stop side for CALL) must NOT claim a stop break AND
+    must NOT let the classifier continue into WITHIN/WAITING/pre-trigger.
+    Return TRIGGER_TRUTH_UNAVAILABLE_RETRY with quote=None so the watcher
+    seeds/preserves AWAITING_FIRST_TRUTH."""
+    # Ask is inside continuation zone (would otherwise be WITHIN); the
+    # missing stop-side bid must override into retry.
+    d = _decide(side="CALL", trigger_price=200, bid=0, ask=200.10,
                 stop=195.00)
-    assert d.classification != ptc.STOP_ALREADY_BROKEN_TERMINAL
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None, (
+        "Missing stop-side quote must yield quote=None so the watcher "
+        "seeds AWAITING_FIRST_TRUTH; a non-None quote would allow the "
+        "arm-time gate to fall through to normal arming."
+    )
 
 
-def test_put_stop_missing_stop_side_quote_does_not_terminalize():
-    d = _decide(side="PUT", trigger_price=200, bid=204.90, ask=0,
+def test_put_stop_missing_stop_side_quote_returns_truth_retry_with_quote_none():
+    d = _decide(side="PUT", trigger_price=200, bid=199.90, ask=0,
                 stop=205.00)
-    assert d.classification != ptc.STOP_ALREADY_BROKEN_TERMINAL
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
+
+
+def test_missing_stop_side_quote_with_no_stop_configured_does_not_retry():
+    """Sanity: if no stop is configured, a missing stop-side quote is not a
+    problem — the classifier can proceed with just the trigger side."""
+    d = _decide(side="CALL", trigger_price=200, bid=0, ask=200.10)  # no stop
+    assert d.classification == ptc.LATE_ATTACHMENT_WITHIN_CONTINUATION
+
+
+def test_call_stop_missing_stop_side_quote_when_would_have_been_waiting_reset():
+    """A CALL past the continuation zone with missing bid must also seed
+    retry (not silently transition to WAITING_RESET without stop truth)."""
+    d = _decide(side="CALL", trigger_price=200, bid=0, ask=200.50,
+                stop=195.00)
+    assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
 
 
 # Case 10: target complete.

@@ -113,6 +113,9 @@ jobs:
             tests/test_p0_open_revalidation_late_attachment.py \
             tests/test_p0_hydration_identity_and_target_complete.py \
             tests/test_p0_shared_fetch_limit_unified.py \
+            tests/test_p0_active_order_fence_full_family.py \
+            tests/test_p0_classifier_import_failure_fail_closed.py \
+            tests/test_p0_decisive_drift_wired.py \
             tests/test_p0_deferred_due_retry_ownership.py \
             tests/test_p0_watcher_materialization_ownership.py \
             tests/test_p0_fenced_retry_terminalization.py \

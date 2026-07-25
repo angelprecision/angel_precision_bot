@@ -265,40 +265,53 @@ class LateAttachmentDecision:
     detail:               str = ""
 
 
-def _stop_broken(side: str, stop, bid, ask) -> bool:
-    """Stop-broken check evaluated at the correct market side.
+_STOP_BROKEN     = "STOP_BROKEN"
+_STOP_NOT_BROKEN = "STOP_NOT_BROKEN"
+_STOP_UNKNOWN    = "STOP_UNKNOWN"
+_STOP_NO_STOP    = "STOP_NO_STOP"
 
-    Stop invalidation uses the OPPOSITE side from trigger evaluation. Real
-    market spreads mean the trigger side and stop side can disagree:
 
-        CALL: trigger uses ASK, stop uses BID  (bid <= stop = broken)
-        PUT:  trigger uses BID, stop uses ASK  (ask >= stop = broken)
+def _evaluate_stop(side: str, stop, bid, ask) -> str:
+    """Tri-state stop-broken evaluator returning one of:
+      _STOP_NO_STOP      — no stop configured (or invalid); nothing to check
+      _STOP_UNKNOWN      — valid stop exists but the STOP-SIDE quote is missing
+      _STOP_BROKEN       — actionable exit-side price crossed the stop
+      _STOP_NOT_BROKEN   — actionable exit-side price is on the safe side
 
-    Passing the canonical trigger quote into a stop check (as the prior
-    implementation did) hides real stop breaks whenever bid/ask disagree:
+    Stop invalidation uses the OPPOSITE side from trigger evaluation:
+      CALL: stop broken when bid <= stop
+      PUT:  stop broken when ask >= stop
 
-        CALL stop=195.00  bid=194.90 (broken)  ask=195.10 (not broken)
-        → canonical trigger quote (ask) = 195.10 → falsely reports NOT broken
-
-    Missing/zero stop returns False (stop unknown — do not claim it broke).
-    Missing quote on the stop side also returns False (cannot claim a break
-    from a missing tick).
+    _STOP_UNKNOWN is the critical distinction from the old boolean
+    signature. When a valid stop exists but the required stop-side quote is
+    missing, the caller MUST NOT interpret this as 'not broken' and continue
+    into WITHIN_CONTINUATION / WAITING_RESET / ordinary pre-trigger. The
+    stop-side truth is unavailable — the whole classifier call is retryable.
     """
     stop_d = _safe_decimal(stop)
     if stop_d is None or stop_d <= _DEC_ZERO:
-        return False
+        return _STOP_NO_STOP
     normalized_side = str(side or "").strip().upper()
     if normalized_side == "CALL":
         stop_quote = _safe_decimal(bid)
         if stop_quote is None or stop_quote <= _DEC_ZERO:
-            return False
-        return stop_quote <= stop_d
+            return _STOP_UNKNOWN
+        return _STOP_BROKEN if stop_quote <= stop_d else _STOP_NOT_BROKEN
     if normalized_side == "PUT":
         stop_quote = _safe_decimal(ask)
         if stop_quote is None or stop_quote <= _DEC_ZERO:
-            return False
-        return stop_quote >= stop_d
-    return False
+            return _STOP_UNKNOWN
+        return _STOP_BROKEN if stop_quote >= stop_d else _STOP_NOT_BROKEN
+    return _STOP_NO_STOP
+
+
+def _stop_broken(side: str, stop, bid, ask) -> bool:
+    """Legacy boolean shim — True only when definitively BROKEN.
+
+    Kept only for callers that still expect a boolean; classify_late_attachment
+    uses _evaluate_stop directly so it can propagate _STOP_UNKNOWN as retry.
+    """
+    return _evaluate_stop(side, stop, bid=bid, ask=ask) == _STOP_BROKEN
 
 
 def classify_late_attachment(
@@ -371,13 +384,28 @@ def classify_late_attachment(
 
     canonical_quote = quote_result.value
 
-    if _stop_broken(normalized_side, stop, bid=bid, ask=ask):
+    _stop_state = _evaluate_stop(normalized_side, stop, bid=bid, ask=ask)
+    if _stop_state == _STOP_BROKEN:
         return LateAttachmentDecision(
             classification=STOP_ALREADY_BROKEN_TERMINAL,
             allowed_continuation=allowed,
             quote=canonical_quote,
             quote_source=quote_result.source,
             detail=f"stop_broken_at_{quote_result.source}={canonical_quote}",
+        )
+    if _stop_state == _STOP_UNKNOWN:
+        # Valid stop exists but the STOP-SIDE quote is missing (CALL: bid=0;
+        # PUT: ask=0). We cannot prove the stop is safe, so we must NOT let
+        # the classifier continue into WITHIN_CONTINUATION / WAITING_RESET
+        # / pre-trigger. Return the retry shape with quote=None so the
+        # watcher seeds/preserves AWAITING_FIRST_TRUTH and blocks the
+        # ordinary breach path until both sides have truth.
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=allowed,
+            quote=None,
+            quote_source=quote_result.source,
+            detail=f"stop_side_quote_unavailable_{normalized_side}",
         )
 
     if decisive_drift_exceeded:

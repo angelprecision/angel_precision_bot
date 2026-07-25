@@ -1,42 +1,35 @@
 """
 tests/test_p0_july23_late_attachment_replay.py
 ================================================
-PR #388 Block-2 — July-23 arm_already_through_trigger replay.
+PR #388 mandatory July-23 late-attachment replay.
 
-Population-level regression: replays real 2026-07-23 rows through the
-canonical classifier and asserts that setups which merely attached
-cents-late are no longer terminalized as arm_already_through_trigger, while
-far-missed moves still terminalize.
+The prior version skipped when a Supabase-derived fixture was absent —
+which meant the incident replay never actually ran, and the softened
+far_missed contract (permit terminal OR waiting_reset) hid the unwired
+decisive-drift bug.
 
-Fixture path (repo-relative):
-    tests/fixtures/july23_late_attachment.json
+This version runs UNCONDITIONALLY. Row source:
+  1. Real fixture at tests/fixtures/july23_late_attachment.json when
+     present (populate from Supabase and drop the file in whenever
+     available; contract preferred over the synthetic set).
+  2. Otherwise a production-shaped synthetic fixture built in
+     tests/fixtures/july23_late_attachment_synthetic.py — 33 Jason LIVE
+     + 41 Jose PAPER + 45 Tradefluence PAPER = 119 rows across the five
+     documented buckets.
 
-Fixture schema (list of objects):
-    [
-      {
-        "client_id": "jason@example.com",
-        "execution_mode": "live",             // "live" | "paper"
-        "ticker": "SPY",
-        "side": "CALL",                        // "CALL" | "PUT"
-        "trigger": 445.10,
-        "arm_time_bid": 445.15,
-        "arm_time_ask": 445.20,
-        "stop": 442.50,
-        "target_complete": false,
-        "arm_time_iso": "2026-07-23T13:32:11+00:00",
-        "expected_bucket": "within" | "waiting_reset" | "stop_broken"
-                          | "target_complete" | "far_missed"
-                          | "ordinary_below_trigger"
-      },
-      ...
-    ]
+The CONTRACT is now tight:
+  * within         → LATE_ATTACHMENT_WITHIN_CONTINUATION (never terminal)
+  * waiting_reset  → MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET
+  * far_missed     → LATE_ATTACHMENT_MOVE_MISSED_TERMINAL (never resettable)
+  * stop_broken    → STOP_ALREADY_BROKEN_TERMINAL
+  * pre_trigger    → TRIGGER_TRUTH_UNAVAILABLE_RETRY with a valid quote
+                     (ordinary pre-trigger arm)
 
-'expected_bucket' is optional and only used to build a per-bucket summary.
-When absent, the row is classified but not asserted against.
-
-Skips cleanly when the fixture is missing so the amendment PR can merge
-without data. Populate the fixture (see PR #388 Block-2 handoff notes) to
-enable the full replay assertion.
+Decisive-drift wiring is what makes far_missed → _MISSED reachable from
+production data (see tests/test_p0_decisive_drift_wired.py). Because the
+classifier itself is pure, the replay test computes decisive_drift_exceeded
+the same way production does: canonical_quote beyond trigger by more than
+MAX_INTRADAY_DRIFT_PCT (default 1.5%).
 """
 from __future__ import annotations
 
@@ -59,24 +52,51 @@ from ap.pending_trigger_classifier import (
 
 FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "july23_late_attachment.json"
 
-# Expected per-client row counts from the incident report.
 EXPECTED_TOTALS = {
-    ("jason@example.com",       "live"):  33,
-    ("jose@example.com",        "paper"): 41,
+    ("jason@example.com",        "live"):  33,
+    ("jose@example.com",         "paper"): 41,
     ("tradefluence@example.com", "paper"): 45,
 }
 
 
 def _load_rows():
-    if not FIXTURE_PATH.exists():
-        pytest.skip(
-            f"July-23 replay fixture not present at {FIXTURE_PATH}. "
-            "See test module docstring for schema; drop the fixture in to enable."
-        )
+    """Real Supabase fixture takes precedence; synthetic fixture is the
+    fallback so the replay always runs and always asserts the tight
+    per-bucket contract."""
+    if FIXTURE_PATH.exists():
+        try:
+            return "real", json.loads(FIXTURE_PATH.read_text())
+        except json.JSONDecodeError as exc:
+            pytest.fail(f"July-23 real fixture is not valid JSON: {exc}")
+    from tests.fixtures.july23_late_attachment_synthetic import (
+        build_july23_synthetic_rows,
+    )
+    return "synthetic", build_july23_synthetic_rows()
+
+
+def _decisive_drift_exceeded(row: dict) -> bool:
+    """Compute decisive drift the SAME way production does (see the wiring
+    in ap_entry_watcher.py at all three classifier call sites). This
+    guarantees the replay evaluates classification against exactly the
+    production contract."""
     try:
-        return json.loads(FIXTURE_PATH.read_text())
-    except json.JSONDecodeError as exc:
-        pytest.fail(f"July-23 fixture is not valid JSON: {exc}")
+        from ap_entry_watcher import MAX_INTRADAY_DRIFT_PCT as _MAX
+    except Exception:
+        _MAX = 0.015
+    side = str(row.get("side") or "").upper()
+    try:
+        trigger = float(row.get("trigger") or 0)
+        bid = float(row.get("arm_time_bid") or 0)
+        ask = float(row.get("arm_time_ask") or 0)
+    except (TypeError, ValueError):
+        return False
+    if trigger <= 0:
+        return False
+    if side == "CALL" and ask > 0:
+        return ask > trigger * (1.0 + _MAX)
+    if side == "PUT" and bid > 0:
+        return bid < trigger * (1.0 - _MAX)
+    return False
 
 
 def _classify_row(row: dict) -> str:
@@ -87,70 +107,108 @@ def _classify_row(row: dict) -> str:
         ask=row.get("arm_time_ask"),
         stop=row.get("stop"),
         target_complete=bool(row.get("target_complete")),
-        decisive_drift_exceeded=bool(row.get("decisive_drift_exceeded")),
+        decisive_drift_exceeded=_decisive_drift_exceeded(row),
     ).classification
 
 
-# ── Sanity: fixture shape matches the incident report ────────────────────────
+# ── Fixture shape ──────────────────────────────────────────────────────────
 
 def test_fixture_row_counts_match_incident_totals():
-    rows = _load_rows()
+    source, rows = _load_rows()
     counts = Counter()
     for r in rows:
         counts[(r.get("client_id"), str(r.get("execution_mode") or "").lower())] += 1
     for pair, expected in EXPECTED_TOTALS.items():
         assert counts.get(pair, 0) == expected, (
-            f"July-23 fixture has {counts.get(pair, 0)} rows for {pair}, "
-            f"expected {expected} per incident report"
+            f"July-23 fixture ({source}) has {counts.get(pair, 0)} rows for "
+            f"{pair}, expected {expected} per incident report"
         )
 
 
-# ── Population invariant: rows that only barely crossed the trigger must NOT
-# terminalize under the new classifier — that was the arm_already_through_trigger
-# regression this PR exists to fix.
+# ── Tight per-bucket contract ─────────────────────────────────────────────
 
-def test_no_row_within_continuation_zone_is_terminalized():
-    rows = _load_rows()
+_EXPECTED_CLASSIFICATION = {
+    "within":          _WITHIN,
+    "waiting_reset":   _WAITING,
+    "far_missed":      _MISSED,
+    "stop_broken":     _STOP,
+    "pre_trigger":     _RETRY,
+    "target_complete": _TARGET,
+}
+
+
+def test_every_bucketed_row_matches_its_exact_expected_classification():
+    """The tight contract — no bucket permits an alternative. `far_missed`
+    MUST land in _MISSED (not _WAITING), which forces decisive_drift wiring
+    to be truthful in production. `within` MUST land in _WITHIN, forcing
+    the whole late-attachment gate to remain active. And so on."""
+    _, rows = _load_rows()
+    mismatches = []
     for r in rows:
+        expected_bucket = r.get("expected_bucket")
+        if expected_bucket is None:
+            continue
+        expected_cls = _EXPECTED_CLASSIFICATION.get(expected_bucket)
+        if expected_cls is None:
+            mismatches.append(
+                f"unknown expected_bucket={expected_bucket!r} for row {r.get('ticker')}"
+            )
+            continue
+        got = _classify_row(r)
+        if got != expected_cls:
+            mismatches.append(
+                f"{r.get('ticker')} ({r.get('client_id')} {r.get('execution_mode')}) "
+                f"bucket={expected_bucket} expected={expected_cls} got={got} "
+                f"quote(bid={r.get('arm_time_bid')}, ask={r.get('arm_time_ask')}) "
+                f"trigger={r.get('trigger')} stop={r.get('stop')}"
+            )
+    assert not mismatches, (
+        "July-23 replay classification mismatch — the amendment's contract "
+        "is not upheld on these rows:\n" + "\n".join(mismatches)
+    )
+
+
+# ── Population invariants ─────────────────────────────────────────────────
+
+def test_no_within_row_terminalizes():
+    """The exact class of rows the amendment must rescue: none may
+    terminalize as STOP/TARGET/MISSED."""
+    _, rows = _load_rows()
+    for r in rows:
+        if r.get("expected_bucket") != "within":
+            continue
         cls = _classify_row(r)
-        if r.get("expected_bucket") == "within":
-            assert cls == _WITHIN, (
-                f"July-23 replay: row {r.get('ticker')} classified {cls}; "
-                f"expected {_WITHIN} (this is the exact class of rows the "
-                f"amendment must rescue). Row: {r}"
-            )
+        assert cls not in (_STOP, _TARGET, _MISSED), (
+            f"WITHIN row {r.get('ticker')} terminalized as {cls}. "
+            f"Row: {r}"
+        )
 
 
-def test_rows_flagged_far_missed_still_terminalize():
-    rows = _load_rows()
+def test_no_far_missed_row_falls_into_waiting_reset():
+    """far_missed must be terminal — never allowed to reset and rebreach.
+    This is the exact softness the reviewer flagged in the previous replay
+    version, and the wiring that makes it enforceable is Blocker #4."""
+    _, rows = _load_rows()
     for r in rows:
-        if r.get("expected_bucket") == "far_missed":
-            cls = _classify_row(r)
-            assert cls in (_MISSED, _WAITING), (
-                f"July-23 replay: row {r.get('ticker')} classified {cls}; "
-                f"expected terminal or waiting-reset (never WITHIN). Row: {r}"
-            )
+        if r.get("expected_bucket") != "far_missed":
+            continue
+        cls = _classify_row(r)
+        assert cls == _MISSED, (
+            f"far_missed row {r.get('ticker')} classified {cls}; must be "
+            f"{_MISSED} — never allowed to reset and rebreach. Row: {r}"
+        )
 
 
-def test_bucketed_replay_summary_and_no_within_rows_are_terminal():
-    """Aggregate view: classify every row, print per-bucket totals, and
-    assert the population invariant — no row lands in WITHIN AND gets
-    reported as terminal simultaneously."""
-    rows = _load_rows()
+def test_bucketed_replay_summary():
+    """Aggregate view: classify every row and print per-bucket totals.
+    Runs unconditionally so the incident replay always leaves a trail."""
+    source, rows = _load_rows()
     per_class = Counter()
     for r in rows:
         per_class[_classify_row(r)] += 1
-
-    # Emit a compact summary via pytest's captured stdout — visible with -s.
-    print("\nJuly-23 replay classification summary:")
+    print(f"\nJuly-23 replay ({source}) classification summary:")
     for cls, n in sorted(per_class.items()):
         print(f"  {cls:50s} {n:4d}")
-
-    # The whole point of Block-2: WITHIN is a first-class non-terminal
-    # classification. Assert it is not counted alongside any terminal code
-    # for the same row (single-return classifier makes this trivially true,
-    # but the assertion makes the intent explicit).
-    assert per_class[_WITHIN] + per_class[_WAITING] + per_class[_STOP] + \
-           per_class[_TARGET] + per_class[_MISSED] + per_class[_RETRY] == \
-           sum(per_class.values()), \
-           "Each row must classify into exactly one bucket."
+    # Assert every row classified into exactly one bucket (single-return
+    # classifier makes this trivially true; assertion makes intent explicit).
+    assert sum(per_class.values()) == len(rows)

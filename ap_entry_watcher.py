@@ -583,12 +583,31 @@ class WatchedSignal:
                     LATE_ATTACHMENT_MOVE_MISSED_TERMINAL as _PT_MOVE_MISSED,
                     TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_TRUTH_RETRY,
                 )
-            except Exception:
-                _PT_AWAITING = None
-                _PT_WITHIN = _PT_WAITING = _PT_STOP_BROKEN = None
-                _PT_TARGET_COMPLETE = _PT_MOVE_MISSED = _PT_TRUTH_RETRY = None
-                _pt_classify_late = None
-                _pt_is_reset = None
+            except Exception as _pt_import_exc:
+                # PR #388 Blocker #3: FAIL CLOSED on classifier import failure.
+                # The prior amendment let execution fall through to the
+                # ordinary CALL/PUT breach path, silently bypassing
+                # WITHIN_CONTINUATION / WAITING_RESET / stop-truth /
+                # target-truth / missed-move classification whenever the
+                # shared classifier import broke. A safety state machine
+                # cannot evaporate because its own import failed.
+                log.critical(
+                    "[%s] LATE_ATTACHMENT_CLASSIFIER_IMPORT_FAILED — "
+                    "preserving state=%s and blocking ordinary breach path "
+                    "for this poll: %s",
+                    self.ticker, self.late_attachment_state, _pt_import_exc,
+                )
+                return self.state
+
+            if _pt_classify_late is None:
+                # Defensive: import returned None (shouldn't happen but
+                # never fall through to ordinary breach if it does).
+                log.critical(
+                    "[%s] LATE_ATTACHMENT_CLASSIFIER_UNAVAILABLE — "
+                    "preserving state=%s and blocking ordinary breach path",
+                    self.ticker, self.late_attachment_state,
+                )
+                return self.state
 
             if _pt_classify_late is not None:
                 # PR #388 P0-7: compute target_complete from canonical side.
@@ -603,6 +622,27 @@ class WatchedSignal:
                             _tgt_complete = True
                 except (TypeError, ValueError):
                     _tgt_complete = False
+
+                # PR #388 Blocker #4: wire decisive drift from the existing
+                # authoritative MAX_INTRADAY_DRIFT_PCT threshold (1.5% by
+                # default). Canonical quote (CALL=ask, PUT=bid) beyond the
+                # trigger by more than this pct → the move is decisively
+                # past; classify_late_attachment must terminalize as
+                # LATE_ATTACHMENT_MOVE_MISSED_TERMINAL rather than
+                # transition to WAITING_RESET.
+                _decisive_drift = False
+                try:
+                    _t_poll = float(self.entry_trigger or 0)
+                    if _t_poll > 0:
+                        if self.side == "CALL" and ask > 0:
+                            if ask > _t_poll * (1.0 + MAX_INTRADAY_DRIFT_PCT):
+                                _decisive_drift = True
+                        elif self.side == "PUT" and bid > 0:
+                            if bid < _t_poll * (1.0 - MAX_INTRADAY_DRIFT_PCT):
+                                _decisive_drift = True
+                except (TypeError, ValueError):
+                    _decisive_drift = False
+
                 _late_dec = _pt_classify_late(
                     side=self.side,
                     trigger_price=self.entry_trigger,
@@ -610,6 +650,7 @@ class WatchedSignal:
                     ask=ask,
                     stop=self.stop_level,
                     target_complete=_tgt_complete,
+                    decisive_drift_exceeded=_decisive_drift,
                 )
                 self.late_attachment_last_quote = (
                     float(_late_dec.quote) if _late_dec.quote is not None else None
@@ -3588,6 +3629,20 @@ class APEntryWatcher:
                         _arm_tgt_complete = True
             except (TypeError, ValueError):
                 _arm_tgt_complete = False
+            # PR #388 Blocker #4: wire decisive drift at arm-time.
+            _arm_decisive_drift = False
+            try:
+                _t_arm = float(trigger or 0)
+                if _t_arm > 0:
+                    if side == "CALL" and _bug_c_ask > 0:
+                        if _bug_c_ask > _t_arm * (1.0 + MAX_INTRADAY_DRIFT_PCT):
+                            _arm_decisive_drift = True
+                    elif side == "PUT" and _bug_c_bid > 0:
+                        if _bug_c_bid < _t_arm * (1.0 - MAX_INTRADAY_DRIFT_PCT):
+                            _arm_decisive_drift = True
+            except (TypeError, ValueError):
+                _arm_decisive_drift = False
+
             _late_decision = _pt_classify_late(
                 side=side,
                 trigger_price=float(trigger),
@@ -3595,7 +3650,7 @@ class APEntryWatcher:
                 ask=_bug_c_ask,
                 stop=stop,
                 target_complete=_arm_tgt_complete,
-                decisive_drift_exceeded=False,
+                decisive_drift_exceeded=_arm_decisive_drift,
             )
             _late_cls = _late_decision.classification
 
@@ -4162,23 +4217,48 @@ class APEntryWatcher:
                             TARGET_ALREADY_COMPLETE_TERMINAL as _PT_OPEN_TARGET,
                             TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_OPEN_RETRY,
                         )
-                    except Exception:
+                    except Exception as _pt_open_import_exc:
                         _pt_classify_late_open = None
                         _PT_OPEN_AWAITING = _PT_OPEN_WITHIN = _PT_OPEN_WAITING = None
                         _PT_OPEN_MISSED = _PT_OPEN_STOP = _PT_OPEN_TARGET = _PT_OPEN_RETRY = None
+                        _pt_open_import_err = _pt_open_import_exc
+                    else:
+                        _pt_open_import_err = None
 
                     if _pt_classify_late_open is None:
-                        # Classifier import failed. Fail open (arm normally) —
-                        # never fall back to the old binary rule that this
-                        # amendment exists to eliminate.
-                        w.overnight = False
-                        w.signal["queue_status"] = OvernightWatchState.VALID_AWAITING_BREACH
-                        log.warning(
-                            "[%s] OVERNIGHT_DAILY_ARMED (classifier import failed; arming normally) "
-                            "side=%s trigger=%.4f",
-                            w.ticker, w.side, w.entry_trigger,
+                        # PR #388 Blocker #3: FAIL CLOSED on classifier import
+                        # failure at open. The prior amendment armed the
+                        # watcher normally, bypassing stop / target /
+                        # continuation / waiting-reset / awaiting-truth
+                        # classification precisely when the shared classifier
+                        # was unavailable. Retain overnight=True + the pending
+                        # queue state so the next reeval poll tries again;
+                        # never terminalize, never arm normally.
+                        log.critical(
+                            "[%s] OPEN_REVALIDATION_CLASSIFIER_IMPORT_FAILED — "
+                            "retaining overnight=True and queue_status=%s; "
+                            "reeval will retry next poll: %s",
+                            w.ticker,
+                            OvernightWatchState.OPEN_RECHECK_PENDING,
+                            _pt_open_import_err,
                         )
+                        w.overnight = True
+                        w.signal["queue_status"] = OvernightWatchState.OPEN_RECHECK_PENDING
                         continue
+
+                    # PR #388 Blocker #4: wire decisive drift at open reval.
+                    _open_decisive_drift = False
+                    try:
+                        _t_o = float(w.entry_trigger or 0)
+                        if _t_o > 0:
+                            if w.side == "CALL" and _bug_d_ask > 0:
+                                if _bug_d_ask > _t_o * (1.0 + MAX_INTRADAY_DRIFT_PCT):
+                                    _open_decisive_drift = True
+                            elif w.side == "PUT" and _bug_d_bid > 0:
+                                if _bug_d_bid < _t_o * (1.0 - MAX_INTRADAY_DRIFT_PCT):
+                                    _open_decisive_drift = True
+                    except (TypeError, ValueError):
+                        _open_decisive_drift = False
 
                     _open_decision = _pt_classify_late_open(
                         side=w.side,
@@ -4187,7 +4267,7 @@ class APEntryWatcher:
                         ask=_bug_d_ask,
                         stop=w.stop_level,
                         target_complete=_bug_d_target_complete,
-                        decisive_drift_exceeded=False,
+                        decisive_drift_exceeded=_open_decisive_drift,
                     )
                     _open_cls = _open_decision.classification
 

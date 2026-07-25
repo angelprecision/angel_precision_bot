@@ -606,8 +606,27 @@ def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) ->
 # PENDING_TRIGGER / SUBMITTED / ACKNOWLEDGED / PARTIAL_FILL → order exists and
 # may need a watcher reattached (Cases A/B) or is in-flight (Case C).
 # FILLED → already entered; must not enter again.
+# PR #388 amendment: full nonterminal ENTRY family. Prior amendment only
+# recognized PENDING_TRIGGER/SUBMITTED/ACKNOWLEDGED/PARTIAL_FILL/FILLED,
+# which meant CREATED/ACCEPTED/OPEN/PARTIALLY_FILLED slipped through the
+# active-order fence and produced duplicate create_entry_order calls on
+# retry. The set matches the repository's existing durable duplicate logic.
 _ACTIVE_ENTRY_OWN_STATUSES = frozenset({
-    "PENDING_TRIGGER", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED",
+    "CREATED",
+    "PENDING_TRIGGER",
+    "SUBMITTED",
+    "ACCEPTED",
+    "ACKNOWLEDGED",
+    "OPEN",
+    "PARTIAL_FILL",
+    "PARTIALLY_FILLED",
+    "FILLED",
+})
+
+# Statuses that mean the order is in flight / done (never re-create).
+_ALREADY_OWNED_STATUSES = frozenset({
+    "SUBMITTED", "ACCEPTED", "ACKNOWLEDGED", "OPEN",
+    "PARTIAL_FILL", "PARTIALLY_FILLED", "FILLED",
 })
 
 
@@ -857,8 +876,24 @@ def _resolve_shared_setup_disposition(
                 _DISPOSITION_REATTACH_WATCHER, _existing_local_id, _order_row
             )
 
-        if _active_status in {"SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL", "FILLED"}:
-            # Case C: entry is already in flight or completed.
+        if _active_status == "CREATED":
+            # Case B': order row exists but hasn't transitioned to
+            # PENDING_TRIGGER yet (materialization interrupted before
+            # transition, or race with a retry). Classify retryable — do NOT
+            # create a duplicate; the next retry may find PENDING_TRIGGER
+            # and take the reattach path. Never route through NEW.
+            log.info(
+                "[%s] reeval disposition=RETRYABLE (order status=CREATED) "
+                "canonical=%s session=%s local_order_id=%s",
+                client_id, canonical, _session_key, _existing_local_id,
+            )
+            return _DispositionResult(_DISPOSITION_RETRYABLE)
+
+        if _active_status in _ALREADY_OWNED_STATUSES:
+            # Case C: entry is already in flight or completed. Covers
+            # SUBMITTED, ACCEPTED, ACKNOWLEDGED, OPEN, PARTIAL_FILL,
+            # PARTIALLY_FILLED, FILLED — the full nonterminal family the
+            # repository's existing durable duplicate logic recognizes.
             log.info(
                 "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s "
                 "order_status=%s",
