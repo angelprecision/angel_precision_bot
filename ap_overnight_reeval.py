@@ -1416,21 +1416,60 @@ def _resolve_shared_setup_disposition(
         if _mode_match and _session_match:
             _has_current_session_proof = True
 
+            # PR #388 nonterminal-ownership-poisoning amendment
+            # ────────────────────────────────────────────────
+            # opportunity_ledger.update_opportunity() blocks lifecycle
+            # regression but continues to write identifier + metadata fields
+            # and returns True. That means a prior WATCHER_ARMED /
+            # BROKER_SUBMITTED / BROKER_ACKED / FILLED row can retain its
+            # stale lifecycle status while accepting current-session
+            # metadata (mode, session key, local_order_id, and
+            # reattach_in_progress=true) from _persist_reattach_in_progress_
+            # fence(). Trusting that stale status immediately here would
+            # return ALREADY_ARMED or ALREADY_OWNED before the exact
+            # active-order fence runs, stranding a live PENDING_TRIGGER
+            # order when watch() later fails and the marker stays set.
+            #
+            # Contract: when reattach_in_progress=true for the exact
+            # current mode/session/order, defer ALL opportunity-based
+            # ownership conclusions — WATCHER_ARMED, broker-owned,
+            # terminal — and let the exact active-order fence decide.
+            # The marker itself must remain until watch() succeeds and
+            # _persist_watcher_armed_proof() explicitly clears it.
+
             # ALREADY_ARMED: durable WATCHER_ARMED proof for this client/mode/session.
             if _status == _OL_WATCHER_ARMED:
-                log.info(
-                    "[%s] reeval disposition=ALREADY_ARMED canonical=%s session=%s",
-                    client_id, canonical, _session_key,
-                )
-                return _DispositionResult(_DISPOSITION_ALREADY_ARMED)
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session WATCHER_ARMED opportunity "
+                        "carries reattach_in_progress=true; deferring ALREADY_ARMED "
+                        "disposition until exact active-order fence runs canonical=%s "
+                        "session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_ARMED canonical=%s session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_ARMED)
 
             # ALREADY_OWNED: broker-submitted, acked, or filled — entry is in flight.
             if _status in {_OL_BROKER_SUBMITTED, _OL_BROKER_ACKED, _OL_FILLED}:
-                log.info(
-                    "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s status=%s",
-                    client_id, canonical, _session_key, _status,
-                )
-                return _DispositionResult(_DISPOSITION_ALREADY_OWNED)
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session broker-owned opportunity "
+                        "(status=%s) carries reattach_in_progress=true; deferring "
+                        "ALREADY_OWNED disposition until exact active-order fence "
+                        "runs canonical=%s session=%s",
+                        client_id, _status, canonical, _session_key,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_OWNED canonical=%s session=%s status=%s",
+                        client_id, canonical, _session_key, _status,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_OWNED)
 
             # ALREADY_TERMINAL: canonical terminal set from opportunity_ledger.
             if _status in _OL_TERMINAL_STATUSES:

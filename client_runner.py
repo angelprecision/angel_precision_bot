@@ -1860,7 +1860,18 @@ class ClientRunner(threading.Thread):
         self._reset_overnight_reeval_state_for_date(today)
 
         if not force:
-            if now_et.weekday() >= 5 or not self._overnight_reeval_in_window(now_et):
+            # PR #388 amendment: route the trading-day precheck through the
+            # canonical NYSE calendar so an observed holiday (July 4, MLK,
+            # Thanksgiving, etc.) is treated identically to a weekend and
+            # never triggers the readiness-deadline enforcement path below.
+            # Fail-safe: on calendar import failure, fall back to
+            # weekday-only (previous behavior).
+            try:
+                from ap.flatline_alarm import is_trading_day as _nyse_is_trading_day
+                _is_trading = bool(_nyse_is_trading_day(now_et.date()))
+            except Exception:
+                _is_trading = now_et.weekday() < 5
+            if not _is_trading or not self._overnight_reeval_in_window(now_et):
                 return self._overnight_reeval_base_result(
                     result_class="SKIPPED_NOT_DUE",
                     completed=False,
@@ -2035,14 +2046,66 @@ class ClientRunner(threading.Thread):
                 result["handoff_result"] = post.get("handoff_result") if isinstance(post, dict) else None
                 result["readiness_result"] = post.get("readiness_result") if isinstance(post, dict) else None
             else:
-                logger.info(
-                    "[%s] POST_OVERNIGHT_HANDOFF_DEFERRED result_class=%s retry_reason=%s",
-                    self.email,
-                    result.get("result_class"),
-                    result.get("retry_reason"),
-                )
+                # PR #388 deadline-enforcement amendment
+                # ──────────────────────────────────────
+                # Post-overnight handoff is only meaningful after completion,
+                # but LIVE readiness enforcement CANNOT wait for completion
+                # or the entire PR's core promise (verified pre-open watcher
+                # ownership before live entries fire) is silently voided
+                # whenever the scheduler exhausts retries or lingers past
+                # the deadline in a retryable state. Once past the readiness
+                # enforcement deadline, run preopen_readiness anyway. With
+                # the new LIVE blocked_keys (overnight_reeval_missing,
+                # pending_trigger_without_watcher_ownership) this reliably
+                # BLOCKS live entries when watchers are not armed.
+                #
+                # Pre-deadline retries are legitimate — do not enforce yet.
+                _deadline_enforced = False
+                try:
+                    from ap.preopen_readiness import (
+                        _readiness_enforcement_active as _pre_ready_active,
+                        run_preopen_autonomous_readiness as _pre_ready_run,
+                    )
+                    if _pre_ready_active(now_et):
+                        logger.warning(
+                            "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCED "
+                            "result_class=%s retry_reason=%s — running preopen "
+                            "readiness despite incomplete overnight reeval",
+                            self.email,
+                            result.get("result_class"),
+                            result.get("retry_reason"),
+                        )
+                        readiness = _pre_ready_run(
+                            self.email,
+                            self.mode,
+                            dry_run=False,
+                            stage="post_overnight_reeval_deadline",
+                            runner=self,
+                        )
+                        if str(self.mode).lower() == "live":
+                            if readiness.get("status") == "BLOCKED":
+                                self._enter_degraded_mode(
+                                    "preopen_readiness_blocked:"
+                                    + ",".join(readiness.get("errors") or ["unknown"])
+                                )
+                            elif readiness.get("ok"):
+                                self._clear_degraded_reason_key("preopen_readiness_blocked")
+                        result["readiness_result"] = readiness
+                        _deadline_enforced = True
+                except Exception as _ready_exc:
+                    logger.error(
+                        "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCEMENT_FAILED: %s",
+                        self.email, _ready_exc, exc_info=True,
+                    )
+                if not _deadline_enforced:
+                    logger.info(
+                        "[%s] POST_OVERNIGHT_HANDOFF_DEFERRED result_class=%s retry_reason=%s",
+                        self.email,
+                        result.get("result_class"),
+                        result.get("retry_reason"),
+                    )
+                    result["readiness_result"] = None
                 result["handoff_result"] = None
-                result["readiness_result"] = None
 
             logger.info(
                 "[%s] Overnight reeval attempt complete: result_class=%s completed=%s retryable=%s next_retry_at=%s armed=%s rejected=%s processed=%s errors=%s",

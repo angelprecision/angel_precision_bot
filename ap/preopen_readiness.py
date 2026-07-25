@@ -36,14 +36,31 @@ def _normalize_mode(value: str | None) -> str:
     return str(value or "").strip().lower()
 
 
+def _nyse_is_trading_day(dt: datetime) -> bool:
+    """Route through the canonical NYSE calendar in ap.flatline_alarm.
+
+    Fail-safe: on calendar import failure, fall back to weekday-only. This
+    preserves prior behavior for environments where the calendar module is
+    unavailable, while every deployment that carries flatline_alarm (all
+    production pods) uses the authoritative holiday-aware truth.
+    """
+    try:
+        from ap.flatline_alarm import is_trading_day as _nyse
+        return bool(_nyse(dt.date()))
+    except Exception:
+        return dt.weekday() < 5  # legacy fallback
+
+
 def _after_929_et(now: datetime | None = None) -> bool:
     dt = _now_et(now)
-    return dt.weekday() < 5 and (dt.hour > 9 or (dt.hour == 9 and dt.minute >= 29))
+    if not _nyse_is_trading_day(dt):
+        return False
+    return dt.hour > 9 or (dt.hour == 9 and dt.minute >= 29)
 
 
 def _overnight_reeval_due(now: datetime | None = None) -> bool:
     dt = _now_et(now)
-    if dt.weekday() >= 5:
+    if not _nyse_is_trading_day(dt):
         return False
     current = dt.hour * 60 + dt.minute
     due = OVERNIGHT_REEVAL_DUE_HOUR_ET * 60 + OVERNIGHT_REEVAL_DUE_MINUTE_ET
@@ -51,7 +68,7 @@ def _overnight_reeval_due(now: datetime | None = None) -> bool:
 
 
 def _is_market_day(now: datetime | None = None) -> bool:
-    return _now_et(now).weekday() < 5
+    return _nyse_is_trading_day(_now_et(now))
 
 
 def _readiness_enforcement_active(now: datetime | None = None) -> bool:
@@ -649,6 +666,18 @@ def run_preopen_autonomous_readiness(
             warnings.append("overnight_reeval_missing")
     details["overnight_reeval"] = {"status": overnight_state, **overnight_details}
 
+    # PR #388 LIVE blocked_keys hardening
+    # ────────────────────────────────────
+    # The prior set omitted the two conditions that most directly violate
+    # this PR's core promise of verified pre-open watcher ownership:
+    #   • overnight_reeval_missing — no overnight watchers armed for this
+    #     trading day. Live entries must not be authorized without them;
+    #     the whole PR is about restoring that guarantee.
+    #   • pending_trigger_without_watcher_ownership — DB rows in
+    #     PENDING_TRIGGER with no live in-memory watcher owner. A breach
+    #     would never fire; a broker-side fill (if any) would be untracked.
+    # Both are BLOCKED for live mode. Paper continues to DEGRADE so paper
+    # sessions can still surface diagnostics without freezing.
     blocked_keys = {
         "pod_mode_client_mode_mismatch",
         "requested_execution_mode_mismatch",
@@ -656,6 +685,8 @@ def run_preopen_autonomous_readiness(
         "morning_handoff_missing",
         "selector_quote_identity_unresolved",
         "runner_not_alive",
+        "overnight_reeval_missing",
+        "pending_trigger_without_watcher_ownership",
     }
     if mode == "live" and any(err in blocked_keys for err in errors):
         status = "BLOCKED"
