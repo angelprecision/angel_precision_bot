@@ -1114,6 +1114,161 @@ def _persist_reattach_terminal_suppression_marker(
         return False
 
 
+def _persist_watcher_armed_proof(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+    extra_meta: Optional[dict] = None,
+    clear_reattach_in_progress: bool = False,
+) -> bool:
+    """Persist WATCHER_ARMED and verify the row actually transitioned.
+
+    opportunity_ledger.update_opportunity() returns True when the update
+    query succeeds, even if its monotonic guard preserved a prior terminal
+    status and only merged metadata. This helper treats the write as durable
+    proof only after readback shows WATCHER_ARMED for the exact
+    client/mode/session/order.
+    """
+    _mode = str(execution_mode or "").strip().lower()
+    _session = str(session_key or _overnight_reeval_session_key()).strip()
+    if not (
+        client_id and _mode in {"live", "paper"} and canonical_signal_id
+        and signal_id and local_order_id and _session
+    ):
+        log.critical(
+            "WATCHER_ARMED_PROOF_INVALID_INPUT client=%s mode=%s canonical=%s "
+            "signal=%s local_order_id=%s session=%s",
+            client_id, execution_mode, canonical_signal_id,
+            signal_id, local_order_id, session_key,
+        )
+        return False
+
+    try:
+        from ap.opportunity_ledger import (
+            WATCHER_ARMED as _OL_WATCHER_ARMED,
+            create_opportunities as _create_opps,
+            mark_watcher_armed as _mark_watcher_armed,
+        )
+
+        _sig_payload = dict(signal_payload or {})
+        _sig_payload.setdefault("signal_id", signal_id)
+        _created = _create_opps(
+            signal_id, [client_id], _sig_payload,
+            canonical_signal_id=canonical_signal_id,
+        )
+        if int(_created or 0) < 1:
+            log.critical(
+                "WATCHER_ARMED_PROOF_CREATE_FAILED client=%s mode=%s "
+                "canonical=%s local_order_id=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+            )
+            return False
+
+        _proof_meta = dict(extra_meta or {})
+        _proof_meta.update({
+            "overnight_reeval_session_key": _session,
+            "execution_mode": _mode,
+            "original_signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "local_order_id": str(local_order_id),
+        })
+        _marked = _mark_watcher_armed(
+            canonical_signal_id,
+            client_id,
+            canonical_signal_id=canonical_signal_id,
+            order_local_id=str(local_order_id),
+            extra_meta=_proof_meta,
+        )
+        if not _marked:
+            log.critical(
+                "WATCHER_ARMED_PROOF_MARK_FAILED client=%s mode=%s "
+                "canonical=%s local_order_id=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+            )
+            return False
+
+        def _readback_verified(*, expect_reattach_cleared: bool) -> bool:
+            _readback = _get_client_opportunity_row(signal_id, client_id, _sig_payload)
+            if _readback.lookup_status != _LS_FOUND or not isinstance(_readback.row, dict):
+                log.critical(
+                    "WATCHER_ARMED_PROOF_READBACK_MISSING client=%s mode=%s "
+                    "canonical=%s local_order_id=%s status=%s err=%s",
+                    client_id, _mode, canonical_signal_id, local_order_id,
+                    _readback.lookup_status, _readback.error,
+                )
+                return False
+
+            _row = _readback.row
+            _meta = _row.get("metadata") if isinstance(_row.get("metadata"), dict) else {}
+            _row_canonical = str(_row.get("canonical_signal_id") or _readback.canonical_signal_id or "")
+            _row_client = str(_row.get("client_id") or client_id)
+            _row_status = str(_row.get("opportunity_status") or "").upper()
+            _row_order = str(_row.get("order_local_id") or _meta.get("local_order_id") or "")
+            _row_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
+            _row_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
+            _reattach_flag = bool(_meta.get("reattach_in_progress"))
+            _verified = (
+                _row_canonical == canonical_signal_id
+                and _row_client == client_id
+                and _row_status == _OL_WATCHER_ARMED
+                and _row_order == str(local_order_id)
+                and _row_mode == _mode
+                and _row_session == _session
+                and (not expect_reattach_cleared or not _reattach_flag)
+            )
+            if not _verified:
+                log.critical(
+                    "WATCHER_ARMED_PROOF_READBACK_MISMATCH client=%s mode=%s "
+                    "canonical=%s local_order_id=%s row_status=%s row_order=%s "
+                    "row_mode=%s row_session=%s reattach_in_progress=%s row=%s metadata=%s",
+                    client_id, _mode, canonical_signal_id, local_order_id,
+                    _row_status, _row_order, _row_mode, _row_session,
+                    _reattach_flag, _row, _meta,
+                )
+                return False
+            return True
+
+        if not _readback_verified(expect_reattach_cleared=False):
+            return False
+
+        if clear_reattach_in_progress:
+            _clear_meta = dict(_proof_meta)
+            _clear_meta.update({
+                "reattach_in_progress": False,
+                "reattach_in_progress_cleared_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _cleared = _mark_watcher_armed(
+                canonical_signal_id,
+                client_id,
+                canonical_signal_id=canonical_signal_id,
+                order_local_id=str(local_order_id),
+                extra_meta=_clear_meta,
+            )
+            if not _cleared:
+                log.critical(
+                    "WATCHER_ARMED_PROOF_CLEAR_FAILED client=%s mode=%s "
+                    "canonical=%s local_order_id=%s",
+                    client_id, _mode, canonical_signal_id, local_order_id,
+                )
+                return False
+            return _readback_verified(expect_reattach_cleared=True)
+
+        return True
+    except Exception as _proof_exc:
+        log.critical(
+            "WATCHER_ARMED_PROOF_EXCEPTION client=%s mode=%s canonical=%s "
+            "local_order_id=%s err=%s",
+            client_id, execution_mode, canonical_signal_id,
+            local_order_id, _proof_exc,
+        )
+        return False
+
+
 def _persist_reattach_post_watch_ambiguity(
     *,
     client_id: str,
@@ -1256,6 +1411,7 @@ def _resolve_shared_setup_disposition(
         # Session isolation: blank stored session NEVER counts as current.
         _recorded_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
         _session_match = bool(_recorded_session and _recorded_session == _session_key)
+        _reattach_in_progress = bool(_meta.get("reattach_in_progress"))
 
         if _mode_match and _session_match:
             _has_current_session_proof = True
@@ -1278,31 +1434,58 @@ def _resolve_shared_setup_disposition(
 
             # ALREADY_TERMINAL: canonical terminal set from opportunity_ledger.
             if _status in _OL_TERMINAL_STATUSES:
-                log.info(
-                    "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
-                    "status=%s stage=%s reason=%s",
-                    client_id, canonical, _session_key, _status, _stage, _reason,
-                )
-                return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session terminal opportunity carries "
+                        "reattach_in_progress=true; deferring terminal disposition "
+                        "until exact active-order fence runs canonical=%s session=%s "
+                        "status=%s stage=%s reason=%s",
+                        client_id, canonical, _session_key, _status, _stage, _reason,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
+                        "status=%s stage=%s reason=%s",
+                        client_id, canonical, _session_key, _status, _stage, _reason,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
 
             # Legacy terminal watcher-arm failure recorded in same-session.
             if (_status == "MISSED" and _stage == "WATCHER_ARM"
                     and _is_terminal_watch_arm_failure_reason(_reason)):
-                log.info(
-                    "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
-                    "canonical=%s session=%s",
-                    client_id, canonical, _session_key,
-                )
-                return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session watcher-arm terminal marker "
+                        "carries reattach_in_progress=true; deferring terminal "
+                        "disposition until exact active-order fence runs canonical=%s "
+                        "session=%s reason=%s",
+                        client_id, canonical, _session_key, _reason,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
+                        "canonical=%s session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
 
             if (_status == "INTERNAL_ERROR"
                     and _is_terminal_watch_arm_failure_reason(_reason)):
-                log.info(
-                    "[%s] reeval disposition=ALREADY_TERMINAL (internal-error) "
-                    "canonical=%s session=%s",
-                    client_id, canonical, _session_key,
-                )
-                return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+                if _reattach_in_progress:
+                    log.warning(
+                        "[%s] reeval: current-session internal-error terminal marker "
+                        "carries reattach_in_progress=true; deferring terminal "
+                        "disposition until exact active-order fence runs canonical=%s "
+                        "session=%s reason=%s",
+                        client_id, canonical, _session_key, _reason,
+                    )
+                else:
+                    log.info(
+                        "[%s] reeval disposition=ALREADY_TERMINAL (internal-error) "
+                        "canonical=%s session=%s",
+                        client_id, canonical, _session_key,
+                    )
+                    return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
 
         # Different mode or session: fall through to active-order check below.
 
@@ -2246,43 +2429,26 @@ def run_overnight_reeval(
 
                     # Persist durable WATCHER_ARMED proof after successful reattachment.
                     _canonical_for_proof = _resolve_canonical_signal_id(signal_id, signal)
-                    try:
-                        from ap.opportunity_ledger import (
-                            create_opportunities as _create_opps,
-                            mark_watcher_armed as _mark_wa,
-                        )
-                        _signal_payload = dict(signal or {})
-                        _signal_payload.setdefault("signal_id", signal_id)
-                        _create_opps(
-                            signal_id, [client_id], _signal_payload,
-                            canonical_signal_id=_canonical_for_proof,
-                        )
-                        _reat_proof_ok = _mark_wa(
-                            _canonical_for_proof,
-                            client_id,
-                            canonical_signal_id=_canonical_for_proof,
-                            order_local_id=str(_existing_oid),
-                            extra_meta={
-                                "overnight_reeval_session_key": session_key,
-                                "execution_mode": _execution_mode,
-                                "source_table": "ap_signals",
-                                "source_job_id": str(job_id),
-                                "ticker": ticker,
-                                "side": side,
-                                "contract_deferred": True,
-                                "contract_selection_deferred_to": "breach_time",
-                                "original_signal_id": signal_id,
-                                "reattach_watcher": True,
-                                "armed_at": datetime.now(timezone.utc).isoformat(),
-                            },
-                        )
-                    except Exception as _reat_proof_exc:
-                        _reat_proof_ok = False
-                        log.error(
-                            "[%s] overnight_reeval: REATTACH_WATCHER proof write exception "
-                            "signal=%s local_order_id=%s: %s",
-                            ticker, signal_id, _existing_oid, _reat_proof_exc,
-                        )
+                    _reat_proof_ok = _persist_watcher_armed_proof(
+                        client_id=client_id,
+                        execution_mode=_execution_mode,
+                        canonical_signal_id=_canonical_for_proof,
+                        signal_id=signal_id,
+                        signal_payload=signal,
+                        local_order_id=str(_existing_oid),
+                        session_key=session_key,
+                        clear_reattach_in_progress=True,
+                        extra_meta={
+                            "source_table": "ap_signals",
+                            "source_job_id": str(job_id),
+                            "ticker": ticker,
+                            "side": side,
+                            "contract_deferred": True,
+                            "contract_selection_deferred_to": "breach_time",
+                            "reattach_watcher": True,
+                            "armed_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
 
                     if not _reat_proof_ok:
                         log.critical(
@@ -3081,42 +3247,24 @@ def run_overnight_reeval(
                     _arm_proof_ok = True
                     if job_source == "ap_signals":
                         _canonical_for_arm = _resolve_canonical_signal_id(signal_id, signal)
-                        try:
-                            from ap.opportunity_ledger import (
-                                create_opportunities as _create_opps_arm,
-                                mark_watcher_armed as _mark_wa_arm,
-                            )
-                            _arm_signal_payload = dict(signal or {})
-                            _arm_signal_payload.setdefault("signal_id", signal_id)
-                            _create_opps_arm(
-                                signal_id, [client_id], _arm_signal_payload,
-                                canonical_signal_id=_canonical_for_arm,
-                            )
-                            _arm_proof_ok = _mark_wa_arm(
-                                _canonical_for_arm,
-                                client_id,
-                                canonical_signal_id=_canonical_for_arm,
-                                order_local_id=str(local_order_id),
-                                extra_meta={
-                                    "overnight_reeval_session_key": session_key,
-                                    "execution_mode": _execution_mode,
-                                    "source_table": "ap_signals",
-                                    "source_job_id": str(job_id),
-                                    "ticker": ticker,
-                                    "side": side,
-                                    "contract_deferred": contract_deferred,
-                                    "contract_selection_deferred_to": "breach_time",
-                                    "original_signal_id": signal_id,
-                                    "armed_at": datetime.now(timezone.utc).isoformat(),
-                                },
-                            )
-                        except Exception as _arm_proof_exc:
-                            _arm_proof_ok = False
-                            log.error(
-                                "[%s] overnight_reeval: WATCHER_ARMED proof write exception "
-                                "signal=%s local_order_id=%s: %s",
-                                ticker, signal_id, local_order_id, _arm_proof_exc,
-                            )
+                        _arm_proof_ok = _persist_watcher_armed_proof(
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                            canonical_signal_id=_canonical_for_arm,
+                            signal_id=signal_id,
+                            signal_payload=signal,
+                            local_order_id=str(local_order_id),
+                            session_key=session_key,
+                            extra_meta={
+                                "source_table": "ap_signals",
+                                "source_job_id": str(job_id),
+                                "ticker": ticker,
+                                "side": side,
+                                "contract_deferred": contract_deferred,
+                                "contract_selection_deferred_to": "breach_time",
+                                "armed_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
 
                         if not _arm_proof_ok:
                             log.critical(
