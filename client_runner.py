@@ -1848,6 +1848,123 @@ class ClientRunner(threading.Thread):
                 self.email, _lock_exc,
             )
 
+    def _enforce_preopen_readiness_at_deadline(
+        self,
+        *,
+        now_et,
+        today,
+        source: str,
+        result_class: str,
+    ) -> dict | None:
+        """PR #388 centralized deadline-enforced readiness.
+
+        Called from every early-return path in run_overnight_reeval_attempt
+        so that no incomplete or suppressed state can bypass LIVE readiness
+        enforcement once the NYSE-aware deadline is active.
+
+        Skips (returns None) when any of the following is true:
+          - not an NYSE trading day (weekend or observed holiday);
+          - overnight reeval already succeeded for today;
+          - the readiness enforcement window is not yet active
+            (pre-deadline retries are legitimate);
+          - preopen_readiness cannot be imported (best-effort scheduler tick).
+
+        Runs otherwise:
+          - LIVE + status=BLOCKED → _enter_degraded_mode with the readiness
+            error list;
+          - LIVE + status=OK → clear preopen_readiness_blocked degraded key;
+          - LIVE + readiness exception → fail closed via _enter_degraded_mode
+            with reason 'preopen_readiness_enforcement_failed:<exc>'. Merely
+            logging the exception would allow entries_allowed to remain True
+            despite unverified pre-open watcher ownership.
+
+        Returns the readiness dict (or a synthetic ERROR dict on exception)
+        so callers can stamp it on their result payload. Returns None when
+        enforcement was skipped.
+        """
+        try:
+            from ap.flatline_alarm import is_trading_day as _nyse_is_trading_day
+            if not bool(_nyse_is_trading_day(now_et.date())):
+                return None
+        except Exception:
+            # Fail-safe: calendar unavailable → fall back to weekday-only so
+            # scheduler ticks during weekends still no-op.
+            if now_et.weekday() >= 5:
+                return None
+
+        if self._overnight_reeval_success_date == today:
+            return None
+
+        try:
+            from ap.preopen_readiness import (
+                _readiness_enforcement_active as _pre_ready_active,
+                run_preopen_autonomous_readiness as _pre_ready_run,
+            )
+        except Exception as _imp_exc:
+            logger.error(
+                "[%s] POST_OVERNIGHT_READINESS_IMPORT_FAILED source=%s "
+                "result_class=%s: %s",
+                self.email, source, result_class, _imp_exc,
+            )
+            return None
+
+        if not _pre_ready_active(now_et):
+            return None
+
+        stage_label = f"post_overnight_reeval_deadline:{result_class or 'unknown'}"
+        logger.warning(
+            "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCED source=%s "
+            "result_class=%s stage=%s — running preopen_readiness despite "
+            "incomplete/suppressed overnight reeval",
+            self.email, source, result_class, stage_label,
+        )
+        is_live = str(self.mode).lower() == "live"
+        try:
+            readiness = _pre_ready_run(
+                self.email,
+                self.mode,
+                dry_run=False,
+                stage=stage_label,
+                runner=self,
+            )
+        except Exception as _ready_exc:
+            logger.error(
+                "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCEMENT_RAISED "
+                "source=%s result_class=%s: %s",
+                self.email, source, result_class, _ready_exc, exc_info=True,
+            )
+            # Fail closed on LIVE: an enforcement raise cannot be allowed to
+            # leave entries_allowed=True. Enter degraded mode explicitly.
+            if is_live:
+                try:
+                    self._enter_degraded_mode(
+                        "preopen_readiness_enforcement_failed:"
+                        f"{type(_ready_exc).__name__}:{_ready_exc}"
+                    )
+                except Exception as _deg_exc:
+                    logger.critical(
+                        "[%s] PREOPEN_READINESS_FAIL_CLOSED_DEGRADED_MODE_ERROR "
+                        "source=%s: %s",
+                        self.email, source, _deg_exc,
+                    )
+            return {
+                "ok": False,
+                "status": "ERROR",
+                "error": str(_ready_exc),
+                "enforcement_stage": stage_label,
+                "fail_closed": is_live,
+            }
+
+        if is_live:
+            if readiness.get("status") == "BLOCKED":
+                self._enter_degraded_mode(
+                    "preopen_readiness_blocked:"
+                    + ",".join(readiness.get("errors") or ["unknown"])
+                )
+            elif readiness.get("ok"):
+                self._clear_degraded_reason_key("preopen_readiness_blocked")
+        return readiness
+
     def run_overnight_reeval_attempt(
         self,
         *,
@@ -1872,14 +1989,28 @@ class ClientRunner(threading.Thread):
             except Exception:
                 _is_trading = now_et.weekday() < 5
             if not _is_trading or not self._overnight_reeval_in_window(now_et):
-                return self._overnight_reeval_base_result(
+                # PR #388 deadline-enforcement: even a "not in window" tick
+                # after the readiness deadline must enforce so LIVE runners
+                # cannot ride an unarmed morning past 9:30 unblocked.
+                # The helper itself no-ops on non-trading days and before
+                # the deadline, so pre-open weekday ticks stay quiet.
+                _res = self._overnight_reeval_base_result(
                     result_class="SKIPPED_NOT_DUE",
                     completed=False,
                     retryable=False,
                     now_et=now_et,
                     source=source,
                 )
+                _readiness = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et, today=today, source=source,
+                    result_class="SKIPPED_NOT_DUE",
+                )
+                if _readiness is not None:
+                    _res["readiness_result"] = _readiness
+                return _res
             if self._overnight_reeval_success_date == today:
+                # Success path: readiness already ran through the normal
+                # post-overnight completion. Do NOT re-enforce.
                 return self._overnight_reeval_base_result(
                     result_class="ALREADY_COMPLETED",
                     completed=False,
@@ -1888,7 +2019,7 @@ class ClientRunner(threading.Thread):
                     source=source,
                 )
             if self._overnight_reeval_exhausted_date == today:
-                return self._overnight_reeval_base_result(
+                _res = self._overnight_reeval_base_result(
                     result_class="RETRY_EXHAUSTED",
                     completed=False,
                     retryable=False,
@@ -1897,11 +2028,18 @@ class ClientRunner(threading.Thread):
                     source=source,
                     last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
                 )
+                _readiness = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et, today=today, source=source,
+                    result_class="RETRY_EXHAUSTED",
+                )
+                if _readiness is not None:
+                    _res["readiness_result"] = _readiness
+                return _res
             if (
                 self._overnight_reeval_next_retry_at is not None
                 and now_et < self._overnight_reeval_next_retry_at
             ):
-                return self._overnight_reeval_base_result(
+                _res = self._overnight_reeval_base_result(
                     result_class="WAITING_FOR_RETRY",
                     completed=False,
                     retryable=True,
@@ -1910,6 +2048,13 @@ class ClientRunner(threading.Thread):
                     source=source,
                     next_retry_at=self._overnight_reeval_next_retry_at,
                 )
+                _readiness = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et, today=today, source=source,
+                    result_class="WAITING_FOR_RETRY",
+                )
+                if _readiness is not None:
+                    _res["readiness_result"] = _readiness
+                return _res
 
             if self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS:
                 self._overnight_reeval_exhausted_date = today
@@ -1931,10 +2076,16 @@ class ClientRunner(threading.Thread):
                     now_et=now_et,
                     last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
                 )
+                _readiness = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et, today=today, source=source,
+                    result_class="RETRY_EXHAUSTED",
+                )
+                if _readiness is not None:
+                    result["readiness_result"] = _readiness
                 return result
 
         if not self._overnight_reeval_attempt_lock.acquire(blocking=False):
-            return self._overnight_reeval_base_result(
+            _res = self._overnight_reeval_base_result(
                 result_class="ATTEMPT_ALREADY_RUNNING",
                 completed=False,
                 retryable=True,
@@ -1943,6 +2094,13 @@ class ClientRunner(threading.Thread):
                 source=source,
                 next_retry_at=self._overnight_reeval_next_retry_at,
             )
+            _readiness = self._enforce_preopen_readiness_at_deadline(
+                now_et=now_et, today=today, source=source,
+                result_class="ATTEMPT_ALREADY_RUNNING",
+            )
+            if _readiness is not None:
+                _res["readiness_result"] = _readiness
+            return _res
 
         result: dict
         last_error = None
@@ -2046,65 +2204,34 @@ class ClientRunner(threading.Thread):
                 result["handoff_result"] = post.get("handoff_result") if isinstance(post, dict) else None
                 result["readiness_result"] = post.get("readiness_result") if isinstance(post, dict) else None
             else:
-                # PR #388 deadline-enforcement amendment
-                # ──────────────────────────────────────
+                # PR #388 deadline-enforcement (tail path)
+                # ────────────────────────────────────────
                 # Post-overnight handoff is only meaningful after completion,
                 # but LIVE readiness enforcement CANNOT wait for completion
                 # or the entire PR's core promise (verified pre-open watcher
                 # ownership before live entries fire) is silently voided
                 # whenever the scheduler exhausts retries or lingers past
-                # the deadline in a retryable state. Once past the readiness
-                # enforcement deadline, run preopen_readiness anyway. With
-                # the new LIVE blocked_keys (overnight_reeval_missing,
-                # pending_trigger_without_watcher_ownership) this reliably
-                # BLOCKS live entries when watchers are not armed.
+                # the deadline in a retryable state.
                 #
-                # Pre-deadline retries are legitimate — do not enforce yet.
-                _deadline_enforced = False
-                try:
-                    from ap.preopen_readiness import (
-                        _readiness_enforcement_active as _pre_ready_active,
-                        run_preopen_autonomous_readiness as _pre_ready_run,
-                    )
-                    if _pre_ready_active(now_et):
-                        logger.warning(
-                            "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCED "
-                            "result_class=%s retry_reason=%s — running preopen "
-                            "readiness despite incomplete overnight reeval",
-                            self.email,
-                            result.get("result_class"),
-                            result.get("retry_reason"),
-                        )
-                        readiness = _pre_ready_run(
-                            self.email,
-                            self.mode,
-                            dry_run=False,
-                            stage="post_overnight_reeval_deadline",
-                            runner=self,
-                        )
-                        if str(self.mode).lower() == "live":
-                            if readiness.get("status") == "BLOCKED":
-                                self._enter_degraded_mode(
-                                    "preopen_readiness_blocked:"
-                                    + ",".join(readiness.get("errors") or ["unknown"])
-                                )
-                            elif readiness.get("ok"):
-                                self._clear_degraded_reason_key("preopen_readiness_blocked")
-                        result["readiness_result"] = readiness
-                        _deadline_enforced = True
-                except Exception as _ready_exc:
-                    logger.error(
-                        "[%s] POST_OVERNIGHT_READINESS_DEADLINE_ENFORCEMENT_FAILED: %s",
-                        self.email, _ready_exc, exc_info=True,
-                    )
-                if not _deadline_enforced:
+                # Delegates to _enforce_preopen_readiness_at_deadline which
+                # (a) skips on holiday/weekend/pre-deadline/success and
+                # (b) FAILS CLOSED for LIVE on readiness exception by
+                # entering degraded mode with reason
+                # preopen_readiness_enforcement_failed:*. Merely logging
+                # the exception here would leave entries_allowed=True
+                # despite unverified pre-open watcher ownership.
+                _readiness = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et, today=today, source=source,
+                    result_class=str(result.get("result_class") or "incomplete"),
+                )
+                if _readiness is None:
                     logger.info(
                         "[%s] POST_OVERNIGHT_HANDOFF_DEFERRED result_class=%s retry_reason=%s",
                         self.email,
                         result.get("result_class"),
                         result.get("retry_reason"),
                     )
-                    result["readiness_result"] = None
+                result["readiness_result"] = _readiness
                 result["handoff_result"] = None
 
             logger.info(

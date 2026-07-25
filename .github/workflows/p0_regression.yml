@@ -157,6 +157,7 @@ jobs:
             tests/test_p0_shared_ap_signals_retry_idempotency.py \
             tests/test_p0_nonterminal_ownership_poisoning.py \
             tests/test_p0_live_readiness_blocked_keys.py \
+            tests/test_p0_readiness_deadline_enforcement.py \
             -v --tb=short --color=yes
 
       - name: Summary
