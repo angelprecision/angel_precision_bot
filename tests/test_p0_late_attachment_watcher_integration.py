@@ -295,6 +295,104 @@ def test_arm_time_missing_then_first_quote_pre_trigger_clears_gate_and_ordinary_
     assert w.state == ew.WatchState.TRIGGERED
 
 
+# ── Both-bid-and-ask-zero arm-time path must still seed AWAITING ────────────
+# Structural + composed proof for the outer-guard removal.
+#
+# The prior amendment wrapped the arm-time classifier call in
+#   `if _bug_c_bid > 0 or _bug_c_ask > 0:`
+# which meant a fully-missing quote payload silently skipped the entire
+# late-attachment gate and armed the watcher with state=None. We prove:
+#
+#   1. STRUCTURAL — the guard is gone from the source and the classifier
+#      call is entered unconditionally at the arm-time site.
+#   2. CLASSIFIER — classify_late_attachment(bid=0, ask=0) yields TRUTH_RETRY
+#      with quote=None (i.e. the arm-time gate's seed condition).
+#   3. WIRING — seeding a WatchedSignal with that state and driving check()
+#      with a next-poll quote far above trigger transitions to WAITING_RESET
+#      and never enters the ordinary breach path.
+#
+# Together these prove the both-zero arm-time path is fixed end-to-end
+# without needing to drive the full APEntryWatcher.watch() call graph.
+
+import pathlib as _pathlib
+
+
+def test_arm_time_outer_guard_removed_from_watcher_source():
+    """Regression: the bypass wrapper must not return."""
+    src = (_pathlib.Path(__file__).parent.parent / "ap_entry_watcher.py").read_text()
+    assert "if _bug_c_bid > 0 or _bug_c_ask > 0" not in src, (
+        "The both-zero arm-time bypass has returned. The late-attachment "
+        "classifier must run unconditionally at arm time — even when both "
+        "bid and ask come back as 0 — so AWAITING_FIRST_TRUTH is seeded and "
+        "the poll loop's gate stays engaged."
+    )
+
+
+def test_arm_time_classifier_unconditional_call_shape_present_in_source():
+    """The arm-time site must call classify_late_attachment with the raw
+    _bug_c_bid / _bug_c_ask values — including when both are 0."""
+    src = (_pathlib.Path(__file__).parent.parent / "ap_entry_watcher.py").read_text()
+    # Both these markers exist inside the arm-time block only.
+    assert "AWAITING_FIRST_TRUTH — " in src
+    assert "bid=_bug_c_bid" in src and "ask=_bug_c_ask" in src
+
+
+def test_classifier_returns_truth_retry_when_both_bid_and_ask_are_zero_call():
+    """This is the classifier-side proof: (bid=0, ask=0) → TRUTH_RETRY with
+    quote=None, which is exactly the shape the arm-time gate now seeds on."""
+    from ap.pending_trigger_classifier import (
+        classify_late_attachment,
+        TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+    )
+    d = classify_late_attachment(
+        side="CALL", trigger_price=200.0, bid=0, ask=0,
+    )
+    assert d.classification == TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
+
+
+def test_classifier_returns_truth_retry_when_both_bid_and_ask_are_zero_put():
+    from ap.pending_trigger_classifier import (
+        classify_late_attachment,
+        TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+    )
+    d = classify_late_attachment(
+        side="PUT", trigger_price=200.0, bid=0, ask=0,
+    )
+    assert d.classification == TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is None
+
+
+def test_both_zero_arm_time_wired_end_to_end_call():
+    """CALL arm-time bid=0 AND ask=0 → seeded AWAITING → next poll far above
+    → WAITING_RESET, never TRIGGERED. Combines the arm-time seed (produced
+    directly from the classifier's TRUTH_RETRY result) with WatchedSignal
+    gate behavior. This is the exact production shape the reviewer flagged."""
+    w = _make_watcher(side="CALL", trigger=200.0, stop=180.0, state=_AWAITING)
+    assert w.late_attachment_state == _AWAITING
+    # First truthful poll: far above continuation (ask=200.40, upper=200.15).
+    st = w.check(bid=200.35, ask=200.40)
+    assert st == ew.WatchState.PENDING
+    assert w.late_attachment_state == _WAITING
+    assert w.state != ew.WatchState.TRIGGERED
+    # Continued far-past-trigger price must stay in WAITING_RESET.
+    for _ in range(3):
+        st = w.check(bid=200.35, ask=200.40)
+        assert st == ew.WatchState.PENDING
+        assert w.late_attachment_state == _WAITING
+        assert w.state != ew.WatchState.TRIGGERED
+
+
+def test_both_zero_arm_time_wired_end_to_end_put():
+    """PUT symmetric proof."""
+    w = _make_watcher(side="PUT", trigger=200.0, stop=220.0, state=_AWAITING)
+    assert w.late_attachment_state == _AWAITING
+    st = w.check(bid=199.60, ask=199.65)   # far below 199.85 lower bound
+    assert st == ew.WatchState.PENDING
+    assert w.late_attachment_state == _WAITING
+    assert w.state != ew.WatchState.TRIGGERED
+
+
 # ── Terminal short-circuits still apply when in AWAITING (defensive) ────────
 
 def test_stop_broken_during_awaiting_terminalizes():

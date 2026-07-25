@@ -3545,159 +3545,163 @@ class APEntryWatcher:
                 _bug_c_quote = {}
             _bug_c_bid = float(_bug_c_quote.get("bid") or 0)
             _bug_c_ask = float(_bug_c_quote.get("ask") or 0)
-            if _bug_c_bid > 0 or _bug_c_ask > 0:
-                # PR #388 Block-2: canonical late-attachment classifier.
-                # Consult the shared classifier for the arm-time decision. A
-                # small continuation zone around the trigger is not a missed
-                # move; only terminalize when the setup is structurally dead.
-                from ap.pending_trigger_classifier import (
-                    classify_late_attachment as _pt_classify_late,
-                    LATE_ATTACHMENT_WITHIN_CONTINUATION as _PT_WITHIN,
-                    MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET as _PT_WAITING,
-                    LATE_ATTACHMENT_MOVE_MISSED_TERMINAL as _PT_MOVE_MISSED,
-                    STOP_ALREADY_BROKEN_TERMINAL as _PT_STOP_BROKEN,
-                    TARGET_ALREADY_COMPLETE_TERMINAL as _PT_TARGET_COMPLETE,
-                    TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_TRUTH_RETRY,
-                )
-                _late_decision = _pt_classify_late(
-                    side=side,
-                    trigger_price=float(trigger),
-                    bid=_bug_c_bid,
-                    ask=_bug_c_ask,
-                    stop=stop,
-                    target_complete=False,
-                    decisive_drift_exceeded=False,
-                )
-                _late_cls = _late_decision.classification
+            # PR #388 Block-2: the classifier runs unconditionally — even when
+            # both bid and ask are zero. A missing canonical quote yields
+            # TRIGGER_TRUTH_UNAVAILABLE_RETRY (quote=None) which seeds the
+            # AWAITING_FIRST_TRUTH state; the arm-time gate must never be
+            # bypassed just because bid and ask both came back as 0.
+            # PR #388 Block-2: canonical late-attachment classifier.
+            # Consult the shared classifier for the arm-time decision. A
+            # small continuation zone around the trigger is not a missed
+            # move; only terminalize when the setup is structurally dead.
+            from ap.pending_trigger_classifier import (
+                classify_late_attachment as _pt_classify_late,
+                LATE_ATTACHMENT_WITHIN_CONTINUATION as _PT_WITHIN,
+                MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET as _PT_WAITING,
+                LATE_ATTACHMENT_MOVE_MISSED_TERMINAL as _PT_MOVE_MISSED,
+                STOP_ALREADY_BROKEN_TERMINAL as _PT_STOP_BROKEN,
+                TARGET_ALREADY_COMPLETE_TERMINAL as _PT_TARGET_COMPLETE,
+                TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_TRUTH_RETRY,
+            )
+            _late_decision = _pt_classify_late(
+                side=side,
+                trigger_price=float(trigger),
+                bid=_bug_c_bid,
+                ask=_bug_c_ask,
+                stop=stop,
+                target_complete=False,
+                decisive_drift_exceeded=False,
+            )
+            _late_cls = _late_decision.classification
 
-                if _late_cls in (_PT_WITHIN, _PT_WAITING):
-                    # Attach the watcher, seed the late-attachment state so
-                    # check() enforces the confirmation / reset requirement
-                    # before allowing the normal breach path to fire.
-                    signal_dict.setdefault("_late_attachment_seed", {
-                        "state": _late_cls,
-                        "seen_at": datetime.now(timezone.utc).isoformat(),
-                        "quote": float(_late_decision.quote or 0),
-                        "quote_source": _late_decision.quote_source,
-                        "allowed_continuation": (
-                            float(_late_decision.allowed_continuation)
-                            if _late_decision.allowed_continuation is not None else None
-                        ),
-                        "raw_bid": _bug_c_bid,
-                        "raw_ask": _bug_c_ask,
-                    })
-                    log.info(
-                        "[%s] LATE_ATTACHMENT_%s — %s canonical_quote=%s trigger=%.4f "
-                        "allowed_continuation=%s recovery_rearm=%s "
-                        "(watcher armed; requires poll-confirmation before submit)",
-                        ticker,
-                        "WITHIN_CONTINUATION" if _late_cls == _PT_WITHIN else "WAITING_RESET",
-                        side,
-                        _late_decision.quote,
-                        float(trigger),
-                        _late_decision.allowed_continuation,
-                        _recovery_rearm,
-                    )
-                    # Fall through to normal add_signal / watcher arm path.
-                elif _late_cls == _PT_TRUTH_RETRY:
-                    # Missing canonical truth at arm-time. Seed a dedicated
-                    # AWAITING_FIRST_TRUTH state so the poll loop's late-
-                    # attachment gate stays engaged and the ordinary breach
-                    # path cannot fire on the first available quote without
-                    # first classifying it against the continuation window.
-                    # (Without this seed a subsequent quote far past the
-                    # trigger would run straight through the ordinary breach
-                    # path and defeat Block-2.)
-                    from ap.pending_trigger_classifier import (
-                        LATE_ATTACHMENT_AWAITING_FIRST_TRUTH as _PT_AWAITING,
-                    )
-                    signal_dict.setdefault("_late_attachment_seed", {
-                        "state": _PT_AWAITING,
-                        "seen_at": datetime.now(timezone.utc).isoformat(),
-                        "quote": None,
-                        "quote_source": _late_decision.quote_source,
-                        "allowed_continuation": (
-                            float(_late_decision.allowed_continuation)
-                            if _late_decision.allowed_continuation is not None else None
-                        ),
-                        "raw_bid": _bug_c_bid,
-                        "raw_ask": _bug_c_ask,
-                        "detail": _late_decision.detail,
-                    })
-                    log.info(
-                        "[%s] LATE_ATTACHMENT_AWAITING_FIRST_TRUTH — "
-                        "canonical trigger quote unavailable at arm time "
-                        "(detail=%s recovery_rearm=%s); watcher armed with "
-                        "gate engaged. Ordinary breach path is blocked until "
-                        "the first truthful canonical quote arrives.",
-                        ticker, _late_decision.detail, _recovery_rearm,
-                    )
-                    # Fall through to normal add_signal / watcher arm path.
-                else:
-                    # Terminal at arm-time: STOP_BROKEN / TARGET_COMPLETE /
-                    # LATE_ATTACHMENT_MOVE_MISSED_TERMINAL. Preserve the
-                    # existing terminalization path, but tag the reason code
-                    # with the canonical classifier output.
-                    _terminal_reason_map = {
-                        _PT_STOP_BROKEN:      "stop_already_broken_terminal",
-                        _PT_TARGET_COMPLETE:  "target_already_complete_terminal",
-                        _PT_MOVE_MISSED:      "late_attachment_move_missed_terminal",
-                    }
-                    _terminal_reason = _terminal_reason_map.get(
-                        _late_cls, "late_attachment_move_missed_terminal",
-                    )
-                    _bug_c_mid = (_bug_c_bid + _bug_c_ask) / 2.0 if (_bug_c_bid and _bug_c_ask) else max(_bug_c_bid, _bug_c_ask)
-                    _bug_c_full_audit = {
-                        "reason_code":     _terminal_reason,
-                        "raw_reason": (
-                            f"side_{side}_ask_{_bug_c_ask:.4f}_bid_{_bug_c_bid:.4f}"
-                            f"_late_attachment_{_late_cls}_{float(trigger):.4f}"
-                            f"_at_arm_time recovery_rearm={_recovery_rearm}"
-                        ),
-                        "trigger_type":    "arm_check",
-                        "current_bid":     _bug_c_bid,
-                        "current_ask":     _bug_c_ask,
-                        "current_mid":     _bug_c_mid,
-                        "arm_condition":   f"trigger_{float(trigger):.4f}",
-                        "recovery_rearm":  _recovery_rearm,
-                        "regular_session": True,
-                        "trigger_price":   float(trigger),
-                        "side":            side,
-                        "late_attachment_detail": _late_decision.detail,
-                    }
+            if _late_cls in (_PT_WITHIN, _PT_WAITING):
+                # Attach the watcher, seed the late-attachment state so
+                # check() enforces the confirmation / reset requirement
+                # before allowing the normal breach path to fire.
+                signal_dict.setdefault("_late_attachment_seed", {
+                    "state": _late_cls,
+                    "seen_at": datetime.now(timezone.utc).isoformat(),
+                    "quote": float(_late_decision.quote or 0),
+                    "quote_source": _late_decision.quote_source,
+                    "allowed_continuation": (
+                        float(_late_decision.allowed_continuation)
+                        if _late_decision.allowed_continuation is not None else None
+                    ),
+                    "raw_bid": _bug_c_bid,
+                    "raw_ask": _bug_c_ask,
+                })
+                log.info(
+                    "[%s] LATE_ATTACHMENT_%s — %s canonical_quote=%s trigger=%.4f "
+                    "allowed_continuation=%s recovery_rearm=%s "
+                    "(watcher armed; requires poll-confirmation before submit)",
+                    ticker,
+                    "WITHIN_CONTINUATION" if _late_cls == _PT_WITHIN else "WAITING_RESET",
+                    side,
+                    _late_decision.quote,
+                    float(trigger),
+                    _late_decision.allowed_continuation,
+                    _recovery_rearm,
+                )
+                # Fall through to normal add_signal / watcher arm path.
+            elif _late_cls == _PT_TRUTH_RETRY:
+                # Missing canonical truth at arm-time. Seed a dedicated
+                # AWAITING_FIRST_TRUTH state so the poll loop's late-
+                # attachment gate stays engaged and the ordinary breach
+                # path cannot fire on the first available quote without
+                # first classifying it against the continuation window.
+                # (Without this seed a subsequent quote far past the
+                # trigger would run straight through the ordinary breach
+                # path and defeat Block-2.)
+                from ap.pending_trigger_classifier import (
+                    LATE_ATTACHMENT_AWAITING_FIRST_TRUTH as _PT_AWAITING,
+                )
+                signal_dict.setdefault("_late_attachment_seed", {
+                    "state": _PT_AWAITING,
+                    "seen_at": datetime.now(timezone.utc).isoformat(),
+                    "quote": None,
+                    "quote_source": _late_decision.quote_source,
+                    "allowed_continuation": (
+                        float(_late_decision.allowed_continuation)
+                        if _late_decision.allowed_continuation is not None else None
+                    ),
+                    "raw_bid": _bug_c_bid,
+                    "raw_ask": _bug_c_ask,
+                    "detail": _late_decision.detail,
+                })
+                log.info(
+                    "[%s] LATE_ATTACHMENT_AWAITING_FIRST_TRUTH — "
+                    "canonical trigger quote unavailable at arm time "
+                    "(detail=%s recovery_rearm=%s); watcher armed with "
+                    "gate engaged. Ordinary breach path is blocked until "
+                    "the first truthful canonical quote arrives.",
+                    ticker, _late_decision.detail, _recovery_rearm,
+                )
+                # Fall through to normal add_signal / watcher arm path.
+            else:
+                # Terminal at arm-time: STOP_BROKEN / TARGET_COMPLETE /
+                # LATE_ATTACHMENT_MOVE_MISSED_TERMINAL. Preserve the
+                # existing terminalization path, but tag the reason code
+                # with the canonical classifier output.
+                _terminal_reason_map = {
+                    _PT_STOP_BROKEN:      "stop_already_broken_terminal",
+                    _PT_TARGET_COMPLETE:  "target_already_complete_terminal",
+                    _PT_MOVE_MISSED:      "late_attachment_move_missed_terminal",
+                }
+                _terminal_reason = _terminal_reason_map.get(
+                    _late_cls, "late_attachment_move_missed_terminal",
+                )
+                _bug_c_mid = (_bug_c_bid + _bug_c_ask) / 2.0 if (_bug_c_bid and _bug_c_ask) else max(_bug_c_bid, _bug_c_ask)
+                _bug_c_full_audit = {
+                    "reason_code":     _terminal_reason,
+                    "raw_reason": (
+                        f"side_{side}_ask_{_bug_c_ask:.4f}_bid_{_bug_c_bid:.4f}"
+                        f"_late_attachment_{_late_cls}_{float(trigger):.4f}"
+                        f"_at_arm_time recovery_rearm={_recovery_rearm}"
+                    ),
+                    "trigger_type":    "arm_check",
+                    "current_bid":     _bug_c_bid,
+                    "current_ask":     _bug_c_ask,
+                    "current_mid":     _bug_c_mid,
+                    "arm_condition":   f"trigger_{float(trigger):.4f}",
+                    "recovery_rearm":  _recovery_rearm,
+                    "regular_session": True,
+                    "trigger_price":   float(trigger),
+                    "side":            side,
+                    "late_attachment_detail": _late_decision.detail,
+                }
+                try:
+                    self._persist_watcher_audit(local_order_id, _bug_c_full_audit)
+                except Exception:
+                    pass
+                # Preserve legacy log markers + reason code so downstream
+                # structural checks (PR #304 Bug C tests, invalidation
+                # taxonomy) continue to recognise this terminalization.
+                # arm_already_through_trigger stays as the canonical
+                # legacy reason string; the new specific code above is
+                # the Block-2 refinement.
+                log.warning(
+                    "[%s] WATCHER_ARM_REJECTED_ALREADY_THROUGH_TRIGGER — "
+                    "%s ask=%.4f bid=%.4f trigger=%.4f "
+                    "new_reason=%s detail=%s (recovery_rearm=%s). "
+                    "reason_code=arm_already_through_trigger",
+                    ticker, side, _bug_c_ask, _bug_c_bid, float(trigger),
+                    _terminal_reason, _late_decision.detail, _recovery_rearm,
+                )
+                if not _recovery_rearm and self.on_invalidate is not None:
                     try:
-                        self._persist_watcher_audit(local_order_id, _bug_c_full_audit)
-                    except Exception:
-                        pass
-                    # Preserve legacy log markers + reason code so downstream
-                    # structural checks (PR #304 Bug C tests, invalidation
-                    # taxonomy) continue to recognise this terminalization.
-                    # arm_already_through_trigger stays as the canonical
-                    # legacy reason string; the new specific code above is
-                    # the Block-2 refinement.
-                    log.warning(
-                        "[%s] WATCHER_ARM_REJECTED_ALREADY_THROUGH_TRIGGER — "
-                        "%s ask=%.4f bid=%.4f trigger=%.4f "
-                        "new_reason=%s detail=%s (recovery_rearm=%s). "
-                        "reason_code=arm_already_through_trigger",
-                        ticker, side, _bug_c_ask, _bug_c_bid, float(trigger),
-                        _terminal_reason, _late_decision.detail, _recovery_rearm,
-                    )
-                    if not _recovery_rearm and self.on_invalidate is not None:
-                        try:
-                            _bug_c_shim = types.SimpleNamespace(
-                                signal=signal_dict,
-                                ticker=ticker,
-                                _pending_audit=_bug_c_full_audit,
-                                state=WatchState.INVALIDATED,
-                            )
-                            self.on_invalidate(_bug_c_shim)
-                        except Exception as _bc_exc:
-                            log.error(
-                                "[%s] %s cleanup callback failed: %s",
-                                ticker, _terminal_reason, _bc_exc,
-                            )
-                    return False
+                        _bug_c_shim = types.SimpleNamespace(
+                            signal=signal_dict,
+                            ticker=ticker,
+                            _pending_audit=_bug_c_full_audit,
+                            state=WatchState.INVALIDATED,
+                        )
+                        self.on_invalidate(_bug_c_shim)
+                    except Exception as _bc_exc:
+                        log.error(
+                            "[%s] %s cleanup callback failed: %s",
+                            ticker, _terminal_reason, _bc_exc,
+                        )
+                return False
 
         # PR-C / BUG-EW-4: when add_signal blocks (dedup, opposite-side
         # weaker score, etc.), the OSM entry order created earlier by the
