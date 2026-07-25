@@ -1348,22 +1348,57 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     # it atomically so we never have two in-memory positions for the same open
     # trade and all subsequent exits use canonical identity.
     _contract_for_adopt = str(order.get("contract") or order.get("symbol") or "").upper().strip()
+
+    # AMENDMENT (PR #385 review — Fix 1 + NO_REPAIR_FOUND fallthrough):
+    # resolve execution_mode ONCE at the top of _seed_exit_engine so the
+    # exact lowercase live/paper flows through every downstream branch:
+    # adoption, seed_position, and ManagedPosition construction.  The
+    # previous placement inside the adoption block meant the fall-through
+    # NO_REPAIR_FOUND path silently re-read the raw nullable order value
+    # and produced a canonical position with blank execution_mode.
+    _resolved_mode, _mode_disp, _mode_diag = _resolve_canonical_adoption_execution_mode(
+        exit_engine, order,
+    )
+
     _adopt_fn = getattr(exit_engine, "adopt_canonical_position_identity", None)
     if callable(_adopt_fn) and _contract_for_adopt and position_id:
-        # AMENDMENT (PR #385 review — Fix 1): resolve execution_mode via
-        # the fail-closed helper.  A NULL order.execution_mode against a
-        # proven engine mode must adopt as the engine mode; a genuine
-        # conflict or unproven pair must NOT adopt.
-        _resolved_mode, _mode_disp, _mode_diag = _resolve_canonical_adoption_execution_mode(
-            exit_engine, order,
-        )
         if _mode_disp != "OK":
-            _reason_code = (
+            _client_id = str(order.get("client_id") or "")
+            # AMENDMENT (PR #385 review — no-owner truthfulness): before
+            # declaring "protective monitoring retained" we must actually
+            # confirm a behavior-active owner exists for this exact
+            # contract on this engine.  If none exists, the caller has
+            # been misled about safety; emit a distinct _NO_OWNER reason
+            # so recovery / reconciliation can escalate rather than
+            # silently accept a zero-owner state.
+            _owner_count = 0
+            try:
+                _active_fn = getattr(exit_engine, "active_positions", None)
+                if callable(_active_fn):
+                    _actives = _active_fn() or []
+                    _owner_count = sum(
+                        1 for _p in _actives
+                        if str(getattr(_p, "option_symbol", "") or "").upper().strip()
+                           == _contract_for_adopt
+                        and (
+                            not getattr(_p, "client_id", "")
+                            or str(getattr(_p, "client_id", "")).strip().lower()
+                               == _client_id.strip().lower()
+                        )
+                    )
+            except Exception as _owner_err:
+                log.warning(
+                    "[%s] owner-existence check failed for %s: %s",
+                    _client_id, _contract_for_adopt, _owner_err,
+                )
+                _owner_count = 0
+
+            _base_reason = (
                 "CANONICAL_ADOPTION_MODE_CONFLICT"
                 if _mode_disp == "CONFLICT"
                 else "CANONICAL_ADOPTION_MODE_UNPROVEN"
             )
-            _client_id = str(order.get("client_id") or "")
+            _reason_code = _base_reason if _owner_count > 0 else f"{_base_reason}_NO_OWNER"
             _payload = {
                 "contract": _contract_for_adopt,
                 "position_id": position_id,
@@ -1374,16 +1409,22 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 "engine_mode": _mode_diag.get("engine_mode"),
                 "engine_status": _mode_diag.get("engine_status"),
                 "engine_sources": _mode_diag.get("engine_sources"),
+                "existing_owner_count": _owner_count,
             }
+            _tail = (
+                "protective monitoring retained; no new exit owner created"
+                if _owner_count > 0
+                else "NO protective owner exists; escalation required"
+            )
             log.critical(
                 "[%s] %s | contract=%s position_id=%s local=%s broker=%s "
-                "order_mode=%s engine_mode=%s engine_status=%s — protective "
-                "monitoring retained; no new exit owner created",
+                "order_mode=%s engine_mode=%s engine_status=%s "
+                "existing_owner_count=%d — %s",
                 _client_id, _reason_code,
                 _contract_for_adopt, position_id,
                 order.get("local_order_id"), order.get("broker_order_id"),
                 _mode_diag.get("order_mode"), _mode_diag.get("engine_mode"),
-                _mode_diag.get("engine_status"),
+                _mode_diag.get("engine_status"), _owner_count, _tail,
             )
             # AMENDMENT (PR #385 review — Fix B): use the real audit /
             # emit_fill_event signatures.  Previously we called
@@ -1402,14 +1443,20 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
             # emit_fill_event is best-effort and never re-raises; it now
             # returns False and logs at WARNING on internal failure, so a
             # redundant outer try/except would never actually fire.
+            _explanation = (
+                "Canonical adoption execution mode could not be proven; "
+                + (
+                    "existing protective owner retained; no new exit owner created."
+                    if _owner_count > 0
+                    else "NO protective exit owner exists for this contract; "
+                         "recovery/reconciliation must escalate."
+                )
+            )
             emit_fill_event(
                 order,
                 decision="ERROR",
                 reason_code=_reason_code,
-                explanation=(
-                    "Canonical adoption execution mode could not be proven; "
-                    "no new exit owner created."
-                ),
+                explanation=_explanation,
                 result=result or {},
                 extra_context=_payload,
             )
@@ -1503,9 +1550,20 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
     except Exception as _ee_err:
         log.warning("Exit engine position check failed for %s: %s", position_id, _ee_err)
 
+    # AMENDMENT (PR #385 review): both fall-through seeding paths
+    # (seed_position and the ManagedPosition/add_position path below)
+    # must consume the SAME _resolved_mode the adoption call would
+    # have used.  A blank order.execution_mode reaching here means the
+    # engine already proved live/paper; we must not re-read the raw
+    # nullable field and store an empty string.
+    _seed_order = order
+    if _resolved_mode and str(order.get("execution_mode") or "").strip().lower() != _resolved_mode:
+        _seed_order = dict(order)
+        _seed_order["execution_mode"] = _resolved_mode
+
     try:
         if hasattr(exit_engine, "seed_position"):
-            exit_engine.seed_position(position_id, order, result)
+            exit_engine.seed_position(position_id, _seed_order, result)
             return
     except Exception as exc:
         log.debug("exit_engine.seed_position failed; trying add_position path: %s", exc)
@@ -1536,10 +1594,14 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
         mp.position_id = position_id
         mp.client_id = str(order.get("client_id") or "")
         mp.signal_id = signal_id
-        # Repair 5: preserve execution_mode from the order so proof rows
-        # record "live" not "unknown".
+        # AMENDMENT (PR #385 review): use _resolved_mode (proven exact
+        # lowercase live/paper), not the raw nullable order value.  A
+        # blank order.execution_mode is exactly the historical /
+        # recovery-created shape the resolver is designed to repair;
+        # storing "" here would break exact-mode protective persistence
+        # and LIVE/PAPER isolation for the canonical position.
         try:
-            mp.execution_mode = str(order.get("execution_mode") or "")
+            mp.execution_mode = _resolved_mode
         except Exception:
             pass
 

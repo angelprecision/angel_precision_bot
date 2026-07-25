@@ -5244,8 +5244,8 @@ class TestFillMonitorDurableDiagnostics:
             {"avg_fill": 0.97}, "sig-diag",
         )
         assert adopt_calls == []
-        assert any(a[2] == "CANONICAL_ADOPTION_MODE_CONFLICT" for a in audits)
-        assert any(e["reason_code"] == "CANONICAL_ADOPTION_MODE_CONFLICT"
+        assert any(a[2].startswith("CANONICAL_ADOPTION_MODE_CONFLICT") for a in audits)
+        assert any(e["reason_code"].startswith("CANONICAL_ADOPTION_MODE_CONFLICT")
                    and e["decision"] == "ERROR" for e in emits)
 
     def test_unproven_calls_audit_and_emit(self, monkeypatch):
@@ -5257,8 +5257,8 @@ class TestFillMonitorDurableDiagnostics:
             {"avg_fill": 0.97}, "sig-diag",
         )
         assert adopt_calls == []
-        assert any(a[2] == "CANONICAL_ADOPTION_MODE_UNPROVEN" for a in audits)
-        assert any(e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN"
+        assert any(a[2].startswith("CANONICAL_ADOPTION_MODE_UNPROVEN") for a in audits)
+        assert any(e["reason_code"].startswith("CANONICAL_ADOPTION_MODE_UNPROVEN")
                    and e["decision"] == "ERROR" for e in emits)
 
     def test_engine_conflict_blocks_and_diagnoses(self, monkeypatch):
@@ -5271,8 +5271,8 @@ class TestFillMonitorDurableDiagnostics:
             {"avg_fill": 0.97}, "sig-diag",
         )
         assert adopt_calls == []
-        assert any(a[2] == "CANONICAL_ADOPTION_MODE_CONFLICT" for a in audits)
-        assert any(e["reason_code"] == "CANONICAL_ADOPTION_MODE_CONFLICT"
+        assert any(a[2].startswith("CANONICAL_ADOPTION_MODE_CONFLICT") for a in audits)
+        assert any(e["reason_code"].startswith("CANONICAL_ADOPTION_MODE_CONFLICT")
                    for e in emits)
 
 
@@ -5419,3 +5419,241 @@ class TestEmitFillEventReturnsBoolAndWarns:
             result={},
         )
         assert ok is False  # explicitly non-fatal
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — NO_REPAIR_FOUND normal-seed + NO_OWNER truth)
+# =============================================================================
+
+
+class TestSeedExitEngineResolvedModeThroughFallThrough:
+    """The resolved execution mode must flow through EVERY seeding branch:
+    adoption, seed_position, and ManagedPosition/add_position.  Previously
+    the fall-through path re-read the raw nullable order.execution_mode
+    and produced a canonical position with blank execution_mode."""
+
+    def _blank_order(self):
+        return {
+            "client_id": "jasoncosby1@gmail.com",
+            "contract": "BAC260724P00062000",
+            "symbol": "BAC260724P00062000",
+            "local_order_id": "L1", "broker_order_id": "B1",
+            "signal_id": "sig-1",
+            "canonical_signal_id": "csig-1",
+            "direction": "PUT",
+            "score": 82.0, "tier": "A", "pattern": "flip", "timeframe": "5m",
+            "stop_underlying": 62.5, "target_underlying": 60.0,
+            "underlying_entry": 62.1,
+            "execution_mode": None,        # ← the historical / recovery shape
+            "qty": 1,
+        }
+
+    def _engine_with_proven_live(self, *, has_repair: bool,
+                                  disposition="NO_REPAIR_FOUND"):
+        adopted_call = {"kwargs": None}
+        added = []
+        seeded_positions = []
+
+        def _fake_adopt(**kw):
+            adopted_call["kwargs"] = kw
+            class _R: pass
+            _r = _R()
+            _r.disposition = disposition
+            return _r
+
+        class _Position:
+            def __init__(self, **kw):
+                for k, v in kw.items():
+                    setattr(self, k, v)
+
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "live", "status": "PROVEN", "sources": {}}
+            def _resolved_execution_mode(self):
+                return "live"
+            adopt_canonical_position_identity = staticmethod(_fake_adopt)
+            def get_position(self_, _pid): return None
+            def active_positions(self_):
+                return [_Position(
+                    option_symbol="BAC260724P00062000",
+                    client_id="jasoncosby1@gmail.com",
+                    closed=False,
+                )] if has_repair else []
+            def add_position(self_, pos):
+                added.append(pos)
+            _email = "jasoncosby1@gmail.com"
+
+        return _E(), adopted_call, added, seeded_positions
+
+    def test_no_repair_found_add_position_carries_resolved_mode(self, monkeypatch):
+        """Test 1: NO_REPAIR_FOUND → normal add_position path.
+        mp.execution_mode must be "live", not "".
+        """
+        import ap.fill_monitor as fm
+        eng, adopt_call, added, _ = self._engine_with_proven_live(
+            has_repair=False, disposition="NO_REPAIR_FOUND",
+        )
+        # Prevent audit/emit from needing a real DB.
+        monkeypatch.setattr(fm, "audit", lambda *a, **kw: None)
+        monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **kw: True)
+
+        fm._seed_exit_engine(
+            eng, "canon-pos-live-1",
+            self._blank_order(), {"avg_fill": 0.97, "filled_qty": 1},
+            "sig-1",
+        )
+        # Adoption was called with resolved live.
+        assert adopt_call["kwargs"]["execution_mode"] == "live"
+        # Normal add_position produced the canonical position.
+        assert len(added) == 1
+        mp = added[0]
+        assert mp.execution_mode == "live", (
+            f"execution_mode must survive fall-through as 'live'; got {mp.execution_mode!r}"
+        )
+        assert mp.position_id == "canon-pos-live-1"
+        assert mp.client_id == "jasoncosby1@gmail.com"
+        assert mp.signal_id == "sig-1"
+        assert mp.entry_price == 0.97
+        assert mp.underlying_entry == 62.1
+        assert mp.underlying_stop  == 62.5
+        assert mp.underlying_target == 60.0
+
+    def test_seed_position_receives_order_copy_with_resolved_mode(self, monkeypatch):
+        """Test 2: engines exposing seed_position must receive an order
+        whose execution_mode is the resolved live/paper, not None."""
+        import ap.fill_monitor as fm
+        eng, adopt_call, _added, seeded = self._engine_with_proven_live(
+            has_repair=False, disposition="NO_REPAIR_FOUND",
+        )
+        # Attach a seed_position seam.
+        def _seed(pid, seed_order, result):
+            seeded.append((pid, dict(seed_order), dict(result)))
+        eng.seed_position = _seed
+        monkeypatch.setattr(fm, "audit", lambda *a, **kw: None)
+        monkeypatch.setattr(fm, "emit_fill_event", lambda *a, **kw: True)
+
+        _order = self._blank_order()
+        fm._seed_exit_engine(
+            eng, "canon-pos-live-2", _order,
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert seeded, "seed_position must have been called"
+        _, seed_order, _ = seeded[-1]
+        assert seed_order["execution_mode"] == "live", (
+            f"seed_position must receive resolved 'live'; got {seed_order['execution_mode']!r}"
+        )
+        # Original order must NOT be mutated in-place.
+        assert _order["execution_mode"] is None
+
+    def test_conflict_with_existing_repair_keeps_owner_and_uses_base_reason(self, monkeypatch):
+        """Test 4: engine CONFLICT + one existing active repair.  The
+        repair remains the sole owner; the diagnostic uses the base
+        CONFLICT reason (not the _NO_OWNER variant), because monitoring
+        really is retained."""
+        import ap.fill_monitor as fm
+        adopt_calls = []
+        added = []
+        audits = []
+        emits = []
+        monkeypatch.setattr(fm, "audit",
+                            lambda cid, lvl, evt, payload: audits.append(evt))
+        monkeypatch.setattr(fm, "emit_fill_event",
+                            lambda o, **kw: emits.append(kw.get("reason_code")) or True)
+
+        class _Position:
+            option_symbol = "BAC260724P00062000"
+            client_id = "jasoncosby1@gmail.com"
+            closed = False
+
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "", "status": "CONFLICT",
+                        "sources": {"master_control.mode": "paper",
+                                    "broker.mode": "live"}}
+            def _resolved_execution_mode(self): return ""
+            def adopt_canonical_position_identity(self_, **kw):
+                adopt_calls.append(kw)
+                class _R: disposition = "ADOPTED"
+                return _R()
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return [_Position()]
+            def add_position(self_, pos): added.append(pos)
+            _email = "jasoncosby1@gmail.com"
+
+        fm._seed_exit_engine(
+            _E(), "canon-pos-conflict",
+            self._blank_order(),   # order mode blank, but engine=CONFLICT anyway
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert adopt_calls == [], "adopt must not be called under CONFLICT"
+        assert added == [], "no new canonical position must be added"
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT" in audits
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT_NO_OWNER" not in audits
+        assert "CANONICAL_ADOPTION_MODE_CONFLICT" in emits
+
+
+class TestSeedExitEngineNoOwnerDiagnostic:
+    """PR #385 review: when mode resolution fails AND no protective owner
+    exists, the diagnostic must NOT falsely claim monitoring is retained.
+    A distinct _NO_OWNER critical reason code must fire."""
+
+    def _order(self):
+        return {
+            "client_id": "jasoncosby1@gmail.com",
+            "contract": "BAC260724P00062000",
+            "symbol": "BAC260724P00062000",
+            "local_order_id": "L1", "broker_order_id": "B1",
+            "signal_id": "sig-1",
+            "execution_mode": None,
+            "qty": 1,
+        }
+
+    def test_unproven_and_no_owner_emits_no_owner_reason(self, monkeypatch):
+        """Test 3: blank order mode + engine UNPROVEN + no owner exists.
+        Emit CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER, not the vanilla
+        UNPROVEN reason."""
+        import ap.fill_monitor as fm
+        audits = []
+        emits = []
+        monkeypatch.setattr(fm, "audit",
+                            lambda cid, lvl, evt, payload: audits.append((evt, payload)))
+        monkeypatch.setattr(fm, "emit_fill_event",
+                            lambda o, **kw: emits.append(kw) or True)
+
+        adopt_calls = []
+        added = []
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "", "status": "UNPROVEN", "sources": {}}
+            def _resolved_execution_mode(self): return ""
+            def adopt_canonical_position_identity(self_, **kw):
+                adopt_calls.append(kw)
+                class _R: disposition = "ADOPTED"
+                return _R()
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return []   # ← no protective owner
+            def add_position(self_, pos): added.append(pos)
+            _email = "jasoncosby1@gmail.com"
+
+        fm._seed_exit_engine(
+            _E(), "canon-pos-no-owner",
+            self._order(), {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert adopt_calls == [], "adopt must not be called when mode is UNPROVEN"
+        assert added == [], "no blank-mode canonical position may be seeded"
+        _reasons = [e[0] for e in audits]
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" in _reasons, (
+            f"expected _NO_OWNER audit; got {_reasons}"
+        )
+        # Payload must carry the zero owner count.
+        _payload = [e[1] for e in audits
+                    if e[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
+        assert _payload["existing_owner_count"] == 0
+        assert any(
+            e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"
+            for e in emits
+        )
+        # Explanation must not claim monitoring is retained.
+        _expl = [e["explanation"] for e in emits
+                 if e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
+        assert "NO protective exit owner" in _expl
