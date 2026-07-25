@@ -198,6 +198,38 @@ def test_reattach_with_valid_quotes_still_proceeds(monkeypatch):
     assert cancel_spy.call_count == 0
 
 
+@pytest.mark.parametrize(
+    ("bid", "ask", "expected_reason"),
+    [
+        (489.90, 500.05, "stop_already_broken_terminal"),
+        (519.90, 520.00, "target_already_complete_terminal"),
+        (508.00, 508.00, "late_attachment_move_missed_terminal"),
+    ],
+)
+def test_reattach_with_proven_terminal_truth_terminalizes_existing_order_once(
+    monkeypatch, bid, ask, expected_reason,
+):
+    """Proven STOP / TARGET / decisive-missed truth is not protected by
+    no_cancel_on_reject. The exact recovered PENDING_TRIGGER row must be
+    terminalized once so the outer no-filter reread can persist suppression."""
+    w, cancel_spy, add_spy = _make_watcher_for_reattach(
+        monkeypatch, quote_bid=bid, quote_ask=ask,
+    )
+
+    result = w.watch(
+        _reattach_plan(),
+        local_order_id="local-existing-terminal",
+        recovery_rearm=True,
+        no_cancel_on_reject=True,
+    )
+
+    assert result is False
+    add_spy.assert_not_called()
+    cancel_spy.assert_called_once()
+    assert cancel_spy.call_args.args[0] == "local-existing-terminal"
+    assert expected_reason in cancel_spy.call_args.kwargs["reason"]
+
+
 def test_non_recovery_arm_does_not_enter_recovery_classifier_at_all(monkeypatch):
     """Scope documentation: with recovery_rearm=False the LIVE recovery
     classifier branch (which is where _terminalize_recovery_rearm_candidate

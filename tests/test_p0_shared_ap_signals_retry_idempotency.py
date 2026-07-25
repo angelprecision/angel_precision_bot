@@ -132,11 +132,16 @@ def _patch_opportunity_lookup(monkeypatch, result: ov._LookupResult):
 
 
 def _patch_active_order_lookup(monkeypatch, status: str, row: dict | None):
-    """Patch _query_active_entry_order to return explicit (status, row)."""
+    """Patch order fences to return explicit active truth and no latest history."""
     monkeypatch.setattr(
         ov,
         "_query_active_entry_order",
         lambda *_a, **_kw: (status, row),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_latest_entry_order_no_status",
+        lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
     )
 
 

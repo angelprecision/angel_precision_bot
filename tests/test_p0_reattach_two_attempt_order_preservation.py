@@ -133,8 +133,32 @@ def _terminal_marker_row(*, reason="reattach_post_watch_terminal:CANCELED"):
     }
 
 
-def _install_opportunity_ledger_stub(monkeypatch, *, create_opportunities, mark_watcher_invalidated):
+def _reattach_in_progress_row():
+    return {
+        "canonical_signal_id": "sig-reattach-integration",
+        "client_id": "jose@example.com",
+        "opportunity_status": "CREATED",
+        "miss_stage": "",
+        "miss_reason": "",
+        "order_local_id": EXISTING_LOCAL_OID,
+        "metadata": {
+            "execution_mode": "paper",
+            "overnight_reeval_session_key": "2026-07-27",
+            "local_order_id": EXISTING_LOCAL_OID,
+            "reattach_in_progress": True,
+        },
+    }
+
+
+def _install_opportunity_ledger_stub(
+    monkeypatch,
+    *,
+    create_opportunities,
+    mark_watcher_invalidated,
+    update_opportunity=None,
+):
     _opp = types.ModuleType("ap.opportunity_ledger")
+    _opp.CREATED = "CREATED"
     _opp.WATCHER_ARMED = "WATCHER_ARMED"
     _opp.BROKER_SUBMITTED = "BROKER_SUBMITTED"
     _opp.BROKER_ACKED = "BROKER_ACKED"
@@ -143,6 +167,7 @@ def _install_opportunity_ledger_stub(monkeypatch, *, create_opportunities, mark_
     _opp.create_opportunities = create_opportunities
     _opp.mark_watcher_armed = MagicMock(return_value=True)
     _opp.mark_watcher_invalidated = mark_watcher_invalidated
+    _opp.update_opportunity = update_opportunity or MagicMock(return_value=True)
     monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", _opp)
     return _opp
 
@@ -237,6 +262,11 @@ def test_terminal_marker_readback_suppresses_new_disposition(monkeypatch):
         "_query_active_entry_order",
         lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
     )
+    monkeypatch.setattr(
+        ov,
+        "_query_latest_entry_order_no_status",
+        lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
+    )
 
     disp = ov._resolve_shared_setup_disposition(
         "sig-reattach-integration",
@@ -282,6 +312,11 @@ def test_second_full_reeval_terminal_marker_creates_zero_replacement_orders(monk
         "_query_active_entry_order",
         lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
     )
+    monkeypatch.setattr(
+        ov,
+        "_query_latest_entry_order_no_status",
+        lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
+    )
     monkeypatch.setattr(ov, "_mark_job_rejected", lambda *_a, **_kw: None)
     monkeypatch.setattr(ov, "_mark_job_error", lambda *_a, **_kw: None)
     monkeypatch.setattr(ov, "_mark_job_watching_reason", lambda *_a, **_kw: None)
@@ -312,6 +347,229 @@ def test_second_full_reeval_terminal_marker_creates_zero_replacement_orders(monk
 
     assert result["already_resolved"] == 1
     assert result["retryable_deferred"] == 0
+    mc_evaluate.assert_not_called()
+    selector_select.assert_not_called()
+    osm_create.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.place_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+    broker.replace_order.assert_not_called()
+
+
+def test_latest_no_status_terminal_order_suppresses_new_disposition(monkeypatch):
+    _install_opportunity_ledger_stub(
+        monkeypatch,
+        create_opportunities=MagicMock(return_value=1),
+        mark_watcher_invalidated=MagicMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_get_client_opportunity_row",
+        lambda *_a, **_kw: ov._LookupResult(
+            canonical_signal_id="sig-reattach-integration",
+            lookup_status=ov._LS_NOT_FOUND,
+            row=None,
+            error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_active_entry_order",
+        lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_latest_entry_order_no_status",
+        lambda *_a, **_kw: (ov._LS_FOUND, {
+            **_pending_trigger_order_row(),
+            "status": "CANCELED",
+        }),
+    )
+
+    disp = ov._resolve_shared_setup_disposition(
+        "sig-reattach-integration",
+        "jose@example.com",
+        _shared_row()["payload"],
+        "paper",
+        session_key="2026-07-27",
+    )
+
+    assert disp.disposition == ov._DISPOSITION_ALREADY_TERMINAL
+
+
+def test_pre_watch_fence_failure_never_calls_watcher_or_replaces_order(monkeypatch):
+    _install_reeval_sub_module_stubs(monkeypatch)
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: "2026-07-27")
+    monkeypatch.setattr(
+        ov, "_fetch_watching_signals_with_status_impl",
+        lambda _c: ov._FetchWatchingSignalsResult(
+            rows=[_shared_row()],
+            trade_queue_status=ov._SOURCE_STATUS_SUCCESS,
+            ap_signals_status=ov._SOURCE_STATUS_SUCCESS,
+            trade_queue_error=None,
+            ap_signals_error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_get_client_opportunity_row",
+        lambda *_a, **_kw: ov._LookupResult(
+            canonical_signal_id="sig-reattach-integration",
+            lookup_status=ov._LS_NOT_FOUND,
+            row=None,
+            error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_active_entry_order",
+        lambda *_a, **_kw: (ov._LS_FOUND, _pending_trigger_order_row()),
+    )
+    monkeypatch.setattr(ov, "_persist_reattach_in_progress_fence", MagicMock(return_value=False))
+    monkeypatch.setattr(ov, "_mark_job_rejected", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ov, "_mark_job_error", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ov, "_mark_job_watching_reason", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ov, "_mark_job_watching_armed", lambda *_a, **_kw: None)
+
+    mc_evaluate = MagicMock()
+    osm_create = MagicMock()
+    selector_select = MagicMock()
+    watcher_watch = MagicMock(return_value=True)
+    broker = SimpleNamespace(
+        submit_order=MagicMock(), place_order=MagicMock(),
+        cancel_order=MagicMock(), replace_order=MagicMock(),
+        get_prior_day_levels=lambda _t: {"prior_day_high": 502, "prior_day_low": 498},
+    )
+
+    result = ov.run_overnight_reeval(
+        client_id="jose@example.com",
+        broker=broker,
+        data_broker=broker,
+        master_control=SimpleNamespace(evaluate=mc_evaluate),
+        contract_selector=SimpleNamespace(select=selector_select),
+        order_state_machine=SimpleNamespace(
+            create_entry_order=osm_create,
+            get_order=lambda _oid: {"local_order_id": _oid, "status": "PENDING_TRIGGER"},
+        ),
+        entry_watcher=SimpleNamespace(has_order=lambda _oid: False, watch=watcher_watch),
+        force=True,
+    )
+
+    assert result["retryable_deferred"] == 1
+    assert result["completed"] is False
+    watcher_watch.assert_not_called()
+    mc_evaluate.assert_not_called()
+    selector_select.assert_not_called()
+    osm_create.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.place_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
+    broker.replace_order.assert_not_called()
+
+
+def test_post_watch_marker_failure_then_second_reeval_cannot_return_new(monkeypatch):
+    _install_reeval_sub_module_stubs(monkeypatch)
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: "2026-07-27")
+    monkeypatch.setattr(
+        ov, "_fetch_watching_signals_with_status_impl",
+        lambda _c: ov._FetchWatchingSignalsResult(
+            rows=[_shared_row()],
+            trade_queue_status=ov._SOURCE_STATUS_SUCCESS,
+            ap_signals_status=ov._SOURCE_STATUS_SUCCESS,
+            trade_queue_error=None,
+            ap_signals_error=None,
+        ),
+    )
+    monkeypatch.setattr(ov, "_mark_job_rejected", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ov, "_mark_job_error", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ov, "_mark_job_watching_reason", lambda *_a, **_kw: None)
+    monkeypatch.setattr(ov, "_mark_job_watching_armed", lambda *_a, **_kw: None)
+
+    broker = SimpleNamespace(
+        submit_order=MagicMock(), place_order=MagicMock(),
+        cancel_order=MagicMock(), replace_order=MagicMock(),
+        get_prior_day_levels=lambda _t: {"prior_day_high": 502, "prior_day_low": 498},
+    )
+    mc_evaluate = MagicMock()
+    osm_create = MagicMock()
+    selector_select = MagicMock()
+
+    # Attempt 1: active PENDING_TRIGGER; pre-watch fence succeeds; watcher
+    # returns False; exact reread sees CANCELED; terminal marker fails.
+    monkeypatch.setattr(
+        ov,
+        "_get_client_opportunity_row",
+        lambda *_a, **_kw: ov._LookupResult(
+            canonical_signal_id="sig-reattach-integration",
+            lookup_status=ov._LS_NOT_FOUND,
+            row=None,
+            error=None,
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_active_entry_order",
+        lambda *_a, **_kw: (ov._LS_FOUND, _pending_trigger_order_row()),
+    )
+    monkeypatch.setattr(ov, "_persist_reattach_in_progress_fence", MagicMock(return_value=True))
+    monkeypatch.setattr(
+        ov,
+        "_query_exact_entry_order_by_local_id",
+        lambda *_a, **_kw: (ov._LS_FOUND, {
+            **_pending_trigger_order_row(),
+            "status": "CANCELED",
+        }),
+    )
+    monkeypatch.setattr(ov, "_persist_reattach_terminal_suppression_marker", MagicMock(return_value=False))
+
+    first = ov.run_overnight_reeval(
+        client_id="jose@example.com",
+        broker=broker,
+        data_broker=broker,
+        master_control=SimpleNamespace(evaluate=mc_evaluate),
+        contract_selector=SimpleNamespace(select=selector_select),
+        order_state_machine=SimpleNamespace(
+            create_entry_order=osm_create,
+            get_order=lambda _oid: {"local_order_id": _oid, "status": "CANCELED"},
+        ),
+        entry_watcher=SimpleNamespace(has_order=lambda _oid: False, watch=MagicMock(return_value=False)),
+        force=True,
+    )
+    assert first["retryable_deferred"] == 1
+    assert first["completed"] is False
+
+    # Attempt 2: opportunity lookup is still NOT_FOUND and active fence sees
+    # nothing, but resolver's no-status latest-order fence finds CANCELED.
+    monkeypatch.setattr(
+        ov,
+        "_query_active_entry_order",
+        lambda *_a, **_kw: (ov._LS_NOT_FOUND, None),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_latest_entry_order_no_status",
+        lambda *_a, **_kw: (ov._LS_FOUND, {
+            **_pending_trigger_order_row(),
+            "status": "CANCELED",
+        }),
+    )
+
+    second = ov.run_overnight_reeval(
+        client_id="jose@example.com",
+        broker=broker,
+        data_broker=broker,
+        master_control=SimpleNamespace(evaluate=mc_evaluate),
+        contract_selector=SimpleNamespace(select=selector_select),
+        order_state_machine=SimpleNamespace(
+            create_entry_order=osm_create,
+            get_order=lambda _oid: {"local_order_id": _oid, "status": "CANCELED"},
+        ),
+        entry_watcher=SimpleNamespace(has_order=lambda _oid: False, watch=MagicMock(return_value=True)),
+        force=True,
+    )
+
+    assert second["already_resolved"] == 1
+    assert second["retryable_deferred"] == 0
     mc_evaluate.assert_not_called()
     selector_select.assert_not_called()
     osm_create.assert_not_called()
@@ -354,6 +612,10 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
         ov, "_query_active_entry_order",
         lambda *_a, **_kw: (ov._LS_FOUND, _pending_trigger_order_row()),
     )
+    monkeypatch.setattr(
+        ov, "_persist_reattach_in_progress_fence",
+        MagicMock(return_value=True),
+    )
 
     # Trap DB writers.
     monkeypatch.setattr(ov, "_mark_job_rejected", lambda *_a, **_kw: None)
@@ -370,6 +632,7 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
     _opp.TERMINAL_STATUSES = frozenset({"EXPIRED", "CANCELED", "REJECTED"})
     _opp.create_opportunities = MagicMock()
     _opp.mark_watcher_armed = mock_ledger  # attempt 1 = fail; attempt 2 = ok
+    _opp.update_opportunity = MagicMock(return_value=True)
     monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", _opp)
 
     mc_evaluate = MagicMock()

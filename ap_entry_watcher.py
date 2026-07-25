@@ -3906,6 +3906,14 @@ class APEntryWatcher:
                         self._persist_watcher_audit(local_order_id, _bug_c_full_audit)
                     except Exception:
                         pass
+                    if _recovery_rearm:
+                        self._terminalize_recovery_rearm_candidate(
+                            local_order_id,
+                            ticker=ticker,
+                            classification=_terminal_reason,
+                            watcher_owned=bool(_watcher_owned),
+                            already_through=True,
+                        )
                     # Preserve legacy log markers + reason code so downstream
                     # structural checks (PR #304 Bug C tests, invalidation
                     # taxonomy) continue to recognise this terminalization.
