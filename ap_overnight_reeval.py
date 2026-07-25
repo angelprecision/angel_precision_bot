@@ -110,10 +110,19 @@ def _normalize_overnight_side(value) -> str:
     return "UNKNOWN"
 
 
-# SIGNALS_LOOKBACK: hours-based alternative. When set, takes precedence over
-# OVERNIGHT_SIGNAL_MAX_AGE_DAYS for the initial created_at cutoff query.
-# Default 18h — covers signals from previous session's close to pre-market.
-_SIGNALS_LOOKBACK_HOURS = int(os.getenv("SIGNALS_LOOKBACK", "18"))
+# SIGNALS_LOOKBACK: hours-based override. Only applied when explicitly set.
+# Without the env var, the cutoff is computed session-aware (see below) so a
+# Friday scanner setup remains visible on Monday morning without every
+# deployment having to override the environment to survive the weekend.
+def _signals_lookback_hours_env() -> Optional[int]:
+    raw = os.getenv("SIGNALS_LOOKBACK")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return v if v > 0 else None
 
 
 def _et_now() -> datetime:
@@ -159,6 +168,42 @@ def _prior_trading_session_date(ref: Optional[datetime] = None) -> date:
         while d.weekday() >= 5:  # Sat/Sun
             d = d - timedelta(days=1)
         return d
+
+
+def _signals_lookback_cutoff_iso(now: Optional[datetime] = None) -> str:
+    """Return the ISO-8601 UTC cutoff to use for the ap_signals/trade_queue
+    created_at filter.
+
+    Rules (in order):
+      1. If SIGNALS_LOOKBACK is explicitly set to a positive integer,
+         cutoff = now - SIGNALS_LOOKBACK hours (backwards-compat override).
+      2. Otherwise cutoff = start (00:00 ET) of the PRIOR TRADING SESSION.
+         On Monday morning this reaches back to Friday 00:00 ET so a Friday
+         scanner setup remains visible through the entire Monday morning
+         reeval window. Skips weekends and NYSE full-closure holidays via
+         the canonical calendar in _prior_trading_session_date.
+
+    The prior default of 18 hours defeats the exact Friday-to-Monday recovery
+    this PR was written to guarantee; that is why the default is now session-
+    aware. The env var remains honored so operators can pin an explicit
+    window for A/B experiments — but correctness does not depend on it.
+    """
+    _now = now or datetime.now(timezone.utc)
+    hours = _signals_lookback_hours_env()
+    if hours is not None:
+        return (_now - timedelta(hours=hours)).isoformat()
+    # Session-aware default. Compute prior-trading-session date in ET, then
+    # anchor cutoff at 00:00 ET of that date and convert to UTC.
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _et = _ZI("America/New_York")
+        prior = _prior_trading_session_date(_now.astimezone(_et))
+        prior_start_et = datetime(prior.year, prior.month, prior.day, 0, 0, 0, tzinfo=_et)
+        return prior_start_et.astimezone(timezone.utc).isoformat()
+    except Exception:
+        # Fail safe: 96h (Friday-to-Tuesday round-trip covers every weekend
+        # + a Monday holiday). Never fall back to the old 18h default.
+        return (_now - timedelta(hours=96)).isoformat()
 
 
 # ── PR4 (prior-day-level cache fallback) ─────────────────────────────────────
@@ -2481,17 +2526,11 @@ def _fetch_watching_signals(client_id: str) -> list:
         if not sb_url or not sb_key:
             log.warning("_fetch_watching_signals[ap_signals]: missing Supabase credentials")
         else:
-            # Use SIGNALS_LOOKBACK (hours) when set; fall back to day-based
-            _lookback_hours = _SIGNALS_LOOKBACK_HOURS
-            if _lookback_hours and _lookback_hours > 0:
-                cutoff = (
-                    datetime.now(timezone.utc) - timedelta(hours=_lookback_hours)
-                ).isoformat()
-            else:
-                cutoff = (
-                    datetime.now(timezone.utc)
-                    - timedelta(days=OVERNIGHT_SIGNAL_MAX_AGE_DAYS + 1)
-                ).isoformat()
+            # Session-aware cutoff (see _signals_lookback_cutoff_iso). A
+            # Friday scanner setup remains visible on Monday morning without
+            # requiring an explicit SIGNALS_LOOKBACK override on every
+            # deployment. Env var still honored when explicitly set.
+            cutoff = _signals_lookback_cutoff_iso()
             sb = _cc(sb_url, sb_key)
             # ── MULTI-CLIENT FAN-OUT FIX ──────────────────────────────────
             # Do NOT filter ap_signals by client_email here. WATCHING rows in
