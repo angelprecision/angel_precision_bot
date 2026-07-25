@@ -1549,6 +1549,9 @@ def run_overnight_reeval(
                         "overnight_reeval_session_key":     session_key,
                         "signal_id":                        _reattach_signal_id,
                         "canonical_signal_id":              _reattach_canonical,
+                        # PR #388 Blocker 1: REATTACH is a proven PR#388
+                        # seam and opts in to the late-attachment classifier.
+                        "late_attachment_policy_eligible":  True,
                     }
 
                     import types as _types_mod
@@ -1575,6 +1578,7 @@ def run_overnight_reeval(
                         canonical_signal_id = _reattach_canonical,
                         client_id         = _reattach_client,
                         execution_mode    = _reattach_mode,
+                        late_attachment_policy_eligible = True,
                         metadata          = _reattach_metadata,
                     )
 
@@ -2185,7 +2189,16 @@ def run_overnight_reeval(
                 "pre_market_selector_failure": None,
                 "pre_market_selector_reason_code": None,
                 "contract_selection_deferred_to": "breach_time",
+                # PR #388 Blocker 1: only PR#388 seams opt in to the
+                # late-attachment continuation/reset classifier. Ordinary
+                # intraday/direct arms keep committed-main's strict
+                # arm_already_through_trigger invariant.
+                "late_attachment_policy_eligible": True,
             })
+            # Also expose the flag as a top-level plan attribute so
+            # APEntryWatcher.watch() can read it without descending into
+            # metadata (matches how client_id / execution_mode are wired).
+            setattr(decision.plan, "late_attachment_policy_eligible", True)
             if _lifecycle_ok:
                 try:
                     from ap_lifecycle import LEDGER as _L

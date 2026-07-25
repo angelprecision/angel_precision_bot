@@ -86,63 +86,56 @@ def _make_watcher_in_state(state):
     return ew.WatchedSignal(signal, overnight=False)
 
 
+def _force_classifier_import_error(monkeypatch):
+    """Force `from ap.pending_trigger_classifier import ...` to raise
+    ImportError inside the current process on any Python version. Uses a
+    narrow builtins.__import__ patch (no meta_path loader; no
+    find_module/load_module — deprecated in Py3.12+ and removed later)."""
+    import builtins
+    import sys as _sys
+
+    _real_import = builtins.__import__
+    monkeypatch.delitem(_sys.modules, "ap.pending_trigger_classifier", raising=False)
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "ap.pending_trigger_classifier" or (
+            name == "ap"
+            and fromlist
+            and "pending_trigger_classifier" in tuple(fromlist)
+        ):
+            raise ImportError("test: classifier import forced to fail")
+        return _real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+
+
 def test_poll_time_gate_preserves_state_on_classifier_import_error(monkeypatch):
-    """Simulate an import failure by breaking sys.modules for the classifier.
-    The gate must return PENDING with state preserved; NEVER enter ordinary
-    breach and NEVER fire TRIGGERED."""
+    """Force the classifier import inside check() to raise; assert state is
+    preserved, ordinary breach never runs, watcher does not TRIGGER."""
     w = _make_watcher_in_state(_WITHIN)
     assert w.late_attachment_state == _WITHIN
 
-    # Force the import inside check() to raise by deleting the module.
-    import sys as _sys
-    original = _sys.modules.pop("ap.pending_trigger_classifier", None)
-    class _RaisingLoader:
-        def find_module(self, name, path=None):
-            if name == "ap.pending_trigger_classifier":
-                return self
-            return None
-        def load_module(self, name):
-            raise ImportError("test: classifier import forced to fail")
-    _sys.meta_path.insert(0, _RaisingLoader())
-    try:
-        st = w.check(bid=200.30, ask=200.40)   # would ordinarily WAITING_RESET
-    finally:
-        _sys.meta_path.pop(0)
-        if original is not None:
-            _sys.modules["ap.pending_trigger_classifier"] = original
+    _force_classifier_import_error(monkeypatch)
+    st = w.check(bid=200.30, ask=200.40)   # would ordinarily WAITING_RESET
 
-    # Must NOT have progressed to TRIGGERED via ordinary breach.
     assert st != ew.WatchState.TRIGGERED, (
         "Ordinary breach path fired despite classifier import failure — "
         "the safety gate evaporated with its module."
     )
-    # State must be preserved.
     assert w.late_attachment_state == _WITHIN, (
         f"late_attachment_state was mutated to {w.late_attachment_state!r} "
         f"after a classifier import failure"
     )
-    # breach_count must NOT have incremented via ordinary path.
     assert w.breach_count == 0
 
 
-def test_poll_time_gate_preserves_waiting_state_on_import_error():
+def test_poll_time_gate_preserves_waiting_state_on_import_error(monkeypatch):
     """Symmetric proof for WAITING_RESET."""
     w = _make_watcher_in_state(_WAITING)
     assert w.late_attachment_state == _WAITING
-    import sys as _sys
-    original = _sys.modules.pop("ap.pending_trigger_classifier", None)
-    class _R:
-        def find_module(self, name, path=None):
-            return self if name == "ap.pending_trigger_classifier" else None
-        def load_module(self, name):
-            raise ImportError("forced")
-    _sys.meta_path.insert(0, _R())
-    try:
-        st = w.check(bid=200.30, ask=200.40)
-    finally:
-        _sys.meta_path.pop(0)
-        if original is not None:
-            _sys.modules["ap.pending_trigger_classifier"] = original
+
+    _force_classifier_import_error(monkeypatch)
+    st = w.check(bid=200.30, ask=200.40)
 
     assert st != ew.WatchState.TRIGGERED
     assert w.late_attachment_state == _WAITING
