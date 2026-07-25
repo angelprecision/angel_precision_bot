@@ -1223,45 +1223,78 @@ def _resolve_canonical_adoption_execution_mode(exit_engine, order: dict):
     """Resolve the exact execution_mode to pass into
     adopt_canonical_position_identity, or fail closed.
 
-    AMENDMENT (PR #385 review — Fix 1): the previous seed path passed
-    `str(order.get("execution_mode") or "")` unchanged, which meant any
-    canonical order row with a NULL execution_mode (historical rows,
-    recovery-created rows) would attempt adoption as "" and be rejected
-    by the exit engine's mode-mismatch guard even when the engine and
-    existing broker-repair position were already proven LIVE (or PAPER).
+    AMENDMENT (PR #385 review — Fix A): consult the ENGINE's structured
+    resolution status, not a bare mode string.  The bare string is ""
+    for BOTH "no evidence" and "contradictory evidence"; treating them
+    the same lets a known-good order mode launder a genuine engine
+    conflict.  We now branch on `_resolved_execution_mode_detail()`:
 
-    Resolution policy (fail closed on any ambiguity):
-      1. Normalize order mode; only lowercase live/paper are recognized.
-      2. Ask the exit engine for its fail-closed resolved mode.
-      3. If both known and equal → return that mode.
-      4. If exactly one is known → return the known mode.
-      5. If both known and disagree → conflict (fail closed).
-      6. If neither known → unproven (fail closed).
+      engine PROVEN   → reconcile against order mode; disagree ⇒ CONFLICT
+      engine CONFLICT → fail closed regardless of order mode
+      engine UNPROVEN → a normalized known order mode may be used;
+                        otherwise UNPROVEN
+
+    The existing `_resolved_execution_mode()` contract remains unchanged
+    for all its other callers.
 
     Returns a 3-tuple (mode, disposition, diagnostics):
       mode        — "live" | "paper" | ""  ("" means "do not adopt")
       disposition — "OK" | "CONFLICT" | "UNPROVEN"
-      diagnostics — dict with order_mode / engine_mode for logs.
+      diagnostics — dict with order_mode / engine_mode / engine_status
+                    / engine_sources for logs and audit records.
     """
     order_mode = _normalize_execution_mode_token(order.get("execution_mode"))
+
+    engine_status = "UNPROVEN"
     engine_mode = ""
-    _resolver = getattr(exit_engine, "_resolved_execution_mode", None)
-    if callable(_resolver):
+    engine_sources: dict = {}
+    _detail_fn = getattr(exit_engine, "_resolved_execution_mode_detail", None)
+    if callable(_detail_fn):
         try:
-            engine_mode = _normalize_execution_mode_token(_resolver())
+            _d = _detail_fn() or {}
+            engine_mode = _normalize_execution_mode_token(_d.get("mode"))
+            _s = str(_d.get("status") or "").upper()
+            if _s in {"PROVEN", "CONFLICT", "UNPROVEN"}:
+                engine_status = _s
+            engine_sources = dict(_d.get("sources") or {})
         except Exception:
+            # Structured detail unavailable — do NOT silently downgrade
+            # to plain-mode inference; treat as UNPROVEN.
+            engine_status = "UNPROVEN"
             engine_mode = ""
+    else:
+        # Older engine without the detail helper: fall back to the plain
+        # resolver.  Its "" cannot distinguish CONFLICT from UNPROVEN, so
+        # we conservatively treat "" as UNPROVEN here.  Real production
+        # engines always expose the detail helper.
+        _plain = getattr(exit_engine, "_resolved_execution_mode", None)
+        if callable(_plain):
+            try:
+                engine_mode = _normalize_execution_mode_token(_plain())
+            except Exception:
+                engine_mode = ""
+            engine_status = "PROVEN" if engine_mode else "UNPROVEN"
 
-    diag = {"order_mode": order_mode, "engine_mode": engine_mode}
+    diag = {
+        "order_mode": order_mode,
+        "engine_mode": engine_mode,
+        "engine_status": engine_status,
+        "engine_sources": engine_sources,
+    }
 
-    if order_mode and engine_mode:
-        if order_mode == engine_mode:
-            return order_mode, "OK", diag
+    # Engine CONFLICT must ALWAYS fail closed — a known-good order mode
+    # cannot mask contradictory engine evidence.
+    if engine_status == "CONFLICT":
         return "", "CONFLICT", diag
-    if order_mode and not engine_mode:
-        return order_mode, "OK", diag
-    if engine_mode and not order_mode:
+
+    if engine_status == "PROVEN":
+        if order_mode and order_mode != engine_mode:
+            return "", "CONFLICT", diag
         return engine_mode, "OK", diag
+
+    # Engine UNPROVEN.
+    if order_mode:
+        return order_mode, "OK", diag
     return "", "UNPROVEN", diag
 
 
@@ -1309,32 +1342,59 @@ def _seed_exit_engine(exit_engine, position_id: str, order: dict, result: dict, 
                 if _mode_disp == "CONFLICT"
                 else "CANONICAL_ADOPTION_MODE_UNPROVEN"
             )
+            _client_id = str(order.get("client_id") or "")
+            _payload = {
+                "contract": _contract_for_adopt,
+                "position_id": position_id,
+                "local_order_id": order.get("local_order_id"),
+                "broker_order_id": order.get("broker_order_id"),
+                "signal_id": signal_id or order.get("signal_id"),
+                "order_mode": _mode_diag.get("order_mode"),
+                "engine_mode": _mode_diag.get("engine_mode"),
+                "engine_status": _mode_diag.get("engine_status"),
+                "engine_sources": _mode_diag.get("engine_sources"),
+            }
             log.critical(
                 "[%s] %s | contract=%s position_id=%s local=%s broker=%s "
-                "order_mode=%s engine_mode=%s — protective monitoring retained; "
-                "no new exit owner created",
-                order.get("client_id"), _reason_code,
+                "order_mode=%s engine_mode=%s engine_status=%s — protective "
+                "monitoring retained; no new exit owner created",
+                _client_id, _reason_code,
                 _contract_for_adopt, position_id,
                 order.get("local_order_id"), order.get("broker_order_id"),
                 _mode_diag.get("order_mode"), _mode_diag.get("engine_mode"),
+                _mode_diag.get("engine_status"),
             )
+            # AMENDMENT (PR #385 review — Fix B): use the real audit /
+            # emit_fill_event signatures.  Previously we called
+            # emit_fill_event with unsupported kwargs (client_id/event/
+            # payload) which raised TypeError, swallowed by a bare
+            # `except Exception: pass` — the durable diagnostic never
+            # actually landed.  Both writes remain best-effort and
+            # non-fatal, but call the functions correctly.
             try:
-                _emit = globals().get("emit_fill_event")
-                if callable(_emit):
-                    _emit(
-                        client_id=order.get("client_id") or "",
-                        event=_reason_code,
-                        payload={
-                            "contract": _contract_for_adopt,
-                            "position_id": position_id,
-                            "local_order_id": order.get("local_order_id"),
-                            "broker_order_id": order.get("broker_order_id"),
-                            "order_mode": _mode_diag.get("order_mode"),
-                            "engine_mode": _mode_diag.get("engine_mode"),
-                        },
-                    )
-            except Exception:
-                pass
+                audit(_client_id, "CRITICAL", _reason_code, _payload)
+            except Exception as _audit_err:
+                log.warning(
+                    "[%s] audit write failed for %s: %s",
+                    _client_id, _reason_code, _audit_err,
+                )
+            try:
+                emit_fill_event(
+                    order,
+                    decision="ERROR",
+                    reason_code=_reason_code,
+                    explanation=(
+                        "Canonical adoption execution mode could not be proven; "
+                        "no new exit owner created."
+                    ),
+                    result=result or {},
+                    extra_context=_payload,
+                )
+            except Exception as _emit_err:
+                log.warning(
+                    "[%s] emit_fill_event failed for %s: %s",
+                    _client_id, _reason_code, _emit_err,
+                )
             return
         try:
             _entry_fill_for_adopt = _safe_float(

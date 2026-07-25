@@ -721,7 +721,18 @@ def _copy_hard_exit_reference(dst, src) -> None:
 
 
 def _merge_hard_exit_reference_for_collapse(dst, src, *, now_utc: datetime) -> None:
-    """Merge repair hard-ref into canonical using QPM's authority ranking."""
+    """Merge repair hard-ref into canonical using the canonical replacement rule.
+
+    AMENDMENT (PR #385 review — Fix C): the previous merge did its own
+    `src_ts > dst_ts` compare and did NOT consult source quality.  An
+    equal-time repair BID therefore could not replace a canonical
+    MARK/LAST/ASK during broker-repair collapse, leaving the persisted
+    canonical authority on the inferior source.  Delegate to the shared
+    `_should_replace_hard_ref` gate (same helper that already governs
+    _apply_option_quote_for_decision and apply_quote_snapshots) and pass
+    source labels so equal-normalized-timestamp ties break by source
+    quality (BID > LAST > MARK > catastrophic ASK).
+    """
     try:
         _src_price = float(getattr(src, "hard_exit_reference_price", 0.0) or 0.0)
         _dst_price = float(getattr(dst, "hard_exit_reference_price", 0.0) or 0.0)
@@ -730,6 +741,8 @@ def _merge_hard_exit_reference_for_collapse(dst, src, *, now_utc: datetime) -> N
 
     _src_validity = str(getattr(src, "hard_exit_reference_validity", "") or "")
     _dst_validity = str(getattr(dst, "hard_exit_reference_validity", "") or "")
+    _src_source = str(getattr(src, "hard_exit_reference_source", "") or "")
+    _dst_source = str(getattr(dst, "hard_exit_reference_source", "") or "")
     _src_ts = _normalize_hard_ref_ts(
         getattr(src, "hard_exit_reference_ts", None), now_utc=now_utc
     )
@@ -737,22 +750,33 @@ def _merge_hard_exit_reference_for_collapse(dst, src, *, now_utc: datetime) -> N
         getattr(dst, "hard_exit_reference_ts", None), now_utc=now_utc
     )
 
+    # Unproven / no-data source cannot erase a positive authoritative dst.
     if _src_validity == "no_data" or _src_price <= 0:
         if _dst_price > 0:
             _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
         return
 
-    if _hard_ref_is_authoritative(_src_validity):
-        if _src_ts is not None and (_dst_ts is None or _src_ts > _dst_ts):
-            _copy_hard_exit_reference(dst, src)
+    # Same fail-closed guard for an unproven src over an authoritative dst.
+    if (
+        _src_validity == "unproven"
+        and _hard_ref_is_authoritative(_dst_validity)
+        and _dst_price > 0
+    ):
+        _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
         return
 
-    if _src_validity == "unproven":
-        if _hard_ref_is_authoritative(_dst_validity) and _dst_price > 0:
-            _set_position_attr_pair(dst, "hard_exit_reference_refresh_needed", True)
-            return
-        if _src_ts is not None and (_dst_ts is None or _src_ts > _dst_ts):
-            _copy_hard_exit_reference(dst, src)
+    _replace = _should_replace_hard_ref(
+        prior_validity=_dst_validity,
+        prior_ts=_dst_ts,
+        prior_price=_dst_price,
+        candidate_validity=_src_validity,
+        candidate_ts=_src_ts,
+        prior_source=_dst_source,
+        candidate_source=_src_source,
+        now_utc=now_utc,
+    )
+    if _replace:
+        _copy_hard_exit_reference(dst, src)
 
 
 def _should_replace_hard_ref(
@@ -6335,16 +6359,26 @@ class APExitEngine:
         m = _re.match(r'^([A-Z]+)\d{6}[CP]\d+$', symbol.strip().upper())
         return m.group(1) if m else symbol.strip().upper()[:5]
 
-    def _resolved_execution_mode(self) -> str:
-        """
-        Fail-closed resolution of LIVE/PAPER identity for this engine instance.
+    def _resolved_execution_mode_detail(self) -> dict:
+        """Structured resolution of LIVE/PAPER identity for this engine.
 
-        Collects every recognized mode source; if the sources disagree (e.g.
-        master_control.mode=paper while broker.mode=live) this returns "" and
-        emits a critical mode-conflict diagnostic. Silently preferring the
-        first hit would launder a LIVE broker under a PAPER identity (or vice
-        versa) and let cross-mode broker repair overwrite the wrong canonical
-        row.
+        AMENDMENT (PR #385 review): callers that must distinguish "no
+        evidence" from "contradictory evidence" (e.g. the fill-monitor
+        canonical adoption gate) need a status they can branch on.
+        `_resolved_execution_mode()` returns "" for BOTH cases; that
+        collapse would let a known-good order mode launder a genuine
+        internal engine conflict.  This helper preserves the distinction.
+
+        Returns:
+            {
+              "mode":    "live" | "paper" | "",
+              "status":  "PROVEN" | "CONFLICT" | "UNPROVEN",
+              "sources": {source_name: normalized_mode, ...},
+            }
+
+        The existing `_resolved_execution_mode()` contract is unchanged;
+        it still returns "" for both CONFLICT and UNPROVEN so all current
+        callers continue to fail closed.
         """
         def _known_mode(value) -> str:
             _mode = str(value or "").strip().lower()
@@ -6371,16 +6405,37 @@ class APExitEngine:
         unique_modes = set(recognized.values())
 
         if len(unique_modes) == 1:
-            return next(iter(unique_modes))
+            return {"mode": next(iter(unique_modes)), "status": "PROVEN",
+                    "sources": recognized}
 
         if len(unique_modes) > 1:
+            return {"mode": "", "status": "CONFLICT", "sources": recognized}
+
+        return {"mode": "", "status": "UNPROVEN", "sources": recognized}
+
+    def _resolved_execution_mode(self) -> str:
+        """
+        Fail-closed resolution of LIVE/PAPER identity for this engine instance.
+
+        Collects every recognized mode source; if the sources disagree (e.g.
+        master_control.mode=paper while broker.mode=live) this returns "" and
+        emits a critical mode-conflict diagnostic. Silently preferring the
+        first hit would launder a LIVE broker under a PAPER identity (or vice
+        versa) and let cross-mode broker repair overwrite the wrong canonical
+        row.
+
+        Returns only the resolved mode string; callers that need to
+        distinguish CONFLICT from UNPROVEN should use
+        `_resolved_execution_mode_detail()`.
+        """
+        detail = self._resolved_execution_mode_detail()
+        if detail["status"] == "CONFLICT":
             log.critical(
                 "[exit_eng] EXECUTION_MODE_CONFLICT client=%s sources=%s — "
                 "broker repair blocked; refusing LIVE/PAPER identity laundering",
-                self._email, recognized,
+                self._email, detail["sources"],
             )
-
-        return ""
+        return detail["mode"]
 
     def _load_db_position_row(self, sym: str) -> dict | None:
         """Look up an active positions row for this client + contract symbol.

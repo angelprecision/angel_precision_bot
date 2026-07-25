@@ -5103,3 +5103,236 @@ class TestFillMonitorSeedExecutionModeBlankOrder:
         result = {"avg_fill": 0.97, "filled_qty": 1}
         fm._seed_exit_engine(_FakeEngine(), "canon-pos-2", order, result, "sig-1")
         assert called["count"] == 0, "conflict must not call adopt_canonical_position_identity"
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — Fix A/B/C)
+# =============================================================================
+
+import types  # noqa: E402
+
+
+class TestEngineExecutionModeConflictPreserved:
+    """Fix A: internal engine mode conflict must remain fail-closed even
+    when the order supplies a normalized live/paper mode."""
+
+    def _make_engine_with_status(self, *, mode, status, sources=None):
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": mode, "status": status,
+                        "sources": sources or {}}
+            def _resolved_execution_mode(self):
+                return mode if status == "PROVEN" else ""
+        return _E()
+
+    def test_engine_conflict_blocks_known_order_mode(self):
+        from ap.fill_monitor import _resolve_canonical_adoption_execution_mode
+        eng = self._make_engine_with_status(
+            mode="", status="CONFLICT",
+            sources={"master_control.mode": "paper", "broker.mode": "live"},
+        )
+        mode, disp, diag = _resolve_canonical_adoption_execution_mode(
+            eng, {"execution_mode": "live"},
+        )
+        assert (mode, disp) == ("", "CONFLICT")
+        assert diag["engine_status"] == "CONFLICT"
+        assert diag["order_mode"] == "live"
+
+    def test_engine_proven_reconciles_with_order(self):
+        from ap.fill_monitor import _resolve_canonical_adoption_execution_mode
+        eng = self._make_engine_with_status(mode="live", status="PROVEN")
+        mode, disp, _ = _resolve_canonical_adoption_execution_mode(
+            eng, {"execution_mode": "LIVE"},
+        )
+        assert (mode, disp) == ("live", "OK")
+
+    def test_engine_proven_disagreement_fails_closed(self):
+        from ap.fill_monitor import _resolve_canonical_adoption_execution_mode
+        eng = self._make_engine_with_status(mode="live", status="PROVEN")
+        mode, disp, _ = _resolve_canonical_adoption_execution_mode(
+            eng, {"execution_mode": "paper"},
+        )
+        assert (mode, disp) == ("", "CONFLICT")
+
+    def test_engine_unproven_uses_known_order_mode(self):
+        from ap.fill_monitor import _resolve_canonical_adoption_execution_mode
+        eng = self._make_engine_with_status(mode="", status="UNPROVEN")
+        mode, disp, _ = _resolve_canonical_adoption_execution_mode(
+            eng, {"execution_mode": "paper"},
+        )
+        assert (mode, disp) == ("paper", "OK")
+
+    def test_engine_unproven_blank_order_is_unproven(self):
+        from ap.fill_monitor import _resolve_canonical_adoption_execution_mode
+        eng = self._make_engine_with_status(mode="", status="UNPROVEN")
+        mode, disp, _ = _resolve_canonical_adoption_execution_mode(
+            eng, {"execution_mode": None},
+        )
+        assert (mode, disp) == ("", "UNPROVEN")
+
+    def test_real_engine_conflict_yields_conflict_detail(self):
+        """Real APExitEngine with disagreeing sources returns CONFLICT."""
+        from ap_exit_engine import APExitEngine as _APExitEngine
+        eng = _APExitEngine.__new__(_APExitEngine)
+        eng._email = "conflict@example.com"
+        eng.master_control = types.SimpleNamespace(mode="paper")
+        eng.broker = types.SimpleNamespace(mode="live")
+        detail = eng._resolved_execution_mode_detail()
+        assert detail["status"] == "CONFLICT"
+        assert detail["mode"] == ""
+
+
+class TestFillMonitorDurableDiagnostics:
+    """Fix B: conflict / unproven adoption must invoke real audit() and
+    real-signature emit_fill_event().  A bare `except Exception: pass`
+    silently swallowing TypeError from wrong kwargs is a hidden failure
+    of the amendment contract."""
+
+    def _install_capture(self, monkeypatch):
+        import ap.fill_monitor as fm
+        audits = []
+        emits = []
+        monkeypatch.setattr(
+            fm, "audit",
+            lambda cid, lvl, evt, payload: audits.append((cid, lvl, evt, payload)),
+        )
+        def _capture_emit(order, *, decision, reason_code, explanation,
+                          result=None, stage="fill_monitor",
+                          extra_inputs=None, extra_context=None):
+            emits.append({
+                "order_client_id": order.get("client_id"),
+                "decision": decision,
+                "reason_code": reason_code,
+                "explanation": explanation,
+                "result": result,
+                "extra_context": extra_context,
+            })
+        monkeypatch.setattr(fm, "emit_fill_event", _capture_emit)
+        return audits, emits
+
+    def _install_engine(self, *, mode, status):
+        adopt_calls = []
+        def _fake_adopt(**kw):
+            adopt_calls.append(kw)
+            class _R: disposition = "ADOPTED"
+            return _R()
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": mode, "status": status, "sources": {}}
+            def _resolved_execution_mode(self):
+                return mode if status == "PROVEN" else ""
+            adopt_canonical_position_identity = staticmethod(_fake_adopt)
+            def get_position(self, _pid): return None
+        return _E(), adopt_calls
+
+    def _order(self, *, exec_mode):
+        return {
+            "client_id": "diag@example.com",
+            "contract": "BAC260724P00062000",
+            "symbol": "BAC260724P00062000",
+            "local_order_id": "L1", "broker_order_id": "B1",
+            "signal_id": "sig-diag",
+            "execution_mode": exec_mode,
+        }
+
+    def test_conflict_calls_audit_and_emit(self, monkeypatch):
+        audits, emits = self._install_capture(monkeypatch)
+        import ap.fill_monitor as fm
+        eng, adopt_calls = self._install_engine(mode="live", status="PROVEN")
+        fm._seed_exit_engine(
+            eng, "canon-p1", self._order(exec_mode="paper"),
+            {"avg_fill": 0.97}, "sig-diag",
+        )
+        assert adopt_calls == []
+        assert any(a[2] == "CANONICAL_ADOPTION_MODE_CONFLICT" for a in audits)
+        assert any(e["reason_code"] == "CANONICAL_ADOPTION_MODE_CONFLICT"
+                   and e["decision"] == "ERROR" for e in emits)
+
+    def test_unproven_calls_audit_and_emit(self, monkeypatch):
+        audits, emits = self._install_capture(monkeypatch)
+        import ap.fill_monitor as fm
+        eng, adopt_calls = self._install_engine(mode="", status="UNPROVEN")
+        fm._seed_exit_engine(
+            eng, "canon-p2", self._order(exec_mode=None),
+            {"avg_fill": 0.97}, "sig-diag",
+        )
+        assert adopt_calls == []
+        assert any(a[2] == "CANONICAL_ADOPTION_MODE_UNPROVEN" for a in audits)
+        assert any(e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN"
+                   and e["decision"] == "ERROR" for e in emits)
+
+    def test_engine_conflict_blocks_and_diagnoses(self, monkeypatch):
+        """The full-stack case: engine CONFLICT + known-good order mode."""
+        audits, emits = self._install_capture(monkeypatch)
+        import ap.fill_monitor as fm
+        eng, adopt_calls = self._install_engine(mode="", status="CONFLICT")
+        fm._seed_exit_engine(
+            eng, "canon-p3", self._order(exec_mode="live"),
+            {"avg_fill": 0.97}, "sig-diag",
+        )
+        assert adopt_calls == []
+        assert any(a[2] == "CANONICAL_ADOPTION_MODE_CONFLICT" for a in audits)
+        assert any(e["reason_code"] == "CANONICAL_ADOPTION_MODE_CONFLICT"
+                   for e in emits)
+
+
+class TestCollapseMergeSourcePriority:
+    """Fix C: equal-time canonical MARK vs repair BID during collapse
+    must produce a persisted BID on the canonical position."""
+
+    def _mk(self, *, price, source, validity="proven", ts):
+        p = types.SimpleNamespace()
+        p.hard_exit_reference_price = price
+        p.hardexitreferenceprice = price
+        p.hard_exit_reference_source = source
+        p.hardexitreferencesource = source
+        p.hard_exit_reference_validity = validity
+        p.hardexitreferencevalidity = validity
+        p.hard_exit_reference_ts = ts
+        p.hardexitreferencets = ts
+        p.hard_exit_reference_pnl_pct = 0.0
+        p.hardexitreferencepnlpct = 0.0
+        p.hard_exit_reference_refresh_needed = False
+        p.hardexitreferencerefreshneeded = False
+        p.entry_price = 1.00
+        return p
+
+    def test_equal_time_repair_bid_replaces_canonical_mark(self):
+        from ap_exit_engine import _merge_hard_exit_reference_for_collapse
+        now = datetime.now(_UTC)
+        canonical = self._mk(price=1.05, source="mark", ts=now)
+        repair    = self._mk(price=0.60, source="bid",  ts=now)
+        _merge_hard_exit_reference_for_collapse(canonical, repair, now_utc=now)
+        assert canonical.hard_exit_reference_source == "bid"
+        assert canonical.hard_exit_reference_price  == 0.60
+
+    def test_equal_time_repair_mark_does_not_replace_canonical_bid(self):
+        from ap_exit_engine import _merge_hard_exit_reference_for_collapse
+        now = datetime.now(_UTC)
+        canonical = self._mk(price=0.60, source="bid",  ts=now)
+        repair    = self._mk(price=1.05, source="mark", ts=now)
+        _merge_hard_exit_reference_for_collapse(canonical, repair, now_utc=now)
+        assert canonical.hard_exit_reference_source == "bid"
+        assert canonical.hard_exit_reference_price  == 0.60
+
+    def test_unproven_repair_does_not_erase_authoritative_canonical(self):
+        from ap_exit_engine import _merge_hard_exit_reference_for_collapse
+        now = datetime.now(_UTC)
+        canonical = self._mk(price=1.05, source="bid", validity="proven", ts=now)
+        repair    = self._mk(price=1.10, source="ask_unproven",
+                             validity="unproven", ts=now)
+        _merge_hard_exit_reference_for_collapse(canonical, repair, now_utc=now)
+        assert canonical.hard_exit_reference_source == "bid"
+        assert canonical.hard_exit_reference_price  == 1.05
+        assert canonical.hard_exit_reference_refresh_needed is True
+
+    def test_older_repair_bid_does_not_replace_newer_canonical_mark(self):
+        """Chronology still wins when timestamps differ."""
+        from ap_exit_engine import _merge_hard_exit_reference_for_collapse
+        newer = datetime.now(_UTC)
+        older = newer - timedelta(seconds=90)
+        canonical = self._mk(price=1.05, source="mark", ts=newer)
+        repair    = self._mk(price=0.60, source="bid",  ts=older)
+        _merge_hard_exit_reference_for_collapse(canonical, repair, now_utc=newer)
+        assert canonical.hard_exit_reference_source == "mark"
+        assert canonical.hard_exit_reference_price  == 1.05
