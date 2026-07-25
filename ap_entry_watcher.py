@@ -3603,15 +3603,15 @@ class APEntryWatcher:
                     _recovery_rearm,
                 )
                 # Fall through to normal add_signal / watcher arm path.
-            elif _late_cls == _PT_TRUTH_RETRY:
-                # Missing canonical truth at arm-time. Seed a dedicated
-                # AWAITING_FIRST_TRUTH state so the poll loop's late-
-                # attachment gate stays engaged and the ordinary breach
-                # path cannot fire on the first available quote without
-                # first classifying it against the continuation window.
-                # (Without this seed a subsequent quote far past the
-                # trigger would run straight through the ordinary breach
-                # path and defeat Block-2.)
+            elif _late_cls == _PT_TRUTH_RETRY and _late_decision.quote is None:
+                # Missing canonical truth at arm-time (canonical side has no
+                # quote — CALL: ask missing; PUT: bid missing; or both zero).
+                # Seed AWAITING_FIRST_TRUTH so the poll loop's gate stays
+                # engaged; the ordinary breach path must not fire on the
+                # first available quote without first classifying it against
+                # the continuation window. TRUTH_RETRY with a valid quote is
+                # handled by the ordinary-arm branch below — that case is
+                # the normal pre-trigger arm, not a late attachment.
                 from ap.pending_trigger_classifier import (
                     LATE_ATTACHMENT_AWAITING_FIRST_TRUTH as _PT_AWAITING,
                 )
@@ -3637,7 +3637,21 @@ class APEntryWatcher:
                     ticker, _late_decision.detail, _recovery_rearm,
                 )
                 # Fall through to normal add_signal / watcher arm path.
-            else:
+            elif _late_cls == _PT_TRUTH_RETRY:
+                # TRUTH_RETRY with a valid canonical quote — the quote is on
+                # the ordinary pre-trigger side of the canonical lane (CALL:
+                # quote<trigger; PUT: quote>trigger). This is the ordinary
+                # normal arm before the trigger has crossed; the setup has
+                # NOT breached and NOT missed its move. Do NOT seed any
+                # late-attachment state — the ordinary breach path owns it.
+                log.debug(
+                    "[%s] arm-time canonical quote=%s is pre-trigger "
+                    "(detail=%s) — arming normally; ordinary breach path owns "
+                    "the future.",
+                    ticker, _late_decision.quote, _late_decision.detail,
+                )
+                # Fall through to normal add_signal / watcher arm path.
+            elif _late_cls in (_PT_STOP_BROKEN, _PT_TARGET_COMPLETE, _PT_MOVE_MISSED):
                 # Terminal at arm-time: STOP_BROKEN / TARGET_COMPLETE /
                 # LATE_ATTACHMENT_MOVE_MISSED_TERMINAL. Preserve the
                 # existing terminalization path, but tag the reason code

@@ -393,6 +393,94 @@ def test_both_zero_arm_time_wired_end_to_end_put():
     assert w.state != ew.WatchState.TRIGGERED
 
 
+# ── TRUTH_RETRY with a valid quote is NOT a late attachment ─────────────────
+# Regression: the prior amendment seeded AWAITING_FIRST_TRUTH for every
+# TRUTH_RETRY result, including the case where the classifier returned a
+# valid pre-trigger canonical quote (CALL: ask<trigger; PUT: bid>trigger).
+# That killed normal trade flow — a CALL armed at ask=199.90 for
+# trigger=200 was placed in AWAITING and then transitioned to WAITING_RESET
+# when the next poll arrived at ask=200.40, even though this was the
+# ordinary "arm slightly early, breach on next tick" path.
+
+
+def test_classifier_call_pre_trigger_quote_returns_truth_retry_with_quote_populated():
+    """Classifier-side proof: a valid CALL ask just below trigger classifies
+    as TRUTH_RETRY, but with .quote populated — distinguishing it from the
+    canonical-quote-unavailable case (quote=None)."""
+    from ap.pending_trigger_classifier import (
+        classify_late_attachment,
+        TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+    )
+    d = classify_late_attachment(
+        side="CALL", trigger_price=200.0, bid=199.85, ask=199.90,
+    )
+    assert d.classification == TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is not None
+    from decimal import Decimal
+    assert d.quote == Decimal("199.90")
+
+
+def test_classifier_put_pre_trigger_quote_returns_truth_retry_with_quote_populated():
+    """PUT symmetric proof — bid above trigger."""
+    from ap.pending_trigger_classifier import (
+        classify_late_attachment,
+        TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+    )
+    d = classify_late_attachment(
+        side="PUT", trigger_price=200.0, bid=200.10, ask=200.15,
+    )
+    assert d.classification == TRIGGER_TRUTH_UNAVAILABLE_RETRY
+    assert d.quote is not None
+    from decimal import Decimal
+    assert d.quote == Decimal("200.10")
+
+
+def test_arm_time_pre_trigger_quote_does_not_seed_late_attachment_state_source():
+    """Structural: the arm-time site's AWAITING seed branch must be gated on
+    `_late_decision.quote is None`. A valid pre-trigger quote must fall
+    through to normal arming — no _late_attachment_seed written."""
+    src = (_pathlib.Path(__file__).parent.parent / "ap_entry_watcher.py").read_text()
+    assert "elif _late_cls == _PT_TRUTH_RETRY and _late_decision.quote is None:" in src, (
+        "The AWAITING_FIRST_TRUTH seed must be gated on quote=None. "
+        "A TRUTH_RETRY with a valid pre-trigger quote is the ordinary arm "
+        "path and must NOT seed any late-attachment gate."
+    )
+    # And the pre-trigger branch must exist as its own elif.
+    assert "elif _late_cls == _PT_TRUTH_RETRY:" in src
+
+
+def test_call_arm_time_pre_trigger_then_first_poll_breach_uses_ordinary_path():
+    """Wiring: watcher armed with no late seed (as the fixed arm-time gate
+    would leave a valid pre-trigger case). First poll arrives at ask=200.40
+    — the ordinary breach path must own it. On the second confirming poll
+    the watcher must TRIGGER via the normal path, NOT enter WAITING_RESET."""
+    # Simulate the fixed arm-time behavior: NO seed on the signal payload.
+    w = ew.WatchedSignal(_signal(side="CALL", entry_price=100.0, stop_price=90.0), overnight=False)
+    # Confirm the watcher was armed with no late state.
+    assert w.late_attachment_state is None
+    # First poll: canonical ask > trigger. Ordinary breach path starts.
+    st1 = w.check(bid=100.35, ask=100.40)
+    assert st1 == ew.WatchState.PENDING
+    assert w.late_attachment_state is None
+    assert w.breach_count == 1
+    # Second poll: normal momentum confirmation fires — NOT WAITING_RESET.
+    st2 = w.check(bid=100.35, ask=100.40)
+    assert st2 == ew.WatchState.TRIGGERED
+    assert w.late_attachment_state is None
+
+
+def test_put_arm_time_pre_trigger_then_first_poll_breach_uses_ordinary_path():
+    """PUT symmetric."""
+    w = ew.WatchedSignal(_signal(side="PUT", entry_price=100.0, stop_price=110.0), overnight=False)
+    assert w.late_attachment_state is None
+    st1 = w.check(bid=99.60, ask=99.65)
+    assert st1 == ew.WatchState.PENDING
+    assert w.breach_count == 1
+    st2 = w.check(bid=99.60, ask=99.65)
+    assert st2 == ew.WatchState.TRIGGERED
+    assert w.late_attachment_state is None
+
+
 # ── Terminal short-circuits still apply when in AWAITING (defensive) ────────
 
 def test_stop_broken_during_awaiting_terminalizes():
