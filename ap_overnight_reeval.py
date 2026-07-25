@@ -696,6 +696,7 @@ _DISPOSITION_ALREADY_ARMED       = "ALREADY_ARMED"
 _DISPOSITION_ALREADY_OWNED       = "ALREADY_OWNED"       # broker-submitted / filled
 _DISPOSITION_ALREADY_TERMINAL    = "ALREADY_TERMINAL"
 _DISPOSITION_REATTACH_WATCHER    = "REATTACH_WATCHER"    # PENDING_TRIGGER order exists, no watcher proof
+_DISPOSITION_ACTIVE_CREATED_RETRY = "ACTIVE_CREATED_RETRY"  # exact CREATED order — retry, never re-enter
 _DISPOSITION_RETRYABLE           = "RETRYABLE"
 _DISPOSITION_NEW                 = "NEW"
 _DISPOSITION_LOOKUP_FAILED       = "LOOKUP_FAILED"
@@ -877,17 +878,24 @@ def _resolve_shared_setup_disposition(
             )
 
         if _active_status == "CREATED":
-            # Case B': order row exists but hasn't transitioned to
+            # Case B': exact order row exists but hasn't transitioned to
             # PENDING_TRIGGER yet (materialization interrupted before
-            # transition, or race with a retry). Classify retryable — do NOT
-            # create a duplicate; the next retry may find PENDING_TRIGGER
-            # and take the reattach path. Never route through NEW.
+            # transition, or race with a retry). Return a DEDICATED
+            # disposition — NOT the generic RETRYABLE — because the outer
+            # caller's RETRYABLE branch shares its code path with NEW and
+            # would fall through to master_control/selector/OSM. That is
+            # exactly the duplicate create_entry_order path the active-
+            # order fence exists to prevent.
             log.info(
-                "[%s] reeval disposition=RETRYABLE (order status=CREATED) "
-                "canonical=%s session=%s local_order_id=%s",
+                "[%s] reeval disposition=ACTIVE_CREATED_RETRY canonical=%s "
+                "session=%s local_order_id=%s (preserve existing CREATED "
+                "order; run classifies retryable_deferred)",
                 client_id, canonical, _session_key, _existing_local_id,
             )
-            return _DispositionResult(_DISPOSITION_RETRYABLE)
+            return _DispositionResult(
+                _DISPOSITION_ACTIVE_CREATED_RETRY,
+                _existing_local_id, _order_row,
+            )
 
         if _active_status in _ALREADY_OWNED_STATUSES:
             # Case C: entry is already in flight or completed. Covers
@@ -1686,6 +1694,27 @@ def run_overnight_reeval(
                     _mark_job_watching_armed(job_id, client_id, f"reattached:{_existing_oid}")
                     result["armed"] += 1
                     result["fresh_armed"] += 1
+                    continue
+
+                if _disp == _DISPOSITION_ACTIVE_CREATED_RETRY:
+                    # PR #388 Blocker #6: an exact active ENTRY order in
+                    # CREATED status already exists for this client + mode
+                    # + canonical_signal_id. Preserve it. Do NOT run
+                    # master_control, contract selector, OSM
+                    # create_entry_order, or the broker. The next reeval
+                    # (or the row's established owner) can transition it
+                    # to PENDING_TRIGGER and take the REATTACH_WATCHER
+                    # path; a duplicate create_entry_order here would
+                    # defeat the whole active-order fence.
+                    _created_oid = (_disp_result.existing_local_order_id or "")
+                    log.info(
+                        "[%s] overnight_reeval: ACTIVE_CREATED_RETRY %s "
+                        "local_order_id=%s — preserving CREATED order; "
+                        "classifying run retryable_deferred",
+                        ticker, signal_id, _created_oid,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
                     continue
 
                 # RETRYABLE or NEW — fall through to normal processing.
