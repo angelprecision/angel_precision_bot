@@ -533,7 +533,7 @@ def _is_terminal_watch_arm_failure_reason(reason: str) -> bool:
         # returns False AND the post-watch verify cannot prove the order
         # is preserved — treat as terminal on the next reeval so no
         # replacement ENTRY is ever created.
-        or reason.startswith("reattach_post_watch_ambiguous")
+        or reason.startswith("reattach_post_watch_")
     )
 
 
@@ -583,7 +583,10 @@ def _get_client_opportunity_row(signal_id: str, client_id: str, signal: dict) ->
 
         res = (
             sb.table("client_signal_opportunities")
-            .select("opportunity_status, miss_stage, miss_reason, metadata, order_local_id")
+            .select(
+                "canonical_signal_id, client_id, opportunity_status, miss_stage, "
+                "miss_reason, metadata, order_local_id"
+            )
             .eq("canonical_signal_id", canonical)
             .eq("client_id", client_id)
             .limit(1)
@@ -765,6 +768,143 @@ _TERMINAL_ENTRY_STATUSES = frozenset({
 })
 
 
+def _persist_reattach_terminal_suppression_marker(
+    *,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+    signal_id: str,
+    signal_payload: dict,
+    local_order_id: str,
+    session_key: str,
+    reason: str,
+    post_status: str,
+    post_row_status: str,
+) -> bool:
+    """Persist and verify a durable terminal marker for a REATTACH outcome.
+
+    The caller may have proved the exact order is terminal, or may be unable
+    to prove whether watch() terminalized it. In both cases, a retry must not
+    classify the setup as NEW just because the active-order fence no longer
+    sees a nonterminal ENTRY row.
+    """
+    _mode = str(execution_mode or "").strip().lower()
+    _session = str(session_key or _overnight_reeval_session_key()).strip()
+    _reason = str(reason or "reattach_post_watch_unknown").strip()
+    if not (
+        client_id and _mode in {"live", "paper"} and canonical_signal_id
+        and signal_id and local_order_id and _session
+    ):
+        log.critical(
+            "REATTACH_TERMINAL_SUPPRESSION_MARKER_INVALID_INPUT "
+            "client=%s mode=%s canonical=%s signal=%s local_order_id=%s session=%s",
+            client_id, execution_mode, canonical_signal_id,
+            signal_id, local_order_id, session_key,
+        )
+        return False
+
+    try:
+        from ap.opportunity_ledger import (
+            create_opportunities as _create_opps,
+            mark_watcher_invalidated as _mark_watcher_invalidated,
+        )
+
+        _sig_payload = dict(signal_payload or {})
+        _sig_payload.setdefault("signal_id", signal_id)
+        _created = _create_opps(
+            signal_id, [client_id], _sig_payload,
+            canonical_signal_id=canonical_signal_id,
+        )
+        if int(_created or 0) < 1:
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_CREATE_FAILED "
+                "client=%s mode=%s canonical=%s local_order_id=%s reason=%s",
+                client_id, _mode, canonical_signal_id, local_order_id, _reason,
+            )
+            return False
+
+        _marker_meta = {
+            "reattach_terminal_suppression": True,
+            "execution_mode": _mode,
+            "overnight_reeval_session_key": _session,
+            "source_table": "ap_signals",
+            "original_signal_id": signal_id,
+            "canonical_signal_id": canonical_signal_id,
+            "local_order_id": str(local_order_id),
+            "reattach_post_watch_status": str(post_status or ""),
+            "reattach_post_watch_row_status": str(post_row_status or ""),
+            "reattach_terminal_suppressed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _marked = _mark_watcher_invalidated(
+            signal_id,
+            client_id,
+            _reason,
+            canonical_signal_id=canonical_signal_id,
+            order_local_id=str(local_order_id),
+            extra_meta=_marker_meta,
+        )
+        if not _marked:
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_MARK_FAILED "
+                "client=%s mode=%s canonical=%s local_order_id=%s reason=%s",
+                client_id, _mode, canonical_signal_id, local_order_id, _reason,
+            )
+            return False
+
+        _readback = _get_client_opportunity_row(signal_id, client_id, _sig_payload)
+        if _readback.lookup_status != _LS_FOUND or not isinstance(_readback.row, dict):
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_READBACK_MISSING "
+                "client=%s mode=%s canonical=%s local_order_id=%s status=%s err=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+                _readback.lookup_status, _readback.error,
+            )
+            return False
+
+        _row = _readback.row
+        _meta = _row.get("metadata") if isinstance(_row.get("metadata"), dict) else {}
+        _row_canonical = str(_row.get("canonical_signal_id") or _readback.canonical_signal_id or "")
+        _row_client = str(_row.get("client_id") or client_id)
+        _row_status = str(_row.get("opportunity_status") or "").upper()
+        _row_stage = str(_row.get("miss_stage") or "").upper()
+        _row_reason = str(_row.get("miss_reason") or "")
+        _row_order = str(_row.get("order_local_id") or _meta.get("local_order_id") or "")
+        _row_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
+        _row_session = str(_meta.get("overnight_reeval_session_key") or "").strip()
+
+        _verified = (
+            _row_canonical == canonical_signal_id
+            and _row_client == client_id
+            and _row_status == "MISSED"
+            and _row_stage == "WATCHER_ARM"
+            and _row_reason == _reason
+            and _row_mode == _mode
+            and _row_session == _session
+            and _row_order == str(local_order_id)
+        )
+        if not _verified:
+            log.critical(
+                "REATTACH_TERMINAL_SUPPRESSION_READBACK_MISMATCH "
+                "client=%s mode=%s canonical=%s local_order_id=%s "
+                "row_canonical=%s row_client=%s row_status=%s row_stage=%s "
+                "row_reason=%s row_mode=%s row_session=%s row_order=%s",
+                client_id, _mode, canonical_signal_id, local_order_id,
+                _row_canonical, _row_client, _row_status, _row_stage,
+                _row_reason, _row_mode, _row_session, _row_order,
+            )
+            return False
+
+        return True
+    except Exception as _marker_exc:
+        log.critical(
+            "REATTACH_TERMINAL_SUPPRESSION_MARKER_EXCEPTION "
+            "client=%s mode=%s canonical=%s local_order_id=%s reason=%s err=%s",
+            client_id, execution_mode, canonical_signal_id,
+            local_order_id, _reason, _marker_exc,
+        )
+        return False
+
+
 def _persist_reattach_post_watch_ambiguity(
     *,
     client_id: str,
@@ -780,50 +920,22 @@ def _persist_reattach_post_watch_ambiguity(
     """Persist a durable AMBIGUOUS opportunity so the NEXT reeval attempt
     cannot classify the setup as NEW and create a replacement ENTRY.
 
-    Written via the opportunity ledger with a distinctive miss_reason that
-    _is_terminal_watch_arm_failure_reason recognises as terminal — so the
-    disposition resolver returns ALREADY_TERMINAL on the next attempt.
-    Best-effort; a False return is a hard failure that MUST be treated as
-    fail-closed retryable by the caller.
+    Returns True only after create, terminal mark, and read-back verification.
+    A False return is a hard failure that MUST be treated as fail-closed
+    retryable by the caller.
     """
-    try:
-        from ap.opportunity_ledger import (
-            create_opportunities as _create_opps_amb,
-            mark_watcher_armed as _mark_wa_amb,
-        )
-        _sig_payload = dict(signal_payload or {})
-        _sig_payload.setdefault("signal_id", signal_id)
-        _create_opps_amb(
-            signal_id, [client_id], _sig_payload,
-            canonical_signal_id=canonical_signal_id,
-        )
-        # We deliberately do NOT mark WATCHER_ARMED — the semantic is
-        # "ambiguous post-watch outcome". Instead, write a MISSED-style
-        # proof via _record_watch_arm_failure_proof using a reason that
-        # is in the terminal set.
-        _record_watch_arm_failure_proof(
-            signal_id=signal_id,
-            client_id=client_id,
-            signal=_sig_payload,
-            reason="reattach_post_watch_ambiguous_terminal_or_missing",
-            session_key=session_key,
-            extra_meta={
-                "execution_mode":                execution_mode,
-                "reattach_post_watch_status":    post_status,
-                "reattach_post_watch_row_status": post_row_status,
-                "local_order_id":                local_order_id,
-                "reattach_ambiguous_at":         datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        return True
-    except Exception as _amb_exc:
-        log.critical(
-            "REATTACH_POST_WATCH_AMBIGUITY_PERSIST_FAILED "
-            "client=%s mode=%s canonical=%s local_order_id=%s err=%s",
-            client_id, execution_mode, canonical_signal_id,
-            local_order_id, _amb_exc,
-        )
-        return False
+    return _persist_reattach_terminal_suppression_marker(
+        client_id=client_id,
+        execution_mode=execution_mode,
+        canonical_signal_id=canonical_signal_id,
+        signal_id=signal_id,
+        signal_payload=signal_payload,
+        local_order_id=local_order_id,
+        session_key=session_key,
+        reason="reattach_post_watch_ambiguous_terminal_or_missing",
+        post_status=post_status,
+        post_row_status=post_row_status,
+    )
 
 
 # ── Disposition constants ─────────────────────────────────────────────────────
@@ -1810,11 +1922,37 @@ def run_overnight_reeval(
 
                         # Case 3: row found in an explicit terminal status.
                         if _post_status == _LS_FOUND and _post_active_status in _TERMINAL_ENTRY_STATUSES:
+                            _terminal_marker_persisted = _persist_reattach_terminal_suppression_marker(
+                                client_id=client_id,
+                                execution_mode=_reattach_mode,
+                                canonical_signal_id=_reattach_canonical,
+                                signal_id=signal_id,
+                                signal_payload=signal,
+                                local_order_id=_existing_oid,
+                                session_key=session_key,
+                                reason=f"reattach_post_watch_terminal:{_post_active_status}",
+                                post_status=_post_status,
+                                post_row_status=_post_active_status,
+                            )
+                            if not _terminal_marker_persisted:
+                                log.critical(
+                                    "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                    " returned False signal=%s local_order_id=%s"
+                                    " — order terminalized (%s) but durable"
+                                    " terminal marker persist FAILED;"
+                                    " classifying retryable_deferred (fail closed)",
+                                    ticker, signal_id, _existing_oid, _post_active_status,
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
                             log.warning(
                                 "[%s] overnight_reeval: REATTACH_WATCHER watch()"
                                 " returned False signal=%s local_order_id=%s"
-                                " — order terminalized (%s);"
-                                " classifying already_resolved (no replacement)",
+                                " — order terminalized (%s); durable marker"
+                                " persisted; classifying already_resolved"
+                                " (no replacement now or on next attempt)",
                                 ticker, signal_id, _existing_oid, _post_active_status,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1

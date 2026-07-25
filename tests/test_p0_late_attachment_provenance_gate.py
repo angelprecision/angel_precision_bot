@@ -23,10 +23,10 @@ import ap_entry_watcher as ew
 
 
 def _force_regular_session(monkeypatch):
-    """Freeze the module's datetime.now to Thursday 2026-07-23 10:15 ET so
+    """Freeze the base module's datetime.now to Thursday 2026-07-23 10:15 ET so
     the arm-time gate treats the call as regular-session (not pre_market,
-    not post_session). Uses the module's `datetime` alias — the exact
-    binding watch() reads."""
+    not post_session). The production import is a shim package; the arm-time
+    logic executes in the loaded base module through super().watch()."""
     from datetime import datetime as _real_datetime
     from zoneinfo import ZoneInfo
     _fixed = _real_datetime(2026, 7, 23, 10, 15, tzinfo=ZoneInfo("America/New_York"))
@@ -38,17 +38,13 @@ def _force_regular_session(monkeypatch):
                 return _fixed.astimezone(tz)
             return _fixed.replace(tzinfo=None)
 
-    # Patch the EXACT globals dict the watch() method resolves LOAD_GLOBAL
-    # against, not just the module attribute ew.datetime. Other tests in
-    # the shared pytest process may swap sys.modules["ap_entry_watcher"]
-    # or reload the module, leaving `ew` (the test's imported name)
-    # pointing to a different object than watch.__globals__ resolves
-    # through. Patching __globals__ eliminates that ambiguity.
-    watch_globals = ew.APEntryWatcher.watch.__globals__
-    monkeypatch.setitem(watch_globals, "datetime", _FrozenDT)
-    monkeypatch.setattr(ew, "datetime", _FrozenDT)   # belt-and-suspenders
+    # Patch the EXACT globals dict the base watch() method resolves
+    # LOAD_GLOBAL against, not the shim module's copied datetime binding.
+    base_watch_globals = ew._BaseAPEntryWatcher.watch.__globals__
+    monkeypatch.setitem(base_watch_globals, "datetime", _FrozenDT)
+    monkeypatch.setattr(ew, "_datetime", _FrozenDT)   # shim-local callers
 
-    assert ew.APEntryWatcher.watch.__globals__["datetime"] is _FrozenDT
+    assert ew._BaseAPEntryWatcher.watch.__globals__["datetime"] is _FrozenDT
 
 
 REPO = pathlib.Path(__file__).parent.parent
