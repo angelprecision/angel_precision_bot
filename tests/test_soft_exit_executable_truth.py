@@ -5563,6 +5563,11 @@ class TestSeedExitEngineResolvedModeThroughFallThrough:
         class _Position:
             option_symbol = "BAC260724P00062000"
             client_id = "jasoncosby1@gmail.com"
+            # AMENDMENT (PR #385 review): proven owner identity requires
+            # exact live/paper on the position too.  Under CONFLICT the
+            # resolved_mode is blank, so the classifier accepts either
+            # live or paper as proven for this position's own identity.
+            execution_mode = "live"
             closed = False
 
         class _E:
@@ -5648,7 +5653,7 @@ class TestSeedExitEngineNoOwnerDiagnostic:
         # Payload must carry the zero owner count.
         _payload = [e[1] for e in audits
                     if e[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
-        assert _payload["existing_owner_count"] == 0
+        assert _payload["proven_owner_count"] == 0
         assert any(
             e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"
             for e in emits
@@ -5656,7 +5661,7 @@ class TestSeedExitEngineNoOwnerDiagnostic:
         # Explanation must not claim monitoring is retained.
         _expl = [e["explanation"] for e in emits
                  if e["reason_code"] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
-        assert "NO protective exit owner" in _expl
+        assert "NO protective owner exists" in _expl
 
 
 # =============================================================================
@@ -5814,12 +5819,16 @@ class TestOwnerCheckRequiresExactClientMatch:
         )
         _payload = [a[1] for a in audits
                     if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
-        assert _payload["existing_owner_count"] == 0
+        assert _payload["proven_owner_count"] == 0
 
-    def test_exact_matching_client_counts_as_owner(self, monkeypatch):
+    def test_exact_matching_client_and_mode_counts_as_owner(self, monkeypatch):
+        """Under the tightened classifier, a same-client-same-contract
+        position ONLY counts as PROVEN when its execution_mode is
+        exactly "live" or "paper" too."""
         class _Position:
             option_symbol = "BAC260724P00062000"
             client_id = "jasoncosby1@gmail.com"
+            execution_mode = "live"   # exact live proves ownership identity
             closed = False
         fm, eng, audits, emits, adopt_calls, added = self._install(
             monkeypatch, [_Position()],
@@ -5828,12 +5837,12 @@ class TestOwnerCheckRequiresExactClientMatch:
                              {"avg_fill": 0.97, "filled_qty": 1}, "sig-1")
         assert added == []
         _reasons = [a[0] for a in audits]
-        # Base reason, not _NO_OWNER.
         assert "CANONICAL_ADOPTION_MODE_UNPROVEN" in _reasons
         assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" not in _reasons
+        assert "CANONICAL_ADOPTION_MODE_UNPROVEN_OWNER_IDENTITY_UNPROVEN" not in _reasons
         _payload = [a[1] for a in audits
                     if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN"][0]
-        assert _payload["existing_owner_count"] == 1
+        assert _payload["proven_owner_count"] == 1
 
     def test_same_client_different_contract_does_not_count(self, monkeypatch):
         class _Position:
@@ -5850,7 +5859,7 @@ class TestOwnerCheckRequiresExactClientMatch:
         assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" in _reasons
         _payload = [a[1] for a in audits
                     if a[0] == "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER"][0]
-        assert _payload["existing_owner_count"] == 0
+        assert _payload["proven_owner_count"] == 0
 
     def test_different_client_same_contract_does_not_count(self, monkeypatch):
         class _Position:
@@ -5865,3 +5874,352 @@ class TestOwnerCheckRequiresExactClientMatch:
         assert added == []
         _reasons = [a[0] for a in audits]
         assert "CANONICAL_ADOPTION_MODE_UNPROVEN_NO_OWNER" in _reasons
+
+
+# =============================================================================
+# AMENDMENT (PR #385 review — hoisted mode gate + owner classifier on every
+# failure path; owner classification requires exact live/paper)
+# =============================================================================
+
+
+def _seed_order(*, exec_mode=None, contract="BAC260724P00062000",
+                client="jasoncosby1@gmail.com"):
+    return {
+        "client_id": client,
+        "contract": contract,
+        "symbol": contract,
+        "local_order_id": "L1", "broker_order_id": "B1",
+        "signal_id": "sig-1",
+        "execution_mode": exec_mode,
+        "qty": 1,
+    }
+
+
+def _install_capture(monkeypatch):
+    import ap.fill_monitor as fm
+    audits, emits = [], []
+    monkeypatch.setattr(fm, "audit",
+                        lambda cid, lvl, evt, payload: audits.append((evt, payload)))
+    monkeypatch.setattr(fm, "emit_fill_event",
+                        lambda o, **kw: emits.append(kw) or True)
+    return fm, audits, emits
+
+
+class _Pos(types.SimpleNamespace):
+    """Position stand-in with defaults matching a behavior-active ManagedPosition."""
+    def __init__(self, **kw):
+        defaults = {
+            "option_symbol": "",
+            "client_id": "",
+            "execution_mode": "",
+            "closed": False,
+        }
+        defaults.update(kw)
+        super().__init__(**defaults)
+
+
+class TestClassifyExistingProtectiveOwner:
+    """The classifier must reject blank / malformed / wrong-mode positions
+    from counting as PROVEN owners, and must distinguish OWNER_IDENTITY_UNPROVEN
+    (same client+contract candidate exists but its identity is unproven)
+    from NO_OWNER (no candidate at all)."""
+
+    def _classify(self, actives, *, expected_mode="live",
+                  contract="BAC260724P00062000",
+                  client="jasoncosby1@gmail.com"):
+        from ap.fill_monitor import _classify_existing_protective_owner
+        class _E:
+            def active_positions(self_): return list(actives)
+        return _classify_existing_protective_owner(
+            exit_engine=_E(), contract=contract, client_id=client,
+            expected_mode=expected_mode,
+        )
+
+    def test_exact_live_client_contract_is_proven(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+        )])
+        assert (s, p, u) == ("PROVEN_OWNER", 1, 0)
+
+    def test_blank_mode_same_client_is_unproven(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="",
+        )])
+        assert (s, p, u) == ("OWNER_IDENTITY_UNPROVEN", 0, 1)
+
+    def test_wrong_mode_same_client_is_unproven(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="paper",
+        )], expected_mode="live")
+        assert (s, p, u) == ("OWNER_IDENTITY_UNPROVEN", 0, 1)
+
+    def test_blank_client_never_counts(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="",
+            execution_mode="live",
+        )])
+        assert s == "NO_OWNER" and p == 0 and u == 0
+
+    def test_different_client_never_counts(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="other@example.com",
+            execution_mode="live",
+        )])
+        assert s == "NO_OWNER"
+
+    def test_different_contract_never_counts(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="AAPL260724C00200000",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="live",
+        )])
+        assert s == "NO_OWNER"
+
+    def test_no_expected_mode_accepts_either_livepaper(self):
+        s, p, u = self._classify([_Pos(
+            option_symbol="BAC260724P00062000",
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="paper",
+        )], expected_mode="")
+        assert (s, p, u) == ("PROVEN_OWNER", 1, 0)
+
+    def test_lookup_exception_yields_lookup_failed(self, monkeypatch):
+        from ap.fill_monitor import _classify_existing_protective_owner
+        class _E:
+            def active_positions(self_):
+                raise RuntimeError("engine offline")
+        s, p, u = _classify_existing_protective_owner(
+            exit_engine=_E(),
+            contract="BAC260724P00062000",
+            client_id="jasoncosby1@gmail.com",
+            expected_mode="live",
+        )
+        assert (s, p, u) == ("OWNER_LOOKUP_FAILED", 0, 0)
+
+
+class TestModeGateAppliesWithoutAdoptionAPI:
+    """Engines lacking `adopt_canonical_position_identity` must still be
+    protected by the mode gate.  Previously the fail-closed block was
+    inside `if callable(_adopt_fn) ...`, letting blank canonical mode
+    reach seed_position()/add_position()."""
+
+    class _EngineNoAdopt:
+        """Exit engine WITHOUT adopt_canonical_position_identity."""
+        def __init__(self, *, mode_status, mode_value=""):
+            self._m = mode_value
+            self._s = mode_status
+            self.seed_calls = []
+            self.add_calls = []
+            self.active_list = []
+        def _resolved_execution_mode_detail(self):
+            return {"mode": self._m, "status": self._s, "sources": {}}
+        def _resolved_execution_mode(self):
+            return self._m
+        def get_position(self, _pid): return None
+        def active_positions(self): return list(self.active_list)
+        def seed_position(self, pid, seed_order, result):
+            self.seed_calls.append((pid, dict(seed_order), dict(result)))
+        def add_position(self, pos): self.add_calls.append(pos)
+
+    def test_A_no_adopt_unproven_and_blank_order_blocks_seeding(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        eng = self._EngineNoAdopt(mode_status="UNPROVEN")
+        fm._seed_exit_engine(
+            eng, "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert eng.seed_calls == []
+        assert eng.add_calls == []
+        _reasons = [a[0] for a in audits]
+        assert any(r.startswith("CANONICAL_ADOPTION_MODE_UNPROVEN") and
+                   r.endswith("_NO_OWNER") for r in _reasons)
+
+    def test_B_no_adopt_valid_order_mode_normalizes_to_seed_position(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        eng = self._EngineNoAdopt(mode_status="UNPROVEN")
+        original = _seed_order(exec_mode="LIVE")
+        fm._seed_exit_engine(
+            eng, "canon-p", original,
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        # Mode resolves to "live"; seed_position gets normalized copy.
+        assert len(eng.seed_calls) == 1
+        _pid, _seed_order_dict, _res = eng.seed_calls[0]
+        assert _seed_order_dict["execution_mode"] == "live"
+        # Original order unchanged.
+        assert original["execution_mode"] == "LIVE"
+        # No mode-fail diagnostic.
+        assert not any(a[0].startswith("CANONICAL_ADOPTION_MODE_") for a in audits)
+
+    def test_C_no_adopt_blank_order_proven_engine_uses_managed_position(self, monkeypatch):
+        """Engine has neither adopt nor seed_position — fall through to
+        the ManagedPosition/add_position path with resolved 'live'."""
+        fm, audits, _ = _install_capture(monkeypatch)
+
+        # Standalone engine class with NO seed_position and NO adopt method.
+        class _EngineNoAdoptNoSeed:
+            def _resolved_execution_mode_detail(self_):
+                return {"mode": "live", "status": "PROVEN", "sources": {}}
+            def _resolved_execution_mode(self_): return "live"
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return []
+            def __init__(self_): self_.add_calls = []
+            def add_position(self_, pos): self_.add_calls.append(pos)
+
+        eng = _EngineNoAdoptNoSeed()
+        fm._seed_exit_engine(
+            eng, "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert len(eng.add_calls) == 1
+        assert eng.add_calls[0].execution_mode == "live"
+
+
+class TestOwnerClassifierAppliedOnEveryFailurePath:
+    """Mode-conflict, RETRY_*, and adoption-exception paths must ALL
+    consult the owner classifier so no path falsely claims monitoring
+    is retained."""
+
+    def _engine_factory(self, *, mode_status, mode_value="", adopt_impl=None,
+                        actives=None):
+        actives = list(actives or [])
+        added, seeded = [], []
+        _mode_status = mode_status
+        _mode_value = mode_value
+        _adopt = adopt_impl
+
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": _mode_value, "status": _mode_status,
+                        "sources": {}}
+            def _resolved_execution_mode(self):
+                return _mode_value if _mode_status == "PROVEN" else ""
+            def get_position(self_, _pid): return None
+            def active_positions(self_): return list(actives)
+            def add_position(self_, pos): added.append(pos)
+            def seed_position(self_, pid, seed_order, result):
+                seeded.append((pid, dict(seed_order), dict(result)))
+        _E.adopt_canonical_position_identity = staticmethod(_adopt) if _adopt else None
+        return _E(), added, seeded
+
+    def test_retry_disposition_with_no_owner_emits_no_owner(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        def _fake_adopt(**_kw):
+            class _R:
+                disposition = "RETRY_CLIENT_MISMATCH"
+                reason = "different client on repair"
+            return _R()
+        eng, added, seeded = self._engine_factory(
+            mode_status="PROVEN", mode_value="live",
+            adopt_impl=_fake_adopt, actives=[],
+        )
+        fm._seed_exit_engine(
+            eng, "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert added == [] and seeded == []
+        _reasons = [a[0] for a in audits]
+        assert any(
+            r.startswith("CANONICAL_ADOPTION_RETRY_CLIENT_MISMATCH")
+            and r.endswith("_NO_OWNER") for r in _reasons
+        ), f"expected _NO_OWNER on RETRY with no owner; got {_reasons}"
+
+    def test_retry_disposition_with_unproven_owner_emits_unproven(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        def _fake_adopt(**_kw):
+            class _R:
+                disposition = "RETRY_MODE_MISMATCH"
+                reason = "engine says live, repair says paper"
+            return _R()
+        # Same-client same-contract candidate but wrong mode → UNPROVEN.
+        eng, added, seeded = self._engine_factory(
+            mode_status="PROVEN", mode_value="live",
+            adopt_impl=_fake_adopt,
+            actives=[_Pos(
+                option_symbol="BAC260724P00062000",
+                client_id="jasoncosby1@gmail.com",
+                execution_mode="paper",
+            )],
+        )
+        fm._seed_exit_engine(
+            eng, "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        _reasons = [a[0] for a in audits]
+        assert any(
+            r.startswith("CANONICAL_ADOPTION_RETRY_MODE_MISMATCH")
+            and r.endswith("_OWNER_IDENTITY_UNPROVEN") for r in _reasons
+        ), f"expected _OWNER_IDENTITY_UNPROVEN; got {_reasons}"
+
+    def test_retry_with_proven_owner_uses_base_reason(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        def _fake_adopt(**_kw):
+            class _R:
+                disposition = "RETRY_IDENTITY_CONFLICT"
+                reason = "identity conflict"
+            return _R()
+        eng, added, seeded = self._engine_factory(
+            mode_status="PROVEN", mode_value="live",
+            adopt_impl=_fake_adopt,
+            actives=[_Pos(
+                option_symbol="BAC260724P00062000",
+                client_id="jasoncosby1@gmail.com",
+                execution_mode="live",
+            )],
+        )
+        fm._seed_exit_engine(
+            eng, "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        _reasons = [a[0] for a in audits]
+        assert "CANONICAL_ADOPTION_RETRY_IDENTITY_CONFLICT" in _reasons, (
+            f"proven owner must yield BASE retry reason; got {_reasons}"
+        )
+        assert not any(r.endswith("_NO_OWNER") for r in _reasons)
+        assert not any(r.endswith("_OWNER_IDENTITY_UNPROVEN") for r in _reasons)
+
+    def test_adoption_exception_with_no_owner_emits_no_owner(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        def _fake_adopt(**_kw):
+            raise RuntimeError("boom")
+        eng, added, seeded = self._engine_factory(
+            mode_status="PROVEN", mode_value="live",
+            adopt_impl=_fake_adopt, actives=[],
+        )
+        fm._seed_exit_engine(
+            eng, "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        assert added == [] and seeded == []
+        _reasons = [a[0] for a in audits]
+        assert any(
+            r.startswith("CANONICAL_ADOPTION_RETRY_ADOPTION_ERROR")
+            and r.endswith("_NO_OWNER") for r in _reasons
+        ), f"expected exception path to emit _NO_OWNER; got {_reasons}"
+
+    def test_owner_lookup_exception_yields_lookup_failed_reason(self, monkeypatch):
+        fm, audits, emits = _install_capture(monkeypatch)
+        # Mode UNPROVEN so the mode-fail path runs; make active_positions raise.
+        class _E:
+            def _resolved_execution_mode_detail(self):
+                return {"mode": "", "status": "UNPROVEN", "sources": {}}
+            def _resolved_execution_mode(self): return ""
+            def active_positions(self_):
+                raise RuntimeError("engine offline")
+            def get_position(self_, _pid): return None
+        fm._seed_exit_engine(
+            _E(), "canon-p", _seed_order(exec_mode=None),
+            {"avg_fill": 0.97, "filled_qty": 1}, "sig-1",
+        )
+        _reasons = [a[0] for a in audits]
+        assert any(
+            r.endswith("_OWNER_LOOKUP_FAILED") for r in _reasons
+        ), f"expected _OWNER_LOOKUP_FAILED; got {_reasons}"
