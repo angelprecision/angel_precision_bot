@@ -2780,6 +2780,14 @@ def _fetch_watching_signals(client_id: str) -> list:
     return _fetch_watching_signals_with_status_impl(client_id).rows
 
 
+# Sentinel attribute stamped on the built-in wrapper so
+# _fetch_watching_signals_with_status can detect a monkey-patched
+# replacement (which will not carry the sentinel) even across
+# importlib.reload cycles, where an is-comparison against a captured
+# original can fail because reload creates a new function object.
+_fetch_watching_signals._is_original_wrapper = True
+
+
 def _fetch_watching_signals_with_status(client_id: str) -> _FetchWatchingSignalsResult:
     """Public status-aware entry point used by run_overnight_reeval.
 
@@ -2790,18 +2798,23 @@ def _fetch_watching_signals_with_status(client_id: str) -> _FetchWatchingSignals
         status alongside rows.
 
     A test that wants to inject a source FAILURE must monkey-patch this
-    function directly (or _fetch_watching_signals_with_status_impl)."""
-    # Compare the current module attribute to the ORIGINAL wrapper captured
-    # at module import time (see _ORIGINAL_FETCH_WATCHING_SIGNALS below);
-    # `is not` distinguishes an untouched module from one where a test
-    # replaced _fetch_watching_signals with its own callable.
+    function directly (or _fetch_watching_signals_with_status_impl).
+
+    Detection strategy: the built-in wrapper carries a sentinel attribute
+    _is_original_wrapper=True. Any test-supplied replacement will not
+    have that attribute. This is robust to importlib.reload cycles used
+    by other tests (e.g. test_p0_paper_overnight_rescue_materialization
+    reloads this module twice, which invalidates a captured-object
+    identity check).
+    """
     import sys as _sys
     _mod = _sys.modules[__name__]
     _current_legacy = getattr(_mod, "_fetch_watching_signals", None)
-    if (
+    _is_patched = (
         _current_legacy is not None
-        and _current_legacy is not _ORIGINAL_FETCH_WATCHING_SIGNALS
-    ):
+        and not getattr(_current_legacy, "_is_original_wrapper", False)
+    )
+    if _is_patched:
         # A test has replaced the legacy wrapper with its own function.
         # Call it and wrap the list result as SUCCESS from both sources.
         try:
