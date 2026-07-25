@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import types
+import datetime as _dt_module
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -31,10 +32,14 @@ def _bind_reloaded_overnight_module():
 
 
 def _dt(hour, minute=0, second=0):
-    # Use today's date in ET so tests pass on any CI run date.
-    # All scheduler/session logic is relative to the injected time's date, not a fixed date.
-    _today = datetime.now(cr._ET).date()
-    return datetime(_today.year, _today.month, _today.day, hour, minute, second, tzinfo=cr._ET)
+    # PR #388 weekend-CI fix: pin to a KNOWN WEEKDAY so the retry-liveness
+    # tests don't collapse to SKIPPED_NOT_DUE when CI runs on a Saturday or
+    # Sunday. The prior helper used today's date, which meant every
+    # weekend run of the retry-liveness suite failed on scheduler.weekday()
+    # >= 5. Thursday 2026-07-23 is a plain non-holiday weekday inside the
+    # scheduler's 9:00–9:45 ET window.
+    _pinned = _dt_module.date(2026, 7, 23)
+    return datetime(_pinned.year, _pinned.month, _pinned.day, hour, minute, second, tzinfo=cr._ET)
 
 
 def _result(**overrides):

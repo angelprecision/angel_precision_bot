@@ -108,6 +108,11 @@ jobs:
             tests/test_p0_late_attachment_continuation.py \
             tests/test_p0_late_attachment_watcher_integration.py \
             tests/test_p0_july23_late_attachment_replay.py \
+            tests/test_p0_signals_lookback_session_aware.py \
+            tests/test_p0_source_lookup_failure.py \
+            tests/test_p0_open_revalidation_late_attachment.py \
+            tests/test_p0_hydration_identity_and_target_complete.py \
+            tests/test_p0_shared_fetch_limit_unified.py \
             tests/test_p0_deferred_due_retry_ownership.py \
             tests/test_p0_watcher_materialization_ownership.py \
             tests/test_p0_fenced_retry_terminalization.py \

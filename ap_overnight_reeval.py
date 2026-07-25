@@ -2782,23 +2782,21 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
     ap_signals_status:  str = _SOURCE_STATUS_SUCCESS
     ap_signals_error:   Optional[str] = None
 
+    # PR #388 P0-8: SINGLE fetch limit for BOTH sources. Previously the
+    # shared ap_signals query was hardcoded at .limit(300) while trade_queue
+    # honored OVERNIGHT_FETCH_LIMIT (default 500). Once the shared inventory
+    # exceeded 300 rows, the newest 300 could permanently occupy every fetch
+    # and older rows never entered the per-client disposition resolver.
+    try:
+        _fetch_limit = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "500"))
+    except (TypeError, ValueError):
+        _fetch_limit = 500
+    _fetch_limit = max(100, min(_fetch_limit, 2000))
+
     # Source 1: local Postgres trade_queue.
     try:
         from ap.db import conn, run_with_retry
         import json as _j
-
-        # P0 (2026-07-02): backlog starvation fix. The hardcoded LIMIT 100
-        # starved the queue when the paper WATCHING backlog exceeded 100 rows
-        # per client (observed: 248–258/client). DESC ordering meant only the
-        # newest 100 were ever fetched; anything older was never re-evaluated
-        # and never expired — rows from 2026-06-22 were still WATCHING on
-        # 2026-07-02. Env-tunable with a hard floor (never below the old 100)
-        # and ceiling (bounded per-run work).
-        try:
-            _fetch_limit = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "500"))
-        except (TypeError, ValueError):
-            _fetch_limit = 500
-        _fetch_limit = max(100, min(_fetch_limit, 2000))
 
         def _fn():
             with conn() as c:
@@ -2882,7 +2880,7 @@ def _fetch_watching_signals_with_status_impl(client_id: str) -> _FetchWatchingSi
                 .eq("decision_status", "WATCHING")
                 .gte("created_at", cutoff)
                 .order("created_at", desc=True)
-                .limit(300)
+                .limit(_fetch_limit)  # P0-8: unified with trade_queue limit
                 .execute()
             )
 
