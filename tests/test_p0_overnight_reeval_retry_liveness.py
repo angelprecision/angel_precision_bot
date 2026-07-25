@@ -63,6 +63,20 @@ def _result(**overrides):
     return out
 
 
+class _Evt:
+    def __init__(self, value=False):
+        self._value = value
+
+    def is_set(self):
+        return self._value
+
+    def set(self):
+        self._value = True
+
+    def clear(self):
+        self._value = False
+
+
 def _runner(email="jose@example.com"):
     runner = object.__new__(cr.ClientRunner)
     runner.email = email
@@ -82,8 +96,16 @@ def _runner(email="jose@example.com"):
     runner._overnight_reeval_attempt_count = 0
     runner._overnight_reeval_last_result_class = None
     runner._overnight_reeval_last_retry_reason = None
+    runner._degraded_lock = threading.Lock()
+    runner.degraded_reasons = set()
+    runner.degraded = _Evt(False)
+    runner.entries_allowed = _Evt(True)
+    runner.failed = _Evt(False)
+    runner.stopping = _Evt(False)
+    runner.stopped = _Evt(False)
     runner.persisted_locks = []
     runner.post_calls = []
+    runner._set_entry_permission = lambda: runner.entries_allowed.set()
 
     def _persist(result, *, today, source, now_et, last_error=None):
         runner.persisted_locks.append(
@@ -195,6 +217,142 @@ def test_scheduler_tick_after_success_performs_no_engine_run(monkeypatch):
     assert result["completed"] is False
     assert result["attempt_performed"] is False
     assert len(calls) == 1
+    assert len(runner.post_calls) == 1
+
+
+def test_completed_post_readiness_exception_degrades_live(monkeypatch):
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: _result(
+            stalled=False,
+            completed=True,
+            retryable=False,
+            retry_reason=None,
+            result_class="COMPLETED_WITH_DECISIONS",
+        ),
+    )
+    handoff_mod = types.ModuleType("ap.morning_handoff")
+    handoff_mod.run_morning_handoff_audit = lambda **kwargs: {"ok": True}
+    readiness_mod = types.ModuleType("ap.preopen_readiness")
+
+    def _raise_readiness(*args, **kwargs):
+        raise RuntimeError("db down")
+
+    readiness_mod.run_preopen_autonomous_readiness = _raise_readiness
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff_mod)
+    monkeypatch.setitem(sys.modules, "ap.preopen_readiness", readiness_mod)
+
+    runner = _runner()
+    runner.mode = "LIVE"
+    runner._run_post_overnight_morning_handoff = cr.ClientRunner._run_post_overnight_morning_handoff.__get__(runner, cr.ClientRunner)
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert result["completed"] is True
+    assert result["readiness_result"]["status"] == "ERROR"
+    assert result["readiness_result"]["failure_reason"] == (
+        "preopen_readiness_enforcement_failed:post_overnight_completion:exception:RuntimeError"
+    )
+    assert runner._overnight_reeval_success_date == _dt(9).date()
+    assert any(
+        reason.startswith("preopen_readiness_enforcement_failed:post_overnight_completion:")
+        for reason in runner.degraded_reasons
+    )
+
+
+def test_completed_post_readiness_error_status_degrades_live(monkeypatch):
+    monkeypatch.setattr(
+        ov,
+        "run_overnight_reeval",
+        lambda **kwargs: _result(
+            stalled=False,
+            completed=True,
+            retryable=False,
+            retry_reason=None,
+            result_class="COMPLETED_WITH_DECISIONS",
+        ),
+    )
+    handoff_mod = types.ModuleType("ap.morning_handoff")
+    handoff_mod.run_morning_handoff_audit = lambda **kwargs: {"ok": True}
+    readiness_mod = types.ModuleType("ap.preopen_readiness")
+    readiness_mod.run_preopen_autonomous_readiness = lambda *args, **kwargs: {
+        "ok": False,
+        "status": "ERROR",
+        "errors": ["db_unavailable"],
+    }
+    monkeypatch.setitem(sys.modules, "ap.morning_handoff", handoff_mod)
+    monkeypatch.setitem(sys.modules, "ap.preopen_readiness", readiness_mod)
+
+    runner = _runner()
+    runner.mode = "LIVE"
+    runner._run_post_overnight_morning_handoff = cr.ClientRunner._run_post_overnight_morning_handoff.__get__(runner, cr.ClientRunner)
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert result["readiness_result"]["failure_reason"] == (
+        "preopen_readiness_enforcement_failed:post_overnight_completion:status_error"
+    )
+    assert "preopen_readiness_enforcement_failed:post_overnight_completion:status_error" in runner.degraded_reasons
+
+
+def test_already_completed_retries_readiness_after_deadline_when_enforcement_failed(monkeypatch):
+    engine_calls = []
+    monkeypatch.setattr(ov, "run_overnight_reeval", lambda **kwargs: engine_calls.append(kwargs) or _result())
+    readiness_calls = []
+    readiness_mod = types.ModuleType("ap.preopen_readiness")
+    readiness_mod.run_preopen_autonomous_readiness = lambda *args, **kwargs: (
+        readiness_calls.append((args, kwargs)) or {"ok": True, "status": "OK", "errors": []}
+    )
+    monkeypatch.setitem(sys.modules, "ap.preopen_readiness", readiness_mod)
+
+    runner = _runner()
+    runner.mode = "LIVE"
+    today = _dt(9).date()
+    runner._overnight_reeval_state_date = today
+    runner._overnight_reeval_success_date = today
+    runner.degraded_reasons = {
+        "preopen_readiness_enforcement_failed:post_overnight_completion:status_error"
+    }
+    runner.degraded.set()
+    runner.entries_allowed.clear()
+
+    result = runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert result["result_class"] == "ALREADY_COMPLETED"
+    assert result["attempt_performed"] is False
+    assert result["readiness_result"]["status"] == "OK"
+    assert engine_calls == []
+    assert len(readiness_calls) == 1
+    assert not runner._has_degraded_reason_key("preopen_readiness_enforcement_failed")
+
+
+def test_recovered_ok_readiness_clears_enforcement_failure_and_blocked(monkeypatch):
+    readiness_mod = types.ModuleType("ap.preopen_readiness")
+    readiness_mod.run_preopen_autonomous_readiness = lambda *args, **kwargs: {
+        "ok": True,
+        "status": "OK",
+        "errors": [],
+    }
+    monkeypatch.setitem(sys.modules, "ap.preopen_readiness", readiness_mod)
+
+    runner = _runner()
+    runner.mode = "LIVE"
+    today = _dt(9).date()
+    runner._overnight_reeval_state_date = today
+    runner._overnight_reeval_success_date = today
+    runner.degraded_reasons = {
+        "preopen_readiness_enforcement_failed:post_overnight_completion:status_error",
+        "preopen_readiness_blocked:watcher_missing",
+    }
+    runner.degraded.set()
+    runner.entries_allowed.clear()
+
+    runner.run_overnight_reeval_attempt(now_et=_dt(9, 31), source="scheduler")
+
+    assert not runner._has_degraded_reason_key("preopen_readiness_enforcement_failed")
+    assert not runner._has_degraded_reason_key("preopen_readiness_blocked")
+    assert runner.entries_allowed.is_set() is True
 
 
 def test_no_work_classifies_completed_no_work():
