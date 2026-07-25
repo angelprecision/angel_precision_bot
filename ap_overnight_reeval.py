@@ -1629,10 +1629,58 @@ def run_overnight_reeval(
                             continue
 
                     if not _reattach_armed:
+                        # PR #388 truthful accounting: watch() returning
+                        # False does NOT by itself prove the existing order
+                        # is intact. Re-read the exact order and classify
+                        # by observed truth:
+                        #   * still PENDING_TRIGGER → retryable_deferred
+                        #   * terminal (EXPIRED/CANCELED/REJECTED/etc.)
+                        #                        → already_resolved
+                        #   * lookup fails / row missing → fail-closed
+                        #                        retryable_deferred
+                        _post_status, _post_row = _query_active_entry_order(
+                            client_id, _reattach_mode, _reattach_canonical,
+                        )
+                        _post_active_status = ""
+                        if _post_status == _LS_FOUND and isinstance(_post_row, dict):
+                            _post_active_status = str(_post_row.get("status") or "").upper()
+
+                        if _post_status == _LS_FOUND and _post_active_status in ("PENDING_TRIGGER", "CREATED"):
+                            log.warning(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False signal=%s local_order_id=%s"
+                                " — VERIFIED PRESERVED (order still %s);"
+                                " classifying retryable_deferred",
+                                ticker, signal_id, _existing_oid, _post_active_status,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+
+                        if _post_status == _LS_FOUND and _post_active_status:
+                            # Terminal or otherwise resolved: no further work.
+                            log.warning(
+                                "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                                " returned False signal=%s local_order_id=%s"
+                                " — order transitioned to %s;"
+                                " classifying already_resolved",
+                                ticker, signal_id, _existing_oid, _post_active_status,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["already_resolved"] += 1
+                            continue
+
+                        # LOOKUP_FAILED or NOT_FOUND after a False return —
+                        # fail closed as retryable so the next attempt tries
+                        # again; NEVER treat unknown as resolved.
                         log.error(
-                            "[%s] overnight_reeval: REATTACH_WATCHER watch() returned False "
-                            "signal=%s local_order_id=%s — retryable (no cancel; recovery mode)",
-                            ticker, signal_id, _existing_oid,
+                            "[%s] overnight_reeval: REATTACH_WATCHER watch()"
+                            " returned False AND post-verify lookup=%s row=%s"
+                            " signal=%s local_order_id=%s"
+                            " — cannot prove order preserved;"
+                            " classifying retryable_deferred (fail closed)",
+                            ticker, _post_status, bool(_post_row),
+                            signal_id, _existing_oid,
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
                         result["retryable_deferred"] += 1

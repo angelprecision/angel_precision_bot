@@ -3287,14 +3287,60 @@ class APEntryWatcher:
                     return True
 
                 if not is_safe_to_recovery_rearm(_recovery_classification):
-                    self._terminalize_recovery_rearm_candidate(
-                        local_order_id,
-                        ticker=ticker,
-                        classification=_recovery_classification,
-                        watcher_owned=_watcher_owned,
-                        already_through=_already_through,
+                    # PR #388 provenance-gated bypass: when the plan is
+                    # explicitly late_attachment_policy_eligible AND the
+                    # ONLY reason the old recovery classifier refuses is
+                    # UNSAFE_ALREADY_THROUGH_TRIGGER, do NOT terminalize
+                    # here. Route onward to the canonical late-attachment
+                    # classifier in the normal watch-flow so it can
+                    # distinguish WITHIN_CONTINUATION / WAITING_RESET /
+                    # LATE_ATTACHMENT_MOVE_MISSED_TERMINAL / STOP_BROKEN /
+                    # TARGET_COMPLETE. Other terminal signals (trigger-
+                    # ready residue, real prior invalidation, terminal
+                    # materialization, past-EOD stale, orphan no-watcher)
+                    # remain authoritative here.
+                    _late_eligible_bypass = (
+                        _no_cancel_on_reject
+                        and bool(signal_dict.get("late_attachment_policy_eligible"))
+                        and _recovery_classification == (
+                            PendingTriggerClassification.UNSAFE_ALREADY_THROUGH_TRIGGER
+                        )
                     )
-                    return False
+                    if _late_eligible_bypass:
+                        try:
+                            self._persist_watcher_audit(local_order_id, {
+                                "reason_code":     "recovery_late_attachment_bypass",
+                                "trigger_type":    "recovery_rearm_classifier",
+                                "classification":  _recovery_classification,
+                                "watcher_owned":   _watcher_owned,
+                                "already_through": _already_through,
+                                "late_attachment_policy_eligible": True,
+                                "no_cancel_on_reject":              True,
+                            })
+                        except Exception:
+                            pass
+                        log.info(
+                            "[%s] RECOVERY_REARM_LATE_ATTACHMENT_BYPASS — "
+                            "old classifier flagged UNSAFE_ALREADY_THROUGH_TRIGGER "
+                            "but plan is late_attachment_policy_eligible with "
+                            "no_cancel_on_reject; skipping early terminalization "
+                            "and routing to the canonical late-attachment classifier. "
+                            "local_order_id=%s",
+                            ticker, local_order_id,
+                        )
+                        # Fall through — the ordinary arm-time gate below
+                        # will invoke classify_late_attachment() on this
+                        # exact plan (which carries the provenance flag),
+                        # and it will decide WITHIN / WAITING / terminal.
+                    else:
+                        self._terminalize_recovery_rearm_candidate(
+                            local_order_id,
+                            ticker=ticker,
+                            classification=_recovery_classification,
+                            watcher_owned=_watcher_owned,
+                            already_through=_already_through,
+                        )
+                        return False
             except Exception as _recovery_cls_exc:
                 log.error(
                     "[%s] RECOVERY_REARM_CLASSIFIER_ERROR local_order_id=%s error=%s",

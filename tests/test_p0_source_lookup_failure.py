@@ -169,7 +169,14 @@ def test_runner_does_not_set_success_date_on_source_lookup_failed(monkeypatch):
     )
     from datetime import datetime
     from zoneinfo import ZoneInfo
+    # force=True: this test verifies runner behavior on a SOURCE_LOOKUP_FAILED
+    # engine result. The window/weekday gate (which produces SKIPPED_NOT_DUE)
+    # is unrelated to that verification — and passing a fixed weekday-in-
+    # window datetime is not portable across CI Python versions where
+    # tz-aware comparison edge cases have surfaced. Force-run bypasses the
+    # gate cleanly and exercises the actual code path under test.
     result = runner.run_overnight_reeval_attempt(
+        force=True,
         now_et=datetime(2026, 7, 23, 9, 31, tzinfo=ZoneInfo("America/New_York")),
         source="scheduler",
     )

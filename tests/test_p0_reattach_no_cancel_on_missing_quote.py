@@ -28,7 +28,13 @@ import pytest
 import ap_entry_watcher as ew
 
 
-def _force_regular_live_session(monkeypatch):
+def _force_regular_live_session(monkeypatch, watcher=None):
+    """Force the runtime session predicates to think we're in the middle of
+    regular session (well before EOD cutoff). Patches the module-level
+    `datetime` AND stubs the two instance methods that gate on wall clock
+    (belt-and-suspenders — different callsites resolve LOAD_GLOBAL in
+    slightly different ways depending on whether the module has been
+    reloaded in the test session)."""
     from datetime import datetime as _real_dt
     _fixed = _real_dt(2026, 7, 23, 10, 15, tzinfo=ZoneInfo("America/New_York"))
 
@@ -40,6 +46,9 @@ def _force_regular_live_session(monkeypatch):
             return _fixed.replace(tzinfo=None)
 
     monkeypatch.setattr(ew, "datetime", _FrozenDT)
+    if watcher is not None:
+        monkeypatch.setattr(watcher, "_is_regular_session_now", lambda: True)
+        monkeypatch.setattr(watcher, "_is_past_entry_cutoff_now", lambda: False)
 
 
 def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
@@ -82,7 +91,7 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
     add_spy = MagicMock(return_value=True)
     monkeypatch.setattr(w, "add_signal", add_spy)
 
-    _force_regular_live_session(monkeypatch)
+    _force_regular_live_session(monkeypatch, watcher=w)
 
     return w, cancel_spy, add_spy
 

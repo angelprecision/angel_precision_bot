@@ -73,9 +73,11 @@ def _make_min_watcher(*, on_invalidate=None):
     """Construct an APEntryWatcher-shaped instance without going through
     the full __init__ (which requires broker / OSM). Enough plumbing for
     the arm-time gate to run."""
+    import threading
     w = object.__new__(ew.APEntryWatcher)
     w._pending = []
     w._dedup_set = set()
+    w._lock = threading.RLock()
     w._last_reject_reason = ""
     w.on_invalidate = on_invalidate
     w.order_state_machine = None
@@ -83,6 +85,7 @@ def _make_min_watcher(*, on_invalidate=None):
     w.broker = SimpleNamespace(session=None)
     w._last_quote_fetch_proof = {}
     w.owner_token = "test-owner"
+    w.core = None
     return w
 
 
