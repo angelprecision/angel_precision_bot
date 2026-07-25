@@ -3980,17 +3980,28 @@ class TestJasonBacReplay:
             lambda _p, _d, **_kw: stamps.append((_p, _d, _kw))
         )
 
+        # Use an OCC expiry a week ahead of today's ET session date so
+        # the exit engine's expired-contract cleanup never rejects the
+        # position before evaluate_exit() runs.  The BAC-shape economics
+        # (entry 0.97 / bid 0.94 / peak +2% / touched_profit=True /
+        # underlying missing) are what this test is asserting on — not
+        # the calendar date of the historical incident.
+        from zoneinfo import ZoneInfo as _ZI
+        _today_et = datetime.now(_ZI("America/New_York")).date()
+        _exp = _today_et + timedelta(days=7)
+        _exp_str = f"{_exp.year % 100:02d}{_exp.month:02d}{_exp.day:02d}"
+        _sym = f"BAC{_exp_str}P00062000"
         pos = _bac_pos(
             touched_profit=True,
             peak_pnl_pct=0.02,
             max_profit_seen=0.02,
+            option_symbol=_sym,
         )
         pos.position_id = "bac-check-all-1"
         eng._positions = [pos]
         eng._positions_by_id = {pos.position_id: pos}
 
         # 10 AM ET — safely outside any EOD pre-gate window.
-        from zoneinfo import ZoneInfo as _ZI
         now_et = datetime.now(_ZI("America/New_York")).replace(
             hour=10, minute=0, second=0, microsecond=0,
         )
