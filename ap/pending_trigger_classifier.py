@@ -231,6 +231,7 @@ def _canonical_trigger_quote(*, side, bid, ask) -> TriggerQuoteResult:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Non-terminal lifecycle labels (watcher continues to own the setup).
+LATE_ATTACHMENT_AWAITING_FIRST_TRUTH          = "LATE_ATTACHMENT_AWAITING_FIRST_TRUTH"
 LATE_ATTACHMENT_WITHIN_CONTINUATION           = "LATE_ATTACHMENT_WITHIN_CONTINUATION"
 LATE_CONTINUATION_CONFIRMED                   = "LATE_CONTINUATION_CONFIRMED"
 MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET  = "MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET"

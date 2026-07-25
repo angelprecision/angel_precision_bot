@@ -575,6 +575,7 @@ class WatchedSignal:
                 from ap.pending_trigger_classifier import (
                     classify_late_attachment as _pt_classify_late,
                     is_reset_confirmed as _pt_is_reset,
+                    LATE_ATTACHMENT_AWAITING_FIRST_TRUTH as _PT_AWAITING,
                     LATE_ATTACHMENT_WITHIN_CONTINUATION as _PT_WITHIN,
                     MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET as _PT_WAITING,
                     STOP_ALREADY_BROKEN_TERMINAL as _PT_STOP_BROKEN,
@@ -583,6 +584,7 @@ class WatchedSignal:
                     TRIGGER_TRUTH_UNAVAILABLE_RETRY as _PT_TRUTH_RETRY,
                 )
             except Exception:
+                _PT_AWAITING = None
                 _PT_WITHIN = _PT_WAITING = _PT_STOP_BROKEN = None
                 _PT_TARGET_COMPLETE = _PT_MOVE_MISSED = _PT_TRUTH_RETRY = None
                 _pt_classify_late = None
@@ -646,6 +648,52 @@ class WatchedSignal:
                     return self.state
 
                 # State transitions.
+                if self.late_attachment_state == _PT_AWAITING:
+                    # No canonical quote at arm time. Quote is now available
+                    # (TRUTH_RETRY-with-None was returned above). Reclassify
+                    # this first truthful poll and transition; never let the
+                    # ordinary breach path run from AWAITING without the
+                    # continuation policy applied.
+                    if _late_dec.classification == _PT_WITHIN:
+                        log.info(
+                            "[%s] LATE_ATTACHMENT_FIRST_TRUTH_WITHIN — "
+                            "%s canonical_quote=%s (transitioning "
+                            "AWAITING_FIRST_TRUTH → WITHIN_CONTINUATION; "
+                            "requires 2 confirming polls)",
+                            self.ticker, self.side, _late_dec.quote,
+                        )
+                        self.late_attachment_state = _PT_WITHIN
+                        self.late_confirm_polls = 0
+                        return self.state
+                    if _late_dec.classification == _PT_WAITING:
+                        log.info(
+                            "[%s] LATE_ATTACHMENT_FIRST_TRUTH_PAST_ZONE — "
+                            "%s canonical_quote=%s (transitioning "
+                            "AWAITING_FIRST_TRUTH → WAITING_RESET; "
+                            "requires 2 reset polls then new ordinary breach)",
+                            self.ticker, self.side, _late_dec.quote,
+                        )
+                        self.late_attachment_state = _PT_WAITING
+                        self.late_reset_polls = 0
+                        return self.state
+                    if _late_dec.classification == _PT_TRUTH_RETRY:
+                        # Quote available but on the pre-trigger side of the
+                        # canonical lane (CALL: quote<trigger; PUT: quote>trigger).
+                        # Setup has NOT breached yet — release the gate and
+                        # let the ordinary breach path own the future.
+                        log.info(
+                            "[%s] LATE_ATTACHMENT_FIRST_TRUTH_PRE_TRIGGER — "
+                            "%s canonical_quote=%s (clearing AWAITING gate; "
+                            "ordinary future breach permitted)",
+                            self.ticker, self.side, _late_dec.quote,
+                        )
+                        self.late_attachment_state = None
+                        return self.state
+                    # Terminal classifications are handled by the block
+                    # above and never reach this switch. Defensive: preserve
+                    # state rather than risk an unclassified fire.
+                    return self.state
+
                 if self.late_attachment_state == _PT_WITHIN:
                     if _late_dec.classification == _PT_WITHIN:
                         self.late_confirm_polls += 1
@@ -3552,15 +3600,39 @@ class APEntryWatcher:
                     )
                     # Fall through to normal add_signal / watcher arm path.
                 elif _late_cls == _PT_TRUTH_RETRY:
-                    # Missing canonical quote — arm normally; poll loop will
-                    # re-decide as soon as a fresh quote arrives. Never
-                    # terminalize on missing truth.
-                    log.debug(
-                        "[%s] arm-time canonical trigger quote unavailable "
-                        "(detail=%s) — arming normally; poll loop will re-decide.",
-                        ticker, _late_decision.detail,
+                    # Missing canonical truth at arm-time. Seed a dedicated
+                    # AWAITING_FIRST_TRUTH state so the poll loop's late-
+                    # attachment gate stays engaged and the ordinary breach
+                    # path cannot fire on the first available quote without
+                    # first classifying it against the continuation window.
+                    # (Without this seed a subsequent quote far past the
+                    # trigger would run straight through the ordinary breach
+                    # path and defeat Block-2.)
+                    from ap.pending_trigger_classifier import (
+                        LATE_ATTACHMENT_AWAITING_FIRST_TRUTH as _PT_AWAITING,
                     )
-                    # Fall through.
+                    signal_dict.setdefault("_late_attachment_seed", {
+                        "state": _PT_AWAITING,
+                        "seen_at": datetime.now(timezone.utc).isoformat(),
+                        "quote": None,
+                        "quote_source": _late_decision.quote_source,
+                        "allowed_continuation": (
+                            float(_late_decision.allowed_continuation)
+                            if _late_decision.allowed_continuation is not None else None
+                        ),
+                        "raw_bid": _bug_c_bid,
+                        "raw_ask": _bug_c_ask,
+                        "detail": _late_decision.detail,
+                    })
+                    log.info(
+                        "[%s] LATE_ATTACHMENT_AWAITING_FIRST_TRUTH — "
+                        "canonical trigger quote unavailable at arm time "
+                        "(detail=%s recovery_rearm=%s); watcher armed with "
+                        "gate engaged. Ordinary breach path is blocked until "
+                        "the first truthful canonical quote arrives.",
+                        ticker, _late_decision.detail, _recovery_rearm,
+                    )
+                    # Fall through to normal add_signal / watcher arm path.
                 else:
                     # Terminal at arm-time: STOP_BROKEN / TARGET_COMPLETE /
                     # LATE_ATTACHMENT_MOVE_MISSED_TERMINAL. Preserve the
