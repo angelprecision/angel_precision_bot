@@ -513,6 +513,144 @@ def resolve_playbook_expiration_order(
     return ordered
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #396 amendment: shared trigger-anchored strike preference authority.
+#
+# Reviewer requirement: quote-budget spending order and final playbook ranking
+# must use the SAME preferred-strike computation, so they cannot silently
+# disagree when the underlying drifts between scanner qualification and breach.
+# Both direct-quote recovery ordering (ap/contract_selector.py) and the
+# candidate-context ranker (build_playbook_candidate_context below) call this
+# single resolver. Do not re-implement this formula anywhere else.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TRIGGER_ANCHOR_SOURCE_TRIGGER = "trigger"
+TRIGGER_ANCHOR_SOURCE_UNDERLYING_FALLBACK = "underlying_fallback"
+TRIGGER_ANCHOR_SOURCE_NONE = "none"
+
+
+@dataclass(frozen=True)
+class TriggerAnchoredStrikePreference:
+    """Result of resolving the trigger-anchored preferred strike.
+
+    Fields:
+        anchor_source: TRIGGER_ANCHOR_SOURCE_TRIGGER when the scanner trigger
+            was the anchor, UNDERLYING_FALLBACK when the trigger was missing
+            and the underlying was used, NONE when neither anchor was usable
+            (missing / non-positive / non-finite). Callers must treat NONE as
+            "no preferred strike" and fall back to their existing deterministic
+            ordering.
+        anchor_price: The numeric anchor actually used, or None when the source
+            is NONE.
+        primary_strike: Nearest strike to the anchor. On distance ties, the
+            OTM side for the trade direction wins (lower for PUT, higher for
+            CALL). None when no strikes were supplied.
+        adjacent_otm_strike: The next-step OTM strike relative to primary
+            (lower for PUT, higher for CALL). None when no adjacent strike
+            exists on that side.
+        ordered_preferred_strikes: (primary, adjacent_otm) with Nones stripped,
+            in the order downstream ordering must apply.
+    """
+
+    anchor_source: str
+    anchor_price: float | None
+    primary_strike: float | None
+    adjacent_otm_strike: float | None
+    ordered_preferred_strikes: tuple[float, ...] = ()
+
+
+def _finite_positive(value) -> float | None:
+    """Return a finite, strictly-positive float, or None."""
+    coerced = _safe_float(value)
+    if coerced is None:
+        return None
+    if coerced <= 0:
+        return None
+    if coerced != coerced:  # NaN
+        return None
+    if coerced in (float("inf"), float("-inf")):
+        return None
+    return coerced
+
+
+def resolve_trigger_anchored_preferred_strikes(
+    *,
+    side: str,
+    trigger_price,
+    underlying_fallback,
+    candidate_strikes,
+) -> TriggerAnchoredStrikePreference:
+    """Single source of truth for trigger-anchored strike preference.
+
+    Rules (locked by the PR #396 review):
+
+      * Use the scanner ``trigger_price`` when finite and strictly positive.
+      * Otherwise use ``underlying_fallback`` when finite and strictly positive.
+      * When neither anchor is usable, return anchor_source=NONE with no
+        preferred strike; do not invent a synthetic anchor.
+      * Distance ties break OTM for the trade direction: PUT prefers the lower
+        strike, CALL prefers the higher strike.
+      * Adjacent OTM is the next strike on the OTM side (lower for PUT, higher
+        for CALL). None when no such strike exists.
+
+    Non-numeric / non-positive strikes in ``candidate_strikes`` are discarded.
+    ``side`` is compared case-insensitively; anything other than "PUT" is
+    treated as CALL for tie-break/OTM purposes (matches the existing playbook
+    contract that a normalized side has already been established upstream).
+    """
+    _side = str(side or "").upper()
+    _dir_is_put = _side == "PUT"
+
+    # De-dupe + sort candidate strikes, dropping non-numeric / non-positive.
+    strikes: list[float] = sorted(
+        {float(s) for s in (candidate_strikes or []) if _finite_positive(s) is not None}
+    )
+
+    trigger = _finite_positive(trigger_price)
+    fallback = _finite_positive(underlying_fallback)
+
+    if trigger is not None:
+        anchor_source = TRIGGER_ANCHOR_SOURCE_TRIGGER
+        anchor_price: float | None = trigger
+    elif fallback is not None:
+        anchor_source = TRIGGER_ANCHOR_SOURCE_UNDERLYING_FALLBACK
+        anchor_price = fallback
+    else:
+        anchor_source = TRIGGER_ANCHOR_SOURCE_NONE
+        anchor_price = None
+
+    if not strikes or anchor_price is None:
+        return TriggerAnchoredStrikePreference(
+            anchor_source=anchor_source,
+            anchor_price=anchor_price,
+            primary_strike=None,
+            adjacent_otm_strike=None,
+            ordered_preferred_strikes=(),
+        )
+
+    if _dir_is_put:
+        # PUT ties: prefer the lower strike (OTM side for a PUT).
+        primary = min(strikes, key=lambda k: (abs(k - anchor_price), k))
+        otm_candidates = sorted((k for k in strikes if k < primary), reverse=True)
+    else:
+        # CALL ties: prefer the higher strike (OTM side for a CALL).
+        primary = min(strikes, key=lambda k: (abs(k - anchor_price), -k))
+        otm_candidates = sorted(k for k in strikes if k > primary)
+
+    adjacent = otm_candidates[0] if otm_candidates else None
+
+    ordered: tuple[float, ...] = tuple(
+        s for s in (primary, adjacent) if s is not None
+    )
+    return TriggerAnchoredStrikePreference(
+        anchor_source=anchor_source,
+        anchor_price=anchor_price,
+        primary_strike=primary,
+        adjacent_otm_strike=adjacent,
+        ordered_preferred_strikes=ordered,
+    )
+
+
 def build_playbook_candidate_context(
     spec: ContractPlaybookSpec,
     candidates: list[dict],
@@ -532,30 +670,34 @@ def build_playbook_candidate_context(
             "strike_band_low": spec.strike_band_low,
             "strike_band_high": spec.strike_band_high,
             "per_symbol": {},
+            "anchor_source": TRIGGER_ANCHOR_SOURCE_NONE,
+            "anchor_price": None,
         }
-    underlying = float(spec.underlying_price or 0.0)
     target = _safe_float(spec.target_underlying)
-    trigger = _safe_float(spec.trigger_price)
-    # Anchor the primary strike to the scanner trigger price when known, so the
-    # selected contract does not drift with the underlying between qualification
-    # and breach. Fall back to the underlying price only when the trigger is
-    # unavailable. On distance ties, prefer the OTM side for the trade direction
-    # (higher for CALL, lower for PUT).
-    anchor = trigger if (trigger is not None and trigger > 0) else underlying
-    if anchor > 0:
-        if spec.side == "PUT":
-            # Ties: prefer the lower strike (OTM for a PUT).
-            atm = min(strikes, key=lambda strike: (abs(strike - anchor), strike))
-        else:
-            # Ties: prefer the higher strike (OTM for a CALL).
-            atm = min(strikes, key=lambda strike: (abs(strike - anchor), -strike))
-    else:
+
+    # Delegate primary + adjacent OTM computation to the single shared authority
+    # so quote-spending ordering and final ranking cannot diverge.
+    preference = resolve_trigger_anchored_preferred_strikes(
+        side=spec.side,
+        trigger_price=spec.trigger_price,
+        underlying_fallback=spec.underlying_price,
+        candidate_strikes=strikes,
+    )
+    atm = preference.primary_strike
+    next_step = preference.adjacent_otm_strike
+
+    if atm is None:
+        # Neither trigger nor underlying was usable — preserve the existing
+        # deterministic fallback (lowest strike) so callers with no anchor at
+        # all still get a stable, testable answer.
         atm = strikes[0]
-    if spec.side == "PUT":
-        otm_candidates = sorted((strike for strike in strikes if strike < atm), reverse=True)
-    else:
-        otm_candidates = sorted(strike for strike in strikes if strike > atm)
-    next_step = otm_candidates[0] if otm_candidates else None
+        if spec.side == "PUT":
+            otm_candidates = [k for k in strikes if k < atm]
+            otm_candidates.sort(reverse=True)
+        else:
+            otm_candidates = [k for k in strikes if k > atm]
+            otm_candidates.sort()
+        next_step = otm_candidates[0] if otm_candidates else None
     preferred = [atm]
     if next_step is not None:
         preferred.append(next_step)
@@ -599,4 +741,6 @@ def build_playbook_candidate_context(
         "strike_band_low": band_low,
         "strike_band_high": band_high,
         "per_symbol": per_symbol,
+        "anchor_source": preference.anchor_source,
+        "anchor_price": preference.anchor_price,
     }
