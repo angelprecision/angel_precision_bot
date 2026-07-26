@@ -1897,6 +1897,7 @@ class APOrderStateMachine:
         expected_watcher_token: str,
         next_retry_at: str,
         max_attempts: int,
+        deferred_contract: Optional[str] = None,
     ) -> bool:
         """PR #391 — HOLD_MARKET_TRUTH_UNAVAILABLE.
 
@@ -1972,7 +1973,13 @@ class APOrderStateMachine:
             "materialization_in_flight":       False,
             "materialization_owner":           "",
             "materialization_lease_until":     "",
-            "watcher_token":                   "",
+            # P0-8: durable and in-memory ownership must agree. The
+            # existing watcher retains ownership across the HOLD; the
+            # canonical retry loop can still reclaim by fencing on this
+            # exact token (the fixed-generation CAS makes stale-worker
+            # rewrites impossible).
+            "watcher_token":                   expected_watcher_token,
+            "current_owner":                   expected_watcher_token,
             "broker_ready":                    False,
 
             "retry_reason":                    reason_code,
@@ -1995,6 +2002,16 @@ class APOrderStateMachine:
             patch_json = _json_local.dumps(patch, default=str)
         except Exception:
             return False
+
+        # P0-9: HOLD must clear the same top-level contract authority as
+        # REARM (contract / limit_price / reserved_cost /
+        # contract_selection_status) so a restart cannot resurrect the
+        # stale OCC + price. Applied only when the caller supplied a
+        # DEFERRED:<TICKER> placeholder; otherwise the top-level fields
+        # are left alone (the meta flag contract_revalidation_required
+        # still marks the row for revalidation).
+        _deferred = str(deferred_contract or "").strip()
+        _clear_contract = _deferred.startswith("DEFERRED:")
 
         def _persist():
             with conn() as c:
@@ -2029,10 +2046,21 @@ class APOrderStateMachine:
                         )
                     )
                 """
+                if _clear_contract:
+                    _extra_set = (
+                        "contract = %s, "
+                        "limit_price = NULL, "
+                        "reserved_cost = 0, "
+                        "contract_selection_status = 'REVALIDATION_REQUIRED', "
+                    )
+                    _extra_params = (_deferred,)
+                else:
+                    _extra_set = ""
+                    _extra_params = ()
                 cur = c.execute(
                     f"""
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{{}}'::jsonb)
+                    SET {_extra_set}meta = COALESCE(meta, '{{}}'::jsonb)
                              || %s::jsonb
                              || {_increment_sql},
                         updated_ts = NOW()
@@ -2061,7 +2089,7 @@ class APOrderStateMachine:
                             )
                           ) IN ('PENDING_TRIGGER', 'BROKER_READY')
                     """,
-                    (
+                    _extra_params + (
                         patch_json,
                         max_attempts, max_attempts, max_attempts,
                         local_order_id,

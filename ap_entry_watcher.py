@@ -1370,6 +1370,23 @@ class APEntryWatcher:
             watched._trigger_stop_collision = False
             watched._ownership_quarantine = False
 
+            # P0-6: the ownership-proof machinery reads
+            # ``watched.deferred_retry_not_before`` — not the signal dict.
+            # Set both so signal serialization stays consistent AND the
+            # in-memory attribute the proof honors is populated.
+            if next_retry_at:
+                try:
+                    _retry_dt = datetime.fromisoformat(
+                        str(next_retry_at).replace("Z", "+00:00")
+                    )
+                    if _retry_dt.tzinfo is None:
+                        _retry_dt = _retry_dt.replace(tzinfo=timezone.utc)
+                    watched.deferred_retry_not_before = _retry_dt
+                except (TypeError, ValueError):
+                    watched.deferred_retry_not_before = None
+            else:
+                watched.deferred_retry_not_before = None
+
             signal = watched.signal
             signal["submit_market_truth_rearmed"] = True
             signal["submit_market_truth_reason_code"] = reason_code

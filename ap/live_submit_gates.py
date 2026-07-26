@@ -171,6 +171,7 @@ _HOLD_REASONS: frozenset[str] = frozenset({
 # terminal. Env-tunable (LIVE_SUBMIT_ALLOWED_QUOTE_SOURCES) but the default
 # denylist covers the concrete failure modes named in the postmortem.
 _UNPROVEN_SOURCES: frozenset[str] = frozenset({
+    "",                    # P0-2: truly blank source is unproven
     "unknown",
     "sandbox",
     "sandbox_only",
@@ -680,8 +681,20 @@ def check_market_validity_gate(
     # PR #391 (blocker 2): source-identity enforcement. A quote whose source
     # is blank, unknown, or sandbox is not proven live-market truth and must
     # not authorize a submit — PAPER or LIVE. HOLD for bounded retry.
+    #
+    # P0-1 exception (Jason's real LIVE shape): a LIVE synchronous_submit_fetch
+    # whose adapter did not populate an explicit source string arrives here
+    # as quote_source="unknown" (the caller's fallback). Freshness, bid/ask,
+    # stop, target, and direction are already checked separately, so the
+    # "unknown + LIVE + synchronous_submit_fetch" triple is provably a fresh
+    # live-broker quote even without an explicit provider name. Every other
+    # unproven combination stays blocked.
     _source_lc = (str(quote_source or "").strip().lower())
-    if _source_lc in _UNPROVEN_SOURCES:
+    if _source_lc in _UNPROVEN_SOURCES and not (
+        _live
+        and _source_lc == "unknown"
+        and provenance == "synchronous_submit_fetch"
+    ):
         return _fail(
             GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN,
             f"quote_source={quote_source!r} is unproven "

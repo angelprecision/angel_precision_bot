@@ -230,6 +230,8 @@ class TestTriggerLaneMarketValidity:
             current_bid=98.5,
             current_ask=99.5,   # ask=99.5 < trigger=100.0
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -245,6 +247,8 @@ class TestTriggerLaneMarketValidity:
             current_bid=99.8,
             current_ask=100.0,   # ask exactly at trigger
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         # Trigger check passes; remaining opportunity check may block but not trigger check
@@ -260,6 +264,8 @@ class TestTriggerLaneMarketValidity:
             current_bid=99.2,   # bid below trigger — fine for CALL
             current_ask=100.8,  # ask above trigger — breach confirmed
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.reason_code != GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER
@@ -275,6 +281,8 @@ class TestTriggerLaneMarketValidity:
             current_bid=100.5,   # bid=100.5 > trigger=100.0
             current_ask=101.0,
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -290,6 +298,8 @@ class TestTriggerLaneMarketValidity:
             current_bid=100.0,   # exactly at trigger
             current_ask=100.5,
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.reason_code != GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
@@ -304,6 +314,8 @@ class TestTriggerLaneMarketValidity:
             current_bid=99.5,   # bid below trigger — breach confirmed
             current_ask=100.8,  # ask above trigger — fine for PUT
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.reason_code != GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
@@ -313,6 +325,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
             current_bid=105.5, current_ask=105.8, quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -322,6 +336,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=94.0, current_ask=94.5, quote_age_ms=0,  # mid=94.25 < stop=95
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -336,6 +352,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
             current_bid=104.6, current_ask=104.8, quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -345,6 +363,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=None, current_ask=None,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -354,6 +374,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=0.0, current_ask=0.0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -363,6 +385,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=101.0, current_ask=101.5, quote_age_ms=10000,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -373,6 +397,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=None, current_ask=None,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="paper",
         )
         assert r.passed is False
@@ -383,6 +409,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=101.0, current_ask=101.5, quote_age_ms=30000,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="paper",
         )
         assert r.passed is False
@@ -393,6 +421,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=100.8, current_ask=101.0, quote_age_ms=200,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is True
@@ -403,6 +433,8 @@ class TestTriggerLaneMarketValidity:
         r = check_market_validity_gate(
             side="PUT", trigger_price=100.0, stop_price=105.0, target_price=90.0,
             current_bid=99.5, current_ask=99.9, quote_age_ms=200,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is True
@@ -518,7 +550,9 @@ class TestNoSubmitOnGateFailure:
     def test_market_fail_returns_false_from_gate(self):
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
-            current_bid=None, current_ask=None, execution_mode="live",
+            current_bid=None, current_ask=None,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="live",
         )
         assert r.passed is False
 
@@ -600,7 +634,9 @@ class TestGateRobustness:
             try:
                 check_market_validity_gate(
                     side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
-                    current_bid=bad_bid, current_ask=bad_ask, execution_mode="live",
+                    current_bid=bad_bid, current_ask=bad_ask,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="live",
                 )
             except Exception as e:
                 pytest.fail(f"market gate raised on bid={bad_bid!r} ask={bad_ask!r}: {e}")

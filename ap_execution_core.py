@@ -7222,11 +7222,27 @@ class APExecutionCore:
                     _gate_exec_mode, ticker, _plan_side,
                 )
 
-                # PR #391 blocker 4: unified degrade path. Every REARM/HOLD
-                # persistence failure funnels through here — reread first,
-                # then either bow out (a peer already handled the row or the
-                # row advanced to broker POST), or fall into a canonical
-                # HOLD with a bounded not-before. Never terminalizes.
+                # PR #391 blocker P0-3: capture the outer ownership fields
+                # BEFORE the nested function is defined. locals() inside a
+                # nested def resolves to the nested scope, not the outer
+                # one, so any lookup done inside must not use locals().
+                _market_truth_generation = int(
+                    (_meta_for_ts or {}).get("materialization_generation") or 0
+                )
+                _market_truth_watcher_token = str(
+                    (_meta_for_ts or {}).get("watcher_token") or ""
+                )
+                _deferred_contract = f"DEFERRED:{str(ticker).upper()}"
+
+                # PR #391 blocker 4/5/7: unified degrade path.
+                #   * The reread only short-circuits on broker evidence. A
+                #     durable REARM/HOLD label alone does NOT authorize
+                #     RETRY_WAIT (P0-7); the caller must also prove memory
+                #     ownership or convert to durable HOLD.
+                #   * CAS failure returns KEEP_WATCHER with
+                #     MARKET_TRUTH_HOLD_NOT_DURABLE (P0-4).
+                #   * Missing watcher / failed reset returns KEEP_WATCHER
+                #     with explicit codes (P0-5).
                 def _degrade_market_truth_block_to_hold(
                     *, reason_code: str, gate_audit: dict,
                 ):
@@ -7238,15 +7254,6 @@ class APExecutionCore:
                         return {
                             "disposition":           "KEEP_WATCHER",
                             "reason_code":           "PEER_ADVANCED_TO_BROKER",
-                            "broker_post_attempted": False,
-                        }
-                    if _reread_authority in (
-                        MarketTruthAuthority.REARM_DIRECTION_REVERSAL,
-                        MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE,
-                    ):
-                        return {
-                            "disposition":           "RETRY_WAIT",
-                            "reason_code":           _reread_authority,
                             "broker_post_attempted": False,
                         }
 
@@ -7272,18 +7279,12 @@ class APExecutionCore:
                                 gate_audit=gate_audit,
                                 execution_mode=_gate_exec_mode,
                                 signal_id=_plan_signal_id,
-                                expected_generation=int(
-                                    (locals().get("_meta_for_ts") or {}).get(
-                                        "materialization_generation"
-                                    ) or 0
-                                ),
-                                expected_watcher_token=str(
-                                    (locals().get("_meta_for_ts") or {}).get(
-                                        "watcher_token"
-                                    ) or ""
-                                ),
+                                expected_generation=_market_truth_generation,
+                                expected_watcher_token=_market_truth_watcher_token,
                                 next_retry_at=_nrb,
                                 max_attempts=_max_att,
+                                # P0-9: HOLD clears stale contract authority too.
+                                deferred_contract=_deferred_contract,
                             )
                         )
                     except Exception as _hold_exc:
@@ -7294,30 +7295,76 @@ class APExecutionCore:
                             reason_code, _hold_exc, exc_info=True,
                         )
 
-                    # Reset the in-memory watcher only after the DB CAS
-                    # succeeded, and only for the exact same watcher owner.
-                    if _hold_ok:
-                        _watched = (
-                            getattr(approved_plan, "watched_signal", None)
-                            or locals().get("watched_signal")
-                            or locals().get("watched")
+                    # P0-4: never claim RETRY_WAIT when the CAS did not confirm
+                    # durability. KEEP_WATCHER + explicit reason lets recovery
+                    # observe the row exists without a durable retry lease.
+                    if not _hold_ok:
+                        log.critical(
+                            "[%s] MARKET_TRUTH_HOLD_NOT_DURABLE order=%s "
+                            "reason=%s gen=%d watcher_token=%s — CAS did not "
+                            "confirm; returning KEEP_WATCHER",
+                            ticker, str(queue_local_order_id or ""),
+                            reason_code, _market_truth_generation,
+                            _market_truth_watcher_token,
                         )
-                        _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
-                        if _watcher is not None:
-                            try:
-                                _watcher.reset_after_submit_market_truth_block(
-                                    str(queue_local_order_id or ""),
-                                    reason_code=reason_code,
-                                    next_retry_at=_nrb,
-                                    force_fresh_contract=True,
-                                )
-                            except Exception as _rw_exc:
-                                log.warning(
-                                    "[%s] SUBMIT_MARKET_TRUTH_WATCHER_RESET_FAILED "
-                                    "order=%s reason=%s error=%s",
-                                    ticker, str(queue_local_order_id or ""),
-                                    reason_code, _rw_exc,
-                                )
+                        return {
+                            "disposition":           "KEEP_WATCHER",
+                            "reason_code":           "MARKET_TRUTH_HOLD_NOT_DURABLE",
+                            "broker_post_attempted": False,
+                        }
+
+                    # P0-5: require the in-memory watcher exists AND its reset
+                    # succeeds. Either is a real ownership failure.
+                    _watched = (
+                        getattr(approved_plan, "watched_signal", None)
+                        or locals().get("watched_signal")
+                        or locals().get("watched")
+                    )
+                    _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
+
+                    if _watcher is None:
+                        log.critical(
+                            "[%s] MARKET_TRUTH_WATCHER_MISSING order=%s reason=%s "
+                            "— durable HOLD written but no in-memory owner to "
+                            "execute retry",
+                            ticker, str(queue_local_order_id or ""), reason_code,
+                        )
+                        return {
+                            "disposition":           "KEEP_WATCHER",
+                            "reason_code":           "MARKET_TRUTH_WATCHER_MISSING",
+                            "broker_post_attempted": False,
+                        }
+
+                    _memory_reset = False
+                    try:
+                        _memory_reset = bool(
+                            _watcher.reset_after_submit_market_truth_block(
+                                str(queue_local_order_id or ""),
+                                reason_code=reason_code,
+                                next_retry_at=_nrb,
+                                force_fresh_contract=True,
+                            )
+                        )
+                    except Exception as _rw_exc:
+                        log.critical(
+                            "[%s] MARKET_TRUTH_WATCHER_RESET_RAISED order=%s "
+                            "reason=%s error=%s",
+                            ticker, str(queue_local_order_id or ""),
+                            reason_code, _rw_exc, exc_info=True,
+                        )
+
+                    if not _memory_reset:
+                        log.critical(
+                            "[%s] MARKET_TRUTH_WATCHER_RESET_FAILED order=%s "
+                            "reason=%s — durable HOLD written but memory reset "
+                            "refused; row will not execute until recovery adopts",
+                            ticker, str(queue_local_order_id or ""), reason_code,
+                        )
+                        return {
+                            "disposition":           "KEEP_WATCHER",
+                            "reason_code":           "MARKET_TRUTH_WATCHER_RESET_FAILED",
+                            "broker_post_attempted": False,
+                        }
 
                     return {
                         "disposition":           "RETRY_WAIT",
@@ -7326,13 +7373,6 @@ class APExecutionCore:
                     }
 
                 if _authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
-                    _order_meta = dict(locals().get("_meta_for_ts") or {})
-                    _generation = int(
-                        _order_meta.get("materialization_generation") or 0
-                    )
-                    _watcher_token = str(_order_meta.get("watcher_token") or "")
-                    _deferred_contract = f"DEFERRED:{str(ticker).upper()}"
-
                     _db_rearmed = False
                     try:
                         _db_rearmed = bool(
@@ -7342,8 +7382,10 @@ class APExecutionCore:
                                 gate_audit=_mv_res.audit,
                                 execution_mode=_gate_exec_mode,
                                 signal_id=_plan_signal_id,
-                                expected_generation=_generation,
-                                expected_watcher_token=_watcher_token,
+                                # P0-3: outer-captured ownership fields; no
+                                # nested locals() lookup.
+                                expected_generation=_market_truth_generation,
+                                expected_watcher_token=_market_truth_watcher_token,
                                 deferred_contract=_deferred_contract,
                             )
                         )
@@ -7367,10 +7409,64 @@ class APExecutionCore:
                         or locals().get("watched")
                     )
                     _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
+
+                    # P0-7: DB rearm success + memory failure MUST become an
+                    # actual durable HOLD, not a silent no-op via the reread
+                    # short-circuit. Convert the row from REARM to HOLD so a
+                    # future owner (recovery / restart) will adopt it with
+                    # the canonical retry lease. We call the OSM HOLD method
+                    # directly here — the degrade helper's reread would see
+                    # the REARM label from the CAS we just did and return
+                    # RETRY_WAIT without proving memory ownership.
+                    def _fall_to_hold_after_rearm_memory_failure(reason_code: str):
+                        _delay_s = max(
+                            1,
+                            int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
+                        )
+                        _max_att = max(
+                            1,
+                            int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")),
+                        )
+                        _nrb = (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=_delay_s)
+                        ).isoformat()
+                        try:
+                            _ok = bool(
+                                self.order_state_machine
+                                .hold_entry_for_market_truth_unavailable(
+                                    str(queue_local_order_id or ""),
+                                    reason_code=reason_code,
+                                    gate_audit=_mv_res.audit,
+                                    execution_mode=_gate_exec_mode,
+                                    signal_id=_plan_signal_id,
+                                    expected_generation=_market_truth_generation,
+                                    expected_watcher_token=_market_truth_watcher_token,
+                                    next_retry_at=_nrb,
+                                    max_attempts=_max_att,
+                                    deferred_contract=_deferred_contract,
+                                )
+                            )
+                        except Exception as _hex:
+                            log.critical(
+                                "[%s] REARM_MEMORY_FAILURE_HOLD_WRITE_RAISED "
+                                "order=%s error=%s",
+                                ticker, str(queue_local_order_id or ""), _hex,
+                                exc_info=True,
+                            )
+                            _ok = False
+                        return {
+                            "disposition":           "KEEP_WATCHER",
+                            "reason_code":           (
+                                reason_code if _ok
+                                else "MARKET_TRUTH_HOLD_NOT_DURABLE"
+                            ),
+                            "broker_post_attempted": False,
+                        }
+
                     if _watcher is None:
-                        return _degrade_market_truth_block_to_hold(
-                            reason_code="REARM_WATCHER_REFERENCE_MISSING",
-                            gate_audit=_mv_res.audit,
+                        return _fall_to_hold_after_rearm_memory_failure(
+                            "MARKET_TRUTH_WATCHER_MISSING",
                         )
 
                     _memory_rearmed = False
@@ -7391,9 +7487,8 @@ class APExecutionCore:
                         )
 
                     if not _memory_rearmed:
-                        return _degrade_market_truth_block_to_hold(
-                            reason_code="REARM_WATCHER_RESET_FAILED",
-                            gate_audit=_mv_res.audit,
+                        return _fall_to_hold_after_rearm_memory_failure(
+                            "MARKET_TRUTH_WATCHER_RESET_FAILED",
                         )
 
                     # Fenced diagnostic write AFTER the CAS + memory reset succeed.
@@ -7669,34 +7764,48 @@ class APExecutionCore:
                 exc_info=True,
             )
 
+            # P0-12: the OSM HOLD method rejects execution_mode="unknown"
+            # (only paper/live are valid). Fall back to "paper" ONLY when
+            # the resolved mode was unknown — that keeps zero POST while
+            # still writing the durable HOLD to a valid row. If the mode
+            # is truly indeterminate, we still refuse POST above; the HOLD
+            # write attempts a best-effort recovery.
+            _hold_write_mode = _module_error_exec_mode
+            if _hold_write_mode == "unknown":
+                _hold_write_mode = "paper"
+
+            _module_hold_ok = False
             try:
-                self.order_state_machine.hold_entry_for_market_truth_unavailable(
-                    str(queue_local_order_id or ""),
-                    reason_code="MARKET_TRUTH_GATE_MODULE_ERROR",
-                    gate_audit=_module_error_audit,
-                    execution_mode=_module_error_exec_mode,
-                    signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                    expected_generation=int(
-                        (locals().get("_meta_for_ts") or {}).get(
-                            "materialization_generation"
-                        ) or 0
-                    ),
-                    expected_watcher_token=str(
-                        (locals().get("_meta_for_ts") or {}).get(
-                            "watcher_token"
-                        ) or ""
-                    ),
-                    next_retry_at=(
-                        datetime.now(timezone.utc)
-                        + timedelta(seconds=max(
+                _module_hold_ok = bool(
+                    self.order_state_machine.hold_entry_for_market_truth_unavailable(
+                        str(queue_local_order_id or ""),
+                        reason_code="MARKET_TRUTH_GATE_MODULE_ERROR",
+                        gate_audit=_module_error_audit,
+                        execution_mode=_hold_write_mode,
+                        signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                        expected_generation=int(
+                            (locals().get("_meta_for_ts") or {}).get(
+                                "materialization_generation"
+                            ) or 0
+                        ),
+                        expected_watcher_token=str(
+                            (locals().get("_meta_for_ts") or {}).get(
+                                "watcher_token"
+                            ) or ""
+                        ),
+                        next_retry_at=(
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=max(
+                                1,
+                                int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
+                            ))
+                        ).isoformat(),
+                        max_attempts=max(
                             1,
-                            int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
-                        ))
-                    ).isoformat(),
-                    max_attempts=max(
-                        1,
-                        int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")),
-                    ),
+                            int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")),
+                        ),
+                        deferred_contract=f"DEFERRED:{str(ticker or '').upper()}",
+                    )
                 )
             except Exception as _hold_exc:
                 log.critical(
@@ -7724,6 +7833,19 @@ class APExecutionCore:
                     "error=%s — canonical HOLD already durable, audit only",
                     ticker, str(queue_local_order_id or ""), _module_diag_exc,
                 )
+
+            # P0-12: never claim RETRY_WAIT if the HOLD CAS did not confirm.
+            if not _module_hold_ok:
+                log.critical(
+                    "[%s] MODULE_ERROR_HOLD_NOT_DURABLE order=%s — CAS did "
+                    "not confirm; returning KEEP_WATCHER (zero POST enforced)",
+                    ticker, str(queue_local_order_id or ""),
+                )
+                return {
+                    "disposition":            "KEEP_WATCHER",
+                    "reason_code":            "MARKET_TRUTH_HOLD_NOT_DURABLE",
+                    "broker_post_attempted":  False,
+                }
 
             return {
                 "disposition":            "RETRY_WAIT",

@@ -142,6 +142,8 @@ class TestMarketValidityGate:
             current_bid=105.10,
             current_ask=105.20,   # mid = 105.15 >= target 105.0
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -156,6 +158,8 @@ class TestMarketValidityGate:
             current_bid=94.90,
             current_ask=94.95,   # mid = 94.925 <= target 95
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -172,6 +176,8 @@ class TestMarketValidityGate:
             current_bid=104.75,
             current_ask=104.85,
             quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -186,6 +192,8 @@ class TestMarketValidityGate:
             target_price=105.0,
             current_bid=None,
             current_ask=None,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -194,7 +202,9 @@ class TestMarketValidityGate:
     def test_07b_blocks_zero_bid_or_ask_live(self):
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=0.0, current_ask=0.0, execution_mode="live",
+            current_bid=0.0, current_ask=0.0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="live",
         )
         assert r.passed is False
         assert r.reason_code == GateOutcome.CURRENT_PRICE_ZERO
@@ -205,7 +215,9 @@ class TestMarketValidityGate:
         classification — bounded retry, not a broker POST."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=None, current_ask=None, execution_mode="paper",
+            current_bid=None, current_ask=None,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="paper",
         )
         assert r.passed is False
         assert r.reason_code == GateOutcome.CURRENT_PRICE_MISSING
@@ -215,6 +227,8 @@ class TestMarketValidityGate:
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
             current_bid=101.0, current_ask=101.2,
             quote_age_ms=10000,   # 10 seconds — well over default 5s
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is False
@@ -225,7 +239,9 @@ class TestMarketValidityGate:
         before we could submit. Never send a stale entry."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=99.4, current_ask=99.6, quote_age_ms=0, execution_mode="live",
+            current_bid=99.4, current_ask=99.6, quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="live",
         )
         assert r.passed is False
         assert r.reason_code == GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER
@@ -233,7 +249,9 @@ class TestMarketValidityGate:
     def test_09b_blocks_put_no_longer_below_trigger(self):
         r = check_market_validity_gate(
             side="PUT", trigger_price=100.0, stop_price=105.0, target_price=95.0,
-            current_bid=100.5, current_ask=100.7, quote_age_ms=0, execution_mode="live",
+            current_bid=100.5, current_ask=100.7, quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="live",
         )
         assert r.passed is False
         assert r.reason_code == GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
@@ -241,7 +259,9 @@ class TestMarketValidityGate:
     def test_10_blocks_call_stop_broken_before_submit(self):
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
-            current_bid=94.5, current_ask=94.9, quote_age_ms=0, execution_mode="live",
+            current_bid=94.5, current_ask=94.9, quote_age_ms=0,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch", execution_mode="live",
         )
         assert r.passed is False
         # This will match CALL_NO_LONGER_ABOVE_TRIGGER since 94 < 100 first
@@ -257,6 +277,8 @@ class TestMarketValidityGate:
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=100.95, current_ask=101.05, quote_age_ms=100,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is True
@@ -267,6 +289,8 @@ class TestMarketValidityGate:
         r = check_market_validity_gate(
             side="PUT", trigger_price=100.0, stop_price=105.0, target_price=90.0,
             current_bid=98.95, current_ask=99.05, quote_age_ms=100,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
             execution_mode="live",
         )
         assert r.passed is True
@@ -375,6 +399,8 @@ class TestGateIntegration:
             current_ask=101.05,
             quote_age_ms=100,
             trigger_crossed_at=self._iso(30),
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
         )
         assert result.passed is True
         assert combined["identity_gate"]["client_id"] == "jasoncosby1@gmail.com"
@@ -388,6 +414,8 @@ class TestGateIntegration:
             side="CALL", trigger_price=100.0,
             current_bid=101.0, current_ask=101.2,
             trigger_crossed_at=self._iso(30),
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
         )
         assert result.passed is False
         assert result.reason_code == GateOutcome.LIVE_SUBMIT_CLIENT_ID_MISSING
@@ -406,6 +434,8 @@ class TestGateIntegration:
             current_bid=105.5, current_ask=105.7,   # target hit
             quote_age_ms=0,
             trigger_crossed_at=self._iso(30),
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
         )
         assert result.passed is False
         assert result.reason_code == GateOutcome.TARGET_ALREADY_INVALID
@@ -536,6 +566,8 @@ class TestRobustness:
                 current_bid="oops",
                 current_ask=None,
                 quote_age_ms="text",
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
                 execution_mode="live",
             )
         except Exception as e:

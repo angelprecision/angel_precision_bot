@@ -569,7 +569,12 @@ class TestOSMHoldAuthority:
         assert patch["materialization_in_flight"] is False
         assert patch["materialization_owner"] == ""
         assert patch["materialization_lease_until"] == ""
-        assert patch["watcher_token"] == ""
+        # P0-8: durable and in-memory ownership must agree — HOLD preserves
+        # the caller's watcher_token, does not blank it. The generation
+        # fence + submit_intent_at fence still prevents stale-worker
+        # rewrites.
+        assert patch["watcher_token"] == _HOLD_KW["expected_watcher_token"]
+        assert patch["current_owner"] == _HOLD_KW["expected_watcher_token"]
         assert patch["broker_ready"] is False
         assert patch["retry_reason"] == GateOutcome.CURRENT_PRICE_STALE
         assert patch["materialization_reason"] == GateOutcome.CURRENT_PRICE_STALE
@@ -611,12 +616,19 @@ class TestOSMHoldAuthority:
 
 
 class TestProvenanceEnforcement:
-    @pytest.mark.parametrize("bad_source", [
-        "unknown", "sandbox", "sandbox_only", "tradier_sandbox",
+    # PR #391 blocker P0-1: LIVE + unknown + synchronous_submit_fetch is
+    # Jason's real production quote shape (the adapter didn't populate a
+    # provider name). It is proven-fresh by the sync provenance, and
+    # freshness/bid/ask/stop/target/direction are checked separately, so
+    # this exact triple is allowed. Every other unproven combo still HOLDs.
+    _BAD_SOURCES_UNIVERSAL = [
+        "sandbox", "sandbox_only", "tradier_sandbox",
         "sim", "SimBroker", "MOCK", "test",
-    ])
+    ]
+
+    @pytest.mark.parametrize("bad_source", _BAD_SOURCES_UNIVERSAL)
     @pytest.mark.parametrize("mode", ["paper", "live"])
-    def test_unproven_source_holds_in_both_modes(self, mode, bad_source):
+    def test_sandbox_family_holds_in_both_modes(self, mode, bad_source):
         r = _gate(mode,
                   side="CALL", trigger_price=100.0, stop_price=95.0,
                   target_price=110.0,
@@ -629,6 +641,53 @@ class TestProvenanceEnforcement:
         assert classify_market_truth(r.reason_code) == (
             MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
         )
+
+    def test_blank_source_holds_both_modes(self):
+        # P0-2: truly blank source is unproven — always HOLD.
+        for mode in ("paper", "live"):
+            r = _gate(mode,
+                      side="CALL", trigger_price=100.0, stop_price=95.0,
+                      target_price=110.0,
+                      current_bid=100.95, current_ask=101.05,
+                      quote_age_ms=100, quote_source="",
+                      quote_provenance="synchronous_submit_fetch")
+            assert r.passed is False
+            assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+
+    def test_live_unknown_with_sync_fetch_is_allowed(self):
+        # P0-1: Jason's real LIVE shape — unknown + synchronous_submit_fetch.
+        r = _gate("live",
+                  side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0,
+                  current_bid=100.95, current_ask=101.05,
+                  quote_age_ms=100, quote_source="unknown",
+                  quote_provenance="synchronous_submit_fetch")
+        assert r.passed is True
+        assert r.reason_code == GateOutcome.PASS
+
+    def test_live_unknown_without_sync_fetch_still_holds(self):
+        # P0-1 exception is scoped tightly: unknown+cached still fails.
+        r = _gate("live",
+                  side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0,
+                  current_bid=100.95, current_ask=101.05,
+                  quote_age_ms=100, quote_source="unknown",
+                  quote_provenance="cached")
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+
+    def test_paper_unknown_with_sync_fetch_still_holds(self):
+        # The P0-1 exception is LIVE-only. PAPER MUST NOT accept "unknown"
+        # even with sync provenance — PAPER must attest a proven-live data
+        # transport, which cannot be labeled "unknown".
+        r = _gate("paper",
+                  side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0,
+                  current_bid=100.95, current_ask=101.05,
+                  quote_age_ms=100, quote_source="unknown",
+                  quote_provenance="synchronous_submit_fetch")
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
 
     def test_proven_live_source_passes(self):
         r = _gate("paper",
@@ -1111,7 +1170,9 @@ class TestHoldOwnerLiveness:
         assert patch["materialization_status"] == "RETRY_PENDING"
         assert patch["materialization_in_flight"] is False
         assert patch["materialization_owner"] == ""
-        assert patch["watcher_token"] == ""
+        # P0-8: durable and in-memory ownership must agree; HOLD preserves
+        # the caller's watcher_token to keep the ownership model coherent.
+        assert patch["watcher_token"] == "watcher:hold"
         assert patch["broker_ready"] is False
         assert patch["retry_reason"] == GateOutcome.CURRENT_PRICE_STALE
         assert patch["materialization_reason"] == GateOutcome.CURRENT_PRICE_STALE
@@ -1426,3 +1487,138 @@ class TestOSMHoldDirectlyOnGateModuleErrorReason:
         assert patch["final_market_truth_reason_code"] == "MARKET_TRUTH_GATE_MODULE_ERROR"
         assert patch["final_market_truth_status"] == "HOLD_MARKET_TRUTH_UNAVAILABLE"
         assert patch["lifecycle_state"] == "RETRY_WAIT"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 HARD-HOLD amendment (Sept 2026 review): 12 blocker corrections.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestHoldClearsStaleContractAuthorityP0_9:
+    """P0-9: when the caller supplies a DEFERRED:<TICKER> placeholder, HOLD
+    must clear the top-level contract / limit_price / reserved_cost fields
+    just like REARM does — so a restart cannot resurrect a stale OCC."""
+
+    def test_hold_with_deferred_contract_clears_top_level_fields(self, osm):
+        ok = osm.hold_entry_for_market_truth_unavailable(
+            "LOID-P09",
+            reason_code=GateOutcome.CURRENT_PRICE_STALE,
+            gate_audit={},
+            execution_mode="paper",
+            signal_id="SIG-P09",
+            expected_generation=2,
+            expected_watcher_token="watcher:p09",
+            next_retry_at="2026-07-26T20:00:00+00:00",
+            max_attempts=5,
+            deferred_contract="DEFERRED:AAPL",
+        )
+        assert ok is True
+        sql, params = osm._fake_conn.executed[0]
+        # SET clause invalidates stale contract authority.
+        assert "contract = %s" in sql
+        assert "limit_price = NULL" in sql
+        assert "reserved_cost = 0" in sql
+        assert "REVALIDATION_REQUIRED" in sql
+        # First positional param is the DEFERRED contract.
+        assert params[0] == "DEFERRED:AAPL"
+
+    def test_hold_without_deferred_contract_leaves_top_level_alone(self, osm):
+        ok = osm.hold_entry_for_market_truth_unavailable(
+            "LOID-P09b",
+            reason_code=GateOutcome.CURRENT_PRICE_STALE,
+            gate_audit={},
+            execution_mode="paper",
+            signal_id="SIG-P09b",
+            expected_generation=2,
+            expected_watcher_token="watcher:p09b",
+            next_retry_at="2026-07-26T20:00:00+00:00",
+            max_attempts=5,
+        )
+        assert ok is True
+        sql, _ = osm._fake_conn.executed[0]
+        # Without deferred_contract, no top-level contract update.
+        assert "contract = %s" not in sql
+        # Meta flag is still stamped (patch level).
+        import json
+        patch = json.loads(osm._fake_conn.executed[0][1][0])
+        assert patch["contract_revalidation_required"] is True
+
+
+class TestWatcherResetSetsDeferredRetryAttributeP0_6:
+    """P0-6: the ownership-proof machinery reads
+    watched.deferred_retry_not_before — writing only to the signal dict
+    left the WatchedSignal inert."""
+
+    def test_reset_sets_attribute_when_next_retry_at_supplied(self):
+        w, watched = _build_watcher_with_triggered_signal()
+        from datetime import datetime, timezone
+        ts = "2026-07-26T21:00:00+00:00"
+        ok = w.reset_after_submit_market_truth_block(
+            "LOID-1", reason_code="X", next_retry_at=ts,
+        )
+        assert ok is True
+        # Attribute is set to a tz-aware datetime, not just a string on the
+        # signal dict.
+        from datetime import datetime as _dt
+        assert isinstance(watched.deferred_retry_not_before, _dt)
+        assert watched.deferred_retry_not_before.tzinfo is not None
+        assert watched.deferred_retry_not_before.isoformat().startswith("2026-07-26T21:00:00")
+        # Signal-dict copy is still present for serialization.
+        assert watched.signal["deferred_retry_not_before"] == ts
+
+    def test_reset_clears_attribute_when_next_retry_at_none(self):
+        w, watched = _build_watcher_with_triggered_signal()
+        watched.deferred_retry_not_before = "should_be_cleared"
+        ok = w.reset_after_submit_market_truth_block(
+            "LOID-1", reason_code="X", next_retry_at=None,
+        )
+        assert ok is True
+        assert watched.deferred_retry_not_before is None
+
+
+class TestHoldOwnershipAgreementP0_8:
+    """P0-8: durable and in-memory watcher_token must agree — HOLD
+    preserves the caller's token instead of blanking it."""
+
+    def test_hold_preserves_caller_watcher_token(self, osm):
+        ok = osm.hold_entry_for_market_truth_unavailable(
+            "LOID-P08",
+            reason_code=GateOutcome.CURRENT_PRICE_STALE,
+            gate_audit={},
+            execution_mode="paper",
+            signal_id="SIG-P08",
+            expected_generation=1,
+            expected_watcher_token="watcher:owner-A",
+            next_retry_at="2026-07-26T20:00:00+00:00",
+            max_attempts=5,
+        )
+        assert ok is True
+        import json
+        patch = json.loads(osm._fake_conn.executed[0][1][0])
+        assert patch["watcher_token"] == "watcher:owner-A"
+        assert patch["current_owner"] == "watcher:owner-A"
+
+
+class TestRearmOwnershipFencingP0_3:
+    """P0-3: outer capture of materialization_generation and watcher_token
+    — no nested locals() lookup — so a real gen>0 row can pass the CAS."""
+
+    def test_rearm_fences_gen_gt_zero(self, osm):
+        ok = osm.rearm_entry_for_direction_reversal(
+            "LOID-P03",
+            reason_code=GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+            gate_audit={},
+            execution_mode="paper",
+            signal_id="SIG-P03",
+            expected_generation=7,   # ← real materialized gen, not 0
+            expected_watcher_token="watcher:P03",
+            deferred_contract="DEFERRED:MSFT",
+        )
+        assert ok is True
+        sql, params = osm._fake_conn.executed[0]
+        # WHERE clause pins on the exact generation and watcher token.
+        assert "(meta->>'materialization_generation')::int" in sql
+        assert "meta->>'watcher_token'" in sql
+        # Params carry the fence values (gen and both token slots).
+        assert 7 in params
+        assert "watcher:P03" in params
