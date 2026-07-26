@@ -2911,8 +2911,33 @@ class APOrderMonitor:
             )
             if handled:
                 return
-            # Fall through to legacy only if the executor wasn't registered —
-            # avoids losing the retry entirely during a startup race.
+            # BLOCKER 6 REPAIR: for a lifecycle-seeded row, NEVER fall back
+            # to the legacy process_signal path — that is precisely the path
+            # that mis-rejects valid retries at the first-30-min time_gate.
+            # Instead persist a durable RETRY_OWNER_UNAVAILABLE HOLD so
+            # restart recovery / next tick can resume on the same lifecycle.
+            try:
+                self.osm.claim_entry_retry_generation(
+                    local_order_id,
+                    current_generation=int((_row_meta or {}).get("retry_generation") or 0),
+                    owner=f"entry_retry:{self.client_id}:owner_unavailable",
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "retry_owner_unavailable_reason": "execution_core_registry_miss",
+                        "retry_owner_unavailable_at":     now_utc_iso(),
+                    },
+                )
+            except Exception as _cxe:
+                log.error(
+                    "[%s] failed to persist RETRY_OWNER_UNAVAILABLE for %s: %s",
+                    self.client_id, local_order_id, _cxe,
+                )
+            log.warning(
+                "[%s] ENTRY_LIFECYCLE row %s: continuation dispatcher unavailable — "
+                "durable HOLD persisted, legacy path NOT invoked",
+                self.client_id, local_order_id,
+            )
+            return
 
         try:
             from ap.post_cancel_retry import evaluate_retry
