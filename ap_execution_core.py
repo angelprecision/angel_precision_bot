@@ -37,6 +37,15 @@ from ap_signal_store         import APSignalStore
 from ap_signal_tracker       import APSignalTracker
 from ap.broker_submit_identity import canonical_broker_submit_key
 from ap.utils                import now_utc_iso
+# PR #391: module-scope re-exports so callers (tests) can monkeypatch the
+# gate module functions and force the outer wrapper's exception branch.
+from ap.live_submit_gates import (
+    check_market_validity_gate,
+    classify_market_truth,
+    MarketTruthAuthority,
+    GateOutcome,
+)
+from urllib.parse import urlparse
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -47,6 +56,44 @@ except ImportError:
 log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
+
+
+def _market_data_transport_proof(adapter) -> dict:
+    """PR #391 blocker 6: prove a quote adapter is a live-market transport,
+    not a friendly-looking source string.
+
+    Returns a dict with keys base_url, host, sandbox, proven. proven is True
+    only when a host is present AND the host does not match any of the
+    sandbox/paper/sim/mock/test markers. No adapter → all None/False.
+    """
+    if adapter is None:
+        return {"base_url": None, "host": None, "sandbox": False, "proven": False}
+
+    cfg = getattr(adapter, "cfg", None)
+    base_url = str(
+        getattr(cfg, "base_url", None)
+        or getattr(adapter, "base_url", None)
+        or ""
+    ).strip()
+
+    host = ""
+    if base_url:
+        try:
+            host = str(urlparse(base_url).hostname or "").strip().lower()
+        except Exception:
+            host = ""
+
+    sandbox = any(
+        marker in host
+        for marker in ("sandbox", "paper", "sim", "mock", "test")
+    )
+
+    return {
+        "base_url": base_url or None,
+        "host": host or None,
+        "sandbox": sandbox,
+        "proven": bool(host) and not sandbox,
+    }
 
 
 def _safe_reread_market_truth(osm, local_order_id: str) -> tuple[str | None, str | None]:
@@ -7004,37 +7051,42 @@ class APExecutionCore:
             _mv_received_at = None            # PR #391 (blocker 2): local receipt ts
             _mv_quote_fetch_failed = True
             _mv_quote_fetch_error = "quote_adapter_unavailable"
+            # PR #391 blocker 6: prove market-data transport, not a source
+            # string. Compute both broker proofs up front so the audit stamp
+            # records them regardless of which adapter served the quote.
+            _data_broker = getattr(self, "data_broker", None)
+            _execution_broker = self.broker
+            _data_proof = _market_data_transport_proof(_data_broker)
+            _execution_proof = _market_data_transport_proof(_execution_broker)
+
             try:
-                # PR #391 (blocker 2): PAPER data-domain requirement.
-                # PAPER execution may remain sandbox, but market truth must
-                # come from the live data broker. Prefer self.data_broker
-                # over self.broker so a sandbox execution adapter never
-                # doubles as market-truth authority. LIVE keeps preferring
-                # broker.get_quote (primary production path).
                 _quote_sources = []
-                _data_broker = getattr(self, "data_broker", None)
                 if _gate_is_live:
-                    if hasattr(self.broker, "get_quote"):
-                        _quote_sources.append(("broker.get_quote", self.broker.get_quote))
-                    if _data_broker is not None and _data_broker is not self.broker \
+                    # LIVE: production quote path is the execution broker
+                    # itself. A separate live data broker is an extra fallback.
+                    if hasattr(_execution_broker, "get_quote"):
+                        _quote_sources.append(("broker.get_quote", _execution_broker.get_quote))
+                    if _data_broker is not None and _data_broker is not _execution_broker \
                        and hasattr(_data_broker, "get_quote"):
                         _quote_sources.append(("data_broker.get_quote", _data_broker.get_quote))
                 else:
-                    # PAPER: live data broker first, execution broker is
-                    # sandbox and must not authorize submit truth.
-                    if _data_broker is not None and _data_broker is not self.broker \
-                       and hasattr(_data_broker, "get_quote"):
+                    # PAPER: require a distinct, proven-live data broker.
+                    # No fallback to the execution broker for market truth —
+                    # that adapter is the sandbox and cannot authorize submit.
+                    if (
+                        _data_broker is None
+                        or _data_broker is _execution_broker
+                        or not _data_proof["proven"]
+                    ):
+                        _mv_quote_fetch_failed = True
+                        _mv_quote_fetch_error = "paper_live_data_broker_unavailable_or_sandbox"
+                    elif hasattr(_data_broker, "get_quote"):
                         _quote_sources.append(("data_broker.get_quote", _data_broker.get_quote))
-                    # PAPER fallback: broker.get_quote only when no separate
-                    # data broker is wired. The gate's source-identity check
-                    # will still reject sandbox strings.
-                    if not _quote_sources and hasattr(self.broker, "get_quote"):
-                        _quote_sources.append(("broker.get_quote", self.broker.get_quote))
-                # Alternate adapter shapes (both modes)
-                if not _quote_sources and hasattr(self.broker, "get_bid_ask"):
-                    _quote_sources.append(("broker.get_bid_ask", self.broker.get_bid_ask))
-                if not _quote_sources and hasattr(self.broker, "quote"):
-                    _quote_sources.append(("broker.quote", self.broker.quote))
+                # Alternate adapter shapes (LIVE fallback only)
+                if _gate_is_live and not _quote_sources and hasattr(_execution_broker, "get_bid_ask"):
+                    _quote_sources.append(("broker.get_bid_ask", _execution_broker.get_bid_ask))
+                if _gate_is_live and not _quote_sources and hasattr(_execution_broker, "quote"):
+                    _quote_sources.append(("broker.quote", _execution_broker.quote))
 
                 _mv_raw_q = None
                 _adapter_name = None
@@ -7146,6 +7198,20 @@ class APExecutionCore:
                     "execution_mode":                 _gate_exec_mode,
                     "signal_id":                      _plan_signal_id,
                     "local_order_id":                 str(queue_local_order_id or ""),
+                    # PR #391 blocker 6: transport-domain proof persisted
+                    # so PAPER data/order separation is auditable.
+                    "paper_data_order_domain_separated": (
+                        _gate_exec_mode == "paper"
+                        and _data_broker is not None
+                        and _data_broker is not _execution_broker
+                        and _data_proof["proven"]
+                    ),
+                    "submit_data_broker_base_url":    _data_proof["base_url"],
+                    "submit_data_broker_host":        _data_proof["host"],
+                    "submit_data_broker_sandbox":     _data_proof["sandbox"],
+                    "execution_broker_base_url":      _execution_proof["base_url"],
+                    "execution_broker_host":          _execution_proof["host"],
+                    "execution_broker_sandbox":       _execution_proof["sandbox"],
                 }
 
                 log.critical(
@@ -7156,22 +7222,181 @@ class APExecutionCore:
                     _gate_exec_mode, ticker, _plan_side,
                 )
 
-                if _authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
-                    _rearmed = False
+                # PR #391 blocker 4: unified degrade path. Every REARM/HOLD
+                # persistence failure funnels through here — reread first,
+                # then either bow out (a peer already handled the row or the
+                # row advanced to broker POST), or fall into a canonical
+                # HOLD with a bounded not-before. Never terminalizes.
+                def _degrade_market_truth_block_to_hold(
+                    *, reason_code: str, gate_audit: dict,
+                ):
+                    _reread_authority, _reread_reason = _safe_reread_market_truth(
+                        self.order_state_machine,
+                        str(queue_local_order_id or ""),
+                    )
+                    if _reread_reason == "broker_evidence_present":
+                        return {
+                            "disposition":           "KEEP_WATCHER",
+                            "reason_code":           "PEER_ADVANCED_TO_BROKER",
+                            "broker_post_attempted": False,
+                        }
+                    if _reread_authority in (
+                        MarketTruthAuthority.REARM_DIRECTION_REVERSAL,
+                        MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE,
+                    ):
+                        return {
+                            "disposition":           "RETRY_WAIT",
+                            "reason_code":           _reread_authority,
+                            "broker_post_attempted": False,
+                        }
+
+                    _delay_s = max(
+                        1,
+                        int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
+                    )
+                    _max_att = max(
+                        1,
+                        int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")),
+                    )
+                    _nrb = (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=_delay_s)
+                    ).isoformat()
+
+                    _hold_ok = False
                     try:
-                        _rearmed = bool(
+                        _hold_ok = bool(
+                            self.order_state_machine.hold_entry_for_market_truth_unavailable(
+                                str(queue_local_order_id or ""),
+                                reason_code=reason_code,
+                                gate_audit=gate_audit,
+                                execution_mode=_gate_exec_mode,
+                                signal_id=_plan_signal_id,
+                                expected_generation=int(
+                                    (locals().get("_meta_for_ts") or {}).get(
+                                        "materialization_generation"
+                                    ) or 0
+                                ),
+                                expected_watcher_token=str(
+                                    (locals().get("_meta_for_ts") or {}).get(
+                                        "watcher_token"
+                                    ) or ""
+                                ),
+                                next_retry_at=_nrb,
+                                max_attempts=_max_att,
+                            )
+                        )
+                    except Exception as _hold_exc:
+                        log.critical(
+                            "[%s] SUBMIT_MARKET_TRUTH_HOLD_WRITE_FAILED "
+                            "order=%s reason=%s error=%s — zero POST enforced",
+                            ticker, str(queue_local_order_id or ""),
+                            reason_code, _hold_exc, exc_info=True,
+                        )
+
+                    # Reset the in-memory watcher only after the DB CAS
+                    # succeeded, and only for the exact same watcher owner.
+                    if _hold_ok:
+                        _watched = (
+                            getattr(approved_plan, "watched_signal", None)
+                            or locals().get("watched_signal")
+                            or locals().get("watched")
+                        )
+                        _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
+                        if _watcher is not None:
+                            try:
+                                _watcher.reset_after_submit_market_truth_block(
+                                    str(queue_local_order_id or ""),
+                                    reason_code=reason_code,
+                                    next_retry_at=_nrb,
+                                    force_fresh_contract=True,
+                                )
+                            except Exception as _rw_exc:
+                                log.warning(
+                                    "[%s] SUBMIT_MARKET_TRUTH_WATCHER_RESET_FAILED "
+                                    "order=%s reason=%s error=%s",
+                                    ticker, str(queue_local_order_id or ""),
+                                    reason_code, _rw_exc,
+                                )
+
+                    return {
+                        "disposition":           "RETRY_WAIT",
+                        "reason_code":           reason_code,
+                        "broker_post_attempted": False,
+                    }
+
+                if _authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
+                    _order_meta = dict(locals().get("_meta_for_ts") or {})
+                    _generation = int(
+                        _order_meta.get("materialization_generation") or 0
+                    )
+                    _watcher_token = str(_order_meta.get("watcher_token") or "")
+                    _deferred_contract = f"DEFERRED:{str(ticker).upper()}"
+
+                    _db_rearmed = False
+                    try:
+                        _db_rearmed = bool(
                             self.order_state_machine.rearm_entry_for_direction_reversal(
                                 str(queue_local_order_id or ""),
                                 reason_code=_mv_res.reason_code,
                                 gate_audit=_mv_res.audit,
+                                execution_mode=_gate_exec_mode,
+                                signal_id=_plan_signal_id,
+                                expected_generation=_generation,
+                                expected_watcher_token=_watcher_token,
+                                deferred_contract=_deferred_contract,
                             )
                         )
                     except Exception as _rearm_exc:
-                        log.warning(
-                            "[%s] REARM_DIRECTION_REVERSAL raised order=%s error=%s "
-                            "— will reread before deciding what to do",
+                        log.critical(
+                            "[%s] REARM_DIRECTION_REVERSAL raised order=%s error=%s",
                             ticker, str(queue_local_order_id or ""), _rearm_exc,
+                            exc_info=True,
                         )
+
+                    if not _db_rearmed:
+                        return _degrade_market_truth_block_to_hold(
+                            reason_code="REARM_DB_CAS_FAILED",
+                            gate_audit=_mv_res.audit,
+                        )
+
+                    # DB CAS succeeded → reset the exact in-memory watcher.
+                    _watched = (
+                        getattr(approved_plan, "watched_signal", None)
+                        or locals().get("watched_signal")
+                        or locals().get("watched")
+                    )
+                    _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
+                    if _watcher is None:
+                        return _degrade_market_truth_block_to_hold(
+                            reason_code="REARM_WATCHER_REFERENCE_MISSING",
+                            gate_audit=_mv_res.audit,
+                        )
+
+                    _memory_rearmed = False
+                    try:
+                        _memory_rearmed = bool(
+                            _watcher.reset_after_submit_market_truth_block(
+                                str(queue_local_order_id or ""),
+                                reason_code=_mv_res.reason_code,
+                                next_retry_at=None,
+                                force_fresh_contract=True,
+                            )
+                        )
+                    except Exception as _rw_exc:
+                        log.critical(
+                            "[%s] REARM_WATCHER_RESET_RAISED order=%s error=%s",
+                            ticker, str(queue_local_order_id or ""), _rw_exc,
+                            exc_info=True,
+                        )
+
+                    if not _memory_rearmed:
+                        return _degrade_market_truth_block_to_hold(
+                            reason_code="REARM_WATCHER_RESET_FAILED",
+                            gate_audit=_mv_res.audit,
+                        )
+
+                    # Fenced diagnostic write AFTER the CAS + memory reset succeed.
                     try:
                         self.order_state_machine.update_order_meta(
                             str(queue_local_order_id or ""),
@@ -7184,103 +7409,44 @@ class APExecutionCore:
                                 "final_market_validity": _mv_res.audit,
                                 **_durable_truth_patch,
                             },
-                        )
-                    except Exception as _mv_meta_exc:
-                        log.warning(
-                            "[%s] SUBMIT_MARKET_TRUTH_AUDIT_WRITE_FAILED gate=market_validity "
-                            "authority=%s order_id=%s error=%s — no POST attempted",
-                            ticker, _authority, str(queue_local_order_id or ""), _mv_meta_exc,
-                        )
-                    if _rearmed:
-                        # Zero broker POST. Setup returned to watcher on same identity.
-                        return
-                    # PR #391 (blocker 4): a False return does NOT authorize
-                    # terminalize. Reread first — the row may already have
-                    # rearmed under another worker, or may have advanced to
-                    # broker submission, or the CAS may simply have lost a
-                    # benign race. Only proven terminal geometry terminalizes.
-                    _reread_authority, _reread_reason = _safe_reread_market_truth(
-                        self.order_state_machine, str(queue_local_order_id or "")
-                    )
-                    if _reread_authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
-                        # Someone else already rearmed. Success.
-                        return
-                    if _reread_reason == "broker_evidence_present":
-                        # Row advanced to broker POST under another worker — do NOT terminalize.
-                        return
-                    # Persistence genuinely failed and the row is still
-                    # unsubmitted — fall through to a retryable HOLD instead
-                    # of a blind terminalize.
-                    log.critical(
-                        "[%s] REARM_DIRECTION_REVERSAL persist failed and row unadvanced "
-                        "order=%s reason=%s — degrading to HOLD (retryable), not terminal",
-                        ticker, str(queue_local_order_id or ""), _mv_res.reason_code,
-                    )
-                    try:
-                        self.order_state_machine.hold_entry_for_market_truth_unavailable(
-                            str(queue_local_order_id or ""),
-                            reason_code="REARM_PERSIST_FAILED",
-                            gate_audit=_mv_res.audit,
                         )
                     except Exception:
                         pass
-                    return
+
+                    return {
+                        "disposition":           "KEEP_WATCHER",
+                        "reason_code":           _mv_res.reason_code,
+                        "authority":             "REARM_DIRECTION_REVERSAL",
+                        "broker_post_attempted": False,
+                    }
 
                 if _authority == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE:
-                    _held = False
-                    try:
-                        _held = bool(
-                            self.order_state_machine.hold_entry_for_market_truth_unavailable(
+                    _result = _degrade_market_truth_block_to_hold(
+                        reason_code=_mv_res.reason_code,
+                        gate_audit=_mv_res.audit,
+                    )
+                    # Diagnostic write only on real HOLD (not on peer-advance),
+                    # AFTER the CAS decision, so the audit reflects observed state.
+                    if _result.get("disposition") == "RETRY_WAIT":
+                        try:
+                            self.order_state_machine.update_order_meta(
                                 str(queue_local_order_id or ""),
-                                reason_code=_mv_res.reason_code,
-                                gate_audit=_mv_res.audit,
-                            )
-                        )
-                    except Exception as _hold_exc:
-                        log.warning(
-                            "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE persist failed order=%s error=%s",
-                            ticker, str(queue_local_order_id or ""), _hold_exc,
-                        )
-                    try:
-                        self.order_state_machine.update_order_meta(
-                            str(queue_local_order_id or ""),
-                            {
-                                "live_submit_gate": {
-                                    "failed_gate": "market_validity",
-                                    **_mv_res.audit,
-                                    "authority": _authority,
+                                {
+                                    "live_submit_gate": {
+                                        "failed_gate": "market_validity",
+                                        **_mv_res.audit,
+                                        "authority": _authority,
+                                    },
+                                    "final_market_validity": _mv_res.audit,
+                                    **_durable_truth_patch,
                                 },
-                                "final_market_validity": _mv_res.audit,
-                                **_durable_truth_patch,
-                            },
-                        )
-                    except Exception as _mv_meta_exc:
-                        log.warning(
-                            "[%s] SUBMIT_MARKET_TRUTH_AUDIT_WRITE_FAILED gate=market_validity "
-                            "authority=%s order_id=%s error=%s — no POST attempted",
-                            ticker, _authority, str(queue_local_order_id or ""), _mv_meta_exc,
-                        )
-                    if not _held:
-                        # PR #391 (blocker 4): reread — do not terminalize
-                        # if the row already advanced or a peer already held.
-                        _r_auth, _r_reason = _safe_reread_market_truth(
-                            self.order_state_machine, str(queue_local_order_id or "")
-                        )
-                        if _r_reason == "broker_evidence_present":
-                            return
-                        if _r_auth == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE:
-                            return
-                        log.critical(
-                            "[%s] HOLD persist failed and row unadvanced order=%s reason=%s "
-                            "— leaving in place for the next retry sweep (no terminalize)",
-                            ticker, str(queue_local_order_id or ""), _mv_res.reason_code,
-                        )
-                    # Zero broker POST. Existing deferred retry lifecycle owns the retry.
-                    return
+                            )
+                        except Exception:
+                            pass
+                    return _result
 
-                # TERMINAL_SETUP_COMPLETE (or unknown → treat as terminal on the
-                # gate side since HOLD is already the unknown-code fallback in
-                # classify_market_truth; if we reach here it is genuinely terminal).
+                # TERMINAL_SETUP_COMPLETE — stop broken, target complete, or
+                # invalid geometry. Only proven terminal reasons terminalize.
                 try:
                     self.order_state_machine.update_order_meta(
                         str(queue_local_order_id or ""),
@@ -7434,6 +7600,19 @@ class APExecutionCore:
                     "watcher_rearm_required":        False,
                     "retryable":                      False,
                     "terminal":                       False,
+                    # PR #391 blocker 6: transport-domain audit stamp.
+                    "paper_data_order_domain_separated": (
+                        _gate_exec_mode == "paper"
+                        and _data_broker is not None
+                        and _data_broker is not _execution_broker
+                        and _data_proof["proven"]
+                    ),
+                    "submit_data_broker_base_url":    _data_proof["base_url"],
+                    "submit_data_broker_host":        _data_proof["host"],
+                    "submit_data_broker_sandbox":     _data_proof["sandbox"],
+                    "execution_broker_base_url":      _execution_proof["base_url"],
+                    "execution_broker_host":          _execution_proof["host"],
+                    "execution_broker_sandbox":       _execution_proof["sandbox"],
                     },
                 )
             except Exception as _ap_meta_exc:
@@ -7443,61 +7622,98 @@ class APExecutionCore:
                     ticker, str(queue_local_order_id or ""), _ap_meta_exc,
                 )
         except Exception as _gate_exc:
-            # If the entire gate module fails, LIVE fails closed. Never let
-            # a bug in the safety code allow an unchecked broker submit.
+            # PR #391 blocker P0-1: any gate-module exception must HOLD
+            # identically for PAPER and LIVE. Zero broker POST regardless
+            # of resolved mode. No mode-conditional fallthrough. No
+            # blind terminalize.
+            _module_error_exec_mode = str(
+                locals().get("_gate_exec_mode") or ""
+            ).strip().lower()
+
+            if _module_error_exec_mode not in {"paper", "live"}:
+                _module_error_exec_mode = "unknown"
+
+            _module_error_audit = {
+                "gate": "market_truth_wrapper",
+                "passed": False,
+                "reason_code": "MARKET_TRUTH_GATE_MODULE_ERROR",
+                "authority": "HOLD_MARKET_TRUTH_UNAVAILABLE",
+                "error_type": type(_gate_exc).__name__,
+                "error": str(_gate_exc)[:500],
+                "execution_mode": _module_error_exec_mode,
+                "client_id": str(locals().get("_gate_client_id") or ""),
+                "local_order_id": str(queue_local_order_id or ""),
+                "symbol": str(ticker or ""),
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "broker_post_attempted": False,
+            }
+
             log.critical(
-                "[%s] LIVE_SUBMIT_GATE_MODULE_ERROR — %s — LIVE will block, PAPER will proceed",
-                ticker, _gate_exc, exc_info=True,
+                "[%s] MARKET_TRUTH_GATE_MODULE_ERROR_BLOCKED "
+                "mode=%s order_id=%s error=%s:%s — zero broker POST",
+                ticker, _module_error_exec_mode,
+                str(queue_local_order_id or ""),
+                type(_gate_exc).__name__, _gate_exc,
+                exc_info=True,
             )
-            _module_error_exec_mode = str(locals().get("_gate_exec_mode") or "").strip().lower()
-            if not _module_error_exec_mode:
-                for _mode_candidate in (
-                    _proof_execution_mode,
-                    getattr(approved_plan, "execution_mode", None),
-                    getattr(self, "execution_mode", None),
-                    getattr(self, "mode", None),
-                    "live" if getattr(self, "paper", True) is False else None,
-                    getattr(self.order_state_machine, "execution_mode", None)
-                    if self.order_state_machine else None,
-                ):
-                    _candidate = str(_mode_candidate or "").strip().lower()
-                    if _candidate in ("live", "paper"):
-                        _module_error_exec_mode = _candidate
-                        break
-            # Amendment 5: fail closed on blank/unknown mode, not only explicit "live".
-            # The entire incident class is blank/unknown execution_mode being treated
-            # as safe. Unknown cannot be safe — only explicit "paper" may proceed.
-            if _module_error_exec_mode != "paper":
-                log.critical(
-                    "[%s] LIVE_SUBMIT_GATE_MODULE_ERROR_BLOCKING "
-                    "mode=%r order_id=%s — blocking submit (unknown mode treated as live)",
-                    ticker, _module_error_exec_mode, str(queue_local_order_id or ""),
+
+            try:
+                self.order_state_machine.hold_entry_for_market_truth_unavailable(
+                    str(queue_local_order_id or ""),
+                    reason_code="MARKET_TRUTH_GATE_MODULE_ERROR",
+                    gate_audit=_module_error_audit,
+                    execution_mode=_module_error_exec_mode,
+                    signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                    expected_generation=int(
+                        (locals().get("_meta_for_ts") or {}).get(
+                            "materialization_generation"
+                        ) or 0
+                    ),
+                    expected_watcher_token=str(
+                        (locals().get("_meta_for_ts") or {}).get(
+                            "watcher_token"
+                        ) or ""
+                    ),
+                    next_retry_at=(
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=max(
+                            1,
+                            int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
+                        ))
+                    ).isoformat(),
+                    max_attempts=max(
+                        1,
+                        int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")),
+                    ),
                 )
-                try:
-                    self.order_state_machine.update_order_meta(
-                        str(queue_local_order_id or ""),
-                        {"live_submit_gate": {
-                            "all_passed": False,
-                            "failed_gate": "module_error",
-                            "error": str(_gate_exc)[:200],
-                            "resolved_mode": _module_error_exec_mode or "unknown",
-                        },
-                        "final_market_validity": {
-                            **(locals().get("_final_market_validity_audit") or {}),
-                            "gate": "market_validity",
-                            "not_run": True,
-                            "reason": "MODULE_ERROR",
-                            "execution_mode": _module_error_exec_mode or "unknown",
-                        }},
-                    )
-                except Exception as _me_meta_exc:
-                    log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=module_error "
-                        "order_id=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _me_meta_exc,
-                    )
-                _terminalize_breach_failure("live_submit_gate:MODULE_ERROR")
-                return
+            except Exception as _hold_exc:
+                log.critical(
+                    "[%s] MARKET_TRUTH_GATE_MODULE_ERROR_HOLD_WRITE_FAILED "
+                    "order_id=%s error=%s — zero broker POST remains enforced",
+                    ticker, str(queue_local_order_id or ""), _hold_exc,
+                    exc_info=True,
+                )
+
+            try:
+                self.order_state_machine.update_order_meta(
+                    str(queue_local_order_id or ""),
+                    {
+                        "live_submit_gate":                _module_error_audit,
+                        "final_market_validity":           _module_error_audit,
+                        "final_market_truth_status":       "HOLD_MARKET_TRUTH_UNAVAILABLE",
+                        "final_market_truth_reason_code":  "MARKET_TRUTH_GATE_MODULE_ERROR",
+                        "retryable":                       True,
+                        "terminal":                        False,
+                    },
+                )
+            except Exception:
+                pass
+
+            return {
+                "disposition":            "RETRY_WAIT",
+                "reason_code":            "MARKET_TRUTH_GATE_MODULE_ERROR",
+                "broker_post_attempted":  False,
+            }
 
         submit_res = self.order_state_machine.submit_existing_entry(
             local_order_id=queue_local_order_id,

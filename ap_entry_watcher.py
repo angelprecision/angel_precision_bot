@@ -1309,6 +1309,87 @@ class APEntryWatcher:
     def _dedup_key_for_signal(self, signal: dict) -> str:
         return str(signal.get("signal_id") or "").strip()
 
+    def reset_after_submit_market_truth_block(
+        self,
+        local_order_id: str,
+        *,
+        reason_code: str,
+        next_retry_at: Optional[str] = None,
+        force_fresh_contract: bool = True,
+    ) -> bool:
+        """PR #391 — return one exact triggered watcher to executable PENDING.
+
+        Used only after the final pre-submit market-truth gate blocks an
+        ENTRY before any broker POST. It preserves the same signal/order
+        identity but clears trigger evidence so a genuinely new breach is
+        required before another submit callback fires. This is the
+        in-memory counterpart to
+        ``osm.rearm_entry_for_direction_reversal`` — the DB CAS runs
+        first; this reset runs only after it succeeds.
+        """
+        local_order_id = str(local_order_id or "").strip()
+        reason_code = str(reason_code or "").strip()
+
+        if not local_order_id or not reason_code:
+            return False
+
+        with self._lock:
+            matches = []
+            for watched in self._pending:
+                signal = getattr(watched, "signal", {}) or {}
+                owned_id = str(signal.get("local_order_id") or "").strip()
+                if owned_id == local_order_id:
+                    matches.append(watched)
+
+            if len(matches) != 1:
+                log.critical(
+                    "SUBMIT_TRUTH_WATCHER_RESET_IDENTITY_ERROR "
+                    "local_order_id=%s matches=%d",
+                    local_order_id, len(matches),
+                )
+                return False
+
+            watched = matches[0]
+
+            if watched.state not in {WatchState.TRIGGERED, WatchState.PENDING}:
+                log.critical(
+                    "[%s] SUBMIT_TRUTH_WATCHER_RESET_REFUSED "
+                    "local_order_id=%s state=%s reason=%s",
+                    watched.ticker, local_order_id, watched.state, reason_code,
+                )
+                return False
+
+            watched.state = WatchState.PENDING
+            watched.breach_count = 0
+            watched.breach_price = 0.0
+            watched.trigger_crossed_at = None
+            watched.triggered_at = None
+            watched.trigger_price = None
+            watched.first_breach_bid = 0.0
+            watched.first_breach_ask = 0.0
+            watched._trigger_stop_collision = False
+            watched._ownership_quarantine = False
+
+            signal = watched.signal
+            signal["submit_market_truth_rearmed"] = True
+            signal["submit_market_truth_reason_code"] = reason_code
+            signal["deferred_retry_not_before"] = next_retry_at
+            signal["watcher_token"] = self.owner_token
+
+            if force_fresh_contract:
+                signal["contract_deferred"] = True
+                signal["contract_symbol"] = f"DEFERRED:{watched.ticker}"
+
+            log.info(
+                "[%s] SUBMIT_TRUTH_WATCHER_RESET "
+                "local_order_id=%s reason=%s next_retry_at=%s "
+                "force_fresh_contract=%s",
+                watched.ticker, local_order_id, reason_code,
+                next_retry_at, force_fresh_contract,
+            )
+
+            return True
+
     def has_order(self, local_order_id: Optional[str]) -> bool:
         """Return True when this watcher currently owns the local ENTRY order.
 

@@ -33,9 +33,10 @@ DESIGN CONTRACT
 • Pure classification — no DB writes, no side effects on watcher/OSM state.
 • Never raises — client-money code; a classifier bug must never crash submit.
 • LIVE fails closed on every ambiguous condition.
-• PAPER fails closed on identity (mode drift is a genuine bug), but market-
-  validity and trigger-age are LIVE-only gates (paper is for testing, we
-  want stale-quote signals to still exercise the flow).
+• PAPER fails closed identically to LIVE on the market-validity gate
+  (PR #391). The only PAPER/LIVE differences are the execution endpoint,
+  pricing model, and confirmation policy. The trigger-age gate remains
+  LIVE-only fail-closed (that class of failure did not motivate PR #391).
 • Every FAIL returns a canonical reason_code from a documented set — the
   operator dashboard filters on these strings.
 • Every FAIL returns an audit dict ready for orders.meta.
@@ -183,18 +184,28 @@ _UNPROVEN_SOURCES: frozenset[str] = frozenset({
 
 
 def classify_market_truth(reason_code: Optional[str]) -> str:
-    """Map a market-validity gate reason to a durable submit authority class."""
+    """Map a market-validity reason to one durable authority class.
+
+    PASS is the only value that authorizes broker submission.
+    Missing, blank, or unknown reason codes fail closed as HOLD.
+    """
     code = str(reason_code or "").strip()
-    if code == GateOutcome.PASS or not code:
+
+    if code == GateOutcome.PASS:
         return MarketTruthAuthority.SUBMIT_VALID
+
+    if not code:
+        return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
     if code in _REARM_REASONS:
         return MarketTruthAuthority.REARM_DIRECTION_REVERSAL
+
     if code in _TERMINAL_REASONS:
         return MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+
     if code in _HOLD_REASONS:
         return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
-    # Unknown → fail closed as HOLD; the submit caller will retry rather than
-    # terminalize an unrecognized reason. Never PASS.
+
     return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
 
 
@@ -482,22 +493,25 @@ def check_market_validity_gate(
     """
     Final pre-submit sanity check on the underlying market.
 
-    Called immediately before broker POST. Fails closed on LIVE for any
-    stale/missing quote or invalidated setup geometry. PAPER passes with a
-    warning so testing can continue past stale-quote sandbox artifacts.
+    Called immediately before broker POST. Fails closed identically on
+    PAPER and LIVE for any stale/missing/unproven quote or invalidated
+    setup geometry (PR #391). The caller is responsible for mapping the
+    returned reason_code to one of the four durable authority classes
+    (SUBMIT_VALID / REARM_DIRECTION_REVERSAL / TERMINAL_SETUP_COMPLETE /
+    HOLD_MARKET_TRUTH_UNAVAILABLE) via classify_market_truth().
 
-    Rules (LIVE):
-      • current bid and ask must both exist and be > 0
-      • quote age must not exceed max_quote_age_ms (env: LIVE_SUBMIT_MAX_QUOTE_AGE_MS,
-        default 5000)
-      • CALL: current mid ≥ trigger (still in breach direction),
-              current mid < target (target not touched),
-              remaining opportunity ≥ min_remaining_pct (default 0.10 = 10%),
-              current mid > stop (stop not broken)
+    Rules (identical for PAPER and LIVE — see the postmortem in PR #391):
+      • current bid and ask must both exist, be finite and > 0
+      • quote age must not exceed max_quote_age_ms
+        (env: LIVE_SUBMIT_MAX_QUOTE_AGE_MS, default 5000)
+      • quote_source must not be blank/unknown/sandbox-family
+        (CURRENT_PRICE_SOURCE_UNPROVEN → HOLD)
+      • terminal geometry evaluated BEFORE direction reversal
+        (stop-broken and target-complete take precedence, so a price
+         beyond both the trigger and the stop is TERMINAL, not REARM)
+      • CALL: mid > stop, mid < target, ask ≥ trigger,
+              remaining opportunity ≥ min_remaining_pct (default 0.10)
       • PUT: mirror of CALL
-
-    Rules (PAPER):
-      • Same checks but log-only. Result.passed always True in paper.
     """
     max_age_ms = max_quote_age_ms if max_quote_age_ms is not None else _int_env("LIVE_SUBMIT_MAX_QUOTE_AGE_MS", 5000)
     max_future_skew_ms = _int_env("LIVE_SYNC_QUOTE_MAX_FUTURE_SKEW_MS", 1000)

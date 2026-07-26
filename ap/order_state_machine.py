@@ -1712,90 +1712,176 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         reason_code: str,
-        gate_audit: Optional[dict] = None,
+        gate_audit: Optional[dict],
+        execution_mode: str,
+        signal_id: str,
+        expected_generation: int,
+        expected_watcher_token: str,
+        deferred_contract: str,
     ) -> bool:
         """PR #391 — REARM_DIRECTION_REVERSAL.
 
-        The final market-validity gate has classified the current setup as
-        direction-reversed (CALL below trigger or PUT above trigger). The
-        entry must NOT be terminalized. Zero broker POSTs occur.
+        The final market-validity gate classified the setup as
+        direction-reversed. The entry is NOT terminalized. Zero broker
+        POSTs occur.
 
-        Atomically clears the SUBMITTING/BROKER_READY submission ownership so
-        the watcher regains authority on the same setup identity, and stamps
-        durable rearm metadata so restart and audit paths can see the state.
+        Owner/generation-fenced CAS. On success, the durable row:
+          * returns to PENDING_TRIGGER
+          * clears broker_ready and every stale submission/materialization
+            ownership field
+          * invalidates the previously selected option contract by writing
+            a DEFERRED:<TICKER> placeholder + NULL limit_price / 0 reserved
+            cost, so the next valid breach must select a fresh contract
+          * preserves local_order_id, signal_id, client_id, execution_mode,
+            generation, watcher_token, absolute deadline
 
-        Preserves: local_order_id, signal_id, client_id, execution_mode,
-        rank, setup generation, original validity deadline, contract intent.
-
-        Refuses when the row is no longer eligible (broker_order_id present,
-        or status advanced past PENDING_TRIGGER/CREATED). Returns False in
-        that case; caller then treats the block as normal-terminal only if
-        no rearm was possible.
+        Refuses (returns False) if any fence condition fails: mode/signal
+        mismatch, wrong generation, wrong watcher_token, broker evidence
+        present, submit_intent already claimed, or wrong lifecycle state.
         """
         import json as _json_local
-        _rc = str(reason_code or "").strip()
-        _audit = dict(gate_audit or {})
-        _now = datetime.now(timezone.utc).isoformat()
 
-        # Fields stamped for PR #391 durability contract.
-        meta_patch: dict = {
-            # Structured decision — never overwrite prior selector/scanner audit.
+        local_order_id = str(local_order_id or "").strip()
+        reason_code = str(reason_code or "").strip()
+        execution_mode = str(execution_mode or "").strip().lower()
+        signal_id = str(signal_id or "").strip()
+        expected_watcher_token = str(expected_watcher_token or "").strip()
+        deferred_contract = str(deferred_contract or "").strip()
+
+        try:
+            expected_generation = int(expected_generation)
+        except (TypeError, ValueError):
+            return False
+
+        if (
+            not local_order_id
+            or not reason_code
+            or execution_mode not in {"paper", "live"}
+            or not signal_id
+            or expected_generation < 0
+            or not deferred_contract.startswith("DEFERRED:")
+        ):
+            return False
+
+        now = now_utc_iso()
+
+        patch = {
             "final_market_truth_status":       "REARM_DIRECTION_REVERSAL",
-            "final_market_truth_reason_code":  _rc or "REARM_DIRECTION_REVERSAL",
-            "final_market_truth_checked_at":   _now,
-            "final_market_truth_gate_audit":   _audit,
+            "final_market_truth_reason_code":  reason_code,
+            "final_market_truth_checked_at":   now,
+            "final_market_truth_gate_audit":   dict(gate_audit or {}),
             "watcher_rearm_required":          True,
             "retryable":                       True,
             "terminal":                        False,
-            # Clear submission ownership so the watcher can regain authority.
+
             "lifecycle_state":                 "PENDING_TRIGGER",
-            "submit_intent_owner":             None,
-            "broker_ready_owner":              None,
-            "submit_started_at":               None,
+            "materialization_status":          "REARMED_DIRECTION_REVERSAL",
+            "materialization_in_flight":       False,
+            "materialization_owner":           "",
+            "materialization_lease_until":     "",
+            "current_owner":                   expected_watcher_token,
+            "watcher_token":                   expected_watcher_token,
+            "broker_ready":                    False,
+
+            "contract_deferred":               True,
+            "contract_revalidation_required":  True,
+            "selected_contract":               None,
+            "selected_limit":                  None,
+            "selected_qty":                    None,
+            "selected_reserved_cost":          None,
+
+            "submit_intent_at":                "",
+            "submit_started_at":               "",
+            "broker_submit_key":               "",
+            "broker_submit_payload_hash":      "",
+            "recovery_submit_owner":           "",
+            "recovery_submit_lease_until":     "",
+
+            "submit_truth_rearmed_at":         now,
         }
+
         try:
-            _patch_json = _json_local.dumps(meta_patch, default=str)
+            patch_json = _json_local.dumps(patch, default=str)
         except Exception as exc:
-            log.warning(
-                "[%s] rearm_entry_for_direction_reversal: serialize failed order=%s err=%s",
+            log.critical(
+                "[%s] REARM_DIRECTION_REVERSAL_SERIALIZE_FAILED order=%s err=%s",
                 self.client_id, local_order_id, exc,
             )
             return False
 
-        def _fn():
+        def _persist():
             with conn() as c:
                 cur = c.execute(
-                    "UPDATE orders "
-                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
-                    "    updated_ts = NOW() "
-                    "WHERE local_order_id = %s "
-                    "  AND client_id      = %s "
-                    "  AND UPPER(COALESCE(kind,''))   = 'ENTRY' "
-                    "  AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
-                    "  AND COALESCE(broker_order_id,'') = '' "
-                    "  AND submitted_ts IS NULL",
-                    (_patch_json, local_order_id, self.client_id),
+                    """
+                    UPDATE orders
+                    SET contract = %s,
+                        limit_price = NULL,
+                        reserved_cost = 0,
+                        contract_selection_status =
+                            'REVALIDATION_REQUIRED',
+                        meta = COALESCE(meta, '{}'::jsonb)
+                            || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND COALESCE(signal_id, '') = %s
+                      AND UPPER(COALESCE(kind, '')) = 'ENTRY'
+                      AND UPPER(COALESCE(status, '')) IN
+                          ('CREATED', 'PENDING_TRIGGER')
+                      AND COALESCE(broker_order_id, '') = ''
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'submit_intent_at', '') = ''
+                      AND COALESCE(
+                            (meta->>'materialization_generation')::int,
+                            0
+                          ) = %s
+                      AND (
+                            %s = ''
+                            OR COALESCE(meta->>'watcher_token', '') = %s
+                          )
+                      AND UPPER(
+                            COALESCE(
+                                meta->>'lifecycle_state',
+                                'PENDING_TRIGGER'
+                            )
+                          ) IN ('PENDING_TRIGGER', 'BROKER_READY')
+                    """,
+                    (
+                        deferred_contract,
+                        patch_json,
+                        local_order_id,
+                        self.client_id,
+                        execution_mode,
+                        signal_id,
+                        expected_generation,
+                        expected_watcher_token,
+                        expected_watcher_token,
+                    ),
                 )
-                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
         try:
-            rowcount = run_with_retry(_fn)
-            ok = bool(rowcount and rowcount > 0)
+            ok = bool(run_with_retry(_persist) == 1)
             if ok:
                 log.info(
-                    "[%s] REARM_DIRECTION_REVERSAL order=%s reason=%s — submit ownership cleared, watcher regains authority",
-                    self.client_id, local_order_id, _rc,
+                    "[%s] REARM_DIRECTION_REVERSAL order=%s reason=%s "
+                    "gen=%d watcher_token=%s contract=%s",
+                    self.client_id, local_order_id, reason_code,
+                    expected_generation, expected_watcher_token, deferred_contract,
                 )
             else:
                 log.warning(
-                    "[%s] rearm_entry_for_direction_reversal: no eligible row order=%s (may have advanced past PENDING_TRIGGER or already broker-owned)",
-                    self.client_id, local_order_id,
+                    "[%s] REARM_DIRECTION_REVERSAL_CAS_MISS order=%s reason=%s "
+                    "gen=%d watcher_token=%s (row advanced or fence disagreed)",
+                    self.client_id, local_order_id, reason_code,
+                    expected_generation, expected_watcher_token,
                 )
             return ok
         except Exception as exc:
-            log.warning(
-                "[%s] rearm_entry_for_direction_reversal failed order=%s: %s",
-                self.client_id, local_order_id, exc,
+            log.critical(
+                "[%s] REARM_DIRECTION_REVERSAL_DB_FAILED order=%s error=%s",
+                self.client_id, local_order_id, exc, exc_info=True,
             )
             return False
 
@@ -1804,123 +1890,211 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         reason_code: str,
-        gate_audit: Optional[dict] = None,
-        retry_after_seconds: Optional[int] = None,
-        max_attempts: Optional[int] = None,
+        gate_audit: Optional[dict],
+        execution_mode: str,
+        signal_id: str,
+        expected_generation: int,
+        expected_watcher_token: str,
+        next_retry_at: str,
+        max_attempts: int,
     ) -> bool:
         """PR #391 — HOLD_MARKET_TRUTH_UNAVAILABLE.
 
-        Underlying quote is missing/stale/malformed/unknown-source. Zero
-        broker POSTs occur. No terminalization.
+        Underlying quote is missing/stale/malformed/unknown-source.
+        Zero broker POSTs. No terminalization.
 
-        PR #391 (blocker 3): the row is durably placed on the existing
-        deferred materialization RETRY_WAIT lifecycle with a bounded
-        not-before time so a future owner is guaranteed:
-          * lifecycle_state = RETRY_WAIT
-          * next_retry_at / materialization_next_retry_at = now + delay
-          * retry_attempt incremented
-          * retry_max_attempts capped
-          * original absolute_entry_deadline preserved
-          * submit ownership cleared so the retry loop can reclaim
+        Owner/generation-fenced CAS. On success the row uses the exact
+        canonical deferred-retry schema so
+        ``APEntryWatcher._resolve_trigger_callback_disposition`` and
+        ``adopt_deferred_retry_watcher`` can adopt it without a second
+        retry dialect:
+
+          * lifecycle_state       = RETRY_WAIT
+          * materialization_status = RETRY_PENDING
+          * materialization_in_flight = False
+          * materialization_owner = ""
+          * watcher_token         = ""     (retry loop will claim)
+          * broker_ready          = False
+          * retry_attempt         = LEAST(existing+1, max_attempts)
+          * breach_attempt_count  = same
+          * materialization_attempts = same
+          * retry_max_attempts    = max_attempts
+          * next_retry_at         = materialization_next_retry_at
+          * every submit-intent / broker-submit / recovery-owner field
+            cleared
+
+        Refuses (returns False) on any fence disagreement: mode/signal
+        mismatch, wrong generation, wrong watcher_token, broker evidence
+        present, submit_intent already claimed, or wrong lifecycle state.
         """
         import json as _json_local
-        _rc = str(reason_code or "").strip()
-        _audit = dict(gate_audit or {})
-        _now_dt = datetime.now(timezone.utc)
-        _now = _now_dt.isoformat()
+
+        local_order_id = str(local_order_id or "").strip()
+        reason_code = str(reason_code or "").strip()
+        execution_mode = str(execution_mode or "").strip().lower()
+        signal_id = str(signal_id or "").strip()
+        expected_watcher_token = str(expected_watcher_token or "").strip()
+        next_retry_at = str(next_retry_at or "").strip()
 
         try:
-            _delay_s = int(retry_after_seconds) if retry_after_seconds is not None \
-                else max(1, int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")))
+            expected_generation = int(expected_generation)
         except (TypeError, ValueError):
-            _delay_s = 30
+            return False
         try:
-            _max_att = int(max_attempts) if max_attempts is not None \
-                else max(1, int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")))
+            max_attempts = int(max_attempts)
         except (TypeError, ValueError):
-            _max_att = 10
-        _not_before = (_now_dt + timedelta(seconds=_delay_s)).isoformat()
+            return False
 
-        # Fetch current attempt count (best-effort; default 1 if not read).
-        _current_attempt = 1
-        try:
-            _existing = self._get_order(local_order_id) or {}
-            _emeta = _existing.get("meta") or {}
-            if isinstance(_emeta, str):
-                try:
-                    _emeta = json.loads(_emeta)
-                except Exception:
-                    _emeta = {}
-            _current_attempt = int(_emeta.get("submit_hold_attempt") or 0) + 1
-        except Exception:
-            _current_attempt = 1
-        _current_attempt = min(_current_attempt, _max_att)
+        if (
+            not local_order_id
+            or not reason_code
+            or execution_mode not in {"paper", "live"}
+            or not signal_id
+            or expected_generation < 0
+            or max_attempts < 1
+            or not next_retry_at
+        ):
+            return False
 
-        meta_patch: dict = {
+        now = now_utc_iso()
+
+        patch = {
             "final_market_truth_status":       "HOLD_MARKET_TRUTH_UNAVAILABLE",
-            "final_market_truth_reason_code":  _rc or "HOLD_MARKET_TRUTH_UNAVAILABLE",
-            "final_market_truth_checked_at":   _now,
-            "final_market_truth_gate_audit":   _audit,
-            "watcher_rearm_required":          False,
+            "final_market_truth_reason_code":  reason_code,
+            "final_market_truth_checked_at":   now,
+            "final_market_truth_gate_audit":   dict(gate_audit or {}),
+
             "retryable":                       True,
             "terminal":                        False,
-            # Bounded retry state on the existing deferred lifecycle.
+
             "lifecycle_state":                 "RETRY_WAIT",
             "materialization_status":          "RETRY_PENDING",
             "materialization_in_flight":       False,
-            "next_retry_at":                   _not_before,
-            "materialization_next_retry_at":   _not_before,
-            "submit_hold_attempt":             _current_attempt,
-            "submit_hold_max_attempts":        _max_att,
-            "submit_hold_last_reason":         _rc or "HOLD",
-            "submit_hold_last_at":             _now,
-            # Clear active submission ownership so the retry loop can reclaim.
-            "submit_intent_owner":             None,
-            "broker_ready_owner":              None,
-            "submit_started_at":               None,
+            "materialization_owner":           "",
+            "materialization_lease_until":     "",
+            "watcher_token":                   "",
+            "broker_ready":                    False,
+
+            "retry_reason":                    reason_code,
+            "materialization_reason":          reason_code,
+            "next_retry_at":                   next_retry_at,
+            "materialization_next_retry_at":   next_retry_at,
+            "retry_max_attempts":              max_attempts,
+
+            "submit_intent_at":                "",
+            "submit_started_at":               "",
+            "broker_submit_key":               "",
+            "broker_submit_payload_hash":      "",
+            "recovery_submit_owner":           "",
+            "recovery_submit_lease_until":     "",
+
+            "contract_revalidation_required":  True,
         }
+
         try:
-            _patch_json = _json_local.dumps(meta_patch, default=str)
+            patch_json = _json_local.dumps(patch, default=str)
         except Exception:
             return False
 
-        def _fn():
+        def _persist():
             with conn() as c:
+                # retry_attempt / breach_attempt_count / materialization_attempts
+                # are computed atomically from the existing meta so two racing
+                # writers cannot double-increment.
+                _increment_sql = """
+                    jsonb_build_object(
+                        'retry_attempt',
+                        LEAST(
+                            COALESCE(
+                                NULLIF(meta->>'retry_attempt', '')::int,
+                                0
+                            ) + 1,
+                            %s::int
+                        ),
+                        'breach_attempt_count',
+                        LEAST(
+                            COALESCE(
+                                NULLIF(meta->>'retry_attempt', '')::int,
+                                0
+                            ) + 1,
+                            %s::int
+                        ),
+                        'materialization_attempts',
+                        LEAST(
+                            COALESCE(
+                                NULLIF(meta->>'retry_attempt', '')::int,
+                                0
+                            ) + 1,
+                            %s::int
+                        )
+                    )
+                """
                 cur = c.execute(
-                    "UPDATE orders "
-                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
-                    "    updated_ts = NOW() "
-                    "WHERE local_order_id = %s "
-                    "  AND client_id      = %s "
-                    "  AND UPPER(COALESCE(kind,''))   = 'ENTRY' "
-                    "  AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
-                    "  AND COALESCE(broker_order_id,'') = '' "
-                    "  AND submitted_ts IS NULL",
-                    (_patch_json, local_order_id, self.client_id),
+                    f"""
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{{}}'::jsonb)
+                             || %s::jsonb
+                             || {_increment_sql},
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
+                      AND COALESCE(signal_id, '') = %s
+                      AND UPPER(COALESCE(kind, '')) = 'ENTRY'
+                      AND UPPER(COALESCE(status, '')) IN
+                          ('CREATED', 'PENDING_TRIGGER')
+                      AND COALESCE(broker_order_id, '') = ''
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'submit_intent_at', '') = ''
+                      AND COALESCE(
+                            (meta->>'materialization_generation')::int,
+                            0
+                          ) = %s
+                      AND (
+                            %s = ''
+                            OR COALESCE(meta->>'watcher_token', '') = %s
+                          )
+                      AND UPPER(
+                            COALESCE(
+                                meta->>'lifecycle_state',
+                                'PENDING_TRIGGER'
+                            )
+                          ) IN ('PENDING_TRIGGER', 'BROKER_READY')
+                    """,
+                    (
+                        patch_json,
+                        max_attempts, max_attempts, max_attempts,
+                        local_order_id,
+                        self.client_id,
+                        execution_mode,
+                        signal_id,
+                        expected_generation,
+                        expected_watcher_token,
+                        expected_watcher_token,
+                    ),
                 )
-                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
         try:
-            rowcount = run_with_retry(_fn)
-            ok = bool(rowcount and rowcount > 0)
+            ok = bool(run_with_retry(_persist) == 1)
             if ok:
                 log.info(
                     "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE order=%s reason=%s "
-                    "attempt=%d/%d next_retry_at=%s",
-                    self.client_id, local_order_id, _rc,
-                    _current_attempt, _max_att, _not_before,
+                    "gen=%d next_retry_at=%s max_attempts=%d",
+                    self.client_id, local_order_id, reason_code,
+                    expected_generation, next_retry_at, max_attempts,
                 )
             else:
                 log.warning(
-                    "[%s] hold_entry_for_market_truth_unavailable: no eligible row "
-                    "order=%s (may have advanced past PENDING_TRIGGER or already broker-owned)",
-                    self.client_id, local_order_id,
+                    "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE_CAS_MISS order=%s reason=%s "
+                    "gen=%d (row advanced or fence disagreed)",
+                    self.client_id, local_order_id, reason_code, expected_generation,
                 )
             return ok
         except Exception as exc:
-            log.warning(
-                "[%s] hold_entry_for_market_truth_unavailable failed order=%s: %s",
-                self.client_id, local_order_id, exc,
+            log.critical(
+                "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE_DB_FAILED order=%s error=%s",
+                self.client_id, local_order_id, exc, exc_info=True,
             )
             return False
 
