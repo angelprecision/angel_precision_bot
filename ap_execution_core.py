@@ -7234,6 +7234,26 @@ class APExecutionCore:
                 )
                 _deferred_contract = f"DEFERRED:{str(ticker).upper()}"
 
+                # HARD-HOLD amendment (remaining blocker 1): the watcher
+                # reference must also be captured in outer scope. Inside
+                # the nested helper, locals().get("watched") returns None
+                # because "watched" is the OUTER _on_entry_trigger parameter,
+                # not a nested-scope local. Resolve now from the three
+                # canonical sources: the callback argument itself, the
+                # plan's _watched_signal (underscore prefix — canonical
+                # attachment), and the fallback attr without underscore.
+                _market_truth_watcher = (
+                    getattr(watched, "_watcher_ref", None)
+                    or getattr(
+                        getattr(approved_plan, "_watched_signal", None),
+                        "_watcher_ref", None,
+                    )
+                    or getattr(
+                        getattr(approved_plan, "watched_signal", None),
+                        "_watcher_ref", None,
+                    )
+                )
+
                 # PR #391 blocker 4/5/7: unified degrade path.
                 #   * The reread only short-circuits on broker evidence. A
                 #     durable REARM/HOLD label alone does NOT authorize
@@ -7313,14 +7333,11 @@ class APExecutionCore:
                             "broker_post_attempted": False,
                         }
 
-                    # P0-5: require the in-memory watcher exists AND its reset
-                    # succeeds. Either is a real ownership failure.
-                    _watched = (
-                        getattr(approved_plan, "watched_signal", None)
-                        or locals().get("watched_signal")
-                        or locals().get("watched")
-                    )
-                    _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
+                    # P0-5 + amendment: use the outer-captured watcher.
+                    # nested locals() cannot see the outer _on_entry_trigger
+                    # parameter "watched", so a nested lookup returns None
+                    # even when the watcher is right there in the caller.
+                    _watcher = _market_truth_watcher
 
                     if _watcher is None:
                         log.critical(
@@ -7402,13 +7419,11 @@ class APExecutionCore:
                             gate_audit=_mv_res.audit,
                         )
 
-                    # DB CAS succeeded → reset the exact in-memory watcher.
-                    _watched = (
-                        getattr(approved_plan, "watched_signal", None)
-                        or locals().get("watched_signal")
-                        or locals().get("watched")
-                    )
-                    _watcher = getattr(_watched, "_watcher_ref", None) if _watched else None
+                    # DB CAS succeeded → reset the exact in-memory watcher,
+                    # using the outer-captured reference. Amendment: same
+                    # scope fix as the HOLD helper — nested locals() lookup
+                    # does not see the outer callback's "watched" parameter.
+                    _watcher = _market_truth_watcher
 
                     # P0-7: DB rearm success + memory failure MUST become an
                     # actual durable HOLD, not a silent no-op via the reread
@@ -7767,12 +7782,41 @@ class APExecutionCore:
             # P0-12: the OSM HOLD method rejects execution_mode="unknown"
             # (only paper/live are valid). Fall back to "paper" ONLY when
             # the resolved mode was unknown — that keeps zero POST while
-            # still writing the durable HOLD to a valid row. If the mode
-            # is truly indeterminate, we still refuse POST above; the HOLD
-            # write attempts a best-effort recovery.
+            # still writing the durable HOLD to a valid row.
             _hold_write_mode = _module_error_exec_mode
             if _hold_write_mode == "unknown":
                 _hold_write_mode = "paper"
+
+            # HARD-HOLD amendment (remaining blocker 2): compute the exact
+            # next_retry_at once so the OSM HOLD write, the memory watcher
+            # reset, and the returned disposition all carry the identical
+            # timestamp. Also resolve the outer-captured ownership fields
+            # (avoid nested locals()-lookup mistakes fixed elsewhere).
+            _module_next_retry_at = (
+                datetime.now(timezone.utc)
+                + timedelta(seconds=max(
+                    1,
+                    int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
+                ))
+            ).isoformat()
+            _module_meta = _meta_for_ts if isinstance(locals().get("_meta_for_ts"), dict) else {}
+            _module_generation = int(
+                (_module_meta or {}).get("materialization_generation") or 0
+            )
+            _module_watcher_token = str(
+                (_module_meta or {}).get("watcher_token") or ""
+            )
+            _module_watcher = (
+                getattr(watched, "_watcher_ref", None)
+                or getattr(
+                    getattr(approved_plan, "_watched_signal", None),
+                    "_watcher_ref", None,
+                )
+                or getattr(
+                    getattr(approved_plan, "watched_signal", None),
+                    "_watcher_ref", None,
+                )
+            )
 
             _module_hold_ok = False
             try:
@@ -7783,23 +7827,9 @@ class APExecutionCore:
                         gate_audit=_module_error_audit,
                         execution_mode=_hold_write_mode,
                         signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
-                        expected_generation=int(
-                            (locals().get("_meta_for_ts") or {}).get(
-                                "materialization_generation"
-                            ) or 0
-                        ),
-                        expected_watcher_token=str(
-                            (locals().get("_meta_for_ts") or {}).get(
-                                "watcher_token"
-                            ) or ""
-                        ),
-                        next_retry_at=(
-                            datetime.now(timezone.utc)
-                            + timedelta(seconds=max(
-                                1,
-                                int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")),
-                            ))
-                        ).isoformat(),
+                        expected_generation=_module_generation,
+                        expected_watcher_token=_module_watcher_token,
+                        next_retry_at=_module_next_retry_at,
                         max_attempts=max(
                             1,
                             int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")),
@@ -7847,9 +7877,57 @@ class APExecutionCore:
                     "broker_post_attempted":  False,
                 }
 
+            # HARD-HOLD amendment (remaining blocker 2): the HOLD row now
+            # says contract=DEFERRED:<TICKER>. The in-memory watcher must
+            # be reset to match — otherwise the callback keeps the old
+            # OCC/limit/breach evidence while the DB expects fresh
+            # materialization.
+            if _module_watcher is None:
+                log.critical(
+                    "[%s] MODULE_ERROR_WATCHER_MISSING order=%s — durable "
+                    "HOLD written but no in-memory owner to execute retry",
+                    ticker, str(queue_local_order_id or ""),
+                )
+                return {
+                    "disposition":            "KEEP_WATCHER",
+                    "reason_code":            "MARKET_TRUTH_WATCHER_MISSING",
+                    "broker_post_attempted":  False,
+                }
+
+            _module_memory_reset = False
+            try:
+                _module_memory_reset = bool(
+                    _module_watcher.reset_after_submit_market_truth_block(
+                        str(queue_local_order_id or ""),
+                        reason_code="MARKET_TRUTH_GATE_MODULE_ERROR",
+                        next_retry_at=_module_next_retry_at,
+                        force_fresh_contract=True,
+                    )
+                )
+            except Exception as _module_reset_exc:
+                log.critical(
+                    "[%s] MODULE_ERROR_WATCHER_RESET_RAISED order=%s error=%s",
+                    ticker, str(queue_local_order_id or ""), _module_reset_exc,
+                    exc_info=True,
+                )
+
+            if not _module_memory_reset:
+                log.critical(
+                    "[%s] MODULE_ERROR_WATCHER_RESET_FAILED order=%s — "
+                    "durable HOLD written but memory reset refused; row "
+                    "will not execute until recovery adopts",
+                    ticker, str(queue_local_order_id or ""),
+                )
+                return {
+                    "disposition":            "KEEP_WATCHER",
+                    "reason_code":            "MARKET_TRUTH_WATCHER_RESET_FAILED",
+                    "broker_post_attempted":  False,
+                }
+
             return {
                 "disposition":            "RETRY_WAIT",
                 "reason_code":            "MARKET_TRUTH_GATE_MODULE_ERROR",
+                "next_retry_at":          _module_next_retry_at,
                 "broker_post_attempted":  False,
             }
 
