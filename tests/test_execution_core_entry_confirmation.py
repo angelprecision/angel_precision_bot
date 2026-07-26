@@ -158,16 +158,33 @@ def _run_entry_trigger(
     core.execution_mode = execution_mode
     core.email = "client@example.com"
     core.client_id = "client@example.com"
-    core.broker = SimpleNamespace(
-        cfg=SimpleNamespace(base_url="https://api.tradier.com"),
-        sandbox=False,
-        get_quote=lambda ticker: {
-            "bid": underlying_last - 0.01,
-            "ask": underlying_last + 0.01,
-            "quote_age_ms": 0,
-            "source": "test_synchronous_quote",
-        },
-    )
+    # PR #391 blocker 6: PAPER requires a proven-live data_broker distinct
+    # from the sandbox execution broker. Wire the execution broker as
+    # sandbox and a separate live data broker with the same quote payload.
+    _q_fn = lambda ticker: {
+        "bid": underlying_last - 0.01,
+        "ask": underlying_last + 0.01,
+        "quote_age_ms": 0,
+        "source": "live_broker",
+    }
+    if execution_mode == "paper":
+        core.broker = SimpleNamespace(
+            cfg=SimpleNamespace(base_url="https://sandbox.tradier.com"),
+            sandbox=True,
+            get_quote=_q_fn,
+        )
+        core.data_broker = SimpleNamespace(
+            cfg=SimpleNamespace(base_url="https://api.tradier.com"),
+            sandbox=False,
+            get_quote=_q_fn,
+        )
+    else:
+        core.broker = SimpleNamespace(
+            cfg=SimpleNamespace(base_url="https://api.tradier.com"),
+            sandbox=False,
+            get_quote=_q_fn,
+        )
+        core.data_broker = None
     core.store = MagicMock()
     core.order_state_machine = osm
     core.contract_selector = None

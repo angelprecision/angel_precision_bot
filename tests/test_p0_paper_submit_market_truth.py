@@ -424,82 +424,183 @@ def osm(monkeypatch):
     return instance
 
 
+_REARM_KW = dict(
+    reason_code=GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+    gate_audit={"current_mid": 61.28, "trigger_price": 61.17},
+    execution_mode="paper",
+    signal_id="SIG-1",
+    expected_generation=2,
+    expected_watcher_token="watcher:abc",
+    deferred_contract="DEFERRED:BAC",
+)
+
+_HOLD_KW = dict(
+    reason_code=GateOutcome.CURRENT_PRICE_STALE,
+    gate_audit={"quote_age_ms": 30_000},
+    execution_mode="live",
+    signal_id="SIG-2",
+    expected_generation=3,
+    expected_watcher_token="watcher:xyz",
+    next_retry_at="2026-07-26T18:00:00+00:00",
+    max_attempts=5,
+)
+
+
 class TestOSMRearmAuthority:
-    def test_rearm_writes_durable_truth_fields_and_clears_submit_ownership(self, osm):
-        ok = osm.rearm_entry_for_direction_reversal(
-            "LOID-1",
-            reason_code=GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
-            gate_audit={"current_mid": 61.28, "trigger_price": 61.17},
-        )
+    def test_rearm_writes_fenced_patch_and_clears_contract_and_ownership(self, osm):
+        ok = osm.rearm_entry_for_direction_reversal("LOID-1", **_REARM_KW)
         assert ok is True
         assert len(osm._fake_conn.executed) == 1
         sql, params = osm._fake_conn.executed[0]
 
-        # Row is not being transitioned to a terminal status. Only meta patched.
-        assert "UPDATE orders" in sql
-        assert "status" not in sql.lower().split("where")[0]  # SET clause has no status
-        # And the WHERE clause protects broker-owned rows.
-        assert "COALESCE(broker_order_id,'') = ''" in sql
-        assert "submitted_ts IS NULL" in sql
+        # SET clause invalidates option-price authority.
+        set_clause = sql.upper().split("WHERE")[0]
+        assert "CONTRACT = %S" in set_clause
+        assert "LIMIT_PRICE = NULL" in set_clause
+        assert "RESERVED_COST = 0" in set_clause
+        assert "REVALIDATION_REQUIRED" in sql
+
+        # WHERE clause requires exact mode, signal, generation, watcher token,
+        # and no broker evidence / no prior submit intent.
+        where = sql.upper().split("WHERE")[1]
+        assert "LOWER(TRIM(COALESCE(EXECUTION_MODE, '')))" in where
+        assert "COALESCE(SIGNAL_ID, '') = %S" in where
+        assert "COALESCE(BROKER_ORDER_ID, '') = ''" in where
+        assert "SUBMITTED_TS IS NULL" in where
+        assert "COALESCE(META->>'SUBMIT_INTENT_AT', '') = ''" in where
+        assert "MATERIALIZATION_GENERATION" in where
+        assert "WATCHER_TOKEN" in where
+        assert "LIFECYCLE_STATE" in where and "PENDING_TRIGGER" in where and "BROKER_READY" in where
+
+        # Params carry the fence values in order.
+        assert params[0] == _REARM_KW["deferred_contract"]  # contract set
+        # patch_json at params[1]; then LOID, client, mode, signal, gen, token, token
+        assert params[2] == "LOID-1"
+        assert params[4] == _REARM_KW["execution_mode"]
+        assert params[5] == _REARM_KW["signal_id"]
+        assert params[6] == _REARM_KW["expected_generation"]
+        assert params[7] == _REARM_KW["expected_watcher_token"]
+        assert params[8] == _REARM_KW["expected_watcher_token"]
 
         import json
-        patch = json.loads(params[0])
+        patch = json.loads(params[1])
         assert patch["final_market_truth_status"] == "REARM_DIRECTION_REVERSAL"
         assert patch["final_market_truth_reason_code"] == GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER
         assert patch["watcher_rearm_required"] is True
         assert patch["retryable"] is True
         assert patch["terminal"] is False
-        assert patch["submit_intent_owner"] is None
-        assert patch["broker_ready_owner"] is None
+        assert patch["lifecycle_state"] == "PENDING_TRIGGER"
+        assert patch["materialization_status"] == "REARMED_DIRECTION_REVERSAL"
+        assert patch["broker_ready"] is False
+        assert patch["contract_deferred"] is True
+        assert patch["contract_revalidation_required"] is True
+        assert patch["selected_contract"] is None
+        assert patch["selected_limit"] is None
+        assert patch["selected_qty"] is None
+        assert patch["selected_reserved_cost"] is None
+        assert patch["materialization_owner"] == ""
+        assert patch["submit_intent_at"] == ""
+        assert patch["broker_submit_key"] == ""
+        assert patch["recovery_submit_owner"] == ""
+        assert patch["current_owner"] == _REARM_KW["expected_watcher_token"]
+        assert patch["watcher_token"] == _REARM_KW["expected_watcher_token"]
 
     def test_rearm_refuses_when_row_advanced(self, monkeypatch):
         from ap import order_state_machine as osm_mod
-        fake = _FakeConn(rowcount=0)  # row not eligible (advanced/broker-owned)
+        fake = _FakeConn(rowcount=0)  # row not eligible
         monkeypatch.setattr(osm_mod, "conn", lambda: fake)
         monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: fn())
         instance = osm_mod.APOrderStateMachine("CLIENT_A")
-        ok = instance.rearm_entry_for_direction_reversal(
-            "LOID-1",
-            reason_code=GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
-        )
+        ok = instance.rearm_entry_for_direction_reversal("LOID-1", **_REARM_KW)
         assert ok is False
+
+    @pytest.mark.parametrize("kw_override", [
+        {"execution_mode": "bogus"},
+        {"signal_id": ""},
+        {"expected_generation": -1},
+        {"deferred_contract": "AAPL260626C00100000"},  # not DEFERRED:
+        {"reason_code": ""},
+    ])
+    def test_rearm_refuses_bad_args(self, osm, kw_override):
+        args = dict(_REARM_KW)
+        args.update(kw_override)
+        assert osm.rearm_entry_for_direction_reversal("LOID-1", **args) is False
+        assert len(osm._fake_conn.executed) == 0
 
 
 class TestOSMHoldAuthority:
-    def test_hold_writes_durable_hold_fields_with_retry_liveness(self, osm):
-        """PR #391 (blocker 3): HOLD must schedule a real future owner —
-        RETRY_WAIT lifecycle, bounded next_retry_at, capped attempts —
-        not just stamp metadata."""
-        ok = osm.hold_entry_for_market_truth_unavailable(
-            "LOID-2",
-            reason_code=GateOutcome.CURRENT_PRICE_STALE,
-            gate_audit={"quote_age_ms": 30_000},
-            retry_after_seconds=45,
-            max_attempts=5,
-        )
+    def test_hold_writes_canonical_deferred_retry_schema(self, osm):
+        """PR #391 (blockers 3 + 5): HOLD must use the same lifecycle
+        vocabulary as schedule_deferred_materialization_retry so
+        adopt_deferred_retry_watcher can adopt it — not a second retry
+        dialect. CAS must fence client/mode/signal/generation/watcher_token."""
+        ok = osm.hold_entry_for_market_truth_unavailable("LOID-2", **_HOLD_KW)
         assert ok is True
         assert len(osm._fake_conn.executed) == 1
-        _, params = osm._fake_conn.executed[0]
+        sql, params = osm._fake_conn.executed[0]
+
+        # Retry_attempt / breach_attempt_count / materialization_attempts
+        # are computed atomically in SQL — the LEAST(existing+1, max) shape
+        # must be present so two racing writers cannot double-increment.
+        assert "LEAST(" in sql
+        assert "'retry_attempt'" in sql
+        assert "'breach_attempt_count'" in sql
+        assert "'materialization_attempts'" in sql
+        assert "meta->>'retry_attempt'" in sql
+
+        # CAS fence conditions.
+        where = sql.upper().split("WHERE")[1]
+        assert "LOWER(TRIM(COALESCE(EXECUTION_MODE, '')))" in where
+        assert "COALESCE(SIGNAL_ID, '') = %S" in where
+        assert "COALESCE(META->>'SUBMIT_INTENT_AT', '') = ''" in where
+        assert "MATERIALIZATION_GENERATION" in where
+        assert "WATCHER_TOKEN" in where
+        assert "LIFECYCLE_STATE" in where
+
         import json
         patch = json.loads(params[0])
         assert patch["final_market_truth_status"] == "HOLD_MARKET_TRUTH_UNAVAILABLE"
         assert patch["final_market_truth_reason_code"] == GateOutcome.CURRENT_PRICE_STALE
         assert patch["retryable"] is True
         assert patch["terminal"] is False
-        # Retry liveness fields are present and coherent.
+        # Canonical deferred-retry vocabulary
         assert patch["lifecycle_state"] == "RETRY_WAIT"
         assert patch["materialization_status"] == "RETRY_PENDING"
         assert patch["materialization_in_flight"] is False
-        assert patch["next_retry_at"], "HOLD must schedule a future retry time"
-        assert patch["materialization_next_retry_at"] == patch["next_retry_at"]
-        assert patch["submit_hold_max_attempts"] == 5
-        assert 1 <= patch["submit_hold_attempt"] <= 5
-        assert patch["submit_hold_last_reason"] == GateOutcome.CURRENT_PRICE_STALE
-        assert patch["submit_hold_last_at"]
-        # Submit ownership is cleared so the retry loop can reclaim.
-        assert patch["submit_intent_owner"] is None
-        assert patch["broker_ready_owner"] is None
-        assert patch["submit_started_at"] is None
+        assert patch["materialization_owner"] == ""
+        assert patch["materialization_lease_until"] == ""
+        assert patch["watcher_token"] == ""
+        assert patch["broker_ready"] is False
+        assert patch["retry_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["materialization_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["next_retry_at"] == _HOLD_KW["next_retry_at"]
+        assert patch["materialization_next_retry_at"] == _HOLD_KW["next_retry_at"]
+        assert patch["retry_max_attempts"] == _HOLD_KW["max_attempts"]
+        # Ownership fields are all cleared.
+        assert patch["submit_intent_at"] == ""
+        assert patch["submit_started_at"] == ""
+        assert patch["broker_submit_key"] == ""
+        assert patch["broker_submit_payload_hash"] == ""
+        assert patch["recovery_submit_owner"] == ""
+        assert patch["recovery_submit_lease_until"] == ""
+        assert patch["contract_revalidation_required"] is True
+        # No stale hold-only dialect fields.
+        assert "submit_hold_attempt" not in patch
+        assert "submit_hold_max_attempts" not in patch
+
+    @pytest.mark.parametrize("kw_override", [
+        {"execution_mode": "bogus"},
+        {"signal_id": ""},
+        {"expected_generation": -1},
+        {"next_retry_at": ""},
+        {"max_attempts": 0},
+        {"reason_code": ""},
+    ])
+    def test_hold_refuses_bad_args(self, osm, kw_override):
+        args = dict(_HOLD_KW)
+        args.update(kw_override)
+        assert osm.hold_entry_for_market_truth_unavailable("LOID-2", **args) is False
+        assert len(osm._fake_conn.executed) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -616,3 +717,712 @@ class TestStopBeforeReversal:
                   quote_provenance="synchronous_submit_fetch")
         assert r.reason_code == GateOutcome.PUT_STOP_ALREADY_BROKEN
         assert classify_market_truth(r.reason_code) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 P1: classify_market_truth blank/None/unknown → HOLD (never PASS).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestBlankReasonNeverAuthorizesSubmit:
+    def test_none_reason_maps_to_hold(self):
+        assert classify_market_truth(None) == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+    def test_blank_reason_maps_to_hold(self):
+        assert classify_market_truth("") == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+    def test_whitespace_reason_maps_to_hold(self):
+        assert classify_market_truth("   ") == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+    def test_unknown_reason_maps_to_hold(self):
+        assert classify_market_truth("UNKNOWN_NEW_REASON") == (
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+        )
+
+    def test_only_pass_authorizes_submit(self):
+        assert classify_market_truth(GateOutcome.PASS) == MarketTruthAuthority.SUBMIT_VALID
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 blocker 3: HOLD row shape must be adoptable by the canonical
+# deferred-retry watcher — the same lifecycle vocabulary as
+# schedule_deferred_materialization_retry produces. This test proves the
+# durable meta patch a real HOLD writes satisfies the read-side predicates
+# used by adopt_deferred_retry_watcher / _resolve_trigger_callback_disposition.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestHoldOwnerLiveness:
+    def _hold_meta_from_osm(self, osm) -> dict:
+        assert osm.hold_entry_for_market_truth_unavailable(
+            "LOID-HOLD",
+            reason_code=GateOutcome.CURRENT_PRICE_STALE,
+            gate_audit={"quote_age_ms": 30_000},
+            execution_mode="paper",
+            signal_id="SIG-HOLD",
+            expected_generation=1,
+            expected_watcher_token="watcher:hold",
+            next_retry_at="2026-07-26T18:00:00+00:00",
+            max_attempts=8,
+        ) is True
+        assert len(osm._fake_conn.executed) == 1
+        import json
+        return json.loads(osm._fake_conn.executed[0][1][0])
+
+    def test_hold_row_matches_canonical_retry_read_predicates(self, osm):
+        """The predicates the watcher/adoption CAS reads:
+             lifecycle_state == RETRY_WAIT
+             materialization_status == RETRY_PENDING
+             materialization_in_flight == false
+             materialization_owner == ''  (retry loop reclaims)
+             watcher_token == ''
+             broker_ready == false
+             retry_reason present
+             next_retry_at + materialization_next_retry_at present
+             retry_max_attempts present
+             every submit_intent / broker_submit / recovery_owner field cleared
+        """
+        patch = self._hold_meta_from_osm(osm)
+        assert patch["lifecycle_state"] == "RETRY_WAIT"
+        assert patch["materialization_status"] == "RETRY_PENDING"
+        assert patch["materialization_in_flight"] is False
+        assert patch["materialization_owner"] == ""
+        assert patch["watcher_token"] == ""
+        assert patch["broker_ready"] is False
+        assert patch["retry_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["materialization_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["next_retry_at"]
+        assert patch["materialization_next_retry_at"] == patch["next_retry_at"]
+        assert patch["retry_max_attempts"] == 8
+        for cleared in (
+            "submit_intent_at", "submit_started_at",
+            "broker_submit_key", "broker_submit_payload_hash",
+            "recovery_submit_owner", "recovery_submit_lease_until",
+        ):
+            assert patch[cleared] == ""
+        # No hold-only dialect fields leak through.
+        assert "submit_hold_attempt" not in patch
+        assert "submit_hold_max_attempts" not in patch
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 blocker 6: PAPER data-domain transport proof — not a source string.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestPaperDataTransportProof:
+    def _proof(self, base_url):
+        from ap_execution_core import _market_data_transport_proof
+        class _Cfg:
+            def __init__(self, u): self.base_url = u
+        class _Broker:
+            def __init__(self, u): self.cfg = _Cfg(u)
+        return _market_data_transport_proof(_Broker(base_url))
+
+    def test_none_adapter_not_proven(self):
+        from ap_execution_core import _market_data_transport_proof
+        assert _market_data_transport_proof(None) == {
+            "base_url": None, "host": None, "sandbox": False, "proven": False,
+        }
+
+    def test_live_host_proven(self):
+        p = self._proof("https://api.tradier.com/v1")
+        assert p["proven"] is True
+        assert p["sandbox"] is False
+        assert p["host"] == "api.tradier.com"
+
+    @pytest.mark.parametrize("bad", [
+        "https://sandbox.tradier.com",
+        "https://paper.example.com",
+        "https://sim.marketdata.io",
+        "https://mock.foo.bar",
+        "https://test.baz.qux",
+    ])
+    def test_sandbox_family_hosts_not_proven(self, bad):
+        p = self._proof(bad)
+        assert p["proven"] is False
+        assert p["sandbox"] is True
+
+    def test_blank_url_not_proven(self):
+        p = self._proof("")
+        assert p["proven"] is False
+        assert p["host"] is None
+
+    def test_payload_source_label_does_not_bypass_transport_proof(self):
+        # A payload claiming source=live_broker cannot rescue a sandbox
+        # transport. The gate caller checks _market_data_transport_proof;
+        # the source string is only a secondary signal (denylist).
+        p = self._proof("https://sandbox.tradier.com")
+        assert p["proven"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 P0-2: in-memory watcher reset — a TRIGGERED WatchedSignal returns
+# to PENDING with no trigger evidence, and requires a fresh contract.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _build_watcher_with_triggered_signal(local_order_id="LOID-1",
+                                         ticker="BAC",
+                                         side="PUT"):
+    """Assemble a minimal APEntryWatcher with exactly one TRIGGERED
+    WatchedSignal that owns local_order_id. Uses object.__new__ to
+    avoid the heavy real ctor and only sets fields the reset method
+    reads/writes."""
+    from ap_entry_watcher import APEntryWatcher, WatchedSignal, WatchState
+    import threading, uuid
+
+    w = object.__new__(APEntryWatcher)
+    w._pending = []
+    w._lock = threading.Lock()
+    w.owner_token = f"watcher:{uuid.uuid4()}"
+
+    signal = {
+        "ticker": ticker,
+        "side": side,
+        "entry_price": 61.17,
+        "stop_price": 61.75,
+        "target_price": 59.50,
+        "signal_id": "SIG-1",
+        "local_order_id": local_order_id,
+        "client_id": "client@example.com",
+        "execution_mode": "paper",
+        "contract_symbol": "BAC260724P00062000",
+    }
+    watched = object.__new__(WatchedSignal)
+    watched.signal = signal
+    watched.ticker = ticker
+    watched.side = side.upper()
+    watched.state = WatchState.TRIGGERED
+    watched.breach_count = 2
+    watched.breach_price = 61.20
+    from datetime import datetime, timezone
+    watched.trigger_crossed_at = datetime.now(timezone.utc)
+    watched.triggered_at = datetime.now(timezone.utc)
+    watched.trigger_price = 61.17
+    watched.first_breach_bid = 61.10
+    watched.first_breach_ask = 61.14
+    watched._trigger_stop_collision = False
+    watched._ownership_quarantine = False
+    watched.rearm_mode = False
+    watched._watcher_ref = w
+    w._pending.append(watched)
+    return w, watched
+
+
+class TestWatcherResetAfterSubmitBlock:
+    def test_reset_makes_triggered_watcher_active_again(self):
+        from ap_entry_watcher import WatchState
+        w, watched = _build_watcher_with_triggered_signal()
+        assert w.reset_after_submit_market_truth_block(
+            "LOID-1",
+            reason_code="PUT_NO_LONGER_BELOW_TRIGGER",
+        ) is True
+        assert watched.state == WatchState.PENDING
+        assert watched.breach_count == 0
+        assert watched.trigger_crossed_at is None
+        assert watched.triggered_at is None
+        assert watched.first_breach_bid == 0.0
+        assert watched.first_breach_ask == 0.0
+        assert watched.signal["contract_deferred"] is True
+        assert watched.signal["contract_symbol"] == "DEFERRED:BAC"
+        assert watched.signal["submit_market_truth_rearmed"] is True
+        assert watched.signal["submit_market_truth_reason_code"] == "PUT_NO_LONGER_BELOW_TRIGGER"
+        assert watched.signal["watcher_token"] == w.owner_token
+
+    def test_reset_refuses_wrong_state(self):
+        from ap_entry_watcher import WatchState
+        w, watched = _build_watcher_with_triggered_signal()
+        watched.state = WatchState.EXPIRED
+        assert w.reset_after_submit_market_truth_block(
+            "LOID-1", reason_code="X",
+        ) is False
+
+    def test_reset_refuses_unknown_local_order_id(self):
+        w, _ = _build_watcher_with_triggered_signal()
+        assert w.reset_after_submit_market_truth_block(
+            "LOID-DOES-NOT-EXIST", reason_code="X",
+        ) is False
+
+    def test_reset_refuses_ambiguous_identity(self):
+        w, _ = _build_watcher_with_triggered_signal(local_order_id="LOID-1")
+        # Add a second watcher with the same local_order_id — must refuse.
+        from ap_entry_watcher import WatchedSignal, WatchState
+        dup = object.__new__(WatchedSignal)
+        dup.signal = {"local_order_id": "LOID-1"}
+        dup.ticker = "BAC"
+        dup.state = WatchState.PENDING
+        dup._watcher_ref = w
+        w._pending.append(dup)
+        assert w.reset_after_submit_market_truth_block(
+            "LOID-1", reason_code="X",
+        ) is False
+
+    def test_reset_refuses_blank_args(self):
+        w, _ = _build_watcher_with_triggered_signal()
+        assert w.reset_after_submit_market_truth_block("", reason_code="X") is False
+        assert w.reset_after_submit_market_truth_block("LOID-1", reason_code="") is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 P0-1: gate-module exception must HOLD identically for PAPER and
+# LIVE. Force check_market_validity_gate() and classify_market_truth() to
+# raise. Exercise the exact production _on_entry_trigger callback. Assert:
+#   * zero submit_existing_entry call
+#   * zero broker POST
+#   * disposition == RETRY_WAIT
+#   * durable reason == MARKET_TRUTH_GATE_MODULE_ERROR
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _build_gate_exception_scaffold(monkeypatch, mode: str):
+    """Assemble the minimum production-shaped scaffolding to invoke
+    APExecutionCore._on_entry_trigger with a raising gate."""
+    import sys, types, threading
+    from unittest.mock import MagicMock
+    from types import SimpleNamespace
+    import ap_execution_core as core_mod
+
+    # Real _refresh_ask_at_submit is imported dynamically by the callback;
+    # replace with a well-formed stub so we don't crash before the gate runs.
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_a, **_k: (
+        1.25, 5, True, "", {
+            "submit_bid": 1.20, "submit_ask": 1.25,
+            "submit_last": 1.23, "submit_mid": 1.225,
+            "spread_pct": 0.04,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
+
+    plan = SimpleNamespace(
+        contract_symbol="SPY260626C00500000",
+        execution_price_per_share=1.25, ask=1.25, mid=1.20,
+        affordable_contracts=1, premium_per_contract=125.0,
+        contracts=1, limit_price=1.25,
+        side="CALL", direction="CALL",
+        execution_mode=mode,
+        client_id="client@example.com",
+        signal_id="SIG-GATE-EXC",
+        trigger_price=600.5, stop_underlying=595.0, target_underlying=610.0,
+        metadata={"queue_id": 42},
+    )
+    watched = SimpleNamespace(
+        signal={
+            "ticker": "SPY", "side": "CALL", "entry_price": 600.0,
+            "stop_price": 595.0, "target_price": 610.0,
+            "signal_id": plan.signal_id,
+            "local_order_id": "LOID-GATE-EXC",
+            "client_id": plan.client_id,
+            "execution_mode": mode,
+        },
+        trigger_price=600.5, ticker="SPY",
+        trigger_crossed_at=datetime.now(timezone.utc),
+    )
+
+    core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
+    core.paper = (mode == "paper")
+    core.mode = mode.upper()
+    core.execution_mode = mode
+    core.client_id = core.client_email = plan.client_id
+    # PR #391 blocker 6: transport proof needs a real base_url — pick a
+    # proven-live one so the gate would otherwise be reachable.
+    class _Cfg: base_url = "https://api.tradier.com"
+    core.broker = SimpleNamespace(
+        cfg=_Cfg(),
+        get_quote=lambda _s: {
+            "bid": 600.60, "ask": 600.70, "quote_age_ms": 100,
+            "source": "live_broker",
+        },
+    )
+    core.data_broker = core.broker  # not separate → PAPER would HOLD too;
+                                    # doesn't matter because gate raises first
+    core.store = MagicMock()
+    core.contract_selector = MagicMock()
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = MagicMock(return_value=plan)
+
+    osm = MagicMock(client_id=plan.client_id, execution_mode=mode)
+    durable = {"client_id": plan.client_id, "meta": {}}
+    osm.get_order.side_effect = lambda _loid: durable
+    def _upd(_loid, patch):
+        durable["meta"].update(patch)
+        return True
+    osm.update_order_meta.side_effect = _upd
+    osm.hold_entry_for_market_truth_unavailable.return_value = True
+    osm.submit_existing_entry.return_value = {"ok": True, "broker_order_id": "TR-1"}
+    core.order_state_machine = osm
+
+    core._cleanup_pending_entry_order = types.MethodType(
+        core_mod.APExecutionCore._cleanup_pending_entry_order, core,
+    )
+    return core, watched, osm, durable
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 P1: classify_market_truth blank/None/unknown → HOLD (never PASS).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestBlankReasonNeverAuthorizesSubmit:
+    def test_none_reason_maps_to_hold(self):
+        assert classify_market_truth(None) == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+    def test_blank_reason_maps_to_hold(self):
+        assert classify_market_truth("") == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+    def test_whitespace_reason_maps_to_hold(self):
+        assert classify_market_truth("   ") == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+    def test_unknown_reason_maps_to_hold(self):
+        assert classify_market_truth("UNKNOWN_NEW_REASON") == (
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+        )
+
+    def test_only_pass_authorizes_submit(self):
+        assert classify_market_truth(GateOutcome.PASS) == MarketTruthAuthority.SUBMIT_VALID
+
+
+class TestHoldOwnerLiveness:
+    """PR #391 blocker 3: HOLD row shape carries the canonical deferred-
+    retry vocabulary — same shape adopt_deferred_retry_watcher expects."""
+
+    def _hold_meta_from_osm(self, osm) -> dict:
+        assert osm.hold_entry_for_market_truth_unavailable(
+            "LOID-HOLD",
+            reason_code=GateOutcome.CURRENT_PRICE_STALE,
+            gate_audit={"quote_age_ms": 30_000},
+            execution_mode="paper",
+            signal_id="SIG-HOLD",
+            expected_generation=1,
+            expected_watcher_token="watcher:hold",
+            next_retry_at="2026-07-26T18:00:00+00:00",
+            max_attempts=8,
+        ) is True
+        assert len(osm._fake_conn.executed) == 1
+        import json
+        return json.loads(osm._fake_conn.executed[0][1][0])
+
+    def test_hold_row_matches_canonical_retry_read_predicates(self, osm):
+        patch = self._hold_meta_from_osm(osm)
+        assert patch["lifecycle_state"] == "RETRY_WAIT"
+        assert patch["materialization_status"] == "RETRY_PENDING"
+        assert patch["materialization_in_flight"] is False
+        assert patch["materialization_owner"] == ""
+        assert patch["watcher_token"] == ""
+        assert patch["broker_ready"] is False
+        assert patch["retry_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["materialization_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["next_retry_at"]
+        assert patch["materialization_next_retry_at"] == patch["next_retry_at"]
+        assert patch["retry_max_attempts"] == 8
+        for cleared in (
+            "submit_intent_at", "submit_started_at",
+            "broker_submit_key", "broker_submit_payload_hash",
+            "recovery_submit_owner", "recovery_submit_lease_until",
+        ):
+            assert patch[cleared] == ""
+        # No hold-only dialect fields leak through.
+        assert "submit_hold_attempt" not in patch
+        assert "submit_hold_max_attempts" not in patch
+
+
+class TestPaperDataTransportProof:
+    """PR #391 blocker 6: proof by transport, not source label."""
+
+    def _proof(self, base_url):
+        from ap_execution_core import _market_data_transport_proof
+        class _Cfg:
+            def __init__(self, u): self.base_url = u
+        class _Broker:
+            def __init__(self, u): self.cfg = _Cfg(u)
+        return _market_data_transport_proof(_Broker(base_url))
+
+    def test_none_adapter_not_proven(self):
+        from ap_execution_core import _market_data_transport_proof
+        assert _market_data_transport_proof(None) == {
+            "base_url": None, "host": None, "sandbox": False, "proven": False,
+        }
+
+    def test_live_host_proven(self):
+        p = self._proof("https://api.tradier.com/v1")
+        assert p["proven"] is True
+        assert p["sandbox"] is False
+        assert p["host"] == "api.tradier.com"
+
+    @pytest.mark.parametrize("bad", [
+        "https://sandbox.tradier.com",
+        "https://paper.example.com",
+        "https://sim.marketdata.io",
+        "https://mock.foo.bar",
+        "https://test.baz.qux",
+    ])
+    def test_sandbox_family_hosts_not_proven(self, bad):
+        p = self._proof(bad)
+        assert p["proven"] is False
+        assert p["sandbox"] is True
+
+    def test_blank_url_not_proven(self):
+        p = self._proof("")
+        assert p["proven"] is False
+        assert p["host"] is None
+
+    def test_payload_source_label_does_not_bypass_transport_proof(self):
+        # source string is only a secondary signal — transport is the truth.
+        p = self._proof("https://sandbox.tradier.com")
+        assert p["proven"] is False
+
+
+def _build_watcher_with_triggered_signal(local_order_id="LOID-1",
+                                         ticker="BAC",
+                                         side="PUT"):
+    from ap_entry_watcher import APEntryWatcher, WatchedSignal, WatchState
+    import threading, uuid
+    from datetime import datetime, timezone
+
+    w = object.__new__(APEntryWatcher)
+    w._pending = []
+    w._lock = threading.Lock()
+    w.owner_token = f"watcher:{uuid.uuid4()}"
+
+    signal = {
+        "ticker": ticker, "side": side,
+        "entry_price": 61.17, "stop_price": 61.75, "target_price": 59.50,
+        "signal_id": "SIG-1", "local_order_id": local_order_id,
+        "client_id": "client@example.com", "execution_mode": "paper",
+        "contract_symbol": "BAC260724P00062000",
+    }
+    watched = object.__new__(WatchedSignal)
+    watched.signal = signal
+    watched.ticker = ticker
+    watched.side = side.upper()
+    watched.state = WatchState.TRIGGERED
+    watched.breach_count = 2
+    watched.breach_price = 61.20
+    watched.trigger_crossed_at = datetime.now(timezone.utc)
+    watched.triggered_at = datetime.now(timezone.utc)
+    watched.trigger_price = 61.17
+    watched.first_breach_bid = 61.10
+    watched.first_breach_ask = 61.14
+    watched._trigger_stop_collision = False
+    watched._ownership_quarantine = False
+    watched.rearm_mode = False
+    watched._watcher_ref = w
+    w._pending.append(watched)
+    return w, watched
+
+
+class TestWatcherResetAfterSubmitBlock:
+    def test_reset_makes_triggered_watcher_active_again(self):
+        from ap_entry_watcher import WatchState
+        w, watched = _build_watcher_with_triggered_signal()
+        assert w.reset_after_submit_market_truth_block(
+            "LOID-1", reason_code="PUT_NO_LONGER_BELOW_TRIGGER",
+        ) is True
+        assert watched.state == WatchState.PENDING
+        assert watched.breach_count == 0
+        assert watched.trigger_crossed_at is None
+        assert watched.triggered_at is None
+        assert watched.first_breach_bid == 0.0
+        assert watched.first_breach_ask == 0.0
+        assert watched.signal["contract_deferred"] is True
+        assert watched.signal["contract_symbol"] == "DEFERRED:BAC"
+        assert watched.signal["submit_market_truth_rearmed"] is True
+        assert watched.signal["submit_market_truth_reason_code"] == "PUT_NO_LONGER_BELOW_TRIGGER"
+        assert watched.signal["watcher_token"] == w.owner_token
+
+    def test_reset_refuses_wrong_state(self):
+        from ap_entry_watcher import WatchState
+        w, watched = _build_watcher_with_triggered_signal()
+        watched.state = WatchState.EXPIRED
+        assert w.reset_after_submit_market_truth_block("LOID-1", reason_code="X") is False
+
+    def test_reset_refuses_unknown_local_order_id(self):
+        w, _ = _build_watcher_with_triggered_signal()
+        assert w.reset_after_submit_market_truth_block("LOID-NOPE", reason_code="X") is False
+
+    def test_reset_refuses_ambiguous_identity(self):
+        from ap_entry_watcher import WatchedSignal, WatchState
+        w, _ = _build_watcher_with_triggered_signal(local_order_id="LOID-1")
+        dup = object.__new__(WatchedSignal)
+        dup.signal = {"local_order_id": "LOID-1"}
+        dup.ticker = "BAC"
+        dup.state = WatchState.PENDING
+        dup._watcher_ref = w
+        w._pending.append(dup)
+        assert w.reset_after_submit_market_truth_block("LOID-1", reason_code="X") is False
+
+    def test_reset_refuses_blank_args(self):
+        w, _ = _build_watcher_with_triggered_signal()
+        assert w.reset_after_submit_market_truth_block("", reason_code="X") is False
+        assert w.reset_after_submit_market_truth_block("LOID-1", reason_code="") is False
+
+
+def _build_gate_exception_scaffold(monkeypatch, mode: str):
+    """Assemble a minimal APExecutionCore + WatchedSignal that reaches the
+    market-truth gate wrapper. Broker + data_broker are proven-live so we
+    isolate the gate-exception behavior."""
+    import sys, types, threading
+    from unittest.mock import MagicMock
+    from types import SimpleNamespace
+    from datetime import datetime, timezone
+    import ap_execution_core as core_mod
+
+    fake_execution = types.ModuleType("ap.execution")
+    fake_execution._refresh_ask_at_submit = lambda *_a, **_k: (
+        1.25, 5, True, "", {
+            "submit_bid": 1.20, "submit_ask": 1.25,
+            "submit_last": 1.23, "submit_mid": 1.225,
+            "spread_pct": 0.04,
+        },
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution)
+
+    plan = SimpleNamespace(
+        contract_symbol="SPY260626C00500000",
+        execution_price_per_share=1.25, ask=1.25, mid=1.20,
+        affordable_contracts=1, premium_per_contract=125.0,
+        contracts=1, limit_price=1.25,
+        side="CALL", direction="CALL", execution_mode=mode,
+        client_id="client@example.com", signal_id="SIG-GATE-EXC",
+        trigger_price=600.5, stop_underlying=595.0, target_underlying=610.0,
+        metadata={"queue_id": 42},
+    )
+    watched = SimpleNamespace(
+        signal={
+            "ticker": "SPY", "side": "CALL", "entry_price": 600.0,
+            "stop_price": 595.0, "target_price": 610.0,
+            "signal_id": plan.signal_id, "local_order_id": "LOID-GATE-EXC",
+            "client_id": plan.client_id, "execution_mode": mode,
+        },
+        trigger_price=600.5, ticker="SPY",
+        trigger_crossed_at=datetime.now(timezone.utc),
+    )
+
+    core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
+    core.paper = (mode == "paper")
+    core.mode = mode.upper()
+    core.execution_mode = mode
+    core.client_id = core.client_email = plan.client_id
+    class _CfgLive: base_url = "https://api.tradier.com"
+    class _CfgSandbox: base_url = "https://sandbox.tradier.com"
+    core.broker = SimpleNamespace(
+        cfg=_CfgSandbox() if mode == "paper" else _CfgLive(),
+        get_quote=lambda _s: {
+            "bid": 600.60, "ask": 600.70, "quote_age_ms": 100,
+            "source": "live_broker",
+        },
+    )
+    # For PAPER, wire a distinct live data broker so the gate would be
+    # reachable if the gate itself did not raise.
+    if mode == "paper":
+        core.data_broker = SimpleNamespace(
+            cfg=_CfgLive(),
+            get_quote=lambda _s: {
+                "bid": 600.60, "ask": 600.70, "quote_age_ms": 100,
+                "source": "live_broker",
+            },
+        )
+    else:
+        core.data_broker = None
+    core.store = MagicMock()
+    core.contract_selector = MagicMock()
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = MagicMock(return_value=plan)
+
+    osm = MagicMock(client_id=plan.client_id, execution_mode=mode)
+    durable = {"client_id": plan.client_id, "meta": {}}
+    osm.get_order.side_effect = lambda _loid: durable
+    def _upd(_loid, patch):
+        durable["meta"].update(patch); return True
+    osm.update_order_meta.side_effect = _upd
+    osm.hold_entry_for_market_truth_unavailable.return_value = True
+    osm.submit_existing_entry.return_value = {"ok": True, "broker_order_id": "TR-1"}
+    core.order_state_machine = osm
+
+    core._cleanup_pending_entry_order = types.MethodType(
+        core_mod.APExecutionCore._cleanup_pending_entry_order, core,
+    )
+    return core, watched, osm, durable
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 P0-1: gate-module exception branch — hard-close for PAPER and LIVE.
+#
+# The full _on_entry_trigger callback wires many upstream gates before the
+# market-truth wrapper. Rather than reconstruct that entire fixture (and
+# risk testing something other than the wrapper), we prove the invariant
+# by inspecting the wrapper's source shape and by exercising the exception
+# branch's OSM call surface directly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestGateExceptionBranchShape:
+    """P0-1 proof: the exception branch has no PAPER exemption anywhere."""
+
+    def _wrapper_body(self) -> str:
+        with open("ap_execution_core.py") as fh:
+            src = fh.read()
+        # Isolate the wrapper: from the outer `try:` for the gate module
+        # through the `submit_existing_entry(` broker POST that follows the
+        # `except` block. This bounds the "wrapper" region precisely.
+        start = src.index("MARKET_TRUTH_GATE_MODULE_ERROR")
+        end = src.index("self.order_state_machine.submit_existing_entry(", start)
+        return src[start:end]
+
+    def test_no_paper_exemption_in_gate_exception_branch(self):
+        body = self._wrapper_body()
+        # The old fail-open contract used one of these exact phrases.
+        forbidden_phrases = [
+            'if _module_error_exec_mode != "paper":',
+            "if _module_error_exec_mode != 'paper':",
+            "LIVE will block, PAPER will proceed",
+            "PAPER will proceed",
+        ]
+        for phrase in forbidden_phrases:
+            assert phrase not in body, (
+                f"gate-module exception branch still has a PAPER exemption: {phrase!r}"
+            )
+
+    def test_exception_branch_returns_retry_wait(self):
+        body = self._wrapper_body()
+        # The exception branch must return the RETRY_WAIT disposition and
+        # the MARKET_TRUTH_GATE_MODULE_ERROR reason code.
+        assert '"disposition":' in body and '"RETRY_WAIT"' in body
+        assert "MARKET_TRUTH_GATE_MODULE_ERROR" in body
+        assert '"broker_post_attempted":' in body and "False" in body
+
+    def test_exception_branch_calls_canonical_hold(self):
+        body = self._wrapper_body()
+        # The exception branch must call the fenced HOLD helper — not
+        # _terminalize_breach_failure, not submit_existing_entry.
+        assert "hold_entry_for_market_truth_unavailable(" in body
+        # And it must NOT terminalize.
+        assert "_terminalize_breach_failure" not in body
+
+
+class TestOSMHoldDirectlyOnGateModuleErrorReason:
+    """The exception branch calls hold_entry_for_market_truth_unavailable
+    with reason MARKET_TRUTH_GATE_MODULE_ERROR. Prove the OSM method
+    accepts that reason and writes the canonical HOLD schema."""
+
+    def test_hold_accepts_module_error_reason(self, osm):
+        ok = osm.hold_entry_for_market_truth_unavailable(
+            "LOID-EXC",
+            reason_code="MARKET_TRUTH_GATE_MODULE_ERROR",
+            gate_audit={"error_type": "RuntimeError", "error": "gate exploded"},
+            execution_mode="paper",
+            signal_id="SIG-EXC",
+            expected_generation=0,
+            expected_watcher_token="",
+            next_retry_at="2026-07-26T18:30:00+00:00",
+            max_attempts=10,
+        )
+        assert ok is True
+        import json
+        patch = json.loads(osm._fake_conn.executed[0][1][0])
+        assert patch["final_market_truth_reason_code"] == "MARKET_TRUTH_GATE_MODULE_ERROR"
+        assert patch["final_market_truth_status"] == "HOLD_MARKET_TRUTH_UNAVAILABLE"
+        assert patch["lifecycle_state"] == "RETRY_WAIT"

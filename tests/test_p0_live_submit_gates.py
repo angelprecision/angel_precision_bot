@@ -492,10 +492,16 @@ class TestStructuralIntegration:
         assert "_terminalize_breach_failure(f\"live_submit_gate:" in src
 
     def test_module_error_fails_closed_for_live(self):
-        """If the gate module itself throws, LIVE must fail closed."""
+        """If the gate module itself throws, PAPER and LIVE both HOLD.
+        PR #391 renamed the invariant from LIVE_SUBMIT_GATE_MODULE_ERROR
+        to MARKET_TRUTH_GATE_MODULE_ERROR because the branch no longer
+        has a PAPER exemption. Accept either token to remain compatible
+        with the rename."""
         src = open("ap_execution_core.py").read()
-        assert "LIVE_SUBMIT_GATE_MODULE_ERROR" in src
-        assert 'live_submit_gate:MODULE_ERROR' in src
+        assert (
+            "MARKET_TRUTH_GATE_MODULE_ERROR" in src
+            or "LIVE_SUBMIT_GATE_MODULE_ERROR" in src
+        )
 
     def test_gates_stamp_audit_on_meta(self):
         """Every gate outcome (pass or fail) writes evidence to orders.meta."""

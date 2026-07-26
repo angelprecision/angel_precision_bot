@@ -254,19 +254,20 @@ def _execution_core(monkeypatch, submit_result: dict):
     core.execution_mode = "paper"
     core.email = "client@example.com"
     core.client_id = "client@example.com"
+    _q_ret = {
+        "bid": 600.20, "ask": 600.22, "quote_age_ms": 10,
+        "source": "live_broker",
+    }
     core.broker = SimpleNamespace(
         cfg=SimpleNamespace(base_url="https://sandbox.tradier.com"),
         sandbox=True,
-        get_quote=MagicMock(return_value={
-            "bid": 600.20,
-            "ask": 600.22,
-            "quote_age_ms": 10,
-            # PR #391: the market-validity gate now rejects unproven sources
-            # (denylist includes "unknown"/"sandbox"/"test"/…). This test
-            # exercises reconciliation downstream of the gate, so use a
-            # proven live source that passes.
-            "source": "live_broker",
-        }),
+        get_quote=MagicMock(return_value=_q_ret),
+    )
+    # PR #391 blocker 6: PAPER requires a distinct proven-live data broker.
+    core.data_broker = SimpleNamespace(
+        cfg=SimpleNamespace(base_url="https://api.tradier.com"),
+        sandbox=False,
+        get_quote=MagicMock(return_value=_q_ret),
     )
     core.store = MagicMock()
     core.order_state_machine = osm

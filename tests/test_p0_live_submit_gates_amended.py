@@ -554,11 +554,18 @@ class TestNoSubmitOnGateFailure:
                 f"Found: _terminalize_breach_failure({c})"
             )
 
-    def test_module_error_blocks_live_not_paper(self):
-        """Module-level gate error must block LIVE, allow PAPER."""
+    def test_module_error_blocks_both_paper_and_live_pr391(self):
+        """PR #391 P0-1: module-level gate error must block BOTH modes.
+        The old fail-open-for-PAPER contract is deleted. The invariant
+        was renamed to MARKET_TRUTH_GATE_MODULE_ERROR."""
         src = open("ap_execution_core.py").read()
-        assert "LIVE_SUBMIT_GATE_MODULE_ERROR" in src
-        assert 'live_submit_gate:MODULE_ERROR' in src
+        assert (
+            "MARKET_TRUTH_GATE_MODULE_ERROR" in src
+            or "LIVE_SUBMIT_GATE_MODULE_ERROR" in src
+        )
+        # And the old PAPER-exemption phrase must be gone.
+        assert 'if _module_error_exec_mode != "paper":' not in src
+        assert "if _module_error_exec_mode != 'paper':" not in src
 
     def test_gate_block_updates_orders_meta(self):
         """Every gate failure persists live_submit_gate to orders.meta."""

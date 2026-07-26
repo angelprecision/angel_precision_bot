@@ -283,29 +283,35 @@ class TestAmendment5ModuleErrorUnknownMode:
             )
             assert "MODULE_ERROR" in reason
 
-    def test_5_explicit_paper_may_proceed(self):
-        """Explicit paper mode may proceed when module errors."""
-        blocked, _ = self._simulate_module_error_gate("paper")
-        assert blocked is False, "Explicit paper mode must be allowed through on module error"
-
-    def test_5_module_error_in_execution_core_blocks_unknown(self):
-        """
-        Structural: ap_execution_core.py must contain the 'not paper' check
-        that closes the unknown-mode gap.
-        """
+    def test_5_explicit_paper_blocks_on_module_error_pr391(self):
+        """PR #391 P0-1 overrides the earlier A5: PAPER now also fails
+        closed on module error. There is no fail-open branch for any mode."""
+        # The old A5 simulator above modeled the previous contract; PR #391
+        # removes the PAPER exemption entirely. Verify at the source level.
         src = open("ap_execution_core.py").read()
-        assert "_module_error_exec_mode != \"paper\"" in src, (
-            "A5: execution_core must check 'not paper' not 'is live' in module error handler"
+        assert 'if _module_error_exec_mode != "paper":' not in src
+        assert "if _module_error_exec_mode != 'paper':" not in src
+
+    def test_5_module_error_in_execution_core_blocks_all_modes_pr391(self):
+        """PR #391 P0-1: the module-error branch has no mode-conditional
+        fallthrough. It always HOLDs (never terminalizes, never posts) and
+        returns RETRY_WAIT. The old 'not paper' guard is deleted because
+        the guard would be dead code — every mode blocks."""
+        src = open("ap_execution_core.py").read()
+        # New invariant name is present.
+        assert (
+            "MARKET_TRUTH_GATE_MODULE_ERROR" in src
+            or "LIVE_SUBMIT_GATE_MODULE_ERROR" in src
         )
-        # Must NOT use the old 'is live' check exclusively
+        # Old mode-conditional check must not gate anything anymore.
+        assert 'if _module_error_exec_mode != "paper":' not in src
+        # And no lingering 'is live' exclusive check either.
         lines_with_old_check = [
             l for l in src.splitlines()
             if "_module_error_exec_mode == \"live\"" in l
             and "# old" not in l.lower()
         ]
-        assert not lines_with_old_check, (
-            "A5: old 'is live' check must be replaced with 'is not paper' check"
-        )
+        assert not lines_with_old_check
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -440,14 +446,18 @@ class TestAmendment7AuditWriteFailureNotSwallowed:
         A7 structural: execution_core gate section must not have bare
         'except Exception: pass' around update_order_meta calls.
         All must use named exception and emit a log.
+
+        PR #391 note: rfind() scopes to the INNERMOST (function-level)
+        live_submit_gates import — PR #391 added a module-level re-export
+        so callers can monkeypatch. Using find() would drag in the entire
+        file between the module import and the submit call, which is far
+        beyond the gate section's scope.
         """
         src = open("ap_execution_core.py").read()
-        # Find the gate section (between live_submit_gates import and submit call)
-        gate_start = src.find("from ap.live_submit_gates import")
+        gate_start = src.rfind("from ap.live_submit_gates import")
         gate_end   = src.find("submit_res = self.order_state_machine.submit_existing_entry(", gate_start)
         gate_section = src[gate_start:gate_end] if gate_start >= 0 and gate_end >= 0 else ""
 
-        # In the gate section, bare 'except Exception:\n                    pass' should be gone
         bare_pass_count = gate_section.count("except Exception:\n                    pass")
         assert bare_pass_count == 0, (
             f"A7: gate section has {bare_pass_count} bare 'except Exception: pass' blocks. "
