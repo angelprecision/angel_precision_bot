@@ -7,13 +7,11 @@ Scope after the formal audit:
   (``resolve_trigger_anchored_preferred_strikes``) — both the direct-quote
   recovery ordering in the selector and the final playbook ranker call this
   one resolver, so quote-spending order and final ranking cannot diverge.
-* ``APContractSelectionEngine.select()`` reorders the option chain by
-  trigger-anchored strike preference BEFORE the quality-filter loop, GATED on
-  ``PLAYBOOK_STRIKE_SELECTION_ENABLED`` / ``PLAYBOOK_CONTRACT_SELECTION_ENABLED``.
-  When the flag is off, the non-playbook selector path preserves prior chain
-  ordering, ranking, quote spending, and selection behavior. A
-  ``preferred_strike_ordering`` diagnostics entry with ``enabled=False`` is
-  still emitted for observability parity, but selection is not affected.
+* ``APContractSelectionEngine.select()`` feeds trigger-anchored strike
+  preference into the post-#389 direct-quote recovery ordering helper, GATED
+  on ``PLAYBOOK_STRIKE_SELECTION_ENABLED`` /
+  ``PLAYBOOK_CONTRACT_SELECTION_ENABLED``. When the flag is off, the
+  post-#389 structural/liquidity ordering remains the baseline.
 * Missing trigger falls back to underlying; missing/invalid both anchors returns
   ``TRIGGER_ANCHOR_SOURCE_NONE`` and callers preserve their prior ordering.
 * No hard quality gate, budget rule, LIVE ask pricing, PAPER pricing, retry
@@ -40,8 +38,9 @@ Required-tests coverage (from the audit):
 from __future__ import annotations
 
 import os
+from datetime import date, timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -59,6 +58,24 @@ from ap.contract_playbook import (
 # Shared fixtures / helpers
 # ---------------------------------------------------------------------------
 
+def _next_weekday(day: date) -> date:
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return day
+
+
+_NEAR_EXPIRY = _next_weekday(date.today() + timedelta(days=2))
+_NEAR_EXPIRY_ISO = _NEAR_EXPIRY.isoformat()
+_NEAR_DTE = (_NEAR_EXPIRY - date.today()).days
+
+
+def _occ_symbol(ticker: str, expiration: date, side: str, strike: float) -> str:
+    root = "".join(str(ticker or "").upper().split())
+    yymmdd = expiration.strftime("%y%m%d")
+    cp = "C" if str(side).upper().startswith("C") else "P"
+    strike_int = int(round(float(strike) * 1000))
+    return f"{root}{yymmdd}{cp}{strike_int:08d}"
+
 def _spec(
     side: str,
     *,
@@ -71,9 +88,9 @@ def _spec(
         instrument_class=instrument_class,
         timeframe="DAILY",
         side=side,
-        preferred_expirations=["2026-07-31"],
-        permitted_expirations=["2026-07-31"],
-        preferred_dte_order=[6],
+        preferred_expirations=[_NEAR_EXPIRY_ISO],
+        permitted_expirations=[_NEAR_EXPIRY_ISO],
+        preferred_dte_order=[_NEAR_DTE],
         strike_policy="LEXICOGRAPHIC_ATM_OR_ONE_STEP_OTM_TOWARD_TARGET",
         preferred_strikes=[],
         strike_band_low=None,
@@ -87,15 +104,22 @@ def _spec(
     )
 
 
-def _candidate_dicts(strikes):
-    return [{"symbol": f"OPT_{s}", "strike": float(s)} for s in strikes]
+def _candidate_dicts(strikes, *, ticker: str = "BAC", side: str = "PUT"):
+    return [
+        {
+            "symbol": _occ_symbol(ticker, _NEAR_EXPIRY, side, float(s)),
+            "strike": float(s),
+        }
+        for s in strikes
+    ]
 
 
 def _tradier_row(
     strike: float,
     *,
     side: str,
-    expiration: str = "2026-07-31",
+    ticker: str = "BAC",
+    expiration: str = _NEAR_EXPIRY_ISO,
     bid: float = 1.20,
     ask: float = 1.30,
     delta: float = 0.42,
@@ -110,7 +134,9 @@ def _tradier_row(
     trigger-preferred candidates."""
     side_low = side.lower()
     return {
-        "symbol": symbol or f"{side_low.upper()}_{int(strike*1000):08d}",
+        "symbol": symbol or _occ_symbol(
+            ticker, date.fromisoformat(expiration), side, strike
+        ),
         "strike": float(strike),
         "bid": float(bid),
         "ask": float(ask),
@@ -249,6 +275,74 @@ def _run_full_select(
     return result, engine, plan
 
 
+def _run_one_call_direct_quote_case(
+    monkeypatch,
+    *,
+    side: str,
+    trigger: float,
+    underlying: float,
+) -> tuple:
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+    monkeypatch.delenv("DIRECT_QUOTE_RECOVERY_TOP_N", raising=False)
+    monkeypatch.delenv("CONTRACT_REVALIDATE_TOP_N", raising=False)
+
+    import ap.contract_quote_revalidator as quote_revalidator
+
+    quote_revalidator.clear_quote_cache()
+    chain = [
+        _tradier_row(s, side=side, bid=0.0, ask=0.0)
+        for s in (60.0, 61.0, 62.0)
+    ]
+    trigger_primary_symbol = _occ_symbol("BAC", _NEAR_EXPIRY, side, 61.0)
+    expected_budget_skipped_symbol = _occ_symbol(
+        "BAC", _NEAR_EXPIRY, side, 60.0 if side == "PUT" else 62.0
+    )
+
+    engine = _make_engine()
+    data_broker = engine.data_broker
+
+    def _direct_quote(symbol):
+        assert symbol == trigger_primary_symbol
+        return {
+            "bid": 1.20,
+            "ask": 1.30,
+            "last": 1.25,
+            "bidsize": 20,
+            "asksize": 20,
+            "volume": 800,
+            "open_interest": 5_000,
+        }
+
+    data_broker.get_quote = Mock(side_effect=_direct_quote)
+    plan = _plan(
+        ticker="BAC",
+        side=side,
+        trigger=trigger,
+        target=trigger * (0.98 if side == "PUT" else 1.02),
+        execution_mode="paper",
+    )
+
+    with patch.object(
+        engine, "_fetch_chain_with_price", return_value=(chain, underlying)
+    ), patch(
+        "ap.contract_selector._pro_contract_quality",
+        return_value=("B", "ok_liquid"),
+    ), patch(
+        "ap.contract_quote_revalidator.is_market_open",
+        return_value=True,
+    ):
+        result = engine.select(plan)
+
+    diagnostics = plan["metadata"]["selector_request_diagnostics"]
+    return (
+        result,
+        data_broker,
+        trigger_primary_symbol,
+        expected_budget_skipped_symbol,
+        diagnostics,
+    )
+
+
 # ===========================================================================
 # Required test A — BAC PUT drift replay
 # ===========================================================================
@@ -269,7 +363,9 @@ class TestBacPutDriftReplay:
 
     def test_playbook_ranker_selects_61_when_drifted(self):
         spec = _spec("PUT", trigger=61.17, underlying=61.60)
-        ctx = build_playbook_candidate_context(spec, _candidate_dicts([60, 61, 62]))
+        ctx = build_playbook_candidate_context(
+            spec, _candidate_dicts([60, 61, 62], side="PUT")
+        )
         assert ctx["atm_strike"] == 61.0
         assert ctx["one_step_otm_strike"] == 60.0
         assert ctx["preferred_strikes"] == [61.0, 60.0]
@@ -295,6 +391,26 @@ class TestBacPutDriftReplay:
         assert result is not None, "selector must return a contract"
         assert result.strike == 61.0
         assert plan["contract_symbol"] == result.contract_symbol
+
+    def test_61_put_receives_only_direct_quote_attempt(self, monkeypatch):
+        result, data_broker, quoted_symbol, skipped_symbol, diagnostics = (
+            _run_one_call_direct_quote_case(
+                monkeypatch,
+                side="PUT",
+                trigger=61.17,
+                underlying=61.60,
+            )
+        )
+
+        assert data_broker.get_quote.call_count == 1
+        assert data_broker.get_quote.call_args.args[0] == quoted_symbol
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["direct_quote_attempted_symbols"] == [quoted_symbol]
+        assert diagnostics["direct_quote_unattempted_count"] >= 1
+        assert skipped_symbol in diagnostics["direct_quote_unattempted_symbols"]
+        assert quoted_symbol not in diagnostics["direct_quote_unattempted_symbols"]
+        assert result is not None
+        assert result.strike == 61.0
 
 
 # ===========================================================================
@@ -327,6 +443,26 @@ class TestBacCallDriftReplay:
             ticker="BAC", side="CALL", trigger=61.17, underlying=60.60,
             chain=chain,
         )
+        assert result is not None
+        assert result.strike == 61.0
+
+    def test_61_call_receives_only_direct_quote_attempt(self, monkeypatch):
+        result, data_broker, quoted_symbol, skipped_symbol, diagnostics = (
+            _run_one_call_direct_quote_case(
+                monkeypatch,
+                side="CALL",
+                trigger=61.17,
+                underlying=60.60,
+            )
+        )
+
+        assert data_broker.get_quote.call_count == 1
+        assert data_broker.get_quote.call_args.args[0] == quoted_symbol
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["direct_quote_attempted_symbols"] == [quoted_symbol]
+        assert diagnostics["direct_quote_unattempted_count"] >= 1
+        assert skipped_symbol in diagnostics["direct_quote_unattempted_symbols"]
+        assert quoted_symbol not in diagnostics["direct_quote_unattempted_symbols"]
         assert result is not None
         assert result.strike == 61.0
 
@@ -388,8 +524,10 @@ class TestMissingTriggerFallback:
         observed, _, engine, plan = _run_and_capture(
             ticker="BAC", side="PUT", trigger=None, underlying=61.60, chain=chain,
         )
-        # 62 nearest (0.4), 61 next (0.6), 60 last (1.6).
-        assert observed == [62.0, 61.0, 60.0]
+        # #389 structural validity remains ahead of preferred tier: the 62 PUT
+        # is above the underlying and therefore comes after directionally valid
+        # 61/60 rows even though it is nearest the fallback anchor.
+        assert observed == [61.0, 60.0, 62.0]
 
     def test_audit_reports_underlying_fallback_source(self):
         chain = [_tradier_row(s, side="PUT") for s in (60.0, 61.0, 62.0)]
@@ -420,7 +558,9 @@ class TestMissingTriggerFallback:
         assert "ordered_candidates" in audit
         assert "attempted_candidates" not in audit
         assert len(audit["ordered_candidates"]) == 3
-        assert audit["ordered_candidates"][0]["strike"] == 62.0
+        assert [row["strike"] for row in audit["ordered_candidates"]] == [
+            61.0, 60.0, 62.0,
+        ]
 
 
 # ===========================================================================
@@ -536,7 +676,9 @@ class TestIndexReplays:
         # divergence between quote-spending and final ranking.
         spec = _spec(side, trigger=trigger, underlying=underlying,
                      instrument_class="LIQUID_INDEX_ETF")
-        ctx = build_playbook_candidate_context(spec, _candidate_dicts(strikes))
+        ctx = build_playbook_candidate_context(
+            spec, _candidate_dicts(strikes, ticker=ticker, side=side)
+        )
         assert ctx["atm_strike"] == expected_primary
         assert ctx["one_step_otm_strike"] == expected_adj
 
@@ -554,7 +696,7 @@ class TestIndexReplays:
     ):
         strikes = [expected_first - 2, expected_first - 1, expected_first,
                    expected_first + 1, expected_first + 2]
-        chain = [_tradier_row(s, side=side) for s in strikes]
+        chain = [_tradier_row(s, side=side, ticker=ticker) for s in strikes]
         observed, _, _, _ = _run_and_capture(
             ticker=ticker, side=side, trigger=trigger, underlying=underlying,
             chain=chain,
@@ -615,7 +757,9 @@ class TestGatePreservation:
     def test_invalid_dte_still_rejects_trigger_preferred_candidate(self):
         # Expiration ~120 days out — well beyond max_dte=21
         result, _, _ = self._reorder_with_bad_primary(
-            gate_perturbation={"expiration_date": "2026-11-30"},
+            gate_perturbation={
+                "expiration_date": (date.today() + timedelta(days=120)).isoformat()
+            },
         )
         assert result is not None
         assert result.strike != 61.0
@@ -697,28 +841,52 @@ class TestPricingAndSideEffects:
 # ===========================================================================
 
 class TestFlagOffLeavesChainOrderUntouched:
-    """When PLAYBOOK_STRIKE_SELECTION_ENABLED is off, the selector must not
-    reorder the chain — non-playbook callers preserve prior chain ordering,
-    ranking, quote spending, and selection behavior. A preferred_strike_ordering
-    diagnostics entry with enabled=False may still be emitted; selection
-    behavior itself is unchanged."""
+    """When PLAYBOOK_STRIKE_SELECTION_ENABLED is off, #389's structural
+    direct-quote recovery ordering is the baseline. Enabling #396 may change
+    only the preferred-strike tier inside that shared helper."""
 
-    def test_flag_off_preserves_original_order(self, monkeypatch):
+    def test_flag_off_uses_post_389_baseline_order(self, monkeypatch):
         monkeypatch.delenv("PLAYBOOK_STRIKE_SELECTION_ENABLED", raising=False)
         monkeypatch.delenv("PLAYBOOK_CONTRACT_SELECTION_ENABLED", raising=False)
 
         chain = [_tradier_row(s, side="PUT") for s in (60.0, 61.0, 62.0)]
         observed, _, engine, plan = _run_and_capture(
-            ticker="BAC", side="PUT", trigger=61.17, underlying=61.60, chain=chain,
+            ticker="BAC", side="PUT", trigger=60.20, underlying=61.60, chain=chain,
         )
-        # Original chain order preserved — no reorder applied.
-        assert observed == [60.0, 61.0, 62.0]
+        expected = [
+            float(opt["strike"])
+            for opt in __import__(
+                "ap.contract_selector", fromlist=["_order_chain_for_direct_quote_recovery"]
+            )._order_chain_for_direct_quote_recovery(
+                list(chain),
+                direction="PUT",
+                underlying_price=61.60,
+                target_delta=0.35,
+                today=date.today(),
+                request_context=None,
+            )
+        ]
+        assert observed == expected
+        assert observed == [61.0, 60.0, 62.0]
 
         diag = plan["metadata"]["selector_request_diagnostics"]
         audit = diag.get("preferred_strike_ordering")
-        # Either absent (flag never touched the code path) or explicitly disabled.
-        if audit is not None:
-            assert audit["enabled"] is False
+        assert audit is not None
+        assert audit["enabled"] is False
+        assert "ordered_candidates" not in audit
+        assert diag["direct_quote_candidate_ranking"]
+
+    def test_flag_on_changes_only_preferred_tier_inside_shared_helper(self):
+        chain = [_tradier_row(s, side="PUT") for s in (60.0, 61.0, 62.0)]
+        observed, _, _, plan = _run_and_capture(
+            ticker="BAC", side="PUT", trigger=60.20, underlying=61.60, chain=chain,
+        )
+        assert observed == [60.0, 61.0, 62.0]
+        diag = plan["metadata"]["selector_request_diagnostics"]
+        ranking = diag["direct_quote_candidate_ranking"]
+        assert [row["strike"] for row in ranking[:3]] == [60.0, 61.0, 62.0]
+        assert ranking[0]["preferred_strike_tier"] == 0
+        assert any(row["preferred_strike_tier"] > 0 for row in ranking[1:])
 
 
 class TestSharedAuthorityIsSingleSource:
@@ -745,7 +913,9 @@ class TestSharedAuthorityIsSingleSource:
             candidate_strikes=strikes,
         )
         spec = _spec(side, trigger=trigger, underlying=underlying)
-        ctx = build_playbook_candidate_context(spec, _candidate_dicts(strikes))
+        ctx = build_playbook_candidate_context(
+            spec, _candidate_dicts(strikes, side=side)
+        )
         assert ctx["atm_strike"] == pref.primary_strike
         assert ctx["one_step_otm_strike"] == pref.adjacent_otm_strike
         assert ctx["anchor_source"] == pref.anchor_source

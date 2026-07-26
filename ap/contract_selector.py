@@ -1061,12 +1061,35 @@ def _order_chain_for_direct_quote_recovery(
     target_delta: float,
     today: date,
     request_context: SelectorRequestContext,
+    preferred_strikes: list[float] | tuple[float, ...] | None = None,
 ) -> list[dict]:
     direction_norm = str(direction or "").strip().upper()
     if direction_norm.startswith("C"):
         direction_norm = "CALL"
     elif direction_norm.startswith("P"):
         direction_norm = "PUT"
+    preferred_order: dict[float, int] = {}
+    for idx, raw_strike in enumerate(preferred_strikes or ()):
+        try:
+            strike_value = float(raw_strike)
+        except (TypeError, ValueError):
+            continue
+        if strike_value > 0 and strike_value not in preferred_order:
+            preferred_order[strike_value] = idx
+
+    def _preferred_tier(strike: float | None) -> tuple[int, float]:
+        if not preferred_order:
+            return 0, 0.0
+        if strike is None:
+            return len(preferred_order) + 1, float("inf")
+        for preferred, tier in preferred_order.items():
+            if abs(float(strike) - preferred) < 1e-9:
+                return tier, 0.0
+        return (
+            len(preferred_order),
+            min(abs(float(strike) - preferred) for preferred in preferred_order),
+        )
+
     rows: list[tuple[tuple, dict, dict]] = []
     for original_index, opt in enumerate(list(chain or [])):
         exp_date = _option_expiration_date(opt)
@@ -1098,6 +1121,7 @@ def _order_chain_for_direct_quote_recovery(
             directional_fit = strike <= float(underlying_price)
         else:
             directional_fit = False
+        preferred_strike_tier, preferred_strike_distance = _preferred_tier(strike)
         oi_missing = opt.get("open_interest") in (None, "")
         vol_missing = opt.get("volume") in (None, "")
         open_interest = int(_safe_float(opt.get("open_interest"), 0.0)) if not oi_missing else None
@@ -1112,6 +1136,8 @@ def _order_chain_for_direct_quote_recovery(
             "delta_distance": delta_distance,
             "moneyness_distance_pct": moneyness_distance_pct,
             "directional_strike_fit": directional_fit,
+            "preferred_strike_tier": preferred_strike_tier,
+            "preferred_strike_distance": preferred_strike_distance,
             "open_interest": open_interest,
             "volume": volume,
             "original_index": original_index,
@@ -1120,6 +1146,8 @@ def _order_chain_for_direct_quote_recovery(
             0 if _valid_occ_symbol(opt) else 1,
             0 if valid_expiration else 1,
             0 if directional_fit else 1,
+            preferred_strike_tier,
+            preferred_strike_distance,
             strike_distance if strike_distance is not None else float("inf"),
             delta_distance if delta_distance is not None else float("inf"),
             -(open_interest or 0),
@@ -2576,6 +2604,9 @@ class APContractSelectionEngine:
             "chain_size_before": len(chain),
             "reordered": False,
         }
+        _preferred_strikes_for_quality_order: tuple[float, ...] = ()
+        _preferred_primary: float | None = None
+        _preferred_adjacent: float | None = None
         if _request_playbook_enabled(request_context):
             _preferred_strike_audit["enabled"] = True
             _preference = resolve_trigger_anchored_preferred_strikes(
@@ -2589,76 +2620,15 @@ class APContractSelectionEngine:
             _preferred_strike_audit["primary_strike"] = _preference.primary_strike
             _preferred_strike_audit["adjacent_otm_strike"] = _preference.adjacent_otm_strike
             if _preference.primary_strike is not None:
-                _primary = float(_preference.primary_strike)
-                _adjacent = (
+                _preferred_primary = float(_preference.primary_strike)
+                _preferred_adjacent = (
                     float(_preference.adjacent_otm_strike)
                     if _preference.adjacent_otm_strike is not None
                     else None
                 )
-                _ordered_audit: list[dict] = []
-
-                def _strike_tier(_opt: dict) -> tuple[int, str]:
-                    _s = _safe_float(_opt.get("strike"))
-                    if _s is None or _s <= 0:
-                        return (STRIKE_POLICY_TIER_NONMATCH, STRIKE_POLICY_LABEL_NONMATCH)
-                    if abs(_s - _primary) < 1e-9:
-                        return (STRIKE_POLICY_TIER_ATM, STRIKE_POLICY_LABEL_ATM)
-                    if _adjacent is not None and abs(_s - _adjacent) < 1e-9:
-                        return (STRIKE_POLICY_TIER_ONE_STEP_OTM, STRIKE_POLICY_LABEL_ONE_STEP_OTM)
-                    return (STRIKE_POLICY_TIER_NONMATCH, STRIKE_POLICY_LABEL_NONMATCH)
-
-                def _order_key(_indexed):
-                    _orig_index, _opt = _indexed
-                    _tier, _label = _strike_tier(_opt)
-                    _s = _safe_float(_opt.get("strike"))
-                    _distance = (
-                        abs(float(_s) - _primary)
-                        if _s is not None and _s > 0
-                        else float("inf")
-                    )
-                    return (_tier, _distance, _orig_index)
-
-                try:
-                    _indexed_chain = list(enumerate(chain))
-                    _reordered_chain = [
-                        opt
-                        for _idx, opt in sorted(_indexed_chain, key=_order_key)
-                    ]
-                    # NOTE: this list records the PLANNED reorder — the order
-                    # in which the quality/direct-quote loop below will visit
-                    # chain rows. It is NOT a record of attempted work: a row
-                    # here may still be rejected by an earlier structural gate,
-                    # may never reach direct-quote revalidation, and may not
-                    # consume a SELECTOR_MAX_DIRECT_QUOTE_CALLS attempt before
-                    # budget exhaustion. Operators reading this must not
-                    # conflate "planned order" with "attempted" or "quoted".
-                    # If a true attempted-work list is ever needed, it must be
-                    # appended inside the actual iteration branch below.
-                    for _opt in _reordered_chain:
-                        _tier, _label = _strike_tier(_opt)
-                        _ordered_audit.append({
-                            "symbol": _opt.get("symbol"),
-                            "strike": _safe_float(_opt.get("strike")),
-                            "strike_policy_tier": _tier,
-                            "strike_policy_label": _label,
-                        })
-                    chain = _reordered_chain
-                    _preferred_strike_audit["reordered"] = True
-                    _preferred_strike_audit["ordered_candidates"] = _ordered_audit
-                except Exception as _exc:
-                    # Ordering failure must never block selection — fall
-                    # through with the original chain order.
-                    _preferred_strike_audit["reorder_error"] = str(_exc)
-
-        try:
-            if request_context is not None and isinstance(
-                request_context.diagnostics_sink, dict
-            ):
-                request_context.diagnostics_sink["preferred_strike_ordering"] = dict(
-                    _preferred_strike_audit
+                _preferred_strikes_for_quality_order = tuple(
+                    float(_s) for _s in (_preference.ordered_preferred_strikes or ())
                 )
-        except Exception:
-            pass
 
         survivors  = []
         _rejections: dict = {}
@@ -2670,7 +2640,50 @@ class APContractSelectionEngine:
             target_delta=float(self.target_delta or 0.0),
             today=today,
             request_context=request_context,
+            preferred_strikes=_preferred_strikes_for_quality_order,
         )
+        if _preferred_strikes_for_quality_order:
+            _ordered_audit: list[dict] = []
+            for _opt in _quality_chain:
+                _s = _safe_float(_opt.get("strike"))
+                if _s is None or _s <= 0:
+                    _tier, _label = (
+                        STRIKE_POLICY_TIER_NONMATCH,
+                        STRIKE_POLICY_LABEL_NONMATCH,
+                    )
+                elif _preferred_primary is not None and abs(_s - _preferred_primary) < 1e-9:
+                    _tier, _label = (STRIKE_POLICY_TIER_ATM, STRIKE_POLICY_LABEL_ATM)
+                elif (
+                    _preferred_adjacent is not None
+                    and abs(_s - _preferred_adjacent) < 1e-9
+                ):
+                    _tier, _label = (
+                        STRIKE_POLICY_TIER_ONE_STEP_OTM,
+                        STRIKE_POLICY_LABEL_ONE_STEP_OTM,
+                    )
+                else:
+                    _tier, _label = (
+                        STRIKE_POLICY_TIER_NONMATCH,
+                        STRIKE_POLICY_LABEL_NONMATCH,
+                    )
+                _ordered_audit.append({
+                    "symbol": _opt.get("symbol"),
+                    "strike": _safe_float(_opt.get("strike")),
+                    "strike_policy_tier": _tier,
+                    "strike_policy_label": _label,
+                })
+            _preferred_strike_audit["reordered"] = True
+            _preferred_strike_audit["ordered_candidates"] = _ordered_audit
+        try:
+            if request_context is not None and isinstance(
+                request_context.diagnostics_sink, dict
+            ):
+                request_context.diagnostics_sink["preferred_strike_ordering"] = dict(
+                    _preferred_strike_audit
+                )
+                _ctx_refresh_diagnostics(request_context)
+        except Exception:
+            pass
         for opt in _quality_chain:
             if _PRO_QUALITY_ENABLED:
                 exp_str = opt.get("expiration_date", "")
