@@ -535,8 +535,20 @@ def build_playbook_candidate_context(
         }
     underlying = float(spec.underlying_price or 0.0)
     target = _safe_float(spec.target_underlying)
-    if underlying > 0:
-        atm = min(strikes, key=lambda strike: (abs(strike - underlying), strike))
+    trigger = _safe_float(spec.trigger_price)
+    # Anchor the primary strike to the scanner trigger price when known, so the
+    # selected contract does not drift with the underlying between qualification
+    # and breach. Fall back to the underlying price only when the trigger is
+    # unavailable. On distance ties, prefer the OTM side for the trade direction
+    # (higher for CALL, lower for PUT).
+    anchor = trigger if (trigger is not None and trigger > 0) else underlying
+    if anchor > 0:
+        if spec.side == "PUT":
+            # Ties: prefer the lower strike (OTM for a PUT).
+            atm = min(strikes, key=lambda strike: (abs(strike - anchor), strike))
+        else:
+            # Ties: prefer the higher strike (OTM for a CALL).
+            atm = min(strikes, key=lambda strike: (abs(strike - anchor), -strike))
     else:
         atm = strikes[0]
     if spec.side == "PUT":
