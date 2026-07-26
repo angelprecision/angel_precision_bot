@@ -66,7 +66,10 @@ def test_production_final_gate_persists_and_passes_fresh_confirmation(monkeypatc
     core.client_id = core.client_email = row["client_id"]
     core.broker = SimpleNamespace(
         cfg=SimpleNamespace(base_url="https://api.tradier.com"),
-        get_quote=lambda _ticker: {"bid": 601.0, "ask": 601.2, "quote_age_ms": 25, "source": "test"},
+        # PR #391: source-identity denylist rejects "test" — use a proven
+        # live source so this trigger-age integration test reaches the seam
+        # under study rather than being short-circuited at market_validity.
+        get_quote=lambda _ticker: {"bid": 601.0, "ask": 601.2, "quote_age_ms": 25, "source": "live_broker"},
     )
     core.store = MagicMock()
     core.contract_selector = MagicMock()

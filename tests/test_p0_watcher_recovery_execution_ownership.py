@@ -261,7 +261,11 @@ def _execution_core(monkeypatch, submit_result: dict):
             "bid": 600.20,
             "ask": 600.22,
             "quote_age_ms": 10,
-            "source": "test",
+            # PR #391: the market-validity gate now rejects unproven sources
+            # (denylist includes "unknown"/"sandbox"/"test"/…). This test
+            # exercises reconciliation downstream of the gate, so use a
+            # proven live source that passes.
+            "source": "live_broker",
         }),
     )
     core.store = MagicMock()
