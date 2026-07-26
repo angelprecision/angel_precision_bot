@@ -25,6 +25,8 @@ import os
 import types
 from datetime import datetime, timezone
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test")
 
 import ap.db as db_mod
@@ -388,6 +390,71 @@ def test_persisted_truth_rejects_infinity_and_nan(monkeypatch):
         assert apm.ensure_calls == [], (
             f"{field}={bad_value!r} must NOT reach _ensure_terminal_close_proof"
         )
+
+
+# ═══ Persisted-truth missing-P&L gate (PR #386 amendment 4) ════════════════
+
+@pytest.mark.parametrize(
+    "missing_value",
+    [None, "", "   "],
+)
+def test_persisted_truth_rejects_missing_realized_pnl_pct(missing_value):
+    row = _terminal_row(realized_pnl_pct=missing_value)
+
+    ok, reason = pm_mod._validate_persisted_terminal_truth(row)
+
+    assert ok is False
+    assert reason == "missing_realized_pnl_pct"
+
+
+def test_persisted_truth_rejects_absent_realized_pnl_pct():
+    row = _terminal_row()
+    row.pop("realized_pnl_pct")
+
+    ok, reason = pm_mod._validate_persisted_terminal_truth(row)
+
+    assert ok is False
+    assert reason == "missing_realized_pnl_pct"
+
+
+@pytest.mark.parametrize("persisted_zero", [0, 0.0, "0"])
+def test_persisted_truth_accepts_explicit_zero_realized_pnl_pct(persisted_zero):
+    row = _terminal_row(realized_pnl_pct=persisted_zero)
+
+    ok, reason = pm_mod._validate_persisted_terminal_truth(row)
+
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_idempotent_terminal_missing_pnl_returns_false_without_proof(monkeypatch):
+    row = _terminal_row(realized_pnl_pct=None)
+    _install_pos_db(monkeypatch, {POSITION_ID: row})
+
+    apm = _APM(CLIENT)
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID,
+        exit_price=99.99,
+        filled_qty=2,
+        broker_order_id="LATE-CALLER",
+    )
+
+    assert ok is False
+    assert apm.ensure_calls == []
+
+
+def test_terminal_recovery_missing_pnl_returns_false_without_proof(monkeypatch):
+    row = _terminal_row(realized_pnl_pct=None)
+    _install_pos_db(monkeypatch, {POSITION_ID: row})
+
+    apm = _APM(CLIENT)
+
+    ok, reason = apm.repair_terminal_proof_from_persisted(POSITION_ID)
+
+    assert ok is False
+    assert reason == "persisted_truth_insufficient:missing_realized_pnl_pct"
+    assert apm.ensure_calls == []
 
 
 # ═══ Serialized proof-binding lock (PR #386 blocker 3) ═════════════════════

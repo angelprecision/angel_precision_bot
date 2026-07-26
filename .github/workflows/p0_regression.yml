@@ -77,6 +77,7 @@ jobs:
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+          MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
           python -m pytest \
             tests/test_osm_retry_idempotency.py \

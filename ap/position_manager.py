@@ -148,11 +148,17 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
     local_order_id = str(row.get("local_order_id") or "").strip()
     if not local_order_id:
         return False, "missing_local_order_id"
+    raw_pnl_pct = row.get("realized_pnl_pct")
+    if raw_pnl_pct is None:
+        return False, "missing_realized_pnl_pct"
+    if isinstance(raw_pnl_pct, str) and not raw_pnl_pct.strip():
+        return False, "missing_realized_pnl_pct"
+
     try:
         qty = int(row.get("qty") or 0)
         avg_fill = float(row.get("avg_fill") or row.get("entry_price") or 0)
         exit_price = float(row.get("exit_price") or 0)
-        pnl_pct = float(row.get("realized_pnl_pct") or 0)
+        pnl_pct = float(raw_pnl_pct)
     except (TypeError, ValueError):
         return False, "unparseable_numeric"
     if qty <= 0:
@@ -2253,7 +2259,7 @@ class APPositionManager:
                         "filled_qty": 0,
                         "remaining": 0,
                         "realized_pnl": float(pos.get("realized_pnl") or 0),
-                        "realized_pnl_pct": float(pos.get("realized_pnl_pct") or 0),
+                        "realized_pnl_pct": pos.get("realized_pnl_pct"),
                         "contract": str(pos.get("contract") or ""),
                         "underlying": str(pos.get("underlying") or pos.get("ticker") or ""),
                         "side": str(pos.get("side") or ""),

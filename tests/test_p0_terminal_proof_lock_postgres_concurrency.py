@@ -26,10 +26,17 @@ from contextlib import contextmanager
 
 import pytest
 
-DATABASE_URL = os.getenv("MANUAL_CLOSE_POSTGRES_TEST_URL", "")
+DATABASE_URL = os.getenv("MANUAL_CLOSE_POSTGRES_TEST_URL", "").strip()
+IN_GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
+
+if IN_GITHUB_ACTIONS and not DATABASE_URL:
+    raise RuntimeError(
+        "MANUAL_CLOSE_POSTGRES_TEST_URL must be configured in GitHub Actions"
+    )
+
 pytestmark = pytest.mark.skipif(
     not DATABASE_URL,
-    reason="MANUAL_CLOSE_POSTGRES_TEST_URL not configured",
+    reason="MANUAL_CLOSE_POSTGRES_TEST_URL not configured outside CI",
 )
 
 try:
@@ -46,29 +53,37 @@ CONTRACT = "F260731C00014000"
 
 @contextmanager
 def _raw_conn():
-    """Fresh independent psycopg2 connection wrapped so ap.db.conn's
-    contract (context manager yielding a cursor with dict rows and
-    __enter__/__exit__/execute/fetchone/fetchall) is honored."""
+    """Yield a fresh independent PostgreSQL cursor wrapper.
+
+    Commit on success, roll back on failure, and always close the cursor
+    and connection. Each invocation uses a distinct PostgreSQL session so
+    concurrent workers genuinely contend on pg_advisory_xact_lock.
+    """
     connection = psycopg2.connect(DATABASE_URL)
-    cursor = connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cursor = connection.cursor(
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
 
     class _Wrap:
-        def __enter__(self): return self
-        def __exit__(self, *a):
-            if a[0] is None:
-                connection.commit()
-            else:
-                connection.rollback()
-            cursor.close()
-            connection.close()
-            return False
         def execute(self, sql, params=None):
             cursor.execute(sql, params if params is not None else ())
             return self
-        def fetchone(self): return cursor.fetchone()
-        def fetchall(self): return cursor.fetchall()
 
-    yield _Wrap()
+        def fetchone(self):
+            return cursor.fetchone()
+
+        def fetchall(self):
+            return cursor.fetchall()
+
+    try:
+        yield _Wrap()
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        cursor.close()
+        connection.close()
 
 
 @pytest.fixture(autouse=True)
