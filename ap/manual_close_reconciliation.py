@@ -65,7 +65,7 @@ FILLED_ORDER_STATUSES = frozenset(
     {"filled", "partially_filled", "partial_fill", "partially-filled"}
 )
 DURABLE_EXIT_FILLED_STATUSES = frozenset({"EXIT_FILLED", "EXIT_PARTIAL_FILL"})
-ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING")
+ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 EXTERNAL_LOCAL_ID_PREFIX = "external-exit:"
 OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
@@ -413,7 +413,7 @@ def select_external_close_fills(
     orders: list[dict],
     position: dict,
     bot_exit_order_ids: set[str],
-    adopted_external_order_ids: set[str] | None = None,
+    adopted_fills: list[dict] | None = None,
     detected_at: datetime,
 ) -> tuple[dict | None, str]:
     """Pick the exact broker fill(s) that closed a missing position.
@@ -422,9 +422,11 @@ def select_external_close_fills(
 
       * bot_exit_order_ids  → legitimate bot EXIT ownership. If ANY match,
         the whole evidence set is rejected — the bot's own path owns this.
-      * adopted_external_order_ids → our own previously-adopted external
-        EXIT rows for THIS position. Count toward aggregate coverage;
-        never re-adopt.
+      * adopted_fills → pre-loaded from DB: our own previously-adopted
+        external EXIT rows for THIS position with full fill evidence. Used
+        directly as adopted_hits without re-scanning broker orders, which
+        enables cross-session recovery when broker no longer returns
+        previous-session orders. Never re-adopted.
       * everything else → candidate external fills to adopt now.
 
     Aggregate quantity constraint remains exact: adopted-so-far plus new
@@ -447,12 +449,17 @@ def select_external_close_fills(
         return None, "position_quantity_missing"
 
     bot_ids = {str(v or "").strip() for v in bot_exit_order_ids if v}
-    adopted_ids = {
-        str(v or "").strip() for v in (adopted_external_order_ids or set()) if v
+    # adopted_fills: pre-loaded from DB with full evidence. Use directly as
+    # adopted_hits — no broker re-scan needed. Cross-session recovery works
+    # even when broker_orders=[] (previous-session orders no longer returned).
+    pre_adopted: list[dict] = list(adopted_fills or [])
+    adopted_ids: set[str] = {
+        str(f.get("broker_order_id") or "").strip()
+        for f in pre_adopted
+        if f.get("broker_order_id")
     }
 
     bot_hit = False
-    adopted_hits: list[dict] = []
     external_fills: list[dict] = []
 
     for order in orders:
@@ -476,9 +483,12 @@ def select_external_close_fills(
             bot_hit = True
             break
         if broker_order_id in adopted_ids:
-            adopted_hits.append(normalized)
-        else:
-            external_fills.append(normalized)
+            # Already durably adopted; do not re-adopt.
+            continue
+        external_fills.append(normalized)
+
+    # Use DB-loaded adopted fills directly — do NOT re-scan broker orders for them.
+    adopted_hits: list[dict] = pre_adopted
 
     if bot_hit:
         return None, "bot_owned_exit_order_present"
@@ -492,6 +502,7 @@ def select_external_close_fills(
                 best[r["broker_order_id"]] = r
         return sorted(best.values(), key=lambda r: r["filled_at"])
 
+    # Dedupe: adopted_hits come from DB rows; external_fills from broker orders.
     adopted_hits = _dedupe(adopted_hits)
     external_fills = _dedupe(external_fills)
 
@@ -528,20 +539,26 @@ def select_external_close_fills(
 
 def load_manual_close_state(
     client_id: str,
-) -> tuple[list[dict], set[str], dict[str, set[str]]]:
-    """Return (active_positions, bot_exit_ids, adopted_external_ids_by_position).
+    execution_mode: str,
+) -> tuple[list[dict], set[str], dict[str, list[dict]]]:
+    """Return (active_positions, bot_exit_ids, adopted_fills_by_position).
 
-    * active_positions covers OPEN and CLOSING (canonical active family),
-      not just OPEN — a CLOSING position with retained external evidence
-      must remain scannable so the finalizer can be re-invoked.
-    * bot_exit_ids is the client's EXIT rows whose local_order_id does
-      NOT start with the external-adoption prefix. Only bot-submitted
-      IDs fence the manual-close path.
-    * adopted_external_ids_by_position maps position_id → set of
-      broker_order_ids we previously adopted for THAT position. Lets the
-      scanner resume/finalize without stranding.
+    * active_positions covers the canonical active family (OPEN, CLOSING,
+      PARTIAL, ACTIVE) plus any row with quantity_remaining > 0, scoped to
+      the exact execution_mode of this runner. A PARTIAL or ACTIVE position
+      with retained external evidence must remain scannable.
+    * bot_exit_ids is the client's EXIT rows whose local_order_id does NOT
+      start with the external-adoption prefix, filtered to the exact
+      execution_mode so PAPER IDs never pollute the LIVE fence and vice versa.
+    * adopted_fills_by_position maps position_id → list of full fill dicts
+      (broker_order_id, filled_qty, fill_price, filled_at, created_at,
+      raw_status, raw_side) for previously-adopted external EXIT rows. Loads
+      the complete fill evidence from durable orders rows so that next-session
+      finalization can reconstruct the weighted aggregate without depending on
+      the broker returning previous-session orders.
     """
     from ap.db import conn, run_with_retry
+    norm_mode = str(execution_mode or "").strip().lower()
 
     def _read():
         with conn() as cursor:
@@ -567,9 +584,13 @@ def load_manual_close_state(
                     pending_exit_local_order_id
                 FROM positions
                 WHERE client_id=%s
-                  AND status = ANY(%s)
+                  AND LOWER(COALESCE(execution_mode,'')) = %s
+                  AND (
+                      UPPER(COALESCE(status,'')) = ANY(%s)
+                      OR COALESCE(quantity_remaining, 0) > 0
+                  )
                 """,
-                (client_id, list(ACTIVE_POSITION_STATUSES)),
+                (client_id, norm_mode, list(ACTIVE_POSITION_STATUSES)),
             )
             positions = [dict(row) for row in (cursor.fetchall() or [])]
 
@@ -578,16 +599,24 @@ def load_manual_close_state(
                 SELECT
                     broker_order_id,
                     local_order_id,
-                    position_id
+                    position_id,
+                    filled_qty,
+                    fill_price,
+                    filled_ts,
+                    execution_mode,
+                    status,
+                    contract,
+                    direction
                 FROM orders
                 WHERE client_id=%s
+                  AND LOWER(COALESCE(execution_mode,'')) = %s
                   AND UPPER(COALESCE(kind,''))='EXIT'
                   AND COALESCE(broker_order_id,'') <> ''
                 """,
-                (client_id,),
+                (client_id, norm_mode),
             )
             bot_ids: set[str] = set()
-            adopted_by_pos: dict[str, set[str]] = {}
+            adopted_fills_by_pos: dict[str, list[dict]] = {}
             for row in (cursor.fetchall() or []):
                 broker_order_id = str(row.get("broker_order_id") or "").strip()
                 if not broker_order_id:
@@ -595,11 +624,25 @@ def load_manual_close_state(
                 local_order_id = str(row.get("local_order_id") or "").strip()
                 position_id = str(row.get("position_id") or "").strip()
                 if local_order_id.startswith(EXTERNAL_LOCAL_ID_PREFIX):
-                    if position_id:
-                        adopted_by_pos.setdefault(position_id, set()).add(broker_order_id)
+                    if not position_id:
+                        continue
+                    filled_qty = positive_int(row.get("filled_qty"))
+                    fill_price = positive_float(row.get("fill_price"))
+                    filled_at = parse_timestamp(row.get("filled_ts"))
+                    if filled_qty > 0 and fill_price > 0 and filled_at is not None:
+                        fill_dict: dict = {
+                            "broker_order_id": broker_order_id,
+                            "filled_qty": filled_qty,
+                            "fill_price": fill_price,
+                            "filled_at": filled_at,
+                            "created_at": None,
+                            "raw_status": str(row.get("status") or "EXIT_FILLED"),
+                            "raw_side": "sell_to_close",
+                        }
+                        adopted_fills_by_pos.setdefault(position_id, []).append(fill_dict)
                 else:
                     bot_ids.add(broker_order_id)
-            return positions, bot_ids, adopted_by_pos
+            return positions, bot_ids, adopted_fills_by_pos
 
     return run_with_retry(_read)
 
@@ -835,6 +878,52 @@ def adopt_external_exit_fills(
         return False, f"external_exit_adoption_error:{exc}"
 
 
+
+def _position_is_still_active(*, position_id: str, client_id: str) -> bool:
+    """Re-read position from DB; return True iff still in the active family.
+
+    Called immediately before finalizing to guard against duplicate P&L
+    writes when two health-loop iterations overlap. The position-scoped
+    advisory lock in adoption is released before finalization, so this
+    guard serializes the finalization decision at the DB level.
+
+    Returns False (treat as inactive/handled) on DB error, which is the
+    safe direction — a failed guard read prevents a potentially redundant
+    finalization rather than allowing a double-write.
+    """
+    from ap.db import conn, run_with_retry
+    active_set = frozenset(s.upper() for s in ACTIVE_POSITION_STATUSES)
+
+    def _check():
+        with conn() as cursor:
+            cursor.execute(
+                """
+                SELECT status, COALESCE(quantity_remaining, 0) AS qty_rem
+                FROM positions
+                WHERE id=%s AND client_id=%s
+                """,
+                (position_id, client_id),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            status = str(row.get("status") or "").upper().strip()
+            qty_rem = float(row.get("qty_rem") or 0)
+            return status in active_set or qty_rem > 0
+
+    try:
+        return run_with_retry(_check)
+    except Exception as exc:
+        log.error(
+            "[%s] MANUAL_CLOSE_ACTIVE_CHECK_FAILED pos=%s err=%s "
+            "— treating as inactive for safety",
+            client_id,
+            position_id,
+            exc,
+        )
+        return False
+
+
 def _finalize_position(
     *,
     finalizer,
@@ -843,6 +932,19 @@ def _finalize_position(
     contract: str,
     evidence: dict,
 ) -> bool:
+    # Idempotency guard: re-read position before finalizing to prevent a
+    # second health-loop iteration from writing duplicate P&L if it overlaps
+    # with an already-completed finalization from the first iteration.
+    if not _position_is_still_active(position_id=position_id, client_id=client_id):
+        log.info(
+            "[%s] MANUAL_CLOSE_FINALIZE_IDEMPOTENT pos=%s contract=%s "
+            "position already terminal — no-op",
+            client_id,
+            position_id,
+            contract,
+        )
+        return True  # Treat as success; caller proceeds to exit-engine eviction.
+
     broker_ids = ",".join(evidence["broker_order_ids"])
     exit_reason = (
         "MANUAL_CLIENT_CLOSE_BROKER_CONFIRMED "
@@ -939,7 +1041,9 @@ def detect_manual_closes(self) -> None:
             )
 
     try:
-        active_positions, bot_exit_ids, adopted_by_pos = load_manual_close_state(client_id)
+        active_positions, bot_exit_ids, adopted_fills_by_pos = load_manual_close_state(
+            client_id, runner_mode
+        )
     except Exception as exc:
         log.error(
             "[%s] MANUAL_CLOSE_SCAN_DB_READ_FAILED mode=%s err=%s",
@@ -1011,12 +1115,12 @@ def detect_manual_closes(self) -> None:
             )
             continue
 
-        adopted_ids_for_pos = adopted_by_pos.get(position_id, set())
+        adopted_fills_for_pos = adopted_fills_by_pos.get(position_id, [])
         evidence, reason_code = select_external_close_fills(
             orders=broker_orders,
             position=position,
             bot_exit_order_ids=bot_exit_ids,
-            adopted_external_order_ids=adopted_ids_for_pos,
+            adopted_fills=adopted_fills_for_pos,
             detected_at=detected_at,
         )
         if evidence is None:
