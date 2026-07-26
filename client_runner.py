@@ -2634,9 +2634,26 @@ class ClientRunner(threading.Thread):
         truth reconciler that never converts broker-list errors into an
         empty account, adopts exact external Tradier EXIT fills
         atomically per-position, and finalizes via canonical proof.
+
+        Wrapped in a supervisor boundary (Blocker 5 / PR #386 amendment)
+        so an unexpected import error, malformed environment variable, or
+        unhandled exception inside the helper cannot terminate the health-
+        loop iteration that also drives entry permission, split-brain
+        recovery, overnight reevaluation, exit recovery, and deferred
+        lifecycle recovery. Failures are logged at ERROR with full
+        traceback so operators are alerted without killing the thread.
         """
-        from ap.manual_close_reconciliation import detect_manual_closes
-        return detect_manual_closes(self)
+        try:
+            from ap.manual_close_reconciliation import detect_manual_closes
+            return detect_manual_closes(self)
+        except Exception as exc:
+            logger.error(
+                "[%s] manual-close reconciliation failed safely: %s",
+                self.email,
+                exc,
+                exc_info=True,
+            )
+            return None
 
     def _start_runtime_health_loop(self):
         interval = float(os.getenv("RUNNER_HEALTH_CHECK_SEC", "20"))
