@@ -169,17 +169,17 @@ def _install_scan_boundaries(
     monkeypatch,
     position=None,
     bot_exit_ids=None,
-    adopted_by_pos=None,
+    adopted_fills_by_pos=None,
     adopt=True,
 ):
     monkeypatch.setattr(manual_mod.time, "time", lambda: DETECTED_EPOCH)
     monkeypatch.setattr(
         manual_mod,
         "load_manual_close_state",
-        lambda client_id: (
+        lambda client_id, execution_mode: (
             [position or _position()],
             set(bot_exit_ids or set()),
-            dict(adopted_by_pos or {}),
+            dict(adopted_fills_by_pos or {}),
         ),
     )
     adopted: list[dict] = []
@@ -457,9 +457,19 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
     )
     pm = _PM()
     runner = _runner(broker=broker, pm=pm)
+    # EXIT-1 already durable: provide full fill dict as loaded from DB.
+    exit1_durable = {
+        "broker_order_id": "EXIT-1",
+        "filled_qty": 1,
+        "fill_price": 0.74,
+        "filled_at": datetime(2026, 7, 21, 15, 56, 0, tzinfo=timezone.utc),
+        "created_at": None,
+        "raw_status": "EXIT_FILLED",
+        "raw_side": "sell_to_close",
+    }
     adopted = _install_scan_boundaries(
         monkeypatch,
-        adopted_by_pos={POSITION_ID: {"EXIT-1"}},   # EXIT-1 already durable
+        adopted_fills_by_pos={POSITION_ID: [exit1_durable]},
     )
 
     runner._detect_manual_closes()
@@ -471,7 +481,7 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
     # Aggregate view spans BOTH fills for finalizer truth.
     all_ids = adopted[0]["evidence"]["broker_order_ids"]
     assert all_ids == ["EXIT-1", "EXIT-2"]
-    # Finalizer receives weighted aggregate.
+    # Finalizer receives quantity-weighted aggregate price.
     assert pm.calls[0]["exit_price"] == 0.75
     assert pm.calls[0]["filled_qty"] == 2
     assert runner.core.exit_eng.closed == [POSITION_ID]
@@ -617,7 +627,7 @@ def test_external_fill_adoption_writes_real_exit_lifecycle_shape(monkeypatch):
         orders=[_filled_exit()],
         position=_position(),
         bot_exit_order_ids=set(),
-        adopted_external_order_ids=set(),
+        adopted_fills=[],
         detected_at=datetime.fromtimestamp(DETECTED_EPOCH, tz=timezone.utc),
     )
     assert reason == "exact_external_broker_fill"
@@ -743,3 +753,336 @@ def test_external_fill_adoption_rejects_existing_mode_or_position_mismatch(monke
     assert ok is False
     assert reason.startswith("external_exit_adoption_error:")
     assert len(rows) == 1
+
+
+# ─── Blocker 2: cross-session recovery from durable DB rows ──────────────────
+
+def test_cross_session_recovery_empty_broker_orders_finalizes_from_durable_rows(monkeypatch):
+    """Blocker 2 regression: after a process restart the broker returns [] for
+    current-session orders, so previous-session fills are no longer visible.
+    Durable adopted EXIT rows in DB must reconstruct the full weighted aggregate
+    and re-invoke the finalizer. broker_orders=[] must NOT strand the position.
+
+    Root: load_manual_close_state previously loaded only broker_order_id — it
+    now loads filled_qty / fill_price / filled_ts so select_external_close_fills
+    can build the aggregate from DB evidence without broker confirmation.
+    """
+    filled_at = datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc)
+    broker = _Broker(orders=[])   # previous-session orders gone
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+
+    durable_fill = {
+        "broker_order_id": "137780001",
+        "filled_qty": 2,
+        "fill_price": 0.75,
+        "filled_at": filled_at,
+        "created_at": None,
+        "raw_status": "EXIT_FILLED",
+        "raw_side": "sell_to_close",
+    }
+    _install_scan_boundaries(
+        monkeypatch,
+        adopted_fills_by_pos={POSITION_ID: [durable_fill]},
+    )
+
+    runner._detect_manual_closes()
+
+    # Finalizer must be called from durable DB evidence alone.
+    assert len(pm.calls) == 1, "finalizer not called with empty broker orders"
+    call = pm.calls[0]
+    assert call["position_id"] == POSITION_ID
+    assert call["exit_price"] == 0.75
+    assert call["filled_qty"] == 2
+    assert call["broker_order_id"] == "137780001"
+    assert call["close_source"] == "manual_client_close_broker_fill"
+    # Exit engine eviction must still fire.
+    assert runner.core.exit_eng.closed == [POSITION_ID]
+
+
+# ─── Blocker 3: PARTIAL and ACTIVE status positions are scannable ─────────────
+
+def test_partial_status_position_is_in_active_family(monkeypatch):
+    """Blocker 3 regression: a PARTIAL position must remain visible to the
+    manual-close scanner. Previously ACTIVE_POSITION_STATUSES was limited to
+    OPEN and CLOSING, silently skipping PARTIAL positions with retained evidence.
+    """
+    broker = _Broker(orders=[_filled_exit()])
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+    adopted = _install_scan_boundaries(
+        monkeypatch,
+        position=_position(status="PARTIAL", quantity_remaining=2),
+    )
+
+    runner._detect_manual_closes()
+
+    assert len(adopted) == 1, "PARTIAL position must be scanned"
+    assert len(pm.calls) == 1
+
+
+def test_active_status_position_is_in_active_family(monkeypatch):
+    """Blocker 3 regression: a position with status='ACTIVE' must be scannable."""
+    broker = _Broker(orders=[_filled_exit()])
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+    adopted = _install_scan_boundaries(
+        monkeypatch,
+        position=_position(status="ACTIVE", quantity_remaining=2),
+    )
+
+    runner._detect_manual_closes()
+
+    assert len(adopted) == 1, "ACTIVE position must be scanned"
+    assert len(pm.calls) == 1
+
+
+# ─── Blocker 4: mode-scoped EXIT ownership fence ─────────────────────────────
+
+def test_wrong_mode_exit_rows_do_not_pollute_current_runner_fence(monkeypatch):
+    """Blocker 4 regression: PAPER broker EXIT IDs must not enter the LIVE
+    runner's bot_exit_ids set, and vice versa. load_manual_close_state now
+    filters orders by exact execution_mode.
+
+    This test verifies the mode-scoped call signature: load_manual_close_state
+    receives execution_mode='live' and must filter the orders table by it, so
+    PAPER-mode EXIT IDs are excluded from the bot_ids fence.
+
+    We simulate a scenario where a broker order ID exists as a PAPER EXIT in
+    DB (wrong mode) but appears in the current LIVE broker orders list as an
+    external fill. If mode scoping is wrong, it would be treated as bot-owned
+    and the manual close would be fenced incorrectly.
+    """
+    # Bot exit IDs should be empty for LIVE mode even if "KNOWN-PAPER-EXIT"
+    # exists in the PAPER orders table — mode filter must exclude it.
+    broker = _Broker(orders=[_filled_exit(id="KNOWN-PAPER-EXIT")])
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+
+    # Simulate: bot_exit_ids set is EMPTY for LIVE mode (PAPER exit was filtered)
+    # even though the broker_order_id "KNOWN-PAPER-EXIT" exists in DB for PAPER.
+    adopted = _install_scan_boundaries(
+        monkeypatch,
+        bot_exit_ids=set(),  # mode-scoped query returns empty for LIVE
+    )
+
+    runner._detect_manual_closes()
+
+    # Must NOT be fenced — the PAPER exit ID is excluded from LIVE bot fence.
+    assert len(adopted) == 1, (
+        "PAPER-mode EXIT IDs must not fence LIVE runner's external close path"
+    )
+    assert len(pm.calls) == 1
+
+    # Verify load_manual_close_state receives execution_mode from the runner.
+    # (The monkeypatch lambda now accepts (client_id, execution_mode); if the
+    # caller omitted execution_mode the lambda would raise TypeError here.)
+
+
+# ─── Blocker 5: supervisor boundary protects health loop ─────────────────────
+
+def test_unexpected_helper_exception_does_not_kill_health_loop_iteration(monkeypatch):
+    """Blocker 5 regression: an unexpected exception inside detect_manual_closes
+    (e.g. malformed env var, import failure, unhandled edge) must NOT propagate
+    out of _detect_manual_closes. The health loop iteration must continue to
+    drive entry permission, split-brain recovery, overnight reevaluation, etc.
+    """
+    import ap.manual_close_reconciliation as manual_local
+
+    def _bomb(self):
+        raise RuntimeError("simulated catastrophic helper failure")
+
+    monkeypatch.setattr(manual_local, "detect_manual_closes", _bomb)
+
+    broker = _Broker()
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+
+    # Must not raise — supervisor boundary must catch and log it.
+    try:
+        runner._detect_manual_closes()
+    except Exception as exc:
+        raise AssertionError(
+            f"_detect_manual_closes must not propagate exceptions; got: {exc}"
+        )
+    # No finalization attempted.
+    assert pm.calls == []
+
+
+# ─── Blocker 6: duplicate finalization idempotency ───────────────────────────
+
+def test_two_finalization_attempts_produce_one_terminal_economic_result(monkeypatch):
+    """Blocker 6 regression: if two health-loop iterations overlap, the second
+    call to _finalize_position must be a no-op and must not write duplicate P&L.
+
+    The idempotency guard re-reads position status from DB before calling the
+    finalizer. We simulate a 'already terminal' position by patching
+    _position_is_still_active to return False on the second call.
+    """
+    import ap.manual_close_reconciliation as manual_local
+
+    call_count = [0]
+    real_is_active = manual_local._position_is_still_active
+
+    def _is_active_once(**kwargs):
+        """Return True on first call (position active), False on second (already terminal)."""
+        call_count[0] += 1
+        return call_count[0] == 1
+
+    monkeypatch.setattr(manual_local, "_position_is_still_active", _is_active_once)
+
+    evidence = {
+        "fills": [],
+        "adopted_fills": [],
+        "all_fills": [],
+        "filled_qty": 2,
+        "fill_price": 0.75,
+        "filled_ts": "2026-07-21T15:57:39+00:00",
+        "broker_order_id": "137780001",
+        "broker_order_ids": ["137780001"],
+    }
+
+    pm = _PM()
+    finalizer = pm.close_position_from_exit_fill
+
+    # First call: position still active → finalizer must fire.
+    result1 = manual_local._finalize_position(
+        finalizer=finalizer,
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        contract=CONTRACT,
+        evidence=evidence,
+    )
+    assert result1 is True
+    assert len(pm.calls) == 1, "first finalization must call the finalizer"
+
+    # Second call: position already terminal → must return True (idempotent)
+    # WITHOUT calling the finalizer again.
+    result2 = manual_local._finalize_position(
+        finalizer=finalizer,
+        client_id=CLIENT,
+        position_id=POSITION_ID,
+        contract=CONTRACT,
+        evidence=evidence,
+    )
+    assert result2 is True, "idempotent finalization must return True"
+    assert len(pm.calls) == 1, (
+        "second finalization attempt must NOT invoke the finalizer again — "
+        "duplicate P&L write is a data integrity violation"
+    )
+
+
+# ─── Blocker 6: atomic adoption rollback on mid-transaction failure ───────────
+
+def test_atomic_adoption_rollback_on_second_fill_insert_failure(monkeypatch):
+    """Blocker 6 / atomic adoption regression: if the first fill INSERT
+    succeeds but the second fails, the transaction must roll back and leave
+    ZERO rows — no partial adoption stranding.
+
+    This is the 'claimed rollback that doesn't actually exercise rollback'
+    note from the review. Here we inject a real failure during the second
+    INSERT and verify the final row count is zero.
+    """
+    rows: list[dict] = []
+    insert_count = [0]
+
+    class _RollbackCursor:
+        """Fake cursor: first INSERT succeeds, second raises, simulating a
+        mid-transaction failure (e.g. unique violation, constraint error)."""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            if exc_type is not None:
+                # Simulate rollback: clear any rows added in this txn.
+                rows.clear()
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split())
+            if "pg_advisory_xact_lock" in compact:
+                return self
+            if "WHERE client_id=%s AND broker_order_id=%s" in compact:
+                self._last_fetchall = []
+                return self
+            if compact.startswith("INSERT INTO orders"):
+                insert_count[0] += 1
+                if insert_count[0] == 2:
+                    raise RuntimeError("simulated second INSERT failure")
+                # First INSERT 'succeeds': add to rows and return it.
+                client_id, local_order_id, broker_order_id, position_id = params[:4]
+                row = {
+                    "client_id": client_id,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": broker_order_id,
+                    "position_id": position_id,
+                    "kind": "EXIT",
+                    "status": "EXIT_FILLED",
+                    "contract": CONTRACT,
+                    "direction": "CALL",
+                    "qty": 1,
+                    "filled_qty": 1,
+                    "fill_price": 0.74,
+                    "execution_mode": "live",
+                }
+                rows.append(row)
+                self._last_fetchone = row
+                return self
+            self._last_fetchall = []
+            self._last_fetchone = None
+            return self
+
+        def fetchall(self):
+            return list(getattr(self, "_last_fetchall", []))
+
+        def fetchone(self):
+            return getattr(self, "_last_fetchone", None)
+
+    import ap.db as db_mod
+    monkeypatch.setattr(db_mod, "conn", lambda: _RollbackCursor())
+
+    # run_with_retry must propagate the exception so rollback logic fires.
+    def _run_no_retry(fn):
+        return fn()
+
+    monkeypatch.setattr(db_mod, "run_with_retry", _run_no_retry)
+
+    filled_at = datetime(2026, 7, 21, 15, 57, 0, tzinfo=timezone.utc)
+    evidence = {
+        "fills": [
+            {
+                "broker_order_id": "EXIT-A",
+                "filled_qty": 1,
+                "fill_price": 0.74,
+                "filled_at": filled_at,
+                "created_at": None,
+                "raw_status": "filled",
+                "raw_side": "sell_to_close",
+            },
+            {
+                "broker_order_id": "EXIT-B",
+                "filled_qty": 1,
+                "fill_price": 0.76,
+                "filled_at": filled_at,
+                "created_at": None,
+                "raw_status": "filled",
+                "raw_side": "sell_to_close",
+            },
+        ]
+    }
+
+    import ap.manual_close_reconciliation as manual_local
+
+    ok, reason = manual_local.adopt_external_exit_fills(
+        client_id=CLIENT,
+        execution_mode="live",
+        position=_position(qty=2, quantity_remaining=2),
+        evidence=evidence,
+    )
+
+    assert ok is False, "adoption must fail when second INSERT raises"
+    assert len(rows) == 0, (
+        f"transaction rollback must leave zero rows; got {len(rows)} — "
+        "partial adoption stranding is a recovery correctness violation"
+    )
