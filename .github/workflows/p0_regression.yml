@@ -168,6 +168,7 @@ jobs:
             tests/test_p0_manual_close_idempotency_and_validation.py \
             tests/test_p0_manual_close_terminal_recovery.py \
             tests/test_p0_terminal_proof_lock_postgres_concurrency.py \
+            tests/test_p0_entry_retry_continuity.py \
             -v --tb=short --color=yes
 
       - name: Summary

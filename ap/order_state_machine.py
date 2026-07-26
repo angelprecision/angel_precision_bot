@@ -6333,6 +6333,424 @@ class APOrderStateMachine:
             )
             return False
 
+    # -------------------------------------------------------------------------
+    # PR #392 amendment — audit blockers 4, 5, 6.
+    # -------------------------------------------------------------------------
+    #
+    # 4  update_entry_retry_state — CAS on lifecycle_id + owner + generation
+    #    WITHOUT incrementing retry_generation. Used for HOLD/rollback stamps
+    #    after the initial claim, so a broker POST failure cannot burn the
+    #    single remaining replacement generation.
+    #
+    # 5  stamp_entry_continuation_reversal — durable post-cancel reversal.
+    #    The #391 helper `rearm_entry_for_direction_reversal` requires the row
+    #    to be CREATED/PENDING_TRIGGER with no broker_order_id and no
+    #    submitted_ts. A post-cancel row cannot satisfy that. This helper
+    #    stamps a lifecycle-level reversal state on the same orders row
+    #    without pretending the row is fresh.
+    #
+    # 6  submit_entry_continuation_replacement — fenced broker POST that
+    #    submits a replacement for a lifecycle whose original broker order
+    #    is confirmed terminal. Bypasses `submit_existing_entry`'s guards
+    #    (which correctly reject CANCELED + prior-submit evidence) by
+    #    routing directly through the broker adapter, and rotates the
+    #    row's broker_order_id / current_broker_order_id / qty inside the
+    #    same CAS. Refuses if the CAS loses.
+    # -------------------------------------------------------------------------
+
+    def update_entry_retry_state(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        current_generation: int,
+        retry_state: str,
+        retry_not_before: Optional[str] = None,
+        extra_meta: Optional[dict] = None,
+    ) -> bool:
+        """CAS-update retry_state on an owned lifecycle WITHOUT bumping generation.
+
+        Only the initial `claim_entry_retry_generation` may increment the
+        generation. Any subsequent HOLD / rollback / metadata stamp on the
+        same generation must use this method — otherwise a broker POST
+        failure "rollback" would silently consume the single allowed
+        replacement.
+        """
+        import json as _json_local
+        owner = str(owner or "").strip()
+        retry_state = str(retry_state or "").strip().upper()
+        try:
+            current_generation = int(current_generation)
+        except (TypeError, ValueError):
+            return False
+        if current_generation < 0 or not owner or not retry_state:
+            return False
+
+        _patch: dict = {
+            "retry_state":         retry_state,
+            "retry_updated_at":    now_utc_iso(),
+        }
+        if retry_not_before:
+            _patch["retry_not_before"] = str(retry_not_before)
+        if isinstance(extra_meta, dict):
+            for _k, _v in extra_meta.items():
+                if _k in (
+                    "entry_lifecycle_id",
+                    "original_local_order_id",
+                    "original_broker_order_id",
+                    "first_broker_ack_at",
+                    "original_approved_quantity",
+                    "original_signal_valid_until",
+                    "retry_deadline",
+                    "static_approval_proof",
+                    "retry_generation",
+                ):
+                    continue
+                try:
+                    _json_local.dumps(_v)
+                    _patch[str(_k)] = _v
+                except (TypeError, ValueError):
+                    continue
+        patch_json = _json_local.dumps(_patch)
+
+        def _upd():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') <> ''
+                      AND COALESCE(meta->>'retry_owner','') = %s
+                      AND COALESCE((meta->>'retry_generation')::int, 0) = %s
+                    """,
+                    (patch_json, local_order_id, self.client_id,
+                     owner, current_generation),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_upd) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] update_entry_retry_state failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def stamp_entry_continuation_reversal(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        current_generation: int,
+        reason_code: str,
+        gate_audit: Optional[dict] = None,
+    ) -> bool:
+        """Durable reversal stamp for a post-cancel entry continuation.
+
+        The #391 rearm helper only rearms rows that have never been submitted
+        (CREATED/PENDING_TRIGGER + empty broker_order_id + null submitted_ts).
+        A post-cancel row fails that contract by construction. This helper
+        stamps the reversal on the lifecycle envelope without lying about
+        the order's history and without producing any replacement POST.
+        """
+        import json as _json_local
+        _rc = str(reason_code or "").strip() or "REARM_DIRECTION_REVERSAL"
+        _audit = dict(gate_audit or {})
+        _now = now_utc_iso()
+        _patch = {
+            "retry_state":                    "REARM_DIRECTION_REVERSAL",
+            "retry_terminal_reason":          "REARM_DIRECTION_REVERSAL",
+            "retry_updated_at":               _now,
+            "final_market_truth_status":      "REARM_DIRECTION_REVERSAL",
+            "final_market_truth_reason_code": _rc,
+            "final_market_truth_checked_at":  _now,
+            "final_market_truth_gate_audit":  _audit,
+            "watcher_rearm_required":         True,
+            "continuation_replacement_suppressed": True,
+        }
+        try:
+            patch_json = _json_local.dumps(_patch, default=str)
+        except Exception as exc:
+            log.warning(
+                "[%s] stamp_entry_continuation_reversal serialize failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+        def _upd():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') <> ''
+                      AND COALESCE(meta->>'retry_owner','') = %s
+                      AND COALESCE((meta->>'retry_generation')::int, 0) = %s
+                    """,
+                    (patch_json, local_order_id, self.client_id,
+                     str(owner).strip(), int(current_generation)),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_upd) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] stamp_entry_continuation_reversal failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def submit_entry_continuation_replacement(
+        self,
+        *,
+        local_order_id: str,
+        broker,
+        lifecycle_id: str,
+        owner: str,
+        current_generation: int,
+        replacement_quantity: int,
+        limit_price: float,
+        original_broker_order_id: str,
+        confirmed_terminal_original_status: str,
+    ) -> dict:
+        """Fenced continuation-specific broker POST.
+
+        This is the ONE place a replacement ENTRY order may be posted to the
+        broker after the original was confirmed terminal (canceled/expired/
+        rejected). It exists as a separate seam from
+        `submit_existing_entry()` because that method — correctly —
+        rejects rows in CANCELED/EXPIRED/REJECTED status and rows with
+        prior broker ownership evidence.
+
+        Guarantees:
+          - The lifecycle owner + generation on the row must match
+            (`owner`, `current_generation`) exactly.
+          - The row's stored `original_broker_order_id` must match the
+            caller-supplied one.
+          - `confirmed_terminal_original_status` must be terminal
+            (CANCELED / CANCELLED / EXPIRED / REJECTED).
+          - `replacement_quantity` must be in [1, original_approved_quantity].
+          - `limit_price` must be a positive float.
+          - The row's `qty` and `current_broker_order_id` are rotated
+            atomically with the durable state transition after the broker
+            acks. If the broker POST fails, the row is unchanged and the
+            caller is responsible for updating retry state via
+            `update_entry_retry_state` (non-incrementing) so the single
+            allowed replacement generation is preserved.
+
+        Returns dict: {ok, local_order_id, broker_order_id, status,
+                        error, replacement_quantity, limit_price}
+        """
+        import json as _json_local
+
+        _now = now_utc_iso()
+        _cts = str(confirmed_terminal_original_status or "").upper()
+        _terminal_ok = any(
+            _tok in _cts for _tok in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED")
+        )
+        if not _terminal_ok:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_ORIGINAL_NOT_TERMINAL"}
+        try:
+            replacement_quantity = int(replacement_quantity)
+            limit_price = float(limit_price)
+        except (TypeError, ValueError):
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_INVALID_QTY_OR_LIMIT"}
+        if replacement_quantity < 1 or limit_price <= 0:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_INVALID_QTY_OR_LIMIT"}
+        owner = str(owner or "").strip()
+        lifecycle_id = str(lifecycle_id or "").strip()
+        if not owner or not lifecycle_id:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_MISSING_OWNER_OR_LIFECYCLE"}
+
+        current = self._get_order(local_order_id)
+        if not current:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_ORDER_NOT_FOUND"}
+        current = dict(current)
+        _meta = current.get("meta") or {}
+        if isinstance(_meta, str):
+            try:
+                _meta = json.loads(_meta)
+            except Exception:
+                _meta = {}
+        if not isinstance(_meta, dict):
+            _meta = {}
+        if str(_meta.get("entry_lifecycle_id") or "") != lifecycle_id:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_LIFECYCLE_MISMATCH"}
+        if str(_meta.get("retry_owner") or "") != owner:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_OWNER_MISMATCH"}
+        if int(_meta.get("retry_generation") or 0) != int(current_generation):
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_GENERATION_MISMATCH"}
+        _stored_orig_bid = str(_meta.get("original_broker_order_id") or "")
+        if _stored_orig_bid != str(original_broker_order_id or ""):
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_ORIGINAL_BROKER_ID_MISMATCH"}
+        _max_qty = int(_meta.get("original_approved_quantity") or 0)
+        if _max_qty and replacement_quantity > _max_qty:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": "CONTINUATION_QTY_EXCEEDS_ORIGINAL"}
+        _existing_replacement = str(_meta.get("replacement_broker_order_id") or "")
+        if _existing_replacement:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": _existing_replacement, "status": None,
+                    "error": "CONTINUATION_REPLACEMENT_ALREADY_EXISTS"}
+
+        _contract = str(current.get("contract") or "").strip()
+        _symbol   = str(current.get("symbol") or "").strip()
+        _direction = str(current.get("direction") or "").upper()
+        _exec_mode = str(current.get("execution_mode") or "").lower()
+        if not _contract or _contract.upper().startswith("DEFERRED:") or _contract.upper() == _symbol.upper():
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": f"CONTINUATION_DEFERRED_CONTRACT_BLOCKED:{_contract}"}
+
+        # Fenced broker POST. Prefer a purpose-built adapter method if the
+        # broker exposes one; otherwise fall back to the canonical
+        # place_order signature already used elsewhere in the code base.
+        _post_result: dict = {}
+        _post_error: Optional[str] = None
+        try:
+            if hasattr(broker, "place_option_order"):
+                _post_result = broker.place_option_order(
+                    contract=_contract,
+                    side="BUY_TO_OPEN",
+                    quantity=int(replacement_quantity),
+                    order_type="LIMIT",
+                    limit_price=float(limit_price),
+                    duration="DAY",
+                    client_order_tag=canonical_broker_submit_key(local_order_id)
+                    if "canonical_broker_submit_key" in globals() else local_order_id,
+                    metadata={
+                        "continuation_replacement": True,
+                        "entry_lifecycle_id":       lifecycle_id,
+                        "retry_owner":              owner,
+                        "retry_generation":         int(current_generation),
+                    },
+                ) or {}
+            elif hasattr(broker, "place_order"):
+                _post_result = broker.place_order(
+                    symbol=_contract,
+                    side="BUY_TO_OPEN",
+                    qty=int(replacement_quantity),
+                    order_type="LIMIT",
+                    limit_price=float(limit_price),
+                    duration="DAY",
+                ) or {}
+            else:
+                _post_error = "BROKER_ADAPTER_LACKS_PLACE_ORDER"
+        except Exception as _pxc:
+            _post_error = f"{type(_pxc).__name__}:{_pxc}"
+
+        if _post_error is not None:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": None,
+                    "error": _post_error,
+                    "replacement_quantity": replacement_quantity,
+                    "limit_price": limit_price}
+        _new_bid = str(
+            _post_result.get("broker_order_id")
+            or _post_result.get("order_id")
+            or _post_result.get("id") or ""
+        ).strip()
+        _new_status = str(_post_result.get("status") or "").strip() or "SUBMITTED"
+        if not _new_bid:
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": None, "status": _new_status,
+                    "error": "CONTINUATION_BROKER_NO_ORDER_ID",
+                    "replacement_quantity": replacement_quantity,
+                    "limit_price": limit_price}
+
+        # Rotate the durable row atomically. The CAS on owner+generation
+        # guarantees only the winning worker mutates.
+        _row_patch = _json_local.dumps({
+            "current_broker_order_id":    _new_bid,
+            "replacement_broker_order_id": _new_bid,
+            "replacement_submitted_at":   _now,
+            "replacement_status":         _new_status,
+            "replacement_owner":          owner,
+            "replacement_generation":     int(current_generation),
+            "replacement_quantity":       int(replacement_quantity),
+            "replacement_limit_price":    float(limit_price),
+            "retry_state":                "REPLACEMENT_SUBMITTED",
+            "retry_updated_at":           _now,
+        })
+
+        def _rotate():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET qty = %s,
+                        broker_order_id = %s,
+                        limit_price = %s,
+                        meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') = %s
+                      AND COALESCE(meta->>'retry_owner','') = %s
+                      AND COALESCE((meta->>'retry_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'replacement_broker_order_id','') = ''
+                    """,
+                    (int(replacement_quantity), _new_bid, float(limit_price),
+                     _row_patch, local_order_id, self.client_id,
+                     lifecycle_id, owner, int(current_generation)),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            _rot = run_with_retry(_rotate)
+        except Exception as exc:
+            log.warning(
+                "[%s] submit_entry_continuation_replacement rotate failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            _rot = 0
+        if not _rot:
+            # Broker accepted the POST but we lost the durable rotation.
+            # Return the broker id so the caller can surface a reconciliation
+            # error rather than reposting.
+            return {"ok": False, "local_order_id": local_order_id,
+                    "broker_order_id": _new_bid, "status": _new_status,
+                    "error": "CONTINUATION_ROTATE_LOST",
+                    "replacement_quantity": replacement_quantity,
+                    "limit_price": limit_price,
+                    "reconciliation_required": True}
+
+        return {"ok": True, "local_order_id": local_order_id,
+                "broker_order_id": _new_bid, "status": _new_status,
+                "error": None,
+                "replacement_quantity": int(replacement_quantity),
+                "limit_price": float(limit_price)}
+
 
 # =============================================================================
 # Backward-compatible shims

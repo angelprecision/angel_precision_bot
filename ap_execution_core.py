@@ -9384,16 +9384,30 @@ class APExecutionCore:
         if _broker_truth_error is not None:
             audit["reason"] = "broker_truth_unavailable"
             audit["broker_truth_error"] = _broker_truth_error
-            osm.claim_entry_retry_generation(
-                local_order_id,
-                current_generation=_prior_gen,
-                owner=f"entry_retry:{_client_id}:hold",
-                retry_state="MARKET_TRUTH_HOLD",
-                extra_meta={
-                    "broker_truth_hold_reason": _broker_truth_error,
-                    "broker_truth_hold_at":     _now.isoformat(),
-                },
-            )
+            # AMENDMENT: non-incrementing HOLD stamp (do not burn generation).
+            _hold_owner_current = str((meta or {}).get("retry_owner") or "")
+            if hasattr(osm, "update_entry_retry_state"):
+                osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_hold_owner_current,
+                    current_generation=_prior_gen,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "broker_truth_hold_reason": _broker_truth_error,
+                        "broker_truth_hold_at":     _now.isoformat(),
+                    },
+                )
+            else:
+                osm.claim_entry_retry_generation(
+                    local_order_id,
+                    current_generation=_prior_gen,
+                    owner=_hold_owner_current or f"entry_retry:{_client_id}:hold",
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "broker_truth_hold_reason": _broker_truth_error,
+                        "broker_truth_hold_at":     _now.isoformat(),
+                    },
+                )
             return {
                 "ok": False,
                 "outcome": "BROKER_TRUTH_UNAVAILABLE_HOLD",
@@ -9436,22 +9450,56 @@ class APExecutionCore:
             # Adoption failed but fill exists at broker. Stay HOLD so
             # fill_monitor loop can adopt on its next pass; do NOT proceed
             # to replacement (would create duplicate exposure).
-            osm.claim_entry_retry_generation(
-                local_order_id,
-                current_generation=_prior_gen,
-                owner=f"entry_retry:{_client_id}:hold",
-                retry_state="MARKET_TRUTH_HOLD",
-                extra_meta={
-                    "late_fill_adoption_hold_reason": _adopt_detail,
-                    "late_fill_adoption_hold_at":     _now.isoformat(),
-                },
-            )
+            _hold_owner_current = str((meta or {}).get("retry_owner") or "")
+            if hasattr(osm, "update_entry_retry_state"):
+                osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_hold_owner_current,
+                    current_generation=_prior_gen,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "late_fill_adoption_hold_reason": _adopt_detail,
+                        "late_fill_adoption_hold_at":     _now.isoformat(),
+                    },
+                )
+            else:
+                osm.claim_entry_retry_generation(
+                    local_order_id,
+                    current_generation=_prior_gen,
+                    owner=_hold_owner_current or f"entry_retry:{_client_id}:hold",
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "late_fill_adoption_hold_reason": _adopt_detail,
+                        "late_fill_adoption_hold_at":     _now.isoformat(),
+                    },
+                )
             return {
                 "ok": False,
                 "outcome": "MARKET_TRUTH_HOLD",
                 "detail": f"late fill exists but adoption not yet complete: {_adopt_detail}",
                 "audit": audit,
             }
+
+        # AMENDMENT (audit blocker 7): route a confirmed PARTIAL broker fill
+        # through canonical fill_monitor accounting BEFORE any replacement,
+        # so cumulative broker fill truth lands durably first.
+        if _broker_filled_qty > 0 and _remaining_qty > 0:
+            _partial_ok, _partial_detail = self._adopt_broker_fill_via_fill_monitor(
+                local_order_id=local_order_id, broker=broker,
+            )
+            audit["partial_fill_accounting_ok"]     = _partial_ok
+            audit["partial_fill_accounting_detail"] = _partial_detail
+            # Re-read remaining_qty after canonical accounting.
+            try:
+                _refresh = osm.get_order(local_order_id) or {}
+                _refresh_meta = _refresh.get("meta") if isinstance(_refresh.get("meta"), dict) else {}
+                _rf_filled = int(_refresh_meta.get("filled_quantity") or _broker_filled_qty)
+                _rf_remaining = max(0, _original_qty - _rf_filled)
+                if _rf_remaining != _remaining_qty:
+                    _remaining_qty = _rf_remaining
+                    audit["remaining_quantity_after_partial_accounting"] = _remaining_qty
+            except Exception:
+                pass
 
         if _remaining_qty < 1:
             audit["reason"] = "no_remaining_quantity"
@@ -9567,16 +9615,29 @@ class APExecutionCore:
 
         if check_market_validity_gate is None or _trigger_px is None:
             # Cannot classify — HOLD (never proceed).
-            osm.claim_entry_retry_generation(
-                local_order_id,
-                current_generation=_prior_gen,
-                owner=f"entry_retry:{_client_id}:hold",
-                retry_state="MARKET_TRUTH_HOLD",
-                extra_meta={
-                    "market_truth_hold_reason": "gate_or_trigger_unavailable",
-                    "market_truth_hold_at":     _now.isoformat(),
-                },
-            )
+            _hold_owner_current = str((meta or {}).get("retry_owner") or "")
+            if hasattr(osm, "update_entry_retry_state"):
+                osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_hold_owner_current,
+                    current_generation=_prior_gen,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "market_truth_hold_reason": "gate_or_trigger_unavailable",
+                        "market_truth_hold_at":     _now.isoformat(),
+                    },
+                )
+            else:
+                osm.claim_entry_retry_generation(
+                    local_order_id,
+                    current_generation=_prior_gen,
+                    owner=_hold_owner_current or f"entry_retry:{_client_id}:hold",
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "market_truth_hold_reason": "gate_or_trigger_unavailable",
+                        "market_truth_hold_at":     _now.isoformat(),
+                    },
+                )
             audit["phase"] = "market_gate_unavailable_hold"
             return {
                 "ok": False,
@@ -9700,16 +9761,29 @@ class APExecutionCore:
         audit["market_truth_authority"] = _authority
 
         if _authority == _AUTH_HOLD:
-            osm.claim_entry_retry_generation(
-                local_order_id,
-                current_generation=_prior_gen,
-                owner=f"entry_retry:{_client_id}:hold",
-                retry_state="MARKET_TRUTH_HOLD",
-                extra_meta={
-                    "market_truth_hold_reason": _mv_reason or "hold",
-                    "market_truth_hold_at":     _now.isoformat(),
-                },
-            )
+            _hold_owner_current = str((meta or {}).get("retry_owner") or "")
+            if hasattr(osm, "update_entry_retry_state"):
+                osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_hold_owner_current,
+                    current_generation=_prior_gen,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "market_truth_hold_reason": _mv_reason or "hold",
+                        "market_truth_hold_at":     _now.isoformat(),
+                    },
+                )
+            else:
+                osm.claim_entry_retry_generation(
+                    local_order_id,
+                    current_generation=_prior_gen,
+                    owner=_hold_owner_current or f"entry_retry:{_client_id}:hold",
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "market_truth_hold_reason": _mv_reason or "hold",
+                        "market_truth_hold_at":     _now.isoformat(),
+                    },
+                )
             audit["phase"] = "market_truth_hold"
             return {
                 "ok": False,
@@ -9737,45 +9811,50 @@ class APExecutionCore:
             }
 
         if _authority == _AUTH_REARM:
-            # BLOCKER 2: direction reversal is REARM. If 391's OSM rearm
-            # helper is available, delegate to it; otherwise stamp lifecycle
-            # HOLD-equivalent state (no replacement, no terminal).
+            # AMENDMENT: direction reversal on a POST-CANCEL row cannot use
+            # #391's rearm_entry_for_direction_reversal (it CAS-refuses
+            # already-submitted rows). Use the continuation-specific
+            # reversal stamp instead. Zero replacement POST occurs.
+            _current_owner = str((meta or {}).get("retry_owner") or "")
             _rearm_ok = False
-            if hasattr(osm, "rearm_entry_for_direction_reversal"):
+            if hasattr(osm, "stamp_entry_continuation_reversal"):
                 try:
-                    _rearm_ok = bool(osm.rearm_entry_for_direction_reversal(
+                    _rearm_ok = bool(osm.stamp_entry_continuation_reversal(
                         local_order_id,
-                        reason=_mv_reason or "direction_reversal",
+                        owner=_current_owner,
+                        current_generation=_prior_gen,
+                        reason_code=_mv_reason or "direction_reversal",
+                        gate_audit=_mv_audit,
                     ))
-                except TypeError:
-                    # Older signature — try without reason kwarg.
-                    try:
-                        _rearm_ok = bool(osm.rearm_entry_for_direction_reversal(local_order_id))
-                    except Exception:
-                        _rearm_ok = False
                 except Exception as _rex:
                     log.warning(
-                        "[%s] rearm_entry_for_direction_reversal raised: %s",
+                        "[%s] stamp_entry_continuation_reversal raised: %s",
                         _client_id, _rex,
                     )
-            osm.claim_entry_retry_generation(
-                local_order_id,
-                current_generation=_prior_gen,
-                owner=f"entry_retry:{_client_id}:rearm",
-                retry_state="MARKET_TRUTH_HOLD",
-                extra_meta={
-                    "market_truth_authority": _authority,
-                    "market_truth_reason":    _mv_reason,
-                    "rearm_ok":               _rearm_ok,
-                    "rearm_at":               _now.isoformat(),
-                },
-            )
+            # If stamp helper missing/failed, fall back to non-inc state update.
+            if not _rearm_ok and hasattr(osm, "update_entry_retry_state"):
+                _rearm_ok = bool(osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_current_owner,
+                    current_generation=_prior_gen,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "market_truth_authority": _authority,
+                        "market_truth_reason":    _mv_reason,
+                        "rearm_fallback":         True,
+                        "rearm_at":               _now.isoformat(),
+                    },
+                ))
             audit["phase"] = "rearm_direction_reversal"
             audit["rearm_ok"] = _rearm_ok
+            audit["replacement_broker_posts"] = 0
             return {
                 "ok": True,
                 "outcome": "REARM_DIRECTION_REVERSAL",
-                "detail": f"direction temporarily reversed ({_mv_reason}) — setup rearmed, zero POST",
+                "detail": (
+                    f"direction reversed ({_mv_reason}) — continuation stamped "
+                    f"(rearm_ok={_rearm_ok}); zero replacement POST"
+                ),
                 "audit": audit,
             }
 
@@ -9813,36 +9892,112 @@ class APExecutionCore:
         audit["retry_generation"] = _prior_gen + 1
         audit["replacement_quantity"] = _remaining_qty
 
-        _limit_price = None
-        # Prefer the mid of the current option quote if we can get one, else
-        # fall back to the row's original limit_price (preserved).
+        # ── AMENDMENT (audit blocker 3): compute replacement limit from the
+        # EXACT OCC option quote, never from the underlying stock midpoint.
+        # Underlying is used for thesis validity only. If the option quote
+        # is unavailable, HOLD (never fall back to the underlying price).
+        _opt_bid = _opt_ask = _opt_age_ms = None
+        _opt_source = None
+        _opt_fetched_at = None
+        _opt_fetch_failed = True
+        _opt_fetch_error: Optional[str] = "option_quote_adapter_unavailable"
         try:
-            if _mv_ask is not None and _mv_bid is not None:
-                _limit_price = (float(_mv_bid) + float(_mv_ask)) / 2.0
-        except (TypeError, ValueError):
-            _limit_price = None
-        if _limit_price is None or _limit_price <= 0:
-            _limit_price = order.get("limit_price") or order.get("price")
+            _opt_raw_q = None
+            if hasattr(broker, "get_option_quote"):
+                _opt_raw_q = broker.get_option_quote(_contract)
+                _opt_fetched_at = datetime.now(timezone.utc).isoformat()
+            elif hasattr(broker, "get_quote"):
+                _opt_raw_q = broker.get_quote(_contract)
+                _opt_fetched_at = datetime.now(timezone.utc).isoformat()
+            elif hasattr(self, "data_broker") and hasattr(self.data_broker, "get_option_quote"):
+                _opt_raw_q = self.data_broker.get_option_quote(_contract)
+                _opt_fetched_at = datetime.now(timezone.utc).isoformat()
+            if isinstance(_opt_raw_q, dict):
+                _opt_fetch_failed = False
+                _opt_fetch_error = None
+                _opt_bid = _opt_raw_q.get("bid")
+                _opt_ask = _opt_raw_q.get("ask")
+                _opt_age_ms = _opt_raw_q.get("quote_age_ms")
+                _opt_source = (
+                    _opt_raw_q.get("source")
+                    or _opt_raw_q.get("quote_source")
+                    or _opt_raw_q.get("provider")
+                    or "unknown"
+                )
+            elif _opt_fetched_at is not None:
+                _opt_fetch_error = f"invalid_option_quote_type:{type(_opt_raw_q).__name__}"
+        except Exception as _oxc:
+            _opt_fetch_error = f"{type(_oxc).__name__}:{_oxc}"
+
+        _limit_price: Optional[float] = None
+        _limit_source = "option_quote_midpoint"
         try:
-            _limit_price = float(_limit_price) if _limit_price is not None else None
+            if _opt_bid is not None and _opt_ask is not None:
+                _fb, _fa = float(_opt_bid), float(_opt_ask)
+                if _fa > 0 and _fb >= 0 and _fa >= _fb:
+                    _limit_price = (_fb + _fa) / 2.0
         except (TypeError, ValueError):
             _limit_price = None
 
+        audit["option_quote_bid"]         = _opt_bid
+        audit["option_quote_ask"]         = _opt_ask
+        audit["option_quote_source"]      = _opt_source
+        audit["option_quote_age_ms"]      = _opt_age_ms
+        audit["option_quote_fetched_at"]  = _opt_fetched_at
+        audit["option_quote_fetch_failed"] = _opt_fetch_failed
+        audit["replacement_limit_source"] = _limit_source
+        audit["replacement_limit_price"]  = _limit_price
+
+        if _limit_price is None or _limit_price <= 0 or _opt_fetch_failed:
+            # AMENDMENT: NEVER fall back to underlying-stock midpoint or to
+            # the stale row limit. Roll back the CAS (non-inc) and HOLD.
+            if hasattr(osm, "update_entry_retry_state"):
+                osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_retry_owner,
+                    current_generation=_prior_gen + 1,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "option_quote_hold_reason": _opt_fetch_error or "option_limit_unavailable",
+                        "option_quote_hold_at":     _now.isoformat(),
+                    },
+                )
+            audit["phase"] = "option_quote_unavailable_hold"
+            return {
+                "ok": False,
+                "outcome": "MARKET_TRUTH_HOLD",
+                "detail": (
+                    f"option quote unavailable ({_opt_fetch_error or 'no_bid_ask'}); "
+                    "refusing to derive replacement limit from underlying"
+                ),
+                "audit": audit,
+            }
+
+        # ── AMENDMENT (audit blockers 1 & 6): fenced continuation POST.
+        # `submit_existing_entry` correctly rejects CANCELED rows and rows
+        # with prior broker ownership evidence, so a post-cancel replacement
+        # must go through the continuation-specific seam.
         _submit_result: dict = {}
         _submit_error: Optional[str] = None
         try:
-            if hasattr(osm, "submit_existing_entry"):
-                _submit_result = osm.submit_existing_entry(
+            if hasattr(osm, "submit_entry_continuation_replacement"):
+                _submit_result = osm.submit_entry_continuation_replacement(
                     local_order_id=local_order_id,
                     broker=broker,
-                    limit_price=_limit_price,
+                    lifecycle_id=_lifecycle_id,
+                    owner=_retry_owner,
+                    current_generation=_prior_gen + 1,
+                    replacement_quantity=int(_remaining_qty),
+                    limit_price=float(_limit_price),
+                    original_broker_order_id=_original_broker_oid,
+                    confirmed_terminal_original_status=cancel_confirmed_status,
                 ) or {}
             else:
-                _submit_error = "osm_lacks_submit_existing_entry"
+                _submit_error = "osm_lacks_submit_entry_continuation_replacement"
         except Exception as _sxc:
             _submit_error = f"{type(_sxc).__name__}:{_sxc}"
             log.error(
-                "[%s] submit_existing_entry raised during continuation of %s: %s",
+                "[%s] submit_entry_continuation_replacement raised during continuation of %s: %s",
                 _client_id, local_order_id, _sxc, exc_info=True,
             )
 
@@ -9899,21 +10054,34 @@ class APExecutionCore:
                 "audit": audit,
             }
 
-        # BLOCKER 3 FAILURE PATH — CAS was claimed but broker POST failed.
-        # Roll back to REPLACEMENT_CLAIMED so restart recovery/fill_monitor
-        # can resume; NEVER falsely emit REPLACEMENT_SUBMITTED.
+        # AMENDMENT (audit blocker 5): CAS was claimed but broker POST failed.
+        # Roll back via NON-INCREMENTING update so the single allowed
+        # replacement generation is preserved for restart recovery.
         try:
-            osm.claim_entry_retry_generation(
-                local_order_id,
-                current_generation=_prior_gen + 1,
-                owner=_retry_owner,
-                retry_state="OPEN_UNFILLED",
-                extra_meta={
-                    "replacement_submit_failed_at":  _now.isoformat(),
-                    "replacement_submit_error":      _submit_error or _submit_result.get("error"),
-                    "replacement_claim_only":        True,
-                },
-            )
+            if hasattr(osm, "update_entry_retry_state"):
+                osm.update_entry_retry_state(
+                    local_order_id,
+                    owner=_retry_owner,
+                    current_generation=_prior_gen + 1,
+                    retry_state="MARKET_TRUTH_HOLD",
+                    extra_meta={
+                        "replacement_submit_failed_at":  _now.isoformat(),
+                        "replacement_submit_error":      _submit_error or _submit_result.get("error"),
+                        "replacement_claim_only":        True,
+                    },
+                )
+            else:
+                osm.claim_entry_retry_generation(
+                    local_order_id,
+                    current_generation=_prior_gen + 1,
+                    owner=_retry_owner,
+                    retry_state="OPEN_UNFILLED",
+                    extra_meta={
+                        "replacement_submit_failed_at":  _now.isoformat(),
+                        "replacement_submit_error":      _submit_error or _submit_result.get("error"),
+                        "replacement_claim_only":        True,
+                    },
+                )
         except Exception:
             pass
         audit["phase"] = "replacement_claimed_submit_failed"

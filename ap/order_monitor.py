@@ -459,6 +459,18 @@ class APOrderMonitor:
                     f"[{self.client_id}] OrderMonitor armed-retry-check error: {e}",
                     exc_info=True,
                 )
+            # PR #392 AMENDMENT: resume any HOLD entry-continuation lifecycles
+            # (broker-truth HOLD, market-truth HOLD, option-quote HOLD, or
+            # rollback after a broker POST failure). Bounded query — one row
+            # per client per tick, scoped by lifecycle_id/owner/generation/
+            # state/not_before/deadline. Never creates new lifecycles.
+            try:
+                self._resume_held_entry_continuations()
+            except Exception as e:
+                log.error(
+                    f"[{self.client_id}] OrderMonitor held-continuation resume error: {e}",
+                    exc_info=True,
+                )
             # PR #30 LIVE-SAFETY: reconciler staleness watchdog.
             # Alert-only. Does NOT change position state, does NOT block exits.
             try:
@@ -2878,6 +2890,86 @@ class APOrderMonitor:
             log.debug("[%s] emit continuation event failed: %s",
                       self.client_id, _eex)
         return True
+
+    def _resume_held_entry_continuations(self) -> None:
+        """PR #392 AMENDMENT: bounded next-tick consumer for HOLD continuations.
+
+        A `submit_entry_continuation` call that returns MARKET_TRUTH_HOLD /
+        BROKER_TRUTH_UNAVAILABLE_HOLD / REPLACEMENT_CLAIMED (rollback) leaves
+        the lifecycle row in a HOLD state under the same generation. Without
+        an external consumer, that row would stall forever after the initial
+        cancel event finished dispatching. This method is that consumer.
+
+        Scope is deliberately narrow:
+          - client_id = self.client_id (via OSM)
+          - kind = 'ENTRY'
+          - retry_state IN ('MARKET_TRUTH_HOLD',)
+          - retry_deadline > NOW()
+          - retry_not_before IS NULL OR retry_not_before <= NOW()
+          - entry_lifecycle_id present
+          - broker status of original still terminal (we re-verify via
+            submit_entry_continuation itself; that method is the authority)
+          - retry_generation < 2
+
+        One retry per tick per client — no new lifecycle scheduler.
+        """
+        osm = getattr(self, "osm", None)
+        if osm is None:
+            return
+        try:
+            from ap.db import conn  # type: ignore
+        except Exception:
+            return
+        try:
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    SELECT local_order_id,
+                           COALESCE(meta->>'entry_lifecycle_id','') AS lc,
+                           COALESCE(meta->>'retry_generation','0') AS gen,
+                           COALESCE(meta->>'retry_owner','')        AS owner,
+                           COALESCE(meta->>'retry_state','')        AS state,
+                           COALESCE(meta->>'retry_deadline','')     AS deadline
+                    FROM orders
+                    WHERE client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') <> ''
+                      AND COALESCE(meta->>'retry_state','') = 'MARKET_TRUTH_HOLD'
+                      AND COALESCE((meta->>'retry_generation')::int, 0) < 2
+                      AND COALESCE(meta->>'retry_deadline','') > to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"')
+                      AND (
+                        COALESCE(meta->>'retry_not_before','') = ''
+                        OR meta->>'retry_not_before' <= to_char(NOW() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"')
+                      )
+                    ORDER BY updated_ts ASC
+                    LIMIT 1
+                    """,
+                    (self.client_id,),
+                )
+                _rows = cur.fetchall() if cur is not None else []
+        except Exception as _qxc:
+            log.debug(
+                "[%s] _resume_held_entry_continuations query failed: %s",
+                self.client_id, _qxc,
+            )
+            return
+        if not _rows:
+            return
+        _row = _rows[0]
+        try:
+            _loid = _row[0] if not isinstance(_row, dict) else _row.get("local_order_id")
+        except Exception:
+            return
+        if not _loid:
+            return
+        # Delegate — submit_entry_continuation is the authority on
+        # whether the HOLD can advance or must stay HOLD.
+        self._dispatch_continuation_via_execution_core(
+            local_order_id=str(_loid),
+            contract="",
+            cancel_reason="resume_held_continuation",
+            confirmed_status="CANCELED",
+        )
 
     def _maybe_arm_post_cancel_retry(
         self,
