@@ -2561,8 +2561,12 @@ class APContractSelectionEngine:
         # quote-spending order and final ranking cannot ever diverge. Preserve
         # existing deterministic secondary ordering for candidates in the same
         # strike tier (original chain index). When the flag is off, or trigger
-        # and underlying are both unusable, fall through unchanged — behavior
-        # for non-playbook callers is byte-for-byte identical to pre-#396.
+        # and underlying are both unusable, fall through unchanged — the
+        # non-playbook selector path preserves prior chain ordering, ranking,
+        # quote spending, and selection behavior. Note: a
+        # preferred_strike_ordering entry with enabled=False is still emitted
+        # into selector_request_diagnostics for observability parity across
+        # flag states; downstream selection is not affected.
         _preferred_strike_audit: dict = {
             "enabled": False,
             "anchor_source": TRIGGER_ANCHOR_SOURCE_NONE,
@@ -2591,7 +2595,7 @@ class APContractSelectionEngine:
                     if _preference.adjacent_otm_strike is not None
                     else None
                 )
-                _attempt_audit: list[dict] = []
+                _ordered_audit: list[dict] = []
 
                 def _strike_tier(_opt: dict) -> tuple[int, str]:
                     _s = _safe_float(_opt.get("strike"))
@@ -2620,11 +2624,19 @@ class APContractSelectionEngine:
                         opt
                         for _idx, opt in sorted(_indexed_chain, key=_order_key)
                     ]
-                    # Attempt-audit stamped in the reordered order so operators
-                    # can see exactly which contracts would be tried first.
+                    # NOTE: this list records the PLANNED reorder — the order
+                    # in which the quality/direct-quote loop below will visit
+                    # chain rows. It is NOT a record of attempted work: a row
+                    # here may still be rejected by an earlier structural gate,
+                    # may never reach direct-quote revalidation, and may not
+                    # consume a SELECTOR_MAX_DIRECT_QUOTE_CALLS attempt before
+                    # budget exhaustion. Operators reading this must not
+                    # conflate "planned order" with "attempted" or "quoted".
+                    # If a true attempted-work list is ever needed, it must be
+                    # appended inside the actual iteration branch below.
                     for _opt in _reordered_chain:
                         _tier, _label = _strike_tier(_opt)
-                        _attempt_audit.append({
+                        _ordered_audit.append({
                             "symbol": _opt.get("symbol"),
                             "strike": _safe_float(_opt.get("strike")),
                             "strike_policy_tier": _tier,
@@ -2632,7 +2644,7 @@ class APContractSelectionEngine:
                         })
                     chain = _reordered_chain
                     _preferred_strike_audit["reordered"] = True
-                    _preferred_strike_audit["attempted_candidates"] = _attempt_audit
+                    _preferred_strike_audit["ordered_candidates"] = _ordered_audit
                 except Exception as _exc:
                     # Ordering failure must never block selection — fall
                     # through with the original chain order.

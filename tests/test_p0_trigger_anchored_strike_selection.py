@@ -409,6 +409,16 @@ class TestMissingTriggerFallback:
         assert audit["anchor_price"] == 61.60
         assert audit["primary_strike"] == 62.0
         assert audit["reordered"] is True
+        # Truthful naming: the audit records the PLANNED reorder, not attempted
+        # work. Rows may still be rejected by earlier structural gates, may
+        # never reach direct-quote revalidation, and may not consume a
+        # SELECTOR_MAX_DIRECT_QUOTE_CALLS attempt before budget exhaustion.
+        # A field named 'attempted_candidates' here would mislead operators;
+        # pin the correct name so it cannot silently regress.
+        assert "ordered_candidates" in audit
+        assert "attempted_candidates" not in audit
+        assert len(audit["ordered_candidates"]) == 3
+        assert audit["ordered_candidates"][0]["strike"] == 62.0
 
 
 # ===========================================================================
