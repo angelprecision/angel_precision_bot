@@ -418,16 +418,23 @@ def _validate_durable_fills(
 ) -> list[dict]:
     """Re-prove durable adopted fills against the current position.
 
-    Before a DB-sourced row can contribute to a terminal close, it must prove:
-      - exact contract match (if db_contract is populated)
-      - exact CALL/PUT direction (if db_direction is populated)
-      - EXIT_FILLED or EXIT_PARTIAL_FILL status
-      - positive quantity and fill price
-      - fill timestamp at or after position entry
-      - external local-ID prefix (already enforced by load_manual_close_state)
+    PR #386 hardening: identity is MANDATORY. A durable row that merely
+    shares a position_id but lacks any of the identity/economics below is
+    corrupt evidence and cannot silently inflate the weighted-close
+    aggregate. Every field must be present and exact:
 
-    A malformed or mis-bound durable row that merely shares a position_id must
-    not silently inflate or corrupt the weighted-close aggregate.
+      * broker_order_id: nonempty
+      * filled_qty > 0
+      * fill_price > 0
+      * filled_at is a datetime instance (not None, not string, not epoch)
+      * filled_at >= position entry timestamp (when entry is known)
+      * db_status: nonempty AND in {EXIT_FILLED, EXIT_PARTIAL_FILL}
+      * db_contract: nonempty AND exactly equals position contract
+      * db_direction: nonempty AND in {CALL, PUT} AND equals position direction
+      * pos_direction: valid CALL/PUT — reject the whole row if the position's
+        own direction is unknown, since the direction check cannot then be made
+
+    Rejected rows are logged loudly and dropped; no partial-credit acceptance.
     """
     pos_contract = normalize_contract(position.get("contract"))
     pos_direction = str(
@@ -437,6 +444,19 @@ def _validate_durable_fills(
         position.get("entry_ts") or position.get("opened_at")
     )
     position_id = str(position.get("id") or "").strip()
+
+    # Position direction validity is a precondition — if the position row
+    # itself lacks a valid CALL/PUT direction we cannot prove alignment for
+    # any fill.  Reject the entire durable set for this position.
+    if pos_direction not in {"CALL", "PUT"}:
+        for f in fills:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_POSITION_DIRECTION_INVALID "
+                "pos=%s broker_id=%s pos_direction=%r — rejected",
+                client_id, position_id,
+                str(f.get("broker_order_id") or "").strip(), pos_direction,
+            )
+        return []
 
     valid: list[dict] = []
     for f in fills:
@@ -454,49 +474,59 @@ def _validate_durable_fills(
                 client_id, position_id,
             )
             continue
-        if filled_qty <= 0 or fill_price <= 0 or filled_at is None:
+        if filled_qty <= 0 or fill_price <= 0:
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_INVALID pos=%s broker_id=%s "
-                "qty=%s price=%s ts=%s — rejected",
-                client_id, position_id, bid, filled_qty, fill_price, filled_at,
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_ECONOMICS_INVALID pos=%s "
+                "broker_id=%s qty=%s price=%s — rejected",
+                client_id, position_id, bid, filled_qty, fill_price,
             )
             continue
-        if db_status and db_status not in DURABLE_EXIT_FILLED_STATUSES:
+        if not isinstance(filled_at, datetime):
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_STATUS_REJECTED pos=%s broker_id=%s "
-                "status=%s — rejected",
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_INVALID pos=%s "
+                "broker_id=%s filled_at_type=%s — rejected",
+                client_id, position_id, bid, type(filled_at).__name__,
+            )
+            continue
+        if not db_status or db_status not in DURABLE_EXIT_FILLED_STATUSES:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_STATUS_REJECTED pos=%s "
+                "broker_id=%s status=%r — rejected",
                 client_id, position_id, bid, db_status,
             )
             continue
-        if db_contract and db_contract != pos_contract:
+        if not db_contract:
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_CONTRACT_MISMATCH pos=%s broker_id=%s "
-                "expected=%s got=%s — rejected",
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_CONTRACT_MISSING pos=%s "
+                "broker_id=%s — rejected",
+                client_id, position_id, bid,
+            )
+            continue
+        if db_contract != pos_contract:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_CONTRACT_MISMATCH pos=%s "
+                "broker_id=%s expected=%s got=%s — rejected",
                 client_id, position_id, bid, pos_contract, db_contract,
             )
             continue
-        if db_direction and db_direction not in {"CALL", "PUT"}:
+        if not db_direction or db_direction not in {"CALL", "PUT"}:
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_DIRECTION_INVALID pos=%s broker_id=%s "
-                "direction=%s — rejected",
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_DIRECTION_INVALID pos=%s "
+                "broker_id=%s direction=%r — rejected",
                 client_id, position_id, bid, db_direction,
             )
             continue
-        if db_direction and pos_direction and db_direction != pos_direction:
+        if db_direction != pos_direction:
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_DIRECTION_MISMATCH pos=%s broker_id=%s "
-                "expected=%s got=%s — rejected",
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_DIRECTION_MISMATCH pos=%s "
+                "broker_id=%s expected=%s got=%s — rejected",
                 client_id, position_id, bid, pos_direction, db_direction,
             )
             continue
-        if (
-            opened_at is not None
-            and isinstance(filled_at, datetime)
-            and filled_at < opened_at
-        ):
+        if opened_at is not None and filled_at < opened_at:
             log.warning(
-                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_STALE pos=%s broker_id=%s "
-                "fill_ts=%s entry_ts=%s — rejected",
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_STALE pos=%s "
+                "broker_id=%s fill_ts=%s entry_ts=%s — rejected",
                 client_id, position_id, bid, filled_at, opened_at,
             )
             continue
