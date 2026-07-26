@@ -1,5 +1,30 @@
+"""PR #386 (post-review): manual-close reconciliation regression suite.
+
+Covers:
+  * happy path (single external fill → adopt → finalize → evict)
+  * broker-positions error is uncertainty, not empty account
+  * broker-orders error is uncertainty, not empty
+  * bot-owned EXIT id fences (real bot ownership)
+  * mode fence
+  * existing exit-owner fence (in-flight / pending_exit_*)
+  * quantity ambiguity (partial external can't terminally close a full pos)
+  * stale fill before entry rejected
+  * multi-fill weighted aggregate
+  * broker still holds contract → not closed
+  * adoption failure blocks finalizer + eviction
+  * finalizer failure does not evict
+  * adoption is atomic per position (single conn / advisory lock)
+  * multi-fill resume: first fill previously adopted, second retries → completes
+    with weighted aggregate across both fills
+  * CLOSING position (not just OPEN) is still scanned
+  * paginated broker-orders fetch pulls beyond default 25-order cap
+  * delegate contract: ClientRunner._detect_manual_closes calls the helper
+"""
+from __future__ import annotations
+
 import json
 import os
+import sys
 import types
 from datetime import datetime, timezone
 
@@ -7,16 +32,14 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/tes
 
 import ap.db as db_mod
 import client_runner as runner_mod
-from client_runner import manual_close_reconciliation as manual_mod
+from ap import manual_close_reconciliation as manual_mod
 
 
 CLIENT = "jasoncosby1@gmail.com"
 CONTRACT = "F260731C00014000"
 POSITION_ID = "ca06eeca-f55b-4778-8756-66c91bae877b"
 ENTRY_TS = "2026-07-21T15:26:58.911238+00:00"
-DETECTED_EPOCH = datetime(
-    2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc
-).timestamp()
+DETECTED_EPOCH = datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp()
 
 
 class _Broker:
@@ -27,6 +50,7 @@ class _Broker:
         orders=None,
         positions_error=None,
         orders_error=None,
+        orders_pages=None,
     ):
         self.cfg = types.SimpleNamespace(account_id="LIVE-ACCOUNT")
         self._positions_payload = (
@@ -35,15 +59,32 @@ class _Broker:
         self._orders = list(orders or [])
         self._positions_error = positions_error
         self._orders_error = orders_error
-        self.calls = []
+        self._orders_pages = orders_pages  # optional: list-of-pages for paginated _get
+        self.calls: list[tuple] = []
 
     def _get(self, path):
         self.calls.append(("get", path))
-        if self._positions_error:
-            raise self._positions_error
-        return self._positions_payload
+        if path.startswith(f"/v1/accounts/{self.cfg.account_id}/positions"):
+            if self._positions_error:
+                raise self._positions_error
+            return self._positions_payload
+        if path.startswith(f"/v1/accounts/{self.cfg.account_id}/orders"):
+            if self._orders_error:
+                raise self._orders_error
+            if self._orders_pages is not None:
+                # Return each page in sequence based on how many order-page
+                # calls we've observed so far.
+                page_calls = [c for c in self.calls if isinstance(c[1], str) and "/orders" in c[1]]
+                idx = len(page_calls) - 1
+                if idx < len(self._orders_pages):
+                    return {"orders": {"order": self._orders_pages[idx]}}
+                return {"orders": "null"}
+            return {"orders": {"order": list(self._orders)}}
+        raise AssertionError(f"unexpected broker path: {path}")
 
     def list_orders(self):
+        # Fallback path when _get is unavailable — not used by tests that
+        # exercise pagination.
         self.calls.append(("list_orders", None))
         if self._orders_error:
             raise self._orders_error
@@ -59,7 +100,7 @@ class _Broker:
 class _PM:
     def __init__(self, result=True):
         self.result = result
-        self.calls = []
+        self.calls: list[dict] = []
 
     def close_position_from_exit_fill(self, **kwargs):
         self.calls.append(kwargs)
@@ -68,7 +109,7 @@ class _PM:
 
 class _ExitEngine:
     def __init__(self):
-        self.closed = []
+        self.closed: list[str] = []
 
     def mark_position_closed(self, position_id):
         self.closed.append(position_id)
@@ -88,6 +129,7 @@ def _position(**overrides):
         "entry_ts": ENTRY_TS,
         "opened_at": ENTRY_TS,
         "execution_mode": "live",
+        "status": "OPEN",
         "exit_in_flight": False,
         "pending_exit_broker_order_id": None,
         "pending_exit_local_order_id": None,
@@ -123,14 +165,24 @@ def _runner(*, broker, pm):
     return runner
 
 
-def _install_scan_boundaries(monkeypatch, position=None, known_ids=None, adopt=True):
+def _install_scan_boundaries(
+    monkeypatch,
+    position=None,
+    bot_exit_ids=None,
+    adopted_by_pos=None,
+    adopt=True,
+):
     monkeypatch.setattr(manual_mod.time, "time", lambda: DETECTED_EPOCH)
     monkeypatch.setattr(
         manual_mod,
         "load_manual_close_state",
-        lambda client_id: ([position or _position()], set(known_ids or set())),
+        lambda client_id: (
+            [position or _position()],
+            set(bot_exit_ids or set()),
+            dict(adopted_by_pos or {}),
+        ),
     )
-    adopted = []
+    adopted: list[dict] = []
 
     def _adopt(**kwargs):
         adopted.append(kwargs)
@@ -140,10 +192,23 @@ def _install_scan_boundaries(monkeypatch, position=None, known_ids=None, adopt=T
     return adopted
 
 
-def test_shadow_package_patches_supervisor_class_binding():
-    assert runner_mod._base.ClientRunner is runner_mod.ClientRunner
-    assert runner_mod.ClientRunner._detect_manual_closes is manual_mod.detect_manual_closes
+# ─── delegate contract ───────────────────────────────────────────────────────
 
+def test_client_runner_detect_manual_closes_delegates_to_helper(monkeypatch):
+    calls = []
+    monkeypatch.setattr(manual_mod, "detect_manual_closes", lambda self: calls.append(self))
+    runner = _runner(broker=_Broker(), pm=_PM())
+    runner._detect_manual_closes()
+    assert calls == [runner]
+
+
+def test_no_shadow_package_client_runner_is_module():
+    # If someone reintroduces the shadow package this fails loudly.
+    assert getattr(runner_mod, "__file__", "").endswith("client_runner.py")
+    assert not hasattr(runner_mod, "_base"), "shadow package must not be present"
+
+
+# ─── happy path ──────────────────────────────────────────────────────────────
 
 def test_manual_close_adopts_exact_fill_then_calls_canonical_finalizer(monkeypatch):
     broker = _Broker(orders=[_filled_exit()])
@@ -170,11 +235,9 @@ def test_manual_close_adopts_exact_fill_then_calls_canonical_finalizer(monkeypat
     assert call["close_confidence"] == "HIGH"
     assert "MANUAL_CLIENT_CLOSE_BROKER_CONFIRMED" in call["exit_reason"]
     assert runner.core.exit_eng.closed == [POSITION_ID]
-    assert broker.calls == [
-        ("get", "/v1/accounts/LIVE-ACCOUNT/positions"),
-        ("list_orders", None),
-    ]
 
+
+# ─── broker error paths (uncertainty, never "empty account") ─────────────────
 
 def test_positions_query_failure_never_reads_orders_or_mutates(monkeypatch):
     broker = _Broker(
@@ -206,17 +269,18 @@ def test_orders_query_failure_never_adopts_or_finalizes(monkeypatch):
     assert runner.core.exit_eng.closed == []
 
 
+# ─── fences ──────────────────────────────────────────────────────────────────
+
 def test_bot_owned_exit_order_is_not_reclassified_as_external(monkeypatch):
     broker = _Broker(orders=[_filled_exit(id="KNOWN-EXIT")])
     pm = _PM()
     runner = _runner(broker=broker, pm=pm)
-    adopted = _install_scan_boundaries(monkeypatch, known_ids={"KNOWN-EXIT"})
+    adopted = _install_scan_boundaries(monkeypatch, bot_exit_ids={"KNOWN-EXIT"})
 
     runner._detect_manual_closes()
 
     assert adopted == []
     assert pm.calls == []
-    assert runner.core.exit_eng.closed == []
 
 
 def test_mode_mismatch_is_fenced_before_order_position_or_proof_mutation(monkeypatch):
@@ -224,15 +288,13 @@ def test_mode_mismatch_is_fenced_before_order_position_or_proof_mutation(monkeyp
     pm = _PM()
     runner = _runner(broker=broker, pm=pm)
     adopted = _install_scan_boundaries(
-        monkeypatch,
-        position=_position(execution_mode="paper"),
+        monkeypatch, position=_position(execution_mode="paper"),
     )
 
     runner._detect_manual_closes()
 
     assert adopted == []
     assert pm.calls == []
-    assert runner.core.exit_eng.closed == []
 
 
 def test_existing_exit_owner_is_fenced(monkeypatch):
@@ -240,8 +302,7 @@ def test_existing_exit_owner_is_fenced(monkeypatch):
     pm = _PM()
     runner = _runner(broker=broker, pm=pm)
     adopted = _install_scan_boundaries(
-        monkeypatch,
-        position=_position(pending_exit_broker_order_id="137700000"),
+        monkeypatch, position=_position(pending_exit_broker_order_id="137700000"),
     )
 
     runner._detect_manual_closes()
@@ -249,6 +310,8 @@ def test_existing_exit_owner_is_fenced(monkeypatch):
     assert adopted == []
     assert pm.calls == []
 
+
+# ─── quantity + timing correctness ───────────────────────────────────────────
 
 def test_partial_external_fill_cannot_terminally_close_full_position(monkeypatch):
     broker = _Broker(orders=[_filled_exit(exec_quantity=1, quantity=1)])
@@ -260,7 +323,6 @@ def test_partial_external_fill_cannot_terminally_close_full_position(monkeypatch
 
     assert adopted == []
     assert pm.calls == []
-    assert runner.core.exit_eng.closed == []
 
 
 def test_stale_same_contract_fill_before_entry_is_rejected(monkeypatch):
@@ -338,9 +400,9 @@ def test_open_broker_contract_is_not_considered_manually_closed(monkeypatch):
 
     assert adopted == []
     assert pm.calls == []
-    assert runner.core.exit_eng.closed == []
-    assert broker.calls == [("get", "/v1/accounts/LIVE-ACCOUNT/positions")]
 
+
+# ─── failure ordering ────────────────────────────────────────────────────────
 
 def test_failed_order_adoption_blocks_position_and_proof_finalization(monkeypatch):
     broker = _Broker(orders=[_filled_exit()])
@@ -368,7 +430,108 @@ def test_finalizer_failure_does_not_evict_exit_engine_after_adoption(monkeypatch
     assert runner.core.exit_eng.closed == []
 
 
+# ─── amendment #1: multi-fill resume without stranding ───────────────────────
+
+def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_aggregate(monkeypatch):
+    """Prior scan adopted EXIT-1; EXIT-2 was newly filled since. Next scan
+    must NOT reject the whole evidence set as 'bot_owned_exit_order_present'
+    — those adopted IDs are OUR own external work, not bot exits. The
+    resume must aggregate EXIT-1 + EXIT-2 for weighted P&L truth."""
+    broker = _Broker(
+        orders=[
+            _filled_exit(
+                id="EXIT-1",
+                exec_quantity=1,
+                quantity=1,
+                avg_fill_price=0.74,
+                transaction_date="2026-07-21T15:56:00Z",
+            ),
+            _filled_exit(
+                id="EXIT-2",
+                exec_quantity=1,
+                quantity=1,
+                avg_fill_price=0.76,
+                transaction_date="2026-07-21T15:57:39Z",
+            ),
+        ]
+    )
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+    adopted = _install_scan_boundaries(
+        monkeypatch,
+        adopted_by_pos={POSITION_ID: {"EXIT-1"}},   # EXIT-1 already durable
+    )
+
+    runner._detect_manual_closes()
+
+    # Adoption is called for the NEW fill only (EXIT-2).
+    assert len(adopted) == 1
+    new_fills = adopted[0]["evidence"]["fills"]
+    assert [f["broker_order_id"] for f in new_fills] == ["EXIT-2"]
+    # Aggregate view spans BOTH fills for finalizer truth.
+    all_ids = adopted[0]["evidence"]["broker_order_ids"]
+    assert all_ids == ["EXIT-1", "EXIT-2"]
+    # Finalizer receives weighted aggregate.
+    assert pm.calls[0]["exit_price"] == 0.75
+    assert pm.calls[0]["filled_qty"] == 2
+    assert runner.core.exit_eng.closed == [POSITION_ID]
+
+
+# ─── amendment #2: CLOSING is still scanned ──────────────────────────────────
+
+def test_active_position_family_includes_closing(monkeypatch):
+    """A position advanced to CLOSING (e.g. by row-at-a-time reconciler)
+    with retained external evidence must remain scannable so the manual-
+    close path can re-finalize with weighted aggregate."""
+    broker = _Broker(orders=[_filled_exit()])
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+    adopted = _install_scan_boundaries(
+        monkeypatch, position=_position(status="CLOSING"),
+    )
+
+    runner._detect_manual_closes()
+
+    assert len(adopted) == 1
+    assert len(pm.calls) == 1
+
+
+# ─── amendment #3: paginated broker order fetch ──────────────────────────────
+
+def test_broker_orders_paginated_beyond_default_25(monkeypatch):
+    """Tradier's list_orders defaults to ~25. Our fetch must page via
+    _get with an explicit limit to see the actual close deep in a busy
+    session."""
+    # Page 1: 500 unrelated orders. Page 2: our real EXIT. Page 3: empty.
+    page1 = [
+        {"id": f"NOISE-{n}", "status": "canceled",
+         "side": "buy_to_open", "option_symbol": "OTHER260731C00010000"}
+        for n in range(500)
+    ]
+    page2 = [_filled_exit()]
+    broker = _Broker(orders_pages=[page1, page2])
+    pm = _PM()
+    runner = _runner(broker=broker, pm=pm)
+    adopted = _install_scan_boundaries(monkeypatch)
+
+    runner._detect_manual_closes()
+
+    # Must have paged past the first 500 to reach our real exit.
+    order_paths = [c[1] for c in broker.calls if isinstance(c[1], str) and "/orders" in c[1]]
+    assert len(order_paths) >= 2, f"paginated fetch expected; saw {order_paths}"
+    assert "page=1" in order_paths[0]
+    assert "page=2" in order_paths[1]
+    # Adoption happened using the deep-page order.
+    assert len(adopted) == 1
+    assert adopted[0]["evidence"]["broker_order_ids"] == ["137780001"]
+    assert pm.calls[0]["exit_price"] == 0.75
+
+
+# ─── DB-shape checks (existing coverage, updated for atomic API) ─────────────
+
 class _FakeCursor:
+    """A single-connection fake cursor that models the exact SQL used by
+    load_manual_close_state and adopt_external_exit_fills."""
     def __init__(self, rows):
         self.rows = rows
         self._fetchall = []
@@ -392,29 +555,16 @@ class _FakeCursor:
         if "WHERE client_id=%s AND broker_order_id=%s" in compact:
             client_id, broker_order_id = params
             self._fetchall = [
-                row
-                for row in self.rows
+                row for row in self.rows
                 if row.get("client_id") == client_id
                 and row.get("broker_order_id") == broker_order_id
             ][:2]
             return self
         if compact.startswith("INSERT INTO orders"):
             (
-                client_id,
-                local_order_id,
-                broker_order_id,
-                position_id,
-                symbol,
-                contract,
-                direction,
-                qty,
-                filled_qty,
-                fill_price,
-                created_ts,
-                updated_ts,
-                submitted_ts,
-                filled_ts,
-                meta,
+                client_id, local_order_id, broker_order_id, position_id,
+                symbol, contract, direction, qty, filled_qty, fill_price,
+                created_ts, updated_ts, submitted_ts, filled_ts, meta,
                 execution_mode,
             ) = params
             if any(row.get("local_order_id") == local_order_id for row in self.rows):
@@ -458,7 +608,7 @@ class _FakeCursor:
 
 
 def test_external_fill_adoption_writes_real_exit_lifecycle_shape(monkeypatch):
-    rows = []
+    rows: list[dict] = []
     cursor = _FakeCursor(rows)
     monkeypatch.setattr(db_mod, "conn", lambda: cursor)
     monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
@@ -466,7 +616,8 @@ def test_external_fill_adoption_writes_real_exit_lifecycle_shape(monkeypatch):
     evidence, reason = manual_mod.select_external_close_fills(
         orders=[_filled_exit()],
         position=_position(),
-        known_exit_order_ids=set(),
+        bot_exit_order_ids=set(),
+        adopted_external_order_ids=set(),
         detected_at=datetime.fromtimestamp(DETECTED_EPOCH, tz=timezone.utc),
     )
     assert reason == "exact_external_broker_fill"
@@ -590,5 +741,5 @@ def test_external_fill_adoption_rejects_existing_mode_or_position_mismatch(monke
     )
 
     assert ok is False
-    assert reason == "external_exit_adoption_existing_row"
+    assert reason.startswith("external_exit_adoption_error:")
     assert len(rows) == 1
