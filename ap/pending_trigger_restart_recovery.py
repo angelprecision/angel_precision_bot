@@ -879,7 +879,13 @@ class PendingTriggerRestartRecovery:
             return None
 
         meta = _extract_meta(reread)
-        if meta.get("materialization_outcome"):
+        materialization_outcome = str(
+            meta.get("materialization_outcome") or ""
+        ).strip().upper()
+        if materialization_outcome and materialization_outcome not in {
+            "RETRY_LATER_SELECTOR_BUDGET",
+            "RETRY_LATER_DATA_UNAVAILABLE",
+        }:
             return None
         mat_status   = str(meta.get(_MAT_STATUS_FIELD) or "").strip().upper()
         broker_ready = meta.get(_MAT_BROKER_READY)

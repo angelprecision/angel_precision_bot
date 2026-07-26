@@ -2571,6 +2571,18 @@ class APExecutionCore:
             _ok = False
             if callable(_schedule):
                 try:
+                    _schedule_meta = _build_deferred_retry_schedule_meta(
+                        reason_code=reason_code,
+                        selector_audit=selector_failure or {},
+                        attempt=_expected_attempt,
+                        max_attempts=max_attempts,
+                        delay_seconds=_retry_delay,
+                        client_id=self.client_id,
+                        execution_mode=row_mode,
+                        local_order_id=local_order_id,
+                        signal_id=signal_id,
+                        now=_now,
+                    )
                     _ok = bool(_schedule(
                         local_order_id,
                         owner=owner,
@@ -2579,7 +2591,10 @@ class APExecutionCore:
                         attempt=_expected_attempt,
                         max_attempts=max_attempts,
                         next_retry_at=_next_retry_at,
-                        selector_failure=selector_failure or {"reason_code": reason_code},
+                        selector_failure={
+                            **(selector_failure or {}),
+                            **_schedule_meta,
+                        },
                     ))
                 except Exception as _sch_exc:
                     log.critical(

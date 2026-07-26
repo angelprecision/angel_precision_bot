@@ -17,7 +17,8 @@ Covers the 12 required tests from the PR spec:
  11. No quality-gate weakening    -> spread/OI/etc still block broker_ready.
  12. No direct broker submit from recovery.
 
-All tests avoid real network / DB / broker calls; they exercise the
+Tests avoid real network and broker calls. One PostgreSQL-gated acceptance
+test proves the durable JSONB round trip; the remaining tests exercise the
 ownership + orchestration primitives added by this PR:
 
   * APEntryWatcher.prove_materialization_retry_owner
@@ -871,12 +872,19 @@ def test_11d_selector_budget_row_persists_through_osm_seam(
     assert patch["breach_attempt_count"] == 1
     assert patch["next_retry_at"] == next_retry_at
     assert patch["materialization_next_retry_at"] == next_retry_at
+    assert patch["materialization_attempts"] == 1
+    assert patch["materialization_reason"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert patch["materialization_last_failure_at"]
 
-    # PR #389 dedicated durable outcome lands in the persisted selector-
-    # failure payload with exact identity intact.
+    # Canonical readers consume the top-level fields; the complete nested
+    # diagnostics carry the exact same values.
+    assert patch["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
+    assert patch["materialization_detail"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert patch["entry_path"] == "DEFERRED_BREACH_MATERIALIZATION"
     persisted = patch["materialization_selector_failure"]
     assert persisted["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
     assert persisted["materialization_detail"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert persisted["entry_path"] == "DEFERRED_BREACH_MATERIALIZATION"
     assert persisted["deferred_retry_reason_code"] == (
         "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
     )
@@ -892,6 +900,274 @@ def test_11d_selector_budget_row_persists_through_osm_seam(
     assert persisted["may_retry_with_fresh_budget"] is True
     # broker_ready stays False so no submit happens off the retry row.
     assert patch["broker_ready"] is False
+
+
+def test_11d_generic_retry_promotes_data_unavailable_and_rejects_contradiction(
+    osm_db_spy,
+):
+    """Generic data misses promote their canonical outcome, while a supplied
+    contradictory outcome fails closed before SQL."""
+    import json
+
+    from ap.order_state_machine import APOrderStateMachine
+
+    sink, _state = osm_db_spy
+    osm = APOrderStateMachine("tradefluencehq@gmail.com")
+    due = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+
+    assert osm.schedule_deferred_materialization_retry(
+        "oid-generic-data",
+        owner="watcher:data",
+        generation=3,
+        reason_code="PROVIDER_TIMEOUT",
+        attempt=2,
+        max_attempts=5,
+        next_retry_at=due,
+        selector_failure={"provider_status": 504},
+    ) is True
+    patch = json.loads(sink[-1][1][0])
+    assert patch["materialization_outcome"] == "RETRY_LATER_DATA_UNAVAILABLE"
+    assert patch["materialization_selector_failure"]["materialization_outcome"] == (
+        "RETRY_LATER_DATA_UNAVAILABLE"
+    )
+
+    prior_writes = len(sink)
+    assert osm.schedule_deferred_materialization_retry(
+        "oid-contradictory",
+        owner="watcher:data",
+        generation=3,
+        reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        attempt=2,
+        max_attempts=5,
+        next_retry_at=due,
+        selector_failure={
+            "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+            "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+        },
+    ) is False
+    assert len(sink) == prior_writes
+
+
+def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
+    """The actual PostgreSQL JSONB merge must expose the canonical outcome
+    to both classifier and restart recovery without changing row identity."""
+    from contextlib import contextmanager
+    import json
+    import uuid
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    import psycopg2.extras
+
+    database_url = os.getenv("INTELLIGENCE_POSTGRES_TEST_URL", "")
+    if not database_url:
+        if os.getenv("GITHUB_ACTIONS") == "true":
+            pytest.fail("INTELLIGENCE_POSTGRES_TEST_URL is required in GitHub Actions")
+        pytest.skip("disposable PostgreSQL URL not configured")
+
+    from ap.order_state_machine import APOrderStateMachine
+    from ap.pending_trigger_classifier import (
+        PendingTriggerClassification,
+        classify_pending_trigger_row,
+    )
+    from ap.pending_trigger_restart_recovery import PendingTriggerRestartRecovery
+    from ap_execution_core import _build_deferred_retry_schedule_meta
+    import ap.order_state_machine as osm_mod
+
+    schema = f"pr389_outcome_{uuid.uuid4().hex}"
+    client_id = "jasoncosby1@gmail.com"
+    local_order_id = f"oid-pr389-{uuid.uuid4().hex}"
+    signal_id = f"sig-pr389-{uuid.uuid4().hex}"
+    owner = "materializer:pr389"
+    generation = 4
+    now = datetime.now(timezone.utc)
+    next_retry_at = (now + timedelta(seconds=45)).isoformat()
+
+    class _Wrapper:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        @property
+        def rowcount(self):
+            return self.cursor.rowcount
+
+        def execute(self, sql, params=()):
+            self.cursor.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            row = self.cursor.fetchone()
+            return dict(row) if row else None
+
+        def fetchall(self):
+            return [dict(row) for row in self.cursor.fetchall()]
+
+    @contextmanager
+    def _pg_conn():
+        db = psycopg2.connect(database_url)
+        cursor = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+            yield _Wrapper(cursor)
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            cursor.close()
+            db.close()
+
+    admin = psycopg2.connect(database_url)
+    admin.autocommit = True
+    try:
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    execution_mode TEXT NOT NULL,
+                    signal_id TEXT,
+                    plan_id TEXT,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    contract TEXT,
+                    symbol TEXT,
+                    direction TEXT,
+                    side TEXT,
+                    timeframe TEXT,
+                    score NUMERIC,
+                    tier TEXT,
+                    trigger_price NUMERIC,
+                    meta JSONB,
+                    created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+
+        monkeypatch.setattr(osm_mod, "conn", _pg_conn)
+        monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn, *a, **k: fn())
+        osm = APOrderStateMachine(client_id)
+        materializing_meta = {
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_status": "RUNNING",
+            "materialization_in_flight": True,
+            "materialization_owner": owner,
+            "materialization_generation": generation,
+            "trigger_crossed_at": (now - timedelta(seconds=10)).isoformat(),
+            "trigger_price": 61.0,
+        }
+        with _pg_conn() as c:
+            c.execute(
+                """
+                INSERT INTO orders (
+                    local_order_id, client_id, kind, status, execution_mode,
+                    signal_id, plan_id, contract, symbol, direction, side,
+                    timeframe, score, tier, trigger_price, meta
+                ) VALUES (
+                    %s,%s,'ENTRY','PENDING_TRIGGER','live',%s,'plan-pr389',
+                    'DEFERRED:BAC','BAC','PUT','PUT','5m',85,'A',61.0,%s::jsonb
+                )
+                """,
+                (
+                    local_order_id,
+                    client_id,
+                    signal_id,
+                    json.dumps(materializing_meta),
+                ),
+            )
+
+        selector_meta = _build_deferred_retry_schedule_meta(
+            reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            selector_audit={
+                "attempted": True,
+                "budget_skipped": True,
+                "last_candidate_reject_reason": "CHAIN_ROW_ZERO_BID_ASK",
+            },
+            attempt=1,
+            max_attempts=5,
+            delay_seconds=45,
+            client_id=client_id,
+            execution_mode="live",
+            local_order_id=local_order_id,
+            signal_id=signal_id,
+            now=now,
+        )
+        assert osm.schedule_deferred_materialization_retry(
+            local_order_id,
+            owner=owner,
+            generation=generation,
+            reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            attempt=1,
+            max_attempts=5,
+            next_retry_at=next_retry_at,
+            selector_failure=selector_meta,
+        ) is True
+
+        row = osm.get_order(local_order_id)
+        assert row is not None
+        meta = row["meta"]
+        assert meta["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
+        assert meta["materialization_detail"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert meta["entry_path"] == "DEFERRED_BREACH_MATERIALIZATION"
+        nested = meta["materialization_selector_failure"]
+        assert nested["materialization_outcome"] == meta["materialization_outcome"]
+        assert nested["materialization_detail"] == meta["materialization_detail"]
+        assert nested["entry_path"] == meta["entry_path"]
+        assert meta["lifecycle_state"] == "RETRY_WAIT"
+        assert meta["materialization_status"] == "RETRY_PENDING"
+        assert meta["retry_owner"] == owner
+        assert meta["materialization_generation"] == generation
+        assert row["client_id"] == client_id
+        assert row["execution_mode"] == "live"
+        assert row["signal_id"] == signal_id
+        assert row["local_order_id"] == local_order_id
+        assert row["status"] == "PENDING_TRIGGER"
+
+        classification = classify_pending_trigger_row(
+            row,
+            watcher_owned=None,
+            is_past_eod=False,
+            live_quote_already_through_trigger=None,
+        )
+        assert classification == PendingTriggerClassification.WAITING_RETRYABLE
+
+        recovery = PendingTriggerRestartRecovery(
+            client_id=client_id,
+            execution_mode="live",
+            osm=osm,
+            entry_watcher=None,
+            broker=None,
+            caller_source="pr389_postgres_acceptance",
+        )
+        summary = recovery.recover_all([row])
+        assert summary["retry_rows_owned"] == 1
+        assert summary["terminalized"] == 0
+        assert summary["ownerless_rows_remaining"] == 0
+
+        reread = osm.get_order(local_order_id)
+        assert reread["status"] == "PENDING_TRIGGER"
+        assert reread["meta"]["materialization_outcome"] == (
+            "RETRY_LATER_SELECTOR_BUDGET"
+        )
+        with _pg_conn() as c:
+            c.execute(
+                """
+                SELECT COUNT(*) AS entry_count
+                FROM orders
+                WHERE client_id=%s AND kind='ENTRY' AND local_order_id=%s
+                """,
+                (client_id, local_order_id),
+            )
+            assert int(c.fetchone()["entry_count"]) == 1
+    finally:
+        with admin.cursor() as cursor:
+            cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        admin.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1036,6 +1312,297 @@ def test_11e_concurrent_recovery_loses_ownership_without_selector_call():
     assert core._on_entry_trigger.call_count <= 1
     if hasattr(core.broker, "submit_order"):
         assert core.broker.submit_order.called is False
+
+
+def test_11e_startup_loader_overlap_runs_one_real_selector_request(monkeypatch):
+    """Two ordinary startup loaders discover the same durable retry row.
+    The production resume method and OSM claim fence permit one real selector
+    request; the loser stops at claim and no broker order is emitted."""
+    import copy
+    from datetime import date
+    from unittest.mock import patch
+
+    from ap.contract_selector import APContractSelectionEngine
+    from ap_recovery import APStartupRecovery
+    import ap_execution_core
+    from ap import db as db_mod
+
+    client_id = "jasoncosby1@gmail.com"
+    local_order_id = "oid-BAC-startup-overlap"
+    signal_id = "sig-BAC-startup-overlap"
+    row = _budget_row(
+        client_id,
+        "live",
+        local_order_id,
+        signal_id,
+        generation=2,
+        attempt=1,
+    )
+    row["symbol"] = "BAC"
+    row["direction"] = "PUT"
+    row["trigger_price"] = 60.90
+    row["target_underlying"] = 59.50
+    row["stop_underlying"] = 61.80
+    row["meta"].update({
+        "materialization_outcome": "RETRY_LATER_SELECTOR_BUDGET",
+        "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
+        "materialization_attempts": 1,
+        "materialization_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "materialization_last_failure_at": datetime.now(timezone.utc).isoformat(),
+        "broker_ready": False,
+    })
+
+    claim_barrier = threading.Barrier(2)
+
+    class _SharedOSM:
+        def __init__(self):
+            self.client_id = client_id
+            self.row = copy.deepcopy(row)
+            self.lock = threading.RLock()
+            self.claim_attempts = 0
+            self.claim_winners = 0
+            self.entry_rows_created = 1
+
+        def get_order(self, oid):
+            assert oid == local_order_id
+            with self.lock:
+                return copy.deepcopy(self.row)
+
+        def claim_deferred_materialization(self, oid, **kwargs):
+            assert oid == local_order_id
+            claim_barrier.wait(timeout=5)
+            with self.lock:
+                self.claim_attempts += 1
+                meta = self.row["meta"]
+                if (
+                    meta.get("lifecycle_state") != "RETRY_WAIT"
+                    or int(meta.get("materialization_generation") or 0) != 2
+                ):
+                    return False
+                self.claim_winners += 1
+                meta.update({
+                    "lifecycle_state": "MATERIALIZING",
+                    "materialization_status": "RUNNING",
+                    "materialization_owner": kwargs["owner"],
+                    "materialization_generation": int(kwargs["new_generation"]),
+                    "retry_attempt": int(kwargs["retry_attempt"]),
+                    "materialization_in_flight": True,
+                })
+                return True
+
+        def update_order_meta(self, oid, patch):
+            with self.lock:
+                self.row["meta"].update(copy.deepcopy(patch))
+            return True
+
+        def schedule_deferred_materialization_retry(self, oid, **kwargs):
+            raise AssertionError("successful selector must not reschedule")
+
+    osm = _SharedOSM()
+
+    expiry_date = date.today() + timedelta(days=3)
+    while expiry_date.weekday() >= 5:
+        expiry_date += timedelta(days=1)
+    expiry = expiry_date.isoformat()
+    occ_date = expiry_date.strftime("%y%m%d")
+    ranked_symbols = [
+        f"BAC{occ_date}P{int((60.90 - rank) * 1000):08d}"
+        for rank in range(1, 13)
+    ]
+    chain = [
+        {
+            "symbol": symbol,
+            "expiration_date": expiry,
+            "strike": 60.90 - rank,
+            "option_type": "put",
+            "bid": 0.0,
+            "ask": 0.0,
+            "open_interest": 9800 + rank,
+            "volume": 4100 + rank,
+            "bid_size": 20,
+            "ask_size": 20,
+            "greeks": {"delta": -0.40},
+        }
+        for rank, symbol in enumerate(ranked_symbols, start=1)
+    ]
+    valid_symbol = ranked_symbols[3]
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _ControlledBroker:
+        base_url = "https://api.tradier.com"
+        cfg = SimpleNamespace(
+            base_url="https://api.tradier.com",
+            access_token="token",
+        )
+
+        def __init__(self):
+            self.session = SimpleNamespace(get=self._get)
+            self.submit_order = MagicMock()
+            self.cancel_order = MagicMock()
+            self.quote_calls = []
+
+        def _get(self, url, **kwargs):
+            if "options/expirations" in url:
+                return _Response({"expirations": {"date": [expiry]}})
+            if "options/chains" in url:
+                return _Response({"options": {"option": chain}})
+            return _Response({"quotes": {"quote": {"last": 60.90}}})
+
+        def get_quote(self, symbol):
+            self.quote_calls.append(symbol)
+            if "".join(str(symbol).upper().split()) == valid_symbol:
+                return {
+                    "bid": 1.10,
+                    "ask": 1.14,
+                    "volume": 4100,
+                    "open_interest": 9800,
+                }
+            return {"bid": 0.0, "ask": 0.0}
+
+    broker = _ControlledBroker()
+    selector = APContractSelectionEngine(
+        broker,
+        mode="LIVE",
+        data_broker=broker,
+        min_premium=1.0,
+        max_premium=1000.0,
+        min_oi=1,
+        min_volume=0,
+    )
+    selector_requests = []
+
+    core = SimpleNamespace(
+        client_id=client_id,
+        email=client_id,
+        execution_mode="live",
+        mode="LIVE",
+        paper=False,
+        order_state_machine=osm,
+        broker=broker,
+    )
+    core.resume_deferred_materialization_retry = (
+        ap_execution_core.APExecutionCore
+        .resume_deferred_materialization_retry.__get__(core, type(core))
+    )
+
+    def _selector_callback(watched):
+        plan_ns = watched.signal["_approved_plan"]
+        plan = {
+            "signal_id": plan_ns.signal_id,
+            "client_id": plan_ns.client_id,
+            "execution_mode": plan_ns.execution_mode,
+            "local_order_id": watched.signal["local_order_id"],
+            "ticker": plan_ns.ticker,
+            "side": plan_ns.side,
+            "target_underlying": 60.90,
+            "trigger_price": 60.90,
+            "wick_targets": [{"distance_pct": 0.5, "confidence": 0.75}],
+            "tier": plan_ns.tier,
+            "score": plan_ns.score,
+            "pattern": plan_ns.pattern,
+            "timeframe": plan_ns.timeframe,
+            "metadata": {"sizing_context": {
+                "budget": 2000.0,
+                "account_equity": 10000.0,
+                "risk_pct": 0.05,
+                "max_affordable_premium": 2000.0,
+            }},
+            "max_position_usd": 2000.0,
+        }
+        selected = selector.select(plan)
+        assert selected is not None
+        selector_requests.append(plan["metadata"]["selector_request_diagnostics"])
+        with osm.lock:
+            osm.row["contract"] = selected.contract_symbol
+            osm.row["meta"].update({
+                "lifecycle_state": "BROKER_READY",
+                "materialization_status": "SELECTED",
+                "broker_ready": True,
+                "selected_contract": selected.contract_symbol,
+            })
+
+    core._on_entry_trigger = _selector_callback
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, *args, **kwargs):
+            return self
+
+        def fetchall(self):
+            return [copy.deepcopy(row)]
+
+    class _Conn:
+        def __enter__(self):
+            return _Cursor()
+
+        def __exit__(self, *args):
+            return False
+
+    def _recovery_instance():
+        return APStartupRecovery(
+            client_id=client_id,
+            broker=broker,
+            osm=osm,
+            pm=MagicMock(),
+            master_control=SimpleNamespace(mode="LIVE"),
+            entry_watcher=None,
+            execution_core=core,
+        )
+
+    results = [{}, {}]
+
+    def _run(worker_idx):
+        bucket = {"deferred_lifecycles_recovered": 0, "errors": []}
+        _recovery_instance()._recover_deferred_breach_lifecycles(bucket)
+        results[worker_idx] = bucket
+
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "8")
+    monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "8")
+    monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "8")
+    monkeypatch.setenv("PRO_CONTRACT_QUALITY", "true")
+    monkeypatch.setenv("DEFERRED_RETRY_OWNER_GRACE_SECONDS", "0")
+    monkeypatch.setattr(
+        "ap.contract_quote_revalidator.is_market_open",
+        lambda *args, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        APContractSelectionEngine,
+        "_emit_selector_event",
+        lambda *args, **kwargs: None,
+    )
+    with patch.object(db_mod, "conn", lambda: _Conn()), \
+         patch.object(db_mod, "run_with_retry", lambda fn, *a, **kw: fn()):
+        threads = [
+            threading.Thread(target=_run, args=(idx,), daemon=True)
+            for idx in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        assert all(not thread.is_alive() for thread in threads)
+
+    assert osm.claim_attempts == 2
+    assert osm.claim_winners == 1
+    assert len(selector_requests) == 1
+    assert selector_requests[0]["direct_quote_budget"]["effective_limit"] == 8
+    assert osm.row["local_order_id"] == local_order_id
+    assert osm.row["signal_id"] == signal_id
+    assert osm.entry_rows_created == 1
+    assert osm.row["meta"]["lifecycle_state"] == "BROKER_READY"
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+    assert sum(r["deferred_lifecycles_recovered"] for r in results) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

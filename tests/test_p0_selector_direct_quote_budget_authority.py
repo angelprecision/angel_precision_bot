@@ -131,9 +131,17 @@ class _DirectQuoteBroker:
     base_url = "https://api.tradier.com"
     cfg = SimpleNamespace(base_url="https://api.tradier.com", access_token="token")
 
-    def __init__(self, chain: list[dict], valid_symbol: str, valid_quote: dict | None = None):
+    def __init__(
+        self,
+        chain: list[dict],
+        valid_symbol: str,
+        valid_quote: dict | None = None,
+        *,
+        underlying_price: float = 450.0,
+    ):
         self.chain = chain
         self.valid_symbol = valid_symbol
+        self.underlying_price = float(underlying_price)
         self.valid_quote = valid_quote or {
             "bid": 1.10,
             "ask": 1.14,
@@ -152,7 +160,7 @@ class _DirectQuoteBroker:
             return _response({"expirations": {"date": [_NEAR_EXPIRY]}})
         if "options/chains" in url:
             return _response({"options": {"option": self.chain}})
-        return _response({"quotes": {"quote": {"last": 450.0}}})
+        return _response({"quotes": {"quote": {"last": self.underlying_price}}})
 
     def _get_quote(self, symbol: str):
         if "".join(str(symbol).upper().split()) == self.valid_symbol:
@@ -815,8 +823,9 @@ class TestAggregateAuditTruthfulness:
 # selector requests. Every request must:
 #
 #   * receive an independent fresh selector budget;
-#   * exhaust its budget on zero-quote candidates;
-#   * report the request-scope reason SELECTOR_REQUEST_BUDGET_EXHAUSTED;
+#   * preserve incident-shaped candidate rank and attempt/skip order;
+#   * recover the declared survivor or exhaust on zero/stale candidates;
+#   * report SELECTOR_REQUEST_BUDGET_EXHAUSTED only for all-failing fixtures;
 #   * NOT submit / cancel / replace any broker order;
 #   * persist the dedicated durable outcome RETRY_LATER_SELECTOR_BUDGET on
 #     the deferred-retry row with exact identity fields intact.
@@ -827,9 +836,41 @@ class TestAggregateAuditTruthfulness:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-FLEET_TICKERS: list[str] = [
-    "ABT", "COF", "GM", "CAT", "KHC", "ROST", "UPS", "BAC",
-]
+FLEET_INCIDENT_FIXTURES: dict[str, dict] = {
+    "ABT": {
+        "underlying": 124.80, "direction": "CALL", "spacing": 0.5,
+        "recovery_rank": 2, "delta": 0.42, "oi": 1850, "volume": 420,
+    },
+    "COF": {
+        "underlying": 214.35, "direction": "PUT", "spacing": 2.5,
+        "recovery_rank": None, "delta": 0.39, "oi": 640, "volume": 85,
+    },
+    "GM": {
+        "underlying": 57.60, "direction": "CALL", "spacing": 0.25,
+        "recovery_rank": 6, "delta": 0.44, "oi": 5200, "volume": 1600,
+    },
+    "CAT": {
+        "underlying": 418.20, "direction": "PUT", "spacing": 2.5,
+        "recovery_rank": 4, "delta": 0.38, "oi": 910, "volume": 210,
+    },
+    "KHC": {
+        "underlying": 29.15, "direction": "CALL", "spacing": 0.5,
+        "recovery_rank": None, "delta": 0.41, "oi": 7300, "volume": 2500,
+    },
+    "ROST": {
+        "underlying": 154.70, "direction": "CALL", "spacing": 0.5,
+        "recovery_rank": 7, "delta": 0.43, "oi": 780, "volume": 145,
+    },
+    "UPS": {
+        "underlying": 111.85, "direction": "PUT", "spacing": 1.0,
+        "recovery_rank": None, "delta": 0.37, "oi": 2400, "volume": 610,
+    },
+    "BAC": {
+        "underlying": 60.90, "direction": "PUT", "spacing": 0.25,
+        "recovery_rank": 8, "delta": 0.40, "oi": 9800, "volume": 4100,
+    },
+}
+FLEET_TICKERS: list[str] = list(FLEET_INCIDENT_FIXTURES)
 
 # Exact production client identities as configured in ap/morning_jobs.py
 # (DEFAULT_LIVE_CLIENT / DEFAULT_PAPER_CLIENTS). Do not substitute aliases.
@@ -864,35 +905,50 @@ def _ticker_option(idx: int, ticker: str, direction: str, strike: float,
     return opt
 
 
-def _fleet_chain(ticker: str, direction: str) -> list[dict]:
-    """A production-shaped chain that guarantees budget exhaustion when the
-    valid-symbol is set to a nonexistent OCC — every recovered candidate
-    returns zero bid/ask, so no survivor is found and the entire direct-
-    quote budget is spent."""
+def _fleet_chain(ticker: str, fixture: dict) -> tuple[list[dict], list[str]]:
+    """Build one incident-shaped chain using that ticker's own price scale,
+    strike spacing, direction, delta, OI, volume, and provider ordering."""
+    direction = fixture["direction"]
+    underlying = float(fixture["underlying"])
+    spacing = float(fixture["spacing"])
     chain: list[dict] = []
-    for idx in range(130):
-        strike = 600 + idx if direction == "CALL" else 300 - idx
+    # Far rows model the large stale/zero provider tail seen in production.
+    for idx in range(48):
+        distance = (30 + idx) * spacing
+        strike = underlying + distance if direction == "CALL" else underlying - distance
         chain.append(_ticker_option(
             idx, ticker, direction, float(strike),
             delta=None, oi=0, volume=0,
         ))
-    priority = ([451.0, 452.0, 453.0, 454.0, 455.0, 456.0, 457.0, 458.0, 459.0]
-                if direction == "CALL"
-                else [449.0, 448.0, 447.0, 446.0, 445.0, 444.0, 443.0, 442.0, 441.0])
-    for rank_idx, strike in enumerate(priority[:8]):
-        chain[rank_idx] = _ticker_option(
-            rank_idx, ticker, direction, strike,
-            delta=0.40, oi=1200, volume=300,
+    expected_ranked_symbols: list[str] = []
+    # Put priority candidates at deliberately non-ranked provider indexes.
+    provider_indexes = [
+        31, 4, 27, 9, 42, 1, 35, 13, 46, 18,
+        23, 7, 39, 15, 44, 21, 33, 11, 47, 25,
+    ]
+    for rank, provider_idx in enumerate(provider_indexes, start=1):
+        strike = (
+            underlying + rank * spacing
+            if direction == "CALL"
+            else underlying - rank * spacing
         )
-    chain[100] = _ticker_option(
-        100, ticker, direction, priority[8],
-        delta=0.41, oi=1200, volume=300,
-    )
-    return chain
+        opt = _ticker_option(
+            provider_idx,
+            ticker,
+            direction,
+            strike,
+            delta=float(fixture["delta"]) + ((rank % 3) - 1) * 0.01,
+            oi=int(fixture["oi"]) + rank * 17,
+            volume=int(fixture["volume"]) + rank * 7,
+        )
+        chain[provider_idx] = opt
+        expected_ranked_symbols.append(opt["symbol"])
+    return chain, expected_ranked_symbols
 
 
 def _fleet_plan(*, ticker: str, direction: str, client_id: str,
                 execution_mode: str, signal_id: str, local_order_id: str,
+                underlying: float,
                 budget: float = 2000.0) -> dict:
     return {
         "signal_id": signal_id,
@@ -901,9 +957,9 @@ def _fleet_plan(*, ticker: str, direction: str, client_id: str,
         "local_order_id": local_order_id,
         "ticker": ticker,
         "side": direction,
-        "target_underlying": 450.0,
+        "target_underlying": underlying,
         "wick_targets": [{"distance_pct": 0.5, "confidence": 0.75}],
-        "trigger_price": 450.0,
+        "trigger_price": underlying,
         "tier": "A",
         "score": 85.0,
         "pattern": "3-1-2",
@@ -925,11 +981,20 @@ class TestJuly23FleetAcceptanceReplay:
     July 23 acceptance surface. See module-level comment for contract."""
 
     def _run_one(self, monkeypatch, ticker: str, client_id: str,
-                 execution_mode: str, direction: str, generation: int,
+                 execution_mode: str, generation: int,
                  attempt: int) -> tuple:
-        chain = _fleet_chain(ticker, direction)
-        # Unattainable valid symbol → every direct quote returns zero, so
-        # the request must exhaust the budget without a survivor.
+        # Each production identity owns a canonical selector request. Avoid
+        # process-global quote-cache carryover between replay identities.
+        clear_quote_cache()
+        fixture = FLEET_INCIDENT_FIXTURES[ticker]
+        direction = fixture["direction"]
+        chain, ranked_symbols = _fleet_chain(ticker, fixture)
+        recovery_rank = fixture["recovery_rank"]
+        valid_symbol = (
+            ranked_symbols[int(recovery_rank) - 1]
+            if recovery_rank is not None
+            else "NEVERMATCH"
+        )
         signal_id = f"sig-{ticker}-{client_id}-g{generation}"
         local_order_id = f"oid-{ticker}-{client_id}-g{generation}-a{attempt}"
         plan = _fleet_plan(
@@ -939,10 +1004,11 @@ class TestJuly23FleetAcceptanceReplay:
             execution_mode=execution_mode,
             signal_id=signal_id,
             local_order_id=local_order_id,
+            underlying=float(fixture["underlying"]),
         )
-        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "20")
+        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "8")
         monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "8")
-        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "20")
+        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "8")
         monkeypatch.setenv("PRO_CONTRACT_QUALITY", "true")
         monkeypatch.setattr(
             "ap.contract_quote_revalidator.is_market_open",
@@ -953,8 +1019,17 @@ class TestJuly23FleetAcceptanceReplay:
             "_emit_selector_event",
             lambda *a, **kw: None,
         )
-        broker = _DirectQuoteBroker(chain, "NEVERMATCH",
-                                    valid_quote={"bid": 0.0, "ask": 0.0})
+        broker = _DirectQuoteBroker(
+            chain,
+            valid_symbol,
+            valid_quote={
+                "bid": 1.10,
+                "ask": 1.14,
+                "volume": int(fixture["volume"]),
+                "open_interest": int(fixture["oi"]),
+            },
+            underlying_price=float(fixture["underlying"]),
+        )
         selector = APContractSelectionEngine(
             broker,
             mode=execution_mode.upper(),
@@ -965,18 +1040,17 @@ class TestJuly23FleetAcceptanceReplay:
             min_volume=0,
         )
         selected = selector.select(plan)
-        return selected, broker, plan
+        return selected, broker, plan, fixture, ranked_symbols
 
     def test_24_requests_each_exhaust_independent_selector_budget(
         self, monkeypatch,
     ):
         """8 tickers × 3 real production identities = 24 canonical
-        selector requests. Each request must receive its own fresh
-        20-call budget, exhaust it on zero-quote candidates, report
-        SELECTOR_REQUEST_BUDGET_EXHAUSTED as the final request-scope
-        reason, keep the original chain-quality reasons in the reject
-        buckets, and never touch the broker. LIVE and PAPER identities
-        remain isolated across the whole matrix.
+        selector requests. Each request receives its own fresh 8-call
+        budget and follows an explicit incident fixture: recoverable cases
+        select the declared rank; all-failing cases exhaust with
+        SELECTOR_REQUEST_BUDGET_EXHAUSTED. Original quality reasons remain
+        attached and the selection pass never touches broker orders.
 
         Durable persistence of the resulting RETRY_LATER_SELECTOR_BUDGET
         row is exercised by
@@ -985,44 +1059,64 @@ class TestJuly23FleetAcceptanceReplay:
         replay_receipts: list[dict] = []
         for ticker in FLEET_TICKERS:
             for client_id, execution_mode, label in FLEET_IDENTITIES:
-                selected, broker, plan = self._run_one(
+                selected, broker, plan, fixture, ranked_symbols = self._run_one(
                     monkeypatch,
                     ticker=ticker,
                     client_id=client_id,
                     execution_mode=execution_mode,
-                    direction=("CALL" if ticker != "BAC" else "PUT"),
                     generation=1,
                     attempt=1,
                 )
-                assert selected is None, f"{ticker} {label} unexpected selection"
+                recovery_rank = fixture["recovery_rank"]
+                if recovery_rank is None:
+                    assert selected is None, f"{ticker} {label} unexpected selection"
+                else:
+                    assert selected is not None, f"{ticker} {label} missed recovery"
+                    assert selected.contract_symbol == ranked_symbols[recovery_rank - 1]
                 assert broker.submit_order.call_count == 0, (
                     f"{ticker} {label} unexpected submit"
                 )
                 assert broker.cancel_order.call_count == 0, (
                     f"{ticker} {label} unexpected cancel"
                 )
-                failure = plan["metadata"]["selector_failure"]
-                assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED", (
-                    f"{ticker} {label} wrong final reason {failure['reason_code']}"
-                )
-                diagnostics = failure["selection_diagnostics"]
+                if selected is None:
+                    failure = plan["metadata"]["selector_failure"]
+                    assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED", (
+                        f"{ticker} {label} wrong final reason {failure['reason_code']}"
+                    )
+                    diagnostics = failure["selection_diagnostics"]
+                    assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
+                    assert (
+                        "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        not in failure["top_reject_buckets"]
+                    )
+                else:
+                    diagnostics = plan["metadata"]["selector_request_diagnostics"]
                 # Independent fresh budget: this request used exactly its
-                # configured 20 calls and left 0 remaining — nothing was
+                # configured 8 calls and left 0 remaining — nothing was
                 # inherited from a sibling identity or earlier ticker.
-                assert diagnostics["direct_quote_budget"]["used"] == 20
+                assert diagnostics["direct_quote_budget"]["used"] == 8
                 assert diagnostics["direct_quote_budget"]["remaining"] == 0
-                # Original chain-quality reasons must survive the budget
-                # exhaustion — not be masked by SELECTOR_REQUEST_*.
-                assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
-                assert (
-                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
-                    not in failure["top_reject_buckets"]
+                ranking = diagnostics["direct_quote_candidate_ranking"]
+                assert [r["symbol"] for r in ranking[:20]] == ranked_symbols
+                assert [r["rank"] for r in ranking[:20]] == list(range(1, 21))
+                expected_attempted = ranked_symbols[:8]
+                expected_skipped = ranked_symbols[8:12]
+                if selected is not None:
+                    assert any(
+                        call.args[0] == ranked_symbols[recovery_rank - 1]
+                        for call in broker.get_quote.call_args_list
+                    )
+                assert diagnostics["direct_quote_attempted_symbols"] == expected_attempted
+                assert diagnostics["direct_quote_unattempted_symbols"][:4] == (
+                    expected_skipped
                 )
                 replay_receipts.append({
                     "ticker": ticker,
                     "client_id": plan["client_id"],
                     "execution_mode": plan["execution_mode"],
                     "budget_used": diagnostics["direct_quote_budget"]["used"],
+                    "recovery_rank": recovery_rank,
                     "signal_id": plan["signal_id"],
                     "local_order_id": plan["local_order_id"],
                 })
@@ -1049,21 +1143,19 @@ class TestJuly23FleetAcceptanceReplay:
         share a selector budget. The second request's ``used`` is the
         exhaustion count for its own scope, not a residual from the
         first."""
-        _live_sel, live_broker, live_plan = self._run_one(
+        _live_sel, live_broker, live_plan, _fixture, _ranked = self._run_one(
             monkeypatch,
             ticker="COF",
             client_id="jasoncosby1@gmail.com",
             execution_mode="live",
-            direction="CALL",
             generation=1,
             attempt=1,
         )
-        _paper_sel, paper_broker, paper_plan = self._run_one(
+        _paper_sel, paper_broker, paper_plan, _fixture, _ranked = self._run_one(
             monkeypatch,
             ticker="COF",
             client_id="jose.vasquez4011@gmail.com",
             execution_mode="paper",
-            direction="CALL",
             generation=1,
             attempt=1,
         )
@@ -1072,8 +1164,8 @@ class TestJuly23FleetAcceptanceReplay:
         paper_diag = paper_plan["metadata"]["selector_failure"][
             "selection_diagnostics"]
         # Both requests exhaust their own budgets independently.
-        assert live_diag["direct_quote_budget"]["used"] == 20
-        assert paper_diag["direct_quote_budget"]["used"] == 20
+        assert live_diag["direct_quote_budget"]["used"] == 8
+        assert paper_diag["direct_quote_budget"]["used"] == 8
         # No cross-mode broker interaction leaked.
         assert live_broker.submit_order.call_count == 0
         assert paper_broker.submit_order.call_count == 0
