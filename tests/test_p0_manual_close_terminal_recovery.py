@@ -295,6 +295,41 @@ def test_concurrent_duplicate_recovery_produces_single_bound_result(monkeypatch)
     assert row["realized_pnl"] == 34.0
 
 
+# ═══ Persisted-truth finite-number gate (PR #386 amendment 2) ══════════════
+
+def test_persisted_truth_rejects_infinity_and_nan(monkeypatch):
+    """_validate_persisted_terminal_truth MUST reject +inf/-inf/NaN for
+    every numeric field entering proof, and MUST NOT write proof when
+    repair_terminal_proof_from_persisted encounters such a row."""
+    import math
+
+    for field, bad_value in [
+        ("avg_fill", math.inf),
+        ("avg_fill", -math.inf),
+        ("avg_fill", math.nan),
+        ("exit_price", math.inf),
+        ("exit_price", -math.inf),
+        ("exit_price", math.nan),
+        ("realized_pnl_pct", math.inf),
+        ("realized_pnl_pct", -math.inf),
+        ("realized_pnl_pct", math.nan),
+    ]:
+        row = _terminal_row(**{field: bad_value})
+        ok, reason = pm_mod._validate_persisted_terminal_truth(row)
+        assert ok is False, f"{field}={bad_value!r} should be rejected"
+        assert reason in {
+            "invalid_entry_price", "invalid_exit_price", "non_finite_pnl_pct",
+        }, f"{field}={bad_value!r} unexpected reason={reason}"
+
+        _install_pos_db(monkeypatch, {POSITION_ID: row})
+        apm = _APM(CLIENT)
+        ok, reason = apm.repair_terminal_proof_from_persisted(POSITION_ID)
+        assert ok is False, f"{field}={bad_value!r} recovery must refuse"
+        assert apm.ensure_calls == [], (
+            f"{field}={bad_value!r} must NOT reach _ensure_terminal_close_proof"
+        )
+
+
 # ═══ Serialized proof-binding lock (PR #386 blocker 3) ═════════════════════
 
 def test_terminal_proof_lock_serializes_overlapping_workers(monkeypatch):

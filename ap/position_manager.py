@@ -132,6 +132,7 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
     rather than becoming a polished-looking proof record.
     """
     from datetime import datetime as _dt
+    import math as _math
 
     if not isinstance(row, dict):
         return False, "row_not_dict"
@@ -156,10 +157,15 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
         return False, "unparseable_numeric"
     if qty <= 0:
         return False, "invalid_qty"
-    if avg_fill <= 0:
+    # PR #386 amendment 2: every numeric field entering canonical proof
+    # must be finite (rejects +inf, -inf, and NaN). A value that "looks"
+    # positive but is infinity would otherwise silently pass the >0 gate.
+    if not _math.isfinite(avg_fill) or avg_fill <= 0:
         return False, "invalid_entry_price"
-    if exit_price <= 0:
+    if not _math.isfinite(exit_price) or exit_price <= 0:
         return False, "invalid_exit_price"
+    if not _math.isfinite(pnl_pct):
+        return False, "non_finite_pnl_pct"
     entry_ts_str = str(row.get("entry_ts") or "").strip()
     exit_ts_str = str(row.get("exit_ts") or "").strip()
     if not entry_ts_str or not exit_ts_str:
@@ -171,8 +177,6 @@ def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
         return False, "unparseable_timestamps"
     if exit_dt < entry_dt:
         return False, "exit_before_entry"
-    if pnl_pct != pnl_pct:  # NaN guard
-        return False, "non_finite_pnl_pct"
     return True, "ok"
 
 
