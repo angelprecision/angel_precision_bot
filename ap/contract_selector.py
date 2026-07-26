@@ -1113,7 +1113,8 @@ def _order_chain_for_direct_quote_recovery(
             else None
         )
         valid_expiration = exp_date is not None and (dte is None or dte >= 0)
-        if strike is None or not underlying_price or opt_type != direction_norm:
+        valid_option_side = opt_type == direction_norm
+        if strike is None or not underlying_price or not valid_option_side:
             directional_fit = False
         elif direction_norm == "CALL":
             directional_fit = strike >= float(underlying_price)
@@ -1135,6 +1136,7 @@ def _order_chain_for_direct_quote_recovery(
             "delta": abs_delta,
             "delta_distance": delta_distance,
             "moneyness_distance_pct": moneyness_distance_pct,
+            "valid_option_side": valid_option_side,
             "directional_strike_fit": directional_fit,
             "preferred_strike_tier": preferred_strike_tier,
             "preferred_strike_distance": preferred_strike_distance,
@@ -1145,9 +1147,10 @@ def _order_chain_for_direct_quote_recovery(
         sort_key = (
             0 if _valid_occ_symbol(opt) else 1,
             0 if valid_expiration else 1,
-            0 if directional_fit else 1,
+            0 if valid_option_side else 1,
             preferred_strike_tier,
             preferred_strike_distance,
+            0 if directional_fit else 1,
             strike_distance if strike_distance is not None else float("inf"),
             delta_distance if delta_distance is not None else float("inf"),
             -(open_interest or 0),
@@ -1164,10 +1167,12 @@ def _order_chain_for_direct_quote_recovery(
     if request_context is not None:
         # ``direct_quote_structural_candidates`` counts rows that are at
         # least structurally direct-quotable — valid OCC symbol, valid
-        # expiration, and directional strike fit. Actual direct-quote
-        # eligibility depends on the chain reject reason being one that
-        # ``_should_revalidate(...)`` accepts, which is not known here
-        # at ordering time and gets counted in the quality-filter loop.
+        # expiration, and the requested CALL/PUT side. Current-underlying
+        # moneyness is a ranking preference only: a slightly ITM
+        # trigger-primary contract remains structurally quotable. Actual
+        # direct-quote eligibility depends on the chain reject reason being
+        # one that ``_should_revalidate(...)`` accepts, which is not known
+        # here and gets counted in the quality-filter loop.
         structural_rows = sum(
             1
             for sort_key, _, _ in rows
@@ -2643,6 +2648,31 @@ class APContractSelectionEngine:
             preferred_strikes=_preferred_strikes_for_quality_order,
         )
         if _preferred_strikes_for_quality_order:
+            def _candidate_order_identity(_opt: dict, _index: int) -> str:
+                _symbol = "".join(
+                    str(_opt.get("symbol") or _opt.get("contract") or "")
+                    .upper()
+                    .split()
+                )
+                if _symbol:
+                    return _symbol
+                return "|".join(
+                    (
+                        str(_opt.get("expiration_date") or _opt.get("expiration") or ""),
+                        str(_opt.get("option_type") or _opt.get("type") or ""),
+                        str(_opt.get("strike") or ""),
+                        str(_index),
+                    )
+                )
+
+            _original_ids = [
+                _candidate_order_identity(_opt, _index)
+                for _index, _opt in enumerate(chain)
+            ]
+            _final_ids = [
+                _candidate_order_identity(_opt, _index)
+                for _index, _opt in enumerate(_quality_chain)
+            ]
             _ordered_audit: list[dict] = []
             for _opt in _quality_chain:
                 _s = _safe_float(_opt.get("strike"))
@@ -2672,7 +2702,7 @@ class APContractSelectionEngine:
                     "strike_policy_tier": _tier,
                     "strike_policy_label": _label,
                 })
-            _preferred_strike_audit["reordered"] = True
+            _preferred_strike_audit["reordered"] = _original_ids != _final_ids
             _preferred_strike_audit["ordered_candidates"] = _ordered_audit
         try:
             if request_context is not None and isinstance(
@@ -3170,12 +3200,23 @@ class APContractSelectionEngine:
             # PR #396 amendment: on the direct (non-ladder) path, if the
             # playbook flag is on and the shared trigger-anchored authority
             # produced a preferred strike, build a compatible candidate context
-            # from that same authority so the final ranker prioritizes the
-            # trigger-anchored tier — closing the divergence between
-            # quote-spending order and final ranking.
+            # from the surviving contracts through that same authority. This
+            # avoids freezing tiers from the unfiltered chain: if the original
+            # primary and adjacent contracts fail hard gates, the nearest valid
+            # survivor becomes the recomputed primary just as it does on the
+            # ladder path.
             try:
-                _primary_strike = float(_preferred_strike_audit["primary_strike"])
-                _adjacent_strike = _preferred_strike_audit.get("adjacent_otm_strike")
+                _survivor_preference = resolve_trigger_anchored_preferred_strikes(
+                    side=direction,
+                    trigger_price=_safe_plan_attr(plan, "trigger_price", None),
+                    underlying_fallback=underlying_price,
+                    candidate_strikes=[opt.get("strike") for opt in survivors],
+                )
+                _primary_strike = _survivor_preference.primary_strike
+                if _primary_strike is None:
+                    raise ValueError("no valid survivor strike preference")
+                _primary_strike = float(_primary_strike)
+                _adjacent_strike = _survivor_preference.adjacent_otm_strike
                 _adjacent_strike = (
                     float(_adjacent_strike) if _adjacent_strike is not None else None
                 )
@@ -3228,8 +3269,8 @@ class APContractSelectionEngine:
                     "strike_band_low": min(_preferred_list),
                     "strike_band_high": max(_preferred_list),
                     "per_symbol": _per_symbol,
-                    "anchor_source": _preferred_strike_audit.get("anchor_source"),
-                    "anchor_price": _preferred_strike_audit.get("anchor_price"),
+                    "anchor_source": _survivor_preference.anchor_source,
+                    "anchor_price": _survivor_preference.anchor_price,
                 }
                 if request_context is not None:
                     request_context.playbook_candidate_context = dict(_playbook_candidate_ctx)

@@ -405,10 +405,31 @@ class TestBacPutDriftReplay:
         assert data_broker.get_quote.call_count == 1
         assert data_broker.get_quote.call_args.args[0] == quoted_symbol
         assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["direct_quote_structural_candidates"] == 3
         assert diagnostics["direct_quote_attempted_symbols"] == [quoted_symbol]
         assert diagnostics["direct_quote_unattempted_count"] >= 1
         assert skipped_symbol in diagnostics["direct_quote_unattempted_symbols"]
         assert quoted_symbol not in diagnostics["direct_quote_unattempted_symbols"]
+        assert result is not None
+        assert result.strike == 61.0
+
+    def test_crossed_61_put_receives_only_direct_quote_attempt(self, monkeypatch):
+        """The trigger-primary remains first after the underlying crosses below it."""
+        result, data_broker, quoted_symbol, skipped_symbol, diagnostics = (
+            _run_one_call_direct_quote_case(
+                monkeypatch,
+                side="PUT",
+                trigger=61.17,
+                underlying=60.60,
+            )
+        )
+
+        assert data_broker.get_quote.call_count == 1
+        assert data_broker.get_quote.call_args.args[0] == quoted_symbol
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["direct_quote_structural_candidates"] == 3
+        assert diagnostics["direct_quote_attempted_symbols"] == [quoted_symbol]
+        assert skipped_symbol in diagnostics["direct_quote_unattempted_symbols"]
         assert result is not None
         assert result.strike == 61.0
 
@@ -459,10 +480,31 @@ class TestBacCallDriftReplay:
         assert data_broker.get_quote.call_count == 1
         assert data_broker.get_quote.call_args.args[0] == quoted_symbol
         assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["direct_quote_structural_candidates"] == 3
         assert diagnostics["direct_quote_attempted_symbols"] == [quoted_symbol]
         assert diagnostics["direct_quote_unattempted_count"] >= 1
         assert skipped_symbol in diagnostics["direct_quote_unattempted_symbols"]
         assert quoted_symbol not in diagnostics["direct_quote_unattempted_symbols"]
+        assert result is not None
+        assert result.strike == 61.0
+
+    def test_crossed_61_call_receives_only_direct_quote_attempt(self, monkeypatch):
+        """The trigger-primary remains first after the underlying crosses above it."""
+        result, data_broker, quoted_symbol, skipped_symbol, diagnostics = (
+            _run_one_call_direct_quote_case(
+                monkeypatch,
+                side="CALL",
+                trigger=61.17,
+                underlying=61.60,
+            )
+        )
+
+        assert data_broker.get_quote.call_count == 1
+        assert data_broker.get_quote.call_args.args[0] == quoted_symbol
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["direct_quote_structural_candidates"] == 3
+        assert diagnostics["direct_quote_attempted_symbols"] == [quoted_symbol]
+        assert skipped_symbol in diagnostics["direct_quote_unattempted_symbols"]
         assert result is not None
         assert result.strike == 61.0
 
@@ -524,10 +566,9 @@ class TestMissingTriggerFallback:
         observed, _, engine, plan = _run_and_capture(
             ticker="BAC", side="PUT", trigger=None, underlying=61.60, chain=chain,
         )
-        # #389 structural validity remains ahead of preferred tier: the 62 PUT
-        # is above the underlying and therefore comes after directionally valid
-        # 61/60 rows even though it is nearest the fallback anchor.
-        assert observed == [61.0, 60.0, 62.0]
+        # CALL/PUT identity remains structural; current-underlying moneyness is
+        # secondary and cannot defeat the preferred fallback anchor.
+        assert observed == [62.0, 61.0, 60.0]
 
     def test_audit_reports_underlying_fallback_source(self):
         chain = [_tradier_row(s, side="PUT") for s in (60.0, 61.0, 62.0)]
@@ -559,7 +600,7 @@ class TestMissingTriggerFallback:
         assert "attempted_candidates" not in audit
         assert len(audit["ordered_candidates"]) == 3
         assert [row["strike"] for row in audit["ordered_candidates"]] == [
-            61.0, 60.0, 62.0,
+            62.0, 61.0, 60.0,
         ]
 
 
@@ -774,6 +815,64 @@ class TestGatePreservation:
         assert result.strike != 61.0
 
 
+class TestSurvivorPreferenceRecomputation:
+    """The direct path must rank the nearest valid survivors, not frozen tiers."""
+
+    def test_put_recomputes_primary_after_original_preferred_rows_fail(self):
+        chain = []
+        for strike in (59.0, 60.0, 61.0, 62.0):
+            row = _tradier_row(strike, side="PUT")
+            if strike in (60.0, 61.0):
+                row.update({"bid": 1.00, "ask": 1.30})
+            chain.append(row)
+
+        survivor_preference = resolve_trigger_anchored_preferred_strikes(
+            side="PUT",
+            trigger_price=61.17,
+            underlying_fallback=61.60,
+            candidate_strikes=[59.0, 62.0],
+        )
+        assert survivor_preference.primary_strike == 62.0
+
+        result, _, plan = _run_full_select(
+            ticker="BAC",
+            side="PUT",
+            trigger=61.17,
+            underlying=61.60,
+            chain=chain,
+        )
+
+        assert result is not None
+        assert result.strike == survivor_preference.primary_strike
+
+    def test_call_recomputes_primary_after_original_preferred_rows_fail(self):
+        chain = []
+        for strike in (60.0, 61.0, 62.0, 63.0):
+            row = _tradier_row(strike, side="CALL")
+            if strike in (61.0, 62.0):
+                row.update({"bid": 1.00, "ask": 1.30})
+            chain.append(row)
+
+        survivor_preference = resolve_trigger_anchored_preferred_strikes(
+            side="CALL",
+            trigger_price=61.17,
+            underlying_fallback=60.60,
+            candidate_strikes=[60.0, 63.0],
+        )
+        assert survivor_preference.primary_strike == 60.0
+
+        result, _, plan = _run_full_select(
+            ticker="BAC",
+            side="CALL",
+            trigger=61.17,
+            underlying=60.60,
+            chain=chain,
+        )
+
+        assert result is not None
+        assert result.strike == survivor_preference.primary_strike
+
+
 # ===========================================================================
 # Required test H — Pricing and side effects
 # ===========================================================================
@@ -887,6 +986,44 @@ class TestFlagOffLeavesChainOrderUntouched:
         assert [row["strike"] for row in ranking[:3]] == [60.0, 61.0, 62.0]
         assert ranking[0]["preferred_strike_tier"] == 0
         assert any(row["preferred_strike_tier"] > 0 for row in ranking[1:])
+
+
+class TestPreferredStrikeReorderAudit:
+    def test_reordered_false_when_provider_order_is_unchanged(self):
+        chain = [_tradier_row(s, side="PUT") for s in (61.0, 60.0, 62.0)]
+        _, _, _, plan = _run_and_capture(
+            ticker="BAC",
+            side="PUT",
+            trigger=61.17,
+            underlying=61.60,
+            chain=chain,
+        )
+
+        audit = plan["metadata"]["selector_request_diagnostics"][
+            "preferred_strike_ordering"
+        ]
+        assert audit["reordered"] is False
+        assert [row["strike"] for row in audit["ordered_candidates"]] == [
+            61.0, 60.0, 62.0,
+        ]
+
+    def test_reordered_true_when_provider_order_changes(self):
+        chain = [_tradier_row(s, side="PUT") for s in (60.0, 61.0, 62.0)]
+        _, _, _, plan = _run_and_capture(
+            ticker="BAC",
+            side="PUT",
+            trigger=61.17,
+            underlying=61.60,
+            chain=chain,
+        )
+
+        audit = plan["metadata"]["selector_request_diagnostics"][
+            "preferred_strike_ordering"
+        ]
+        assert audit["reordered"] is True
+        assert [row["strike"] for row in audit["ordered_candidates"]] == [
+            61.0, 60.0, 62.0,
+        ]
 
 
 class TestSharedAuthorityIsSingleSource:
