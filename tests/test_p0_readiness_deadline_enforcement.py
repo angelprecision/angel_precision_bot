@@ -362,6 +362,18 @@ def test_completed_overnight_success_skips_enforcement(rr_env):
     assert runner._entered_degraded == []
 
 
+def test_has_degraded_reason_key_without_lock_or_reason_set_returns_false(rr_env):
+    """Skeletal fixtures may bypass __init__ and omit degraded-state fields.
+    _has_degraded_reason_key must return False without raising."""
+    cr, _, _ = rr_env
+    runner = cr.ClientRunner.__new__(cr.ClientRunner)
+
+    assert runner._has_degraded_reason_key("preopen_readiness_blocked") is False
+
+    runner.degraded_reasons = set()
+    assert runner._has_degraded_reason_key("preopen_readiness_blocked") is False
+
+
 # ─── OK status clears prior degraded key ─────────────────────────────────────
 
 def test_readiness_ok_clears_prior_preopen_readiness_blocked_key(rr_env):
