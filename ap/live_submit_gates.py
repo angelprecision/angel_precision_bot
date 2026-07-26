@@ -106,6 +106,10 @@ class GateOutcome:
     PUT_NO_LONGER_BELOW_TRIGGER            = "PUT_NO_LONGER_BELOW_TRIGGER"
     PUT_STOP_ALREADY_BROKEN                = "PUT_STOP_ALREADY_BROKEN"
 
+    # PR #391 (blocker 2): provenance failure — quote_source unknown, blank,
+    # sandbox-only, or otherwise unproven. Bounded retry, not terminal.
+    CURRENT_PRICE_SOURCE_UNPROVEN          = "CURRENT_PRICE_SOURCE_UNPROVEN"
+
     # Trigger age gate (Gate 3)
     STALE_TRIGGER_BREACH                   = "STALE_TRIGGER_BREACH"
 
@@ -156,6 +160,25 @@ _HOLD_REASONS: frozenset[str] = frozenset({
     GateOutcome.CURRENT_PRICE_STALE,
     GateOutcome.CURRENT_PRICE_MISSING,
     GateOutcome.CURRENT_PRICE_ZERO,
+    GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN,
+})
+
+
+# PR #391 (blocker 2): source-identity denylist. A quote whose source is
+# blank, "unknown", or a known sandbox is not proven live-market truth and
+# must not authorize a broker POST — PAPER or LIVE. Bounded retry, not
+# terminal. Env-tunable (LIVE_SUBMIT_ALLOWED_QUOTE_SOURCES) but the default
+# denylist covers the concrete failure modes named in the postmortem.
+_UNPROVEN_SOURCES: frozenset[str] = frozenset({
+    "unknown",
+    "sandbox",
+    "sandbox_only",
+    "tradier_sandbox",
+    "sim",
+    "simbroker",
+    "sim_broker",
+    "mock",
+    "test",
 })
 
 
@@ -640,6 +663,17 @@ def check_market_validity_gate(
             f"quote_age_ms={effective_age_ms:.0f} > max={max_age_ms}",
         )
 
+    # PR #391 (blocker 2): source-identity enforcement. A quote whose source
+    # is blank, unknown, or sandbox is not proven live-market truth and must
+    # not authorize a submit — PAPER or LIVE. HOLD for bounded retry.
+    _source_lc = (str(quote_source or "").strip().lower())
+    if _source_lc in _UNPROVEN_SOURCES:
+        return _fail(
+            GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN,
+            f"quote_source={quote_source!r} is unproven "
+            "(blank/unknown/sandbox) — refuse to authorize submit",
+        )
+
     _side = str(side or "").strip().upper()
     tr = _finite_float(trigger_price)
     tg = _finite_float(target_price)
@@ -651,18 +685,16 @@ def check_market_validity_gate(
     if stop_price is not None and st is None:
         return _fail(GateOutcome.CURRENT_PRICE_INVALID, f"stop_price={stop_price!r}")
 
-    # Rule: direction-specific geometry
-    # Amendment 3 (PR #305): use ASK (CALL) / BID (PUT) as primary trigger-
-    # lane check — matching WatchedSignal.check breach semantics exactly.
-    # Mid is only used as fallback when bid/ask missing, and for stop/target
-    # geometry (which is symmetric on both sides).
+    # Rule: direction-specific geometry.
+    # PR #391 (blocker 1): terminal geometry (stop broken, target complete)
+    # MUST be evaluated before temporary direction reversal. A price beyond
+    # the stop line is not a re-armable reversal — it is a completed setup
+    # failure. Same for a price beyond the target.
+    #
+    # PR #305: use ASK (CALL) / BID (PUT) as the trigger-lane check, matching
+    # WatchedSignal.check breach semantics. Mid is used for stop/target
+    # geometry, which is symmetric on both sides.
     if _side == "CALL":
-        _trigger_check = ask if ask and ask > 0 else mid
-        if _trigger_check is not None and _trigger_check < tr:
-            return _fail(
-                GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
-                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
-            )
         if st is not None and st > 0 and mid is not None and mid <= st:
             return _fail(
                 GateOutcome.CALL_STOP_ALREADY_BROKEN,
@@ -673,13 +705,13 @@ def check_market_validity_gate(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"CALL mid={mid:.4f} >= target={tg:.4f} — move complete",
             )
-    elif _side == "PUT":
-        _trigger_check = bid if bid and bid > 0 else mid
-        if _trigger_check is not None and _trigger_check > tr:
+        _trigger_check = ask if ask and ask > 0 else mid
+        if _trigger_check is not None and _trigger_check < tr:
             return _fail(
-                GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
-                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
+                GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
+                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
             )
+    elif _side == "PUT":
         if st is not None and st > 0 and mid is not None and mid >= st:
             return _fail(
                 GateOutcome.PUT_STOP_ALREADY_BROKEN,
@@ -689,6 +721,12 @@ def check_market_validity_gate(
             return _fail(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"PUT mid={mid:.4f} <= target={tg:.4f} — move complete",
+            )
+        _trigger_check = bid if bid and bid > 0 else mid
+        if _trigger_check is not None and _trigger_check > tr:
+            return _fail(
+                GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
             )
     # Unknown side: pass (identity gate would have blocked this earlier)
 

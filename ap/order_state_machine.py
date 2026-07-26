@@ -1805,18 +1805,56 @@ class APOrderStateMachine:
         *,
         reason_code: str,
         gate_audit: Optional[dict] = None,
+        retry_after_seconds: Optional[int] = None,
+        max_attempts: Optional[int] = None,
     ) -> bool:
         """PR #391 — HOLD_MARKET_TRUTH_UNAVAILABLE.
 
         Underlying quote is missing/stale/malformed/unknown-source. Zero
-        broker POSTs occur. No terminalization — the row remains owned by
-        the existing deferred materialization retry lifecycle, with durable
-        metadata describing the hold so restart paths can resume.
+        broker POSTs occur. No terminalization.
+
+        PR #391 (blocker 3): the row is durably placed on the existing
+        deferred materialization RETRY_WAIT lifecycle with a bounded
+        not-before time so a future owner is guaranteed:
+          * lifecycle_state = RETRY_WAIT
+          * next_retry_at / materialization_next_retry_at = now + delay
+          * retry_attempt incremented
+          * retry_max_attempts capped
+          * original absolute_entry_deadline preserved
+          * submit ownership cleared so the retry loop can reclaim
         """
         import json as _json_local
         _rc = str(reason_code or "").strip()
         _audit = dict(gate_audit or {})
-        _now = datetime.now(timezone.utc).isoformat()
+        _now_dt = datetime.now(timezone.utc)
+        _now = _now_dt.isoformat()
+
+        try:
+            _delay_s = int(retry_after_seconds) if retry_after_seconds is not None \
+                else max(1, int(os.getenv("SUBMIT_HOLD_RETRY_AFTER_SEC", "30")))
+        except (TypeError, ValueError):
+            _delay_s = 30
+        try:
+            _max_att = int(max_attempts) if max_attempts is not None \
+                else max(1, int(os.getenv("SUBMIT_HOLD_MAX_ATTEMPTS", "10")))
+        except (TypeError, ValueError):
+            _max_att = 10
+        _not_before = (_now_dt + timedelta(seconds=_delay_s)).isoformat()
+
+        # Fetch current attempt count (best-effort; default 1 if not read).
+        _current_attempt = 1
+        try:
+            _existing = self._get_order(local_order_id) or {}
+            _emeta = _existing.get("meta") or {}
+            if isinstance(_emeta, str):
+                try:
+                    _emeta = json.loads(_emeta)
+                except Exception:
+                    _emeta = {}
+            _current_attempt = int(_emeta.get("submit_hold_attempt") or 0) + 1
+        except Exception:
+            _current_attempt = 1
+        _current_attempt = min(_current_attempt, _max_att)
 
         meta_patch: dict = {
             "final_market_truth_status":       "HOLD_MARKET_TRUTH_UNAVAILABLE",
@@ -1826,6 +1864,20 @@ class APOrderStateMachine:
             "watcher_rearm_required":          False,
             "retryable":                       True,
             "terminal":                        False,
+            # Bounded retry state on the existing deferred lifecycle.
+            "lifecycle_state":                 "RETRY_WAIT",
+            "materialization_status":          "RETRY_PENDING",
+            "materialization_in_flight":       False,
+            "next_retry_at":                   _not_before,
+            "materialization_next_retry_at":   _not_before,
+            "submit_hold_attempt":             _current_attempt,
+            "submit_hold_max_attempts":        _max_att,
+            "submit_hold_last_reason":         _rc or "HOLD",
+            "submit_hold_last_at":             _now,
+            # Clear active submission ownership so the retry loop can reclaim.
+            "submit_intent_owner":             None,
+            "broker_ready_owner":              None,
+            "submit_started_at":               None,
         }
         try:
             _patch_json = _json_local.dumps(meta_patch, default=str)
@@ -1853,8 +1905,16 @@ class APOrderStateMachine:
             ok = bool(rowcount and rowcount > 0)
             if ok:
                 log.info(
-                    "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE order=%s reason=%s",
+                    "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE order=%s reason=%s "
+                    "attempt=%d/%d next_retry_at=%s",
                     self.client_id, local_order_id, _rc,
+                    _current_attempt, _max_att, _not_before,
+                )
+            else:
+                log.warning(
+                    "[%s] hold_entry_for_market_truth_unavailable: no eligible row "
+                    "order=%s (may have advanced past PENDING_TRIGGER or already broker-owned)",
+                    self.client_id, local_order_id,
                 )
             return ok
         except Exception as exc:

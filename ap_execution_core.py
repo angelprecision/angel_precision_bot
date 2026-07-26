@@ -49,6 +49,40 @@ log = logging.getLogger("ap.execution_core")
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 
 
+def _safe_reread_market_truth(osm, local_order_id: str) -> tuple[str | None, str | None]:
+    """PR #391 (blocker 4): reread the order after a REARM/HOLD write returned
+    False. Returns (authority_or_none, reason).
+
+    A False return means: no row was updated. The reason may be benign — a
+    peer already rearmed, or the row advanced to broker POST. Only proven
+    terminal geometry (or missing-row) may terminalize; everything else is
+    retryable HOLD.
+
+    Reasons: "broker_evidence_present", "row_missing", "unchanged", or None.
+    """
+    try:
+        row = None
+        if hasattr(osm, "get_order"):
+            row = osm.get_order(local_order_id)
+        if not row:
+            return (None, "row_missing")
+        broker_id = str(row.get("broker_order_id") or "").strip()
+        submitted_ts = row.get("submitted_ts")
+        if broker_id or submitted_ts:
+            return (None, "broker_evidence_present")
+        meta = row.get("meta") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _json
+                meta = _json.loads(meta)
+            except Exception:
+                meta = {}
+        authority = str(meta.get("final_market_truth_status") or "").strip() or None
+        return (authority, "unchanged")
+    except Exception:
+        return (None, "unchanged")
+
+
 def _normalize_execution_mode(value) -> str | None:
     mode = str(value or "").strip().lower()
     return mode if mode in _VALID_EXECUTION_MODES else None
@@ -6966,36 +7000,59 @@ class APExecutionCore:
             _mv_quote_source = None
             _mv_quote_fetched_at = None
             _mv_quote_provenance = None
+            _mv_provider_ts = None            # PR #391 (blocker 2): true provider ts
+            _mv_received_at = None            # PR #391 (blocker 2): local receipt ts
             _mv_quote_fetch_failed = True
             _mv_quote_fetch_error = "quote_adapter_unavailable"
             try:
-                _mv_q: dict = {}
+                # PR #391 (blocker 2): PAPER data-domain requirement.
+                # PAPER execution may remain sandbox, but market truth must
+                # come from the live data broker. Prefer self.data_broker
+                # over self.broker so a sandbox execution adapter never
+                # doubles as market-truth authority. LIVE keeps preferring
+                # broker.get_quote (primary production path).
+                _quote_sources = []
+                _data_broker = getattr(self, "data_broker", None)
+                if _gate_is_live:
+                    if hasattr(self.broker, "get_quote"):
+                        _quote_sources.append(("broker.get_quote", self.broker.get_quote))
+                    if _data_broker is not None and _data_broker is not self.broker \
+                       and hasattr(_data_broker, "get_quote"):
+                        _quote_sources.append(("data_broker.get_quote", _data_broker.get_quote))
+                else:
+                    # PAPER: live data broker first, execution broker is
+                    # sandbox and must not authorize submit truth.
+                    if _data_broker is not None and _data_broker is not self.broker \
+                       and hasattr(_data_broker, "get_quote"):
+                        _quote_sources.append(("data_broker.get_quote", _data_broker.get_quote))
+                    # PAPER fallback: broker.get_quote only when no separate
+                    # data broker is wired. The gate's source-identity check
+                    # will still reject sandbox strings.
+                    if not _quote_sources and hasattr(self.broker, "get_quote"):
+                        _quote_sources.append(("broker.get_quote", self.broker.get_quote))
+                # Alternate adapter shapes (both modes)
+                if not _quote_sources and hasattr(self.broker, "get_bid_ask"):
+                    _quote_sources.append(("broker.get_bid_ask", self.broker.get_bid_ask))
+                if not _quote_sources and hasattr(self.broker, "quote"):
+                    _quote_sources.append(("broker.quote", self.broker.quote))
+
                 _mv_raw_q = None
-                # Method 1: broker.get_quote() — primary production path
-                if hasattr(self.broker, "get_quote"):
-                    _mv_raw_q = self.broker.get_quote(ticker)
-                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
-                # Method 2: broker.get_bid_ask() — alternate production adapter
-                elif hasattr(self.broker, "get_bid_ask"):
-                    _ba = self.broker.get_bid_ask(ticker)
-                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
-                    if isinstance(_ba, dict):
-                        _mv_raw_q = {
-                            "bid": _ba.get("bid"),
-                            "ask": _ba.get("ask"),
-                            "quote_age_ms": _ba.get("quote_age_ms"),
-                            "source": _ba.get("source", "get_bid_ask"),
+                _adapter_name = None
+                for _adapter_name, _fetch in _quote_sources:
+                    _mv_received_at = datetime.now(timezone.utc).isoformat()
+                    _mv_quote_fetched_at = _mv_received_at
+                    _r = _fetch(ticker)
+                    if _adapter_name == "broker.get_bid_ask" and isinstance(_r, dict):
+                        _r = {
+                            "bid": _r.get("bid"),
+                            "ask": _r.get("ask"),
+                            "quote_age_ms": _r.get("quote_age_ms"),
+                            "source": _r.get("source", "get_bid_ask"),
+                            "provider_timestamp": _r.get("provider_timestamp"),
                         }
-                    else:
-                        _mv_raw_q = _ba
-                # Method 3: broker.quote() — older adapter shape
-                elif hasattr(self.broker, "quote"):
-                    _mv_raw_q = self.broker.quote(ticker)
-                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
-                # Method 4: data_broker attr (paper pods may wire data separately)
-                elif hasattr(self, "data_broker") and hasattr(self.data_broker, "get_quote"):
-                    _mv_raw_q = self.data_broker.get_quote(ticker)
-                    _mv_quote_fetched_at = datetime.now(timezone.utc).isoformat()
+                    if isinstance(_r, dict):
+                        _mv_raw_q = _r
+                        break
 
                 if isinstance(_mv_raw_q, dict):
                     _mv_q = _mv_raw_q
@@ -7011,10 +7068,24 @@ class APExecutionCore:
                         or _mv_q.get("provider")
                         or "unknown"
                     )
+                    # True provider timestamp when supplied by the adapter;
+                    # NEVER a rewrite of the local receipt time. Missing
+                    # provider ts is fine as long as quote_age_ms is present
+                    # or the synchronous_submit_fetch provenance certifies
+                    # freshness.
+                    _mv_provider_ts = (
+                        _mv_q.get("provider_timestamp")
+                        or _mv_q.get("provider_ts")
+                        or _mv_q.get("quote_time")
+                        or None
+                    )
                 elif _mv_quote_fetched_at is not None:
                     _mv_quote_fetch_error = (
                         f"invalid_quote_response_type:{type(_mv_raw_q).__name__}"
                     )
+                elif not _quote_sources and not _gate_is_live:
+                    # PAPER with no live data source and no fallback adapter.
+                    _mv_quote_fetch_error = "paper_live_data_broker_unavailable"
             except Exception as _mv_exc:
                 _mv_quote_fetch_failed = True
                 _mv_quote_fetch_error = f"{type(_mv_exc).__name__}:{_mv_exc}"
@@ -7061,8 +7132,12 @@ class APExecutionCore:
                     "final_market_truth_reason_code": _mv_res.reason_code,
                     "final_market_truth_checked_at":  _mv_res.audit.get("checked_at"),
                     "underlying_price":               _mv_res.audit.get("current_mid"),
-                    "underlying_provider_timestamp":  _mv_res.audit.get("quote_fetched_at"),
-                    "underlying_received_at":        _mv_res.audit.get("checked_at"),
+                    # PR #391 (blocker 2): split provider ts from local
+                    # receipt ts. Never label the local fetch time as the
+                    # provider timestamp — provider ts is None when the
+                    # adapter did not supply one.
+                    "underlying_provider_timestamp":  _mv_provider_ts,
+                    "underlying_received_at":         _mv_received_at,
                     "underlying_source":              _mv_res.audit.get("quote_source"),
                     "trigger_price":                  _mv_res.audit.get("trigger_price"),
                     "stop_underlying":                _mv_res.audit.get("stop_price"),
@@ -7093,8 +7168,8 @@ class APExecutionCore:
                         )
                     except Exception as _rearm_exc:
                         log.warning(
-                            "[%s] REARM_DIRECTION_REVERSAL failed order=%s error=%s — "
-                            "falling back to terminalize",
+                            "[%s] REARM_DIRECTION_REVERSAL raised order=%s error=%s "
+                            "— will reread before deciding what to do",
                             ticker, str(queue_local_order_id or ""), _rearm_exc,
                         )
                     try:
@@ -7119,16 +7194,47 @@ class APExecutionCore:
                     if _rearmed:
                         # Zero broker POST. Setup returned to watcher on same identity.
                         return
-                    # Rearm not eligible (row advanced) — fall through to terminalize.
-                    _terminalize_breach_failure(f"live_submit_gate:{_mv_res.reason_code}")
-                    return
-
-                if _authority == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE:
+                    # PR #391 (blocker 4): a False return does NOT authorize
+                    # terminalize. Reread first — the row may already have
+                    # rearmed under another worker, or may have advanced to
+                    # broker submission, or the CAS may simply have lost a
+                    # benign race. Only proven terminal geometry terminalizes.
+                    _reread_authority, _reread_reason = _safe_reread_market_truth(
+                        self.order_state_machine, str(queue_local_order_id or "")
+                    )
+                    if _reread_authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
+                        # Someone else already rearmed. Success.
+                        return
+                    if _reread_reason == "broker_evidence_present":
+                        # Row advanced to broker POST under another worker — do NOT terminalize.
+                        return
+                    # Persistence genuinely failed and the row is still
+                    # unsubmitted — fall through to a retryable HOLD instead
+                    # of a blind terminalize.
+                    log.critical(
+                        "[%s] REARM_DIRECTION_REVERSAL persist failed and row unadvanced "
+                        "order=%s reason=%s — degrading to HOLD (retryable), not terminal",
+                        ticker, str(queue_local_order_id or ""), _mv_res.reason_code,
+                    )
                     try:
                         self.order_state_machine.hold_entry_for_market_truth_unavailable(
                             str(queue_local_order_id or ""),
-                            reason_code=_mv_res.reason_code,
+                            reason_code="REARM_PERSIST_FAILED",
                             gate_audit=_mv_res.audit,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                if _authority == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE:
+                    _held = False
+                    try:
+                        _held = bool(
+                            self.order_state_machine.hold_entry_for_market_truth_unavailable(
+                                str(queue_local_order_id or ""),
+                                reason_code=_mv_res.reason_code,
+                                gate_audit=_mv_res.audit,
+                            )
                         )
                     except Exception as _hold_exc:
                         log.warning(
@@ -7153,6 +7259,21 @@ class APExecutionCore:
                             "[%s] SUBMIT_MARKET_TRUTH_AUDIT_WRITE_FAILED gate=market_validity "
                             "authority=%s order_id=%s error=%s — no POST attempted",
                             ticker, _authority, str(queue_local_order_id or ""), _mv_meta_exc,
+                        )
+                    if not _held:
+                        # PR #391 (blocker 4): reread — do not terminalize
+                        # if the row already advanced or a peer already held.
+                        _r_auth, _r_reason = _safe_reread_market_truth(
+                            self.order_state_machine, str(queue_local_order_id or "")
+                        )
+                        if _r_reason == "broker_evidence_present":
+                            return
+                        if _r_auth == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE:
+                            return
+                        log.critical(
+                            "[%s] HOLD persist failed and row unadvanced order=%s reason=%s "
+                            "— leaving in place for the next retry sweep (no terminalize)",
+                            ticker, str(queue_local_order_id or ""), _mv_res.reason_code,
                         )
                     # Zero broker POST. Existing deferred retry lifecycle owns the retry.
                     return
@@ -7299,8 +7420,9 @@ class APExecutionCore:
                     "final_market_truth_reason_code": GateOutcome.PASS,
                     "final_market_truth_checked_at":  _mv_res.audit.get("checked_at"),
                     "underlying_price":               _mv_res.audit.get("current_mid"),
-                    "underlying_provider_timestamp":  _mv_res.audit.get("quote_fetched_at"),
-                    "underlying_received_at":        _mv_res.audit.get("checked_at"),
+                    # PR #391 (blocker 2): split provider vs receipt.
+                    "underlying_provider_timestamp":  _mv_provider_ts,
+                    "underlying_received_at":         _mv_received_at,
                     "underlying_source":              _mv_res.audit.get("quote_source"),
                     "trigger_price":                  _mv_res.audit.get("trigger_price"),
                     "stop_underlying":                _mv_res.audit.get("stop_price"),

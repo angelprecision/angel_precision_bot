@@ -151,38 +151,36 @@ class TestValidRebreachAfterRearm:
 
 
 class TestTerminalConditions:
-    """5. Stop already broken. 6. Target already complete."""
+    """5. Stop already broken. 6. Target already complete.
+
+    PR #391 (blocker 1): stop-broken and target-complete are evaluated
+    BEFORE trigger reversal. A price beyond both the trigger and the stop
+    must terminalize (broken stop), not re-arm."""
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
-    def test_5_call_stop_already_broken_is_terminal(self, mode):
-        # CALL trigger 100 with stop 95. Current mid 94.5 → below stop.
-        # The gate checks trigger first (94.5 < 100) → CALL_NO_LONGER_ABOVE_TRIGGER;
-        # but with a mid that is at trigger, the stop is what fires. Use
-        # trigger=94 so the trigger check passes and the stop check fires.
-        r = _gate(mode, side="CALL", trigger_price=94.0, stop_price=95.0,
-                  target_price=105.0, current_bid=94.90, current_ask=94.95,
+    def test_5_call_stop_already_broken_is_terminal_exact(self, mode):
+        # CALL trigger 100, stop 95. Current mid 94.5 is beyond BOTH the
+        # trigger and the stop. Under the fixed ordering, the stop reason
+        # fires — never the reversal reason.
+        r = _gate(mode, side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0, current_bid=94.45, current_ask=94.55,
                   quote_age_ms=100, quote_source="live_broker",
                   quote_provenance="synchronous_submit_fetch")
         assert r.passed is False
-        # The audit + classification decide terminality regardless of which
-        # geometry rule fired first — both stop-broken and reversed are non-PASS.
-        assert classify_market_truth(r.reason_code) in (
-            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE,
-            MarketTruthAuthority.REARM_DIRECTION_REVERSAL,
-        )
+        assert r.reason_code == GateOutcome.CALL_STOP_ALREADY_BROKEN
+        assert classify_market_truth(r.reason_code) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
-    def test_5_put_stop_already_broken_is_terminal(self, mode):
-        # PUT trigger 106, stop 105. Current mid 105.5 → above stop → broken.
-        r = _gate(mode, side="PUT", trigger_price=106.0, stop_price=105.0,
-                  target_price=95.0, current_bid=105.40, current_ask=105.60,
+    def test_5_put_stop_already_broken_is_terminal_exact(self, mode):
+        # PUT trigger 100, stop 105. Current mid 105.5 is beyond BOTH the
+        # trigger and the stop. Stop reason must fire, not reversal.
+        r = _gate(mode, side="PUT", trigger_price=100.0, stop_price=105.0,
+                  target_price=90.0, current_bid=105.45, current_ask=105.55,
                   quote_age_ms=100, quote_source="live_broker",
                   quote_provenance="synchronous_submit_fetch")
         assert r.passed is False
-        assert classify_market_truth(r.reason_code) in (
-            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE,
-            MarketTruthAuthority.REARM_DIRECTION_REVERSAL,
-        )
+        assert r.reason_code == GateOutcome.PUT_STOP_ALREADY_BROKEN
+        assert classify_market_truth(r.reason_code) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
     def test_6_call_target_complete_is_terminal(self, mode):
@@ -193,6 +191,7 @@ class TestTerminalConditions:
                   quote_source="live_broker",
                   quote_provenance="synchronous_submit_fetch")
         assert r.passed is False
+        assert r.reason_code == GateOutcome.TARGET_ALREADY_INVALID
         assert classify_market_truth(r.reason_code) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
 
 
@@ -417,6 +416,10 @@ def osm(monkeypatch):
     monkeypatch.setattr(osm_mod, "run_with_retry", _run_with_retry)
 
     instance = osm_mod.APOrderStateMachine("CLIENT_A")
+    # HOLD needs to read the existing order to increment attempt count.
+    def _get_order(_loid):
+        return {"local_order_id": _loid, "client_id": "CLIENT_A", "meta": {}}
+    instance._get_order = _get_order
     instance._fake_conn = fake  # for assertions
     return instance
 
@@ -463,11 +466,16 @@ class TestOSMRearmAuthority:
 
 
 class TestOSMHoldAuthority:
-    def test_hold_writes_durable_hold_fields_without_terminalizing(self, osm):
+    def test_hold_writes_durable_hold_fields_with_retry_liveness(self, osm):
+        """PR #391 (blocker 3): HOLD must schedule a real future owner —
+        RETRY_WAIT lifecycle, bounded next_retry_at, capped attempts —
+        not just stamp metadata."""
         ok = osm.hold_entry_for_market_truth_unavailable(
             "LOID-2",
             reason_code=GateOutcome.CURRENT_PRICE_STALE,
             gate_audit={"quote_age_ms": 30_000},
+            retry_after_seconds=45,
+            max_attempts=5,
         )
         assert ok is True
         assert len(osm._fake_conn.executed) == 1
@@ -478,6 +486,133 @@ class TestOSMHoldAuthority:
         assert patch["final_market_truth_reason_code"] == GateOutcome.CURRENT_PRICE_STALE
         assert patch["retryable"] is True
         assert patch["terminal"] is False
-        # Hold must NOT clear submit ownership — retry keeps ownership
-        # inside the existing deferred materialization lifecycle.
-        assert "submit_intent_owner" not in patch or patch["submit_intent_owner"] is None
+        # Retry liveness fields are present and coherent.
+        assert patch["lifecycle_state"] == "RETRY_WAIT"
+        assert patch["materialization_status"] == "RETRY_PENDING"
+        assert patch["materialization_in_flight"] is False
+        assert patch["next_retry_at"], "HOLD must schedule a future retry time"
+        assert patch["materialization_next_retry_at"] == patch["next_retry_at"]
+        assert patch["submit_hold_max_attempts"] == 5
+        assert 1 <= patch["submit_hold_attempt"] <= 5
+        assert patch["submit_hold_last_reason"] == GateOutcome.CURRENT_PRICE_STALE
+        assert patch["submit_hold_last_at"]
+        # Submit ownership is cleared so the retry loop can reclaim.
+        assert patch["submit_intent_owner"] is None
+        assert patch["broker_ready_owner"] is None
+        assert patch["submit_started_at"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 blocker 2: PAPER live-data provenance is enforced by the gate.
+# quote_source values that are blank, "unknown", or sandbox-family strings
+# must fail closed with CURRENT_PRICE_SOURCE_UNPROVEN → HOLD.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestProvenanceEnforcement:
+    @pytest.mark.parametrize("bad_source", [
+        "unknown", "sandbox", "sandbox_only", "tradier_sandbox",
+        "sim", "SimBroker", "MOCK", "test",
+    ])
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_unproven_source_holds_in_both_modes(self, mode, bad_source):
+        r = _gate(mode,
+                  side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0,
+                  current_bid=100.95, current_ask=101.05,
+                  quote_age_ms=100,
+                  quote_source=bad_source,
+                  quote_provenance="synchronous_submit_fetch")
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+        assert classify_market_truth(r.reason_code) == (
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+        )
+
+    def test_proven_live_source_passes(self):
+        r = _gate("paper",
+                  side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0,
+                  current_bid=100.95, current_ask=101.05,
+                  quote_age_ms=100,
+                  quote_source="live_broker",
+                  quote_provenance="synchronous_submit_fetch")
+        assert r.passed is True
+        assert r.reason_code == GateOutcome.PASS
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 blocker 4: failed rearm/hold write is NOT blindly terminalized —
+# execution core rereads first. Verify the reread helper does the right thing.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestFailedRearmReread:
+    def test_reread_detects_peer_rearm(self):
+        from ap_execution_core import _safe_reread_market_truth
+        osm = MagicMock()
+        osm.get_order.return_value = {
+            "broker_order_id": None,
+            "submitted_ts": None,
+            "meta": {"final_market_truth_status": MarketTruthAuthority.REARM_DIRECTION_REVERSAL},
+        }
+        authority, reason = _safe_reread_market_truth(osm, "LOID-x")
+        assert authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL
+        assert reason == "unchanged"
+
+    def test_reread_detects_broker_evidence(self):
+        from ap_execution_core import _safe_reread_market_truth
+        osm = MagicMock()
+        osm.get_order.return_value = {
+            "broker_order_id": "BR-42",
+            "submitted_ts": "2026-07-26T15:00:00+00:00",
+            "meta": {},
+        }
+        authority, reason = _safe_reread_market_truth(osm, "LOID-x")
+        assert reason == "broker_evidence_present"
+
+    def test_reread_missing_row(self):
+        from ap_execution_core import _safe_reread_market_truth
+        osm = MagicMock()
+        osm.get_order.return_value = None
+        authority, reason = _safe_reread_market_truth(osm, "LOID-x")
+        assert reason == "row_missing"
+
+    def test_reread_swallows_osm_exceptions(self):
+        from ap_execution_core import _safe_reread_market_truth
+        osm = MagicMock()
+        osm.get_order.side_effect = RuntimeError("db down")
+        # Must never raise — a bug in reread cannot cause a terminalize.
+        authority, reason = _safe_reread_market_truth(osm, "LOID-x")
+        assert authority is None
+        assert reason == "unchanged"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 blocker 1: stop-broken is evaluated BEFORE direction reversal.
+# A price beyond both the trigger AND the stop must terminalize, not rearm.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestStopBeforeReversal:
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_call_beyond_trigger_and_stop_is_stop_broken(self, mode):
+        # trigger=100, stop=95, current mid 94.5 (also < trigger)
+        r = _gate(mode, side="CALL", trigger_price=100.0, stop_price=95.0,
+                  target_price=110.0,
+                  current_bid=94.45, current_ask=94.55,
+                  quote_age_ms=100, quote_source="live_broker",
+                  quote_provenance="synchronous_submit_fetch")
+        assert r.reason_code == GateOutcome.CALL_STOP_ALREADY_BROKEN
+        assert classify_market_truth(r.reason_code) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    def test_put_beyond_trigger_and_stop_is_stop_broken(self, mode):
+        # trigger=100, stop=105, current mid 105.5 (also > trigger)
+        r = _gate(mode, side="PUT", trigger_price=100.0, stop_price=105.0,
+                  target_price=90.0,
+                  current_bid=105.45, current_ask=105.55,
+                  quote_age_ms=100, quote_source="live_broker",
+                  quote_provenance="synchronous_submit_fetch")
+        assert r.reason_code == GateOutcome.PUT_STOP_ALREADY_BROKEN
+        assert classify_market_truth(r.reason_code) == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE

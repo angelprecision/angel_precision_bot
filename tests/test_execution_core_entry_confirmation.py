@@ -400,12 +400,18 @@ def test_enforce_missing_continuation_blocks_and_expires_pending_entry(monkeypat
 
 
 def test_observe_failed_continuation_with_data_submits_and_records_would_block(monkeypatch):
+    # PR #391: keep the underlying above the CALL trigger so the final
+    # market-validity gate passes (it now blocks reversed direction in
+    # PAPER as in LIVE). The daily-continuation observe-mode semantic
+    # under test is orthogonal to market truth — with failing candles the
+    # continuation still records would_block=True and the submit still
+    # proceeds because observe mode does not enforce.
     result = _run_entry_trigger(
         monkeypatch,
         mode="observe",
         confirmation_required=False,
         candles=_failing_candles(),
-        underlying_last=99.60,
+        underlying_last=100.90,
     )
 
     result["osm"].submit_existing_entry.assert_called_once()

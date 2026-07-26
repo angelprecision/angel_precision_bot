@@ -380,10 +380,20 @@ class TestAmendment6QuoteAdapter:
         assert age is None, "quote_age_ms must be None when unavailable — do not fake freshness"
 
     def test_6_execution_core_has_four_method_chain(self):
-        """A6: execution_core must contain all 4 quote methods in the gate section."""
+        """A6: execution_core must reference all 4 quote-adapter names in
+        the gate section. PR #391 refactored the chain from an if/elif
+        cascade into a data-driven list, so the check is on adapter name
+        presence rather than a specific call-syntax literal."""
         src = open("ap_execution_core.py").read()
         assert "get_bid_ask" in src, "A6: get_bid_ask fallback must be in execution_core"
-        assert "self.broker.quote(" in src or 'broker.quote(' in src, "A6: quote() fallback must be present"
+        # quote() adapter is referenced by its attribute name; check either
+        # the historical call literal or the new attribute reference.
+        assert (
+            "self.broker.quote(" in src
+            or 'broker.quote(' in src
+            or 'self.broker.quote' in src
+            or '"broker.quote"' in src
+        ), "A6: quote() fallback adapter must be referenced"
         assert "data_broker" in src, "A6: data_broker fallback must be present"
 
 
