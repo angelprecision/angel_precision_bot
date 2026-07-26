@@ -2125,21 +2125,18 @@ class ClientRunner(threading.Thread):
                     f"keys={sorted(list(readiness.keys()))!r}",
                 )
 
-            # Step E: interpret the result. Guarded because .get() on values
-            # a downstream stub may have set to non-str is fine, but the
-            # comparison itself could still raise on adversarial subclasses.
+            # Step E: interpret via the shared PR #394 validator.
+            # PR #395: this closes the recovery gap where a LIVE runner
+            # fail-closed at startup (preopen_readiness_enforcement_failed:
+            # startup:*) could not be unfrozen by a later healthy readiness
+            # result — the previous custom interpretation only cleared
+            # `preopen_readiness_blocked`. The shared validator's OK path
+            # calls `_clear_preopen_readiness_degraded_reasons()` which
+            # clears BOTH reason families.
             try:
-                _status = readiness.get("status")
-                _ok     = bool(readiness.get("ok"))
-                if is_live:
-                    if _status == "BLOCKED":
-                        _err_list = readiness.get("errors") or ["unknown"]
-                        self._enter_degraded_mode(
-                            "preopen_readiness_blocked:"
-                            + ",".join(str(e) for e in _err_list)
-                        )
-                    elif _ok:
-                        self._clear_degraded_reason_key("preopen_readiness_blocked")
+                readiness = self._enforce_post_overnight_readiness(
+                    readiness, context=stage_label
+                )
             except Exception as _interp_exc:
                 return _fail_closed(
                     "readiness_result_interpretation_raised",
@@ -2485,18 +2482,19 @@ class ClientRunner(threading.Thread):
             logger.error("[%s] Overnight reeval error (non-fatal): %s", self.email, exc, exc_info=True)
 
     def _run_startup_morning_handoff(self) -> None:
+        handoff_result = None
         try:
             from ap.morning_handoff import run_morning_handoff_audit
             from ap.preopen_readiness import run_preopen_autonomous_readiness
 
-            result = run_morning_handoff_audit(
+            handoff_result = run_morning_handoff_audit(
                 client_id=self.email,
                 execution_mode=self.mode,
                 stage="startup",
                 dry_run=False,
                 runner=self,
             )
-            logger.info("[%s] Startup morning handoff result: %s", self.email, result)
+            logger.info("[%s] Startup morning handoff result: %s", self.email, handoff_result)
             readiness = run_preopen_autonomous_readiness(
                 self.email,
                 self.mode,
@@ -2505,15 +2503,20 @@ class ClientRunner(threading.Thread):
                 runner=self,
             )
             logger.info("[%s] Startup preopen readiness result: %s", self.email, readiness)
-            if str(self.mode).lower() == "live":
-                if readiness.get("status") == "BLOCKED":
-                    self._enter_degraded_mode(
-                        "preopen_readiness_blocked:" + ",".join(readiness.get("errors") or ["unknown"])
-                    )
-                elif readiness.get("ok"):
-                    self._clear_degraded_reason_key("preopen_readiness_blocked")
+            # PR #395: route through the shared PR #394 validator. context="startup"
+            # gives distinct failure_reason labels while closing the same fail-open
+            # class (ERROR/DEGRADED status, malformed return, missing/invalid ok flag).
+            self._enforce_post_overnight_readiness(readiness, context="startup")
         except Exception as exc:
             logger.error("[%s] Startup morning handoff failed (non-fatal): %s", self.email, exc, exc_info=True)
+            # PR #395: LIVE must not silently come up with entries_allowed=True when
+            # the readiness/handoff import or call raises. Mirror the post-overnight
+            # exception branch: fail-closed for LIVE, diagnostic-only for PAPER.
+            if str(self.mode).lower() == "live":
+                self._fail_closed_post_overnight_readiness(
+                    context="startup",
+                    detail=f"exception:{type(exc).__name__}",
+                )
 
     def _run_post_overnight_morning_handoff(self, overnight_result: dict | None) -> dict:
         if not isinstance(overnight_result, dict):
