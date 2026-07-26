@@ -408,6 +408,103 @@ def _normalize_fill(order: dict) -> dict | None:
     }
 
 
+
+def _validate_durable_fills(
+    fills: list[dict],
+    *,
+    position: dict,
+    detected_at: datetime,
+    client_id: str = "",
+) -> list[dict]:
+    """Re-prove durable adopted fills against the current position.
+
+    Before a DB-sourced row can contribute to a terminal close, it must prove:
+      - exact contract match (if db_contract is populated)
+      - exact CALL/PUT direction (if db_direction is populated)
+      - EXIT_FILLED or EXIT_PARTIAL_FILL status
+      - positive quantity and fill price
+      - fill timestamp at or after position entry
+      - external local-ID prefix (already enforced by load_manual_close_state)
+
+    A malformed or mis-bound durable row that merely shares a position_id must
+    not silently inflate or corrupt the weighted-close aggregate.
+    """
+    pos_contract = normalize_contract(position.get("contract"))
+    pos_direction = str(
+        position.get("side") or position.get("direction") or ""
+    ).upper().strip()
+    opened_at = parse_timestamp(
+        position.get("entry_ts") or position.get("opened_at")
+    )
+    position_id = str(position.get("id") or "").strip()
+
+    valid: list[dict] = []
+    for f in fills:
+        bid = str(f.get("broker_order_id") or "").strip()
+        db_contract = str(f.get("db_contract") or "").upper().strip()
+        db_direction = str(f.get("db_direction") or "").upper().strip()
+        db_status = str(f.get("raw_status") or "").upper().strip()
+        filled_qty = positive_int(f.get("filled_qty"))
+        fill_price = positive_float(f.get("fill_price"))
+        filled_at = f.get("filled_at")
+
+        if not bid:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_NO_ID pos=%s — rejected",
+                client_id, position_id,
+            )
+            continue
+        if filled_qty <= 0 or fill_price <= 0 or filled_at is None:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_INVALID pos=%s broker_id=%s "
+                "qty=%s price=%s ts=%s — rejected",
+                client_id, position_id, bid, filled_qty, fill_price, filled_at,
+            )
+            continue
+        if db_status and db_status not in DURABLE_EXIT_FILLED_STATUSES:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_STATUS_REJECTED pos=%s broker_id=%s "
+                "status=%s — rejected",
+                client_id, position_id, bid, db_status,
+            )
+            continue
+        if db_contract and db_contract != pos_contract:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_CONTRACT_MISMATCH pos=%s broker_id=%s "
+                "expected=%s got=%s — rejected",
+                client_id, position_id, bid, pos_contract, db_contract,
+            )
+            continue
+        if db_direction and db_direction not in {"CALL", "PUT"}:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_DIRECTION_INVALID pos=%s broker_id=%s "
+                "direction=%s — rejected",
+                client_id, position_id, bid, db_direction,
+            )
+            continue
+        if db_direction and pos_direction and db_direction != pos_direction:
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_DIRECTION_MISMATCH pos=%s broker_id=%s "
+                "expected=%s got=%s — rejected",
+                client_id, position_id, bid, pos_direction, db_direction,
+            )
+            continue
+        if (
+            opened_at is not None
+            and isinstance(filled_at, datetime)
+            and filled_at < opened_at
+        ):
+            log.warning(
+                "[%s] MANUAL_CLOSE_DURABLE_FILL_TIMESTAMP_STALE pos=%s broker_id=%s "
+                "fill_ts=%s entry_ts=%s — rejected",
+                client_id, position_id, bid, filled_at, opened_at,
+            )
+            continue
+        valid.append(f)
+
+    return valid
+
+
 def select_external_close_fills(
     *,
     orders: list[dict],
@@ -449,10 +546,17 @@ def select_external_close_fills(
         return None, "position_quantity_missing"
 
     bot_ids = {str(v or "").strip() for v in bot_exit_order_ids if v}
-    # adopted_fills: pre-loaded from DB with full evidence. Use directly as
-    # adopted_hits — no broker re-scan needed. Cross-session recovery works
-    # even when broker_orders=[] (previous-session orders no longer returned).
-    pre_adopted: list[dict] = list(adopted_fills or [])
+    # adopted_fills: pre-loaded from DB. Re-validate each fill against this
+    # position's contract, direction, status, and entry timestamp before
+    # allowing it to contribute to the weighted-close aggregate. A durable row
+    # that merely shares a position_id must not silently corrupt the evidence.
+    client_id_ctx = str(position.get("client_id") or "")
+    pre_adopted: list[dict] = _validate_durable_fills(
+        list(adopted_fills or []),
+        position=position,
+        detected_at=detected_at,
+        client_id=client_id_ctx,
+    )
     adopted_ids: set[str] = {
         str(f.get("broker_order_id") or "").strip()
         for f in pre_adopted
@@ -626,9 +730,17 @@ def load_manual_close_state(
                 if local_order_id.startswith(EXTERNAL_LOCAL_ID_PREFIX):
                     if not position_id:
                         continue
+                    row_status = str(row.get("status") or "").upper().strip()
+                    if row_status not in DURABLE_EXIT_FILLED_STATUSES:
+                        # Row exists with an external local_id prefix but has a
+                        # non-durable status (e.g. still pending). Not valid as
+                        # recovery evidence; skip without adding to bot_ids.
+                        continue
                     filled_qty = positive_int(row.get("filled_qty"))
                     fill_price = positive_float(row.get("fill_price"))
                     filled_at = parse_timestamp(row.get("filled_ts"))
+                    db_contract = str(row.get("contract") or "").upper().strip()
+                    db_direction = str(row.get("direction") or "").upper().strip()
                     if filled_qty > 0 and fill_price > 0 and filled_at is not None:
                         fill_dict: dict = {
                             "broker_order_id": broker_order_id,
@@ -636,8 +748,11 @@ def load_manual_close_state(
                             "fill_price": fill_price,
                             "filled_at": filled_at,
                             "created_at": None,
-                            "raw_status": str(row.get("status") or "EXIT_FILLED"),
+                            "raw_status": row_status,
                             "raw_side": "sell_to_close",
+                            # DB-sourced identity fields for cross-position validation.
+                            "db_contract": db_contract,
+                            "db_direction": db_direction,
                         }
                         adopted_fills_by_pos.setdefault(position_id, []).append(fill_dict)
                 else:
@@ -879,50 +994,6 @@ def adopt_external_exit_fills(
 
 
 
-def _position_is_still_active(*, position_id: str, client_id: str) -> bool:
-    """Re-read position from DB; return True iff still in the active family.
-
-    Called immediately before finalizing to guard against duplicate P&L
-    writes when two health-loop iterations overlap. The position-scoped
-    advisory lock in adoption is released before finalization, so this
-    guard serializes the finalization decision at the DB level.
-
-    Returns False (treat as inactive/handled) on DB error, which is the
-    safe direction — a failed guard read prevents a potentially redundant
-    finalization rather than allowing a double-write.
-    """
-    from ap.db import conn, run_with_retry
-    active_set = frozenset(s.upper() for s in ACTIVE_POSITION_STATUSES)
-
-    def _check():
-        with conn() as cursor:
-            cursor.execute(
-                """
-                SELECT status, COALESCE(quantity_remaining, 0) AS qty_rem
-                FROM positions
-                WHERE id=%s AND client_id=%s
-                """,
-                (position_id, client_id),
-            )
-            row = cursor.fetchone()
-            if row is None:
-                return False
-            status = str(row.get("status") or "").upper().strip()
-            qty_rem = float(row.get("qty_rem") or 0)
-            return status in active_set or qty_rem > 0
-
-    try:
-        return run_with_retry(_check)
-    except Exception as exc:
-        log.error(
-            "[%s] MANUAL_CLOSE_ACTIVE_CHECK_FAILED pos=%s err=%s "
-            "— treating as inactive for safety",
-            client_id,
-            position_id,
-            exc,
-        )
-        return False
-
 
 def _finalize_position(
     *,
@@ -932,19 +1003,12 @@ def _finalize_position(
     contract: str,
     evidence: dict,
 ) -> bool:
-    # Idempotency guard: re-read position before finalizing to prevent a
-    # second health-loop iteration from writing duplicate P&L if it overlaps
-    # with an already-completed finalization from the first iteration.
-    if not _position_is_still_active(position_id=position_id, client_id=client_id):
-        log.info(
-            "[%s] MANUAL_CLOSE_FINALIZE_IDEMPOTENT pos=%s contract=%s "
-            "position already terminal — no-op",
-            client_id,
-            position_id,
-            contract,
-        )
-        return True  # Treat as success; caller proceeds to exit-engine eviction.
-
+    # Canonical idempotency is handled inside APPositionManager
+    # .close_position_from_exit_fill() under its SELECT ... FOR UPDATE row
+    # lock. A detached pre-read (with no lock) cannot prevent a race and is
+    # therefore removed. The finalizer returns True for already-terminal
+    # positions and False for missing positions or DB errors, which is the
+    # correct tri-state contract: terminal→evict, unknown/error→retain.
     broker_ids = ",".join(evidence["broker_order_ids"])
     exit_reason = (
         "MANUAL_CLIENT_CLOSE_BROKER_CONFIRMED "
@@ -976,22 +1040,50 @@ def _finalize_position(
         return False
 
 
+
+def _evict_exit_engine(
+    runner: Any,
+    *,
+    client_id: str,
+    position_id: str,
+    contract: str,
+) -> None:
+    """Evict a finalized position from the in-memory exit engine."""
+    core = getattr(runner, "core", None)
+    exit_engine = getattr(core, "exit_eng", None) if core is not None else None
+    mark_closed = getattr(exit_engine, "mark_position_closed", None)
+    if callable(mark_closed):
+        try:
+            mark_closed(position_id)
+        except Exception as exc:
+            log.warning(
+                "[%s] MANUAL_CLOSE_EXIT_ENGINE_EVICT_FAILED pos=%s contract=%s err=%s",
+                client_id, position_id, contract, exc,
+            )
+
+
 def detect_manual_closes(self) -> None:
-    """Finalize externally closed positions only from exact broker fill truth.
+    """Finalize externally closed positions from exact broker fill truth.
 
-    Throttled to MANUAL_CLOSE_INTERVAL_SEC. Runs three passes per tick:
+    Throttled to MANUAL_CLOSE_INTERVAL_SEC. Two passes per tick:
 
-      1. Resume any position that has previously-adopted external EXIT
-         rows but is still active — call the finalizer with the weighted
-         aggregate reconstructed from those durable rows. This closes
-         the "adopted-but-finalizer-failed" recovery gap without
-         relying on the row-at-a-time reconciler.
+      PASS 1 — Durable recovery (no broker call required):
+        For each active position whose adopted EXIT rows already cover
+        the full required quantity, re-validate the durable fills and call
+        the canonical finalizer directly. This handles cross-session
+        restarts (broker no longer returns previous-session orders) and
+        the case where PASS 2 previously adopted fills but finalization
+        failed. Runs even if the current-session broker order endpoint
+        is unavailable.
 
-      2. Scan authoritative broker positions; anything DB thinks is
-         active but broker no longer holds → collect exact external
-         close evidence, atomically adopt, finalize.
-
-      3. Evict from the exit engine only after canonical finalization.
+      PASS 2 — New external fill discovery:
+        Fetch authoritative broker positions to find contracts no longer
+        held by the broker. For each missing position not yet resolved by
+        PASS 1, fetch current-session broker orders, select exact external
+        close evidence, adopt atomically, and finalize. Broker orders are
+        fetched only AFTER durable-covered positions are handled so a
+        transient order-endpoint failure cannot block already-evidenced
+        recovery.
     """
     now_epoch = time.time()
     last_check = float(getattr(self, "_last_manual_close_check_ts", 0.0) or 0.0)
@@ -1013,33 +1105,7 @@ def detect_manual_closes(self) -> None:
     if broker is None:
         return
 
-    try:
-        broker_positions = fetch_authoritative_broker_positions(broker)
-    except Exception as exc:
-        log.error(
-            "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_positions_unavailable "
-            "mode=%s err=%s — no state mutation",
-            client_id,
-            runner_mode,
-            exc,
-        )
-        return
-
-    broker_contract_qty: dict[str, int] = {}
-    for broker_position in broker_positions:
-        contract = normalize_contract(
-            broker_position.get("symbol")
-            or broker_position.get("option_symbol")
-            or broker_position.get("contract")
-        )
-        quantity = positive_int(
-            broker_position.get("quantity") or broker_position.get("qty")
-        )
-        if contract and quantity > 0:
-            broker_contract_qty[contract] = (
-                broker_contract_qty.get(contract, 0) + quantity
-            )
-
+    # Always load durable DB state first — safe regardless of broker availability.
     try:
         active_positions, bot_exit_ids, adopted_fills_by_pos = load_manual_close_state(
             client_id, runner_mode
@@ -1053,66 +1119,193 @@ def detect_manual_closes(self) -> None:
         )
         return
 
-    missing_positions = [
-        position
-        for position in active_positions
-        if normalize_contract(position.get("contract")) not in broker_contract_qty
-    ]
-    if not missing_positions:
+    if not active_positions:
         return
 
     pm = getattr(self, "position_manager", None)
     finalizer = getattr(pm, "close_position_from_exit_fill", None)
     if not callable(finalizer):
         log.critical(
-            "[%s] MANUAL_CLOSE_CANONICAL_FINALIZER_UNAVAILABLE "
-            "missing_positions=%s",
+            "[%s] MANUAL_CLOSE_CANONICAL_FINALIZER_UNAVAILABLE active=%s",
             client_id,
-            len(missing_positions),
+            len(active_positions),
         )
         return
 
+    detected_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
+
+    def _check_fences(position: dict, position_id: str, contract: str) -> bool:
+        """Return True if the position passes all ownership fences."""
+        position_mode = str(position.get("execution_mode") or "").strip().lower()
+        if position_mode not in VALID_EXECUTION_MODES or position_mode != runner_mode:
+            log.critical(
+                "[%s] MANUAL_CLOSE_MODE_FENCE pos=%s contract=%s "
+                "runner_mode=%s position_mode=%s — no mutation",
+                client_id, position_id, contract,
+                runner_mode, position_mode or "missing",
+            )
+            return False
+        if (
+            bool(position.get("exit_in_flight"))
+            or str(position.get("pending_exit_broker_order_id") or "").strip()
+            or str(position.get("pending_exit_local_order_id") or "").strip()
+        ):
+            log.info(
+                "[%s] MANUAL_CLOSE_SKIPPED_EXISTING_EXIT_OWNER pos=%s contract=%s",
+                client_id, position_id, contract,
+            )
+            return False
+        return True
+
+    # ─── PASS 1: Durable recovery — finalize from DB evidence alone ───────────
+    # Positions whose adopted EXIT rows already cover the full required quantity
+    # are finalized here without any broker call. This handles:
+    #   a) Cross-session restarts (broker no longer returns previous-session orders)
+    #   b) Positions where adoption succeeded but finalization failed last scan
+    #   c) Cases where the current-session broker order endpoint is unavailable
+    # ──────────────────────────────────────────────────────────────────────────
+    needs_broker_scan: list[dict] = []
+
+    for position in active_positions:
+        position_id = str(position.get("id") or "").strip()
+        contract = normalize_contract(position.get("contract"))
+        if not position_id or not contract:
+            continue
+        if not _check_fences(position, position_id, contract):
+            continue
+
+        required_qty = positive_int(
+            position.get("quantity_remaining")
+            if position.get("quantity_remaining") is not None
+            else position.get("qty")
+        )
+        if required_qty <= 0:
+            continue
+
+        durable_fills = adopted_fills_by_pos.get(position_id, [])
+        if not durable_fills:
+            needs_broker_scan.append(position)
+            continue
+
+        valid_durable = _validate_durable_fills(
+            durable_fills,
+            position=position,
+            detected_at=detected_at,
+            client_id=client_id,
+        )
+        if not valid_durable:
+            needs_broker_scan.append(position)
+            continue
+
+        adopted_qty = sum(int(f["filled_qty"]) for f in valid_durable)
+        if adopted_qty != required_qty:
+            # Partial durable coverage — broker scan may supply remaining fills.
+            needs_broker_scan.append(position)
+            continue
+
+        # Full durable coverage. Build aggregate and finalize without broker.
+        all_fills = sorted(valid_durable, key=lambda r: r["filled_at"])
+        weighted_notional = sum(
+            float(f["fill_price"]) * int(f["filled_qty"]) for f in all_fills
+        )
+        avg_price = weighted_notional / adopted_qty
+
+        durable_evidence: dict = {
+            "fills": [],
+            "adopted_fills": all_fills,
+            "all_fills": all_fills,
+            "filled_qty": adopted_qty,
+            "fill_price": round(avg_price, 6),
+            "filled_ts": all_fills[-1]["filled_at"].isoformat(),
+            "broker_order_id": all_fills[-1]["broker_order_id"],
+            "broker_order_ids": [f["broker_order_id"] for f in all_fills],
+        }
+
+        finalized = _finalize_position(
+            finalizer=finalizer,
+            client_id=client_id,
+            position_id=position_id,
+            contract=contract,
+            evidence=durable_evidence,
+        )
+        if finalized:
+            _evict_exit_engine(
+                self, client_id=client_id, position_id=position_id, contract=contract
+            )
+            log.info(
+                "[%s] MANUAL_CLOSE_PASS1_FINALIZED pos=%s contract=%s "
+                "exit=%.4f qty=%s broker_order_ids=%s "
+                "proof_path=canonical taxonomy_source=durable_exit_orders",
+                client_id, position_id, contract,
+                avg_price, adopted_qty,
+                ",".join(durable_evidence["broker_order_ids"]),
+            )
+        else:
+            log.critical(
+                "[%s] MANUAL_CLOSE_PASS1_FINALIZE_FAILED pos=%s contract=%s "
+                "— durable EXIT rows retained; next scan will retry",
+                client_id, position_id, contract,
+            )
+
+    if not needs_broker_scan:
+        return
+
+    # ─── PASS 2: New external fill discovery via broker ────────────────────────
+    # Broker calls happen here — AFTER durable-covered positions are handled.
+    # A transient broker-positions or broker-orders failure does not block
+    # positions that already have complete durable evidence.
+    # ──────────────────────────────────────────────────────────────────────────
+    try:
+        broker_positions = fetch_authoritative_broker_positions(broker)
+    except Exception as exc:
+        log.error(
+            "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_positions_unavailable "
+            "mode=%s err=%s — no state mutation",
+            client_id, runner_mode, exc,
+        )
+        return
+
+    broker_contract_qty: dict[str, int] = {}
+    for broker_position in broker_positions:
+        bpos_contract = normalize_contract(
+            broker_position.get("symbol")
+            or broker_position.get("option_symbol")
+            or broker_position.get("contract")
+        )
+        quantity = positive_int(
+            broker_position.get("quantity") or broker_position.get("qty")
+        )
+        if bpos_contract and quantity > 0:
+            broker_contract_qty[bpos_contract] = (
+                broker_contract_qty.get(bpos_contract, 0) + quantity
+            )
+
+    missing_positions = [
+        position
+        for position in needs_broker_scan
+        if normalize_contract(position.get("contract")) not in broker_contract_qty
+    ]
+    if not missing_positions:
+        return
+
+    # Fetch current-session orders only now — only for positions that still
+    # need new external fill discovery (not for durable-covered ones).
     try:
         broker_orders = fetch_all_current_session_orders(broker)
     except Exception as exc:
         log.error(
             "[%s] MANUAL_CLOSE_SCAN_UNCERTAIN broker_orders_failed "
             "missing_positions=%s err=%s — no state mutation",
-            client_id,
-            len(missing_positions),
-            exc,
+            client_id, len(missing_positions), exc,
         )
         return
-
-    detected_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
 
     for position in missing_positions:
         position_id = str(position.get("id") or "").strip()
         contract = normalize_contract(position.get("contract"))
-        position_mode = str(position.get("execution_mode") or "").strip().lower()
-
         if not position_id or not contract:
             continue
-        if position_mode not in VALID_EXECUTION_MODES or position_mode != runner_mode:
-            log.critical(
-                "[%s] MANUAL_CLOSE_MODE_FENCE pos=%s contract=%s "
-                "runner_mode=%s position_mode=%s — no mutation",
-                client_id,
-                position_id,
-                contract,
-                runner_mode,
-                position_mode or "missing",
-            )
-            continue
-        if bool(position.get("exit_in_flight")) or str(
-            position.get("pending_exit_broker_order_id") or ""
-        ).strip() or str(position.get("pending_exit_local_order_id") or "").strip():
-            log.info(
-                "[%s] MANUAL_CLOSE_SKIPPED_EXISTING_EXIT_OWNER pos=%s contract=%s",
-                client_id,
-                position_id,
-                contract,
-            )
+        if not _check_fences(position, position_id, contract):
             continue
 
         adopted_fills_for_pos = adopted_fills_by_pos.get(position_id, [])
@@ -1127,10 +1320,7 @@ def detect_manual_closes(self) -> None:
             log.warning(
                 "[%s] MANUAL_CLOSE_EVIDENCE_MISSING pos=%s contract=%s "
                 "reason=%s — position remains active",
-                client_id,
-                position_id,
-                contract,
-                reason_code,
+                client_id, position_id, contract, reason_code,
             )
             continue
 
@@ -1144,10 +1334,7 @@ def detect_manual_closes(self) -> None:
             log.critical(
                 "[%s] MANUAL_CLOSE_ADOPTION_FAILED pos=%s contract=%s reason=%s "
                 "— position remains active; next scan will retry",
-                client_id,
-                position_id,
-                contract,
-                adoption_reason,
+                client_id, position_id, contract, adoption_reason,
             )
             continue
 
@@ -1163,35 +1350,19 @@ def detect_manual_closes(self) -> None:
                 "[%s] MANUAL_CLOSE_FINALIZE_FAILED pos=%s contract=%s "
                 "broker_order_ids=%s — durable EXIT rows retained; next "
                 "scan will re-invoke finalizer with weighted aggregate",
-                client_id,
-                position_id,
-                contract,
+                client_id, position_id, contract,
                 ",".join(evidence["broker_order_ids"]),
             )
             continue
 
-        core = getattr(self, "core", None)
-        exit_engine = getattr(core, "exit_eng", None) if core is not None else None
-        mark_closed = getattr(exit_engine, "mark_position_closed", None)
-        if callable(mark_closed):
-            try:
-                mark_closed(position_id)
-            except Exception as exc:
-                log.warning(
-                    "[%s] MANUAL_CLOSE_EXIT_ENGINE_EVICT_FAILED "
-                    "pos=%s contract=%s err=%s",
-                    client_id,
-                    position_id,
-                    contract,
-                    exc,
-                )
-
+        _evict_exit_engine(
+            self, client_id=client_id, position_id=position_id, contract=contract
+        )
         log.info(
             "[%s] MANUAL_CLOSE_FINALIZED pos=%s contract=%s exit=%.4f "
-            "qty=%s broker_order_ids=%s proof_path=canonical taxonomy_source=durable_exit_orders",
-            client_id,
-            position_id,
-            contract,
+            "qty=%s broker_order_ids=%s "
+            "proof_path=canonical taxonomy_source=durable_exit_orders",
+            client_id, position_id, contract,
             float(evidence["fill_price"]),
             int(evidence["filled_qty"]),
             ",".join(evidence["broker_order_ids"]),
