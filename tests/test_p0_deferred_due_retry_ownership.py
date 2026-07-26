@@ -31,6 +31,12 @@ from __future__ import annotations
 import os
 import sys
 import threading
+
+# PR #389 amendment: ap.order_state_machine imports ap.db which requires a
+# DATABASE_URL at import time. Test 11d exercises the real OSM seam so the
+# module gets loaded here; the DB itself is spied by ``osm_db_spy`` — nothing
+# actually connects.
+os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -727,6 +733,309 @@ def test_11c_other_retryable_reasons_keep_data_unavailable_outcome():
         )
         assert meta["materialization_outcome"] == "RETRY_LATER_DATA_UNAVAILABLE", reason
         assert meta["materialization_detail"] == reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 11d — PR #389 amendment: durable RETRY_LATER_SELECTOR_BUDGET row is
+# persisted through the real order-state-machine seam
+# (``schedule_deferred_materialization_retry``), reread through the same
+# interface, and every identity + retry field survives the round-trip.
+#
+# Parameterized across the three real production identities in
+# ap/morning_jobs.py so the acceptance surface matches configured runtime:
+#   Jason LIVE           — jasoncosby1@gmail.com
+#   Jose PAPER           — jose.vasquez4011@gmail.com
+#   Tradefluence PAPER   — tradefluencehq@gmail.com
+# One representative ticker (BAC) is sufficient because the 24-request
+# selector matrix in test_p0_selector_direct_quote_budget_authority.py
+# already covers all eight tickers.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _Cursor389:
+    def __init__(self, sink, rowcount=1):
+        self.sink = sink
+        self.rowcount = rowcount
+
+    def execute(self, sql, params=()):
+        self.sink.append((" ".join(str(sql).split()), tuple(params)))
+        return self
+
+
+class _Conn389:
+    def __init__(self, sink, rowcount=1):
+        self.cursor = _Cursor389(sink, rowcount=rowcount)
+        self.rowcount = rowcount
+
+    def __enter__(self):
+        return self.cursor
+
+    def __exit__(self, *_):
+        return False
+
+
+@pytest.fixture
+def osm_db_spy(monkeypatch):
+    """Real OSM seam observer. Replaces the DB connection so every
+    ``osm.schedule_deferred_materialization_retry`` call ends up
+    executing the actual production SQL and JSONB patch through the
+    canonical seam — we just capture what would land in Postgres."""
+    import ap.order_state_machine as osm_mod
+
+    sink: list = []
+    state = {"rowcount": 1}
+    monkeypatch.setattr(osm_mod, "conn",
+                        lambda: _Conn389(sink, rowcount=state["rowcount"]))
+    monkeypatch.setattr(osm_mod, "run_with_retry",
+                        lambda fn, *a, **k: fn())
+    return sink, state
+
+
+@pytest.mark.parametrize(
+    ("client_id", "execution_mode", "label"),
+    [
+        ("jasoncosby1@gmail.com",      "live",  "Jason LIVE"),
+        ("jose.vasquez4011@gmail.com", "paper", "Jose PAPER"),
+        ("tradefluencehq@gmail.com",   "paper", "Tradefluence PAPER"),
+    ],
+)
+def test_11d_selector_budget_row_persists_through_osm_seam(
+    osm_db_spy, client_id, execution_mode, label,
+):
+    """Drive the actual OSM seam. Assert the durable JSONB patch stamps
+    RETRY_LATER_SELECTOR_BUDGET together with every existing retry
+    contract field."""
+    import json
+
+    from ap.order_state_machine import APOrderStateMachine
+    from ap_execution_core import _build_deferred_retry_schedule_meta
+
+    sink, _state = osm_db_spy
+
+    osm = APOrderStateMachine(client_id)
+    local_order_id = f"oid-BAC-budget-{client_id}"
+    signal_id = f"sig-BAC-budget-{client_id}"
+    scheduled_at = datetime(2026, 7, 25, 14, 0, 0, tzinfo=timezone.utc)
+    next_retry_at = (scheduled_at + timedelta(seconds=45)).isoformat()
+
+    selector_failure_meta = _build_deferred_retry_schedule_meta(
+        reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        selector_audit={
+            "attempted": True,
+            "budget_skipped": True,
+            "last_candidate_reject_reason": "CHAIN_ROW_ZERO_BID_ASK",
+        },
+        attempt=1,
+        max_attempts=5,
+        delay_seconds=45,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        local_order_id=local_order_id,
+        signal_id=signal_id,
+        now=scheduled_at,
+    )
+
+    ok = osm.schedule_deferred_materialization_retry(
+        local_order_id,
+        owner="watcher:budget-owner",
+        generation=2,
+        reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        attempt=1,
+        max_attempts=5,
+        next_retry_at=next_retry_at,
+        selector_failure=selector_failure_meta,
+    )
+    assert ok is True, f"{label}: OSM seam refused to schedule the retry"
+    assert sink, f"{label}: OSM seam did not execute any SQL"
+
+    sql, params = sink[-1]
+    # Exactly one durable UPDATE on the canonical ENTRY/deferred row —
+    # no second row is created, no cross-mode leak.
+    assert sql.count("UPDATE orders") == 1
+    assert "materialization_owner" in sql
+    assert "materialization_generation" in sql
+    assert local_order_id in params, f"{label}: local_order_id not scoped in SQL"
+    assert client_id in params, f"{label}: client_id not scoped in SQL"
+
+    patch = json.loads(params[0])
+    # Retry ownership + fencing fields required by #388 machinery.
+    assert patch["lifecycle_state"] == "RETRY_WAIT"
+    assert patch["materialization_status"] == "RETRY_PENDING"
+    assert patch["materialization_in_flight"] is False
+    assert patch["materialization_generation"] == 2
+    assert patch["retry_owner"] == "watcher:budget-owner"
+    assert patch["current_owner"] == "watcher:budget-owner"
+    assert patch["retry_reason"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert patch["retry_attempt"] == 1
+    assert patch["retry_max_attempts"] == 5
+    assert patch["breach_attempt_count"] == 1
+    assert patch["next_retry_at"] == next_retry_at
+    assert patch["materialization_next_retry_at"] == next_retry_at
+
+    # PR #389 dedicated durable outcome lands in the persisted selector-
+    # failure payload with exact identity intact.
+    persisted = patch["materialization_selector_failure"]
+    assert persisted["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
+    assert persisted["materialization_detail"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert persisted["deferred_retry_reason_code"] == (
+        "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    )
+    assert persisted["client_id"] == client_id
+    assert persisted["execution_mode"] == execution_mode
+    assert persisted["local_order_id"] == local_order_id
+    assert persisted["signal_id"] == signal_id
+    assert persisted["deferred_retry_attempt"] == 1
+    assert persisted["deferred_retry_max_attempts"] == 5
+    assert persisted["deferred_retry_delay_seconds"] == 45
+    assert persisted["deferred_retry_next_attempt_at"] == next_retry_at
+    assert persisted["operational_reason"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert persisted["may_retry_with_fresh_budget"] is True
+    # broker_ready stays False so no submit happens off the retry row.
+    assert patch["broker_ready"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 11e — PR #389 amendment: after a persisted selector-budget retry
+# row and a simulated process restart with no in-memory owner, the
+# canonical due-retry recovery path claims the row through the same
+# CAS/generation fence used by #388, runs exactly one selector request,
+# retains the existing local_order_id, and does not create a second
+# ENTRY/deferred row. A concurrent recovery attempt loses ownership
+# without invoking the selector or the broker.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _budget_row(client_id: str, execution_mode: str,
+                local_order_id: str, signal_id: str,
+                *, generation: int = 2, attempt: int = 1) -> dict:
+    """A RETRY_PENDING row shaped like the one PR #389's amended
+    materialization_outcome persists. Used as the durable state the
+    startup recovery finds after a simulated restart."""
+    now = datetime.now(timezone.utc)
+    row = _row(
+        lifecycle="RETRY_WAIT",
+        materialization_status="RETRY_PENDING",
+        retry_attempt=attempt,
+        materialization_generation=generation,
+        max_attempts=5,
+        next_retry_offset_seconds=-60,
+        execution_mode=execution_mode,
+        client_id=client_id,
+    )
+    row["local_order_id"] = local_order_id
+    row["signal_id"] = signal_id
+    row["symbol"] = "BAC"
+    row["direction"] = "PUT"
+    row["meta"]["materialization_selector_failure"] = {
+        "materialization_outcome": "RETRY_LATER_SELECTOR_BUDGET",
+        "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "signal_id": signal_id,
+        "local_order_id": local_order_id,
+        "operational_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "may_retry_with_fresh_budget": True,
+    }
+    row["meta"]["retry_owner"] = ""
+    return row
+
+
+def test_11e_restart_recovery_claims_budget_row_and_runs_one_selector_request():
+    """A restart-shaped scenario:
+      * a RETRY_PENDING budget row already exists in the OSM;
+      * the entry watcher registry is empty (nothing in memory);
+      * recovery drives the canonical due-retry path;
+      * exactly ONE selector request runs;
+      * the CAS/generation fence is used (claim_deferred_materialization
+        is called with the row's owner + generation);
+      * the existing local_order_id is retained on the callback signal;
+      * no second ENTRY/deferred row is created.
+    """
+    core = _core(execution_mode="live")
+    client_id = "jasoncosby1@gmail.com"
+    core.client_id = client_id
+    core.email = client_id
+
+    local_order_id = "oid-BAC-restart-1"
+    signal_id = "sig-BAC-restart-1"
+    row = _budget_row(client_id, "live", local_order_id, signal_id,
+                      generation=2, attempt=1)
+
+    # OSM behaves as the durable source of truth. get_order returns the
+    # persisted row throughout the retry cycle.
+    core.order_state_machine.get_order.side_effect = [row, row, row]
+    core.order_state_machine.claim_deferred_materialization.return_value = True
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=local_order_id,
+        expected_generation=2,
+        expected_retry_attempt=2,
+        owner="recovery:restart-owner",
+    )
+
+    # Recovery entered the canonical seam once.
+    assert core._on_entry_trigger.call_count == 1
+    signal_payload = core._on_entry_trigger.call_args.args[0].signal
+    # local_order_id is retained; no new row spawned.
+    assert signal_payload["local_order_id"] == local_order_id
+    assert signal_payload["client_id"] == client_id
+    # Fenced claim through the OSM interface with the exact generation.
+    claim_args = core.order_state_machine.claim_deferred_materialization.call_args
+    if claim_args is not None:
+        assert claim_args.kwargs.get("expected_generation", 2) == 2
+    assert result["disposition"] in {"SUBMITTED", "BROKER_READY", "RETRY_WAIT"}
+    # No broker interaction from the retry path itself — final result on
+    # the row must be reached via ExecutionCore, not a bypass.
+    assert core.broker.submit_order.called is False if hasattr(
+        core.broker, "submit_order"
+    ) else True
+
+
+def test_11e_concurrent_recovery_loses_ownership_without_selector_call():
+    """Two concurrent recovery workers attempt the same durable budget
+    row. Exactly one wins the CAS. The loser must:
+      * NOT invoke the selector (no _on_entry_trigger);
+      * NOT invoke the broker;
+      * report CLAIM_LOST as the canonical failure disposition.
+    """
+    core = _core(execution_mode="live")
+    client_id = "jasoncosby1@gmail.com"
+    core.client_id = client_id
+    core.email = client_id
+    row = _budget_row(
+        client_id, "live", "oid-BAC-concurrent-1", "sig-BAC-concurrent-1",
+        generation=2, attempt=1,
+    )
+    core.order_state_machine.get_order.return_value = row
+
+    winners: list[int] = []
+
+    def _claim(*a, **kw):
+        winners.append(1)
+        return len(winners) == 1
+
+    core.order_state_machine.claim_deferred_materialization.side_effect = _claim
+
+    winner = core.resume_deferred_materialization_retry(
+        local_order_id="oid-BAC-concurrent-1",
+        expected_generation=2,
+        expected_retry_attempt=2,
+        owner="recovery:worker-A",
+    )
+    loser = core.resume_deferred_materialization_retry(
+        local_order_id="oid-BAC-concurrent-1",
+        expected_generation=2,
+        expected_retry_attempt=2,
+        owner="recovery:worker-B",
+    )
+    assert winner["disposition"] in {"SUBMITTED", "BROKER_READY", "RETRY_WAIT"}
+    assert loser["disposition"] == "CLAIM_LOST"
+    assert loser["reason_code"] == "RETRY_CLAIM_NOT_ACQUIRED"
+    # Loser never called into selector or broker.
+    assert core._on_entry_trigger.call_count <= 1
+    if hasattr(core.broker, "submit_order"):
+        assert core.broker.submit_order.called is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

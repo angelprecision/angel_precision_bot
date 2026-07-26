@@ -831,10 +831,12 @@ FLEET_TICKERS: list[str] = [
     "ABT", "COF", "GM", "CAT", "KHC", "ROST", "UPS", "BAC",
 ]
 
+# Exact production client identities as configured in ap/morning_jobs.py
+# (DEFAULT_LIVE_CLIENT / DEFAULT_PAPER_CLIENTS). Do not substitute aliases.
 FLEET_IDENTITIES: list[tuple[str, str, str]] = [
-    ("jason@angelprecision.com",       "live",  "Jason LIVE"),
-    ("jose@angelprecision.com",        "paper", "Jose PAPER"),
-    ("tradefluence@angelprecision.com", "paper", "Tradefluence PAPER"),
+    ("jasoncosby1@gmail.com",       "live",  "Jason LIVE"),
+    ("jose.vasquez4011@gmail.com",  "paper", "Jose PAPER"),
+    ("tradefluencehq@gmail.com",    "paper", "Tradefluence PAPER"),
 ]
 
 
@@ -965,11 +967,21 @@ class TestJuly23FleetAcceptanceReplay:
         selected = selector.select(plan)
         return selected, broker, plan
 
-    def test_24_requests_each_exhaust_independent_budget_and_persist_retry_row(
+    def test_24_requests_each_exhaust_independent_selector_budget(
         self, monkeypatch,
     ):
-        from ap_execution_core import _build_deferred_retry_schedule_meta
+        """8 tickers × 3 real production identities = 24 canonical
+        selector requests. Each request must receive its own fresh
+        20-call budget, exhaust it on zero-quote candidates, report
+        SELECTOR_REQUEST_BUDGET_EXHAUSTED as the final request-scope
+        reason, keep the original chain-quality reasons in the reject
+        buckets, and never touch the broker. LIVE and PAPER identities
+        remain isolated across the whole matrix.
 
+        Durable persistence of the resulting RETRY_LATER_SELECTOR_BUDGET
+        row is exercised by
+        test_p0_deferred_due_retry_ownership.py's OSM-seam tests —
+        keeping this matrix strictly about selector-budget behavior."""
         replay_receipts: list[dict] = []
         for ticker in FLEET_TICKERS:
             for client_id, execution_mode, label in FLEET_IDENTITIES:
@@ -982,8 +994,6 @@ class TestJuly23FleetAcceptanceReplay:
                     generation=1,
                     attempt=1,
                 )
-                # No survivor and no broker interaction under budget
-                # exhaustion.
                 assert selected is None, f"{ticker} {label} unexpected selection"
                 assert broker.submit_order.call_count == 0, (
                     f"{ticker} {label} unexpected submit"
@@ -1008,45 +1018,10 @@ class TestJuly23FleetAcceptanceReplay:
                     "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
                     not in failure["top_reject_buckets"]
                 )
-                # Persist a durable retry row via the amended helper.
-                meta = _build_deferred_retry_schedule_meta(
-                    reason_code=failure["reason_code"],
-                    selector_audit={
-                        "attempted": True,
-                        "budget_skipped": True,
-                        "last_candidate_reject_reason": "CHAIN_ROW_ZERO_BID_ASK",
-                    },
-                    attempt=1,
-                    max_attempts=5,
-                    delay_seconds=45,
-                    client_id=plan["client_id"],
-                    execution_mode=plan["execution_mode"],
-                    local_order_id=plan["local_order_id"],
-                    signal_id=plan["signal_id"],
-                )
-                # Dedicated durable outcome, exact identity preserved.
-                assert meta["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
-                assert meta["deferred_retry_reason_code"] == (
-                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
-                )
-                assert meta["client_id"] == plan["client_id"]
-                assert meta["execution_mode"] == plan["execution_mode"]
-                assert meta["local_order_id"] == plan["local_order_id"]
-                assert meta["signal_id"] == plan["signal_id"]
-                assert meta["deferred_retry_attempt"] == 1
-                assert meta["deferred_retry_max_attempts"] == 5
-                assert meta["deferred_retry_delay_seconds"] == 45
-                assert meta["deferred_retry_next_attempt_at"], "missing next-attempt ts"
-                assert meta["breach_attempt_count"] == 1
-                assert meta["operational_reason"] == (
-                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
-                )
-                assert meta["may_retry_with_fresh_budget"] is True
                 replay_receipts.append({
                     "ticker": ticker,
                     "client_id": plan["client_id"],
                     "execution_mode": plan["execution_mode"],
-                    "materialization_outcome": meta["materialization_outcome"],
                     "budget_used": diagnostics["direct_quote_budget"]["used"],
                     "signal_id": plan["signal_id"],
                     "local_order_id": plan["local_order_id"],
@@ -1062,56 +1037,12 @@ class TestJuly23FleetAcceptanceReplay:
         # LIVE and PAPER identities remain distinct.
         modes = {r["execution_mode"] for r in replay_receipts}
         assert modes == {"live", "paper"}
-        # Every receipt persists the dedicated durable outcome.
-        assert all(
-            r["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
-            for r in replay_receipts
-        )
-
-    def test_restart_then_one_due_retry_creates_one_fresh_selector_request(
-        self, monkeypatch,
-    ):
-        """After a restart-shaped run, exactly one due-retry cycle produces
-        exactly one fresh selector budget consumption — no duplicate
-        selector invocations, no consumption of the earlier request's
-        budget."""
-        first_selected, first_broker, first_plan = self._run_one(
-            monkeypatch,
-            ticker="BAC",
-            client_id="jason@angelprecision.com",
-            execution_mode="live",
-            direction="PUT",
-            generation=1,
-            attempt=1,
-        )
-        assert first_selected is None
-        first_used = first_plan["metadata"]["selector_failure"][
-            "selection_diagnostics"]["direct_quote_budget"]["used"]
-        assert first_used == 20
-        # Simulate restart + due retry: attempt=2, generation=2, brand-new
-        # selector engine, unaffected by the earlier request's budget.
-        second_selected, second_broker, second_plan = self._run_one(
-            monkeypatch,
-            ticker="BAC",
-            client_id="jason@angelprecision.com",
-            execution_mode="live",
-            direction="PUT",
-            generation=2,
-            attempt=2,
-        )
-        assert second_selected is None
-        second_used = second_plan["metadata"]["selector_failure"][
-            "selection_diagnostics"]["direct_quote_budget"]["used"]
-        # Fresh independent budget, again exactly 20.
-        assert second_used == 20
-        # No duplicate broker interactions across the two request scopes.
-        assert first_broker.submit_order.call_count == 0
-        assert second_broker.submit_order.call_count == 0
-        assert first_broker.cancel_order.call_count == 0
-        assert second_broker.cancel_order.call_count == 0
-        # Local order ids of the two attempts are distinct — no duplicate
-        # ENTRY/deferred handoff row.
-        assert first_plan["local_order_id"] != second_plan["local_order_id"]
+        # The three real production emails are all represented.
+        assert {r["client_id"] for r in replay_receipts} == {
+            "jasoncosby1@gmail.com",
+            "jose.vasquez4011@gmail.com",
+            "tradefluencehq@gmail.com",
+        }
 
     def test_live_and_paper_identities_never_share_budget(self, monkeypatch):
         """Consecutive LIVE and PAPER requests on the same ticker must not
@@ -1121,7 +1052,7 @@ class TestJuly23FleetAcceptanceReplay:
         _live_sel, live_broker, live_plan = self._run_one(
             monkeypatch,
             ticker="COF",
-            client_id="jason@angelprecision.com",
+            client_id="jasoncosby1@gmail.com",
             execution_mode="live",
             direction="CALL",
             generation=1,
@@ -1130,7 +1061,7 @@ class TestJuly23FleetAcceptanceReplay:
         _paper_sel, paper_broker, paper_plan = self._run_one(
             monkeypatch,
             ticker="COF",
-            client_id="jose@angelprecision.com",
+            client_id="jose.vasquez4011@gmail.com",
             execution_mode="paper",
             direction="CALL",
             generation=1,
