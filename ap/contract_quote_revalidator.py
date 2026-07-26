@@ -62,7 +62,30 @@ log = logging.getLogger("angel.contract_quote_revalidator")
 # ── Configuration ───────────────────────────────────────────────────────────
 # Top N candidate option symbols to fetch direct quotes for when chain rows
 # look bad.  Keeping this small keeps the Tradier rate-limit budget bounded.
-DEFAULT_REVALIDATE_TOP_N = int(os.getenv("CONTRACT_REVALIDATE_TOP_N", "5"))
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "DIRECT_QUOTE_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int default=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value <= 0:
+        log.warning(
+            "DIRECT_QUOTE_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int default=%s",
+            name,
+            raw,
+            default,
+        )
+        return default
+    return value
+
+
+DEFAULT_REVALIDATE_TOP_N = _positive_int_env("CONTRACT_REVALIDATE_TOP_N", 5)
 
 # Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
 # Cleared per process; tests can reset by calling clear_quote_cache().
@@ -84,6 +107,7 @@ REASON_FINAL_CONTRACT_UNAFFORDABLE    = "FINAL_CONTRACT_UNAFFORDABLE"
 REASON_LIQUIDITY_BELOW_THRESHOLD      = "LIQUIDITY_BELOW_THRESHOLD"
 REASON_MARKET_DATA_THROTTLE_UNAVAILABLE = "MARKET_DATA_THROTTLE_UNAVAILABLE"
 REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+ACTION_SKIP_BUDGET_EXHAUSTED = "SKIP_BUDGET_EXHAUSTED"
 
 # Reasons that warrant direct quote revalidation.
 #
@@ -182,7 +206,34 @@ def _ctx_update_sink(request_context) -> None:
     sink["provider_call_counts"] = dict(getattr(request_context, "provider_call_counts", {}) or {})
     sink["elapsed_ms_by_stage"] = dict(getattr(request_context, "elapsed_ms_by_stage", {}) or {})
     counts = sink["provider_call_counts"]
-    sink["direct_quote_calls"] = int(counts.get("direct_quote_calls", 0) or 0)
+    used = int(counts.get("direct_quote_calls", 0) or 0)
+    effective = int(
+        getattr(
+            request_context,
+            "effective_direct_quote_limit",
+            getattr(request_context, "max_direct_quote_calls", 5),
+        )
+        or 5
+    )
+    remaining = max(0, effective - used)
+    sink["direct_quote_calls"] = used
+    sink["direct_quote_attempts_remaining"] = remaining
+    budget = sink.setdefault("direct_quote_budget", {})
+    if isinstance(budget, dict):
+        budget.update({
+            "canonical_env": getattr(request_context, "configured_selector_max_direct_quote_calls", None),
+            "direct_recovery_alias": getattr(request_context, "configured_direct_quote_recovery_top_n", None),
+            "contract_revalidate_alias": getattr(request_context, "configured_contract_revalidate_top_n", None),
+            "source": getattr(request_context, "direct_quote_budget_source", "default"),
+            "effective_limit": effective,
+            "used": used,
+            "remaining": remaining,
+            "conflict": bool(getattr(request_context, "direct_quote_budget_conflict", False)),
+            "conflict_detail": getattr(request_context, "direct_quote_budget_conflict_detail", None),
+        })
+    sink["direct_quote_attempted_symbols"] = list(getattr(request_context, "direct_quote_attempted_symbols", []) or [])
+    sink["direct_quote_unattempted_count"] = int(getattr(request_context, "direct_quote_unattempted_count", 0) or 0)
+    sink["direct_quote_unattempted_symbols"] = list((getattr(request_context, "direct_quote_unattempted_symbols", []) or [])[:25])
     sink["budget_exhausted_stage"] = getattr(request_context, "budget_exhausted_stage", None)
     sink["budget_exhausted_detail"] = getattr(request_context, "budget_exhausted_detail", None)
 
@@ -195,7 +246,14 @@ def _direct_quote_budget_failure(request_context) -> Optional[dict]:
     elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 15000) or 15000)
     counts = getattr(request_context, "provider_call_counts", {}) or {}
     used = int(counts.get("direct_quote_calls", 0) or 0)
-    call_limit = int(getattr(request_context, "max_direct_quote_calls", 5) or 5)
+    call_limit = int(
+        getattr(
+            request_context,
+            "effective_direct_quote_limit",
+            getattr(request_context, "max_direct_quote_calls", 5),
+        )
+        or 5
+    )
     detail = None
     if elapsed_ms >= elapsed_limit:
         detail = f"elapsed_ms={elapsed_ms:.3f} limit_ms={elapsed_limit}"
@@ -224,6 +282,32 @@ def _ctx_increment_call_count(request_context, key: str, count: int = 1) -> None
     if isinstance(counts, dict):
         counts[key] = int(counts.get(key, 0) or 0) + count
         _ctx_update_sink(request_context)
+
+
+def _ctx_note_attempted_symbol(request_context, occ_symbol: str) -> None:
+    if request_context is None:
+        return
+    attempted = getattr(request_context, "direct_quote_attempted_symbols", None)
+    if isinstance(attempted, list) and occ_symbol not in attempted:
+        attempted.append(occ_symbol)
+        _ctx_update_sink(request_context)
+
+
+def _ctx_note_unattempted_symbol(request_context, occ_symbol: str) -> None:
+    if request_context is None:
+        return
+    seen = getattr(request_context, "direct_quote_unattempted_set", None)
+    if isinstance(seen, set):
+        if occ_symbol in seen:
+            _ctx_update_sink(request_context)
+            return
+        seen.add(occ_symbol)
+    symbols = getattr(request_context, "direct_quote_unattempted_symbols", None)
+    if isinstance(symbols, list) and occ_symbol not in symbols and len(symbols) < 25:
+        symbols.append(occ_symbol)
+    current = len(seen) if isinstance(seen, set) else len(symbols or [])
+    setattr(request_context, "direct_quote_unattempted_count", current)
+    _ctx_update_sink(request_context)
 
 
 def _ctx_add_stage_ms(request_context, key: str, elapsed_ms: float) -> None:
@@ -492,6 +576,7 @@ def fetch_direct_option_quote_with_meta(
                 return failure
             throttle_token = None
     t0 = _now()  # start timing AFTER throttle sleep — latency reflects broker only
+    _ctx_note_attempted_symbol(request_context, occ_symbol)
     _ctx_increment_call_count(request_context, "direct_quote_calls")
     try:
         raw = broker.get_quote(occ_symbol) or {}
@@ -693,36 +778,20 @@ def revalidate_with_direct_quote(
                 }
         budget_failure = _direct_quote_budget_failure(request_context)
         if budget_failure is not None:
+            _ctx_note_unattempted_symbol(request_context, occ_key)
             audit = dict(audit_base)
             audit["direct_quote_error"] = budget_failure["error"]
             audit["direct_quote_endpoint"] = budget_failure["endpoint"]
             audit["contract_quote_source"] = "none"
+            audit["budget_exhausted"] = True
+            audit["original_chain_reject_reason"] = chain_reject_reason
             return {
-                "action":            "REJECT_UNAVAILABLE",
+                "action":            ACTION_SKIP_BUDGET_EXHAUSTED,
                 "reason_code":       REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED,
                 "direct_quote_used": False,
                 "opt_updated":       None,
                 "audit":             audit,
             }
-        remaining = getattr(request_context, "direct_quote_attempts_remaining", None)
-        if remaining is not None:
-            remaining = int(remaining or 0)
-            if remaining <= 0:
-                setattr(request_context, "budget_exhausted_stage", "direct_quote")
-                setattr(
-                    request_context,
-                    "budget_exhausted_detail",
-                    "direct_quote_attempts_remaining=0",
-                )
-                _ctx_update_sink(request_context)
-                return {
-                    "action":            "REJECT_UNAVAILABLE",
-                    "reason_code":       REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED,
-                    "direct_quote_used": False,
-                    "opt_updated":       None,
-                    "audit":             audit_base,
-                }
-            setattr(request_context, "direct_quote_attempts_remaining", remaining - 1)
         if isinstance(revalidated_contracts, set):
             revalidated_contracts.add(occ_key)
 
@@ -738,6 +807,17 @@ def revalidate_with_direct_quote(
         audit["direct_quote_status_code"] = quote_meta.get("status_code")
         audit["direct_quote_retryable"] = quote_meta.get("retryable")
         audit["contract_quote_source"] = "none"
+        if quote_meta.get("reason_code") == REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED:
+            _ctx_note_unattempted_symbol(request_context, occ_key)
+            audit["budget_exhausted"] = True
+            audit["original_chain_reject_reason"] = chain_reject_reason
+            return {
+                "action":            ACTION_SKIP_BUDGET_EXHAUSTED,
+                "reason_code":       REASON_SELECTOR_REQUEST_BUDGET_EXHAUSTED,
+                "direct_quote_used": False,
+                "opt_updated":       None,
+                "audit":             audit,
+            }
         return {
             "action":            "REJECT_UNAVAILABLE",
             "reason_code":       quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE,

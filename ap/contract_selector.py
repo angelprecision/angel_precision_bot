@@ -134,6 +134,17 @@ class SelectorRequestBudgetExhausted(Exception):
         self.detail = detail
 
 
+@dataclass(frozen=True)
+class DirectQuoteBudgetConfig:
+    canonical_raw: str | None
+    direct_recovery_raw: str | None
+    contract_revalidate_raw: str | None
+    effective_limit: int
+    source: str
+    conflict: bool
+    conflict_detail: str | None
+
+
 @dataclass
 class SelectorRequestContext:
     ticker: str
@@ -152,6 +163,26 @@ class SelectorRequestContext:
     max_expiration_calls: int = 2
     max_chain_calls: int = 6
     max_direct_quote_calls: int = 5
+    effective_direct_quote_limit: int = 5
+    direct_quote_budget_source: str = "default"
+    direct_quote_budget_conflict: bool = False
+    direct_quote_budget_conflict_detail: str | None = None
+    configured_selector_max_direct_quote_calls: int | None = None
+    configured_direct_quote_recovery_top_n: int | None = None
+    configured_contract_revalidate_top_n: int | None = None
+    # Rows that are at least structurally direct-quotable (valid OCC, valid
+    # expiration, directional fit). Set at chain-ordering time.
+    direct_quote_structural_candidates: int = 0
+    # Rows whose chain-reject reason was one _should_revalidate() accepted —
+    # i.e., the ones that actually reached the direct-quote branch. Set in
+    # the quality-filter loop, once per unique OCC symbol.
+    direct_quote_eligible_candidates: int = 0
+    direct_quote_eligible_symbols: set[str] = field(default_factory=set)
+    direct_quote_attempted_symbols: list[str] = field(default_factory=list)
+    direct_quote_unattempted_symbols: list[str] = field(default_factory=list)
+    direct_quote_unattempted_set: set[str] = field(default_factory=set)
+    direct_quote_unattempted_count: int = 0
+    direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
     max_total_elapsed_ms: int = 15000
     budget_exhausted_stage: str | None = None
     budget_exhausted_detail: str | None = None
@@ -549,19 +580,114 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
 
 
+_DIRECT_QUOTE_BUDGET_CONFLICTS_LOGGED: set[str] = set()
+
+
+def _parse_positive_int_config(env, key: str) -> tuple[int | None, str | None]:
+    raw = env.get(key)
+    if raw is None or str(raw).strip() == "":
+        return None, None
+    raw_s = str(raw).strip()
+    try:
+        parsed = int(raw_s)
+    except (TypeError, ValueError):
+        log.warning(
+            "SELECTOR_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int",
+            key,
+            raw_s,
+        )
+        return None, raw_s
+    if parsed <= 0:
+        log.warning(
+            "SELECTOR_ENV_PARSE_ERROR key=%s value=%r expected_type=positive_int",
+            key,
+            raw_s,
+        )
+        return None, raw_s
+    return parsed, raw_s
+
+
+def _resolve_direct_quote_budget_config(env=None) -> DirectQuoteBudgetConfig:
+    env = os.environ if env is None else env
+    canonical, canonical_raw = _parse_positive_int_config(env, "SELECTOR_MAX_DIRECT_QUOTE_CALLS")
+    direct_recovery, direct_recovery_raw = _parse_positive_int_config(env, "DIRECT_QUOTE_RECOVERY_TOP_N")
+    contract_revalidate, contract_revalidate_raw = _parse_positive_int_config(env, "CONTRACT_REVALIDATE_TOP_N")
+
+    conflict = False
+    conflict_detail = None
+    if canonical is not None:
+        effective = canonical
+        source = "SELECTOR_MAX_DIRECT_QUOTE_CALLS"
+        conflicting = []
+        if direct_recovery is not None and direct_recovery != canonical:
+            conflicting.append(f"direct_recovery={direct_recovery}")
+        if contract_revalidate is not None and contract_revalidate != canonical:
+            conflicting.append(f"contract_revalidate={contract_revalidate}")
+        conflict = bool(conflicting)
+        if conflict:
+            conflict_detail = " ".join(conflicting)
+            log_key = (
+                f"canonical={canonical} direct_recovery={direct_recovery} "
+                f"contract_revalidate={contract_revalidate}"
+            )
+            if log_key not in _DIRECT_QUOTE_BUDGET_CONFLICTS_LOGGED:
+                _DIRECT_QUOTE_BUDGET_CONFLICTS_LOGGED.add(log_key)
+                log.critical(
+                    "SELECTOR_DIRECT_QUOTE_BUDGET_CONFLICT canonical=%s direct_recovery=%s "
+                    "contract_revalidate=%s effective=%s source=%s",
+                    canonical,
+                    direct_recovery,
+                    contract_revalidate,
+                    effective,
+                    source,
+                )
+    elif direct_recovery is not None:
+        effective = direct_recovery
+        source = "DIRECT_QUOTE_RECOVERY_TOP_N"
+    elif contract_revalidate is not None:
+        effective = contract_revalidate
+        source = "CONTRACT_REVALIDATE_TOP_N"
+    else:
+        effective = 5
+        source = "default"
+
+    return DirectQuoteBudgetConfig(
+        canonical_raw=canonical_raw,
+        direct_recovery_raw=direct_recovery_raw,
+        contract_revalidate_raw=contract_revalidate_raw,
+        effective_limit=int(effective),
+        source=source,
+        conflict=conflict,
+        conflict_detail=conflict_detail,
+    )
+
+
 def _new_selector_request_context(
     ticker: str,
     execution_mode: str = "unknown",
 ) -> SelectorRequestContext:
-    max_direct_quotes = _positive_int_env("SELECTOR_MAX_DIRECT_QUOTE_CALLS", 5)
+    budget_cfg = _resolve_direct_quote_budget_config()
     return SelectorRequestContext(
         ticker=str(ticker or ""),
-        direct_quote_attempts_remaining=min(_DIRECT_QUOTE_RECOVERY_TOP_N, max_direct_quotes),
+        direct_quote_attempts_remaining=budget_cfg.effective_limit,
         started_at_monotonic=time.monotonic(),
         execution_mode=str(execution_mode or "unknown").lower(),
         max_expiration_calls=_positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 2),
         max_chain_calls=_positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 6),
-        max_direct_quote_calls=max_direct_quotes,
+        max_direct_quote_calls=budget_cfg.effective_limit,
+        effective_direct_quote_limit=budget_cfg.effective_limit,
+        direct_quote_budget_source=budget_cfg.source,
+        direct_quote_budget_conflict=budget_cfg.conflict,
+        direct_quote_budget_conflict_detail=budget_cfg.conflict_detail,
+        configured_selector_max_direct_quote_calls=(
+            int(budget_cfg.canonical_raw) if budget_cfg.canonical_raw and budget_cfg.canonical_raw.isdigit() else None
+        ),
+        configured_direct_quote_recovery_top_n=(
+            int(budget_cfg.direct_recovery_raw) if budget_cfg.direct_recovery_raw and budget_cfg.direct_recovery_raw.isdigit() else None
+        ),
+        configured_contract_revalidate_top_n=(
+            int(budget_cfg.contract_revalidate_raw) if budget_cfg.contract_revalidate_raw and budget_cfg.contract_revalidate_raw.isdigit() else None
+        ),
         max_total_elapsed_ms=_positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 15000),
     )
 
@@ -625,7 +751,7 @@ def _ctx_assert_budget(
         limit_by_key = {
             "expiration_calls": int(ctx.max_expiration_calls),
             "chain_calls": int(ctx.max_chain_calls),
-            "direct_quote_calls": int(ctx.max_direct_quote_calls),
+            "direct_quote_calls": int(ctx.effective_direct_quote_limit),
         }
         if call_key is None:
             return
@@ -685,11 +811,14 @@ def _ctx_note_throttle_issue(
 def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
     if ctx is None:
         return {}
+    direct_quote_used = int(ctx.provider_call_counts.get("direct_quote_calls", 0) or 0)
+    effective_direct_quote_limit = int(ctx.effective_direct_quote_limit or ctx.max_direct_quote_calls or 5)
+    direct_quote_remaining = max(0, effective_direct_quote_limit - direct_quote_used)
     return {
         "underlying_quote_calls": int(ctx.provider_call_counts.get("underlying_quote_calls", 0) or 0),
         "expiration_calls": int(ctx.provider_call_counts.get("expiration_calls", 0) or 0),
         "chain_calls": int(ctx.provider_call_counts.get("chain_calls", 0) or 0),
-        "direct_quote_calls": int(ctx.provider_call_counts.get("direct_quote_calls", 0) or 0),
+        "direct_quote_calls": direct_quote_used,
         "provider_call_counts": dict(ctx.provider_call_counts),
         "elapsed_ms_by_stage": {
             key: round(float(value or 0.0), 3)
@@ -699,11 +828,28 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "selector_elapsed_ms": round(_ctx_elapsed_ms(ctx), 3),
         "expirations_probed": list(ctx.expirations_probed),
         "throttle_diagnostics": list(ctx.throttle_diagnostics),
-        "direct_quote_attempts_remaining": int(ctx.direct_quote_attempts_remaining or 0),
+        "direct_quote_attempts_remaining": direct_quote_remaining,
+        "direct_quote_budget": {
+            "canonical_env": ctx.configured_selector_max_direct_quote_calls,
+            "direct_recovery_alias": ctx.configured_direct_quote_recovery_top_n,
+            "contract_revalidate_alias": ctx.configured_contract_revalidate_top_n,
+            "source": str(ctx.direct_quote_budget_source or "default"),
+            "effective_limit": effective_direct_quote_limit,
+            "used": direct_quote_used,
+            "remaining": direct_quote_remaining,
+            "conflict": bool(ctx.direct_quote_budget_conflict),
+            "conflict_detail": ctx.direct_quote_budget_conflict_detail,
+        },
+        "direct_quote_structural_candidates": int(ctx.direct_quote_structural_candidates or 0),
+        "direct_quote_eligible_candidates": int(ctx.direct_quote_eligible_candidates or 0),
+        "direct_quote_attempted_symbols": list(ctx.direct_quote_attempted_symbols),
+        "direct_quote_unattempted_count": int(ctx.direct_quote_unattempted_count or 0),
+        "direct_quote_unattempted_symbols": list(ctx.direct_quote_unattempted_symbols[:25]),
+        "direct_quote_candidate_ranking": list(ctx.direct_quote_candidate_ranking[:25]),
         "limits": {
             "max_expiration_calls": int(ctx.max_expiration_calls),
             "max_chain_calls": int(ctx.max_chain_calls),
-            "max_direct_quote_calls": int(ctx.max_direct_quote_calls),
+            "max_direct_quote_calls": effective_direct_quote_limit,
             "max_total_elapsed_ms": int(ctx.max_total_elapsed_ms),
         },
         "budget_exhausted_stage": ctx.budget_exhausted_stage,
@@ -839,6 +985,162 @@ def _extract_abs_delta(opt: dict) -> tuple[Optional[float], str]:
     if d <= 0 or d > 1.0:
         return None, f"delta_out_of_valid_range_{d:.4f}"
     return d, "ok"
+
+
+def _option_expiration_date(opt: dict) -> date | None:
+    raw = opt.get("expiration_date") or opt.get("expiration")
+    if raw:
+        try:
+            return date.fromisoformat(str(raw)[:10])
+        except Exception:
+            pass
+    symbol = "".join(str(opt.get("symbol") or opt.get("contract") or "").upper().split())
+    if len(symbol) >= 15:
+        try:
+            return datetime.strptime(symbol[-15:-9], "%y%m%d").date()
+        except Exception:
+            return None
+    return None
+
+
+def _option_strike(opt: dict) -> float | None:
+    strike = opt.get("strike")
+    if strike not in (None, ""):
+        try:
+            return float(strike)
+        except Exception:
+            pass
+    symbol = "".join(str(opt.get("symbol") or opt.get("contract") or "").upper().split())
+    if len(symbol) >= 8:
+        try:
+            return int(symbol[-8:]) / 1000.0
+        except Exception:
+            return None
+    return None
+
+
+def _option_type(opt: dict) -> str:
+    raw = opt.get("option_type") or opt.get("type") or opt.get("put_call")
+    if raw:
+        value = str(raw).strip().upper()
+        if value.startswith("C"):
+            return "CALL"
+        if value.startswith("P"):
+            return "PUT"
+    symbol = "".join(str(opt.get("symbol") or opt.get("contract") or "").upper().split())
+    if len(symbol) >= 9 and symbol[-9] in ("C", "P"):
+        return "CALL" if symbol[-9] == "C" else "PUT"
+    return ""
+
+
+def _valid_occ_symbol(opt: dict) -> bool:
+    symbol = "".join(str(opt.get("symbol") or opt.get("contract") or "").upper().split())
+    if len(symbol) < 15:
+        return False
+    try:
+        datetime.strptime(symbol[-15:-9], "%y%m%d")
+        int(symbol[-8:])
+    except Exception:
+        return False
+    return symbol[-9] in ("C", "P")
+
+
+def _order_chain_for_direct_quote_recovery(
+    chain: list[dict],
+    *,
+    direction: str,
+    underlying_price: float,
+    target_delta: float,
+    today: date,
+    request_context: SelectorRequestContext,
+) -> list[dict]:
+    direction_norm = str(direction or "").strip().upper()
+    if direction_norm.startswith("C"):
+        direction_norm = "CALL"
+    elif direction_norm.startswith("P"):
+        direction_norm = "PUT"
+    rows: list[tuple[tuple, dict, dict]] = []
+    for original_index, opt in enumerate(list(chain or [])):
+        exp_date = _option_expiration_date(opt)
+        strike = _option_strike(opt)
+        opt_type = _option_type(opt)
+        dte = (exp_date - today).days if exp_date else None
+        abs_delta, _ = _extract_abs_delta(opt)
+        delta_distance = (
+            abs(abs_delta - abs(float(target_delta or 0.0)))
+            if abs_delta is not None and target_delta is not None
+            else None
+        )
+        strike_distance = (
+            abs(float(strike) - float(underlying_price))
+            if strike is not None and underlying_price
+            else None
+        )
+        moneyness_distance_pct = (
+            strike_distance / abs(float(underlying_price))
+            if strike_distance is not None and underlying_price
+            else None
+        )
+        valid_expiration = exp_date is not None and (dte is None or dte >= 0)
+        if strike is None or not underlying_price or opt_type != direction_norm:
+            directional_fit = False
+        elif direction_norm == "CALL":
+            directional_fit = strike >= float(underlying_price)
+        elif direction_norm == "PUT":
+            directional_fit = strike <= float(underlying_price)
+        else:
+            directional_fit = False
+        oi_missing = opt.get("open_interest") in (None, "")
+        vol_missing = opt.get("volume") in (None, "")
+        open_interest = int(_safe_float(opt.get("open_interest"), 0.0)) if not oi_missing else None
+        volume = int(_safe_float(opt.get("volume"), 0.0)) if not vol_missing else None
+        ranking = {
+            "rank": 0,
+            "symbol": opt.get("symbol") or opt.get("contract"),
+            "strike": strike,
+            "expiration": exp_date.isoformat() if exp_date else None,
+            "dte": dte,
+            "delta": abs_delta,
+            "delta_distance": delta_distance,
+            "moneyness_distance_pct": moneyness_distance_pct,
+            "directional_strike_fit": directional_fit,
+            "open_interest": open_interest,
+            "volume": volume,
+            "original_index": original_index,
+        }
+        sort_key = (
+            0 if _valid_occ_symbol(opt) else 1,
+            0 if valid_expiration else 1,
+            0 if directional_fit else 1,
+            strike_distance if strike_distance is not None else float("inf"),
+            delta_distance if delta_distance is not None else float("inf"),
+            -(open_interest or 0),
+            -(volume or 0),
+            original_index,
+        )
+        rows.append((sort_key, opt, ranking))
+    rows.sort(key=lambda item: item[0])
+    rankings = []
+    for rank, (_, _, ranking) in enumerate(rows, start=1):
+        ranked = dict(ranking)
+        ranked["rank"] = rank
+        rankings.append(ranked)
+    if request_context is not None:
+        # ``direct_quote_structural_candidates`` counts rows that are at
+        # least structurally direct-quotable — valid OCC symbol, valid
+        # expiration, and directional strike fit. Actual direct-quote
+        # eligibility depends on the chain reject reason being one that
+        # ``_should_revalidate(...)`` accepts, which is not known here
+        # at ordering time and gets counted in the quality-filter loop.
+        structural_rows = sum(
+            1
+            for sort_key, _, _ in rows
+            if sort_key[0] == 0 and sort_key[1] == 0 and sort_key[2] == 0
+        )
+        request_context.direct_quote_structural_candidates = structural_rows
+        request_context.direct_quote_candidate_ranking = rankings
+        _ctx_refresh_diagnostics(request_context)
+    return [opt for _, opt, _ in rows]
 
 
 def _extract_iv(opt: dict) -> Optional[float]:
@@ -1076,9 +1378,8 @@ _PAPER_SELECTOR_MARKET_DATA_DOMAIN = os.getenv(
     "PAPER_SELECTOR_MARKET_DATA_DOMAIN", "auto"
 ).strip().lower()
 
-# P0 PR #302 — Fix 2: DIRECT_QUOTE_RECOVERY_TOP_N env alias.
-# Maps to existing CONTRACT_REVALIDATE_TOP_N; preference given to the new name.
-# Safe parse: never raises at module import on malformed env value.
+# P0 PR #302 compatibility helper retained for older tests/callers. It no
+# longer owns per-request direct quote budget authority.
 def _safe_int_env(primary: str, fallback: str, default: int) -> int:
     """Parse int from env var safely. Logs warning on parse failure, never raises."""
     import logging as _log_env
@@ -1094,12 +1395,6 @@ def _safe_int_env(primary: str, fallback: str, default: int) -> int:
                     _key, _raw, default,
                 )
     return default
-
-_DIRECT_QUOTE_RECOVERY_TOP_N: int = _safe_int_env(
-    "DIRECT_QUOTE_RECOVERY_TOP_N",
-    "CONTRACT_REVALIDATE_TOP_N",
-    DEFAULT_REVALIDATE_TOP_N,
-)
 
 # Paper sandbox data failure reasons — these indicate data domain issues,
 # not true contract quality failures.
@@ -2240,7 +2535,15 @@ class APContractSelectionEngine:
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
-        for opt in chain:
+        _quality_chain = _order_chain_for_direct_quote_recovery(
+            chain,
+            direction=direction,
+            underlying_price=float(underlying_price or 0.0),
+            target_delta=float(self.target_delta or 0.0),
+            today=today,
+            request_context=request_context,
+        )
+        for opt in _quality_chain:
             if _PRO_QUALITY_ENABLED:
                 exp_str = opt.get("expiration_date", "")
                 _dte = 0
@@ -2258,6 +2561,12 @@ class APContractSelectionEngine:
                 # and rerun pro_quality on the patched opt before rejecting.
                 # One context enforces the hard cap across every DTE probe.
                 if pro_tier == "REJECT" and _should_revalidate(pro_reason):
+                    _sym_for_count = str(opt.get("symbol") or "").strip().upper()
+                    if _sym_for_count and _sym_for_count not in request_context.direct_quote_eligible_symbols:
+                        request_context.direct_quote_eligible_symbols.add(_sym_for_count)
+                        request_context.direct_quote_eligible_candidates = len(
+                            request_context.direct_quote_eligible_symbols
+                        )
                     _rv_pro = _revalidate_direct(
                         self.data_broker,
                         opt,
@@ -2318,6 +2627,20 @@ class APContractSelectionEngine:
                             "selected":  False,
                             "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
                         })
+                    elif _rv_pro.get("action") == "SKIP_BUDGET_EXHAUSTED":
+                        # ``_direct_quote_recovery_audit`` is a REQUEST-level
+                        # aggregate. Never overwrite ``attempted``,
+                        # ``selected``, or the selected contract from a later
+                        # budget-skipped candidate — earlier candidates in the
+                        # same request may already have made a real provider
+                        # call or produced a survivor. OR-only semantics:
+                        # ``budget_skipped=True`` sticks once any later
+                        # candidate is unattempted; per-candidate attribution
+                        # lives in ``direct_quote_unattempted_symbols``.
+                        _direct_quote_recovery_audit["budget_skipped"] = True
+                        _direct_quote_recovery_audit["budget_skip_reason"] = (
+                            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        )
                     elif _rv_pro.get("action") == "REJECT_UNAVAILABLE":
                         pro_reason = _rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"
                         _direct_quote_recovery_audit.update({
@@ -2384,6 +2707,12 @@ class APContractSelectionEngine:
             # re-enforced against the direct quote — never bypassed.
             # One context enforces the hard cap across every DTE probe.
             if result is not None and _should_revalidate(result):
+                _sym_for_count = str(opt.get("symbol") or "").strip().upper()
+                if _sym_for_count and _sym_for_count not in request_context.direct_quote_eligible_symbols:
+                    request_context.direct_quote_eligible_symbols.add(_sym_for_count)
+                    request_context.direct_quote_eligible_candidates = len(
+                        request_context.direct_quote_eligible_symbols
+                    )
                 _rv = _revalidate_direct(
                     self.data_broker,
                     opt,
@@ -2478,6 +2807,21 @@ class APContractSelectionEngine:
                                 "selected":  False,
                                 "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
                             })
+                    except Exception:
+                        pass
+                elif _rv_action == "SKIP_BUDGET_EXHAUSTED":
+                    try:
+                        # Request-level aggregate: OR ``budget_skipped``
+                        # in and record the reason. Do NOT overwrite
+                        # ``attempted``, ``selected``, or the recorded
+                        # contract — earlier candidates in this request
+                        # may already have made a real provider call or
+                        # produced a survivor. Per-candidate detail lives
+                        # in ``direct_quote_unattempted_symbols``.
+                        _direct_quote_recovery_audit["budget_skipped"] = True
+                        _direct_quote_recovery_audit["budget_skip_reason"] = (
+                            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        )
                     except Exception:
                         pass
                 elif _rv_action == "REJECT_UNAVAILABLE":
@@ -2623,6 +2967,12 @@ class APContractSelectionEngine:
                     )
             except Exception:
                 pass
+            if (
+                request_context is not None
+                and int(getattr(request_context, "direct_quote_unattempted_count", 0) or 0) > 0
+                and getattr(request_context, "budget_exhausted_stage", None) == "direct_quote"
+            ):
+                _final_reason = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
             _attach_selector_failure(
                 plan,
                 reason_code=_final_reason,
@@ -3229,6 +3579,14 @@ class APContractSelectionEngine:
         # the selected contract fields on the plan. Set mutate_plan=False only
         # for audit/replay callers that explicitly consume SelectedContract.
         _selection_diagnostics = _selector_request_diagnostics(request_context)
+        # Attach the request-level direct-quote recovery audit so the caller
+        # can verify aggregate truthfulness (attempted / selected /
+        # budget_skipped) without needing a failure path to emit it.
+        _selection_diagnostics["direct_quote_recovery_audit"] = dict(_direct_quote_recovery_audit)
+        try:
+            plan.setdefault("metadata", {})["selector_diagnostics"] = _selection_diagnostics
+        except Exception:
+            pass
         if isinstance(selected.candidate_audit, dict):
             selected.candidate_audit["selection_diagnostics"] = _selection_diagnostics
         if request_context is not None and isinstance(request_context.playbook_audit, dict):

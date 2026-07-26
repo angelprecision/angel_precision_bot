@@ -187,13 +187,16 @@ def _acceptance_ask_cap() -> "tuple[bool, float | None, str | None]":
 
 
 # ── P0 (monday-trade-flow-readiness, amended): canonical materialization
-# outcome. Every triggered deferred row must resolve to EXACTLY ONE of three
+# outcomes. Every triggered deferred row must resolve to EXACTLY ONE of these
 # operator-facing outcomes — the acceptance contract for restored trade flow:
 #   MATERIALIZED_AND_SUBMITTED     real OCC contract selected AND handed to
 #                                  the broker submit path
 #   RETRY_LATER_DATA_UNAVAILABLE   transient data-miss (zero quotes / empty
 #                                  chain near open); a bounded retry is
 #                                  scheduled inside the warmup/entry window
+#   RETRY_LATER_SELECTOR_BUDGET    PR #389: the request ran out of direct-
+#                                  quote budget before finding a survivor;
+#                                  a bounded retry gets a fresh budget
 #   TERMINAL_NO_TRADEABLE_CONTRACT everything else terminal: quality rejects,
 #                                  budget/cap blocks, retry exhaustion/cutoff,
 #                                  selector exceptions, submit failures
@@ -615,11 +618,22 @@ def _build_deferred_retry_schedule_meta(
         "local_order_id": str(local_order_id or ""),
         "signal_id": str(signal_id or ""),
         "contract_selection_status": "CONTRACT_SELECTION_RETRY",
-        # P0 amended: canonical tri-outcome stamp — a scheduled retry is the
-        # RETRY_LATER_DATA_UNAVAILABLE state until the next attempt resolves
+        # P0 amended: canonical materialization outcome stamp — a scheduled
+        # retry is either RETRY_LATER_SELECTOR_BUDGET (PR #389, when the
+        # request ran out of direct-quote budget) or RETRY_LATER_DATA_UNAVAILABLE
+        # (all other retryable data reasons), until the next attempt resolves
         # it to MATERIALIZED_AND_SUBMITTED or TERMINAL_NO_TRADEABLE_CONTRACT.
         "entry_path": _MATERIALIZATION_ENTRY_PATH,
-        "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+        # PR #389 amendment: SELECTOR_REQUEST_BUDGET_EXHAUSTED gets its own
+        # durable outcome so operators can tell "we ran out of direct-quote
+        # calls this request, retry with a fresh budget" apart from the
+        # generic transient data-miss. All other retryable data reasons keep
+        # the existing RETRY_LATER_DATA_UNAVAILABLE contract.
+        "materialization_outcome": (
+            "RETRY_LATER_SELECTOR_BUDGET"
+            if str(reason_code or "").strip() == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+            else "RETRY_LATER_DATA_UNAVAILABLE"
+        ),
         "materialization_detail": str(reason_code or ""),
         # P0 §5: honest taxonomy — both operational and candidate-quality
         # dimensions preserved together on the durable row.
@@ -657,7 +671,7 @@ def _build_deferred_retry_terminal_meta(
         "local_order_id": str(local_order_id or ""),
         "signal_id": str(signal_id or ""),
         "last_breach_failure_at": _now.isoformat(),
-        # P0 amended: canonical tri-outcome stamp for retry-exhaustion/cutoff/
+        # P0 amended: canonical materialization outcome stamp for retry-exhaustion/cutoff/
         # disabled terminals — the fine-grained reason stays in
         # materialization_detail / deferred_retry_terminal_reason.
         "entry_path": _MATERIALIZATION_ENTRY_PATH,
@@ -2557,6 +2571,18 @@ class APExecutionCore:
             _ok = False
             if callable(_schedule):
                 try:
+                    _schedule_meta = _build_deferred_retry_schedule_meta(
+                        reason_code=reason_code,
+                        selector_audit=selector_failure or {},
+                        attempt=_expected_attempt,
+                        max_attempts=max_attempts,
+                        delay_seconds=_retry_delay,
+                        client_id=self.client_id,
+                        execution_mode=row_mode,
+                        local_order_id=local_order_id,
+                        signal_id=signal_id,
+                        now=_now,
+                    )
                     _ok = bool(_schedule(
                         local_order_id,
                         owner=owner,
@@ -2565,7 +2591,10 @@ class APExecutionCore:
                         attempt=_expected_attempt,
                         max_attempts=max_attempts,
                         next_retry_at=_next_retry_at,
-                        selector_failure=selector_failure or {"reason_code": reason_code},
+                        selector_failure={
+                            **(selector_failure or {}),
+                            **_schedule_meta,
+                        },
                     ))
                 except Exception as _sch_exc:
                     log.critical(
@@ -3663,7 +3692,7 @@ class APExecutionCore:
                 except Exception:
                     pass
             # ── P0 (monday-trade-flow-readiness, amended): persist the
-            # canonical tri-outcome onto the order row so the operator can
+            # canonical materialization outcome onto the order row so the operator can
             # answer "what happened to this deferred trigger?" from
             # orders.meta alone — no log spelunking. Best-effort, never
             # raises, exactly-once by construction (this emitter is the

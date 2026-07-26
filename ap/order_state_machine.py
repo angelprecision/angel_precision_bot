@@ -2483,6 +2483,25 @@ class APOrderStateMachine:
 
         _owner = str(owner or "").strip()
         _reason = str(reason_code or "").strip()
+        _selector_failure = (
+            dict(selector_failure) if isinstance(selector_failure, dict) else {}
+        )
+        _expected_outcome = (
+            "RETRY_LATER_SELECTOR_BUDGET"
+            if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+            else "RETRY_LATER_DATA_UNAVAILABLE"
+        )
+        _outcome = str(
+            _selector_failure.get("materialization_outcome")
+            or _expected_outcome
+        ).strip().upper()
+        _detail = str(
+            _selector_failure.get("materialization_detail") or _reason
+        ).strip()
+        _entry_path = str(
+            _selector_failure.get("entry_path")
+            or "DEFERRED_BREACH_MATERIALIZATION"
+        ).strip().upper()
         try:
             _generation = max(1, int(generation or 1))
             _attempt = max(1, int(attempt or 1))
@@ -2491,6 +2510,35 @@ class APOrderStateMachine:
             return False
         if not _owner or not _reason or not str(next_retry_at or "").strip():
             return False
+        if (
+            _outcome not in {
+                "RETRY_LATER_SELECTOR_BUDGET",
+                "RETRY_LATER_DATA_UNAVAILABLE",
+            }
+            or _outcome != _expected_outcome
+            or _detail != _reason
+            or _entry_path != "DEFERRED_BREACH_MATERIALIZATION"
+        ):
+            log.critical(
+                "[%s] MATERIALIZATION_RETRY_OUTCOME_INVALID | order=%s | "
+                "reason=%s outcome=%s detail=%s entry_path=%s",
+                self.client_id,
+                local_order_id,
+                _reason,
+                _outcome,
+                _detail,
+                _entry_path,
+            )
+            return False
+
+        # Keep the complete selector diagnostics, but make the canonical
+        # outcome fields identical at both read surfaces.  Pending-trigger
+        # classification and restart recovery read the top-level fields.
+        _selector_failure.update({
+            "materialization_outcome": _outcome,
+            "materialization_detail": _detail,
+            "entry_path": _entry_path,
+        })
 
         _now = now_utc_iso()
         _patch = {
@@ -2504,14 +2552,20 @@ class APOrderStateMachine:
             "retry_reason": _reason,
             "retry_attempt": _attempt,
             "breach_attempt_count": _attempt,
+            "materialization_attempts": _attempt,
             "retry_max_attempts": _max_attempts,
             "next_retry_at": str(next_retry_at),
             "materialization_next_retry_at": str(next_retry_at),
+            "materialization_reason": _reason,
+            "materialization_last_failure_at": _now,
             "retry_owner": _owner,
             "current_owner": _owner,
             "retry_scheduled_at": _now,
             "selector_completed_at": _now,
-            "materialization_selector_failure": selector_failure or {},
+            "materialization_outcome": _outcome,
+            "materialization_detail": _detail,
+            "entry_path": _entry_path,
+            "materialization_selector_failure": _selector_failure,
             "broker_ready": False,
         }
         try:

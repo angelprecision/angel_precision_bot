@@ -22,6 +22,17 @@ from ap.contract_selector import (
 )
 
 
+def _next_weekday(target: date) -> date:
+    while target.weekday() >= 5:
+        target += timedelta(days=1)
+    return target
+
+
+# Session-relative near-future weekday — avoids the date-rot trap where a
+# hardcoded expiry silently becomes 0DTE / expired between commit and CI run.
+_NEAR_EXPIRY = _next_weekday(date.today() + timedelta(days=2)).isoformat()
+
+
 def _response(*, status_code=200, payload=None):
     resp = MagicMock()
     resp.status_code = status_code
@@ -109,13 +120,12 @@ class TestDeferredSelectorLatency:
 
         assert broker.get_quote.call_count == 5
         assert ctx.provider_call_counts["direct_quote_calls"] == 5
-        assert ctx.direct_quote_attempts_remaining == 0
+        assert ctx.direct_quote_attempts_remaining == 5
 
     def test_same_occ_is_not_revalidated_twice_in_one_request(self):
         broker = MagicMock()
         broker.get_quote.return_value = {"bid": 1.1, "ask": 1.2}
         ctx = _new_selector_request_context("SPY")
-        ctx.direct_quote_attempts_remaining = 5
         opt = {"symbol": "SPY260710C00450000", "bid": 0.0, "ask": 0.0}
 
         first = revalidate_with_direct_quote(
@@ -141,8 +151,8 @@ class TestDeferredSelectorLatency:
         broker = MagicMock()
         broker.get_quote.return_value = {"bid": 0.0, "ask": 0.0}
         ctx = _new_selector_request_context("SPY", "paper")
-        ctx.direct_quote_attempts_remaining = 2
         ctx.max_direct_quote_calls = 2
+        ctx.effective_direct_quote_limit = 2
 
         results = []
         for expiration_index in range(3):
@@ -357,6 +367,7 @@ class TestDeferredSelectorLatency:
         assert ctx.max_expiration_calls == 2
         assert ctx.max_chain_calls == 4
         assert ctx.max_direct_quote_calls == 3
+        assert ctx.effective_direct_quote_limit == 3
         assert ctx.max_total_elapsed_ms == 9000
         assert ctx.direct_quote_attempts_remaining == 3
 
@@ -423,7 +434,6 @@ class TestDeferredSelectorLatency:
         broker = MagicMock()
         broker.get_quote.side_effect = RuntimeError("provider boom")
         ctx = _new_selector_request_context("SPY")
-        ctx.direct_quote_attempts_remaining = 1
 
         with patch("ap.tradier_market_data_throttle.before_market_data_call", return_value={"acquired": True, "wait_ms": 7.0}), \
              patch("ap.tradier_market_data_throttle.after_market_data_call") as after_call:
@@ -442,8 +452,8 @@ class TestDeferredSelectorLatency:
         broker.get_quote.return_value = {"bid": 1.1, "ask": 1.2}
         ctx_a = _new_selector_request_context("SPY")
         ctx_b = _new_selector_request_context("SPY")
-        ctx_a.direct_quote_attempts_remaining = 1
-        ctx_b.direct_quote_attempts_remaining = 1
+        ctx_a.max_direct_quote_calls = ctx_a.effective_direct_quote_limit = 1
+        ctx_b.max_direct_quote_calls = ctx_b.effective_direct_quote_limit = 1
 
         def _run(ctx, symbol):
             revalidate_with_direct_quote(
@@ -461,8 +471,8 @@ class TestDeferredSelectorLatency:
         t1.join()
         t2.join()
 
-        assert ctx_a.direct_quote_attempts_remaining == 0
-        assert ctx_b.direct_quote_attempts_remaining == 0
+        assert ctx_a.direct_quote_attempts_remaining == 5
+        assert ctx_b.direct_quote_attempts_remaining == 5
         assert ctx_a.provider_call_counts["direct_quote_calls"] == 1
         assert ctx_b.provider_call_counts["direct_quote_calls"] == 1
         assert broker.get_quote.call_count == 2
@@ -470,7 +480,7 @@ class TestDeferredSelectorLatency:
     def test_non_deferred_single_selection_has_single_provider_pass(self):
         sel, session = _make_selector()
         ctx = _new_selector_request_context("SPY")
-        expirations = ["2026-07-10"]
+        expirations = [_NEAR_EXPIRY]
         session.get.side_effect = [
             _response(payload={"quotes": {"quote": {"last": 450.0}}}),
             _response(payload={"expirations": {"date": expirations}}),
@@ -488,7 +498,7 @@ class TestDeferredSelectorLatency:
         }
 
     def test_cached_and_uncached_chain_output_match(self):
-        expirations = ["2026-07-10"]
+        expirations = [_NEAR_EXPIRY]
 
         sel_a, session_a = _make_selector()
         ctx_a = _new_selector_request_context("SPY")
