@@ -162,6 +162,7 @@ jobs:
             tests/test_p0_startup_readiness_fail_closed.py \
             tests/test_p0_manual_client_close_proof.py \
             tests/test_p0_manual_close_production_shape.py \
+            tests/test_p0_manual_close_idempotency_and_validation.py \
             -v --tb=short --color=yes
 
       - name: Summary
