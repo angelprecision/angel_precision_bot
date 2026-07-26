@@ -641,6 +641,95 @@ def test_11b_operational_and_terminal_reasons_preserved_side_by_side():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TEST 11c — PR #389 amendment: selector-budget exhaustion gets its own
+# durable materialization_outcome so operators can distinguish
+# "ran out of direct-quote budget this request" from generic transient
+# data-miss. All other retryable data reasons must keep the existing
+# RETRY_LATER_DATA_UNAVAILABLE contract, and every existing field on the
+# durable retry row must be preserved.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_11c_selector_budget_exhausted_stamps_dedicated_outcome():
+    from ap_execution_core import _build_deferred_retry_schedule_meta
+
+    now = datetime(2026, 7, 25, 14, 0, 0, tzinfo=timezone.utc)
+    audit = {
+        "attempted": True,
+        "budget_skipped": True,
+        "budget_skip_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        "last_candidate_reject_reason": "OI_TOO_LOW",
+    }
+
+    meta = _build_deferred_retry_schedule_meta(
+        reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+        selector_audit=audit,
+        attempt=2,
+        max_attempts=5,
+        delay_seconds=45,
+        client_id="jason@example.com",
+        execution_mode="live",
+        local_order_id="oid-budget-1",
+        signal_id="sig-budget-1",
+        now=now,
+    )
+
+    # Dedicated durable outcome for the selector-budget case.
+    assert meta["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
+    assert meta["materialization_detail"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+
+    # All previously-required fields must still be present and truthful.
+    assert meta["deferred_retry_scheduled"] is True
+    assert meta["deferred_retry_reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert meta["deferred_retry_attempt"] == 2
+    assert meta["deferred_retry_max_attempts"] == 5
+    assert meta["deferred_retry_delay_seconds"] == 45
+    assert meta["deferred_retry_next_attempt_at"] == (
+        now + timedelta(seconds=45)
+    ).isoformat()
+    assert meta["breach_attempt_count"] == 2
+    assert meta["client_id"] == "jason@example.com"
+    assert meta["execution_mode"] == "live"
+    assert meta["local_order_id"] == "oid-budget-1"
+    assert meta["signal_id"] == "sig-budget-1"
+    assert meta["contract_selection_status"] == "CONTRACT_SELECTION_RETRY"
+    assert meta["retry_class"] == "OPERATIONAL_REQUEST_BUDGET"
+    assert meta["operational_reason"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    # The last candidate-quality reason from the audit is carried through
+    # the taxonomy so operators keep visibility on both dimensions.
+    assert meta["selector_terminal_reason"] == "OI_TOO_LOW"
+    assert meta["may_retry_with_fresh_budget"] is True
+
+
+def test_11c_other_retryable_reasons_keep_data_unavailable_outcome():
+    from ap_execution_core import _build_deferred_retry_schedule_meta
+
+    now = datetime(2026, 7, 25, 14, 0, 0, tzinfo=timezone.utc)
+    for reason in (
+        "QUOTE_ZERO_BID_ASK",
+        "MARKET_DATA_THROTTLE_UNAVAILABLE",
+        "PROVIDER_RATE_LIMITED",
+        "PROVIDER_TIMEOUT",
+        "SELECTOR_NO_QUOTES",
+        "SELECTOR_EMPTY_CHAIN",
+    ):
+        meta = _build_deferred_retry_schedule_meta(
+            reason_code=reason,
+            selector_audit={},
+            attempt=1,
+            max_attempts=5,
+            delay_seconds=30,
+            client_id="tf@example.com",
+            execution_mode="paper",
+            local_order_id="oid-x",
+            signal_id="sig-x",
+            now=now,
+        )
+        assert meta["materialization_outcome"] == "RETRY_LATER_DATA_UNAVAILABLE", reason
+        assert meta["materialization_detail"] == reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TEST 12 — No direct broker submit from recovery
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -808,3 +808,343 @@ class TestAggregateAuditTruthfulness:
         assert diagnostics["direct_quote_budget"]["used"] == 1
         # Second candidate was never quoted — record it as unattempted.
         assert second_symbol in diagnostics["direct_quote_unattempted_symbols"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# July 23 fleet acceptance replay — 8 tickers × 3 identities = 24 canonical
+# selector requests. Every request must:
+#
+#   * receive an independent fresh selector budget;
+#   * exhaust its budget on zero-quote candidates;
+#   * report the request-scope reason SELECTOR_REQUEST_BUDGET_EXHAUSTED;
+#   * NOT submit / cancel / replace any broker order;
+#   * persist the dedicated durable outcome RETRY_LATER_SELECTOR_BUDGET on
+#     the deferred-retry row with exact identity fields intact.
+#
+# Identity fixtures mirror the three that exist in repository configuration
+# and runtime. They are never invented on the fly and never collapsed into
+# a generic client.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+FLEET_TICKERS: list[str] = [
+    "ABT", "COF", "GM", "CAT", "KHC", "ROST", "UPS", "BAC",
+]
+
+FLEET_IDENTITIES: list[tuple[str, str, str]] = [
+    ("jason@angelprecision.com",       "live",  "Jason LIVE"),
+    ("jose@angelprecision.com",        "paper", "Jose PAPER"),
+    ("tradefluence@angelprecision.com", "paper", "Tradefluence PAPER"),
+]
+
+
+def _ticker_option(idx: int, ticker: str, direction: str, strike: float,
+                   *, delta: float | None, oi: int | None, volume: int | None) -> dict:
+    """Produce a chain option row keyed to ``ticker``. Same shape as
+    _option() but the OCC symbol embeds the ticker rather than SPY."""
+    cp = "C" if direction == "CALL" else "P"
+    occ = f"{ticker}{_NEAR_EXPIRY_OCC}{cp}{int(strike * 1000):08d}"
+    opt = {
+        "symbol": occ,
+        "expiration_date": _NEAR_EXPIRY,
+        "strike": float(strike),
+        "option_type": direction.lower(),
+        "bid": 0.0,
+        "ask": 0.0,
+        "open_interest": oi,
+        "volume": volume,
+        "bid_size": 20,
+        "ask_size": 20,
+        "_provider_index": idx,
+    }
+    if delta is not None:
+        opt["greeks"] = {"delta": delta if direction == "CALL" else -abs(delta)}
+    return opt
+
+
+def _fleet_chain(ticker: str, direction: str) -> list[dict]:
+    """A production-shaped chain that guarantees budget exhaustion when the
+    valid-symbol is set to a nonexistent OCC — every recovered candidate
+    returns zero bid/ask, so no survivor is found and the entire direct-
+    quote budget is spent."""
+    chain: list[dict] = []
+    for idx in range(130):
+        strike = 600 + idx if direction == "CALL" else 300 - idx
+        chain.append(_ticker_option(
+            idx, ticker, direction, float(strike),
+            delta=None, oi=0, volume=0,
+        ))
+    priority = ([451.0, 452.0, 453.0, 454.0, 455.0, 456.0, 457.0, 458.0, 459.0]
+                if direction == "CALL"
+                else [449.0, 448.0, 447.0, 446.0, 445.0, 444.0, 443.0, 442.0, 441.0])
+    for rank_idx, strike in enumerate(priority[:8]):
+        chain[rank_idx] = _ticker_option(
+            rank_idx, ticker, direction, strike,
+            delta=0.40, oi=1200, volume=300,
+        )
+    chain[100] = _ticker_option(
+        100, ticker, direction, priority[8],
+        delta=0.41, oi=1200, volume=300,
+    )
+    return chain
+
+
+def _fleet_plan(*, ticker: str, direction: str, client_id: str,
+                execution_mode: str, signal_id: str, local_order_id: str,
+                budget: float = 2000.0) -> dict:
+    return {
+        "signal_id": signal_id,
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "local_order_id": local_order_id,
+        "ticker": ticker,
+        "side": direction,
+        "target_underlying": 450.0,
+        "wick_targets": [{"distance_pct": 0.5, "confidence": 0.75}],
+        "trigger_price": 450.0,
+        "tier": "A",
+        "score": 85.0,
+        "pattern": "3-1-2",
+        "timeframe": "5m",
+        "metadata": {
+            "sizing_context": {
+                "budget": budget,
+                "account_equity": 10000.0,
+                "risk_pct": 0.05,
+                "max_affordable_premium": budget,
+            }
+        },
+        "max_position_usd": budget,
+    }
+
+
+class TestJuly23FleetAcceptanceReplay:
+    """PR #389 amendment 2 — 24-request fleet replay covering the
+    July 23 acceptance surface. See module-level comment for contract."""
+
+    def _run_one(self, monkeypatch, ticker: str, client_id: str,
+                 execution_mode: str, direction: str, generation: int,
+                 attempt: int) -> tuple:
+        chain = _fleet_chain(ticker, direction)
+        # Unattainable valid symbol → every direct quote returns zero, so
+        # the request must exhaust the budget without a survivor.
+        signal_id = f"sig-{ticker}-{client_id}-g{generation}"
+        local_order_id = f"oid-{ticker}-{client_id}-g{generation}-a{attempt}"
+        plan = _fleet_plan(
+            ticker=ticker,
+            direction=direction,
+            client_id=client_id,
+            execution_mode=execution_mode,
+            signal_id=signal_id,
+            local_order_id=local_order_id,
+        )
+        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "20")
+        monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "8")
+        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "20")
+        monkeypatch.setenv("PRO_CONTRACT_QUALITY", "true")
+        monkeypatch.setattr(
+            "ap.contract_quote_revalidator.is_market_open",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            APContractSelectionEngine,
+            "_emit_selector_event",
+            lambda *a, **kw: None,
+        )
+        broker = _DirectQuoteBroker(chain, "NEVERMATCH",
+                                    valid_quote={"bid": 0.0, "ask": 0.0})
+        selector = APContractSelectionEngine(
+            broker,
+            mode=execution_mode.upper(),
+            data_broker=broker,
+            min_premium=1.0,
+            max_premium=1000.0,
+            min_oi=1,
+            min_volume=0,
+        )
+        selected = selector.select(plan)
+        return selected, broker, plan
+
+    def test_24_requests_each_exhaust_independent_budget_and_persist_retry_row(
+        self, monkeypatch,
+    ):
+        from ap_execution_core import _build_deferred_retry_schedule_meta
+
+        replay_receipts: list[dict] = []
+        for ticker in FLEET_TICKERS:
+            for client_id, execution_mode, label in FLEET_IDENTITIES:
+                selected, broker, plan = self._run_one(
+                    monkeypatch,
+                    ticker=ticker,
+                    client_id=client_id,
+                    execution_mode=execution_mode,
+                    direction=("CALL" if ticker != "BAC" else "PUT"),
+                    generation=1,
+                    attempt=1,
+                )
+                # No survivor and no broker interaction under budget
+                # exhaustion.
+                assert selected is None, f"{ticker} {label} unexpected selection"
+                assert broker.submit_order.call_count == 0, (
+                    f"{ticker} {label} unexpected submit"
+                )
+                assert broker.cancel_order.call_count == 0, (
+                    f"{ticker} {label} unexpected cancel"
+                )
+                failure = plan["metadata"]["selector_failure"]
+                assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED", (
+                    f"{ticker} {label} wrong final reason {failure['reason_code']}"
+                )
+                diagnostics = failure["selection_diagnostics"]
+                # Independent fresh budget: this request used exactly its
+                # configured 20 calls and left 0 remaining — nothing was
+                # inherited from a sibling identity or earlier ticker.
+                assert diagnostics["direct_quote_budget"]["used"] == 20
+                assert diagnostics["direct_quote_budget"]["remaining"] == 0
+                # Original chain-quality reasons must survive the budget
+                # exhaustion — not be masked by SELECTOR_REQUEST_*.
+                assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
+                assert (
+                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                    not in failure["top_reject_buckets"]
+                )
+                # Persist a durable retry row via the amended helper.
+                meta = _build_deferred_retry_schedule_meta(
+                    reason_code=failure["reason_code"],
+                    selector_audit={
+                        "attempted": True,
+                        "budget_skipped": True,
+                        "last_candidate_reject_reason": "CHAIN_ROW_ZERO_BID_ASK",
+                    },
+                    attempt=1,
+                    max_attempts=5,
+                    delay_seconds=45,
+                    client_id=plan["client_id"],
+                    execution_mode=plan["execution_mode"],
+                    local_order_id=plan["local_order_id"],
+                    signal_id=plan["signal_id"],
+                )
+                # Dedicated durable outcome, exact identity preserved.
+                assert meta["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
+                assert meta["deferred_retry_reason_code"] == (
+                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                )
+                assert meta["client_id"] == plan["client_id"]
+                assert meta["execution_mode"] == plan["execution_mode"]
+                assert meta["local_order_id"] == plan["local_order_id"]
+                assert meta["signal_id"] == plan["signal_id"]
+                assert meta["deferred_retry_attempt"] == 1
+                assert meta["deferred_retry_max_attempts"] == 5
+                assert meta["deferred_retry_delay_seconds"] == 45
+                assert meta["deferred_retry_next_attempt_at"], "missing next-attempt ts"
+                assert meta["breach_attempt_count"] == 1
+                assert meta["operational_reason"] == (
+                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                )
+                assert meta["may_retry_with_fresh_budget"] is True
+                replay_receipts.append({
+                    "ticker": ticker,
+                    "client_id": plan["client_id"],
+                    "execution_mode": plan["execution_mode"],
+                    "materialization_outcome": meta["materialization_outcome"],
+                    "budget_used": diagnostics["direct_quote_budget"]["used"],
+                    "signal_id": plan["signal_id"],
+                    "local_order_id": plan["local_order_id"],
+                })
+
+        # 8 tickers × 3 identities → exactly 24 canonical requests.
+        assert len(replay_receipts) == 24
+        # Each (ticker, client_id, execution_mode) triple is unique — no
+        # collapse across identities.
+        triples = {(r["ticker"], r["client_id"], r["execution_mode"])
+                   for r in replay_receipts}
+        assert len(triples) == 24
+        # LIVE and PAPER identities remain distinct.
+        modes = {r["execution_mode"] for r in replay_receipts}
+        assert modes == {"live", "paper"}
+        # Every receipt persists the dedicated durable outcome.
+        assert all(
+            r["materialization_outcome"] == "RETRY_LATER_SELECTOR_BUDGET"
+            for r in replay_receipts
+        )
+
+    def test_restart_then_one_due_retry_creates_one_fresh_selector_request(
+        self, monkeypatch,
+    ):
+        """After a restart-shaped run, exactly one due-retry cycle produces
+        exactly one fresh selector budget consumption — no duplicate
+        selector invocations, no consumption of the earlier request's
+        budget."""
+        first_selected, first_broker, first_plan = self._run_one(
+            monkeypatch,
+            ticker="BAC",
+            client_id="jason@angelprecision.com",
+            execution_mode="live",
+            direction="PUT",
+            generation=1,
+            attempt=1,
+        )
+        assert first_selected is None
+        first_used = first_plan["metadata"]["selector_failure"][
+            "selection_diagnostics"]["direct_quote_budget"]["used"]
+        assert first_used == 20
+        # Simulate restart + due retry: attempt=2, generation=2, brand-new
+        # selector engine, unaffected by the earlier request's budget.
+        second_selected, second_broker, second_plan = self._run_one(
+            monkeypatch,
+            ticker="BAC",
+            client_id="jason@angelprecision.com",
+            execution_mode="live",
+            direction="PUT",
+            generation=2,
+            attempt=2,
+        )
+        assert second_selected is None
+        second_used = second_plan["metadata"]["selector_failure"][
+            "selection_diagnostics"]["direct_quote_budget"]["used"]
+        # Fresh independent budget, again exactly 20.
+        assert second_used == 20
+        # No duplicate broker interactions across the two request scopes.
+        assert first_broker.submit_order.call_count == 0
+        assert second_broker.submit_order.call_count == 0
+        assert first_broker.cancel_order.call_count == 0
+        assert second_broker.cancel_order.call_count == 0
+        # Local order ids of the two attempts are distinct — no duplicate
+        # ENTRY/deferred handoff row.
+        assert first_plan["local_order_id"] != second_plan["local_order_id"]
+
+    def test_live_and_paper_identities_never_share_budget(self, monkeypatch):
+        """Consecutive LIVE and PAPER requests on the same ticker must not
+        share a selector budget. The second request's ``used`` is the
+        exhaustion count for its own scope, not a residual from the
+        first."""
+        _live_sel, live_broker, live_plan = self._run_one(
+            monkeypatch,
+            ticker="COF",
+            client_id="jason@angelprecision.com",
+            execution_mode="live",
+            direction="CALL",
+            generation=1,
+            attempt=1,
+        )
+        _paper_sel, paper_broker, paper_plan = self._run_one(
+            monkeypatch,
+            ticker="COF",
+            client_id="jose@angelprecision.com",
+            execution_mode="paper",
+            direction="CALL",
+            generation=1,
+            attempt=1,
+        )
+        live_diag = live_plan["metadata"]["selector_failure"][
+            "selection_diagnostics"]
+        paper_diag = paper_plan["metadata"]["selector_failure"][
+            "selection_diagnostics"]
+        # Both requests exhaust their own budgets independently.
+        assert live_diag["direct_quote_budget"]["used"] == 20
+        assert paper_diag["direct_quote_budget"]["used"] == 20
+        # No cross-mode broker interaction leaked.
+        assert live_broker.submit_order.call_count == 0
+        assert paper_broker.submit_order.call_count == 0
+        assert live_broker.cancel_order.call_count == 0
+        assert paper_broker.cancel_order.call_count == 0

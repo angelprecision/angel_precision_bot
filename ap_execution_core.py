@@ -619,7 +619,16 @@ def _build_deferred_retry_schedule_meta(
         # RETRY_LATER_DATA_UNAVAILABLE state until the next attempt resolves
         # it to MATERIALIZED_AND_SUBMITTED or TERMINAL_NO_TRADEABLE_CONTRACT.
         "entry_path": _MATERIALIZATION_ENTRY_PATH,
-        "materialization_outcome": "RETRY_LATER_DATA_UNAVAILABLE",
+        # PR #389 amendment: SELECTOR_REQUEST_BUDGET_EXHAUSTED gets its own
+        # durable outcome so operators can tell "we ran out of direct-quote
+        # calls this request, retry with a fresh budget" apart from the
+        # generic transient data-miss. All other retryable data reasons keep
+        # the existing RETRY_LATER_DATA_UNAVAILABLE contract.
+        "materialization_outcome": (
+            "RETRY_LATER_SELECTOR_BUDGET"
+            if str(reason_code or "").strip() == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+            else "RETRY_LATER_DATA_UNAVAILABLE"
+        ),
         "materialization_detail": str(reason_code or ""),
         # P0 §5: honest taxonomy — both operational and candidate-quality
         # dimensions preserved together on the durable row.
