@@ -170,7 +170,14 @@ class SelectorRequestContext:
     configured_selector_max_direct_quote_calls: int | None = None
     configured_direct_quote_recovery_top_n: int | None = None
     configured_contract_revalidate_top_n: int | None = None
+    # Rows that are at least structurally direct-quotable (valid OCC, valid
+    # expiration, directional fit). Set at chain-ordering time.
+    direct_quote_structural_candidates: int = 0
+    # Rows whose chain-reject reason was one _should_revalidate() accepted —
+    # i.e., the ones that actually reached the direct-quote branch. Set in
+    # the quality-filter loop, once per unique OCC symbol.
     direct_quote_eligible_candidates: int = 0
+    direct_quote_eligible_symbols: set[str] = field(default_factory=set)
     direct_quote_attempted_symbols: list[str] = field(default_factory=list)
     direct_quote_unattempted_symbols: list[str] = field(default_factory=list)
     direct_quote_unattempted_set: set[str] = field(default_factory=set)
@@ -833,6 +840,7 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
             "conflict": bool(ctx.direct_quote_budget_conflict),
             "conflict_detail": ctx.direct_quote_budget_conflict_detail,
         },
+        "direct_quote_structural_candidates": int(ctx.direct_quote_structural_candidates or 0),
         "direct_quote_eligible_candidates": int(ctx.direct_quote_eligible_candidates or 0),
         "direct_quote_attempted_symbols": list(ctx.direct_quote_attempted_symbols),
         "direct_quote_unattempted_count": int(ctx.direct_quote_unattempted_count or 0),
@@ -1118,16 +1126,18 @@ def _order_chain_for_direct_quote_recovery(
         ranked["rank"] = rank
         rankings.append(ranked)
     if request_context is not None:
-        # Truthful count: only rows that could actually go to direct
-        # revalidation — valid OCC symbol, valid expiration, and directional
-        # strike fit. The full ordered-chain length is preserved as a
-        # separate diagnostic so the total is still visible.
-        eligible_rows = sum(
+        # ``direct_quote_structural_candidates`` counts rows that are at
+        # least structurally direct-quotable — valid OCC symbol, valid
+        # expiration, and directional strike fit. Actual direct-quote
+        # eligibility depends on the chain reject reason being one that
+        # ``_should_revalidate(...)`` accepts, which is not known here
+        # at ordering time and gets counted in the quality-filter loop.
+        structural_rows = sum(
             1
             for sort_key, _, _ in rows
             if sort_key[0] == 0 and sort_key[1] == 0 and sort_key[2] == 0
         )
-        request_context.direct_quote_eligible_candidates = eligible_rows
+        request_context.direct_quote_structural_candidates = structural_rows
         request_context.direct_quote_candidate_ranking = rankings
         _ctx_refresh_diagnostics(request_context)
     return [opt for _, opt, _ in rows]
@@ -2551,6 +2561,12 @@ class APContractSelectionEngine:
                 # and rerun pro_quality on the patched opt before rejecting.
                 # One context enforces the hard cap across every DTE probe.
                 if pro_tier == "REJECT" and _should_revalidate(pro_reason):
+                    _sym_for_count = str(opt.get("symbol") or "").strip().upper()
+                    if _sym_for_count and _sym_for_count not in request_context.direct_quote_eligible_symbols:
+                        request_context.direct_quote_eligible_symbols.add(_sym_for_count)
+                        request_context.direct_quote_eligible_candidates = len(
+                            request_context.direct_quote_eligible_symbols
+                        )
                     _rv_pro = _revalidate_direct(
                         self.data_broker,
                         opt,
@@ -2612,16 +2628,19 @@ class APContractSelectionEngine:
                             "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
                         })
                     elif _rv_pro.get("action") == "SKIP_BUDGET_EXHAUSTED":
-                        # No provider call occurred for this candidate — the
-                        # revalidator short-circuited on the budget guard —
-                        # so ``attempted`` must stay False. ``budget_skipped``
-                        # is the truthful flag for aggregate diagnostics.
-                        _direct_quote_recovery_audit.update({
-                            "attempted":      False,
-                            "budget_skipped": True,
-                            "selected":       False,
-                            "failure":        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
-                        })
+                        # ``_direct_quote_recovery_audit`` is a REQUEST-level
+                        # aggregate. Never overwrite ``attempted``,
+                        # ``selected``, or the selected contract from a later
+                        # budget-skipped candidate — earlier candidates in the
+                        # same request may already have made a real provider
+                        # call or produced a survivor. OR-only semantics:
+                        # ``budget_skipped=True`` sticks once any later
+                        # candidate is unattempted; per-candidate attribution
+                        # lives in ``direct_quote_unattempted_symbols``.
+                        _direct_quote_recovery_audit["budget_skipped"] = True
+                        _direct_quote_recovery_audit["budget_skip_reason"] = (
+                            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        )
                     elif _rv_pro.get("action") == "REJECT_UNAVAILABLE":
                         pro_reason = _rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"
                         _direct_quote_recovery_audit.update({
@@ -2688,6 +2707,12 @@ class APContractSelectionEngine:
             # re-enforced against the direct quote — never bypassed.
             # One context enforces the hard cap across every DTE probe.
             if result is not None and _should_revalidate(result):
+                _sym_for_count = str(opt.get("symbol") or "").strip().upper()
+                if _sym_for_count and _sym_for_count not in request_context.direct_quote_eligible_symbols:
+                    request_context.direct_quote_eligible_symbols.add(_sym_for_count)
+                    request_context.direct_quote_eligible_candidates = len(
+                        request_context.direct_quote_eligible_symbols
+                    )
                 _rv = _revalidate_direct(
                     self.data_broker,
                     opt,
@@ -2786,16 +2811,17 @@ class APContractSelectionEngine:
                         pass
                 elif _rv_action == "SKIP_BUDGET_EXHAUSTED":
                     try:
-                        if not _direct_quote_recovery_audit.get("selected"):
-                            # No provider call happened here — mark the
-                            # budget-skip explicitly and leave ``attempted``
-                            # False so the summary matches call-count truth.
-                            _direct_quote_recovery_audit.update({
-                                "attempted":      False,
-                                "budget_skipped": True,
-                                "selected":       False,
-                                "failure":        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
-                            })
+                        # Request-level aggregate: OR ``budget_skipped``
+                        # in and record the reason. Do NOT overwrite
+                        # ``attempted``, ``selected``, or the recorded
+                        # contract — earlier candidates in this request
+                        # may already have made a real provider call or
+                        # produced a survivor. Per-candidate detail lives
+                        # in ``direct_quote_unattempted_symbols``.
+                        _direct_quote_recovery_audit["budget_skipped"] = True
+                        _direct_quote_recovery_audit["budget_skip_reason"] = (
+                            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        )
                     except Exception:
                         pass
                 elif _rv_action == "REJECT_UNAVAILABLE":
@@ -3553,6 +3579,14 @@ class APContractSelectionEngine:
         # the selected contract fields on the plan. Set mutate_plan=False only
         # for audit/replay callers that explicitly consume SelectedContract.
         _selection_diagnostics = _selector_request_diagnostics(request_context)
+        # Attach the request-level direct-quote recovery audit so the caller
+        # can verify aggregate truthfulness (attempted / selected /
+        # budget_skipped) without needing a failure path to emit it.
+        _selection_diagnostics["direct_quote_recovery_audit"] = dict(_direct_quote_recovery_audit)
+        try:
+            plan.setdefault("metadata", {})["selector_diagnostics"] = _selection_diagnostics
+        except Exception:
+            pass
         if isinstance(selected.candidate_audit, dict):
             selected.candidate_audit["selection_diagnostics"] = _selection_diagnostics
         if request_context is not None and isinstance(request_context.playbook_audit, dict):

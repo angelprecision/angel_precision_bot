@@ -22,6 +22,17 @@ from ap.contract_selector import (
 )
 
 
+def _next_weekday(target: date) -> date:
+    while target.weekday() >= 5:
+        target += timedelta(days=1)
+    return target
+
+
+# Session-relative near-future weekday — avoids the date-rot trap where a
+# hardcoded expiry silently becomes 0DTE / expired between commit and CI run.
+_NEAR_EXPIRY = _next_weekday(date.today() + timedelta(days=2)).isoformat()
+
+
 def _response(*, status_code=200, payload=None):
     resp = MagicMock()
     resp.status_code = status_code
@@ -469,7 +480,7 @@ class TestDeferredSelectorLatency:
     def test_non_deferred_single_selection_has_single_provider_pass(self):
         sel, session = _make_selector()
         ctx = _new_selector_request_context("SPY")
-        expirations = ["2026-07-24"]
+        expirations = [_NEAR_EXPIRY]
         session.get.side_effect = [
             _response(payload={"quotes": {"quote": {"last": 450.0}}}),
             _response(payload={"expirations": {"date": expirations}}),
@@ -487,7 +498,7 @@ class TestDeferredSelectorLatency:
         }
 
     def test_cached_and_uncached_chain_output_match(self):
-        expirations = ["2026-07-24"]
+        expirations = [_NEAR_EXPIRY]
 
         sel_a, session_a = _make_selector()
         ctx_a = _new_selector_request_context("SPY")

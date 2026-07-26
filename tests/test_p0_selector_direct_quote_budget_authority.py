@@ -710,3 +710,101 @@ class TestSelectorIntegration:
             assert selected.contract_symbol == expected_symbol
             assert selected.pricing_basis == expected_basis
             assert plan["execution_mode"] == execution_mode
+
+
+class TestAggregateAuditTruthfulness:
+    """Real integration regression for the request-level audit aggregate.
+
+    ``_direct_quote_recovery_audit`` is a REQUEST-level aggregate. A later
+    budget-skipped candidate must never overwrite ``attempted``,
+    ``selected``, or the recorded contract stamped by an earlier
+    successful direct quote. The truthful summary flags are:
+
+      * ``attempted`` — True when any provider call happened in the request
+      * ``selected``  — True when any direct quote produced a survivor
+      * ``budget_skipped`` — True when any later candidate was unattempted
+    """
+
+    def _make_chain(self, direction: str, first_symbol: str, second_symbol: str):
+        """Two candidates. First fails a revalidatable chain reason and
+        is patched by a successful direct quote. Second also needs
+        direct-quote recovery but hits the budget guard first."""
+        return [
+            _option(
+                0,
+                direction=direction,
+                strike=451.0,
+                delta=0.40,
+                oi=1200,
+                volume=300,
+            ) | {"symbol": first_symbol, "bid": 0.0, "ask": 0.0},
+            _option(
+                1,
+                direction=direction,
+                strike=452.0,
+                delta=0.40,
+                oi=1200,
+                volume=300,
+            ) | {"symbol": second_symbol, "bid": 0.0, "ask": 0.0},
+        ]
+
+    def test_budget_skip_after_survivor_preserves_attempted_and_selected(
+        self, monkeypatch
+    ):
+        # Budget of one allows exactly one direct quote. First candidate
+        # gets it and survives; second candidate must be reported as
+        # budget-skipped without erasing the first's survivor status.
+        first_symbol = f"SPY{_NEAR_EXPIRY_OCC}C00451000"
+        second_symbol = f"SPY{_NEAR_EXPIRY_OCC}C00452000"
+        chain = self._make_chain("CALL", first_symbol, second_symbol)
+
+        monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+        monkeypatch.setenv("DIRECT_QUOTE_RECOVERY_TOP_N", "8")
+        monkeypatch.setenv("CONTRACT_REVALIDATE_TOP_N", "20")
+        monkeypatch.setenv("PRO_CONTRACT_QUALITY", "true")
+        monkeypatch.setattr(
+            "ap.contract_quote_revalidator.is_market_open",
+            lambda *a, **kw: True,
+        )
+        monkeypatch.setattr(
+            APContractSelectionEngine,
+            "_emit_selector_event",
+            lambda *a, **kw: None,
+        )
+        broker = _DirectQuoteBroker(chain, first_symbol)
+        selector = APContractSelectionEngine(
+            broker,
+            mode="LIVE",
+            data_broker=broker,
+            min_premium=1.0,
+            max_premium=1000.0,
+            min_oi=1,
+            min_volume=0,
+        )
+        plan = _plan("CALL")
+        selected = selector.select(plan)
+
+        assert selected is not None
+        assert selected.contract_symbol == first_symbol
+
+        ctx = plan["metadata"].get("selector_request_context") or plan["metadata"].get(
+            "selector_diagnostics"
+        )
+        # The plan diagnostics carry the final aggregate audit.
+        audit = plan["metadata"].get("selector_diagnostics", {}).get(
+            "direct_quote_recovery_audit"
+        )
+        # Truthful semantics: attempted stayed True from the survivor,
+        # selected stayed True, budget_skipped is now True because a
+        # later candidate hit the budget guard.
+        assert audit is not None
+        assert audit["attempted"] is True
+        assert audit["selected"] is True
+        assert audit["contract"] == first_symbol
+        assert audit.get("budget_skipped") is True
+        assert audit.get("budget_skip_reason") == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+
+        diagnostics = plan["metadata"]["selector_diagnostics"]
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        # Second candidate was never quoted — record it as unattempted.
+        assert second_symbol in diagnostics["direct_quote_unattempted_symbols"]
