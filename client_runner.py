@@ -1257,8 +1257,17 @@ class ClientRunner(threading.Thread):
         key = str(key or "")
         if not key:
             return False
-        with self._degraded_lock:
-            return any(self._reason_key(r) == key for r in self.degraded_reasons)
+        lock = getattr(self, "_degraded_lock", None)
+
+        def _check() -> bool:
+            reasons = getattr(self, "degraded_reasons", set()) or set()
+            return any(self._reason_key(reason) == key for reason in reasons)
+
+        if lock is None:
+            return _check()
+
+        with lock:
+            return _check()
 
     def _clear_degraded_reason_key(self, key: str):
         """
