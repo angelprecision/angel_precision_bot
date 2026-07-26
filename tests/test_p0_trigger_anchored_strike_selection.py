@@ -10,8 +10,10 @@ Scope after the formal audit:
 * ``APContractSelectionEngine.select()`` reorders the option chain by
   trigger-anchored strike preference BEFORE the quality-filter loop, GATED on
   ``PLAYBOOK_STRIKE_SELECTION_ENABLED`` / ``PLAYBOOK_CONTRACT_SELECTION_ENABLED``.
-  When the flag is off, chain order is untouched — the non-playbook selector
-  path is byte-for-byte identical to pre-#396.
+  When the flag is off, the non-playbook selector path preserves prior chain
+  ordering, ranking, quote spending, and selection behavior. A
+  ``preferred_strike_ordering`` diagnostics entry with ``enabled=False`` is
+  still emitted for observability parity, but selection is not affected.
 * Missing trigger falls back to underlying; missing/invalid both anchors returns
   ``TRIGGER_ANCHOR_SOURCE_NONE`` and callers preserve their prior ordering.
 * No hard quality gate, budget rule, LIVE ask pricing, PAPER pricing, retry
@@ -696,7 +698,10 @@ class TestPricingAndSideEffects:
 
 class TestFlagOffLeavesChainOrderUntouched:
     """When PLAYBOOK_STRIKE_SELECTION_ENABLED is off, the selector must not
-    reorder the chain — non-playbook callers are byte-for-byte unchanged."""
+    reorder the chain — non-playbook callers preserve prior chain ordering,
+    ranking, quote spending, and selection behavior. A preferred_strike_ordering
+    diagnostics entry with enabled=False may still be emitted; selection
+    behavior itself is unchanged."""
 
     def test_flag_off_preserves_original_order(self, monkeypatch):
         monkeypatch.delenv("PLAYBOOK_STRIKE_SELECTION_ENABLED", raising=False)
