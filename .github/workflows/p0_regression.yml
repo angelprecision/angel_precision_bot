@@ -77,6 +77,7 @@ jobs:
           PGSSLMODE: "disable"
           DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
           INTELLIGENCE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
+          MANUAL_CLOSE_POSTGRES_TEST_URL: "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
         run: |
           python -m pytest \
             tests/test_osm_retry_idempotency.py \
@@ -160,6 +161,11 @@ jobs:
             tests/test_p0_live_readiness_blocked_keys.py \
             tests/test_p0_readiness_deadline_enforcement.py \
             tests/test_p0_startup_readiness_fail_closed.py \
+            tests/test_p0_manual_client_close_proof.py \
+            tests/test_p0_manual_close_production_shape.py \
+            tests/test_p0_manual_close_idempotency_and_validation.py \
+            tests/test_p0_manual_close_terminal_recovery.py \
+            tests/test_p0_terminal_proof_lock_postgres_concurrency.py \
             -v --tb=short --color=yes
 
       - name: Summary

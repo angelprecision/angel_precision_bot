@@ -484,10 +484,85 @@ def test_terminal_metadata_quarantine_forces_training_ineligible_stamp(monkeypat
     assert persisted["taxonomy_reason"] == "terminal_fallback_strategy_metadata_unproven"
 
 
-def test_manual_close_without_broker_exit_fill_does_not_create_normal_proof_performance():
-    body = _func_body(RUNNER_SRC, "_detect_manual_closes")
-    assert "allow_fallback_insert=False" in body
-    assert "MANUAL_CLIENT_CLOSE_UNVERIFIED" in body
+def test_manual_close_without_broker_exit_fill_does_not_create_normal_proof_performance(monkeypatch):
+    """PR #386 migration: ClientRunner._detect_manual_closes now delegates
+    to ap.manual_close_reconciliation. The old source-string assertion
+    (allow_fallback_insert=False / MANUAL_CLIENT_CLOSE_UNVERIFIED) checked
+    the legacy inlined detector and is no longer meaningful.
+
+    Replaced with a behavioral test: when the broker reports the position
+    missing but there is NO exact filled external EXIT evidence, the
+    reconciler must:
+        - NOT adopt any external EXIT row
+        - NOT invoke the canonical position finalizer
+        - NOT create or repair terminal proof
+        - NOT evict the exit engine
+    """
+    import types as _types
+    from datetime import datetime, timezone
+    from ap import manual_close_reconciliation as manual_mod
+
+    CLIENT = "client@example.com"
+    POSITION_ID = "POS-NO-EXTERNAL"
+    CONTRACT = "AMD260821C00100000"
+
+    class _Broker:
+        cfg = _types.SimpleNamespace(account_id="LIVE-ACCOUNT")
+        calls = []
+        def _get(self, path):
+            self.calls.append(("get", path))
+            if "/positions" in path:
+                return {"positions": "null"}  # broker reports empty
+            if "/orders" in path:
+                return {"orders": "null"}     # no external evidence
+            raise AssertionError(f"unexpected path: {path}")
+
+    class _PM:
+        calls = []
+        def close_position_from_exit_fill(self, **kwargs):
+            self.calls.append(kwargs)
+            return True
+
+    class _ExitEng:
+        closed = []
+        def mark_position_closed(self, pid):
+            self.closed.append(pid)
+
+    runner = _types.SimpleNamespace(
+        email=CLIENT, mode="LIVE", broker=_Broker(),
+        position_manager=_PM(),
+        core=_types.SimpleNamespace(exit_eng=_ExitEng()),
+        _last_manual_close_check_ts=0.0,
+    )
+
+    active_pos = {
+        "id": POSITION_ID, "client_id": CLIENT, "contract": CONTRACT,
+        "underlying": "AMD", "avg_fill": 1.20, "qty": 1, "quantity_remaining": 1,
+        "side": "CALL", "local_order_id": "ENTRY-1",
+        "entry_ts": "2026-07-18T14:00:00+00:00",
+        "opened_at": "2026-07-18T14:00:00+00:00",
+        "execution_mode": "live", "status": "OPEN",
+        "exit_in_flight": False,
+        "pending_exit_broker_order_id": None,
+        "pending_exit_local_order_id": None,
+    }
+    monkeypatch.setattr(
+        manual_mod, "load_manual_close_state",
+        lambda cid, mode: ([active_pos], set(), {}),
+    )
+    monkeypatch.setattr(
+        manual_mod, "load_terminal_recovery_candidates",
+        lambda cid, mode: [],
+    )
+    monkeypatch.setattr(
+        manual_mod.time, "time",
+        lambda: datetime(2026, 7, 18, 15, 0, 0, tzinfo=timezone.utc).timestamp(),
+    )
+
+    manual_mod.detect_manual_closes(runner)
+
+    assert runner.position_manager.calls == []
+    assert runner.core.exit_eng.closed == []
 
 
 def test_exit_local_order_identity_is_refused(monkeypatch):
@@ -658,7 +733,12 @@ def test_fill_repair_uses_exact_identity_and_confirms_single_row(monkeypatch):
         "side": "CALL",
         "opened_at": "2026-07-18T15:00:00+00:00",
         "closed_at": "2026-07-18T16:00:00+00:00",
+        "entry_ts": "2026-07-18T15:00:00+00:00",
+        "exit_ts": "2026-07-18T16:00:00+00:00",
         "entry_option_price": 3.47,
+        "avg_fill": 3.47,
+        "qty": 2,
+        "execution_mode": "live",
         "local_order_id": "ENTRY-8",
     }
     sql_calls = []
@@ -685,6 +765,9 @@ def test_fill_repair_uses_exact_identity_and_confirms_single_row(monkeypatch):
     monkeypatch.setattr(pm_mod, "run_with_retry", _run)
     monkeypatch.setattr(pm_mod, "conn", fake)
     monkeypatch.setattr(pm, "_ensure_terminal_close_proof", lambda **kwargs: True)
+    # PR #386 amendment 4: lock wrapper reads binding-state on success.
+    monkeypatch.setattr(pm, "_proof_row_binding_state", lambda **kw: "bound_position")
+    monkeypatch.setattr(pm, "_with_terminal_proof_lock", lambda pid, fn: fn())
 
     assert pm.close_position_from_exit_fill(
         position_id="POS-8",
@@ -708,7 +791,12 @@ def test_fill_repair_blocks_duplicate_exact_candidates(monkeypatch):
         "side": "CALL",
         "opened_at": "2026-07-18T15:00:00+00:00",
         "closed_at": "2026-07-18T16:00:00+00:00",
+        "entry_ts": "2026-07-18T15:00:00+00:00",
+        "exit_ts": "2026-07-18T16:00:00+00:00",
         "entry_option_price": 3.47,
+        "avg_fill": 3.47,
+        "qty": 2,
+        "execution_mode": "live",
         "local_order_id": "ENTRY-9",
     }
 
@@ -729,6 +817,9 @@ def test_fill_repair_blocks_duplicate_exact_candidates(monkeypatch):
     monkeypatch.setattr(pm_mod, "run_with_retry", _run)
     monkeypatch.setattr(pm_mod, "conn", fake)
     monkeypatch.setattr(pm, "_ensure_terminal_close_proof", lambda **kwargs: True)
+    # PR #386 amendment 4: lock wrapper reads binding-state on success.
+    monkeypatch.setattr(pm, "_proof_row_binding_state", lambda **kw: "bound_position")
+    monkeypatch.setattr(pm, "_with_terminal_proof_lock", lambda pid, fn: fn())
 
     assert pm.close_position_from_exit_fill(
         position_id="POS-9",
