@@ -733,7 +733,12 @@ def test_fill_repair_uses_exact_identity_and_confirms_single_row(monkeypatch):
         "side": "CALL",
         "opened_at": "2026-07-18T15:00:00+00:00",
         "closed_at": "2026-07-18T16:00:00+00:00",
+        "entry_ts": "2026-07-18T15:00:00+00:00",
+        "exit_ts": "2026-07-18T16:00:00+00:00",
         "entry_option_price": 3.47,
+        "avg_fill": 3.47,
+        "qty": 2,
+        "execution_mode": "live",
         "local_order_id": "ENTRY-8",
     }
     sql_calls = []
@@ -760,6 +765,9 @@ def test_fill_repair_uses_exact_identity_and_confirms_single_row(monkeypatch):
     monkeypatch.setattr(pm_mod, "run_with_retry", _run)
     monkeypatch.setattr(pm_mod, "conn", fake)
     monkeypatch.setattr(pm, "_ensure_terminal_close_proof", lambda **kwargs: True)
+    # PR #386 amendment 4: lock wrapper reads binding-state on success.
+    monkeypatch.setattr(pm, "_proof_row_binding_state", lambda **kw: "bound_position")
+    monkeypatch.setattr(pm, "_with_terminal_proof_lock", lambda pid, fn: fn())
 
     assert pm.close_position_from_exit_fill(
         position_id="POS-8",
@@ -783,7 +791,12 @@ def test_fill_repair_blocks_duplicate_exact_candidates(monkeypatch):
         "side": "CALL",
         "opened_at": "2026-07-18T15:00:00+00:00",
         "closed_at": "2026-07-18T16:00:00+00:00",
+        "entry_ts": "2026-07-18T15:00:00+00:00",
+        "exit_ts": "2026-07-18T16:00:00+00:00",
         "entry_option_price": 3.47,
+        "avg_fill": 3.47,
+        "qty": 2,
+        "execution_mode": "live",
         "local_order_id": "ENTRY-9",
     }
 
@@ -804,6 +817,9 @@ def test_fill_repair_blocks_duplicate_exact_candidates(monkeypatch):
     monkeypatch.setattr(pm_mod, "run_with_retry", _run)
     monkeypatch.setattr(pm_mod, "conn", fake)
     monkeypatch.setattr(pm, "_ensure_terminal_close_proof", lambda **kwargs: True)
+    # PR #386 amendment 4: lock wrapper reads binding-state on success.
+    monkeypatch.setattr(pm, "_proof_row_binding_state", lambda **kw: "bound_position")
+    monkeypatch.setattr(pm, "_with_terminal_proof_lock", lambda pid, fn: fn())
 
     assert pm.close_position_from_exit_fill(
         position_id="POS-9",

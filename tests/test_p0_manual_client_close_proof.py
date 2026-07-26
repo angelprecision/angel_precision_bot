@@ -458,6 +458,8 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
     pm = _PM()
     runner = _runner(broker=broker, pm=pm)
     # EXIT-1 already durable: provide full fill dict as loaded from DB.
+    # PR #386 amendment 6: durable fills MUST include db_contract and
+    # db_direction — _validate_durable_fills rejects any row missing them.
     exit1_durable = {
         "broker_order_id": "EXIT-1",
         "filled_qty": 1,
@@ -466,6 +468,8 @@ def test_multi_fill_resume_after_partial_prior_adoption_completes_with_weighted_
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "db_contract": CONTRACT,
+        "db_direction": "CALL",
     }
     adopted = _install_scan_boundaries(
         monkeypatch,
@@ -772,6 +776,8 @@ def test_cross_session_recovery_empty_broker_orders_finalizes_from_durable_rows(
     pm = _PM()
     runner = _runner(broker=broker, pm=pm)
 
+    # PR #386 amendment 6: durable fills MUST include db_contract and
+    # db_direction — _validate_durable_fills rejects any row missing them.
     durable_fill = {
         "broker_order_id": "137780001",
         "filled_qty": 2,
@@ -780,6 +786,8 @@ def test_cross_session_recovery_empty_broker_orders_finalizes_from_durable_rows(
         "created_at": None,
         "raw_status": "EXIT_FILLED",
         "raw_side": "sell_to_close",
+        "db_contract": CONTRACT,
+        "db_direction": "CALL",
     }
     _install_scan_boundaries(
         monkeypatch,

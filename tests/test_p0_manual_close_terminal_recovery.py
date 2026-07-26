@@ -60,6 +60,13 @@ class _PosCursor:
             if row and row.get("client_id") == cid:
                 self._fetchone = dict(row)
             return self
+        if s.startswith("UPDATE positions SET"):
+            pid, cid = params[-2], params[-1]
+            row = self.positions.get(pid)
+            if not row or row.get("client_id") != cid:
+                return self
+            self._fetchone = {"id": pid, "status": "CLOSED"}
+            return self
         if "FROM proof_trades" in s and s.strip().startswith("SELECT"):
             self.proof_selects.append((s, params))
             return self
@@ -293,6 +300,59 @@ def test_concurrent_duplicate_recovery_produces_single_bound_result(monkeypatch)
     assert row["status"] == "CLOSED"
     assert row["exit_price"] == 0.90
     assert row["realized_pnl"] == 34.0
+
+
+# ═══ First-close fail-closed on proof-binding failure (amendment 1+2) ══════
+
+def test_first_close_returns_false_when_proof_binding_fails(monkeypatch):
+    """The first-close path in close_position_from_exit_fill must return
+    False when the terminal proof lock/binding fails, so the caller does
+    NOT evict the exit engine — PASS 0 must remain able to repair.
+
+    Uses an OPEN position with qty=2; we force _ensure_terminal_close_proof
+    to return False. The updated position row is committed inside the
+    transaction (that's the crash window), but the outer function must
+    then surface False and leave the row/durable evidence discoverable.
+    """
+    row = {
+        "id": POSITION_ID,
+        "client_id": CLIENT,
+        "status": "OPEN",
+        "qty": 2,
+        "quantity_remaining": 2,
+        "avg_fill": 0.73,
+        "exit_price": 0,
+        "realized_pnl": 0,
+        "realized_pnl_pct": 0,
+        "contract": CONTRACT,
+        "underlying": "F",
+        "side": "CALL",
+        "direction": "CALL",
+        "local_order_id": "entry-1",
+        "broker_order_id": None,
+        "entry_ts": "2026-07-21T15:26:58.911238+00:00",
+        "exit_ts": None,
+        "exit_reason": None,
+        "close_source": None,
+        "execution_mode": "live",
+    }
+    _install_pos_db(monkeypatch, {POSITION_ID: row})
+    apm = _APM(CLIENT)
+    apm._forced_return = False   # models proof binding failure
+
+    ok = apm.close_position_from_exit_fill(
+        position_id=POSITION_ID, exit_price=0.90, filled_qty=2,
+        broker_order_id="BROKER-1", exit_reason="broker_close",
+        close_source="broker_exit_fill",
+    )
+    assert ok is False
+    # Exactly one ensure invocation (through the lock wrapper).
+    assert len(apm.ensure_calls) == 1
+    # The ensure call used PERSISTED fields (persisted qty=2, mode=live),
+    # not fabricated fallbacks like contracts=1 or execution_mode="".
+    kw = apm.ensure_calls[0]
+    assert kw["contracts"] == 2
+    assert kw["execution_mode"] == "live"
 
 
 # ═══ Persisted-truth finite-number gate (PR #386 amendment 2) ══════════════
