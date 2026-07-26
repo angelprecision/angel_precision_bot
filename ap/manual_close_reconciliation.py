@@ -67,6 +67,20 @@ FILLED_ORDER_STATUSES = frozenset(
 DURABLE_EXIT_FILLED_STATUSES = frozenset({"EXIT_FILLED", "EXIT_PARTIAL_FILL"})
 ACTIVE_POSITION_STATUSES = ("OPEN", "CLOSING", "PARTIAL", "ACTIVE")
 EXTERNAL_LOCAL_ID_PREFIX = "external-exit:"
+
+
+def _terminal_position_statuses() -> list[str]:
+    """Canonical TERMINAL position statuses for PASS 0 candidate selection.
+
+    Sourced from ap.position_manager.PositionStatus.TERMINAL so PASS 0
+    matches whatever position_manager considers terminal — CLOSED,
+    CLOSED_REPAIR, EXPIRED, STOPPED, TAKEN_PROFIT, ERROR, CANCELED,
+    CANCELLED. PR #386 blocker 1 fix: previous revision referenced an
+    undefined TERMINAL_POSITION_STATUSES name, which silently ran PASS 0
+    with zero candidates forever.
+    """
+    from ap.position_manager import PositionStatus
+    return sorted(PositionStatus.TERMINAL)
 OCC_RE = re.compile(r"^[A-Z0-9.]{1,6}\d{6}[CP]\d{8}$")
 
 
@@ -846,11 +860,17 @@ def load_terminal_recovery_candidates(
                         AND UPPER(COALESCE(o.status, '')) = ANY(%s)
                         AND o.local_order_id LIKE %s
                   )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM proof_trades pt
+                      WHERE pt.client_email = p.client_id
+                        AND pt.system_version = 'v2'
+                        AND pt.position_id = p.id
+                  )
                 """,
                 (
                     client_id,
                     norm_mode,
-                    list(TERMINAL_POSITION_STATUSES),
+                    list(_terminal_position_statuses()),
                     norm_mode,
                     list(DURABLE_EXIT_FILLED_STATUSES),
                     f"{EXTERNAL_LOCAL_ID_PREFIX}%",
@@ -1208,8 +1228,10 @@ def detect_manual_closes(self) -> None:
             runner_mode,
         )
         return
-    if broker is None:
-        return
+    # PR #386 blocker fix: broker unavailability MUST NOT skip PASS 0
+    # (proof-only recovery for terminal-without-proof) or the durable-only
+    # arm of PASS 1. Only PASS 2 (broker discovery) requires broker access.
+    # The broker=None gate is enforced below, immediately before PASS 2.
 
     # Always load durable DB state first — safe regardless of broker availability.
     try:
@@ -1227,6 +1249,10 @@ def detect_manual_closes(self) -> None:
 
     pm_for_recovery = getattr(self, "position_manager", None)
     recovery_method = getattr(pm_for_recovery, "repair_terminal_proof_from_persisted", None)
+
+    # detected_at is shared by PASS 0 durable-fill validation and the
+    # PASS 1/2 fence machinery below.
+    detected_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
 
     # ── PASS 0: proof-only recovery for terminal-without-proof rows ────────
     # A crash after position commit but before proof persist leaves a
@@ -1251,8 +1277,65 @@ def detect_manual_closes(self) -> None:
             candidate_mode = str(candidate.get("execution_mode") or "").strip().lower()
             if not candidate_id or candidate_mode != runner_mode:
                 continue
+            # PR #386 blocker 2: PASS 0 must not authorize proof creation
+            # on EXISTS alone. Load the adopted EXIT rows and validate
+            # them through the same _validate_durable_fills policy used
+            # by PASS 1. Only a fully-validated aggregate that agrees
+            # with persisted position economics may pass.
+            durable_for_candidate = adopted_fills_by_pos.get(candidate_id, [])
+            if not durable_for_candidate:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_NO_DURABLE_FILLS "
+                    "pos=%s — deferring",
+                    client_id, candidate_id,
+                )
+                continue
+            valid_durable = _validate_durable_fills(
+                durable_for_candidate,
+                position=candidate,
+                detected_at=detected_at,
+                client_id=client_id,
+            )
+            if not valid_durable:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_DURABLE_REJECTED "
+                    "pos=%s — no valid EXIT evidence; deferring",
+                    client_id, candidate_id,
+                )
+                continue
+            adopted_qty = sum(int(f["filled_qty"]) for f in valid_durable)
+            required_qty = positive_int(candidate.get("qty"))
+            if required_qty <= 0 or adopted_qty != required_qty:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_QTY_MISMATCH "
+                    "pos=%s required=%s adopted=%s — deferring",
+                    client_id, candidate_id, required_qty, adopted_qty,
+                )
+                continue
+            weighted_notional = sum(
+                float(f["fill_price"]) * int(f["filled_qty"]) for f in valid_durable
+            )
+            avg_price = weighted_notional / adopted_qty
+            durable_evidence = {
+                "filled_qty": adopted_qty,
+                "fill_price": round(avg_price, 6),
+            }
             try:
-                ok, reason = recovery_method(candidate_id)
+                ok, reason = recovery_method(
+                    candidate_id,
+                    expected_execution_mode=runner_mode,
+                    durable_exit_evidence=durable_evidence,
+                )
+            except TypeError:
+                # Older signature — fall back but retain fail-closed logging.
+                try:
+                    ok, reason = recovery_method(candidate_id)
+                except Exception as exc:
+                    log.error(
+                        "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_ERROR pos=%s err=%s",
+                        client_id, candidate_id, exc,
+                    )
+                    continue
             except Exception as exc:
                 log.error(
                     "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_ERROR pos=%s err=%s",
@@ -1295,8 +1378,6 @@ def detect_manual_closes(self) -> None:
             len(active_positions),
         )
         return
-
-    detected_at = datetime.fromtimestamp(now_epoch, tz=timezone.utc)
 
     def _check_fences(position: dict, position_id: str, contract: str) -> bool:
         """Return True if the position passes all ownership fences."""
@@ -1419,6 +1500,9 @@ def detect_manual_closes(self) -> None:
     # A transient broker-positions or broker-orders failure does not block
     # positions that already have complete durable evidence.
     # ──────────────────────────────────────────────────────────────────────────
+    if broker is None:
+        # Only PASS 2 requires broker access; upstream passes have already run.
+        return
     try:
         broker_positions = fetch_authoritative_broker_positions(broker)
     except Exception as exc:

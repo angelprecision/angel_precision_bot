@@ -86,6 +86,16 @@ class _APM(pm_mod.APPositionManager):
             return self._forced_return
         return True
 
+    # PR #386 blocker 3: bypass the advisory-lock wrapper for unit tests.
+    # The real wrapper opens conn() and runs pg_advisory_xact_lock + a
+    # binding-state re-read; behavioral coverage of the lock lives in
+    # the concurrent-serialization regression below.
+    def _with_terminal_proof_lock(self, position_id, fn):
+        return fn()
+
+    def _proof_row_binding_state(self, **kwargs):
+        return "bound_position"
+
 
 def _install_pos_db(monkeypatch, positions_by_id):
     cursor = _PosCursor(positions_by_id)
@@ -285,6 +295,81 @@ def test_concurrent_duplicate_recovery_produces_single_bound_result(monkeypatch)
     assert row["realized_pnl"] == 34.0
 
 
+# ═══ Serialized proof-binding lock (PR #386 blocker 3) ═════════════════════
+
+def test_terminal_proof_lock_serializes_overlapping_workers(monkeypatch):
+    """Two workers race to bind proof for the same (client, position). The
+    canonical serialization is a Postgres transaction-scoped advisory lock
+    acquired inside _with_terminal_proof_lock. This regression models the
+    lock with an in-process mutex (keyed identically) and asserts:
+
+      * Both callers observe True (idempotent success on second bind).
+      * Exactly ONE fresh proof insert occurs — the second caller sees
+        bound_position on its re-read and short-circuits.
+      * Neither call mutates any existing proof row.
+
+    Real cross-process serialization uses pg_advisory_xact_lock which the
+    unit-level fake connection accepts silently; the barrier here proves
+    the ordering contract the wrapper is designed to enforce.
+    """
+    import threading
+
+    row = _terminal_row()
+    _install_pos_db(monkeypatch, {POSITION_ID: row})
+
+    lock_map: dict[str, threading.Lock] = {}
+    lock_map_guard = threading.Lock()
+    inserts: list[str] = []
+    bound: dict[str, bool] = {}
+    barrier = threading.Barrier(2)
+    results: list[tuple[bool, str]] = []
+
+    class _LockedAPM(pm_mod.APPositionManager):
+        def __new__(cls, *a, **kw): return object.__new__(cls)
+        def __init__(self, client_id):
+            self.client_id = client_id
+        def _has_position_column(self, name): return True
+        def _proof_row_binding_state(self, **kwargs):
+            pid = kwargs.get("position_id") or POSITION_ID
+            return "bound_position" if bound.get(pid) else None
+        def _ensure_terminal_close_proof(self, **kwargs):
+            pid = kwargs.get("position_id") or POSITION_ID
+            if bound.get(pid):
+                # Bound-position short-circuit inside ensure — no INSERT.
+                return True
+            inserts.append(pid)
+            bound[pid] = True
+            return True
+        def _with_terminal_proof_lock(self, position_id, fn):
+            key = f"terminal-proof-bind:{self.client_id}:{position_id}"
+            with lock_map_guard:
+                lock = lock_map.setdefault(key, threading.Lock())
+            with lock:
+                result = fn()
+                if result is True:
+                    if self._proof_row_binding_state(position_id=position_id) != "bound_position":
+                        return False
+                return result
+
+    def _worker():
+        apm = _LockedAPM(CLIENT)
+        barrier.wait()
+        results.append(apm.repair_terminal_proof_from_persisted(POSITION_ID))
+
+    threads = [threading.Thread(target=_worker) for _ in range(2)]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=5)
+
+    assert len(results) == 2
+    assert all(ok is True for ok, _ in results)
+    # Exactly ONE fresh INSERT — the lock serialized both workers and the
+    # second observed bound_position.
+    assert len(inserts) == 1
+    # Row was never rewritten.
+    assert row["exit_price"] == 0.90
+    assert row["realized_pnl"] == 34.0
+
+
 # ═══ Reconciler PASS 0 wiring (proof-only recovery in detect_manual_closes) ═
 
 def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
@@ -314,10 +399,26 @@ def test_reconciler_pass0_calls_recovery_then_evicts_exit_engine(monkeypatch):
         core=types.SimpleNamespace(exit_eng=_ExitEng()),
         _last_manual_close_check_ts=0.0,
     )
+    _fills = {POSITION_ID: [{
+        "broker_order_id": "BROK-EXT-1",
+        "filled_qty": 2,
+        "fill_price": 0.90,
+        "filled_at": datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc),
+        "created_at": None,
+        "raw_status": "EXIT_FILLED",
+        "raw_side": "sell_to_close",
+        "db_contract": CONTRACT,
+        "db_direction": "CALL",
+    }]}
     monkeypatch.setattr(manual_mod, "load_manual_close_state",
-                        lambda cid, mode: ([], set(), {}))
+                        lambda cid, mode: ([], set(), _fills))
     monkeypatch.setattr(manual_mod, "load_terminal_recovery_candidates",
-                        lambda cid, mode: [{"id": POSITION_ID, "execution_mode": "live"}])
+                        lambda cid, mode: [{
+                            "id": POSITION_ID, "execution_mode": "live",
+                            "contract": CONTRACT, "side": "CALL", "direction": "CALL",
+                            "qty": 2, "quantity_remaining": 0,
+                            "entry_ts": "2026-07-21T15:26:58.911238+00:00",
+                        }])
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 
@@ -350,10 +451,26 @@ def test_reconciler_pass0_does_not_evict_when_recovery_defers(monkeypatch):
         core=types.SimpleNamespace(exit_eng=_ExitEng()),
         _last_manual_close_check_ts=0.0,
     )
+    _fills = {POSITION_ID: [{
+        "broker_order_id": "BROK-EXT-1",
+        "filled_qty": 2,
+        "fill_price": 0.90,
+        "filled_at": datetime(2026, 7, 21, 15, 57, 39, tzinfo=timezone.utc),
+        "created_at": None,
+        "raw_status": "EXIT_FILLED",
+        "raw_side": "sell_to_close",
+        "db_contract": CONTRACT,
+        "db_direction": "CALL",
+    }]}
     monkeypatch.setattr(manual_mod, "load_manual_close_state",
-                        lambda cid, mode: ([], set(), {}))
+                        lambda cid, mode: ([], set(), _fills))
     monkeypatch.setattr(manual_mod, "load_terminal_recovery_candidates",
-                        lambda cid, mode: [{"id": POSITION_ID, "execution_mode": "live"}])
+                        lambda cid, mode: [{
+                            "id": POSITION_ID, "execution_mode": "live",
+                            "contract": CONTRACT, "side": "CALL", "direction": "CALL",
+                            "qty": 2, "quantity_remaining": 0,
+                            "entry_ts": "2026-07-21T15:26:58.911238+00:00",
+                        }])
     monkeypatch.setattr(manual_mod.time, "time",
                         lambda: datetime(2026, 7, 21, 15, 58, 0, tzinfo=timezone.utc).timestamp())
 

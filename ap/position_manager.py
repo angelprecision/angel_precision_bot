@@ -122,6 +122,60 @@ class PositionStatus:
 ACTIVE_DB_STATUSES: set[str] = {"OPEN", "CLOSING", "PARTIAL", "ACTIVE"}
 
 
+def _validate_persisted_terminal_truth(row: dict) -> tuple[bool, str]:
+    """PR #386 blocker 4: fail-closed persisted-truth gate.
+
+    Every canonical field required to write terminal proof must be present
+    and shaped correctly on the persisted position row. Callers must not
+    manufacture fallbacks (no ``now_utc_iso()``, no ``max(qty, 1)``, no
+    zero economics). Missing truth remains discoverable and alertable
+    rather than becoming a polished-looking proof record.
+    """
+    from datetime import datetime as _dt
+
+    if not isinstance(row, dict):
+        return False, "row_not_dict"
+    contract = str(row.get("contract") or "").strip()
+    if not contract:
+        return False, "missing_contract"
+    side = str(row.get("side") or row.get("direction") or "").upper().strip()
+    if side not in {"CALL", "PUT"}:
+        return False, "invalid_side"
+    mode = str(row.get("execution_mode") or "").strip().lower()
+    if mode not in {"live", "paper"}:
+        return False, "invalid_execution_mode"
+    local_order_id = str(row.get("local_order_id") or "").strip()
+    if not local_order_id:
+        return False, "missing_local_order_id"
+    try:
+        qty = int(row.get("qty") or 0)
+        avg_fill = float(row.get("avg_fill") or row.get("entry_price") or 0)
+        exit_price = float(row.get("exit_price") or 0)
+        pnl_pct = float(row.get("realized_pnl_pct") or 0)
+    except (TypeError, ValueError):
+        return False, "unparseable_numeric"
+    if qty <= 0:
+        return False, "invalid_qty"
+    if avg_fill <= 0:
+        return False, "invalid_entry_price"
+    if exit_price <= 0:
+        return False, "invalid_exit_price"
+    entry_ts_str = str(row.get("entry_ts") or "").strip()
+    exit_ts_str = str(row.get("exit_ts") or "").strip()
+    if not entry_ts_str or not exit_ts_str:
+        return False, "missing_timestamps"
+    try:
+        entry_dt = _dt.fromisoformat(entry_ts_str.replace("Z", "+00:00"))
+        exit_dt = _dt.fromisoformat(exit_ts_str.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False, "unparseable_timestamps"
+    if exit_dt < entry_dt:
+        return False, "exit_before_entry"
+    if pnl_pct != pnl_pct:  # NaN guard
+        return False, "non_finite_pnl_pct"
+    return True, "ok"
+
+
 _PENDING_ENTRY_STATUSES = (
     "CREATED",
     "PENDING_TRIGGER",
@@ -1147,6 +1201,49 @@ class APPositionManager:
         )
         return False
 
+    def _with_terminal_proof_lock(self, position_id: str, fn):
+        """PR #386 blocker 3: serialize the entire terminal-proof-binding
+        sequence (binding-state read → repair-claim → fallback insert →
+        final binding re-read) across processes/workers.
+
+        Uses a Postgres transaction-scoped advisory lock keyed by
+        ``terminal-proof-bind:{client_id}:{position_id}``. Overlapping
+        callers on the same key block at acquisition and the second caller
+        observes ``bound_position`` on the re-read, converging to
+        idempotent success without a duplicate proof insert.
+        """
+        lock_key = f"terminal-proof-bind:{self.client_id}:{position_id}"
+
+        def _guarded():
+            with conn() as c:
+                c.execute(
+                    "SELECT pg_advisory_xact_lock(('x' || md5(%s))::bit(64)::bigint)",
+                    (lock_key,),
+                )
+                result = fn()
+                # Final binding re-read (still under the advisory lock).
+                # A returned True MUST be witnessed by a bound canonical
+                # proof row for this position; otherwise fail so the exit
+                # engine is not evicted.
+                if result is True:
+                    state = self._proof_row_binding_state(position_id=position_id)
+                    if state != "bound_position":
+                        log.critical(
+                            "[%s] TERMINAL_PROOF_LOCK_REREAD_UNBOUND pos=%s state=%s",
+                            self.client_id, position_id, state,
+                        )
+                        return False
+                return result
+
+        try:
+            return run_with_retry(_guarded)
+        except Exception as exc:
+            log.error(
+                "[%s] TERMINAL_PROOF_LOCK_FAILED pos=%s err=%s",
+                self.client_id, position_id, exc,
+            )
+            return False
+
     def _ensure_terminal_close_proof(
         self,
         *,
@@ -2145,7 +2242,7 @@ class APPositionManager:
                         "side": str(pos.get("side") or ""),
                         "direction": str(pos.get("direction") or pos.get("side") or ""),
                         "entry_ts": str(pos.get("entry_ts") or ""),
-                        "opened_at": str(pos.get("entry_ts") or now_utc_iso()),
+                        "opened_at": str(pos.get("entry_ts") or ""),
                         "exit_ts": str(pos.get("exit_ts") or ""),
                         "closed_at": str(pos.get("exit_ts") or ""),
                         "local_order_id": str(pos.get("local_order_id") or ""),
@@ -2251,28 +2348,39 @@ class APPositionManager:
             # the idempotent path repairs it from PERSISTED values only.
             if isinstance(detail, dict) and detail.get("idempotent"):
                 persisted = detail
-                proof_ok = self._ensure_terminal_close_proof(
-                    position_id=str(persisted.get("position_id") or position_id),
-                    local_order_id=str(persisted.get("local_order_id") or ""),
-                    contract=str(persisted.get("contract") or ""),
-                    underlying=str(
-                        persisted.get("underlying") or persisted.get("contract") or ""
+                _pt_ok, _pt_reason = _validate_persisted_terminal_truth(persisted)
+                if not _pt_ok:
+                    log.critical(
+                        "[%s] MANUAL_CLOSE_IDEMPOTENT_PERSISTED_TRUTH_INSUFFICIENT "
+                        "pos=%s reason=%s — refusing to write proof from incomplete row",
+                        self.client_id, position_id, _pt_reason,
+                    )
+                    return False
+                proof_ok = self._with_terminal_proof_lock(
+                    position_id,
+                    lambda: self._ensure_terminal_close_proof(
+                        position_id=str(persisted.get("position_id") or position_id),
+                        local_order_id=str(persisted.get("local_order_id") or ""),
+                        contract=str(persisted.get("contract") or ""),
+                        underlying=str(
+                            persisted.get("underlying") or persisted.get("contract") or ""
+                        ),
+                        side=str(persisted.get("side") or persisted.get("direction") or ""),
+                        opened_at=str(persisted.get("opened_at") or persisted.get("entry_ts") or ""),
+                        closed_at=str(persisted.get("closed_at") or persisted.get("exit_ts") or ""),
+                        entry_option_price=float(
+                            persisted.get("entry_option_price") or persisted.get("avg_fill") or 0
+                        ),
+                        exit_option_price=float(persisted.get("exit_price") or 0),
+                        contracts=int(persisted.get("qty") or 0),
+                        exit_reason=str(persisted.get("exit_reason") or ""),
+                        option_pnl_pct=float(persisted.get("realized_pnl_pct") or 0),
+                        setup_status=str(persisted.get("close_source") or ""),
+                        execution_mode=str(persisted.get("execution_mode") or ""),
+                        exit_fill_price=float(persisted.get("exit_price") or 0),
+                        allow_fallback_insert=True,
+                        missing_reason_code="MANUAL_CLOSE_IDEMPOTENT_PROOF_REPAIR",
                     ),
-                    side=str(persisted.get("side") or persisted.get("direction") or ""),
-                    opened_at=str(persisted.get("opened_at") or persisted.get("entry_ts") or ""),
-                    closed_at=str(persisted.get("closed_at") or persisted.get("exit_ts") or ""),
-                    entry_option_price=float(
-                        persisted.get("entry_option_price") or persisted.get("avg_fill") or 0
-                    ),
-                    exit_option_price=float(persisted.get("exit_price") or 0),
-                    contracts=int(persisted.get("qty") or 0),
-                    exit_reason=str(persisted.get("exit_reason") or ""),
-                    option_pnl_pct=float(persisted.get("realized_pnl_pct") or 0),
-                    setup_status=str(persisted.get("close_source") or ""),
-                    execution_mode=str(persisted.get("execution_mode") or ""),
-                    exit_fill_price=float(persisted.get("exit_price") or 0),
-                    allow_fallback_insert=True,
-                    missing_reason_code="MANUAL_CLOSE_IDEMPOTENT_PROOF_REPAIR",
                 )
                 if proof_ok:
                     log.info(
@@ -2388,24 +2496,27 @@ class APPositionManager:
                     self.client_id, _proof_err,
                 )
             if int(detail.get("remaining") or 0) <= 0:
-                self._ensure_terminal_close_proof(
-                    position_id=position_id,
-                    local_order_id=str(detail.get("local_order_id") or ""),
-                    contract=str(detail.get("contract") or ""),
-                    underlying=str(detail.get("underlying") or detail.get("contract") or ""),
-                    side=str(detail.get("side") or ""),
-                    opened_at=str(detail.get("opened_at") or ts),
-                    closed_at=str(detail.get("closed_at") or ts),
-                    entry_option_price=float(detail.get("entry_option_price") or 0),
-                    exit_option_price=exit_px,
-                    contracts=int(detail.get("filled_qty") or fill_qty or 1),
-                    exit_reason=exit_reason,
-                    option_pnl_pct=float(detail.get("realized_pnl_pct") or 0),
-                    setup_status=str(close_source or "broker_exit_fill"),
-                    execution_mode="",
-                    exit_fill_price=exit_px,
-                    allow_fallback_insert=True,
-                    missing_reason_code="BROKER_TRUTH_CLOSE_PROOF_WRITE_FAILED",
+                self._with_terminal_proof_lock(
+                    position_id,
+                    lambda: self._ensure_terminal_close_proof(
+                        position_id=position_id,
+                        local_order_id=str(detail.get("local_order_id") or ""),
+                        contract=str(detail.get("contract") or ""),
+                        underlying=str(detail.get("underlying") or detail.get("contract") or ""),
+                        side=str(detail.get("side") or ""),
+                        opened_at=str(detail.get("opened_at") or ts),
+                        closed_at=str(detail.get("closed_at") or ts),
+                        entry_option_price=float(detail.get("entry_option_price") or 0),
+                        exit_option_price=exit_px,
+                        contracts=int(detail.get("filled_qty") or fill_qty or 1),
+                        exit_reason=exit_reason,
+                        option_pnl_pct=float(detail.get("realized_pnl_pct") or 0),
+                        setup_status=str(close_source or "broker_exit_fill"),
+                        execution_mode="",
+                        exit_fill_price=exit_px,
+                        allow_fallback_insert=True,
+                        missing_reason_code="BROKER_TRUTH_CLOSE_PROOF_WRITE_FAILED",
+                    ),
                 )
             return True
 
@@ -2416,7 +2527,11 @@ class APPositionManager:
         return False
 
     def repair_terminal_proof_from_persisted(
-        self, position_id: str,
+        self,
+        position_id: str,
+        *,
+        expected_execution_mode: str = "",
+        durable_exit_evidence: Optional[dict] = None,
     ) -> tuple[bool, str]:
         """PR #386 fix 2: proof-only restart recovery.
 
@@ -2461,28 +2576,80 @@ class APPositionManager:
         if persisted is None:
             return False, str(reason)
 
-        proof_ok = self._ensure_terminal_close_proof(
-            position_id=position_id,
-            local_order_id=str(persisted.get("local_order_id") or ""),
-            contract=str(persisted.get("contract") or ""),
-            underlying=str(
-                persisted.get("underlying") or persisted.get("ticker") or persisted.get("contract") or ""
+        # PR #386 blocker 4: fail closed on incomplete persisted truth.
+        # Refuse to synthesize proof from a row missing any of the required
+        # identity/economic fields, and refuse when the caller-declared
+        # execution mode doesn't match the persisted mode exactly.
+        expected_mode = str(expected_execution_mode or "").strip().lower()
+        row_mode = str(persisted.get("execution_mode") or "").strip().lower()
+        if expected_mode and expected_mode != row_mode:
+            log.critical(
+                "[%s] TERMINAL_PROOF_RESTART_RECOVERY_MODE_MISMATCH "
+                "pos=%s expected=%s row=%s",
+                self.client_id, position_id, expected_mode, row_mode,
+            )
+            return False, "execution_mode_mismatch"
+        pt_ok, pt_reason = _validate_persisted_terminal_truth(persisted)
+        if not pt_ok:
+            log.critical(
+                "[%s] TERMINAL_PROOF_RESTART_RECOVERY_INCOMPLETE "
+                "pos=%s reason=%s — no proof written",
+                self.client_id, position_id, pt_reason,
+            )
+            return False, f"persisted_truth_insufficient:{pt_reason}"
+
+        # PR #386 blocker 2 hook: if the caller supplied a validated durable
+        # EXIT aggregate (from _validate_durable_fills), require its
+        # quantity to equal persisted qty and its weighted price to agree
+        # with persisted exit_price within a small tolerance.
+        if durable_exit_evidence is not None:
+            try:
+                aggregate_qty = int(durable_exit_evidence.get("filled_qty") or 0)
+                aggregate_price = float(durable_exit_evidence.get("fill_price") or 0)
+            except (TypeError, ValueError):
+                aggregate_qty, aggregate_price = 0, 0.0
+            persisted_qty = int(persisted.get("qty") or 0)
+            persisted_exit = float(persisted.get("exit_price") or 0)
+            if aggregate_qty != persisted_qty:
+                log.critical(
+                    "[%s] TERMINAL_PROOF_RESTART_RECOVERY_QTY_DISAGREE "
+                    "pos=%s durable=%s persisted=%s",
+                    self.client_id, position_id, aggregate_qty, persisted_qty,
+                )
+                return False, "durable_qty_mismatch"
+            if persisted_exit > 0 and abs(aggregate_price - persisted_exit) > 0.005:
+                log.critical(
+                    "[%s] TERMINAL_PROOF_RESTART_RECOVERY_PRICE_DISAGREE "
+                    "pos=%s durable=%.4f persisted=%.4f",
+                    self.client_id, position_id, aggregate_price, persisted_exit,
+                )
+                return False, "durable_price_mismatch"
+
+        proof_ok = self._with_terminal_proof_lock(
+            position_id,
+            lambda: self._ensure_terminal_close_proof(
+                position_id=position_id,
+                local_order_id=str(persisted.get("local_order_id") or ""),
+                contract=str(persisted.get("contract") or ""),
+                underlying=str(
+                    persisted.get("underlying") or persisted.get("ticker") or persisted.get("contract") or ""
+                ),
+                side=str(persisted.get("side") or persisted.get("direction") or ""),
+                opened_at=str(persisted.get("entry_ts") or persisted.get("opened_at") or ""),
+                closed_at=str(persisted.get("exit_ts") or persisted.get("closed_at") or ""),
+                entry_option_price=float(
+                    persisted.get("avg_fill") or persisted.get("entry_price") or 0
+                ),
+                exit_option_price=float(persisted.get("exit_price") or 0),
+                contracts=int(persisted.get("qty") or 0),
+                exit_reason=str(persisted.get("exit_reason") or ""),
+                option_pnl_pct=float(persisted.get("realized_pnl_pct") or 0),
+                setup_status=str(persisted.get("close_source") or ""),
+                execution_mode=str(persisted.get("execution_mode") or ""),
+                exit_fill_price=float(persisted.get("exit_price") or 0),
+                allow_fallback_insert=True,
+                missing_reason_code="TERMINAL_PROOF_RESTART_RECOVERY",
             ),
-            side=str(persisted.get("side") or persisted.get("direction") or ""),
-            opened_at=str(persisted.get("entry_ts") or persisted.get("opened_at") or ""),
-            closed_at=str(persisted.get("exit_ts") or persisted.get("closed_at") or ""),
-            entry_option_price=float(
-                persisted.get("avg_fill") or persisted.get("entry_price") or 0
-            ),
-            exit_option_price=float(persisted.get("exit_price") or 0),
-            contracts=int(persisted.get("qty") or 0),
-            exit_reason=str(persisted.get("exit_reason") or ""),
-            option_pnl_pct=float(persisted.get("realized_pnl_pct") or 0),
-            setup_status=str(persisted.get("close_source") or ""),
-            execution_mode=str(persisted.get("execution_mode") or ""),
-            exit_fill_price=float(persisted.get("exit_price") or 0),
-            allow_fallback_insert=True,
-            missing_reason_code="TERMINAL_PROOF_RESTART_RECOVERY",
         )
         if proof_ok:
             log.info(

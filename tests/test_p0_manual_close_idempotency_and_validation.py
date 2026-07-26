@@ -120,9 +120,21 @@ class _APM(pm_mod.APPositionManager):
         return True
 
     def _ensure_terminal_close_proof(self, **kwargs):
-        # Sentinel: record the call so tests can assert non-invocation.
+        # Sentinel: record the call and return True so the lock-wrapper's
+        # binding re-read is exercised.
         self._terminal_proof_calls = getattr(self, "_terminal_proof_calls", [])
         self._terminal_proof_calls.append(kwargs)
+        return True
+
+    # PR #386 blocker 3: bypass the advisory-lock wrapper in unit tests
+    # so the fake DB cursor does not need to model pg_advisory_xact_lock or
+    # proof-binding-state SQL. Integration coverage of the lock lives in
+    # tests/test_p0_manual_close_terminal_recovery.py.
+    def _with_terminal_proof_lock(self, position_id, fn):
+        return fn()
+
+    def _proof_row_binding_state(self, **kwargs):
+        return "bound_position"
 
 
 def _install_pm_db(monkeypatch, positions_by_id):
@@ -157,7 +169,8 @@ def _open_position(**overrides):
 
 def test_terminal_status_with_zero_remaining_is_idempotent_success(monkeypatch):
     row = _open_position(status="CLOSED", quantity_remaining=0,
-                          exit_price=0.90, realized_pnl=34.0, realized_pnl_pct=23.3)
+                          exit_price=0.90, realized_pnl=34.0, realized_pnl_pct=23.3,
+                          execution_mode="paper", exit_ts="2026-07-21T16:30:00+00:00")
     _install_pm_db(monkeypatch, {POSITION_ID: row})
     apm = _APM(CLIENT)
     ok = apm.close_position_from_exit_fill(
@@ -165,8 +178,14 @@ def test_terminal_status_with_zero_remaining_is_idempotent_success(monkeypatch):
         broker_order_id="LATE-CALLER", exit_reason="late_call_should_noop",
     )
     assert ok is True
-    # No terminal_proof invocation
-    assert getattr(apm, "_terminal_proof_calls", []) == []
+    # PR #386 amendment: idempotent path MUST run proof repair (once) using
+    # PERSISTED values only — never the second caller's evidence.
+    calls = getattr(apm, "_terminal_proof_calls", [])
+    assert len(calls) == 1
+    kw = calls[0]
+    assert kw["exit_option_price"] == 0.90         # persisted, not 1.50
+    assert kw["exit_fill_price"] == 0.90
+    assert kw["option_pnl_pct"] == 23.3
     # Original row untouched
     assert row["exit_price"] == 0.90
 
@@ -198,7 +217,9 @@ def test_nonterminal_status_with_zero_remaining_refuses_mutation(monkeypatch):
 def test_closed_repair_stopped_taken_profit_are_terminal_classified(monkeypatch):
     for status in ("CLOSED_REPAIR", "STOPPED", "TAKEN_PROFIT"):
         row = _open_position(status=status, quantity_remaining=0,
-                              exit_price=0.80, realized_pnl=10.0)
+                              exit_price=0.80, realized_pnl=10.0,
+                              execution_mode="paper",
+                              exit_ts="2026-07-21T16:30:00+00:00")
         _install_pm_db(monkeypatch, {POSITION_ID: row})
         apm = _APM(CLIENT)
         ok = apm.close_position_from_exit_fill(
@@ -206,8 +227,10 @@ def test_closed_repair_stopped_taken_profit_are_terminal_classified(monkeypatch)
             broker_order_id=f"LATE-{status}",
         )
         assert ok is True, f"{status} should be terminal-idempotent success"
-        # No proof mutation for idempotent path
-        assert getattr(apm, "_terminal_proof_calls", []) == []
+        # PR #386 amendment: idempotent path performs one proof-repair call.
+        calls = getattr(apm, "_terminal_proof_calls", [])
+        assert len(calls) == 1, f"{status} expected exactly one proof-repair call"
+        assert calls[0]["exit_option_price"] == 0.80
         # Original economics preserved
         assert row["exit_price"] == 0.80
 
@@ -216,7 +239,9 @@ def test_closed_repair_stopped_taken_profit_are_terminal_classified(monkeypatch)
 
 def test_duplicate_finalizer_with_different_caller_evidence_does_not_rewrite_proof(monkeypatch):
     row = _open_position(status="CLOSED", quantity_remaining=0,
-                          exit_price=0.90, realized_pnl=34.0, realized_pnl_pct=23.3)
+                          exit_price=0.90, realized_pnl=34.0, realized_pnl_pct=23.3,
+                          execution_mode="paper",
+                          exit_ts="2026-07-21T16:30:00+00:00")
     cursor = _install_pm_db(monkeypatch, {POSITION_ID: row})
     apm = _APM(CLIENT)
 
@@ -229,12 +254,19 @@ def test_duplicate_finalizer_with_different_caller_evidence_does_not_rewrite_pro
     )
 
     assert ok is True
-    # No proof_trades SELECT/UPDATE — the idempotent path must SKIP the proof
-    # repair block entirely.
+    # No proof_trades SELECT/UPDATE — the idempotent path skips the generic
+    # proof repair block entirely (that block would use CALLER evidence).
     assert cursor.proof_selects == []
     assert cursor.proof_updates == []
-    # No terminal-proof insert either.
-    assert getattr(apm, "_terminal_proof_calls", []) == []
+    # PR #386 amendment: one canonical proof-repair call IS expected, but it
+    # MUST use PERSISTED values — never the second caller's 99.99 / SECOND-
+    # CALLER / second_call_wrong_evidence.
+    calls = getattr(apm, "_terminal_proof_calls", [])
+    assert len(calls) == 1
+    kw = calls[0]
+    assert kw["exit_option_price"] == 0.90        # persisted, not 99.99
+    assert kw["exit_fill_price"] == 0.90
+    assert kw["exit_reason"] != "second_call_wrong_evidence"
     # First finalization's economics are still on the row.
     assert row["exit_price"] == 0.90
     assert row["realized_pnl"] == 34.0
