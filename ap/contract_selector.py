@@ -1118,7 +1118,16 @@ def _order_chain_for_direct_quote_recovery(
         ranked["rank"] = rank
         rankings.append(ranked)
     if request_context is not None:
-        request_context.direct_quote_eligible_candidates = len(rows)
+        # Truthful count: only rows that could actually go to direct
+        # revalidation — valid OCC symbol, valid expiration, and directional
+        # strike fit. The full ordered-chain length is preserved as a
+        # separate diagnostic so the total is still visible.
+        eligible_rows = sum(
+            1
+            for sort_key, _, _ in rows
+            if sort_key[0] == 0 and sort_key[1] == 0 and sort_key[2] == 0
+        )
+        request_context.direct_quote_eligible_candidates = eligible_rows
         request_context.direct_quote_candidate_ranking = rankings
         _ctx_refresh_diagnostics(request_context)
     return [opt for _, opt, _ in rows]
@@ -2603,10 +2612,15 @@ class APContractSelectionEngine:
                             "failure":   "DIRECT_QUOTE_ZERO_BID_ASK",
                         })
                     elif _rv_pro.get("action") == "SKIP_BUDGET_EXHAUSTED":
+                        # No provider call occurred for this candidate — the
+                        # revalidator short-circuited on the budget guard —
+                        # so ``attempted`` must stay False. ``budget_skipped``
+                        # is the truthful flag for aggregate diagnostics.
                         _direct_quote_recovery_audit.update({
-                            "attempted": True,
-                            "selected":  False,
-                            "failure":   "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                            "attempted":      False,
+                            "budget_skipped": True,
+                            "selected":       False,
+                            "failure":        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                         })
                     elif _rv_pro.get("action") == "REJECT_UNAVAILABLE":
                         pro_reason = _rv_pro.get("reason_code") or "QUOTE_FETCH_FAILED"
@@ -2773,10 +2787,14 @@ class APContractSelectionEngine:
                 elif _rv_action == "SKIP_BUDGET_EXHAUSTED":
                     try:
                         if not _direct_quote_recovery_audit.get("selected"):
+                            # No provider call happened here — mark the
+                            # budget-skip explicitly and leave ``attempted``
+                            # False so the summary matches call-count truth.
                             _direct_quote_recovery_audit.update({
-                                "attempted": True,
-                                "selected":  False,
-                                "failure":   "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                                "attempted":      False,
+                                "budget_skipped": True,
+                                "selected":       False,
+                                "failure":        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                             })
                     except Exception:
                         pass

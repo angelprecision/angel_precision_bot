@@ -37,6 +37,20 @@ def _clear_cache_and_throttle(monkeypatch):
     clear_quote_cache()
 
 
+def _next_weekday(target: date) -> date:
+    while target.weekday() >= 5:  # Sat/Sun
+        target += timedelta(days=1)
+    return target
+
+
+# Near-future expiry, recomputed each test session, so DTE-window checks in
+# ap.contract_selector.select() (which compare against date.today()) stay
+# valid regardless of when CI runs.
+_NEAR_EXPIRY_DATE = _next_weekday(date.today() + timedelta(days=2))
+_NEAR_EXPIRY = _NEAR_EXPIRY_DATE.isoformat()
+_NEAR_EXPIRY_OCC = _NEAR_EXPIRY_DATE.strftime("%y%m%d")
+
+
 def _ctx(limit: int) -> SelectorRequestContext:
     ctx = SelectorRequestContext(
         ticker="SPY",
@@ -53,7 +67,7 @@ def _option(
     *,
     direction: str = "CALL",
     strike: float = 450.0,
-    expiration: str = "2026-07-24",
+    expiration: str = _NEAR_EXPIRY,
     delta: float | None = 0.40,
     oi: int | None = 100,
     volume: int | None = 10,
@@ -61,7 +75,7 @@ def _option(
     ask_size: int | None = 20,
 ) -> dict:
     cp = "C" if direction == "CALL" else "P"
-    occ = f"SPY260724{cp}{int(strike * 1000):08d}"
+    occ = f"SPY{_NEAR_EXPIRY_OCC}{cp}{int(strike * 1000):08d}"
     opt = {
         "symbol": occ,
         "expiration_date": expiration,
@@ -135,7 +149,7 @@ class _DirectQuoteBroker:
     def _session_get(self, url, *, params=None, headers=None, timeout=None):
         params = params or {}
         if "options/expirations" in url:
-            return _response({"expirations": {"date": ["2026-07-24"]}})
+            return _response({"expirations": {"date": [_NEAR_EXPIRY]}})
         if "options/chains" in url:
             return _response({"options": {"option": self.chain}})
         return _response({"quotes": {"quote": {"last": 450.0}}})
@@ -148,7 +162,7 @@ class _DirectQuoteBroker:
 
 def _production_shaped_chain(direction: str) -> tuple[list[dict], str]:
     chain = []
-    expiry = "2026-07-24"
+    expiry = _NEAR_EXPIRY
     for idx in range(130):
         strike = 600 + idx if direction == "CALL" else 300 - idx
         chain.append(
@@ -373,14 +387,14 @@ class TestOneAuthority:
 
         first = revalidate_with_direct_quote(
             broker,
-            {"symbol": "SPY260724C00450000", "bid": 0, "ask": 0},
+            {"symbol": f"SPY{_NEAR_EXPIRY_OCC}C00450000", "bid": 0, "ask": 0},
             "zero_bid_or_ask",
             market_open_override=True,
             request_context=ctx,
         )
         second = revalidate_with_direct_quote(
             broker,
-            {"symbol": "SPY   260724C00450000", "bid": 0, "ask": 0},
+            {"symbol": f"SPY   {_NEAR_EXPIRY_OCC}C00450000", "bid": 0, "ask": 0},
             "zero_bid_or_ask",
             market_open_override=True,
             request_context=ctx,
@@ -390,7 +404,7 @@ class TestOneAuthority:
         assert second["action"] == "SKIP_ALREADY_REVALIDATED"
         assert broker.get_quote.call_count == 1
         assert ctx.provider_call_counts["direct_quote_calls"] == 1
-        assert ctx.direct_quote_attempted_symbols == ["SPY260724C00450000"]
+        assert ctx.direct_quote_attempted_symbols == [f"SPY{_NEAR_EXPIRY_OCC}C00450000"]
 
 
 class TestCandidateOrderingAndReasonHonesty:
@@ -464,7 +478,7 @@ class TestCandidateOrderingAndReasonHonesty:
         assert second["audit"]["original_chain_reject_reason"] == "low_oi_0"
         assert second["audit"]["budget_exhausted"] is True
         assert ctx.direct_quote_unattempted_count == 1
-        assert ctx.direct_quote_unattempted_symbols == ["SPY260724C00451000"]
+        assert ctx.direct_quote_unattempted_symbols == [f"SPY{_NEAR_EXPIRY_OCC}C00451000"]
 
     def test_direct_quote_safety_recheck_rejects_wide_spread_and_inverted_quotes(self):
         selector = APContractSelectionEngine(MagicMock(), max_spread_pct=0.20, min_oi=1, min_volume=0)
@@ -486,12 +500,12 @@ class TestCandidateOrderingAndReasonHonesty:
              patch("ap.tradier_market_data_throttle.after_market_data_call"):
             result = fetch_direct_option_quote_with_meta(
                 broker,
-                "SPY260724C00450000",
+                f"SPY{_NEAR_EXPIRY_OCC}C00450000",
                 request_context=ctx,
             )
 
         assert result["ok"] is True
-        assert ctx.direct_quote_attempted_symbols == ["SPY260724C00450000"]
+        assert ctx.direct_quote_attempted_symbols == [f"SPY{_NEAR_EXPIRY_OCC}C00450000"]
         assert _selector_request_diagnostics(ctx)["direct_quote_budget"]["remaining"] == 1
 
     def test_duplicate_unattempted_symbols_count_once(self):
@@ -501,21 +515,21 @@ class TestCandidateOrderingAndReasonHonesty:
 
         revalidate_with_direct_quote(
             broker,
-            {"symbol": "SPY260724C00450000", "bid": 0.0, "ask": 0.0},
+            {"symbol": f"SPY{_NEAR_EXPIRY_OCC}C00450000", "bid": 0.0, "ask": 0.0},
             "zero_bid_or_ask",
             market_open_override=True,
             request_context=ctx,
         )
         first_skip = revalidate_with_direct_quote(
             broker,
-            {"symbol": "SPY260724C00451000", "bid": 0.0, "ask": 0.0},
+            {"symbol": f"SPY{_NEAR_EXPIRY_OCC}C00451000", "bid": 0.0, "ask": 0.0},
             "zero_bid_or_ask",
             market_open_override=True,
             request_context=ctx,
         )
         second_skip = revalidate_with_direct_quote(
             broker,
-            {"symbol": "SPY   260724C00451000", "bid": 0.0, "ask": 0.0},
+            {"symbol": f"SPY   {_NEAR_EXPIRY_OCC}C00451000", "bid": 0.0, "ask": 0.0},
             "zero_bid_or_ask",
             market_open_override=True,
             request_context=ctx,
@@ -524,7 +538,7 @@ class TestCandidateOrderingAndReasonHonesty:
         assert first_skip["action"] == "SKIP_BUDGET_EXHAUSTED"
         assert second_skip["action"] == "SKIP_BUDGET_EXHAUSTED"
         assert ctx.direct_quote_unattempted_count == 1
-        assert ctx.direct_quote_unattempted_symbols == ["SPY260724C00451000"]
+        assert ctx.direct_quote_unattempted_symbols == [f"SPY{_NEAR_EXPIRY_OCC}C00451000"]
 
 
 class TestSelectorIntegration:
@@ -566,7 +580,7 @@ class TestSelectorIntegration:
         selected, selector, broker, plan = _select_with_chain(
             monkeypatch,
             chain,
-            "SPY260724C99999999",
+            f"SPY{_NEAR_EXPIRY_OCC}C99999999",
             "CALL",
             quote={"bid": 0.0, "ask": 0.0},
         )
@@ -652,7 +666,7 @@ class TestSelectorIntegration:
         plan_overrides,
         expected_reason,
     ):
-        expiration = chain_overrides.pop("expiration", "2026-07-24")
+        expiration = chain_overrides.pop("expiration", _NEAR_EXPIRY)
         opt = _option(
             0,
             direction="CALL",
