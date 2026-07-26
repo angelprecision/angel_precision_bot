@@ -2696,6 +2696,189 @@ class APOrderMonitor:
                 self.client_id, local_order_id, symbol, e,
             )
 
+    # =========================================================================
+    # PR #392 — Unfilled-entry lifecycle helpers
+    #
+    # Two hooks into the existing order-monitor tick:
+    #   1. _maybe_seed_entry_lifecycle: called from _advance_from_broker_status
+    #      the first time an ENTRY row transitions to ACKNOWLEDGED. Stamps
+    #      the durable envelope: entry_lifecycle_id, first_broker_ack_at,
+    #      original quantities, retry_deadline, static_approval_proof.
+    #   2. _dispatch_entry_continuation: called from _maybe_arm_post_cancel_retry
+    #      when the row already carries an entry_lifecycle_id (i.e. this cancel
+    #      is happening AFTER the broker acknowledged the order). Delegates to
+    #      APExecutionCore.submit_entry_continuation which owns the bounded
+    #      one-shot replacement.
+    #
+    # For CREATED cancels (never broker-ack'd), the legacy post_cancel_retry
+    # ARM/SUBMIT path continues to run — no behavioral change there.
+    # =========================================================================
+
+    def _maybe_seed_entry_lifecycle(self, local_order_id: str, order_snapshot: dict) -> None:
+        """Idempotently seed the entry lifecycle envelope on first broker ack."""
+        try:
+            row = self.osm.get_order(local_order_id) or dict(order_snapshot or {})
+        except Exception as _gexc:
+            log.debug("[%s] _maybe_seed_entry_lifecycle get_order failed: %s",
+                      self.client_id, _gexc)
+            return
+        if not row:
+            return
+        row = dict(row)
+        meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+        if isinstance(meta, str):
+            try:
+                import json as _jl
+                meta = _jl.loads(meta)
+            except Exception:
+                meta = {}
+        if not isinstance(meta, dict):
+            meta = {}
+        # Idempotency: OSM CAS enforces this too, but short-circuit here to
+        # avoid the round-trip for already-seeded rows.
+        if str(meta.get("entry_lifecycle_id") or "").strip():
+            return
+
+        broker_oid = str(row.get("broker_order_id") or "").strip()
+        if not broker_oid:
+            # No broker ID yet — cannot seed. The next ack tick will retry.
+            return
+
+        # Original approved quantity — prefer the row's `qty` (canonical),
+        # then meta.qty, then meta.original_qty.
+        _qty_raw = row.get("qty") or meta.get("qty") or meta.get("original_qty") or 0
+        try:
+            _original_qty = int(float(_qty_raw))
+        except (TypeError, ValueError):
+            _original_qty = 0
+        if _original_qty < 1:
+            log.debug("[%s] _maybe_seed_entry_lifecycle: qty<1 order=%s — skip seed",
+                      self.client_id, local_order_id)
+            return
+
+        _first_ack = str(row.get("acknowledged_ts") or row.get("submitted_ts") or now_utc_iso())
+        _signal_valid_until = (
+            meta.get("signal_valid_until")
+            or meta.get("original_signal_valid_until")
+            or (meta.get("trigger") or {}).get("signal_valid_until")
+            if isinstance(meta.get("trigger"), dict) else meta.get("signal_valid_until")
+        )
+
+        # ── Static approval proof — freeze what admission already decided ──
+        # This is the exact set of facts we refuse to re-derive on retry.
+        _trigger = meta.get("trigger") if isinstance(meta.get("trigger"), dict) else {}
+        _proof = {
+            "symbol":                 str(row.get("symbol") or meta.get("ticker") or "").upper(),
+            "direction":              str(row.get("direction") or meta.get("direction") or "").upper(),
+            "contract":               str(row.get("contract") or meta.get("contract") or "").upper(),
+            "execution_mode":         str(row.get("execution_mode") or meta.get("execution_mode") or "").lower(),
+            "signal_id":              str(row.get("signal_id") or meta.get("signal_id") or ""),
+            "score":                  meta.get("score"),
+            "tier":                   meta.get("tier"),
+            "pattern":                meta.get("pattern"),
+            "setup_generation":       meta.get("setup_generation") or meta.get("materialization_generation"),
+            "first_30min_allowed":    True,  # by definition — this order was already admitted
+            "time_gate_policy_id":    meta.get("time_gate_policy_id") or "admission_v1",
+            "regime_context":         meta.get("regime_context") or meta.get("spy_trend"),
+            "trigger_price":          _trigger.get("price") or meta.get("trigger_price"),
+            "stop_price":             meta.get("stop_price") or _trigger.get("stop_price"),
+            "target_price":           meta.get("target_price") or _trigger.get("target_price"),
+            "seeded_at":              now_utc_iso(),
+        }
+
+        _window = 75
+        try:
+            _window = int(os.getenv("ENTRY_RETRY_WINDOW_SECONDS", "75"))
+        except (TypeError, ValueError):
+            _window = 75
+
+        try:
+            seeded = self.osm.seed_entry_lifecycle_on_first_ack(
+                local_order_id,
+                broker_order_id=broker_oid,
+                first_broker_ack_at=_first_ack,
+                original_approved_quantity=_original_qty,
+                original_signal_valid_until=_signal_valid_until,
+                retry_window_seconds=_window,
+                static_approval_proof=_proof,
+            )
+        except Exception as _sexc:
+            log.warning("[%s] seed_entry_lifecycle_on_first_ack raised: %s",
+                        self.client_id, _sexc)
+            return
+        if seeded:
+            log.info(
+                "[%s] ENTRY_LIFECYCLE_SEEDED order=%s broker=%s qty=%d window=%ds",
+                self.client_id, local_order_id, broker_oid, _original_qty, _window,
+            )
+
+    def _dispatch_entry_continuation(
+        self,
+        local_order_id: str,
+        contract: str,
+        cancel_reason: str,
+        confirmed_status: str,
+    ) -> bool:
+        """Try to run PR #392 continuation. Returns True if handled (regardless
+        of outcome), False if the caller should fall back to legacy behavior.
+        """
+        try:
+            from ap_execution_core import get_execution_core_for_client
+        except Exception as _ie:
+            log.debug("[%s] execution_core registry unavailable: %s",
+                      self.client_id, _ie)
+            return False
+        core = get_execution_core_for_client(self.client_id)
+        if core is None:
+            log.debug("[%s] no registered execution_core for continuation "
+                      "of %s — falling back to legacy path",
+                      self.client_id, local_order_id)
+            return False
+        if not hasattr(core, "submit_entry_continuation"):
+            return False
+
+        try:
+            result = core.submit_entry_continuation(
+                local_order_id,
+                cancel_confirmed_status=confirmed_status,
+                broker=self.broker,
+            )
+        except Exception as _cexc:
+            log.error(
+                "[%s] submit_entry_continuation raised for %s: %s",
+                self.client_id, local_order_id, _cexc, exc_info=True,
+            )
+            return False
+
+        outcome = str((result or {}).get("outcome") or "")
+        log.info(
+            "[%s] ENTRY_CONTINUATION order=%s outcome=%s detail=%s",
+            self.client_id, local_order_id, outcome,
+            (result or {}).get("detail", ""),
+        )
+        # Emit a decision event for the dashboard.
+        try:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="entry_continuation",
+                decision=("SUBMIT" if outcome == "REPLACEMENT_SUBMITTED"
+                          else "ADOPT" if outcome == "LATE_FILL_ADOPTED"
+                          else "HOLD" if outcome == "MARKET_TRUTH_HOLD"
+                          else "ABORT"),
+                reason_code=outcome or "UNKNOWN",
+                explanation=(result or {}).get("detail", "")[:500],
+                contract=contract,
+                inputs={
+                    "cancel_reason":     cancel_reason,
+                    "confirmed_status":  confirmed_status,
+                    "audit":             (result or {}).get("audit", {}),
+                },
+            )
+        except Exception as _eex:
+            log.debug("[%s] emit continuation event failed: %s",
+                      self.client_id, _eex)
+        return True
+
     def _maybe_arm_post_cancel_retry(
         self,
         local_order_id: str,
@@ -2704,6 +2887,33 @@ class APOrderMonitor:
     ) -> None:
         if not ENTRY_RETRY_ENABLED:
             return
+
+        # PR #392 fast-path: if this order was broker-acknowledged before
+        # cancel, it has an entry_lifecycle_id. Route through the durable
+        # continuation seam instead of the legacy process_signal-based path
+        # (which was rejecting valid retries at the first-30-min time gate).
+        try:
+            _row = self.osm.get_order(local_order_id) or {}
+            _row_meta = _row.get("meta") if isinstance(_row.get("meta"), dict) else {}
+            _has_lifecycle = bool(str(_row_meta.get("entry_lifecycle_id") or "").strip())
+        except Exception:
+            _has_lifecycle = False
+
+        if _has_lifecycle:
+            # Cancel is broker-confirmed here by construction (this method is
+            # called only from the terminal-cancel branches of
+            # _handle_stale_entry).
+            handled = self._dispatch_entry_continuation(
+                local_order_id,
+                contract,
+                cancel_reason,
+                confirmed_status="CANCELED",
+            )
+            if handled:
+                return
+            # Fall through to legacy only if the executor wasn't registered —
+            # avoids losing the retry entirely during a startup race.
+
         try:
             from ap.post_cancel_retry import evaluate_retry
         except Exception as e:
@@ -3694,6 +3904,13 @@ class APOrderMonitor:
                 position_id=(order or {}).get("position_id"),
                 inputs={"broker_status": s, "kind": kind, "new_status": new_status},
             )
+
+        # ── PR #392: seed entry lifecycle on FIRST broker ACKNOWLEDGED ──
+        # This is the earliest broker-truth moment for an ENTRY order and
+        # anchors the entire unfilled-retry lifecycle. Idempotent — the OSM
+        # CAS refuses to overwrite an existing entry_lifecycle_id.
+        if ok and kind == "ENTRY" and new_status == "ACKNOWLEDGED":
+            self._maybe_seed_entry_lifecycle(local_order_id, order)
 
         if ok and kind == "EXIT" and new_status == "EXIT_FILLED":
             _pos_id = (order or {}).get("position_id")

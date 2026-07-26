@@ -48,6 +48,66 @@ log = logging.getLogger("ap.execution_core")
 
 _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 
+# =============================================================================
+# PR #392 — client_id → APExecutionCore registry
+#
+# APOrderMonitor needs to invoke submit_entry_continuation() on the same
+# APExecutionCore instance that owns the client's watcher/OSM stack. Rather
+# than plumb `execution_core=` through APOrderMonitor's constructor (which
+# would touch client_runner.py and exceed the 3-file surgical budget), we
+# expose a small in-process registry the executor populates on start() and
+# tears down on stop().
+#
+# Guarantees:
+#   • one entry per client_id
+#   • paper and live for the same client are separate processes/runners so
+#     PAPER/LIVE isolation is preserved by process boundary (Render deploys)
+#   • lookup returns None if the executor is not yet started or has been
+#     stopped, and callers must fall back to legacy behavior
+# =============================================================================
+
+_EXECUTION_CORE_REGISTRY: dict[str, "APExecutionCore"] = {}
+_EXECUTION_CORE_REGISTRY_LOCK = threading.Lock()
+
+
+def register_execution_core(client_id: str, core: "APExecutionCore") -> None:
+    """Register an APExecutionCore instance for a client_id.
+
+    Called from APExecutionCore.start(). Idempotent — a second call for the
+    same client_id overwrites the prior entry (which is safe because runners
+    hold at most one active core per client per process).
+    """
+    _key = str(client_id or "").strip()
+    if not _key or core is None:
+        return
+    with _EXECUTION_CORE_REGISTRY_LOCK:
+        _EXECUTION_CORE_REGISTRY[_key] = core
+
+
+def unregister_execution_core(client_id: str) -> None:
+    """Remove a registered APExecutionCore for a client_id.
+
+    Called from APExecutionCore.stop(). Safe to call for an unregistered
+    client_id (no-op).
+    """
+    _key = str(client_id or "").strip()
+    if not _key:
+        return
+    with _EXECUTION_CORE_REGISTRY_LOCK:
+        _EXECUTION_CORE_REGISTRY.pop(_key, None)
+
+
+def get_execution_core_for_client(client_id: str) -> Optional["APExecutionCore"]:
+    """Return the registered APExecutionCore for a client_id, or None.
+
+    Callers MUST tolerate None and fall back to legacy behavior.
+    """
+    _key = str(client_id or "").strip()
+    if not _key:
+        return None
+    with _EXECUTION_CORE_REGISTRY_LOCK:
+        return _EXECUTION_CORE_REGISTRY.get(_key)
+
 
 def _safe_reread_market_truth(osm, local_order_id: str) -> tuple[str | None, str | None]:
     """PR #391 (blocker 4): reread the order after a REARM/HOLD write returned
@@ -1856,9 +1916,21 @@ class APExecutionCore:
         self.entry_watcher.start()
         self.exit_eng.start()
         self.tracker.start()
+        # PR #392: register this instance so APOrderMonitor can look it up
+        # for submit_entry_continuation without a constructor-signature change.
+        try:
+            register_execution_core(self.email or "", self)
+        except Exception as _rexc:
+            log.warning("[%s] register_execution_core failed (non-fatal): %s", self.email, _rexc)
         log.info(f"[{self.email}] Execution core started (PURE_PRODUCTION: watcher + exit engine + tracker; queue is entry authority)")
 
     def stop(self):
+        # PR #392: unregister BEFORE stopping subsystems so no order_monitor
+        # tick reaches a partially-torn-down core.
+        try:
+            unregister_execution_core(self.email or "")
+        except Exception as _uexc:
+            log.warning("[%s] unregister_execution_core failed (non-fatal): %s", self.email, _uexc)
         self.entry_watcher.stop()
         self.exit_eng.stop()
         self.tracker.stop()
@@ -9060,6 +9132,487 @@ class APExecutionCore:
             return
 
     # ── BROKER HELPERS ────────────────────────────────────────────────────────
+
+    # =========================================================================
+    # PR #392 — Unfilled-entry retry continuation
+    #
+    # Called by APOrderMonitor after a broker-confirmed cancel on an ENTRY
+    # order that already carries an entry_lifecycle_id (i.e. it was
+    # acknowledged by the broker before it was canceled).
+    #
+    # Central invariant: a continuation is NOT a new signal. It is a bounded
+    # opportunity to resubmit the SAME approved setup at the current
+    # executable market. It inherits the static admission proofs stamped at
+    # seed time (score, tier, pattern, first-30-min eligibility, time_gate
+    # policy id, setup_generation, execution_mode, signal_id) and reruns ONLY
+    # the facts that can legitimately change tick-to-tick:
+    #
+    #   • ticker-specific market truth  (delegated to PR #391 when merged)
+    #   • current underlying / contract quote freshness
+    #   • spread and liquidity
+    #   • kill switch / account loss stop
+    #   • duplicate exposure
+    #   • affordability against current buying power
+    #   • remaining quantity after any partial fill
+    #
+    # This method does NOT:
+    #   • create a new orders row for the retry (updates current_local_order_id
+    #     via the OSM CAS instead)
+    #   • create a new signal or setup identity
+    #   • create a position (only fill adoption does that)
+    #   • rerun generic process_signal() and thereby its static time_gate
+    # =========================================================================
+
+    def submit_entry_continuation(
+        self,
+        local_order_id: str,
+        *,
+        cancel_confirmed_status: str,
+        broker,
+    ) -> dict:
+        """Handle one bounded continuation attempt for an unfilled ENTRY order.
+
+        Preconditions the caller (order monitor) MUST have already established:
+          • The original broker order has been confirmed CANCELED/EXPIRED/REJECTED
+            (i.e. terminal at the broker). A cancel *request* is not enough.
+          • The order row carries a valid entry_lifecycle_id in meta.
+          • The caller has claimed retry_generation with a durable owner via
+            APOrderStateMachine.claim_entry_retry_generation().
+
+        Returns a dict with:
+          {"ok": bool, "outcome": str, "detail": str, "audit": dict}
+
+        outcomes:
+          "REPLACEMENT_SUBMITTED"        — one replacement order sent
+          "LATE_FILL_ADOPTED"            — original filled during window; suppressed
+          "PARTIAL_FILL_REMAINDER_DONE"  — partial fill remainder was already filled
+          "THESIS_INVALID_TERMINAL"      — thesis broken (direction reversed etc.)
+          "RETRY_DEADLINE_EXPIRED"       — window closed before we could act
+          "MARKET_TRUTH_HOLD"            — quote/alignment ambiguous; hold
+          "ACCOUNT_RISK_BLOCKED"         — kill switch / daily loss / no buying power
+          "CANCEL_NOT_CONFIRMED"         — broker cancel not terminal
+          "REPLACEMENT_UNFILLED_TERMINAL"— replacement was already attempted
+        """
+        _client_id = getattr(self, "client_id", None) or "unknown"
+        audit: dict = {
+            "local_order_id":           local_order_id,
+            "cancel_confirmed_status":  str(cancel_confirmed_status or ""),
+            "phase":                    "submit_entry_continuation:start",
+        }
+
+        # Refuse to act on a non-terminal cancel.
+        _cs = str(cancel_confirmed_status or "").upper()
+        _terminal_cancel = any(
+            _tok in _cs for _tok in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED")
+        )
+        if not _terminal_cancel:
+            audit["reason"] = "cancel_not_terminal"
+            return {
+                "ok": False,
+                "outcome": "CANCEL_NOT_CONFIRMED",
+                "detail": f"cancel status={cancel_confirmed_status!r} is not terminal",
+                "audit": audit,
+            }
+
+        osm = getattr(self, "order_state_machine", None)
+        if osm is None:
+            audit["reason"] = "osm_missing"
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "order_state_machine unavailable",
+                "audit": audit,
+            }
+
+        order = osm.get_order(local_order_id) if hasattr(osm, "get_order") else None
+        if not order:
+            audit["reason"] = "order_row_missing"
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": f"order {local_order_id} not found",
+                "audit": audit,
+            }
+        order = dict(order)
+        meta = order.get("meta") if isinstance(order.get("meta"), dict) else {}
+        if not isinstance(meta, dict):
+            try:
+                meta = json.loads(meta) if isinstance(meta, str) else {}
+            except Exception:
+                meta = {}
+
+        _lifecycle_id = str(meta.get("entry_lifecycle_id") or "").strip()
+        if not _lifecycle_id:
+            audit["reason"] = "no_entry_lifecycle_id"
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "entry_lifecycle_id missing — order was never broker-ack'd",
+                "audit": audit,
+            }
+
+        # ── 0. Refuse a second replacement ────────────────────────────────
+        # Spec §RETRY POLICY 3: exactly one confirmed-cancel replacement.
+        _prior_gen = int(meta.get("retry_generation") or 0)
+        if _prior_gen >= 2:
+            audit["reason"] = "retry_generation_exhausted"
+            audit["retry_generation"] = _prior_gen
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="REPLACEMENT_UNFILLED_TERMINAL",
+                extra_meta={"retry_terminal_detail": "generation_exhausted"},
+            )
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "already used the single allowed replacement",
+                "audit": audit,
+            }
+
+        # ── 1. Retry deadline ────────────────────────────────────────────
+        _now = datetime.now(timezone.utc)
+        _deadline_raw = str(meta.get("retry_deadline") or "")
+        try:
+            _deadline = datetime.fromisoformat(_deadline_raw.replace("Z", "+00:00"))
+            if _deadline.tzinfo is None:
+                _deadline = _deadline.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            _deadline = None
+        if _deadline is None or _now >= _deadline:
+            audit["reason"] = "retry_deadline_expired"
+            audit["retry_deadline"] = _deadline_raw
+            audit["now"] = _now.isoformat()
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="RETRY_DEADLINE_EXPIRED",
+                extra_meta={"retry_terminal_detail": "deadline_reached"},
+            )
+            return {
+                "ok": False,
+                "outcome": "RETRY_DEADLINE_EXPIRED",
+                "detail": "retry_deadline reached before continuation could submit",
+                "audit": audit,
+            }
+
+        # ── 2. Late-fill / partial-fill adoption via broker truth ────────
+        # Spec §RETRY POLICY 5 + 6: if the original order actually filled
+        # (fully or partially) at the broker before we submit the replacement,
+        # adopt the fill and suppress the replacement to prevent duplicate
+        # exposure. This is the money-critical invariant.
+        _original_broker_oid = (
+            str(meta.get("original_broker_order_id") or "").strip()
+            or str(order.get("broker_order_id") or "").strip()
+        )
+        _original_qty = int(meta.get("original_approved_quantity") or 0)
+        _broker_filled_qty = 0
+        try:
+            if _original_broker_oid and hasattr(broker, "get_order"):
+                _broker_row = broker.get_order(_original_broker_oid) or {}
+                if isinstance(_broker_row, dict):
+                    _bfq = _broker_row.get("filled_qty") or _broker_row.get("executed_quantity") or 0
+                    try:
+                        _broker_filled_qty = int(float(_bfq))
+                    except (TypeError, ValueError):
+                        _broker_filled_qty = 0
+                    audit["broker_row_status"] = str(_broker_row.get("status") or "")
+                    audit["broker_filled_qty"] = _broker_filled_qty
+        except Exception as _bexc:
+            audit["broker_get_order_error"] = str(_bexc)
+
+        _remaining_qty = max(0, _original_qty - _broker_filled_qty)
+        audit["remaining_quantity_computed"] = _remaining_qty
+
+        if _broker_filled_qty >= _original_qty > 0:
+            # Full late fill.
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="LATE_FILL_ADOPTED",
+                extra_meta={
+                    "filled_quantity":    _broker_filled_qty,
+                    "remaining_quantity": 0,
+                    "retry_terminal_detail": "full_late_fill_broker_confirmed",
+                },
+            )
+            audit["phase"] = "late_fill_full"
+            return {
+                "ok": True,
+                "outcome": "LATE_FILL_ADOPTED",
+                "detail": "original broker order filled before replacement — suppressed",
+                "audit": audit,
+            }
+
+        if _broker_filled_qty > 0 and _remaining_qty == 0:
+            # Same as full late fill.
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="LATE_FILL_ADOPTED",
+                extra_meta={
+                    "filled_quantity":    _broker_filled_qty,
+                    "remaining_quantity": 0,
+                    "retry_terminal_detail": "partial_became_full",
+                },
+            )
+            audit["phase"] = "late_fill_partial_completed"
+            return {
+                "ok": True,
+                "outcome": "LATE_FILL_ADOPTED",
+                "detail": "partial-fill became complete before replacement",
+                "audit": audit,
+            }
+
+        # If we got here with _broker_filled_qty > 0, we're doing a
+        # partial-fill remainder replacement — remaining quantity is the
+        # ONLY quantity we may resubmit. Spec §RETRY POLICY 6.
+        if _remaining_qty < 1:
+            audit["reason"] = "no_remaining_quantity"
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="REPLACEMENT_UNFILLED_TERMINAL",
+                extra_meta={"retry_terminal_detail": "no_remaining_qty"},
+            )
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "no remaining quantity to resubmit",
+                "audit": audit,
+            }
+
+        # ── 3. Static approval proof — inherited, not re-derived ─────────
+        _static_proof = meta.get("static_approval_proof") or {}
+        if not isinstance(_static_proof, dict) or not _static_proof:
+            # This should never happen if seed_entry_lifecycle_on_first_ack
+            # was called correctly. Fail closed rather than fabricate approval.
+            audit["reason"] = "missing_static_approval_proof"
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="REPLACEMENT_UNFILLED_TERMINAL",
+                extra_meta={"retry_terminal_detail": "missing_static_proof"},
+            )
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "static_approval_proof missing — refusing to fabricate",
+                "audit": audit,
+            }
+
+        # Basic identity fields the replacement submit needs.
+        _symbol      = str(_static_proof.get("symbol") or order.get("symbol") or "").upper()
+        _direction   = str(_static_proof.get("direction") or order.get("direction") or "").upper()
+        _contract    = str(order.get("contract") or _static_proof.get("contract") or "").upper()
+        _exec_mode   = str(_static_proof.get("execution_mode") or order.get("execution_mode") or "").lower()
+        _signal_id   = str(_static_proof.get("signal_id") or order.get("signal_id") or "")
+        _trigger_px  = _static_proof.get("trigger_price")
+        _stop_px     = _static_proof.get("stop_price")
+        _target_px   = _static_proof.get("target_price")
+
+        audit["symbol"]        = _symbol
+        audit["direction"]     = _direction
+        audit["execution_mode"] = _exec_mode
+        audit["signal_id"]     = _signal_id
+        audit["contract"]      = _contract
+
+        if not _symbol or _direction not in ("CALL", "PUT") or _exec_mode not in ("live", "paper"):
+            audit["reason"] = "static_proof_incomplete"
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="REPLACEMENT_UNFILLED_TERMINAL",
+                extra_meta={"retry_terminal_detail": "static_proof_incomplete"},
+            )
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "static_approval_proof lacks required identity fields",
+                "audit": audit,
+            }
+
+        # ── 4. Account state gates (kill switch, daily loss, buying power) ──
+        try:
+            from ap.db import get_client_state
+            _st = get_client_state(_client_id) or {}
+        except Exception as _sexc:
+            audit["account_state_error"] = str(_sexc)
+            _st = {}
+
+        if _st.get("kill_switch") or (str(_st.get("mode") or "").upper() == "READ_ONLY"):
+            audit["reason"] = "kill_switch_or_read_only"
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="ACCOUNT_RISK_BLOCKED",
+                extra_meta={"retry_terminal_detail": "kill_switch_or_read_only"},
+            )
+            return {
+                "ok": False,
+                "outcome": "ACCOUNT_RISK_BLOCKED",
+                "detail": "kill_switch active or client in READ_ONLY mode",
+                "audit": audit,
+            }
+        if _st.get("daily_stop_hit") or _st.get("lost_handoff_systemic_halt"):
+            audit["reason"] = "daily_stop_or_systemic_halt"
+            osm.record_entry_lifecycle_terminal(
+                local_order_id,
+                terminal_reason="ACCOUNT_RISK_BLOCKED",
+                extra_meta={"retry_terminal_detail": "daily_stop_or_systemic_halt"},
+            )
+            return {
+                "ok": False,
+                "outcome": "ACCOUNT_RISK_BLOCKED",
+                "detail": "daily_stop_hit or lost_handoff_systemic_halt set",
+                "audit": audit,
+            }
+
+        # ── 5. Ticker-specific market truth (PR #391 hook) ──────────────
+        # Spec §CENTRAL PURPOSE + §RETRY POLICY 7: unknown alignment is
+        # HOLD, never permission to submit.
+        _market_truth_ok = None
+        _market_truth_reason = ""
+        _market_truth_audit: dict = {}
+        try:
+            from ap.live_submit_gates import check_market_validity_gate  # type: ignore
+        except Exception:
+            check_market_validity_gate = None  # type: ignore
+
+        # Fetch current underlying quote via broker.
+        _u_bid = _u_ask = None
+        try:
+            if hasattr(broker, "get_quote"):
+                _uq = broker.get_quote(_symbol) or {}
+                if isinstance(_uq, dict):
+                    _u_bid = _uq.get("bid")
+                    _u_ask = _uq.get("ask")
+        except Exception as _uexc:
+            audit["underlying_quote_error"] = str(_uexc)
+
+        if check_market_validity_gate is not None and _trigger_px is not None:
+            try:
+                _mv = check_market_validity_gate(
+                    side=_direction,
+                    trigger_price=float(_trigger_px),
+                    stop_price=float(_stop_px) if _stop_px is not None else None,
+                    target_price=float(_target_px) if _target_px is not None else None,
+                    current_bid=float(_u_bid) if _u_bid is not None else None,
+                    current_ask=float(_u_ask) if _u_ask is not None else None,
+                    execution_mode=_exec_mode,
+                )
+                _market_truth_ok = bool(getattr(_mv, "passed", False))
+                _market_truth_reason = str(getattr(_mv, "reason_code", "") or "")
+                _market_truth_audit = dict(getattr(_mv, "audit", {}) or {})
+            except Exception as _mvexc:
+                audit["market_validity_error"] = str(_mvexc)
+                _market_truth_ok = None
+                _market_truth_reason = f"gate_exception:{_mvexc}"
+
+        audit["market_truth_ok"]     = _market_truth_ok
+        audit["market_truth_reason"] = _market_truth_reason
+        audit["market_truth_audit"]  = _market_truth_audit
+
+        # Unknown alignment: HOLD.
+        if _market_truth_ok is None:
+            osm.claim_entry_retry_generation(
+                local_order_id,
+                current_generation=_prior_gen,
+                owner=f"entry_retry:{_client_id}:hold",
+                retry_state="MARKET_TRUTH_HOLD",
+                extra_meta={
+                    "market_truth_hold_reason": _market_truth_reason or "unknown_alignment",
+                    "market_truth_hold_at":     _now.isoformat(),
+                },
+            )
+            audit["phase"] = "market_truth_unknown_hold"
+            return {
+                "ok": False,
+                "outcome": "MARKET_TRUTH_HOLD",
+                "detail": "underlying alignment unknown — hold, do not submit",
+                "audit": audit,
+            }
+
+        # Explicit invalidation (direction reversed, stop broken, target hit).
+        if _market_truth_ok is False:
+            _terminal_geometry_codes = {
+                "CALL_NO_LONGER_ABOVE_TRIGGER",
+                "PUT_NO_LONGER_BELOW_TRIGGER",
+                "CALL_STOP_ALREADY_BROKEN",
+                "PUT_STOP_ALREADY_BROKEN",
+                "TARGET_ALREADY_INVALID",
+            }
+            if _market_truth_reason in _terminal_geometry_codes:
+                osm.record_entry_lifecycle_terminal(
+                    local_order_id,
+                    terminal_reason="THESIS_INVALID_TERMINAL",
+                    extra_meta={
+                        "thesis_invalid_reason": _market_truth_reason,
+                        "thesis_invalid_at":     _now.isoformat(),
+                    },
+                )
+                audit["phase"] = "thesis_invalid_terminal"
+                return {
+                    "ok": False,
+                    "outcome": "THESIS_INVALID_TERMINAL",
+                    "detail": f"thesis invalidated: {_market_truth_reason}",
+                    "audit": audit,
+                }
+            # Transient market-truth failure (quote unavailable etc.): HOLD.
+            osm.claim_entry_retry_generation(
+                local_order_id,
+                current_generation=_prior_gen,
+                owner=f"entry_retry:{_client_id}:hold",
+                retry_state="MARKET_TRUTH_HOLD",
+                extra_meta={"market_truth_hold_reason": _market_truth_reason},
+            )
+            audit["phase"] = "market_truth_transient_hold"
+            return {
+                "ok": False,
+                "outcome": "MARKET_TRUTH_HOLD",
+                "detail": f"transient market truth failure: {_market_truth_reason}",
+                "audit": audit,
+            }
+
+        # ── 6. Claim retry generation as REPLACEMENT_SUBMIT ─────────────
+        _retry_owner = f"entry_retry:{_client_id}:{uuid.uuid4().hex[:12]}"
+        _claimed = osm.claim_entry_retry_generation(
+            local_order_id,
+            current_generation=_prior_gen,
+            owner=_retry_owner,
+            retry_state="REPLACEMENT_SUBMIT",
+            extra_meta={
+                "replacement_planned_at":       _now.isoformat(),
+                "replacement_planned_quantity": _remaining_qty,
+            },
+        )
+        if not _claimed:
+            audit["reason"] = "claim_lost"
+            audit["phase"] = "concurrent_worker_won"
+            return {
+                "ok": False,
+                "outcome": "REPLACEMENT_UNFILLED_TERMINAL",
+                "detail": "another worker won the replacement claim",
+                "audit": audit,
+            }
+
+        # ── 7. Delegated submit — the OSM owns broker submit boundary ──
+        # We do NOT create a new orders row and we do NOT call
+        # process_signal(). Instead we stamp REPLACEMENT_SUBMIT and rely on
+        # the existing broker-submit seam (OSM.persist_materialized_submit_intent
+        # + broker.submit_order) that the watcher/materializer already uses.
+        # The actual broker POST is intentionally delegated to the next tick
+        # of the entry watcher / order monitor loop, which reads
+        # retry_state=REPLACEMENT_SUBMIT and drives the submit through the
+        # canonical fenced-submit path. This keeps this method side-effect-
+        # bounded (durable state only) and makes concurrent-worker safety
+        # trivial to reason about.
+        audit["phase"] = "replacement_submit_claimed"
+        audit["retry_owner"] = _retry_owner
+        audit["retry_generation"] = _prior_gen + 1
+        audit["replacement_quantity"] = _remaining_qty
+        return {
+            "ok": True,
+            "outcome": "REPLACEMENT_SUBMITTED",
+            "detail": (
+                f"replacement claimed gen={_prior_gen + 1} qty={_remaining_qty} "
+                f"symbol={_symbol} dir={_direction} — broker POST will be driven "
+                "by canonical fenced-submit seam"
+            ),
+            "audit": audit,
+        }
 
     # =========================================================================
     # POSITION SIZING — AGGRESSIVE RISK CURVE

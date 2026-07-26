@@ -5914,6 +5914,425 @@ class APOrderStateMachine:
         except Exception as _e:
             log.warning("osm_runwithretry_fn_failed: %s", _e)
 
+    # =========================================================================
+    # PR #392 — Unfilled-entry repricing & retry continuity
+    #
+    # A valid approved ENTRY that is submitted but stays unfilled must receive
+    # ONE bounded continuation opportunity without restarting through generic
+    # process_signal(), without losing its original approvals, and without
+    # producing duplicate broker orders.
+    #
+    # These methods are the durable lifecycle authority:
+    #   1. seed_entry_lifecycle_on_first_ack  — stamp entry_lifecycle_id and
+    #      static_approval_proof exactly once at first broker acknowledgment.
+    #   2. claim_entry_retry_generation       — CAS on retry_owner + retry_generation
+    #      to guarantee exactly one worker owns the continuation attempt.
+    #   3. record_entry_lifecycle_terminal    — durable terminal outcome stamp.
+    #
+    # All writes use non-destructive JSONB `||` merge into orders.meta. No new
+    # tables. No new setup identity. The original orders row IS the lifecycle
+    # record; retry_generation counts continuation attempts on that row.
+    # =========================================================================
+
+    def seed_entry_lifecycle_on_first_ack(
+        self,
+        local_order_id: str,
+        *,
+        broker_order_id: str,
+        first_broker_ack_at: str,
+        original_approved_quantity: int,
+        original_signal_valid_until: Optional[str],
+        retry_window_seconds: int,
+        static_approval_proof: dict,
+    ) -> bool:
+        """Idempotently stamp the entry lifecycle envelope on FIRST broker ack.
+
+        Called once per ENTRY order the moment the broker acknowledges receipt.
+        Subsequent calls are no-ops (guarded by the existence of
+        ``entry_lifecycle_id`` in meta). The lifecycle is anchored to the
+        original local_order_id and travels with the order row through cancel,
+        confirmed-cancel, and replacement.
+
+        Fields stamped (all under orders.meta, single JSONB merge):
+          - entry_lifecycle_id       — canonical UUID for the whole lifecycle
+          - original_local_order_id  — permanent anchor
+          - current_local_order_id   — updated on each replacement
+          - original_broker_order_id — permanent anchor
+          - current_broker_order_id  — updated on each replacement
+          - first_broker_ack_at      — ISO-8601 UTC timestamp
+          - original_approved_quantity
+          - filled_quantity          — always starts at 0
+          - remaining_quantity       — starts equal to original_approved_quantity
+          - original_signal_valid_until
+          - retry_deadline           — min(signal_valid_until, ack+window)
+          - retry_generation         — starts at 0
+          - retry_state              — 'OPEN_UNFILLED'
+          - retry_owner              — empty until claimed
+          - retry_not_before         — empty until claimed
+          - static_approval_proof    — frozen snapshot of scanner+time_gate
+                                       admission proofs (time_gate_policy_id,
+                                       score, tier, pattern, setup_generation,
+                                       regime_context, first_30min_allowed,
+                                       signal_id, execution_mode, client_id)
+
+        Returns True if the row was newly seeded, False if it was already
+        seeded (idempotent no-op) or the CAS failed.
+        """
+        import json as _json_local
+        from datetime import timedelta as _td
+
+        try:
+            original_approved_quantity = int(original_approved_quantity)
+        except (TypeError, ValueError):
+            return False
+        if original_approved_quantity < 1:
+            return False
+
+        try:
+            retry_window_seconds = int(retry_window_seconds)
+        except (TypeError, ValueError):
+            return False
+        # Spec §RETRY POLICY 2: bounded 60–90s window. Clamp to that band.
+        if retry_window_seconds < 30 or retry_window_seconds > 120:
+            retry_window_seconds = 75
+
+        _first_ack = str(first_broker_ack_at or "").strip()
+        _broker_oid = str(broker_order_id or "").strip()
+        if not _first_ack or not _broker_oid:
+            return False
+
+        # Compute retry_deadline = min(signal_valid_until, ack + window)
+        _retry_deadline = None
+        try:
+            _ack_dt = datetime.fromisoformat(_first_ack.replace("Z", "+00:00"))
+            if _ack_dt.tzinfo is None:
+                _ack_dt = _ack_dt.replace(tzinfo=timezone.utc)
+            _window_deadline = _ack_dt + _td(seconds=retry_window_seconds)
+            _retry_deadline = _window_deadline
+            if original_signal_valid_until:
+                try:
+                    _svu = datetime.fromisoformat(
+                        str(original_signal_valid_until).replace("Z", "+00:00")
+                    )
+                    if _svu.tzinfo is None:
+                        _svu = _svu.replace(tzinfo=timezone.utc)
+                    if _svu < _window_deadline:
+                        _retry_deadline = _svu
+                except (TypeError, ValueError):
+                    pass
+        except (TypeError, ValueError):
+            return False
+
+        # Freeze the static approval proof. Reject empty/None to force callers
+        # to compute it — a retry with no proof is a retry that could bypass
+        # the wrong gate.
+        if not isinstance(static_approval_proof, dict) or not static_approval_proof:
+            return False
+        _safe_proof = {}
+        for _k, _v in static_approval_proof.items():
+            try:
+                _json_local.dumps(_v)  # ensure JSON-serializable
+                _safe_proof[str(_k)] = _v
+            except (TypeError, ValueError):
+                continue
+
+        _lifecycle_id = f"entry_lifecycle:{local_order_id}"
+
+        patch = _json_local.dumps({
+            "entry_lifecycle_id":          _lifecycle_id,
+            "original_local_order_id":     local_order_id,
+            "current_local_order_id":      local_order_id,
+            "original_broker_order_id":    _broker_oid,
+            "current_broker_order_id":     _broker_oid,
+            "first_broker_ack_at":         _first_ack,
+            "original_approved_quantity":  original_approved_quantity,
+            "filled_quantity":             0,
+            "remaining_quantity":          original_approved_quantity,
+            "original_signal_valid_until": original_signal_valid_until or None,
+            "retry_deadline":              _retry_deadline.isoformat(),
+            "retry_window_seconds":        retry_window_seconds,
+            "retry_generation":            0,
+            "retry_state":                 "OPEN_UNFILLED",
+            "retry_owner":                 "",
+            "retry_not_before":            "",
+            "static_approval_proof":       _safe_proof,
+            "entry_lifecycle_seeded_at":   now_utc_iso(),
+        })
+
+        def _seed():
+            with conn() as c:
+                # Idempotency: refuse to seed a row that already carries an
+                # entry_lifecycle_id. This guarantees the anchor never moves.
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') = ''
+                    """,
+                    (patch, local_order_id, self.client_id),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_seed) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] seed_entry_lifecycle_on_first_ack failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def claim_entry_retry_generation(
+        self,
+        local_order_id: str,
+        *,
+        current_generation: int,
+        owner: str,
+        retry_state: str,
+        retry_not_before: Optional[str] = None,
+        extra_meta: Optional[dict] = None,
+    ) -> bool:
+        """CAS-claim the next retry generation for an unfilled-entry lifecycle.
+
+        Atomically bumps ``retry_generation`` from ``current_generation`` to
+        ``current_generation + 1`` and stamps ``retry_owner`` + ``retry_state``.
+        Fails closed if any concurrent worker already advanced the generation
+        or if the row has no entry_lifecycle_id (i.e. no first_broker_ack yet).
+
+        Spec §RETRY POLICY 10: at most one worker owns retry generation.
+
+        Args:
+            current_generation: the generation the caller believes is current.
+                                MUST match the row's stored value exactly.
+            owner: opaque token (typically "entry_retry:<client>:<pid>:<uuid>")
+                   the worker will present when it later persists a
+                   replacement or terminal state.
+            retry_state: one of the lifecycle spec states
+                        (CANCEL_REQUESTED, CANCEL_CONFIRMED, REPLACEMENT_SUBMIT,
+                         MARKET_TRUTH_HOLD, etc.).
+            retry_not_before: optional ISO-8601 UTC timestamp — the earliest
+                              moment the caller may act on this claim.
+            extra_meta: additional non-destructive fields to merge (e.g.
+                        market_truth audit, cancel broker status).
+
+        Returns True if the claim was won, False otherwise.
+        """
+        import json as _json_local
+        owner = str(owner or "").strip()
+        retry_state = str(retry_state or "").strip().upper()
+        try:
+            current_generation = int(current_generation)
+        except (TypeError, ValueError):
+            return False
+        if current_generation < 0 or not owner or not retry_state:
+            return False
+
+        _valid_states = {
+            "OPEN_UNFILLED",
+            "CANCEL_REQUESTED",
+            "CANCEL_CONFIRMED",
+            "REPLACEMENT_SUBMIT",
+            "MARKET_TRUTH_HOLD",
+            "ACCOUNT_RISK_BLOCKED",
+        }
+        if retry_state not in _valid_states:
+            return False
+
+        next_gen = current_generation + 1
+        _now = now_utc_iso()
+        _patch: dict = {
+            "retry_generation":       next_gen,
+            "retry_owner":            owner,
+            "retry_state":            retry_state,
+            "retry_claimed_at":       _now,
+        }
+        if retry_not_before:
+            _patch["retry_not_before"] = str(retry_not_before)
+        if isinstance(extra_meta, dict):
+            for _k, _v in extra_meta.items():
+                # Never allow extra_meta to overwrite the durable anchors.
+                if _k in (
+                    "entry_lifecycle_id",
+                    "original_local_order_id",
+                    "original_broker_order_id",
+                    "first_broker_ack_at",
+                    "original_approved_quantity",
+                    "original_signal_valid_until",
+                    "retry_deadline",
+                    "static_approval_proof",
+                ):
+                    continue
+                try:
+                    _json_local.dumps(_v)
+                    _patch[str(_k)] = _v
+                except (TypeError, ValueError):
+                    continue
+
+        patch_json = _json_local.dumps(_patch)
+
+        def _claim():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') <> ''
+                      AND COALESCE((meta->>'retry_generation')::int, 0) = %s
+                    """,
+                    (patch_json, local_order_id, self.client_id, current_generation),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_claim) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] claim_entry_retry_generation failed order=%s gen=%s: %s",
+                self.client_id, local_order_id, current_generation, exc,
+            )
+            return False
+
+    def record_entry_lifecycle_terminal(
+        self,
+        local_order_id: str,
+        *,
+        terminal_reason: str,
+        owner: Optional[str] = None,
+        current_generation: Optional[int] = None,
+        extra_meta: Optional[dict] = None,
+    ) -> bool:
+        """Stamp a terminal outcome on the entry lifecycle envelope.
+
+        This is a durable audit stamp; it does NOT itself transition the
+        underlying order status. The order status transitions are still
+        driven by broker truth via the standard ``transition()`` path.
+
+        Terminal reasons (§SCOPE / lifecycle):
+          LATE_FILL_ADOPTED, PARTIAL_FILL_REMAINDER_FILLED,
+          THESIS_INVALID_TERMINAL, RETRY_DEADLINE_EXPIRED,
+          CANCEL_NOT_CONFIRMED, REPLACEMENT_UNFILLED_TERMINAL,
+          ACCOUNT_RISK_BLOCKED, MARKET_TRUTH_HOLD (terminal),
+          FILLED (normal happy path).
+
+        Owner + generation guard: if ``owner`` and ``current_generation`` are
+        supplied, the CAS requires exact match — a stale worker cannot stamp
+        terminal over a fresher claim.
+        """
+        import json as _json_local
+        terminal_reason = str(terminal_reason or "").strip().upper()
+        if not terminal_reason:
+            return False
+
+        _valid_terminals = {
+            "FILLED",
+            "LATE_FILL_ADOPTED",
+            "PARTIAL_FILL_REMAINDER_FILLED",
+            "THESIS_INVALID_TERMINAL",
+            "RETRY_DEADLINE_EXPIRED",
+            "CANCEL_NOT_CONFIRMED",
+            "REPLACEMENT_UNFILLED_TERMINAL",
+            "ACCOUNT_RISK_BLOCKED",
+            "MARKET_TRUTH_HOLD",
+        }
+        if terminal_reason not in _valid_terminals:
+            return False
+
+        _now = now_utc_iso()
+        _patch: dict = {
+            "retry_state":             terminal_reason,
+            "retry_terminal_reason":   terminal_reason,
+            "retry_terminalized_at":   _now,
+        }
+        if isinstance(extra_meta, dict):
+            for _k, _v in extra_meta.items():
+                if _k in (
+                    "entry_lifecycle_id",
+                    "original_local_order_id",
+                    "original_broker_order_id",
+                    "first_broker_ack_at",
+                    "original_approved_quantity",
+                    "original_signal_valid_until",
+                    "retry_deadline",
+                    "static_approval_proof",
+                ):
+                    continue
+                try:
+                    _json_local.dumps(_v)
+                    _patch[str(_k)] = _v
+                except (TypeError, ValueError):
+                    continue
+
+        patch_json = _json_local.dumps(_patch)
+
+        _guarded = bool(owner and current_generation is not None)
+        if _guarded:
+            try:
+                _gen_int = int(current_generation)
+            except (TypeError, ValueError):
+                return False
+
+            def _stamp_guarded():
+                with conn() as c:
+                    cur = c.execute(
+                        """
+                        UPDATE orders
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_ts = NOW()
+                        WHERE local_order_id = %s
+                          AND client_id = %s
+                          AND kind = 'ENTRY'
+                          AND COALESCE(meta->>'entry_lifecycle_id','') <> ''
+                          AND COALESCE(meta->>'retry_owner','') = %s
+                          AND COALESCE((meta->>'retry_generation')::int, 0) = %s
+                        """,
+                        (patch_json, local_order_id, self.client_id,
+                         str(owner).strip(), _gen_int),
+                    )
+                    return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+            try:
+                return bool(run_with_retry(_stamp_guarded) > 0)
+            except Exception as exc:
+                log.warning(
+                    "[%s] record_entry_lifecycle_terminal guarded failed order=%s: %s",
+                    self.client_id, local_order_id, exc,
+                )
+                return False
+
+        # Unguarded stamp — used by broker-fill-adoption which owns truth.
+        def _stamp():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND kind = 'ENTRY'
+                      AND COALESCE(meta->>'entry_lifecycle_id','') <> ''
+                    """,
+                    (patch_json, local_order_id, self.client_id),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_stamp) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] record_entry_lifecycle_terminal failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
 
 # =============================================================================
 # Backward-compatible shims
