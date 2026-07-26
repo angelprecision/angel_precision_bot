@@ -2184,7 +2184,7 @@ class ClientRunner(threading.Thread):
                 _is_trading = bool(_nyse_is_trading_day(now_et.date()))
             except Exception:
                 _is_trading = now_et.weekday() < 5
-            if not _is_trading or not self._overnight_reeval_in_window(now_et):
+            if not _is_trading:
                 # PR #388 deadline-enforcement: even a "not in window" tick
                 # after the readiness deadline must enforce so LIVE runners
                 # cannot ride an unarmed morning past 9:30 unblocked.
@@ -2222,6 +2222,26 @@ class ClientRunner(threading.Thread):
                     result["handoff_result"] = None
                     result["readiness_result"] = self._retry_post_overnight_readiness()
                 return result
+            if not self._overnight_reeval_in_window(now_et):
+                # PR #388 deadline-enforcement: even a "not in window" tick
+                # after the readiness deadline must enforce so LIVE runners
+                # cannot ride an unarmed morning past 9:30 unblocked.
+                # The helper itself no-ops on non-trading days and before
+                # the deadline, so pre-open weekday ticks stay quiet.
+                _res = self._overnight_reeval_base_result(
+                    result_class="SKIPPED_NOT_DUE",
+                    completed=False,
+                    retryable=False,
+                    now_et=now_et,
+                    source=source,
+                )
+                _readiness = self._enforce_preopen_readiness_at_deadline(
+                    now_et=now_et, today=today, source=source,
+                    result_class="SKIPPED_NOT_DUE",
+                )
+                if _readiness is not None:
+                    _res["readiness_result"] = _readiness
+                return _res
             if self._overnight_reeval_exhausted_date == today:
                 _res = self._overnight_reeval_base_result(
                     result_class="RETRY_EXHAUSTED",
