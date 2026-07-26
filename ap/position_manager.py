@@ -2090,25 +2090,35 @@ class APPositionManager:
                 if not pos:
                     return False, "position_not_found"
 
-                # ── Idempotency guard under the FOR UPDATE row lock ───────────
-                # If the position is already terminal or has no remaining
-                # quantity, a previous finalization completed. Return success
-                # so overlapping callers (two health-loop iterations or the
-                # row-at-a-time reconciler racing this helper) both see True
-                # without rewriting P&L or recalculating realized returns.
-                # This is the ONLY correct serialization point — a detached
-                # pre-read does not hold the lock and cannot prevent a race.
-                _TERMINAL_FOR_CLOSE = frozenset(
-                    {"CLOSED", "EXPIRED", "CANCELLED", "CANCELED", "ERROR"}
-                )
+                # ── Canonical state classification under FOR UPDATE (PR #386) ─
+                # The row lock is the ONLY correct serialization point. Any
+                # detached pre-read cannot prevent overlapping callers from
+                # racing here. We classify (status, quantity_remaining) into
+                # four exact outcomes:
+                #
+                #   1. status in TERMINAL and remaining <= 0
+                #      → idempotent success. The first successful finalization
+                #        owns economic truth; do NOT recalculate position P&L
+                #        and do NOT overwrite position exit fields. Caller
+                #        sees True and MUST NOT rewrite proof (enforced above
+                #        run_with_retry via detail["idempotent"]).
+                #   2. status in TERMINAL and remaining > 0
+                #      → invariant broken: terminal position still carries
+                #        remaining quantity. Refuse to mutate; no evict.
+                #   3. status not in TERMINAL and remaining <= 0
+                #      → invariant broken: active position has zero remaining.
+                #        Refuse to mutate; no evict.
+                #   4. status not in TERMINAL and remaining > 0
+                #      → continue through canonical finalization below.
                 _idm_status = str(pos.get("status") or "").upper().strip()
+                _idm_terminal = _idm_status in PositionStatus.TERMINAL
                 _idm_remaining_raw = pos.get("quantity_remaining")
                 _idm_qty = int(pos.get("qty") or 0)
                 _idm_remaining = (
                     _idm_qty if _idm_remaining_raw is None
                     else int(_idm_remaining_raw or 0)
                 )
-                if _idm_status in _TERMINAL_FOR_CLOSE or _idm_remaining <= 0:
+                if _idm_terminal and _idm_remaining <= 0:
                     log.info(
                         "[%s] close_position_from_exit_fill idempotent | "
                         "pos=%s status=%s remaining=%s",
@@ -2129,7 +2139,23 @@ class APPositionManager:
                         "opened_at": str(pos.get("entry_ts") or now_utc_iso()),
                         "idempotent": True,
                     }
-                # ── End idempotency guard ─────────────────────────────────────
+                if _idm_terminal and _idm_remaining > 0:
+                    log.critical(
+                        "[%s] close_position_from_exit_fill invariant | "
+                        "pos=%s status=%s remaining=%s reason=%s — refusing mutation",
+                        self.client_id, position_id, _idm_status, _idm_remaining,
+                        "terminal_position_has_remaining_quantity",
+                    )
+                    return False, "terminal_position_has_remaining_quantity"
+                if (not _idm_terminal) and _idm_remaining <= 0:
+                    log.critical(
+                        "[%s] close_position_from_exit_fill invariant | "
+                        "pos=%s status=%s remaining=%s reason=%s — refusing mutation",
+                        self.client_id, position_id, _idm_status, _idm_remaining,
+                        "nonterminal_position_has_zero_remaining",
+                    )
+                    return False, "nonterminal_position_has_zero_remaining"
+                # ── End canonical state classification ────────────────────────
 
                 avg_fill = float(pos.get("avg_fill") or pos.get("entry_price") or 0)
                 qty      = int(pos.get("qty") or 0)
@@ -2202,6 +2228,18 @@ class APPositionManager:
 
         ok, detail = run_with_retry(_fn)
         if ok:
+            # PR #386 fix 2: idempotent success means the first successful
+            # finalization already owns economic truth (P&L, exit price,
+            # broker identity, timestamps, proof rows). A duplicate caller
+            # must no-op — never rewrite proof with different evidence.
+            if isinstance(detail, dict) and detail.get("idempotent"):
+                log.info(
+                    "[%s] close_position_from_exit_fill idempotent no-op | "
+                    "pos=%s status=%s — proof economics preserved from first "
+                    "finalization; skipping proof update and terminal proof",
+                    self.client_id, position_id, detail.get("status"),
+                )
+                return True
             log.info(
                 "[%s] POSITION FINALIZED FROM EXIT FILL | pos=%s exit=$%.2f qty=%s "
                 "pnl=$%+.2f (%.1f%%) source=%s broker=%s",
