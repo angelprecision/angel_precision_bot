@@ -51,12 +51,20 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from ap.contract_playbook import (
     ContractPlaybookSpec,
+    STRIKE_POLICY_LABEL_ATM,
     STRIKE_POLICY_LABEL_NONMATCH,
+    STRIKE_POLICY_LABEL_ONE_STEP_OTM,
+    STRIKE_POLICY_TIER_ATM,
     STRIKE_POLICY_TIER_NONMATCH,
+    STRIKE_POLICY_TIER_ONE_STEP_OTM,
+    TRIGGER_ANCHOR_SOURCE_NONE,
+    TRIGGER_ANCHOR_SOURCE_TRIGGER,
+    TRIGGER_ANCHOR_SOURCE_UNDERLYING_FALLBACK,
     build_playbook_candidate_context,
     playbook_contract_selection_enabled,
     resolve_contract_playbook,
     resolve_playbook_expiration_order,
+    resolve_trigger_anchored_preferred_strikes,
 )
 
 # P0A: direct option quote revalidation (do not remove — restores flow for
@@ -1053,12 +1061,35 @@ def _order_chain_for_direct_quote_recovery(
     target_delta: float,
     today: date,
     request_context: SelectorRequestContext,
+    preferred_strikes: list[float] | tuple[float, ...] | None = None,
 ) -> list[dict]:
     direction_norm = str(direction or "").strip().upper()
     if direction_norm.startswith("C"):
         direction_norm = "CALL"
     elif direction_norm.startswith("P"):
         direction_norm = "PUT"
+    preferred_order: dict[float, int] = {}
+    for idx, raw_strike in enumerate(preferred_strikes or ()):
+        try:
+            strike_value = float(raw_strike)
+        except (TypeError, ValueError):
+            continue
+        if strike_value > 0 and strike_value not in preferred_order:
+            preferred_order[strike_value] = idx
+
+    def _preferred_tier(strike: float | None) -> tuple[int, float]:
+        if not preferred_order:
+            return 0, 0.0
+        if strike is None:
+            return len(preferred_order) + 1, float("inf")
+        for preferred, tier in preferred_order.items():
+            if abs(float(strike) - preferred) < 1e-9:
+                return tier, 0.0
+        return (
+            len(preferred_order),
+            min(abs(float(strike) - preferred) for preferred in preferred_order),
+        )
+
     rows: list[tuple[tuple, dict, dict]] = []
     for original_index, opt in enumerate(list(chain or [])):
         exp_date = _option_expiration_date(opt)
@@ -1082,7 +1113,8 @@ def _order_chain_for_direct_quote_recovery(
             else None
         )
         valid_expiration = exp_date is not None and (dte is None or dte >= 0)
-        if strike is None or not underlying_price or opt_type != direction_norm:
+        valid_option_side = opt_type == direction_norm
+        if strike is None or not underlying_price or not valid_option_side:
             directional_fit = False
         elif direction_norm == "CALL":
             directional_fit = strike >= float(underlying_price)
@@ -1090,6 +1122,7 @@ def _order_chain_for_direct_quote_recovery(
             directional_fit = strike <= float(underlying_price)
         else:
             directional_fit = False
+        preferred_strike_tier, preferred_strike_distance = _preferred_tier(strike)
         oi_missing = opt.get("open_interest") in (None, "")
         vol_missing = opt.get("volume") in (None, "")
         open_interest = int(_safe_float(opt.get("open_interest"), 0.0)) if not oi_missing else None
@@ -1103,7 +1136,10 @@ def _order_chain_for_direct_quote_recovery(
             "delta": abs_delta,
             "delta_distance": delta_distance,
             "moneyness_distance_pct": moneyness_distance_pct,
+            "valid_option_side": valid_option_side,
             "directional_strike_fit": directional_fit,
+            "preferred_strike_tier": preferred_strike_tier,
+            "preferred_strike_distance": preferred_strike_distance,
             "open_interest": open_interest,
             "volume": volume,
             "original_index": original_index,
@@ -1111,6 +1147,9 @@ def _order_chain_for_direct_quote_recovery(
         sort_key = (
             0 if _valid_occ_symbol(opt) else 1,
             0 if valid_expiration else 1,
+            0 if valid_option_side else 1,
+            preferred_strike_tier,
+            preferred_strike_distance,
             0 if directional_fit else 1,
             strike_distance if strike_distance is not None else float("inf"),
             delta_distance if delta_distance is not None else float("inf"),
@@ -1128,10 +1167,12 @@ def _order_chain_for_direct_quote_recovery(
     if request_context is not None:
         # ``direct_quote_structural_candidates`` counts rows that are at
         # least structurally direct-quotable — valid OCC symbol, valid
-        # expiration, and directional strike fit. Actual direct-quote
-        # eligibility depends on the chain reject reason being one that
-        # ``_should_revalidate(...)`` accepts, which is not known here
-        # at ordering time and gets counted in the quality-filter loop.
+        # expiration, and the requested CALL/PUT side. Current-underlying
+        # moneyness is a ranking preference only: a slightly ITM
+        # trigger-primary contract remains structurally quotable. Actual
+        # direct-quote eligibility depends on the chain reject reason being
+        # one that ``_should_revalidate(...)`` accepts, which is not known
+        # here and gets counted in the quality-filter loop.
         structural_rows = sum(
             1
             for sort_key, _, _ in rows
@@ -2532,6 +2573,68 @@ class APContractSelectionEngine:
         # This is thread-safe when worker_loop and entry_watcher breach both call
         # select() on the same instance simultaneously.
         today = getattr(request_context, "playbook_today_et", None) or date.today()
+
+        # ── PR #396 amendment (post-review) ───────────────────────────────────
+        # Align bounded direct-quote recovery spending with the playbook's
+        # trigger-anchored strike preference.
+        #
+        # Problem this fixes: when the underlying drifts between scanner
+        # qualification and breach, chain iteration order (which drives which
+        # rows get to spend SELECTOR_MAX_DIRECT_QUOTE_CALLS) can favor strikes
+        # clustered around the *current* underlying while the playbook's final
+        # ranker (build_playbook_candidate_context) later prefers strikes
+        # anchored to the *scanner trigger*. If the trigger-preferred strike
+        # never gets a fresh direct quote, it is silently discarded before
+        # ranking runs. BAC production replay: trigger 61.17, underlying 61.60,
+        # budget=1 — the 61 strike went unquoted and was rejected in favor of a
+        # 62-cluster contract.
+        #
+        # Fix: gate on the playbook flag. When enabled, delegate to the single
+        # shared authority (resolve_trigger_anchored_preferred_strikes) so
+        # quote-spending order and final ranking cannot ever diverge. Preserve
+        # existing deterministic secondary ordering for candidates in the same
+        # strike tier (original chain index). When the flag is off, or trigger
+        # and underlying are both unusable, fall through unchanged — the
+        # non-playbook selector path preserves prior chain ordering, ranking,
+        # quote spending, and selection behavior. Note: a
+        # preferred_strike_ordering entry with enabled=False is still emitted
+        # into selector_request_diagnostics for observability parity across
+        # flag states; downstream selection is not affected.
+        _preferred_strike_audit: dict = {
+            "enabled": False,
+            "anchor_source": TRIGGER_ANCHOR_SOURCE_NONE,
+            "anchor_price": None,
+            "primary_strike": None,
+            "adjacent_otm_strike": None,
+            "chain_size_before": len(chain),
+            "reordered": False,
+        }
+        _preferred_strikes_for_quality_order: tuple[float, ...] = ()
+        _preferred_primary: float | None = None
+        _preferred_adjacent: float | None = None
+        if _request_playbook_enabled(request_context):
+            _preferred_strike_audit["enabled"] = True
+            _preference = resolve_trigger_anchored_preferred_strikes(
+                side=direction,
+                trigger_price=_safe_plan_attr(plan, "trigger_price", None),
+                underlying_fallback=underlying_price,
+                candidate_strikes=[opt.get("strike") for opt in chain],
+            )
+            _preferred_strike_audit["anchor_source"] = _preference.anchor_source
+            _preferred_strike_audit["anchor_price"] = _preference.anchor_price
+            _preferred_strike_audit["primary_strike"] = _preference.primary_strike
+            _preferred_strike_audit["adjacent_otm_strike"] = _preference.adjacent_otm_strike
+            if _preference.primary_strike is not None:
+                _preferred_primary = float(_preference.primary_strike)
+                _preferred_adjacent = (
+                    float(_preference.adjacent_otm_strike)
+                    if _preference.adjacent_otm_strike is not None
+                    else None
+                )
+                _preferred_strikes_for_quality_order = tuple(
+                    float(_s) for _s in (_preference.ordered_preferred_strikes or ())
+                )
+
         survivors  = []
         _rejections: dict = {}
         _pro_tiers:  dict = {"A": 0, "B": 0}
@@ -2542,7 +2645,75 @@ class APContractSelectionEngine:
             target_delta=float(self.target_delta or 0.0),
             today=today,
             request_context=request_context,
+            preferred_strikes=_preferred_strikes_for_quality_order,
         )
+        if _preferred_strikes_for_quality_order:
+            def _candidate_order_identity(_opt: dict, _index: int) -> str:
+                _symbol = "".join(
+                    str(_opt.get("symbol") or _opt.get("contract") or "")
+                    .upper()
+                    .split()
+                )
+                if _symbol:
+                    return _symbol
+                return "|".join(
+                    (
+                        str(_opt.get("expiration_date") or _opt.get("expiration") or ""),
+                        str(_opt.get("option_type") or _opt.get("type") or ""),
+                        str(_opt.get("strike") or ""),
+                        str(_index),
+                    )
+                )
+
+            _original_ids = [
+                _candidate_order_identity(_opt, _index)
+                for _index, _opt in enumerate(chain)
+            ]
+            _final_ids = [
+                _candidate_order_identity(_opt, _index)
+                for _index, _opt in enumerate(_quality_chain)
+            ]
+            _ordered_audit: list[dict] = []
+            for _opt in _quality_chain:
+                _s = _safe_float(_opt.get("strike"))
+                if _s is None or _s <= 0:
+                    _tier, _label = (
+                        STRIKE_POLICY_TIER_NONMATCH,
+                        STRIKE_POLICY_LABEL_NONMATCH,
+                    )
+                elif _preferred_primary is not None and abs(_s - _preferred_primary) < 1e-9:
+                    _tier, _label = (STRIKE_POLICY_TIER_ATM, STRIKE_POLICY_LABEL_ATM)
+                elif (
+                    _preferred_adjacent is not None
+                    and abs(_s - _preferred_adjacent) < 1e-9
+                ):
+                    _tier, _label = (
+                        STRIKE_POLICY_TIER_ONE_STEP_OTM,
+                        STRIKE_POLICY_LABEL_ONE_STEP_OTM,
+                    )
+                else:
+                    _tier, _label = (
+                        STRIKE_POLICY_TIER_NONMATCH,
+                        STRIKE_POLICY_LABEL_NONMATCH,
+                    )
+                _ordered_audit.append({
+                    "symbol": _opt.get("symbol"),
+                    "strike": _safe_float(_opt.get("strike")),
+                    "strike_policy_tier": _tier,
+                    "strike_policy_label": _label,
+                })
+            _preferred_strike_audit["reordered"] = _original_ids != _final_ids
+            _preferred_strike_audit["ordered_candidates"] = _ordered_audit
+        try:
+            if request_context is not None and isinstance(
+                request_context.diagnostics_sink, dict
+            ):
+                request_context.diagnostics_sink["preferred_strike_ordering"] = dict(
+                    _preferred_strike_audit
+                )
+                _ctx_refresh_diagnostics(request_context)
+        except Exception:
+            pass
         for opt in _quality_chain:
             if _PRO_QUALITY_ENABLED:
                 exp_str = opt.get("expiration_date", "")
@@ -3020,6 +3191,89 @@ class APContractSelectionEngine:
                     request_context.playbook_audit["preferred_strikes"] = list(_playbook_candidate_ctx.get("preferred_strikes") or [])
                     request_context.playbook_audit["strike_band_low"] = _playbook_candidate_ctx.get("strike_band_low")
                     request_context.playbook_audit["strike_band_high"] = _playbook_candidate_ctx.get("strike_band_high")
+            except Exception:
+                _playbook_candidate_ctx = None
+        elif (
+            _preferred_strike_audit.get("enabled")
+            and _preferred_strike_audit.get("primary_strike") is not None
+        ):
+            # PR #396 amendment: on the direct (non-ladder) path, if the
+            # playbook flag is on and the shared trigger-anchored authority
+            # produced a preferred strike, build a compatible candidate context
+            # from the surviving contracts through that same authority. This
+            # avoids freezing tiers from the unfiltered chain: if the original
+            # primary and adjacent contracts fail hard gates, the nearest valid
+            # survivor becomes the recomputed primary just as it does on the
+            # ladder path.
+            try:
+                _survivor_preference = resolve_trigger_anchored_preferred_strikes(
+                    side=direction,
+                    trigger_price=_safe_plan_attr(plan, "trigger_price", None),
+                    underlying_fallback=underlying_price,
+                    candidate_strikes=[opt.get("strike") for opt in survivors],
+                )
+                _primary_strike = _survivor_preference.primary_strike
+                if _primary_strike is None:
+                    raise ValueError("no valid survivor strike preference")
+                _primary_strike = float(_primary_strike)
+                _adjacent_strike = _survivor_preference.adjacent_otm_strike
+                _adjacent_strike = (
+                    float(_adjacent_strike) if _adjacent_strike is not None else None
+                )
+                _preferred_list = [_primary_strike]
+                if _adjacent_strike is not None:
+                    _preferred_list.append(_adjacent_strike)
+                _per_symbol: dict[str, dict] = {}
+                for _s_opt in survivors:
+                    _sym = str(_s_opt.get("symbol") or "")
+                    _s_strike = _safe_float(_s_opt.get("strike"))
+                    if _s_strike is None:
+                        _per_symbol[_sym] = {
+                            "strike_policy_tier": STRIKE_POLICY_TIER_NONMATCH,
+                            "strike_policy_label": STRIKE_POLICY_LABEL_NONMATCH,
+                            "strike_policy_match": False,
+                            "distance_to_preferred": None,
+                        }
+                        continue
+                    if abs(_s_strike - _primary_strike) < 1e-9:
+                        _tier, _label = (
+                            STRIKE_POLICY_TIER_ATM, STRIKE_POLICY_LABEL_ATM,
+                        )
+                    elif (
+                        _adjacent_strike is not None
+                        and abs(_s_strike - _adjacent_strike) < 1e-9
+                    ):
+                        _tier, _label = (
+                            STRIKE_POLICY_TIER_ONE_STEP_OTM,
+                            STRIKE_POLICY_LABEL_ONE_STEP_OTM,
+                        )
+                    else:
+                        _tier, _label = (
+                            STRIKE_POLICY_TIER_NONMATCH,
+                            STRIKE_POLICY_LABEL_NONMATCH,
+                        )
+                    _per_symbol[_sym] = {
+                        "strike_policy_tier": _tier,
+                        "strike_policy_label": _label,
+                        "strike_policy_match": _tier != STRIKE_POLICY_TIER_NONMATCH,
+                        "distance_to_preferred": (
+                            0.0
+                            if _tier != STRIKE_POLICY_TIER_NONMATCH
+                            else min(abs(_s_strike - _p) for _p in _preferred_list)
+                        ),
+                    }
+                _playbook_candidate_ctx = {
+                    "atm_strike": _primary_strike,
+                    "one_step_otm_strike": _adjacent_strike,
+                    "preferred_strikes": _preferred_list,
+                    "strike_band_low": min(_preferred_list),
+                    "strike_band_high": max(_preferred_list),
+                    "per_symbol": _per_symbol,
+                    "anchor_source": _survivor_preference.anchor_source,
+                    "anchor_price": _survivor_preference.anchor_price,
+                }
+                if request_context is not None:
+                    request_context.playbook_candidate_context = dict(_playbook_candidate_ctx)
             except Exception:
                 _playbook_candidate_ctx = None
         scored = []
