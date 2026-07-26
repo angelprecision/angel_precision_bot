@@ -163,7 +163,19 @@ def test_execution_core_accepts_approved_plan_mode_alias(monkeypatch, mode_value
     core.mode = "PAPER"
     core.client_id = "client@example.com"
     core.client_email = "client@example.com"
-    core.broker = SimpleNamespace(cfg=SimpleNamespace(base_url="https://api.tradier.com"))
+    # PR #391: the final market-validity gate now fetches a fresh underlying
+    # quote in PAPER as in LIVE. Give the broker a get_quote that returns a
+    # quote consistent with the plan (CALL, trigger=600.5, stop=595, target=610)
+    # so the gate passes and the mode-alias seam under test is exercised.
+    core.broker = SimpleNamespace(
+        cfg=SimpleNamespace(base_url="https://api.tradier.com"),
+        get_quote=lambda _sym: {
+            "bid": 600.60,
+            "ask": 600.70,
+            "quote_age_ms": 100,
+            "source": "live_broker",
+        },
+    )
     core.store = MagicMock()
     core.order_state_machine = MagicMock()
     core.order_state_machine.client_id = "client@example.com"
