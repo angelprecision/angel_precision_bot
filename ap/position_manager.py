@@ -2090,6 +2090,47 @@ class APPositionManager:
                 if not pos:
                     return False, "position_not_found"
 
+                # ── Idempotency guard under the FOR UPDATE row lock ───────────
+                # If the position is already terminal or has no remaining
+                # quantity, a previous finalization completed. Return success
+                # so overlapping callers (two health-loop iterations or the
+                # row-at-a-time reconciler racing this helper) both see True
+                # without rewriting P&L or recalculating realized returns.
+                # This is the ONLY correct serialization point — a detached
+                # pre-read does not hold the lock and cannot prevent a race.
+                _TERMINAL_FOR_CLOSE = frozenset(
+                    {"CLOSED", "EXPIRED", "CANCELLED", "CANCELED", "ERROR"}
+                )
+                _idm_status = str(pos.get("status") or "").upper().strip()
+                _idm_remaining_raw = pos.get("quantity_remaining")
+                _idm_qty = int(pos.get("qty") or 0)
+                _idm_remaining = (
+                    _idm_qty if _idm_remaining_raw is None
+                    else int(_idm_remaining_raw or 0)
+                )
+                if _idm_status in _TERMINAL_FOR_CLOSE or _idm_remaining <= 0:
+                    log.info(
+                        "[%s] close_position_from_exit_fill idempotent | "
+                        "pos=%s status=%s remaining=%s",
+                        self.client_id, position_id, _idm_status, _idm_remaining,
+                    )
+                    return True, {
+                        "status": _idm_status,
+                        "exit_price": float(pos.get("exit_price") or 0),
+                        "filled_qty": 0,
+                        "remaining": 0,
+                        "realized_pnl": float(pos.get("realized_pnl") or 0),
+                        "realized_pnl_pct": float(pos.get("realized_pnl_pct") or 0),
+                        "contract": str(pos.get("contract") or ""),
+                        "underlying": str(
+                            pos.get("underlying") or pos.get("ticker") or ""
+                        ),
+                        "side": str(pos.get("side") or ""),
+                        "opened_at": str(pos.get("entry_ts") or now_utc_iso()),
+                        "idempotent": True,
+                    }
+                # ── End idempotency guard ─────────────────────────────────────
+
                 avg_fill = float(pos.get("avg_fill") or pos.get("entry_price") or 0)
                 qty      = int(pos.get("qty") or 0)
                 current_remaining = pos.get("quantity_remaining")
@@ -2100,7 +2141,9 @@ class APPositionManager:
                 if avg_fill <= 0 or qty <= 0:
                     return False, "invalid_position_cost_basis"
 
-                close_qty    = min(fill_qty, current_remaining if current_remaining > 0 else fill_qty)
+                # current_remaining is guaranteed > 0 here (idempotency guard
+                # handled the zero-remaining case above).
+                close_qty    = min(fill_qty, current_remaining)
                 new_remaining = max(current_remaining - close_qty, 0)
 
                 realized_pnl     = round((exit_px - avg_fill) * close_qty * 100, 2)
