@@ -792,6 +792,82 @@ def load_manual_close_state(
     return run_with_retry(_read)
 
 
+def load_terminal_recovery_candidates(
+    client_id: str,
+    execution_mode: str,
+) -> list[dict]:
+    """PR #386 fix 2: candidates for proof-only restart recovery.
+
+    Returns terminal positions with zero remaining quantity that also carry
+    at least one externally-adopted EXIT row in the durable ledger.
+    Scoped to the exact execution mode of the current runner.
+
+    Handed to APPositionManager.repair_terminal_proof_from_persisted, which
+    performs the actual FOR UPDATE re-read, invariant checks, and canonical
+    proof repair. This function only surfaces the candidate set.
+    """
+    from ap.db import conn, run_with_retry
+    norm_mode = str(execution_mode or "").strip().lower()
+
+    def _read():
+        with conn() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    client_id,
+                    contract,
+                    execution_mode,
+                    status,
+                    quantity_remaining,
+                    qty,
+                    exit_price,
+                    realized_pnl,
+                    realized_pnl_pct,
+                    entry_ts,
+                    exit_ts,
+                    local_order_id,
+                    broker_order_id,
+                    side,
+                    direction,
+                    exit_reason,
+                    close_source
+                FROM positions p
+                WHERE p.client_id = %s
+                  AND LOWER(COALESCE(p.execution_mode, '')) = %s
+                  AND UPPER(COALESCE(p.status, '')) = ANY(%s)
+                  AND COALESCE(p.quantity_remaining, 0) <= 0
+                  AND EXISTS (
+                      SELECT 1 FROM orders o
+                      WHERE o.client_id = p.client_id
+                        AND o.position_id = p.id
+                        AND LOWER(COALESCE(o.execution_mode, '')) = %s
+                        AND UPPER(COALESCE(o.kind, '')) = 'EXIT'
+                        AND UPPER(COALESCE(o.status, '')) = ANY(%s)
+                        AND o.local_order_id LIKE %s
+                  )
+                """,
+                (
+                    client_id,
+                    norm_mode,
+                    list(TERMINAL_POSITION_STATUSES),
+                    norm_mode,
+                    list(DURABLE_EXIT_FILLED_STATUSES),
+                    f"{EXTERNAL_LOCAL_ID_PREFIX}%",
+                ),
+            )
+            return [dict(row) for row in (cursor.fetchall() or [])]
+
+    try:
+        return run_with_retry(_read) or []
+    except Exception as exc:
+        log.error(
+            "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_LOAD_FAILED mode=%s err=%s",
+            client_id, norm_mode, exc,
+        )
+        return []
+
+
 def _external_local_order_id(client_id: str, broker_order_id: str) -> str:
     return f"{EXTERNAL_LOCAL_ID_PREFIX}{client_id}:{broker_order_id}"
 
@@ -1148,6 +1224,64 @@ def detect_manual_closes(self) -> None:
             exc,
         )
         return
+
+    pm_for_recovery = getattr(self, "position_manager", None)
+    recovery_method = getattr(pm_for_recovery, "repair_terminal_proof_from_persisted", None)
+
+    # ── PASS 0: proof-only recovery for terminal-without-proof rows ────────
+    # A crash after position commit but before proof persist leaves a
+    # terminal row (qty_remaining <= 0) with durable EXIT evidence but no
+    # canonical proof. This pass repairs proof through the canonical
+    # function using ONLY persisted position economics; it never calls the
+    # broker, never reopens the position, and evicts the exit engine only
+    # after proof binding is proven.
+    if callable(recovery_method):
+        try:
+            recovery_candidates = load_terminal_recovery_candidates(
+                client_id, runner_mode,
+            )
+        except Exception as exc:
+            recovery_candidates = []
+            log.error(
+                "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_LOAD_ERROR mode=%s err=%s",
+                client_id, runner_mode, exc,
+            )
+        for candidate in recovery_candidates:
+            candidate_id = str(candidate.get("id") or "").strip()
+            candidate_mode = str(candidate.get("execution_mode") or "").strip().lower()
+            if not candidate_id or candidate_mode != runner_mode:
+                continue
+            try:
+                ok, reason = recovery_method(candidate_id)
+            except Exception as exc:
+                log.error(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_ERROR pos=%s err=%s",
+                    client_id, candidate_id, exc,
+                )
+                continue
+            if not ok:
+                log.warning(
+                    "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_DEFERRED pos=%s reason=%s "
+                    "— proof not yet bound; next scan will retry",
+                    client_id, candidate_id, reason,
+                )
+                continue
+            log.info(
+                "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_BOUND pos=%s reason=%s",
+                client_id, candidate_id, reason,
+            )
+            _core = getattr(self, "core", None)
+            _exit_eng = getattr(_core, "exit_eng", None) if _core is not None else None
+            _mark = getattr(_exit_eng, "mark_position_closed", None)
+            if callable(_mark):
+                try:
+                    _mark(candidate_id)
+                except Exception as exc:
+                    log.warning(
+                        "[%s] MANUAL_CLOSE_TERMINAL_RECOVERY_EVICT_FAILED "
+                        "pos=%s err=%s",
+                        client_id, candidate_id, exc,
+                    )
 
     if not active_positions:
         return
