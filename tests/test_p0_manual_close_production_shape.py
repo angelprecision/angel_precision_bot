@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test")
 
 import ap.db as db_mod
-from client_runner import manual_close_reconciliation as manual_mod
+from ap import manual_close_reconciliation as manual_mod
 
 
 CLIENT = "jasoncosby1@gmail.com"
@@ -15,8 +15,8 @@ CONTRACT = "F260731C00014000"
 
 class _Cursor:
     def __init__(self):
-        self.rows = []
-        self._fetchall = []
+        self.rows: list[dict] = []
+        self._fetchall: list[dict] = []
         self._fetchone = None
 
     def __enter__(self):
