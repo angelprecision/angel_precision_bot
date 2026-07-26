@@ -199,14 +199,16 @@ class TestMarketValidityGate:
         assert r.passed is False
         assert r.reason_code == GateOutcome.CURRENT_PRICE_ZERO
 
-    def test_07c_paper_missing_quote_does_not_block(self):
-        """PAPER logs the failure but passes — the sandbox flow can continue
-        for testing purposes."""
+    def test_07c_paper_missing_quote_blocks_pr391(self):
+        """PR #391: PAPER must fail closed identically to LIVE on missing
+        underlying truth. The reason is a HOLD_MARKET_TRUTH_UNAVAILABLE
+        classification — bounded retry, not a broker POST."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=105.0,
             current_bid=None, current_ask=None, execution_mode="paper",
         )
-        assert r.passed is True   # paper does not block on missing quote
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_MISSING
 
     def test_08_blocks_stale_quote_live(self):
         r = check_market_validity_gate(

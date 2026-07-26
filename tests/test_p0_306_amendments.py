@@ -937,9 +937,17 @@ class TestQuoteAgeMsEnforcement:
                 "age=0 must not trigger STALE — synchronous fetch IS fresh"
             )
 
-    def test_paper_gate_passes_with_none_age(self):
-        """PAPER gate must not block on unknown quote age — paper is fail-open."""
-        from ap.live_submit_gates import check_market_validity_gate
+    def test_paper_gate_fails_closed_with_none_age_pr391(self):
+        """PR #391: PAPER must fail closed on unknown quote age (no provider
+        timestamp, no synchronous_submit_fetch provenance). The reason maps
+        to HOLD_MARKET_TRUTH_UNAVAILABLE via classify_market_truth — a
+        bounded retry rather than a broker POST."""
+        from ap.live_submit_gates import (
+            check_market_validity_gate,
+            classify_market_truth,
+            MarketTruthAuthority,
+            GateOutcome,
+        )
         result = check_market_validity_gate(
             side="CALL",
             trigger_price=465.0,
@@ -951,8 +959,12 @@ class TestQuoteAgeMsEnforcement:
             quote_source="sandbox",
             execution_mode="paper",
         )
-        # Paper: None age should not block
-        if not result.passed:
-            assert "STALE" not in result.reason_code, (
-                "PAPER must not block on unknown quote age"
-            )
+        assert result.passed is False
+        # Direction / geometry checks may fire before freshness depending on
+        # how far the test's synthetic option-priced quote falls from the
+        # underlying trigger. What PR #391 requires is only that PAPER does
+        # not silently PASS — the exact code order between geometry and
+        # freshness is not part of the contract.
+        assert classify_market_truth(result.reason_code) != (
+            MarketTruthAuthority.SUBMIT_VALID
+        )

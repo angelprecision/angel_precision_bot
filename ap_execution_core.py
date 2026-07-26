@@ -6749,7 +6749,9 @@ class APExecutionCore:
                 check_identity_gate,
                 check_market_validity_gate,
                 check_trigger_age_gate,
+                classify_market_truth,
                 GateOutcome,
+                MarketTruthAuthority,
             )
 
             # Amendment 4 (hardened): collect all 6 client_id sources and verify
@@ -7044,25 +7046,140 @@ class APExecutionCore:
             )
             _final_market_validity_audit = _mv_res.audit
             if not _mv_res.passed:
+                # ── PR #391: authority-class dispatch ──────────────────────
+                # PAPER and LIVE now fail identically on ticker-specific
+                # truth. Route to the correct durable decision:
+                #   REARM_DIRECTION_REVERSAL      → zero POST, watcher regains ownership
+                #   HOLD_MARKET_TRUTH_UNAVAILABLE → zero POST, bounded retry
+                #   TERMINAL_SETUP_COMPLETE       → zero POST, terminalize
+                _authority = classify_market_truth(_mv_res.reason_code)
+                _plan_side = str(getattr(approved_plan, "side", "") or "").upper()
+                _plan_signal_id = str(getattr(approved_plan, "signal_id", "") or "")
+
+                _durable_truth_patch = {
+                    "final_market_truth_status":      _authority,
+                    "final_market_truth_reason_code": _mv_res.reason_code,
+                    "final_market_truth_checked_at":  _mv_res.audit.get("checked_at"),
+                    "underlying_price":               _mv_res.audit.get("current_mid"),
+                    "underlying_provider_timestamp":  _mv_res.audit.get("quote_fetched_at"),
+                    "underlying_received_at":        _mv_res.audit.get("checked_at"),
+                    "underlying_source":              _mv_res.audit.get("quote_source"),
+                    "trigger_price":                  _mv_res.audit.get("trigger_price"),
+                    "stop_underlying":                _mv_res.audit.get("stop_price"),
+                    "target_underlying":              _mv_res.audit.get("target_price"),
+                    "client_id":                      _gate_client_id,
+                    "execution_mode":                 _gate_exec_mode,
+                    "signal_id":                      _plan_signal_id,
+                    "local_order_id":                 str(queue_local_order_id or ""),
+                }
+
                 log.critical(
-                    "LIVE_SUBMIT_GATE_BLOCKED gate=market_validity reason=%s detail=%s "
-                    "order_id=%s client_id=%s symbol=%s",
-                    _mv_res.reason_code, _mv_res.detail,
-                    str(queue_local_order_id or ""), _gate_client_id, ticker,
+                    "SUBMIT_MARKET_TRUTH_BLOCKED authority=%s reason=%s detail=%s "
+                    "order_id=%s client_id=%s execution_mode=%s symbol=%s side=%s",
+                    _authority, _mv_res.reason_code, _mv_res.detail,
+                    str(queue_local_order_id or ""), _gate_client_id,
+                    _gate_exec_mode, ticker, _plan_side,
                 )
+
+                if _authority == MarketTruthAuthority.REARM_DIRECTION_REVERSAL:
+                    _rearmed = False
+                    try:
+                        _rearmed = bool(
+                            self.order_state_machine.rearm_entry_for_direction_reversal(
+                                str(queue_local_order_id or ""),
+                                reason_code=_mv_res.reason_code,
+                                gate_audit=_mv_res.audit,
+                            )
+                        )
+                    except Exception as _rearm_exc:
+                        log.warning(
+                            "[%s] REARM_DIRECTION_REVERSAL failed order=%s error=%s — "
+                            "falling back to terminalize",
+                            ticker, str(queue_local_order_id or ""), _rearm_exc,
+                        )
+                    try:
+                        self.order_state_machine.update_order_meta(
+                            str(queue_local_order_id or ""),
+                            {
+                                "live_submit_gate": {
+                                    "failed_gate": "market_validity",
+                                    **_mv_res.audit,
+                                    "authority": _authority,
+                                },
+                                "final_market_validity": _mv_res.audit,
+                                **_durable_truth_patch,
+                            },
+                        )
+                    except Exception as _mv_meta_exc:
+                        log.warning(
+                            "[%s] SUBMIT_MARKET_TRUTH_AUDIT_WRITE_FAILED gate=market_validity "
+                            "authority=%s order_id=%s error=%s — no POST attempted",
+                            ticker, _authority, str(queue_local_order_id or ""), _mv_meta_exc,
+                        )
+                    if _rearmed:
+                        # Zero broker POST. Setup returned to watcher on same identity.
+                        return
+                    # Rearm not eligible (row advanced) — fall through to terminalize.
+                    _terminalize_breach_failure(f"live_submit_gate:{_mv_res.reason_code}")
+                    return
+
+                if _authority == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE:
+                    try:
+                        self.order_state_machine.hold_entry_for_market_truth_unavailable(
+                            str(queue_local_order_id or ""),
+                            reason_code=_mv_res.reason_code,
+                            gate_audit=_mv_res.audit,
+                        )
+                    except Exception as _hold_exc:
+                        log.warning(
+                            "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE persist failed order=%s error=%s",
+                            ticker, str(queue_local_order_id or ""), _hold_exc,
+                        )
+                    try:
+                        self.order_state_machine.update_order_meta(
+                            str(queue_local_order_id or ""),
+                            {
+                                "live_submit_gate": {
+                                    "failed_gate": "market_validity",
+                                    **_mv_res.audit,
+                                    "authority": _authority,
+                                },
+                                "final_market_validity": _mv_res.audit,
+                                **_durable_truth_patch,
+                            },
+                        )
+                    except Exception as _mv_meta_exc:
+                        log.warning(
+                            "[%s] SUBMIT_MARKET_TRUTH_AUDIT_WRITE_FAILED gate=market_validity "
+                            "authority=%s order_id=%s error=%s — no POST attempted",
+                            ticker, _authority, str(queue_local_order_id or ""), _mv_meta_exc,
+                        )
+                    # Zero broker POST. Existing deferred retry lifecycle owns the retry.
+                    return
+
+                # TERMINAL_SETUP_COMPLETE (or unknown → treat as terminal on the
+                # gate side since HOLD is already the unknown-code fallback in
+                # classify_market_truth; if we reach here it is genuinely terminal).
                 try:
                     self.order_state_machine.update_order_meta(
                         str(queue_local_order_id or ""),
                         {
-                            "live_submit_gate": {"failed_gate": "market_validity", **_mv_res.audit},
+                            "live_submit_gate": {
+                                "failed_gate": "market_validity",
+                                **_mv_res.audit,
+                                "authority": _authority,
+                            },
                             "final_market_validity": _mv_res.audit,
+                            **_durable_truth_patch,
+                            "terminal": True,
+                            "retryable": False,
                         },
                     )
                 except Exception as _mv_meta_exc:
                     log.warning(
-                        "[%s] LIVE_SUBMIT_GATE_AUDIT_WRITE_FAILED gate=market_validity "
-                        "order_id=%s reason=%s error=%s — submit still blocked",
-                        ticker, str(queue_local_order_id or ""), _mv_res.reason_code, _mv_meta_exc,
+                        "[%s] SUBMIT_MARKET_TRUTH_AUDIT_WRITE_FAILED gate=market_validity "
+                        "authority=%s order_id=%s error=%s — submit still blocked",
+                        ticker, _authority, str(queue_local_order_id or ""), _mv_meta_exc,
                     )
                 _terminalize_breach_failure(f"live_submit_gate:{_mv_res.reason_code}")
                 return
@@ -7177,6 +7294,24 @@ class APExecutionCore:
                         "trigger_age_gate": _ta_res.audit,
                     },
                     "final_market_validity": _mv_res.audit,
+                    # PR #391 durable truth stamp
+                    "final_market_truth_status":      MarketTruthAuthority.SUBMIT_VALID,
+                    "final_market_truth_reason_code": GateOutcome.PASS,
+                    "final_market_truth_checked_at":  _mv_res.audit.get("checked_at"),
+                    "underlying_price":               _mv_res.audit.get("current_mid"),
+                    "underlying_provider_timestamp":  _mv_res.audit.get("quote_fetched_at"),
+                    "underlying_received_at":        _mv_res.audit.get("checked_at"),
+                    "underlying_source":              _mv_res.audit.get("quote_source"),
+                    "trigger_price":                  _mv_res.audit.get("trigger_price"),
+                    "stop_underlying":                _mv_res.audit.get("stop_price"),
+                    "target_underlying":              _mv_res.audit.get("target_price"),
+                    "client_id":                      _gate_client_id,
+                    "execution_mode":                 _gate_exec_mode,
+                    "signal_id":                      str(getattr(approved_plan, "signal_id", "") or ""),
+                    "local_order_id":                 str(queue_local_order_id or ""),
+                    "watcher_rearm_required":        False,
+                    "retryable":                      False,
+                    "terminal":                       False,
                     },
                 )
             except Exception as _ap_meta_exc:

@@ -1910,6 +1910,16 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     core.paper = True
     core.order_state_machine = osm
     core.broker = MagicMock()
+    # PR #391: the final market-validity gate now fetches a fresh underlying
+    # quote in PAPER as in LIVE. Provide a quote consistent with the CALL
+    # setup (trigger=130.0, stop=128.0, target=133.0) so the gate passes and
+    # the retry-claim seam is what's under test, not the market-truth gate.
+    core.broker.get_quote.return_value = {
+        "bid": 130.05,
+        "ask": 130.10,
+        "quote_age_ms": 100,
+        "source": "live_broker",
+    }
     core.contract_selector = selector
     # Signal store (telemetry only — stubs prevent side effects)
     core.store = MagicMock()

@@ -368,22 +368,25 @@ class TestTriggerLaneMarketValidity:
         assert r.passed is False
         assert r.reason_code == GateOutcome.CURRENT_PRICE_STALE
 
-    def test_paper_missing_quote_passes(self):
-        """Paper does not fail closed on missing quote — sandbox testing."""
+    def test_paper_missing_quote_fails_closed_pr391(self):
+        """PR #391: PAPER fails closed identically to LIVE on missing quote."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=None, current_ask=None,
             execution_mode="paper",
         )
-        assert r.passed is True
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_MISSING
 
-    def test_paper_stale_quote_passes(self):
+    def test_paper_stale_quote_fails_closed_pr391(self):
+        """PR #391: PAPER fails closed identically to LIVE on stale quote."""
         r = check_market_validity_gate(
             side="CALL", trigger_price=100.0, stop_price=95.0, target_price=110.0,
             current_bid=101.0, current_ask=101.5, quote_age_ms=30000,
             execution_mode="paper",
         )
-        assert r.passed is True
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_STALE
 
     def test_valid_call_setup_passes_all_checks(self):
         """Clean CALL: ask above trigger, mid below target, above stop, good opportunity."""

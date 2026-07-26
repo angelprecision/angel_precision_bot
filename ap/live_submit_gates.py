@@ -113,6 +113,68 @@ class GateOutcome:
     PASS                                   = "PASS"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 — Authority classes for the final submit decision.
+#
+# check_market_validity_gate returns a low-level GateResult (passed + reason
+# code). The submit caller must map that to one of exactly four durable
+# decisions so PAPER and LIVE behave identically on ticker-specific truth:
+#
+#   SUBMIT_VALID                     — proceed to broker POST
+#   REARM_DIRECTION_REVERSAL         — zero POST, return setup to watcher
+#   TERMINAL_SETUP_COMPLETE          — zero POST, terminalize (stop/target/geometry)
+#   HOLD_MARKET_TRUTH_UNAVAILABLE    — zero POST, bounded retry via deferred lifecycle
+#
+# Direction reversal is not terminal failure. Missing/stale truth is not
+# terminal failure. Only stop-broken, target-complete, or invalid geometry
+# terminalize the ENTRY lifecycle.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MarketTruthAuthority:
+    SUBMIT_VALID                  = "SUBMIT_VALID"
+    REARM_DIRECTION_REVERSAL      = "REARM_DIRECTION_REVERSAL"
+    TERMINAL_SETUP_COMPLETE       = "TERMINAL_SETUP_COMPLETE"
+    HOLD_MARKET_TRUTH_UNAVAILABLE = "HOLD_MARKET_TRUTH_UNAVAILABLE"
+
+
+_REARM_REASONS: frozenset[str] = frozenset({
+    GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
+    GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+})
+
+_TERMINAL_REASONS: frozenset[str] = frozenset({
+    GateOutcome.CALL_STOP_ALREADY_BROKEN,
+    GateOutcome.PUT_STOP_ALREADY_BROKEN,
+    GateOutcome.TARGET_ALREADY_INVALID,
+    GateOutcome.REMAINING_OPPORTUNITY_TOO_SMALL,
+})
+
+_HOLD_REASONS: frozenset[str] = frozenset({
+    GateOutcome.CURRENT_PRICE_AGE_UNKNOWN,
+    GateOutcome.CURRENT_PRICE_FETCH_FAILED,
+    GateOutcome.CURRENT_PRICE_INVALID,
+    GateOutcome.CURRENT_PRICE_STALE,
+    GateOutcome.CURRENT_PRICE_MISSING,
+    GateOutcome.CURRENT_PRICE_ZERO,
+})
+
+
+def classify_market_truth(reason_code: Optional[str]) -> str:
+    """Map a market-validity gate reason to a durable submit authority class."""
+    code = str(reason_code or "").strip()
+    if code == GateOutcome.PASS or not code:
+        return MarketTruthAuthority.SUBMIT_VALID
+    if code in _REARM_REASONS:
+        return MarketTruthAuthority.REARM_DIRECTION_REVERSAL
+    if code in _TERMINAL_REASONS:
+        return MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+    if code in _HOLD_REASONS:
+        return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+    # Unknown → fail closed as HOLD; the submit caller will retry rather than
+    # terminalize an unrecognized reason. Never PASS.
+    return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+
+
 @dataclass
 class GateResult:
     """Uniform return type for every gate.
@@ -519,16 +581,19 @@ def check_market_validity_gate(
     }
 
     def _fail(reason_code: str, detail: str) -> GateResult:
-        # In paper mode we log the fail but still return passed=True so the
-        # sandbox flow can be exercised end-to-end. LIVE always blocks.
-        blocked = _live
-        _audit_out = {**audit, "passed": not blocked, "reason_code": reason_code}
-        if blocked:
-            _audit_out["blocked"] = True
+        # PR #391: the market-validity gate must fail closed identically for
+        # PAPER and LIVE. A reversed setup, broken stop, completed target, or
+        # missing/stale underlying quote is a ticker-specific truth failure
+        # that is the same fact in both modes; the ONLY differences between
+        # PAPER and LIVE are the execution endpoint, pricing model, and
+        # confirmation policy. The caller (submit path) is responsible for
+        # dispatching the reason to the correct authority class — REARM,
+        # TERMINAL, or HOLD — via classify_market_truth().
+        _audit_out = {**audit, "passed": False, "reason_code": reason_code, "blocked": True}
         return GateResult(
-            passed=not blocked,
-            reason_code=reason_code if blocked else GateOutcome.PASS,
-            detail=("BLOCKED " if blocked else "warn ") + detail,
+            passed=False,
+            reason_code=reason_code,
+            detail="BLOCKED " + detail,
             audit=_audit_out,
         )
 
@@ -560,11 +625,11 @@ def check_market_validity_gate(
             "invalid synchronous quote fetch timestamp",
         )
 
-    # Rule: quote freshness
-    if effective_age_ms is None and _live:
+    # Rule: quote freshness — PR #391: PAPER and LIVE fail identically.
+    if effective_age_ms is None:
         return _fail(
             GateOutcome.CURRENT_PRICE_AGE_UNKNOWN,
-            "quote age unknown — LIVE requires provider age or explicit "
+            "quote age unknown — requires provider age or explicit "
             "synchronous_submit_fetch provenance with a valid UTC fetch timestamp",
         )
     if effective_age_ms is not None and effective_age_ms < 0:

@@ -186,14 +186,17 @@ def test_live_quote_fetch_failure_is_distinct():
     assert result.audit["quote_fetch_error"] == "ReadTimeout"
 
 
-def test_paper_missing_age_behavior_remains_unchanged():
+def test_paper_missing_age_fails_closed_pr391():
+    """PR #391: PAPER fails closed identically to LIVE when quote freshness
+    cannot be certified (no provider age, no sync fetch provenance)."""
     result = _fresh_sync(
         execution_mode="paper",
         quote_fetched_at=None,
         quote_provenance=None,
     )
 
-    assert result.passed is True
+    assert result.passed is False
+    assert result.reason_code == GateOutcome.CURRENT_PRICE_AGE_UNKNOWN
 
 
 @pytest.mark.parametrize(

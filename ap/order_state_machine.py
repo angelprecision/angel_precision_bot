@@ -1707,6 +1707,163 @@ class APOrderStateMachine:
             )
             return False
 
+    def rearm_entry_for_direction_reversal(
+        self,
+        local_order_id: str,
+        *,
+        reason_code: str,
+        gate_audit: Optional[dict] = None,
+    ) -> bool:
+        """PR #391 — REARM_DIRECTION_REVERSAL.
+
+        The final market-validity gate has classified the current setup as
+        direction-reversed (CALL below trigger or PUT above trigger). The
+        entry must NOT be terminalized. Zero broker POSTs occur.
+
+        Atomically clears the SUBMITTING/BROKER_READY submission ownership so
+        the watcher regains authority on the same setup identity, and stamps
+        durable rearm metadata so restart and audit paths can see the state.
+
+        Preserves: local_order_id, signal_id, client_id, execution_mode,
+        rank, setup generation, original validity deadline, contract intent.
+
+        Refuses when the row is no longer eligible (broker_order_id present,
+        or status advanced past PENDING_TRIGGER/CREATED). Returns False in
+        that case; caller then treats the block as normal-terminal only if
+        no rearm was possible.
+        """
+        import json as _json_local
+        _rc = str(reason_code or "").strip()
+        _audit = dict(gate_audit or {})
+        _now = datetime.now(timezone.utc).isoformat()
+
+        # Fields stamped for PR #391 durability contract.
+        meta_patch: dict = {
+            # Structured decision — never overwrite prior selector/scanner audit.
+            "final_market_truth_status":       "REARM_DIRECTION_REVERSAL",
+            "final_market_truth_reason_code":  _rc or "REARM_DIRECTION_REVERSAL",
+            "final_market_truth_checked_at":   _now,
+            "final_market_truth_gate_audit":   _audit,
+            "watcher_rearm_required":          True,
+            "retryable":                       True,
+            "terminal":                        False,
+            # Clear submission ownership so the watcher can regain authority.
+            "lifecycle_state":                 "PENDING_TRIGGER",
+            "submit_intent_owner":             None,
+            "broker_ready_owner":              None,
+            "submit_started_at":               None,
+        }
+        try:
+            _patch_json = _json_local.dumps(meta_patch, default=str)
+        except Exception as exc:
+            log.warning(
+                "[%s] rearm_entry_for_direction_reversal: serialize failed order=%s err=%s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id = %s "
+                    "  AND client_id      = %s "
+                    "  AND UPPER(COALESCE(kind,''))   = 'ENTRY' "
+                    "  AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
+                    "  AND COALESCE(broker_order_id,'') = '' "
+                    "  AND submitted_ts IS NULL",
+                    (_patch_json, local_order_id, self.client_id),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            ok = bool(rowcount and rowcount > 0)
+            if ok:
+                log.info(
+                    "[%s] REARM_DIRECTION_REVERSAL order=%s reason=%s — submit ownership cleared, watcher regains authority",
+                    self.client_id, local_order_id, _rc,
+                )
+            else:
+                log.warning(
+                    "[%s] rearm_entry_for_direction_reversal: no eligible row order=%s (may have advanced past PENDING_TRIGGER or already broker-owned)",
+                    self.client_id, local_order_id,
+                )
+            return ok
+        except Exception as exc:
+            log.warning(
+                "[%s] rearm_entry_for_direction_reversal failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def hold_entry_for_market_truth_unavailable(
+        self,
+        local_order_id: str,
+        *,
+        reason_code: str,
+        gate_audit: Optional[dict] = None,
+    ) -> bool:
+        """PR #391 — HOLD_MARKET_TRUTH_UNAVAILABLE.
+
+        Underlying quote is missing/stale/malformed/unknown-source. Zero
+        broker POSTs occur. No terminalization — the row remains owned by
+        the existing deferred materialization retry lifecycle, with durable
+        metadata describing the hold so restart paths can resume.
+        """
+        import json as _json_local
+        _rc = str(reason_code or "").strip()
+        _audit = dict(gate_audit or {})
+        _now = datetime.now(timezone.utc).isoformat()
+
+        meta_patch: dict = {
+            "final_market_truth_status":       "HOLD_MARKET_TRUTH_UNAVAILABLE",
+            "final_market_truth_reason_code":  _rc or "HOLD_MARKET_TRUTH_UNAVAILABLE",
+            "final_market_truth_checked_at":   _now,
+            "final_market_truth_gate_audit":   _audit,
+            "watcher_rearm_required":          False,
+            "retryable":                       True,
+            "terminal":                        False,
+        }
+        try:
+            _patch_json = _json_local.dumps(meta_patch, default=str)
+        except Exception:
+            return False
+
+        def _fn():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id = %s "
+                    "  AND client_id      = %s "
+                    "  AND UPPER(COALESCE(kind,''))   = 'ENTRY' "
+                    "  AND UPPER(COALESCE(status,'')) IN ('CREATED','PENDING_TRIGGER') "
+                    "  AND COALESCE(broker_order_id,'') = '' "
+                    "  AND submitted_ts IS NULL",
+                    (_patch_json, local_order_id, self.client_id),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            ok = bool(rowcount and rowcount > 0)
+            if ok:
+                log.info(
+                    "[%s] HOLD_MARKET_TRUTH_UNAVAILABLE order=%s reason=%s",
+                    self.client_id, local_order_id, _rc,
+                )
+            return ok
+        except Exception as exc:
+            log.warning(
+                "[%s] hold_entry_for_market_truth_unavailable failed order=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return False
+
     def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
         """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
         error_text = str(last_error or "NO_POST_ATTEMPTED")
