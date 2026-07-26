@@ -7410,8 +7410,14 @@ class APExecutionCore:
                                 **_durable_truth_patch,
                             },
                         )
-                    except Exception:
-                        pass
+                    except Exception as _rearm_diag_exc:
+                        log.warning(
+                            "[%s] REARM_DIAGNOSTIC_META_WRITE_FAILED order=%s "
+                            "authority=%s error=%s — DB CAS + memory reset "
+                            "already succeeded, audit only",
+                            ticker, str(queue_local_order_id or ""),
+                            _authority, _rearm_diag_exc,
+                        )
 
                     return {
                         "disposition":           "KEEP_WATCHER",
@@ -7441,8 +7447,14 @@ class APExecutionCore:
                                     **_durable_truth_patch,
                                 },
                             )
-                        except Exception:
-                            pass
+                        except Exception as _hold_diag_exc:
+                            log.warning(
+                                "[%s] HOLD_DIAGNOSTIC_META_WRITE_FAILED order=%s "
+                                "authority=%s error=%s — retry lifecycle already "
+                                "durable, audit only",
+                                ticker, str(queue_local_order_id or ""),
+                                _authority, _hold_diag_exc,
+                            )
                     return _result
 
                 # TERMINAL_SETUP_COMPLETE — stop broken, target complete, or
@@ -7706,8 +7718,12 @@ class APExecutionCore:
                         "terminal":                        False,
                     },
                 )
-            except Exception:
-                pass
+            except Exception as _module_diag_exc:
+                log.warning(
+                    "[%s] MODULE_ERROR_DIAGNOSTIC_META_WRITE_FAILED order=%s "
+                    "error=%s — canonical HOLD already durable, audit only",
+                    ticker, str(queue_local_order_id or ""), _module_diag_exc,
+                )
 
             return {
                 "disposition":            "RETRY_WAIT",
