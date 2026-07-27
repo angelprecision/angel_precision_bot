@@ -366,6 +366,50 @@ def test_4b_no_supabase_client_marks_error(monkeypatch, marks):
     assert [m["status"] for m in marks if m["job_id"] == 414] == ["ERROR"]
 
 
+def test_4c_missing_signal_identity_fails_closed_no_random_uuid(sb, marks):
+    """Signal identity is MANDATORY. A missing function arg AND a missing payload
+    signal_id must fail closed to queue ERROR — never invent a random UUID that
+    no longer matches the queue opportunity that produced it."""
+    ok = queue._persist_watching_deferral(
+        job_id=424,
+        client_id="carol@example.com",
+        signal_id="",                     # missing function signal_id
+        execution_mode="paper",
+        payload={"ticker": "NVDA", "side": "PUT", "score": 66},  # no payload signal_id
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="after hours",
+    )
+    assert ok is False
+    # queue ERROR with the invalid-signal reason.
+    my = [m for m in marks if m["job_id"] == 424]
+    assert len(my) == 1 and my[0]["status"] == "ERROR"
+    assert my[0]["error"].endswith(":invalid_signal_id")
+    # Zero ap_signals rows — nothing persisted, so no random UUID was minted.
+    assert sb.rows == {}
+
+
+def test_4d_malformed_score_does_not_raise(sb, marks):
+    """A malformed scanner score ("A+") must not raise past the fail-closed
+    persistence contract: exactly one canonical WATCHING row, queue WATCHING,
+    persisted score coerced to 0.0."""
+    ok = queue._persist_watching_deferral(
+        job_id=434,
+        client_id="carol@example.com",
+        signal_id="sig-4d",
+        execution_mode="paper",
+        payload={"ticker": "NVDA", "side": "CALL", "score": "A+", "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="after hours",
+    )
+    assert ok is True
+    rows = _signal_rows(sb, "WATCHING")
+    assert len(rows) == 1
+    assert rows[0]["score"] == 0.0
+    assert [m["status"] for m in marks if m["job_id"] == 434] == ["WATCHING"]
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 5. Idempotency — two identical deferrals leave exactly one signal + one queue row
 # ═════════════════════════════════════════════════════════════════════════════
@@ -412,16 +456,23 @@ def test_6_client_isolation(sb, marks):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 7. Execution-mode isolation — PAPER deferral cannot claim/satisfy a LIVE row
+# 7. Execution-mode validation + mode stamping (NOT cross-mode row isolation)
 # ═════════════════════════════════════════════════════════════════════════════
-def test_7_execution_mode_isolation(sb, marks):
+def test_7_execution_mode_validation_and_stamping(sb, marks):
+    """SCOPE NOTE: the ap_signals upsert key is (signal_id, client_email) only —
+    execution mode is NOT part of the row identity. This test proves the helper
+    (a) requires an exact paper/live mode and (b) stamps that mode into the row
+    for provenance, and — because paper and live run under different client
+    identities — that the two clients' rows do not collide. It does NOT (and
+    cannot) prove cross-mode isolation for the SAME (signal_id, client_email);
+    that guarantee is owned by the runtime/broker mode boundary (PR #397)."""
     common = dict(
         payload={"ticker": "AMD", "side": "CALL", "score": 71, "timeframe": "1d"},
         stage="master_control", reason_code="market_closed_deferred",
         human_reason="after hours",
     )
     # Same signal id, DIFFERENT client per mode (paper vs live run under
-    # different client identities). The rows must not collide or cross-satisfy.
+    # different client identities). The rows are keyed by client → no collision.
     assert queue._persist_watching_deferral(
         job_id=701, client_id="paper-acct@x.com", signal_id="sig-7",
         execution_mode="PAPER", **common) is True
@@ -431,9 +482,9 @@ def test_7_execution_mode_isolation(sb, marks):
 
     paper_row = sb.rows[("sig-7", "paper-acct@x.com")]
     live_row = sb.rows[("sig-7", "live-acct@x.com")]
+    # Mode is stamped into raw_payload (provenance), distinct per row.
     assert paper_row["raw_payload"]["execution_mode"] == "paper"
     assert live_row["raw_payload"]["execution_mode"] == "live"
-    # The PAPER write did not mutate the LIVE row's mode, and vice versa.
     assert paper_row["raw_payload"]["execution_mode"] != live_row["raw_payload"]["execution_mode"]
 
     # Invalid execution mode is refused (queue ERROR, no WATCHING, no signal row).

@@ -42,7 +42,11 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo as _ZoneInfo
 
 from ap.state import update_state
-from ap_signal_store import canonical_client_email, upsert_ap_signal_row_with_fallback
+from ap_signal_store import (
+    canonical_client_email,
+    canonical_signal_id,
+    upsert_ap_signal_row_with_fallback,
+)
 
 def _conn():
     from ap.db import conn
@@ -934,7 +938,14 @@ def _log_signal_to_db(
             "system_version":  "v2",
             "ticker":          str(ticker),
             "side":            _row_side,
-            "score":           float(score or _payload_for_row.get("score") or 0),
+            # Malformed scanner scores (e.g. "A+") must never raise inside the
+            # row build — _safe_float coerces bad input to the default rather
+            # than throwing (the caller relies on the True/False return, not an
+            # exception, to make its fail-closed decision).
+            "score":           _safe_float(
+                score if score not in (None, "") else _payload_for_row.get("score"),
+                0.0,
+            ),
             "tier":            str(_payload_for_row.get("tier") or "B"),
             "pattern":         str(_payload_for_row.get("pattern") or ""),
             "timeframe":       str(_payload_for_row.get("timeframe") or "1d"),
@@ -1040,11 +1051,13 @@ def _persist_watching_deferral(
          client_email) and the queue update is keyed on job_id, so repeating the
          same deferral updates in place rather than duplicating. A row already
          canonical WATCHING is upserted to the same values (still success).
-      9. Preserves client + execution-mode isolation: the canonical client_email
-         is part of the ap_signals key, the execution mode is stamped on the row,
-         and the queue update is scoped to this job_id only. A PAPER deferral
-         cannot claim/update/satisfy a LIVE row (different client key and/or
-         mode stamp), and vice versa.
+      9. Preserves CLIENT isolation: the canonical client_email is part of the
+         ap_signals upsert key and the queue update is scoped to this job_id
+         only, so one client's deferral can never claim/update another client's
+         row. The execution mode is stamped into raw_payload for provenance but
+         is NOT part of the row identity — cross-mode isolation for the SAME
+         (signal_id, client_email) is owned by the runtime/broker mode boundary
+         (PR #397), not by this helper.
      10. Never converts a genuinely terminal rejection into WATCHING — it is the
          ONLY WATCHING authority and callers invoke it BEFORE any terminalization,
          so no terminal state is ever overwritten.
@@ -1077,23 +1090,46 @@ def _persist_watching_deferral(
         _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_mode")
         return False
 
-    # (3) canonical signal identity.
-    _sig = str(signal_id or (payload or {}).get("signal_id") or uuid.uuid4())
+    # (3) canonical signal identity — MANDATORY. Never invent one: a random
+    # uuid would persist a WATCHING row that no longer matches the queue
+    # opportunity that produced it. Fail closed to ERROR instead.
+    _sig_raw = str(signal_id or (payload or {}).get("signal_id") or "").strip()
+    _sig = str(canonical_signal_id(_sig_raw) or "").strip()
+    if not _sig:
+        log.error(
+            "DEFERRAL_REFUSED_INVALID_SIGNAL job_id=%s client=%s mode=%s — "
+            "marking queue ERROR (no canonical signal identity to defer).",
+            job_id, _client, _mode,
+        )
+        _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_signal_id")
+        return False
 
     # (4)+(5) persist/confirm the ap_signals WATCHING row FIRST. Stamp the
-    # execution mode onto the row so a PAPER deferral can never be read as a LIVE
-    # one (and vice versa). _log_signal_to_db upserts on (signal_id,
-    # client_email) — inherently idempotent — and returns True only on a
-    # confirmed write.
+    # execution mode into raw_payload for provenance. _log_signal_to_db upserts
+    # on (signal_id, client_email) — inherently idempotent — and returns True
+    # only on a confirmed write.
+    #
+    # NOTE: the (signal_id, client_email) upsert key gives CLIENT isolation; the
+    # execution mode is provenance only, NOT part of the row identity. Cross-mode
+    # isolation for the SAME (signal_id, client_email) is owned by the
+    # runtime/broker mode boundary (PR #397), not by this helper.
     _payload = dict(payload or {})
     _payload["execution_mode"] = _mode
-    _payload.setdefault("signal_id", _sig)
+    _payload["signal_id"] = _sig
+    # Sanitize score BEFORE building the row: a malformed scanner score (e.g.
+    # "A+") must not raise past the fail-closed persistence contract.
+    _score = _safe_float(
+        _payload.get("score") if _payload.get("score") not in (None, "")
+        else _payload.get("ev_score"),
+        0.0,
+    )
+    _payload["score"] = _score
     _signals_ok = _log_signal_to_db(
         signal_id=_sig,
         client_id=_client,
         ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
         side=str(_payload.get("side") or _payload.get("direction") or ""),
-        score=float(_payload.get("score") or _payload.get("ev_score") or 0),
+        score=_score,
         stage=stage,
         reason_code=reason_code,
         human_reason=human_reason,
@@ -1114,7 +1150,7 @@ def _persist_watching_deferral(
         return False
 
     # (6) confirmed discoverable — now (and only now) mark the exact queue row
-    # WATCHING. Scoped to this job_id; preserves per-client/per-mode isolation.
+    # WATCHING. Scoped to this job_id; preserves per-client isolation.
     _mark_job(job_id, "WATCHING", result=watching_result, error=watching_error)
     return True
 
