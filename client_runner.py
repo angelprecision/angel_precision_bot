@@ -518,6 +518,16 @@ class PaperSelectorNoMarketDataTokenError(RuntimeError):
     """
 
 
+# PR #391 amendment: strict market-data transport allowlist. Reused verbatim
+# from ap.live_submit_gates so client_runner and ap_execution_core cannot
+# drift on what counts as a proven live-market URL.
+from ap.live_submit_gates import (
+    CANONICAL_TRADIER_MARKET_DATA_BASE_URL,
+    MarketDataTransportConfigurationError,
+    require_proven_market_data_transport,
+)
+
+
 def resolve_market_data_transport(
     *,
     mode: str,
@@ -580,23 +590,36 @@ def resolve_market_data_transport(
         token, token_source = "", "missing"
 
     # ── Base URL resolution ───────────────────────────────────────────────
-    base_url = (
+    #
+    # PR #391 amendment: the earlier resolver used a "sandbox" substring
+    # denylist and silently rewrote non-matching URLs to
+    # https://api.tradier.com. That was unsafe on two fronts:
+    #
+    #   1. Non-sandbox but still-untrusted URLs (evil.example,
+    #      api.tradier.com.evil.example, http://api.tradier.com, ...) fell
+    #      through as "accepted", so a misconfigured env var would route
+    #      the live market-data bearer token to an arbitrary host.
+    #   2. An explicit sandbox URL from the operator was silently repaired
+    #      to live, hiding a real configuration bug.
+    #
+    # The corrected policy: require an exact allowlist match up-front.
+    # An invalid explicit env value fails startup BEFORE TradierConfig is
+    # constructed with the token — no silent rewrite, no token leakage.
+    configured_base_url = (
         (env.get("TRADIER_MARKET_DATA_BASE_URL") or "").strip()
         or (env.get("TRADIER_DATA_BASE_URL") or "").strip()
-        or "https://api.tradier.com"
     )
 
-    # Hard guard: market-data base URL must never be sandbox. Sandbox quotes
-    # are delayed and using them as the selector's truth source defeats the
-    # entire purpose of the split. Force live and warn loudly.
-    if "sandbox" in base_url.lower():
-        logger.critical(
-            "PAPER_SELECTOR_MARKET_DATA_BASE_URL_SANDBOX_GUARD_TRIGGERED "
-            "resolved_url=%s — sandbox URL must not be used for selector "
-            "market data. Forcing https://api.tradier.com.",
-            base_url,
-        )
-        base_url = "https://api.tradier.com"
+    base_url = (
+        configured_base_url
+        or CANONICAL_TRADIER_MARKET_DATA_BASE_URL
+    )
+
+    # Validate before constructing a broker config containing the token.
+    # An invalid explicit environment value must fail closed, not be repaired
+    # silently and never receive the market-data bearer token.
+    _transport_proof = require_proven_market_data_transport(base_url)
+    base_url = str(_transport_proof["base_url"])
 
     execution_base_url = getattr(getattr(execution_broker, "cfg", None), "base_url", "")
 
@@ -621,10 +644,19 @@ def resolve_market_data_transport(
         data_broker = broker_cls(cfg)
         is_dedicated = True
     else:
-        # LIVE-only path: live execution broker already has live market data.
+        # LIVE-only fallback. The execution broker must itself be proven to
+        # use the canonical Tradier live HTTPS endpoint before it becomes the
+        # data authority. If the LIVE execution broker was somehow built
+        # against a non-canonical URL we fail loudly at startup rather than
+        # silently accept the mismatch — this is the same allowlist applied
+        # to the explicit market-data env var.
+        _execution_transport_proof = require_proven_market_data_transport(
+            execution_base_url
+        )
+
         data_broker = execution_broker
         token_source = "execution_broker_fallback_live"
-        base_url = execution_base_url or base_url
+        base_url = str(_execution_transport_proof["base_url"])
         is_dedicated = False
 
     return {

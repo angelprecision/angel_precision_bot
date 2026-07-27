@@ -1235,6 +1235,118 @@ class TestPaperDataTransportProof:
         p = self._proof("https://sandbox.tradier.com")
         assert p["proven"] is False
 
+    # ─── PR #391 amendment: strict allowlist regressions ────────────────
+    #
+    # The prior substring denylist over-approved every URL that did not
+    # contain "sandbox/paper/sim/mock/test" in its host, including obvious
+    # attack vectors (evil.example, api.tradier.com.evil.example) and every
+    # non-HTTPS scheme. Proof now requires an EXACT match on
+    # scheme=https / host=api.tradier.com / port ∈ {None, 443}.
+
+    @pytest.mark.parametrize(
+        "bad_url",
+        [
+            "https://evil.example",
+            "https://api.tradier.com.evil.example",
+            "ftp://api.tradier.com",
+            "http://api.tradier.com",
+            "https://api.tradier.com:8443",
+            "https://sandbox.tradier.com",
+            "https://paper.example.com",
+            "https://sim.marketdata.io",
+            "https://mock.foo.bar",
+            "https://test.baz.qux",
+        ],
+    )
+    def test_noncanonical_transport_is_not_proven(self, bad_url):
+        proof = self._proof(bad_url)
+        assert proof["proven"] is False
+
+    @pytest.mark.parametrize(
+        "valid_url",
+        [
+            "https://api.tradier.com",
+            "https://api.tradier.com/",
+            "https://api.tradier.com/v1",
+            "https://api.tradier.com:443",
+        ],
+    )
+    def test_canonical_tradier_https_transport_is_proven(self, valid_url):
+        proof = self._proof(valid_url)
+        assert proof["proven"] is True
+        assert proof["host"] == "api.tradier.com"
+        assert proof["sandbox"] is False
+
+
+class TestInvalidDirectionFailsClosed:
+    """PR #391 amendment: the market-validity gate must fail closed on any
+    option direction other than exactly CALL or PUT.
+
+    Prior behavior fell through the CALL/PUT branches and returned PASS on
+    unknown side. A fresh quote fetch does not heal an unknown direction,
+    so this failure is terminal (TERMINAL_SETUP_COMPLETE), not a retryable
+    HOLD — zero broker POST either way.
+    """
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    @pytest.mark.parametrize(
+        "side",
+        [None, "", "UNKNOWN", "CALLS", "PUTT", "0"],
+    )
+    def test_invalid_direction_never_authorizes_submit(self, mode, side):
+        result = check_market_validity_gate(
+            execution_mode=mode,
+            side=side,
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.90,
+            current_ask=101.10,
+            quote_age_ms=100,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
+        )
+
+        assert result.passed is False
+        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert classify_market_truth(result.reason_code) == (
+            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+        )
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    @pytest.mark.parametrize("side", ["CALL", "PUT"])
+    def test_canonical_direction_remains_supported(self, mode, side):
+        if side == "CALL":
+            stop_price = 95.0
+            target_price = 110.0
+            # CALL: ask must be at or above trigger, and mid within
+            # (stop, target) exclusive.
+            current_bid = 100.00
+            current_ask = 100.10
+        else:
+            stop_price = 105.0
+            target_price = 90.0
+            # PUT: bid must be at or below trigger, and mid within
+            # (target, stop) exclusive.
+            current_bid = 99.90
+            current_ask = 100.00
+
+        result = check_market_validity_gate(
+            execution_mode=mode,
+            side=side,
+            trigger_price=100.0,
+            stop_price=stop_price,
+            target_price=target_price,
+            current_bid=current_bid,
+            current_ask=current_ask,
+            quote_age_ms=100,
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
+        )
+
+        assert result.passed is True
+        assert result.reason_code == GateOutcome.PASS
+
 
 def _build_watcher_with_triggered_signal(local_order_id="LOID-1",
                                          ticker="BAC",
@@ -1462,6 +1574,26 @@ class TestGateExceptionBranchShape:
         assert "hold_entry_for_market_truth_unavailable(" in body
         # And it must NOT terminalize.
         assert "_terminalize_breach_failure" not in body
+
+    def test_module_error_diagnostic_hold_metadata_follows_successful_cas(self):
+        """PR #391 amendment: the diagnostic HOLD-authority metadata write
+        must run AFTER the failed-HOLD-CAS guard. Otherwise a row whose
+        fenced HOLD CAS never confirmed would still carry
+        final_market_truth_status="HOLD_MARKET_TRUTH_UNAVAILABLE" in meta,
+        contradicting the canonical durable authority write.
+        """
+        body = self._wrapper_body()
+
+        hold_guard = body.index("if not _module_hold_ok:")
+        diagnostic_write = body.index(
+            "self.order_state_machine.update_order_meta(",
+            hold_guard,
+        )
+
+        # No generic HOLD-authority metadata write is permitted before the
+        # fenced HOLD CAS result is checked.
+        assert "self.order_state_machine.update_order_meta(" not in body[:hold_guard]
+        assert diagnostic_write > hold_guard
 
 
 class TestOSMHoldDirectlyOnGateModuleErrorReason:

@@ -72,10 +72,148 @@ import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+from urllib.parse import urlparse
 
 from ap.logger import get_logger
 
 log = get_logger("ap.live_submit_gates")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 amendment — canonical market-data transport proof.
+#
+# The prior "sandbox/paper/sim/mock/test" substring denylist over-approved:
+# any nonblank host not matching one of those markers was treated as proven
+# live market data, including https://evil.example, ftp://api.tradier.com,
+# and https://api.tradier.com.evil.example. That opened a startup-time path
+# for client_runner to construct a TradierBroker with the live market-data
+# bearer token pointed at an arbitrary URL from environment configuration.
+#
+# The corrected policy is a strict allowlist. A transport is proven only
+# when EVERY one of the following is true:
+#   - scheme is exactly "https"
+#   - hostname is exactly "api.tradier.com"
+#   - port is omitted or 443
+#   - no username or password is embedded in the URL
+#   - no query string or fragment is present
+#
+# Paths (e.g. "/v1") are allowed. Anything outside this envelope fails
+# closed BEFORE the token-bearing TradierConfig is constructed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CANONICAL_TRADIER_MARKET_DATA_BASE_URL = "https://api.tradier.com"
+
+_ALLOWED_TRADIER_MARKET_DATA_HOSTS: frozenset[str] = frozenset({
+    "api.tradier.com",
+})
+
+
+class MarketDataTransportConfigurationError(RuntimeError):
+    """Configured market-data transport is not proven to be Tradier live HTTPS."""
+
+
+def inspect_market_data_transport(base_url: Optional[str]) -> dict:
+    """Validate the exact market-data transport without exposing credentials.
+
+    A transport is proven only when all of these are true:
+
+    - scheme is exactly HTTPS;
+    - hostname is exactly api.tradier.com;
+    - port is omitted or 443;
+    - URL contains no embedded username/password;
+    - URL contains no query string or fragment.
+
+    Paths such as /v1 are allowed.
+
+    Returns a dict with keys base_url, scheme, host, port, sandbox, proven,
+    reason_code. `sandbox` remains a diagnostic label preserved for backward
+    compatibility with prior audit consumers; it is derived from the hostname
+    string only and does NOT participate in the proof decision (an arbitrary
+    non-sandbox host is still unproven unless it exactly matches the
+    allowlist). `reason_code` is stable and safe to log — it never contains
+    the URL body itself, credentials, or the bearer token.
+    """
+
+    raw = str(base_url or "").strip()
+
+    result = {
+        "base_url": raw or None,
+        "scheme": None,
+        "host": None,
+        "port": None,
+        "sandbox": False,
+        "proven": False,
+        "reason_code": "MARKET_DATA_BASE_URL_MISSING",
+    }
+
+    if not raw:
+        return result
+
+    try:
+        parsed = urlparse(raw)
+        scheme = str(parsed.scheme or "").strip().lower()
+        host = str(parsed.hostname or "").strip().lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        result["reason_code"] = "MARKET_DATA_URL_PARSE_FAILED"
+        return result
+
+    sandbox = any(
+        marker in host
+        for marker in ("sandbox", "paper", "sim", "mock", "test")
+    )
+
+    result.update({
+        "scheme": scheme or None,
+        "host": host or None,
+        "port": port,
+        "sandbox": sandbox,
+    })
+
+    if scheme != "https":
+        result["reason_code"] = "MARKET_DATA_SCHEME_NOT_HTTPS"
+        return result
+
+    if host not in _ALLOWED_TRADIER_MARKET_DATA_HOSTS:
+        result["reason_code"] = "MARKET_DATA_HOST_NOT_ALLOWED"
+        return result
+
+    if port not in (None, 443):
+        result["reason_code"] = "MARKET_DATA_PORT_NOT_ALLOWED"
+        return result
+
+    if parsed.username is not None or parsed.password is not None:
+        result["reason_code"] = "MARKET_DATA_URL_EMBEDDED_CREDENTIALS"
+        return result
+
+    if parsed.query or parsed.fragment:
+        result["reason_code"] = "MARKET_DATA_URL_QUERY_OR_FRAGMENT"
+        return result
+
+    result["proven"] = True
+    result["reason_code"] = "MARKET_DATA_TRANSPORT_PROVEN"
+    return result
+
+
+def require_proven_market_data_transport(base_url: Optional[str]) -> dict:
+    """Raise MarketDataTransportConfigurationError unless the transport
+    passes the strict allowlist above. Callers that want a boolean should
+    use inspect_market_data_transport() directly; this helper exists for the
+    single-shot startup-time fail-closed path in client_runner, where any
+    invalid explicit configuration must abort broker construction BEFORE
+    the token enters TradierConfig.
+    """
+    proof = inspect_market_data_transport(base_url)
+
+    if proof["proven"]:
+        return proof
+
+    raise MarketDataTransportConfigurationError(
+        f"{proof['reason_code']} "
+        f"scheme={proof['scheme']!r} "
+        f"host={proof['host']!r} "
+        f"port={proof['port']!r}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +244,12 @@ class GateOutcome:
     CALL_STOP_ALREADY_BROKEN               = "CALL_STOP_ALREADY_BROKEN"
     PUT_NO_LONGER_BELOW_TRIGGER            = "PUT_NO_LONGER_BELOW_TRIGGER"
     PUT_STOP_ALREADY_BROKEN                = "PUT_STOP_ALREADY_BROKEN"
+
+    # PR #391 amendment: option direction (side) is missing, blank, or
+    # anything other than exactly "CALL" or "PUT" after normalization.
+    # Terminal, not retryable — a fresh quote fetch does not heal an
+    # unknown side, and the identity gate does not inspect direction.
+    ENTRY_DIRECTION_INVALID                = "ENTRY_DIRECTION_INVALID"
 
     # PR #391 (blocker 2): provenance failure — quote_source unknown, blank,
     # sandbox-only, or otherwise unproven. Bounded retry, not terminal.
@@ -152,6 +296,7 @@ _TERMINAL_REASONS: frozenset[str] = frozenset({
     GateOutcome.PUT_STOP_ALREADY_BROKEN,
     GateOutcome.TARGET_ALREADY_INVALID,
     GateOutcome.REMAINING_OPPORTUNITY_TOO_SMALL,
+    GateOutcome.ENTRY_DIRECTION_INVALID,
 })
 
 _HOLD_REASONS: frozenset[str] = frozenset({
@@ -702,6 +847,19 @@ def check_market_validity_gate(
         )
 
     _side = str(side or "").strip().upper()
+
+    # PR #391 amendment: direction MUST be exactly CALL or PUT after
+    # normalization. Anything else (None, "", "UNKNOWN", "CALLS", "PUTT",
+    # "BUY", "0", …) is terminal: a fresh quote will not heal an unknown
+    # side, and the identity gate does not inspect direction. Fail closed
+    # BEFORE geometry evaluation so we never fall through to the old
+    # "unknown side → PASS" path.
+    if _side not in {"CALL", "PUT"}:
+        return _fail(
+            GateOutcome.ENTRY_DIRECTION_INVALID,
+            f"side={side!r} is invalid; expected exactly CALL or PUT",
+        )
+
     tr = _finite_float(trigger_price)
     tg = _finite_float(target_price)
     st = _finite_float(stop_price)
@@ -755,7 +913,8 @@ def check_market_validity_gate(
                 GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
                 f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
             )
-    # Unknown side: pass (identity gate would have blocked this earlier)
+    # No other branch is reachable here: side is guaranteed to be exactly
+    # "CALL" or "PUT" by the ENTRY_DIRECTION_INVALID fail-closed above.
 
     # Rule: remaining opportunity
     rem_pct = _remaining_opportunity_pct(_side, mid, tr, tg)

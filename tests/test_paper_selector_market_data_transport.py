@@ -38,9 +38,12 @@ test session to keep import time low.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+from ap.live_submit_gates import MarketDataTransportConfigurationError
 
 
 # ─── Mock heavy imports BEFORE importing client_runner ──────────────────────
@@ -254,27 +257,36 @@ class TestTokenAndBaseUrlPriority:
         assert out["token_source"] == "TRADIER_MARKET_DATA_TOKEN"
 
     def test_market_data_base_url_beats_data_base_url(self):
+        # PR #391 amendment: env var priority is proven by showing that
+        # TRADIER_MARKET_DATA_BASE_URL is the one validated when both are
+        # set. Setting MARKET_DATA to an invalid URL and DATA to the
+        # canonical live URL must raise — proving MARKET_DATA is what the
+        # resolver actually consulted (if it had used DATA, this would
+        # succeed).
         env = {
             "TRADIER_MARKET_DATA_TOKEN":    "t",
             "TRADIER_MARKET_DATA_BASE_URL": "https://md.example.com",
-            "TRADIER_DATA_BASE_URL":        "https://data.example.com",
+            "TRADIER_DATA_BASE_URL":        "https://api.tradier.com",
         }
-        out = resolve_market_data_transport(
-            mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
-            env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
-        )
-        assert out["base_url"] == "https://md.example.com"
+        with pytest.raises(MarketDataTransportConfigurationError):
+            resolve_market_data_transport(
+                mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
+                env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
+            )
 
     def test_data_base_url_used_when_no_md_base_url(self):
+        # PR #391 amendment: TRADIER_DATA_BASE_URL is consulted only when
+        # TRADIER_MARKET_DATA_BASE_URL is absent, and it is subject to the
+        # same strict allowlist. Canonical value → dedicated broker on live.
         env = {
             "TRADIER_MARKET_DATA_TOKEN": "t",
-            "TRADIER_DATA_BASE_URL":     "https://data.example.com",
+            "TRADIER_DATA_BASE_URL":     "https://api.tradier.com",
         }
         out = resolve_market_data_transport(
             mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
             env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
         )
-        assert out["base_url"] == "https://data.example.com"
+        assert out["base_url"] == "https://api.tradier.com"
 
     def test_default_base_url_is_live_tradier(self):
         env = {"TRADIER_MARKET_DATA_TOKEN": "t"}
@@ -286,31 +298,34 @@ class TestTokenAndBaseUrlPriority:
 
 
 class TestSandboxGuard:
-    def test_sandbox_in_md_base_url_is_forced_to_live(self):
+    """PR #391 amendment: the previous behavior was to silently rewrite any
+    sandbox URL to https://api.tradier.com. That masked real configuration
+    bugs. The new contract is fail-closed: any non-canonical URL — sandbox
+    included — must raise MarketDataTransportConfigurationError BEFORE the
+    token-bearing TradierConfig is constructed.
+    """
+
+    def test_sandbox_in_md_base_url_raises_not_rewrites(self):
         env = {
             "TRADIER_MARKET_DATA_TOKEN":    "t",
             "TRADIER_MARKET_DATA_BASE_URL": "https://sandbox.tradier.com",
         }
-        out = resolve_market_data_transport(
-            mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
-            env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
-        )
-        # Sandbox URL must be rewritten to live — otherwise PAPER would still
-        # be reading 15-min-delayed chains.
-        assert "sandbox" not in out["base_url"].lower()
-        assert out["base_url"] == "https://api.tradier.com"
-        assert out["data_broker"].cfg.base_url == "https://api.tradier.com"
+        with pytest.raises(MarketDataTransportConfigurationError):
+            resolve_market_data_transport(
+                mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
+                env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
+            )
 
-    def test_sandbox_in_data_base_url_is_forced_to_live(self):
+    def test_sandbox_in_data_base_url_raises_not_rewrites(self):
         env = {
             "TRADIER_DATA_TOKEN":    "t",
             "TRADIER_DATA_BASE_URL": "https://sandbox.tradier.com",
         }
-        out = resolve_market_data_transport(
-            mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
-            env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
-        )
-        assert out["base_url"] == "https://api.tradier.com"
+        with pytest.raises(MarketDataTransportConfigurationError):
+            resolve_market_data_transport(
+                mode="PAPER", account_id="X", execution_broker=_sandbox_execution_broker(),
+                env=env, broker_cls=_FakeBroker, broker_config_cls=_FakeCfg,
+            )
 
 
 class TestExecutionBaseUrlPreserved:
@@ -358,3 +373,129 @@ class TestRegressionPaperExecutionStillSandbox:
                 os.environ["BOT_MODE"] = prior_mode
         assert creds["mode"]     == "PAPER"
         assert creds["base_url"] == "https://sandbox.tradier.com"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #391 amendment — strict market-data transport allowlist.
+#
+# The previous "sandbox substring" denylist over-approved: any nonblank host
+# not matching sandbox/paper/sim/mock/test was treated as proven live. That
+# opened a path for client_runner to construct TradierConfig with the live
+# market-data bearer token pointed at an arbitrary environment-supplied URL.
+#
+# The corrected policy is a strict allowlist: scheme=https, host exactly
+# api.tradier.com, port omitted or 443, no embedded credentials, no query/
+# fragment. Invalid explicit URLs must fail BEFORE the token-bearing
+# TradierConfig is constructed.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://evil.example",
+        "https://api.tradier.com.evil.example",
+        "ftp://api.tradier.com",
+        "http://api.tradier.com",
+        "https://api.tradier.com:8443",
+        "https://sandbox.tradier.com",
+        "https://user:pass@api.tradier.com",
+        "https://api.tradier.com?redirect=https://evil.example",
+    ],
+)
+def test_invalid_market_data_url_fails_before_token_enters_config(bad_url):
+    """A misconfigured TRADIER_MARKET_DATA_BASE_URL must raise before the
+    token-bearing TradierConfig is constructed. This is the critical safety
+    invariant: the live market-data bearer token must never touch an
+    untrusted transport, and the resolver must not silently rewrite the URL.
+    """
+    config_calls = []
+
+    class RecordingConfig:
+        def __init__(self, *, base_url, access_token, account_id):
+            config_calls.append({
+                "base_url": base_url,
+                "access_token": access_token,
+                "account_id": account_id,
+            })
+            self.base_url = base_url
+            self.access_token = access_token
+            self.account_id = account_id
+
+    class RecordingBroker:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+    execution_broker = SimpleNamespace(
+        cfg=SimpleNamespace(base_url="https://sandbox.tradier.com")
+    )
+
+    with pytest.raises(MarketDataTransportConfigurationError):
+        resolve_market_data_transport(
+            mode="PAPER",
+            account_id="paper-account",
+            execution_broker=execution_broker,
+            env={
+                "TRADIER_MARKET_DATA_TOKEN": "secret-market-data-token",
+                "TRADIER_MARKET_DATA_BASE_URL": bad_url,
+            },
+            broker_cls=RecordingBroker,
+            broker_config_cls=RecordingConfig,
+        )
+
+    # Critical assertion: invalid URL was rejected before the token-bearing
+    # config object was constructed.
+    assert config_calls == []
+
+
+@pytest.mark.parametrize(
+    "valid_url",
+    [
+        "https://api.tradier.com",
+        "https://api.tradier.com/",
+        "https://api.tradier.com/v1",
+        "https://api.tradier.com:443",
+    ],
+)
+def test_exact_tradier_https_transport_is_allowed(valid_url):
+    """Positive proof: the exact canonical Tradier live HTTPS transport is
+    accepted (with or without trailing slash, with a path, with the default
+    port explicit), and the token-bearing TradierConfig is built exactly once
+    with the expected inputs.
+    """
+    config_calls = []
+
+    class RecordingConfig:
+        def __init__(self, *, base_url, access_token, account_id):
+            config_calls.append({
+                "base_url": base_url,
+                "access_token": access_token,
+                "account_id": account_id,
+            })
+            self.base_url = base_url
+            self.access_token = access_token
+            self.account_id = account_id
+
+    class RecordingBroker:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+    result = resolve_market_data_transport(
+        mode="PAPER",
+        account_id="paper-account",
+        execution_broker=SimpleNamespace(
+            cfg=SimpleNamespace(base_url="https://sandbox.tradier.com")
+        ),
+        env={
+            "TRADIER_MARKET_DATA_TOKEN": "secret-market-data-token",
+            "TRADIER_MARKET_DATA_BASE_URL": valid_url,
+        },
+        broker_cls=RecordingBroker,
+        broker_config_cls=RecordingConfig,
+    )
+
+    assert result["data_broker"] is not None
+    assert result["base_url"] == valid_url
+    assert len(config_calls) == 1
+    assert config_calls[0]["base_url"] == valid_url
+    assert config_calls[0]["access_token"] == "secret-market-data-token"

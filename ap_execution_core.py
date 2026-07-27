@@ -42,10 +42,10 @@ from ap.utils                import now_utc_iso
 from ap.live_submit_gates import (
     check_market_validity_gate,
     classify_market_truth,
+    inspect_market_data_transport,
     MarketTruthAuthority,
     GateOutcome,
 )
-from urllib.parse import urlparse
 
 # Intelligence outcome feedback — optional, fails silently if bridge not deployed
 try:
@@ -59,15 +59,34 @@ _VALID_EXECUTION_MODES = frozenset({"paper", "live"})
 
 
 def _market_data_transport_proof(adapter) -> dict:
-    """PR #391 blocker 6: prove a quote adapter is a live-market transport,
-    not a friendly-looking source string.
+    """Prove the adapter uses the canonical Tradier live HTTPS transport.
 
-    Returns a dict with keys base_url, host, sandbox, proven. proven is True
-    only when a host is present AND the host does not match any of the
-    sandbox/paper/sim/mock/test markers. No adapter → all None/False.
+    PR #391 amendment: delegates to ap.live_submit_gates.inspect_market_data_transport
+    so this file and client_runner enforce the same strict allowlist:
+
+      - scheme exactly "https"
+      - hostname exactly "api.tradier.com"
+      - port omitted or 443
+      - no embedded credentials, no query, no fragment
+
+    The prior "any host not matching sandbox/paper/sim/mock/test"
+    heuristic incorrectly approved arbitrary hosts (e.g. evil.example,
+    api.tradier.com.evil.example) and non-HTTPS schemes; those all now
+    fail proven=False.
+
+    The returned four-field contract (base_url/host/sandbox/proven) is
+    preserved unchanged so existing audit consumers keep working. The
+    `sandbox` field remains a diagnostic hint sourced from the hostname
+    string and does not by itself decide `proven`.
     """
+
     if adapter is None:
-        return {"base_url": None, "host": None, "sandbox": False, "proven": False}
+        return {
+            "base_url": None,
+            "host": None,
+            "sandbox": False,
+            "proven": False,
+        }
 
     cfg = getattr(adapter, "cfg", None)
     base_url = str(
@@ -76,23 +95,14 @@ def _market_data_transport_proof(adapter) -> dict:
         or ""
     ).strip()
 
-    host = ""
-    if base_url:
-        try:
-            host = str(urlparse(base_url).hostname or "").strip().lower()
-        except Exception:
-            host = ""
+    proof = inspect_market_data_transport(base_url)
 
-    sandbox = any(
-        marker in host
-        for marker in ("sandbox", "paper", "sim", "mock", "test")
-    )
-
+    # Preserve the existing four-field consumer contract.
     return {
-        "base_url": base_url or None,
-        "host": host or None,
-        "sandbox": sandbox,
-        "proven": bool(host) and not sandbox,
+        "base_url": proof["base_url"],
+        "host": proof["host"],
+        "sandbox": bool(proof["sandbox"]),
+        "proven": bool(proof["proven"]),
     }
 
 
@@ -7845,6 +7855,31 @@ class APExecutionCore:
                     exc_info=True,
                 )
 
+            # PR #391 amendment: the failed-HOLD-CAS guard MUST run before
+            # any generic HOLD-authority metadata is stamped. Otherwise a
+            # row that never received a durable HOLD would still carry
+            # final_market_truth_status="HOLD_MARKET_TRUTH_UNAVAILABLE" in
+            # meta, contradicting the fenced canonical HOLD schema and
+            # confusing recovery / audit.
+            if not _module_hold_ok:
+                log.critical(
+                    "[%s] MODULE_ERROR_HOLD_NOT_DURABLE order=%s — CAS did "
+                    "not confirm; returning KEEP_WATCHER without stamping "
+                    "HOLD authority metadata",
+                    ticker,
+                    str(queue_local_order_id or ""),
+                )
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "MARKET_TRUTH_HOLD_NOT_DURABLE",
+                    "broker_post_attempted": False,
+                }
+
+            # Diagnostic aliases are legal only after the fenced HOLD CAS
+            # succeeds. hold_entry_for_market_truth_unavailable() is the
+            # canonical authority write; these keys are best-effort audit
+            # aliases so operator queries against orders.meta still find a
+            # readable snapshot of the gate result.
             try:
                 self.order_state_machine.update_order_meta(
                     str(queue_local_order_id or ""),
@@ -7863,19 +7898,6 @@ class APExecutionCore:
                     "error=%s — canonical HOLD already durable, audit only",
                     ticker, str(queue_local_order_id or ""), _module_diag_exc,
                 )
-
-            # P0-12: never claim RETRY_WAIT if the HOLD CAS did not confirm.
-            if not _module_hold_ok:
-                log.critical(
-                    "[%s] MODULE_ERROR_HOLD_NOT_DURABLE order=%s — CAS did "
-                    "not confirm; returning KEEP_WATCHER (zero POST enforced)",
-                    ticker, str(queue_local_order_id or ""),
-                )
-                return {
-                    "disposition":            "KEEP_WATCHER",
-                    "reason_code":            "MARKET_TRUTH_HOLD_NOT_DURABLE",
-                    "broker_post_attempted":  False,
-                }
 
             # HARD-HOLD amendment (remaining blocker 2): the HOLD row now
             # says contract=DEFERRED:<TICKER>. The in-memory watcher must
