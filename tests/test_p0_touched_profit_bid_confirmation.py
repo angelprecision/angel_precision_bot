@@ -96,6 +96,24 @@ def test_repeated_evaluation_of_same_bid_does_not_count_twice():
     assert pos._touched_profit_floor_breach_count == 1
 
 
+def test_missing_timestamp_does_not_count_toward_confirmation():
+    first_ts = datetime.now(timezone.utc)
+    pos = _position(last_option_bid_update_ts=None)
+    original_decision = _decision("TOUCHED_PROFIT_STOP")
+    wrapped = _wrapped([original_decision, original_decision])
+
+    first = wrapped(pos)
+
+    assert first.action == "HOLD"
+    assert pos._touched_profit_floor_breach_count == 0
+
+    pos.last_option_bid_update_ts = first_ts
+    second = wrapped(pos)
+
+    assert second.action == "HOLD"
+    assert pos._touched_profit_floor_breach_count == 1
+
+
 def test_second_distinct_bid_confirms_sustained_floor_breach():
     first_ts = datetime.now(timezone.utc)
     pos = _position(last_option_bid_update_ts=first_ts)

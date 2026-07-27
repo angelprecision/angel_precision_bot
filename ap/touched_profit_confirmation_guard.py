@@ -145,6 +145,20 @@ def wrap_evaluate_exit(
             return decision
 
         observation_key = _observation_key(pos)
+        if observation_key == "missing_bid_timestamp":
+            _reset_state(pos)
+            return exit_decision_cls(
+                action="HOLD",
+                quantity=0,
+                reason=(
+                    "TOUCHED PROFIT STOP CONFIRMING — "
+                    "dedicated BID timestamp unavailable"
+                ),
+                urgency="NORMAL",
+                pnl_pct=_float(getattr(decision, "pnl_pct", 0.0)),
+                reason_code="TOUCHED_PROFIT_STOP_CONFIRMING",
+            )
+
         prior_key = str(getattr(pos, _STATE_KEY, "") or "")
         count = int(getattr(pos, _STATE_COUNT, 0) or 0)
 
