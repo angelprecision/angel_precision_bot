@@ -268,6 +268,24 @@ _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
 _PAPER_OVERNIGHT_REEVAL_ONLY_ERROR = "after_hours_deferred:awaiting_overnight_reeval"
 _VALID_EXECUTION_MODES = frozenset({"PAPER", "LIVE"})
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical decision-status constants (P0: queue deferral truth)
+# ─────────────────────────────────────────────────────────────────────────────
+# ap_signals.decision_status is the value the overnight reeval discovery
+# predicate matches on — exactly `.eq("decision_status", "WATCHING")`. Any
+# lowercase "watching" written by queue code is invisible to that query, so the
+# deferred setup silently never gets re-armed. These constants exist so every
+# deferral path spells the discoverable value the SAME way. No queue path may
+# write a bare lowercase "watching" for decision_status.
+DECISION_REJECTED = "rejected"
+DECISION_WATCHING = "WATCHING"
+DECISION_QUEUED = "queued"
+
+# Stable reason stamped on trade_queue.last_error when the ap_signals write that
+# MUST precede a WATCHING mark fails or cannot be verified. The queue row is
+# marked ERROR (never a phantom WATCHING) so the operator sees the failure.
+WATCHING_SIGNAL_PERSISTENCE_FAILED = "WATCHING_SIGNAL_PERSISTENCE_FAILED"
+
 # ── PAPER recovery restart-guard classifier ───────────────────────────────────
 # Production incident 2026-07-16: APStartupRecovery legitimately reset Jose's
 # current-session PAPER WATCHING rows to NEW and stamped recovery_rescue +
@@ -974,8 +992,131 @@ def _log_rejection_to_db(
         signal_id=signal_id, client_id=client_id, ticker=ticker,
         side=side, score=score, stage=stage,
         reason_code=reason_code, human_reason=human_reason,
-        payload=payload, decision_status="rejected",
+        payload=payload, decision_status=DECISION_REJECTED,
     )
+
+
+def _persist_watching_deferral(
+    *,
+    job_id: int,
+    client_id: str,
+    signal_id: str,
+    execution_mode: str,
+    payload: dict,
+    stage: str,
+    reason_code: str,
+    human_reason: str,
+    watching_error: str | None = None,
+    watching_result: dict | None = None,
+    failure_error: str | None = None,
+) -> bool:
+    """Single authority for turning an intentional deferral into a durable,
+    consistently-discoverable WATCHING row.
+
+    P0 (queue deferral truth): before this existed, more than one queue path
+    could defer a setup, and they disagreed. One path even marked the queue row
+    REJECTED and then wrote a lowercase ap_signals decision_status="watching" —
+    split truth the overnight reeval could not find (it discovers via
+    `.eq("decision_status", "WATCHING")`). Every legitimate deferral now routes
+    through this one function so trade_queue.status and ap_signals.decision_status
+    always tell the SAME story.
+
+    Contract:
+      1. Requires an exact canonical client identity (rejects ownerless rows).
+      2. Requires a valid execution mode of exactly "paper" or "live".
+      3. Requires a canonical signal identity.
+      4. Persists/confirms the ap_signals row FIRST with
+         decision_status="WATCHING" (exact uppercase), the canonical client
+         identity, the execution mode, the original signal identity, a truthful
+         deferral reason, and the score/tier/direction/timeframe/trigger/stop/
+         target fields already present on the payload.
+      5. Confirms the signal write succeeded.
+      6. Only THEN marks the exact queue row WATCHING.
+      7. On signal-persistence failure (or unverifiable write): marks the exact
+         queue row ERROR with a stable reason (WATCHING_SIGNAL_PERSISTENCE_FAILED
+         unless the caller supplied a more specific one) — never WATCHING, never
+         REJECTED+WATCHING split truth. No watcher / OSM / broker action is taken.
+      8. Idempotent — the ap_signals upsert is keyed on (signal_id,
+         client_email) and the queue update is keyed on job_id, so repeating the
+         same deferral updates in place rather than duplicating. A row already
+         canonical WATCHING is upserted to the same values (still success).
+      9. Preserves client + execution-mode isolation: the canonical client_email
+         is part of the ap_signals key, the execution mode is stamped on the row,
+         and the queue update is scoped to this job_id only. A PAPER deferral
+         cannot claim/update/satisfy a LIVE row (different client key and/or
+         mode stamp), and vice versa.
+     10. Never converts a genuinely terminal rejection into WATCHING — it is the
+         ONLY WATCHING authority and callers invoke it BEFORE any terminalization,
+         so no terminal state is ever overwritten.
+
+    Returns True iff the queue row ended WATCHING; False iff it ended ERROR (or
+    the deferral was refused because a required identity/mode was invalid).
+    """
+    _fail = failure_error or WATCHING_SIGNAL_PERSISTENCE_FAILED
+
+    # (1) canonical client identity — refuse ownerless deferrals. A WATCHING row
+    # with no owner cannot preserve client isolation downstream.
+    _client = canonical_client_email(client_id)
+    if not str(client_id or "").strip() or _client == "__shared__":
+        log.error(
+            "DEFERRAL_REFUSED_INVALID_CLIENT job_id=%s signal_id=%s client=%r — "
+            "marking queue ERROR (a WATCHING row must have an exact client owner).",
+            job_id, signal_id, client_id,
+        )
+        _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_client")
+        return False
+
+    # (2) valid execution mode — exactly paper or live.
+    _mode = str(execution_mode or "").strip().lower()
+    if _mode not in ("paper", "live"):
+        log.error(
+            "DEFERRAL_REFUSED_INVALID_MODE job_id=%s signal_id=%s mode=%r — "
+            "marking queue ERROR.",
+            job_id, signal_id, execution_mode,
+        )
+        _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_mode")
+        return False
+
+    # (3) canonical signal identity.
+    _sig = str(signal_id or (payload or {}).get("signal_id") or uuid.uuid4())
+
+    # (4)+(5) persist/confirm the ap_signals WATCHING row FIRST. Stamp the
+    # execution mode onto the row so a PAPER deferral can never be read as a LIVE
+    # one (and vice versa). _log_signal_to_db upserts on (signal_id,
+    # client_email) — inherently idempotent — and returns True only on a
+    # confirmed write.
+    _payload = dict(payload or {})
+    _payload["execution_mode"] = _mode
+    _payload.setdefault("signal_id", _sig)
+    _signals_ok = _log_signal_to_db(
+        signal_id=_sig,
+        client_id=_client,
+        ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
+        side=str(_payload.get("side") or _payload.get("direction") or ""),
+        score=float(_payload.get("score") or _payload.get("ev_score") or 0),
+        stage=stage,
+        reason_code=reason_code,
+        human_reason=human_reason,
+        payload=_payload,
+        decision_status=DECISION_WATCHING,
+        queued_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    # (7) fail closed — no phantom WATCHING, no split truth, no money-path action.
+    if not _signals_ok:
+        log.critical(
+            "WATCHING_SIGNAL_PERSISTENCE_FAILED job_id=%s signal_id=%s client=%s "
+            "mode=%s stage=%s reason=%s — refusing to mark queue WATCHING; "
+            "marking queue ERROR so the operator sees the failure.",
+            job_id, _sig, _client, _mode, stage, reason_code,
+        )
+        _mark_job(job_id, "ERROR", error=_fail)
+        return False
+
+    # (6) confirmed discoverable — now (and only now) mark the exact queue row
+    # WATCHING. Scoped to this job_id; preserves per-client/per-mode isolation.
+    _mark_job(job_id, "WATCHING", result=watching_result, error=watching_error)
+    return True
 
 
 def _dispatch(
@@ -1278,11 +1419,26 @@ def _dispatch(
             signal_id,
             job_id,
         )
-        _mark_job(
-            job_id,
-            "WATCHING",
-            result={"stage": "overnight_reeval", "reason": "paper_force_overnight_only"},
-            error=_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR,
+        # Route through the single deferral authority: the overnight reeval only
+        # discovers this row via ap_signals decision_status='WATCHING', so the
+        # ap_signals row MUST be persisted (and confirmed) BEFORE the queue row
+        # is marked WATCHING. If persistence fails the queue row becomes ERROR
+        # (not a phantom WATCHING the rescue could never find).
+        _persist_watching_deferral(
+            job_id=job_id,
+            client_id=client_id,
+            signal_id=signal_id,
+            execution_mode=_execution_mode,
+            payload=payload,
+            stage="overnight_reeval",
+            reason_code="market_closed_deferred",
+            human_reason=(
+                "PAPER overnight rescue — deferred to overnight reeval. "
+                "No action needed until the morning revaluation."
+            ),
+            watching_error=_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR,
+            watching_result={"stage": "overnight_reeval", "reason": "paper_force_overnight_only"},
+            failure_error="ap_signals_write_failed:paper_overnight_reeval_only",
         )
         return
 
@@ -1439,17 +1595,9 @@ def _dispatch(
         except Exception: pass
         trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
                    reason=decision.reason, score=float(payload.get("score") or 0))
-        _mark_job(job_id, "REJECTED",
-                  result={"stage": decision.stage, "reason": decision.reason})
-        # Permanent structured rejection record — queryable by client/dashboard
-        _log_rejection_to_db(
-            signal_id=signal_id, client_id=client_id, ticker=ticker,
-            side=payload.get("side", ""), score=float(payload.get("score") or 0),
-            stage=decision.stage, reason_code=str(decision.reason or ""),
-            human_reason=str(decision.reason or ""), payload=payload,
-        )
 
-        # Post rejection to Discord
+        # Post the master-control block to Discord (informational — fires for
+        # every block, deferral or terminal; unchanged behavior).
         try:
             from ap.rejection_feed import post_master_control_block
             post_master_control_block(
@@ -1463,37 +1611,54 @@ def _dispatch(
         except Exception:
             pass
 
-        # Write to ap_signals as watching for deferrable post-market blocks only
+        # ── DEFERRAL vs TERMINAL REJECTION ────────────────────────────────────
+        # A deferrable block (daily_stop / sizer_blocked / after_hours) that
+        # lands OUTSIDE regular session is NOT a terminal rejection — it is a
+        # setup to reevaluate overnight. It MUST route through the single
+        # deferral authority so trade_queue.status and ap_signals.decision_status
+        # agree (WATCHING + WATCHING). The previous code marked the queue row
+        # REJECTED and then wrote a lowercase ap_signals decision_status="watching"
+        # — the exact split truth this P0 removes (REJECTED queue + watching
+        # signal the overnight reeval could never discover).
+        # reason_code="market_closed_deferred" keeps the row recognizable to the
+        # shared overnight fan-out (_is_shared_watch_signal_row).
         _block_reason = str(decision.reason or "")
-        _is_deferrable = any(k in _block_reason for k in ("daily_stop", "sizer_blocked", "after_hours"))
+        _is_deferrable = any(
+            k in _block_reason for k in ("daily_stop", "sizer_blocked", "after_hours")
+        )
         try:
-            _now_et_def = _now_et()
-            _in_session = _is_regular_session_et(_now_et_def)
-            if not _in_session and _is_deferrable:
-                import uuid as _uuid
-                _sbc = _get_sb_client()
-                if _sbc:
-                    _sig_id = str(payload.get("signal_id") or _uuid.uuid4())
-                    upsert_ap_signal_row_with_fallback(_sbc, {
-                        "signal_id":       _sig_id,
-                        "client_email":    canonical_client_email(client_id),
-                        "system_version":  "v2",
-                        "ticker":          ticker,
-                        "side":            str(payload.get("side") or payload.get("direction") or "CALL").upper(),
-                        "score":           float(payload.get("score") or payload.get("ev_score") or 0),
-                        "tier":            str(payload.get("tier") or "B"),
-                        "pattern":         str(payload.get("pattern") or ""),
-                        "timeframe":       str(payload.get("timeframe") or "1d"),
-                        "entry_trigger":   float(payload.get("entry_price") or payload.get("trigger_price") or 0) or None,
-                        "stop_price":      float(payload.get("stop_price") or 0) or None,
-                        "target_price":    float(payload.get("target_price") or 0) or None,
-                        "decision_status": "watching",
-                        "context_notes":   f"post_market_blocked: {decision.reason}",
-                        "raw_payload":     payload,
-                    })
-                    log.info(f"[{ticker}] Written to ap_signals as watching (post-market queue)")
-        except Exception as _e:
-            log.debug(f"[{ticker}] ap_signals write skipped: {_e}")
+            _in_session = _is_regular_session_et(_now_et())
+        except Exception:
+            # Fail toward terminal rejection — never a phantom deferral.
+            _in_session = True
+        if _is_deferrable and not _in_session:
+            _persist_watching_deferral(
+                job_id=job_id,
+                client_id=client_id,
+                signal_id=signal_id,
+                execution_mode=_execution_mode,
+                payload=payload,
+                stage="master_control",
+                reason_code="market_closed_deferred",
+                human_reason=(
+                    f"After market hours — master control deferred ({_block_reason}). "
+                    "Awaiting overnight reeval. No action needed."
+                ),
+                watching_error=_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR,
+                failure_error="ap_signals_write_failed:master_control_deferred",
+            )
+            return
+
+        # Genuine terminal rejection (in-session, or a non-deferrable reason).
+        _mark_job(job_id, "REJECTED",
+                  result={"stage": decision.stage, "reason": decision.reason})
+        # Permanent structured rejection record — queryable by client/dashboard
+        _log_rejection_to_db(
+            signal_id=signal_id, client_id=client_id, ticker=ticker,
+            side=payload.get("side", ""), score=float(payload.get("score") or 0),
+            stage=decision.stage, reason_code=str(decision.reason or ""),
+            human_reason=str(decision.reason or ""), payload=payload,
+        )
         return
 
     plan = decision.plan

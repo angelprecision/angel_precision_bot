@@ -85,6 +85,27 @@ def test_dispatch_paper_overnight_only_payload_restores_watching_instead_of_dire
 
     monkeypatch.setattr(queue_mod, "_mark_job", lambda job_id, status, *, result=None, error=None: calls.append((status, error)))
 
+    # P0 queue-deferral-truth: the PAPER overnight rescue route now persists the
+    # ap_signals WATCHING row (via the single deferral authority) BEFORE marking
+    # the queue row WATCHING — the overnight reeval only discovers the row via
+    # ap_signals.decision_status='WATCHING'. Provide a working ap_signals writer
+    # so the persistence confirms and the queue row is allowed to become WATCHING.
+    signal_writes: list[dict] = []
+
+    class _Tbl:
+        def upsert(self, row, *a, **kw):
+            signal_writes.append(row)
+            return self
+
+        def execute(self):
+            return {"data": [{"signal_id": "sig-paper"}]}
+
+    class _Sbc:
+        def table(self, _name):
+            return _Tbl()
+
+    monkeypatch.setattr(queue_mod, "_get_sb_client", lambda: _Sbc())
+
     queue_mod._dispatch(
         99,
         "paper-client",
@@ -111,6 +132,10 @@ def test_dispatch_paper_overnight_only_payload_restores_watching_instead_of_dire
     assert ("evaluate", 99) not in calls
     assert ("WATCHING", "after_hours_deferred:awaiting_overnight_reeval") in calls
     assert ("REJECTED", "restart_guard:overnight_skip") not in calls
+    # Discoverability proven: the ap_signals WATCHING row was written before the
+    # queue row was marked WATCHING (single deferral authority, fail-closed).
+    assert signal_writes, "ap_signals WATCHING row must be persisted for the rescue"
+    assert signal_writes[0].get("decision_status") == "WATCHING"
 
 
 def test_manual_restart_guard_bypass_disabled_without_marker():
