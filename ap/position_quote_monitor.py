@@ -34,6 +34,9 @@ MAX_SPREAD_PCT              = float(os.getenv("MAX_OPTION_SPREAD_PCT", "0.18"))
 MAX_SPREAD_ABS              = float(os.getenv("MAX_OPTION_SPREAD_ABS", "0.15"))
 HEARTBEAT_DEGRADED_SEC      = float(os.getenv("QUOTE_HEARTBEAT_DEGRADED_SEC", "10.0"))
 IMMEDIATE_REFRESH_MIN_INTERVAL_SECONDS = float(os.getenv("IMMEDIATE_REFRESH_MIN_INTERVAL_SECONDS", "1.0"))
+QPM_DIRECT_RECOVERY_MIN_INTERVAL_SEC = float(
+    os.getenv("QPM_DIRECT_RECOVERY_MIN_INTERVAL_SEC", "5.0")
+)
 
 # Feature flag: migrate to snapshots-only ownership later by setting this to "0".
 DIRECT_POSITION_WRITES      = os.getenv("QUOTE_MONITOR_DIRECT_WRITES", "1") == "1"
@@ -461,6 +464,8 @@ class APPositionQuoteMonitor:
         self._last_wake_price: dict[str, float] = {}
         self._last_wake_ts:    dict[str, float] = {}
         self._last_immediate_refresh_ts: dict[str, float] = {}
+        self._last_direct_recovery_attempt_ts: dict[str, float] = {}
+        self._last_direct_recovery_result: dict = {}
 
         # P0 (PR #385 amendment): touched_profit consecutive-confirmation tracking.
         # touched_profit must NEVER arm from a single poll or from midpoint P&L.
@@ -519,6 +524,11 @@ class APPositionQuoteMonitor:
             "immediate_retry_evictions": 0,
             "immediate_retry_backoff_suppressed": 0,
             "coverage_incomplete_cycles": 0,
+            "direct_recovery_attempts": 0,
+            "direct_recovery_successes": 0,
+            "direct_recovery_failures": 0,
+            "direct_recovery_cooldown_suppressed": 0,
+            "direct_recovery_backoff_suppressed": 0,
             "exits_gated_blind": 0,    # bumped by exit engine when it gates
             "exits_gated_stale": 0,    # bumped by exit engine when it gates
         }
@@ -612,6 +622,9 @@ class APPositionQuoteMonitor:
         m["health_key"] = self._health_key
         m["cache_namespace"] = self._cache_namespace
         m["binding"] = self.binding_snapshot()
+        m["last_direct_recovery_result"] = dict(
+            self._last_direct_recovery_result
+        )
         m["direct_writes"] = DIRECT_POSITION_WRITES
         return m
 
@@ -826,6 +839,85 @@ class APPositionQuoteMonitor:
         wake_engine = False
         snapshots = []
         positions_fully_fresh = 0
+        recovery_candidates = []
+        effective_quotes: dict[int, tuple] = {}
+
+        # Network recovery must never run while the exit engine's position lock
+        # is held. Resolve bounded candidates first, then apply them through the
+        # ordinary write/snapshot path under the existing lock.
+        for pos in positions:
+            pid = str(_get_attr(pos, "positionid", "position_id", default="") or "")
+            t = str(_get_attr(pos, "ticker", "underlying", default="") or "").upper()
+            c = str(_get_attr(pos, "optionsymbol", "option_symbol", "contract", default="") or "").upper()
+            position_mode = str(
+                _get_attr(
+                    pos,
+                    "executionmode",
+                    "execution_mode",
+                    default="",
+                )
+                or ""
+            ).strip().lower()
+            uq = und_quotes.get(t) or {}
+            oq = opt_quotes.get(c) or {}
+            prior_opt_ts = _get_attr(
+                pos,
+                "lastoptionquoteupdatets",
+                "last_option_quote_update_ts",
+                default=None,
+            )
+            prior_und_ts = _get_attr(
+                pos,
+                "lastunderlyingquoteupdatets",
+                "last_underlying_quote_update_ts",
+                default=None,
+            )
+            recovery = None
+            option_fresh = True
+            underlying_fresh = True
+            if position_mode == "live":
+                option_fresh = self._ordinary_quote_is_fresh(
+                    oq, require_bid=True, now_utc=now_utc
+                )
+                underlying_fresh = self._ordinary_quote_is_fresh(
+                    uq, require_bid=False, now_utc=now_utc
+                )
+                if not (option_fresh and underlying_fresh):
+                    recovery = self._maybe_direct_recover_position(
+                        position=pos,
+                        position_id=pid,
+                        execution_mode=position_mode,
+                        option_symbol=c,
+                        underlying_symbol=t,
+                        now_utc=now_utc,
+                    )
+                    if recovery.get("ok"):
+                        oq = dict(recovery["option_quote"])
+                        oq["bid_ts"] = recovery["option_provider_ts"]
+                        uq = recovery["underlying_quote"]
+                    else:
+                        # Underlying stale truth has no separate emergency
+                        # authority, so do not apply it. Option ASK/MARK/LAST
+                        # remains available to the existing hard-reference
+                        # selector, while its general freshness timestamp is
+                        # restored below.
+                        if not option_fresh:
+                            oq = dict(oq)
+                            oq["bid"] = 0.0
+                            oq.pop("bid_ts", None)
+                            oq.pop("bid_date", None)
+                            oq.pop("bid_timestamp", None)
+                        if not underlying_fresh:
+                            uq = {}
+            effective_quotes[id(pos)] = (
+                uq,
+                oq,
+                recovery,
+                option_fresh,
+                underlying_fresh,
+                prior_opt_ts,
+                prior_und_ts,
+            )
 
         engine_lock = getattr(self.exit_engine, "_lock", None)
         lock_ctx = engine_lock if engine_lock is not None else _NullCtx()
@@ -835,20 +927,61 @@ class APPositionQuoteMonitor:
                 pid = str(_get_attr(pos, "positionid", "position_id", default="") or "")
                 t = str(_get_attr(pos, "ticker", "underlying", default="") or "").upper()
                 c = str(_get_attr(pos, "optionsymbol", "option_symbol", "contract", default="") or "").upper()
+                (
+                    uq,
+                    oq,
+                    recovery,
+                    option_fresh,
+                    underlying_fresh,
+                    prior_opt_ts,
+                    prior_und_ts,
+                ) = effective_quotes[id(pos)]
 
-                uq = und_quotes.get(t) or {}
-                oq = opt_quotes.get(c) or {}
+                if (
+                    recovery
+                    and recovery.get("ok")
+                    and not self._direct_recovery_position_is_current_locked(
+                        recovery, pos
+                    )
+                ):
+                    self._record_direct_recovery_failure(
+                        recovery["key"],
+                        "position_identity_changed_after_fetch",
+                    )
+                    continue
 
                 und_last = self._extract_underlying_price(uq)
                 bid = _safe_float(oq.get("bid"), 0.0)
                 ask = _safe_float(oq.get("ask"), 0.0)
                 opt_price, price_source = self._extract_option_price(oq, bid, ask)
+                option_observation_ts = (
+                    recovery["option_provider_ts"]
+                    if recovery and recovery.get("ok")
+                    else now_utc
+                )
+                bid_observation_ts = option_observation_ts
+                underlying_observation_ts = (
+                    recovery["underlying_provider_ts"]
+                    if recovery and recovery.get("ok")
+                    else now_utc
+                )
+                if recovery and recovery.get("ok"):
+                    bid_observation_ts = (
+                        self._monotonic_bid_observation_ts(
+                            pos,
+                            recovery["option_provider_ts"],
+                            now_utc=now_utc,
+                        )
+                    )
+                    recovery["expected_bid_observation_ts"] = (
+                        bid_observation_ts
+                    )
 
                 if und_last > 0:
                     self._write_field_unconditional(pos, "currentunderlying", und_last)
                     self._write_field_unconditional(pos, "current_underlying", und_last)
-                    self._write_field_unconditional(pos, "lastunderlyingquoteupdatets", now_utc)
-                    self._write_field_unconditional(pos, "last_underlying_quote_update_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastunderlyingquoteupdatets", underlying_observation_ts)
+                    self._write_field_unconditional(pos, "last_underlying_quote_update_ts", underlying_observation_ts)
                     self._write_field_unconditional(pos, "lastunderlyingquotemissingts", None)
                     self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", None)
                 else:
@@ -869,15 +1002,15 @@ class APPositionQuoteMonitor:
                 self._write_field_unconditional(pos, "currentask", ask if ask > 0 else 0.0)
                 self._write_field_unconditional(pos, "current_ask", ask if ask > 0 else 0.0)
                 if bid > 0:
-                    self._write_field_unconditional(pos, "lastoptionbidupdatets", now_utc)
-                    self._write_field_unconditional(pos, "last_option_bid_update_ts", now_utc)
+                    self._write_field_unconditional(pos, "lastoptionbidupdatets", bid_observation_ts)
+                    self._write_field_unconditional(pos, "last_option_bid_update_ts", bid_observation_ts)
 
                 if opt_price > 0:
                     self._write_field(pos, "currentoptionprice", opt_price)
                     self._write_field(pos, "current_option_price", opt_price)
-                    self._write_field_unconditional(pos, "lastoptionquoteupdatets", now_utc)
-                    self._write_field_unconditional(pos, "last_option_quote_update_ts", now_utc)
-                    self._write_field_unconditional(pos, "lastquoteupdatets", now_utc)
+                    self._write_field_unconditional(pos, "lastoptionquoteupdatets", option_observation_ts)
+                    self._write_field_unconditional(pos, "last_option_quote_update_ts", option_observation_ts)
+                    self._write_field_unconditional(pos, "lastquoteupdatets", option_observation_ts)
                     self._write_field_unconditional(pos, "last_option_price_source", price_source)
                     self._write_field_unconditional(pos, "lastoptionpricesource", price_source)
                     self._write_field_unconditional(pos, "lastoptionquotemissingts", None)
@@ -910,12 +1043,40 @@ class APPositionQuoteMonitor:
                         log.debug("[%s] QuoteAuthority write failed for %s: %s",
                                   self.client_id, c, _qa_err)
 
-                    if self._should_wake(c, opt_price):
+                    if (
+                        not (recovery and recovery.get("ok"))
+                        and self._should_wake(c, opt_price)
+                    ):
                         wake_engine = True
                     self._last_push_price[c] = opt_price
                 else:
                     self._write_field_unconditional(pos, "lastoptionquotemissingts", now_utc)
                     self._write_field_unconditional(pos, "last_option_quote_missing_ts", now_utc)
+
+                if recovery and not recovery.get("ok"):
+                    if not option_fresh:
+                        self._write_field_unconditional(
+                            pos, "lastoptionquoteupdatets", prior_opt_ts
+                        )
+                        self._write_field_unconditional(
+                            pos,
+                            "last_option_quote_update_ts",
+                            prior_opt_ts,
+                        )
+                        self._write_field_unconditional(
+                            pos, "lastquoteupdatets", prior_opt_ts
+                        )
+                    if not underlying_fresh:
+                        self._write_field_unconditional(
+                            pos,
+                            "lastunderlyingquoteupdatets",
+                            prior_und_ts,
+                        )
+                        self._write_field_unconditional(
+                            pos,
+                            "last_underlying_quote_update_ts",
+                            prior_und_ts,
+                        )
 
                 cost_basis = (
                     _safe_float(_get_attr(pos, "entryprice", "entry_price", default=None), 0.0)
@@ -1323,6 +1484,27 @@ class APPositionQuoteMonitor:
                     "hard_exit_reference_refresh_needed": _final_href_refresh,
                 })
 
+                if recovery and recovery.get("ok"):
+                    self._write_field_unconditional(
+                        pos,
+                        "last_option_provider_quote_ts",
+                        recovery["option_provider_ts"],
+                    )
+                    self._write_field_unconditional(
+                        pos,
+                        "last_underlying_provider_quote_ts",
+                        recovery["underlying_provider_ts"],
+                    )
+                    snapshots[-1]["last_option_provider_quote_ts"] = recovery[
+                        "option_provider_ts"
+                    ]
+                    snapshots[-1][
+                        "last_underlying_provider_quote_ts"
+                    ] = recovery["underlying_provider_ts"]
+                    recovery["position"] = pos
+                    recovery["snapshot"] = snapshots[-1]
+                    recovery_candidates.append(recovery)
+
                 self._classify_health(pid, c, t, pos)
                 if (
                     _opt_bid_valid
@@ -1344,6 +1526,69 @@ class APPositionQuoteMonitor:
             except Exception as exc:
                 position_state_propagation_ok = False
                 log.warning("[%s] apply_quote_snapshots failed: %s", self.client_id, exc)
+
+        for recovery in recovery_candidates:
+            key = recovery["key"]
+            position = recovery["position"]
+            verify_lock = (
+                engine_lock if engine_lock is not None else _NullCtx()
+            )
+            with verify_lock:
+                exact_position_updated = bool(
+                    self._direct_recovery_position_is_current_locked(
+                        recovery, position
+                    )
+                )
+                if exact_position_updated:
+                    expected_fields = {
+                        "last_option_bid_update_ts": recovery[
+                            "expected_bid_observation_ts"
+                        ],
+                        "lastoptionbidupdatets": recovery[
+                            "expected_bid_observation_ts"
+                        ],
+                        "last_option_quote_update_ts": recovery[
+                            "option_provider_ts"
+                        ],
+                        "lastoptionquoteupdatets": recovery[
+                            "option_provider_ts"
+                        ],
+                        "lastquoteupdatets": recovery[
+                            "option_provider_ts"
+                        ],
+                        "last_underlying_quote_update_ts": recovery[
+                            "underlying_provider_ts"
+                        ],
+                        "lastunderlyingquoteupdatets": recovery[
+                            "underlying_provider_ts"
+                        ],
+                        "last_option_provider_quote_ts": recovery[
+                            "option_provider_ts"
+                        ],
+                        "last_underlying_provider_quote_ts": recovery[
+                            "underlying_provider_ts"
+                        ],
+                    }
+                    exact_position_updated = all(
+                        getattr(position, field, None) == expected
+                        for field, expected in expected_fields.items()
+                    )
+            if exact_position_updated:
+                self._metrics["direct_recovery_successes"] = (
+                    self._metrics.get("direct_recovery_successes", 0) + 1
+                )
+                self._last_direct_recovery_result = {
+                    "ok": True,
+                    "key": key,
+                    "reason": "fresh_provider_truth_applied",
+                    "at": time.time(),
+                }
+                wake_engine = True
+            else:
+                self._record_direct_recovery_failure(
+                    key,
+                    "exact_position_not_updated",
+                )
 
         self._prune_closed(active_ids, active_contracts)
 
@@ -1874,6 +2119,342 @@ class APPositionQuoteMonitor:
         ]
         for k in _stale_tp_keys:
             self._tp_pending_confirm.pop(k, None)
+
+        stale_recovery_keys = [
+            key
+            for key in getattr(
+                self, "_last_direct_recovery_attempt_ts", {}
+            )
+            if key.split("|")[-2] not in active_ids
+        ]
+        for key in stale_recovery_keys:
+            self._last_direct_recovery_attempt_ts.pop(key, None)
+
+    # ── Bounded LIVE direct recovery ─────────────────────────────────────────
+    @staticmethod
+    def _monotonic_bid_observation_ts(
+        position,
+        provider_ts: datetime,
+        *,
+        now_utc: datetime,
+    ):
+        """Advance dedicated BID identity only for a newer provider event."""
+        existing = []
+        for field in (
+            "last_option_bid_update_ts",
+            "lastoptionbidupdatets",
+        ):
+            raw = getattr(position, field, None)
+            normalized = normalize_hard_ref_ts(raw, now_utc=now_utc)
+            if normalized is not None:
+                existing.append((normalized, raw))
+        if not existing:
+            return provider_ts
+        latest_normalized, latest_raw = max(
+            existing, key=lambda item: item[0]
+        )
+        return (
+            provider_ts
+            if provider_ts > latest_normalized
+            else latest_raw
+        )
+
+    def _direct_recovery_position_is_current_locked(
+        self, recovery: dict, position
+    ) -> bool:
+        """Prove the fetched identity still names this exact active object."""
+        index = getattr(self.exit_engine, "_positions_by_id", None)
+        if not isinstance(index, dict):
+            return False
+        position_id = str(recovery.get("position_id") or "").strip()
+        current = index.get(position_id)
+        if current is not position:
+            return False
+        if bool(_get_attr(current, "closed", default=False)):
+            return False
+        try:
+            if int(
+                _get_attr(
+                    current,
+                    "quantity_remaining",
+                    "quantityremaining",
+                    default=0,
+                )
+                or 0
+            ) <= 0:
+                return False
+        except Exception:
+            return False
+        current_mode = str(
+            _get_attr(
+                current,
+                "executionmode",
+                "execution_mode",
+                default="",
+            )
+            or ""
+        ).strip().lower()
+        current_option = str(
+            _get_attr(
+                current,
+                "optionsymbol",
+                "option_symbol",
+                "contract",
+                default="",
+            )
+            or ""
+        ).strip().upper()
+        current_underlying = str(
+            _get_attr(
+                current,
+                "ticker",
+                "underlying",
+                default="",
+            )
+            or ""
+        ).strip().upper()
+        return (
+            current_mode == "live"
+            and current_mode == recovery.get("execution_mode")
+            and current_option == recovery.get("option_symbol")
+            and current_underlying == recovery.get("underlying_symbol")
+        )
+
+    @staticmethod
+    def _provider_quote_ts(quote: dict, *, require_bid: bool) -> Optional[datetime]:
+        if not isinstance(quote, dict):
+            return None
+        keys = (
+            ("bid_ts", "bid_date", "bid_timestamp")
+            if require_bid
+            else (
+                "trade_date",
+                "last_trade_ts",
+                "quote_ts",
+                "timestamp",
+                "bid_date",
+                "ask_date",
+            )
+        )
+        for key in keys:
+            raw = quote.get(key)
+            if raw in (None, "") or isinstance(raw, bool):
+                continue
+            if isinstance(raw, (int, float)):
+                value = float(raw)
+                if value > 10_000_000_000:
+                    raw = value / 1000.0
+            parsed = normalize_hard_ref_ts(raw)
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _quote_has_fresh_provider_truth(
+        self,
+        quote: dict,
+        *,
+        require_bid: bool,
+        now_utc: datetime,
+    ) -> bool:
+        if require_bid:
+            if _safe_float(quote.get("bid"), 0.0) <= 0:
+                return False
+        elif self._extract_underlying_price(quote) <= 0:
+            return False
+        provider_ts = self._provider_quote_ts(
+            quote, require_bid=require_bid
+        )
+        if provider_ts is None:
+            return False
+        age = (now_utc - provider_ts).total_seconds()
+        return -2.0 <= age <= STALE_MAX_SEC
+
+    def _ordinary_quote_is_fresh(
+        self,
+        quote: dict,
+        *,
+        require_bid: bool,
+        now_utc: datetime,
+    ) -> bool:
+        if require_bid:
+            if _safe_float(quote.get("bid"), 0.0) <= 0:
+                return False
+        elif self._extract_underlying_price(quote) <= 0:
+            return False
+        provider_ts = self._provider_quote_ts(
+            quote, require_bid=require_bid
+        )
+        if provider_ts is not None:
+            age = (now_utc - provider_ts).total_seconds()
+            return 0.0 <= age <= STALE_MAX_SEC
+        receipt_ts = normalize_hard_ref_ts(
+            quote.get("_ap_receipt_epoch"), now_utc=now_utc
+        )
+        if receipt_ts is None:
+            # Compatibility for broker/test seams that return a positive quote
+            # without transport metadata. Direct recovery itself remains strict.
+            return True
+        age = (now_utc - receipt_ts).total_seconds()
+        return 0.0 <= age <= STALE_MAX_SEC
+
+    def _record_direct_recovery_failure(self, key: str, reason: str) -> dict:
+        self._metrics["direct_recovery_failures"] = (
+            self._metrics.get("direct_recovery_failures", 0) + 1
+        )
+        result = {
+            "ok": False,
+            "key": key,
+            "reason": reason,
+            "at": time.time(),
+        }
+        self._last_direct_recovery_result = result
+        return result
+
+    def _maybe_direct_recover_position(
+        self,
+        *,
+        position,
+        position_id: str,
+        execution_mode: str,
+        option_symbol: str,
+        underlying_symbol: str,
+        now_utc: datetime,
+    ) -> dict:
+        key = "|".join(
+            [
+                str(self.client_id or "").strip(),
+                str(execution_mode or "").strip().lower(),
+                str(position_id or "").strip(),
+                str(option_symbol or "").strip().upper(),
+            ]
+        )
+        if execution_mode != "live":
+            return {"ok": False, "key": key, "reason": "not_live"}
+        attempts = getattr(
+            self, "_last_direct_recovery_attempt_ts", None
+        )
+        if attempts is None:
+            attempts = {}
+            self._last_direct_recovery_attempt_ts = attempts
+        now_epoch = time.time()
+        if not position_id:
+            if (
+                now_epoch - attempts.get(key, 0.0)
+                < QPM_DIRECT_RECOVERY_MIN_INTERVAL_SEC
+            ):
+                self._metrics["direct_recovery_cooldown_suppressed"] = (
+                    self._metrics.get(
+                        "direct_recovery_cooldown_suppressed", 0
+                    )
+                    + 1
+                )
+                return {
+                    "ok": False,
+                    "key": key,
+                    "reason": "cooldown",
+                }
+            attempts[key] = now_epoch
+            log.critical(
+                "[%s] LIVE_DIRECT_QUOTE_RECOVERY_POSITION_ID_MISSING "
+                "contract=%s",
+                self.client_id,
+                option_symbol,
+            )
+            return self._record_direct_recovery_failure(
+                key, "missing_position_id"
+            )
+        if not option_symbol or not underlying_symbol:
+            if (
+                now_epoch - attempts.get(key, 0.0)
+                < QPM_DIRECT_RECOVERY_MIN_INTERVAL_SEC
+            ):
+                self._metrics["direct_recovery_cooldown_suppressed"] = (
+                    self._metrics.get(
+                        "direct_recovery_cooldown_suppressed", 0
+                    )
+                    + 1
+                )
+                return {
+                    "ok": False,
+                    "key": key,
+                    "reason": "cooldown",
+                }
+            attempts[key] = now_epoch
+            return self._record_direct_recovery_failure(
+                key, "missing_symbol"
+            )
+
+        global _SHARED_BACKOFF_UNTIL
+        if now_epoch < _SHARED_BACKOFF_UNTIL:
+            self._metrics["direct_recovery_backoff_suppressed"] = (
+                self._metrics.get(
+                    "direct_recovery_backoff_suppressed", 0
+                )
+                + 1
+            )
+            return {
+                "ok": False,
+                "key": key,
+                "reason": "global_rate_limit_backoff",
+            }
+        last_attempt = attempts.get(key, 0.0)
+        if (
+            now_epoch - last_attempt
+            < QPM_DIRECT_RECOVERY_MIN_INTERVAL_SEC
+        ):
+            self._metrics["direct_recovery_cooldown_suppressed"] = (
+                self._metrics.get(
+                    "direct_recovery_cooldown_suppressed", 0
+                )
+                + 1
+            )
+            return {"ok": False, "key": key, "reason": "cooldown"}
+
+        attempts[key] = now_epoch
+        self._metrics["direct_recovery_attempts"] = (
+            self._metrics.get("direct_recovery_attempts", 0) + 1
+        )
+        quotes = self._fetch_batch([underlying_symbol, option_symbol])
+        validation_now_utc = _utc_now()
+        option_quote = quotes.get(option_symbol) or {}
+        underlying_quote = quotes.get(underlying_symbol) or {}
+        option_provider_ts = self._provider_quote_ts(
+            option_quote, require_bid=True
+        )
+        underlying_provider_ts = self._provider_quote_ts(
+            underlying_quote, require_bid=False
+        )
+        if not self._quote_has_fresh_provider_truth(
+            option_quote,
+            require_bid=True,
+            now_utc=validation_now_utc,
+        ):
+            return self._record_direct_recovery_failure(
+                key, "option_provider_truth_stale_or_missing"
+            )
+        if not self._quote_has_fresh_provider_truth(
+            underlying_quote,
+            require_bid=False,
+            now_utc=validation_now_utc,
+        ):
+            return self._record_direct_recovery_failure(
+                key, "underlying_provider_truth_stale_or_missing"
+            )
+        return {
+            "ok": True,
+            "key": key,
+            "reason": "fresh_provider_truth_fetched",
+            "position_id": str(position_id or "").strip(),
+            "execution_mode": str(execution_mode or "").strip().lower(),
+            "option_symbol": str(option_symbol or "").strip().upper(),
+            "underlying_symbol": str(
+                underlying_symbol or ""
+            ).strip().upper(),
+            "option_quote": option_quote,
+            "underlying_quote": underlying_quote,
+            "option_provider_ts": option_provider_ts,
+            "underlying_provider_ts": underlying_provider_ts,
+        }
 
     # ── Quote fetch (shared cache + 429 backoff) ─────────────────────────────
     def _cache_key(self, symbol: str) -> str:
