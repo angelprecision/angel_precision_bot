@@ -138,7 +138,14 @@ def sb(monkeypatch):
 
 @pytest.fixture
 def marks(monkeypatch):
-    """Capture every _mark_job(job_id, status, error=, result=) call."""
+    """Capture every _mark_job(job_id, status, error=, result=) call.
+
+    Also stubs _checked_watching_cas to return True (simulating a successful
+    single-row queue CAS) so tests that exercise _persist_watching_deferral or
+    _dispatch do not require a live Postgres connection.  Tests that specifically
+    exercise CAS failure (test_4e, test_4f) override this with their own
+    monkeypatch after the fixture runs.
+    """
     recorded: list[dict] = []
 
     def _fake_mark(job_id, status, *, result=None, error=None):
@@ -147,6 +154,19 @@ def marks(monkeypatch):
         )
 
     monkeypatch.setattr(queue, "_mark_job", _fake_mark)
+
+    # Default: CAS succeeds (rowcount == 1) AND records a WATCHING mark so that
+    # assertions like `[m["status"] for m in marks if m["job_id"] == X]` still
+    # see ["WATCHING"] without requiring a live Postgres connection.
+    # Tests that exercise CAS failure (test_4e, test_4f) override this.
+    def _fake_cas(job_id, *, watching_error=None, watching_result=None):
+        recorded.append(
+            {"job_id": job_id, "status": "WATCHING",
+             "result": watching_result, "error": watching_error}
+        )
+        return True
+
+    monkeypatch.setattr(queue, "_checked_watching_cas", _fake_cas)
     return recorded
 
 
@@ -300,6 +320,15 @@ def test_3_paper_overnight_only_persists_signal_before_watching(monkeypatch, sb)
         order.append(f"mark:{status}")
 
     monkeypatch.setattr(queue, "_mark_job", _fake_mark)
+
+    # _checked_watching_cas now owns the WATCHING queue transition; stub it so
+    # it (a) doesn't hit the real DB and (b) records the ordering event the
+    # assertions below depend on.
+    def _fake_cas(job_id, *, watching_error=None, watching_result=None):
+        order.append("mark:WATCHING")
+        return True
+
+    monkeypatch.setattr(queue, "_checked_watching_cas", _fake_cas)
 
     mc = _MC(_Decision(ok=True, stage="ok", reason=""))  # never reached
 
@@ -574,6 +603,144 @@ def test_9_no_split_truth_on_deferral(monkeypatch, sb, marks):
     # It resolved consistently as WATCHING + WATCHING.
     assert queue_status == ["WATCHING"]
     assert signal_status == ["WATCHING"]
+
+
+def test_2c_malformed_score_in_dispatch_does_not_raise(monkeypatch, sb, marks):
+    """Blocker 1 regression: _dispatch() with score='A+', decision.ok=False,
+    reason='daily_stop_hit', in_session=False must:
+      - not raise (float("A+") used to crash before _persist_watching_deferral);
+      - leave queue=WATCHING (deferral path, not terminal);
+      - never call mark_missed (opportunity ledger must not be terminalized);
+      - never emit a REJECT trace (trace_gate must not be called with REJECT);
+      - never call the rejection feed;
+      - touch zero money-path collaborators (selector/OSM/watcher/broker).
+    """
+    _isolate_dispatch(monkeypatch, in_session=False)
+
+    reject_traces: list[dict] = []
+    _orig_trace = queue.trace_gate
+
+    def _spy_trace(*args, **kwargs):
+        if "REJECT" in str(args) or kwargs.get("disposition") == "REJECT":
+            reject_traces.append({"args": args, "kwargs": kwargs})
+
+    monkeypatch.setattr(queue, "trace_gate", _spy_trace)
+
+    missed_calls: list = []
+    sys.modules["ap.opportunity_ledger"].mark_missed = lambda *a, **k: missed_calls.append((a, k))
+
+    rejection_feed_calls: list = []
+    sys.modules["ap.rejection_feed"].post_master_control_block = (
+        lambda **k: rejection_feed_calls.append(k)
+    )
+
+    selector, osm, watcher, broker = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    mc = _MC(_Decision(ok=False, stage="risk", reason="daily_stop_hit"))
+
+    # Must not raise — float("A+") previously crashed before the deferral guard.
+    queue._dispatch(
+        299, "zara@example.com", "sig-2c",
+        {"ticker": "BAC", "side": "PUT", "score": "A+", "timeframe": "1d"},
+        master_control=mc, contract_selector=selector,
+        order_state_machine=osm, entry_watcher=watcher, broker=broker,
+    )
+
+    # Queue: WATCHING (deferral, not terminal).
+    statuses = [m["status"] for m in marks if m["job_id"] == 299]
+    assert statuses == ["WATCHING"], f"expected [WATCHING], got {statuses}"
+
+    # Opportunity ledger: mark_missed must NOT have been called.
+    assert not missed_calls, (
+        f"mark_missed must not be called on a deferral — called {len(missed_calls)}x"
+    )
+
+    # Trace gate: no REJECT disposition emitted.
+    assert not reject_traces, (
+        f"trace_gate must not emit REJECT on a deferral — got {reject_traces}"
+    )
+
+    # Rejection feed: not called.
+    assert not rejection_feed_calls, (
+        f"rejection feed must not fire on a deferral — got {rejection_feed_calls}"
+    )
+
+    # ap_signals: one uppercase WATCHING row.
+    assert _signal_rows(sb, "WATCHING"), "ap_signals must hold an uppercase WATCHING row"
+    assert not _signal_rows(sb, "watching"), "lowercase watching must not appear"
+
+    # Money-path collaborators: silent.
+    selector.select.assert_not_called()
+    osm.create_entry_order.assert_not_called()
+    watcher.watch.assert_not_called()
+    for meth in ("submit_order", "submit", "cancel_order", "cancel"):
+        getattr(broker, meth, MagicMock()).assert_not_called()
+
+
+def test_4e_queue_cas_raises_returns_false(monkeypatch, sb, marks):
+    """Blocker 2: if _checked_watching_cas returns False because an exception was
+    raised internally (e.g. DB connection lost after ap_signals write succeeded),
+    _persist_watching_deferral must return False (not True), attempt best-effort
+    signal revert, and best-effort mark the queue ERROR. No true success can be
+    returned on an unverifiable queue transition.
+
+    NOTE: _checked_watching_cas catches all exceptions internally and returns
+    False — callers of _persist_watching_deferral never see the raw exception.
+    This test simulates that path by patching the CAS to return False directly,
+    mirroring what _checked_watching_cas does when its UPDATE raises."""
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: False,  # mirrors _checked_watching_cas catching an exception
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=491,
+        client_id="henry@example.com",
+        signal_id="sig-4e",
+        execution_mode="paper",
+        payload={"ticker": "MSFT", "side": "CALL", "score": 74, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="after hours",
+    )
+    # Must return False — never True on a CAS failure.
+    assert ok is False, "helper must return False when queue CAS raises"
+
+    # Queue must not hold a WATCHING status — only ERROR from compensation.
+    queue_statuses = [m["status"] for m in marks if m["job_id"] == 491]
+    assert "WATCHING" not in queue_statuses, (
+        f"WATCHING must not appear when CAS raises — got {queue_statuses}"
+    )
+
+
+def test_4f_queue_cas_zero_rows_returns_false(monkeypatch, sb, marks):
+    """Blocker 2: if _checked_watching_cas returns False (zero rows updated),
+    _persist_watching_deferral must return False, attempt signal revert, and
+    best-effort mark queue ERROR. No false success."""
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: False,  # simulates 0 rows updated
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=492,
+        client_id="irene@example.com",
+        signal_id="sig-4f",
+        execution_mode="live",
+        payload={"ticker": "NVDA", "side": "PUT", "score": 68, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="after hours",
+    )
+    assert ok is False, "helper must return False when CAS returns False (0 rows)"
+
+    queue_statuses = [m["status"] for m in marks if m["job_id"] == 492]
+    assert "WATCHING" not in queue_statuses, (
+        f"WATCHING must not appear when CAS returns False — got {queue_statuses}"
+    )
+    # Compensation must attempt ERROR.
+    assert any(m["status"] == "ERROR" for m in marks if m["job_id"] == 492), (
+        "compensation must best-effort mark queue ERROR after CAS failure"
+    )
 
 
 def test_9b_no_direct_lowercase_write_in_queue_source():

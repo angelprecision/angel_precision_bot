@@ -1149,10 +1149,101 @@ def _persist_watching_deferral(
         _mark_job(job_id, "ERROR", error=_fail)
         return False
 
-    # (6) confirmed discoverable — now (and only now) mark the exact queue row
-    # WATCHING. Scoped to this job_id; preserves per-client isolation.
-    _mark_job(job_id, "WATCHING", result=watching_result, error=watching_error)
+    # (6) CAS the queue row to WATCHING, confirmed. A bare _mark_job call cannot
+    # verify that the queue row actually transitioned — it returns None regardless
+    # of rowcount. A failed or zero-row queue write after a successful ap_signals
+    # write creates split truth (ap_signals=WATCHING, trade_queue=PROCESSING or
+    # ERROR). _checked_watching_cas requires rowcount==1.
+    #
+    # NOTE: two separate databases (Supabase Postgres for ap_signals, primary
+    # Postgres for trade_queue) means perfect atomicity is impossible. What this
+    # guarantees is a checked transition plus loud, best-effort compensation on
+    # failure. The PR description no longer claims "atomic consistency".
+    _cas_ok = _checked_watching_cas(
+        job_id,
+        watching_error=watching_error,
+        watching_result=watching_result,
+    )
+    if not _cas_ok:
+        log.critical(
+            "DEFERRAL_QUEUE_CAS_FAILED job_id=%s signal_id=%s client=%s mode=%s — "
+            "ap_signals is WATCHING but queue CAS confirmed 0 rows updated. "
+            "Best-effort signal revert attempted. Manual reconciliation required.",
+            job_id, _sig, _client, _mode,
+        )
+        # Best-effort: overwrite the ap_signals WATCHING row with ERROR so it
+        # is not silently discoverable as a valid overnight deferral.
+        try:
+            _log_signal_to_db(
+                signal_id=_sig,
+                client_id=_client,
+                ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
+                side=str(_payload.get("side") or _payload.get("direction") or ""),
+                score=_score,
+                stage=stage,
+                reason_code="PERSISTENCE_FAILURE",
+                human_reason="Queue CAS failed — ap_signals reverted from WATCHING.",
+                payload=_payload,
+                decision_status="ERROR",
+                queued_at=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception:
+            log.exception(
+                "DEFERRAL_SIGNAL_REVERT_FAILED job_id=%s — ap_signals may remain "
+                "WATCHING with no matching queue row. Operator action required.",
+                job_id,
+            )
+        # Best-effort: mark queue ERROR so the operator sees the failure.
+        try:
+            _mark_job(job_id, "ERROR", error=f"{_fail}:queue_cas_failed")
+        except Exception:
+            pass
+        return False
     return True
+
+
+def _checked_watching_cas(
+    job_id: int,
+    *,
+    watching_error: str | None = None,
+    watching_result: dict | None = None,
+) -> bool:
+    """CAS: UPDATE trade_queue SET status='WATCHING' WHERE id=%s AND status='PROCESSING'.
+
+    Returns True iff exactly 1 row was updated, confirming the queue row now
+    holds WATCHING scoped to this job_id. Returns False if zero rows were updated
+    (row already terminal, wrong owner, or id mismatch) or if the UPDATE raises.
+    Never raises — caller handles compensation.
+
+    Uses non-destructive JSONB meta merge (meta || ...) per standing schema rules.
+    Does NOT touch result_json (deprecated column).
+    """
+    try:
+        def _fn() -> int:
+            with _conn()() as c:
+                c.execute(
+                    """
+                    UPDATE trade_queue
+                    SET   status     = 'WATCHING',
+                          meta       = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                          last_error = %s
+                    WHERE id     = %s
+                      AND status = 'PROCESSING'
+                    """,
+                    (
+                        _json_dumps(watching_result or {}),
+                        watching_error,
+                        job_id,
+                    ),
+                )
+                return c.rowcount
+        return _run_with_retry(_fn) == 1
+    except Exception:
+        log.exception(
+            "_checked_watching_cas raised for job_id=%s — treating as CAS failure",
+            job_id,
+        )
+        return False
 
 
 def _dispatch(
@@ -1616,48 +1707,22 @@ def _dispatch(
         log.info(f"[{ticker}] BLOCKED | stage={decision.stage} reason={decision.reason}")
 
 
-        # PR1 + Amendment §4: map MC reason to canonical miss stage instead
-        # of always writing STAGE_UNKNOWN.
-        try:
-            from ap.opportunity_ledger import mark_missed, map_reason_to_stage
-            _mc_stage = map_reason_to_stage(
-                f"{decision.stage or ''} {decision.reason or ''}"
-            )
-            mark_missed(signal_id, client_id, _mc_stage,
-                        str(decision.reason or "mc_blocked"),
-                        canonical_signal_id=_canonical_signal_id,
-                        extra_meta={"mc_decision_stage": str(decision.stage or ""),
-                                    "mc_decision_reason": str(decision.reason or "")})
-        except Exception: pass
-        trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
-                   reason=decision.reason, score=float(payload.get("score") or 0))
-
-        # Post the master-control block to Discord (informational — fires for
-        # every block, deferral or terminal; unchanged behavior).
-        try:
-            from ap.rejection_feed import post_master_control_block
-            post_master_control_block(
-                ticker=ticker,
-                side=payload.get("side", ""),
-                stage=decision.stage,
-                reason=decision.reason,
-                score=float(payload.get("score") or 0),
-                pattern=payload.get("pattern_id") or payload.get("pattern", ""),
-            )
-        except Exception:
-            pass
-
-        # ── DEFERRAL vs TERMINAL REJECTION ────────────────────────────────────
+        # ── CLASSIFY FIRST: deferral vs genuine terminal rejection ─────────────
         # A deferrable block (daily_stop / sizer_blocked / after_hours) that
         # lands OUTSIDE regular session is NOT a terminal rejection — it is a
-        # setup to reevaluate overnight. It MUST route through the single
-        # deferral authority so trade_queue.status and ap_signals.decision_status
-        # agree (WATCHING + WATCHING). The previous code marked the queue row
-        # REJECTED and then wrote a lowercase ap_signals decision_status="watching"
-        # — the exact split truth this P0 removes (REJECTED queue + watching
-        # signal the overnight reeval could never discover).
-        # reason_code="market_closed_deferred" keeps the row recognizable to the
-        # shared overnight fan-out (_is_shared_watch_signal_row).
+        # setup to reevaluate overnight. Classify BEFORE calling mark_missed,
+        # trace_gate, or the rejection feed: a deferred setup must NEVER be
+        # terminalized in the opportunity ledger, traced as REJECT, or broadcast
+        # as rejected — it remains live, awaiting overnight reeval.
+        #
+        # The previous ordering ran mark_missed → trace_gate(REJECT) → rejection
+        # feed FIRST, then checked deferrability. That created two defects:
+        #   1. float(payload["score"]) in trace_gate crashed on malformed scanner
+        #      scores (e.g. "A+") before _persist_watching_deferral was reached.
+        #   2. mark_missed stamped the opportunity MISSED (rank 90) in the ledger;
+        #      a later overnight rearm could not repair that terminal status.
+        # reason_code="market_closed_deferred" keeps the row recognizable to
+        # the shared overnight fan-out (_is_shared_watch_signal_row).
         _block_reason = str(decision.reason or "")
         _is_deferrable = any(
             k in _block_reason for k in ("daily_stop", "sizer_blocked", "after_hours")
@@ -1685,13 +1750,50 @@ def _dispatch(
             )
             return
 
-        # Genuine terminal rejection (in-session, or a non-deferrable reason).
+        # ── GENUINE TERMINAL REJECTION ─────────────────────────────────────────
+        # Only reaches here when: in-session, or a non-deferrable reason.
+        # Safe to terminalize the opportunity ledger, emit the REJECT trace,
+        # and broadcast the rejection feed.
+
+        # PR1 + Amendment §4: map MC reason to canonical miss stage instead
+        # of always writing STAGE_UNKNOWN.
+        try:
+            from ap.opportunity_ledger import mark_missed, map_reason_to_stage
+            _mc_stage = map_reason_to_stage(
+                f"{decision.stage or ''} {decision.reason or ''}"
+            )
+            mark_missed(signal_id, client_id, _mc_stage,
+                        str(decision.reason or "mc_blocked"),
+                        canonical_signal_id=_canonical_signal_id,
+                        extra_meta={"mc_decision_stage": str(decision.stage or ""),
+                                    "mc_decision_reason": str(decision.reason or "")})
+        except Exception: pass
+        # _safe_float guards against malformed scanner scores ("A+") on the
+        # terminal path — the float() call that was here previously would have
+        # raised; we now use the same guard as _persist_watching_deferral.
+        trace_gate(str(payload.get("signal_id","")), ticker, "MC_REJECTED", "REJECT",
+                   reason=decision.reason, score=_safe_float(payload.get("score") or 0))
+
+        # Post the master-control terminal block to Discord.
+        try:
+            from ap.rejection_feed import post_master_control_block
+            post_master_control_block(
+                ticker=ticker,
+                side=payload.get("side", ""),
+                stage=decision.stage,
+                reason=decision.reason,
+                score=_safe_float(payload.get("score") or 0),
+                pattern=payload.get("pattern_id") or payload.get("pattern", ""),
+            )
+        except Exception:
+            pass
+
+        # Permanent structured terminal rejection.
         _mark_job(job_id, "REJECTED",
                   result={"stage": decision.stage, "reason": decision.reason})
-        # Permanent structured rejection record — queryable by client/dashboard
         _log_rejection_to_db(
             signal_id=signal_id, client_id=client_id, ticker=ticker,
-            side=payload.get("side", ""), score=float(payload.get("score") or 0),
+            side=payload.get("side", ""), score=_safe_float(payload.get("score") or 0),
             stage=decision.stage, reason_code=str(decision.reason or ""),
             human_reason=str(decision.reason or ""), payload=payload,
         )
