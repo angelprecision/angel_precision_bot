@@ -700,6 +700,7 @@ class ClientRunner(threading.Thread):
         self.order_monitor = None
         self.quotemonitor = None
         self.quote_monitor = None
+        self._position_quote_monitor_lock = threading.Lock()
         self.broker = None
         self.data_broker = None
         self.databroker = None
@@ -1488,14 +1489,6 @@ class ClientRunner(threading.Thread):
             logger.warning("[%s] PositionQuoteMonitor unavailable: import failed", self.email)
             return
 
-        existing = getattr(self, "quotemonitor", None) or getattr(self, "quote_monitor", None)
-        if existing is not None:
-            try:
-                if existing.is_alive():
-                    return
-            except Exception:
-                pass
-
         core = getattr(self, "core", None)
         broker = (
             broker
@@ -1523,6 +1516,17 @@ class ClientRunner(threading.Thread):
             logger.error("[%s] PositionQuoteMonitor not started: exit engine missing", self.email)
             return
 
+        client_id = str(self.email or "").strip()
+        execution_mode = str(self.mode or "").strip().lower()
+        if execution_mode not in {"live", "paper"}:
+            logger.critical(
+                "[%s] PositionQuoteMonitor not started: "
+                "invalid execution mode %r",
+                self.email,
+                self.mode,
+            )
+            return
+
         def _qpm_alert(msg: str) -> None:
             try:
                 logger.warning("[%s] %s", self.email, msg)
@@ -1532,40 +1536,119 @@ class ClientRunner(threading.Thread):
             except Exception as _e:
                 logger.warning("runner_dashboard_alert_failed_2: %s", _e)
 
-        qm = APPositionQuoteMonitor(
-            broker=broker,
-            client_id=self.email,
-            exit_engine=exit_eng,
-            alert_fn=_qpm_alert,
-        )
+        lock = getattr(self, "_position_quote_monitor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._position_quote_monitor_lock = lock
 
-        attach = (
-            getattr(exit_eng, "attach_quote_monitor", None)
-            or getattr(exit_eng, "attachquotemonitor", None)
-        )
-        if callable(attach):
-            attach(qm)
-        else:
+        with lock:
+            existing = (
+                getattr(self, "quotemonitor", None)
+                or getattr(self, "quote_monitor", None)
+            )
+            existing_alive = False
+            try:
+                existing_alive = bool(existing and existing.is_alive())
+            except Exception:
+                existing_alive = False
+
+            if existing_alive:
+                try:
+                    if existing.binding_matches(
+                        client_id=client_id,
+                        execution_mode=execution_mode,
+                        broker=broker,
+                        exit_engine=exit_eng,
+                    ):
+                        return
+                except Exception:
+                    pass
+                old_binding = {}
+                try:
+                    old_binding = existing.binding_snapshot()
+                except Exception:
+                    old_binding = {"monitor": repr(existing)}
+                logger.critical(
+                    "[%s] Replacing alive PositionQuoteMonitor with wrong binding "
+                    "old=%s new_client=%s new_mode=%s new_broker=%s new_exit_engine=%s",
+                    self.email,
+                    old_binding,
+                    client_id,
+                    execution_mode or "unknown",
+                    f"{broker.__class__.__module__}.{broker.__class__.__qualname__}@{id(broker):x}",
+                    f"{exit_eng.__class__.__module__}.{exit_eng.__class__.__qualname__}@{id(exit_eng):x}",
+                )
+
+            if existing is not None:
+                try:
+                    existing.stop()
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] PositionQuoteMonitor cleanup failed: %s",
+                        self.email,
+                        exc,
+                    )
+                try:
+                    if existing.is_alive():
+                        logger.critical(
+                            "[%s] PositionQuoteMonitor replacement blocked: "
+                            "old monitor did not stop",
+                            self.email,
+                        )
+                        return
+                except Exception:
+                    logger.critical(
+                        "[%s] PositionQuoteMonitor replacement blocked: "
+                        "old monitor liveness is unknown",
+                        self.email,
+                    )
+                    return
+
+            qm = APPositionQuoteMonitor(
+                broker=broker,
+                client_id=client_id,
+                exit_engine=exit_eng,
+                execution_mode=execution_mode,
+                alert_fn=_qpm_alert,
+            )
+
+            attach = (
+                getattr(exit_eng, "attach_quote_monitor", None)
+                or getattr(exit_eng, "attachquotemonitor", None)
+            )
+            if callable(attach):
+                attach(qm)
+            else:
+                try:
+                    setattr(exit_eng, "quote_monitor", qm)
+                    setattr(exit_eng, "quotemonitor", qm)
+                except Exception as _e:
+                    logger.warning("runner_exit_eng_quote_monitor_setattr_failed: %s", _e)
+
+            self.quote_monitor = qm
+            self.quotemonitor = qm
             try:
                 setattr(exit_eng, "quote_monitor", qm)
                 setattr(exit_eng, "quotemonitor", qm)
             except Exception as _e:
-                logger.warning("runner_exit_eng_quote_monitor_setattr_failed: %s", _e)
+                logger.warning("runner_exit_eng_quote_monitor_setattr_failed_2: %s", _e)
 
-        self.quote_monitor = qm
-        self.quotemonitor = qm
-        try:
-            setattr(exit_eng, "quote_monitor", qm)
-            setattr(exit_eng, "quotemonitor", qm)
-        except Exception as _e:
-            logger.warning("runner_exit_eng_quote_monitor_setattr_failed_2: %s", _e)
-
-        qm.start()
-        logger.info("[%s] PositionQuoteMonitor started and attached to exit engine", self.email)
+            qm.start()
+            logger.info(
+                "[%s] PositionQuoteMonitor started and attached to exit engine",
+                self.email,
+            )
 
         # ── Start ExitReliabilityMonitor alongside QPM ────────────────────────
         # Checks every 60s for: GREEN_NO_DECISION, DECISION_NO_ORDER, STALE_EXIT_ORDER
         try:
+            existing_erm = getattr(self, "exit_reliability_monitor", None)
+            if existing_erm is not None:
+                try:
+                    if existing_erm.is_alive():
+                        return
+                except Exception:
+                    return
             from ap.exit_reliability_monitor import ExitReliabilityMonitor
             erm = ExitReliabilityMonitor(
                 client_id=self.email,
