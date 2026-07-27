@@ -77,29 +77,23 @@ def _normalize_ts(value: Any) -> str:
         else:
             normalized = normalized.astimezone(timezone.utc)
         return normalized.isoformat(timespec="microseconds")
-    text = str(value).strip()
-    return text
+    return str(value).strip()
 
 
 def _observation_key(pos: Any) -> str:
-    """Key a candidate breach to the exact BID observation that produced it.
+    """Key a candidate breach to the dedicated BID observation timestamp.
 
-    The timestamp is the primary identity.  BID is included so a malformed
-    producer that reuses a timestamp while changing the price still cannot make
-    two evaluations of the *same* object count as two independent observations.
-    Missing timestamps intentionally collapse to one key; the guard then keeps
-    holding rather than certifying a durable soft exit without provenance.
+    A changed numeric BID with the same timestamp is still one observation, not
+    independent confirmation.  Missing timestamps intentionally collapse to the
+    same key; the guard then keeps holding rather than certifying a durable soft
+    exit without quote provenance.
     """
     bid_ts = getattr(
         pos,
         "last_option_bid_update_ts",
         getattr(pos, "lastoptionbidupdatets", None),
     )
-    bid = _float(
-        getattr(pos, "current_bid", getattr(pos, "currentbid", 0.0)),
-        0.0,
-    )
-    return f"{_normalize_ts(bid_ts)}|{bid:.8f}"
+    return _normalize_ts(bid_ts) or "missing_bid_timestamp"
 
 
 def _reset_state(pos: Any) -> None:
@@ -142,7 +136,7 @@ def wrap_evaluate_exit(
         code = _decision_code(decision, classify_decision)
         if not _is_live_touched_profit_stop(pos, decision, code):
             # A recovered quote returns HOLD, while genuine hard/runner/EOD exits
-            # return their own code.  Either way, an interrupted sequence is not
+            # return their own code. Either way, an interrupted sequence is not
             # durable and must restart from observation one.
             _reset_state(pos)
             return decision
