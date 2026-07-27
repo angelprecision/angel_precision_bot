@@ -454,14 +454,17 @@ def test_invalid_market_data_url_fails_before_token_enters_config(bad_url):
         "https://api.tradier.com",
         "https://api.tradier.com/",
         "https://api.tradier.com/v1",
+        "https://api.tradier.com/v1/",
         "https://api.tradier.com:443",
     ],
 )
-def test_exact_tradier_https_transport_is_allowed(valid_url):
-    """Positive proof: the exact canonical Tradier live HTTPS transport is
-    accepted (with or without trailing slash, with a path, with the default
-    port explicit), and the token-bearing TradierConfig is built exactly once
-    with the expected inputs.
+def test_exact_tradier_https_transport_is_normalized(valid_url):
+    """PR #391 amendment: every accepted canonical variant NORMALIZES to
+    the single canonical origin form. Preserving the raw input (with a
+    trailing slash or /v1 prefix) would produce broken concatenated URLs
+    at request time because TradierBroker builds
+        base_url + "/v1/markets/quotes"
+    and every endpoint path already begins with /v1.
     """
     config_calls = []
 
@@ -495,7 +498,39 @@ def test_exact_tradier_https_transport_is_allowed(valid_url):
     )
 
     assert result["data_broker"] is not None
-    assert result["base_url"] == valid_url
+    assert result["base_url"] == "https://api.tradier.com"
     assert len(config_calls) == 1
-    assert config_calls[0]["base_url"] == valid_url
+    assert config_calls[0]["base_url"] == "https://api.tradier.com"
     assert config_calls[0]["access_token"] == "secret-market-data-token"
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://api.tradier.com/foo",
+        "https://api.tradier.com/v2",
+        "https://api.tradier.com/v1/markets",
+        "https://api.tradier.com//evil",
+    ],
+)
+def test_unrecognized_tradier_path_is_rejected(bad_url):
+    """PR #391 amendment: base URL is an ORIGIN, not an API prefix. Only
+    the empty/root path and /v1 (with or without trailing slash) survive
+    normalization. Every other path — even on the canonical host — must
+    fail closed, because the real broker concatenates base_url + '/v1/...'
+    when making requests.
+    """
+    with pytest.raises(MarketDataTransportConfigurationError):
+        resolve_market_data_transport(
+            mode="PAPER",
+            account_id="paper-account",
+            execution_broker=SimpleNamespace(
+                cfg=SimpleNamespace(base_url="https://sandbox.tradier.com")
+            ),
+            env={
+                "TRADIER_MARKET_DATA_TOKEN": "secret-market-data-token",
+                "TRADIER_MARKET_DATA_BASE_URL": bad_url,
+            },
+            broker_cls=lambda cfg: SimpleNamespace(cfg=cfg),
+            broker_config_cls=lambda **kw: SimpleNamespace(**kw),
+        )

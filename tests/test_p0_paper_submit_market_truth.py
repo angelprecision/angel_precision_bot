@@ -1268,6 +1268,7 @@ class TestPaperDataTransportProof:
             "https://api.tradier.com",
             "https://api.tradier.com/",
             "https://api.tradier.com/v1",
+            "https://api.tradier.com/v1/",
             "https://api.tradier.com:443",
         ],
     )
@@ -1276,6 +1277,37 @@ class TestPaperDataTransportProof:
         assert proof["proven"] is True
         assert proof["host"] == "api.tradier.com"
         assert proof["sandbox"] is False
+        # PR #391 amendment: every accepted variant NORMALIZES to the
+        # canonical origin. Preserving the raw input would produce broken
+        # URLs at request time (base_url + "/v1/markets/quotes").
+        assert proof["base_url"] == "https://api.tradier.com"
+
+    @pytest.mark.parametrize(
+        "bad_url",
+        [
+            "https://api.tradier.com/foo",
+            "https://api.tradier.com/v2",
+            "https://api.tradier.com/v1/markets",
+            "https://api.tradier.com//evil",
+        ],
+    )
+    def test_unrecognized_path_is_rejected(self, bad_url):
+        proof = self._proof(bad_url)
+        assert proof["proven"] is False
+
+    def test_rejected_embedded_credentials_are_never_echoed(self):
+        """PR #391 amendment (P1): the diagnostics envelope must never carry
+        the raw URL back out when embedded credentials are present, because
+        base_url gets persisted into durable order metadata.
+        """
+        from ap.live_submit_gates import inspect_market_data_transport
+        proof = inspect_market_data_transport(
+            "https://user:pass@api.tradier.com"
+        )
+        assert proof["proven"] is False
+        assert proof["base_url"] is None
+        assert "user" not in repr(proof)
+        assert "pass" not in repr(proof)
 
 
 class TestInvalidDirectionFailsClosed:
@@ -1346,6 +1378,73 @@ class TestInvalidDirectionFailsClosed:
 
         assert result.passed is True
         assert result.reason_code == GateOutcome.PASS
+
+    # ─── PR #391 amendment: precedence — direction check runs BEFORE ────
+    # every quote-dependent check. A malformed side must not be masked by
+    # transient quote failures; terminalization authority must attach to
+    # the true root cause.
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    @pytest.mark.parametrize(
+        "side", [None, "", "UNKNOWN", "CALLS", "PUTT", "BUY", "0"]
+    )
+    def test_invalid_direction_precedes_missing_quote(self, mode, side):
+        result = check_market_validity_gate(
+            execution_mode=mode,
+            side=side,
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=None,
+            current_ask=None,
+            quote_fetch_failed=True,
+            quote_fetch_error="provider unavailable",
+            quote_source="unknown",
+        )
+        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert classify_market_truth(result.reason_code) == (
+            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+        )
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    @pytest.mark.parametrize("side", [None, "", "UNKNOWN", "CALLS", "BUY"])
+    def test_invalid_direction_precedes_stale_quote(self, mode, side):
+        result = check_market_validity_gate(
+            execution_mode=mode,
+            side=side,
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.90,
+            current_ask=101.10,
+            quote_age_ms=999_999_999,  # arbitrarily stale
+            quote_source="live_broker",
+            quote_provenance="synchronous_submit_fetch",
+        )
+        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert classify_market_truth(result.reason_code) == (
+            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+        )
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    @pytest.mark.parametrize("side", [None, "", "UNKNOWN", "CALLS", "BUY"])
+    def test_invalid_direction_precedes_unproven_source(self, mode, side):
+        result = check_market_validity_gate(
+            execution_mode=mode,
+            side=side,
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.90,
+            current_ask=101.10,
+            quote_age_ms=100,
+            quote_source="",  # blank ⇒ CURRENT_PRICE_SOURCE_UNPROVEN if it ran
+            quote_provenance="synchronous_submit_fetch",
+        )
+        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert classify_market_truth(result.reason_code) == (
+            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+        )
 
 
 def _build_watcher_with_triggered_signal(local_order_id="LOID-1",

@@ -136,8 +136,13 @@ def inspect_market_data_transport(base_url: Optional[str]) -> dict:
 
     raw = str(base_url or "").strip()
 
+    # PR #391 amendment: never echo the raw URL until it is fully validated.
+    # An unvalidated URL may contain embedded credentials, redirect payloads,
+    # or attacker-controlled path segments, and diagnostics that persist
+    # base_url into durable order metadata must never surface any of those.
+    # base_url is populated with the canonical origin only on success.
     result = {
-        "base_url": raw or None,
+        "base_url": None,
         "scheme": None,
         "host": None,
         "port": None,
@@ -190,6 +195,22 @@ def inspect_market_data_transport(base_url: Optional[str]) -> dict:
         result["reason_code"] = "MARKET_DATA_URL_QUERY_OR_FRAGMENT"
         return result
 
+    # PR #391 amendment: base_url is an ORIGIN, not an API prefix. The real
+    # TradierBroker constructs requests by directly concatenating
+    #   base_url + path
+    # and its endpoint paths already begin with "/v1". Accepting
+    # https://api.tradier.com/v1 as base_url and preserving it would
+    # produce https://api.tradier.com/v1/v1/markets/quotes at request time.
+    # Accept only origin-shaped paths and the /v1 prefixes the operator
+    # is likely to type, then NORMALIZE to the canonical origin. There is
+    # exactly one accepted output form.
+    path = str(parsed.path or "")
+
+    if path not in {"", "/", "/v1", "/v1/"}:
+        result["reason_code"] = "MARKET_DATA_PATH_NOT_ALLOWED"
+        return result
+
+    result["base_url"] = CANONICAL_TRADIER_MARKET_DATA_BASE_URL
     result["proven"] = True
     result["reason_code"] = "MARKET_DATA_TRANSPORT_PROVEN"
     return result
@@ -780,6 +801,22 @@ def check_market_validity_gate(
             audit=_audit_out,
         )
 
+    # Rule: option direction MUST be exactly CALL or PUT after normalization.
+    #
+    # PR #391 amendment (precedence fix): the direction check runs BEFORE
+    # every quote-dependent check. A malformed side will not heal after
+    # another quote fetch, so it must not be masked by transient quote
+    # failures (CURRENT_PRICE_FETCH_FAILED, CURRENT_PRICE_MISSING,
+    # CURRENT_PRICE_STALE, CURRENT_PRICE_AGE_UNKNOWN,
+    # CURRENT_PRICE_SOURCE_UNPROVEN, CURRENT_PRICE_INVALID). Terminalization
+    # authority (TERMINAL_SETUP_COMPLETE) must attach to the true root cause.
+    _side = str(side or "").strip().upper()
+    if _side not in {"CALL", "PUT"}:
+        return _fail(
+            GateOutcome.ENTRY_DIRECTION_INVALID,
+            f"side={side!r} is invalid; expected exactly CALL or PUT",
+        )
+
     # Rule: fetch transport completed successfully.
     if quote_fetch_failed:
         return _fail(
@@ -847,18 +884,6 @@ def check_market_validity_gate(
         )
 
     _side = str(side or "").strip().upper()
-
-    # PR #391 amendment: direction MUST be exactly CALL or PUT after
-    # normalization. Anything else (None, "", "UNKNOWN", "CALLS", "PUTT",
-    # "BUY", "0", …) is terminal: a fresh quote will not heal an unknown
-    # side, and the identity gate does not inspect direction. Fail closed
-    # BEFORE geometry evaluation so we never fall through to the old
-    # "unknown side → PASS" path.
-    if _side not in {"CALL", "PUT"}:
-        return _fail(
-            GateOutcome.ENTRY_DIRECTION_INVALID,
-            f"side={side!r} is invalid; expected exactly CALL or PUT",
-        )
 
     tr = _finite_float(trigger_price)
     tg = _finite_float(target_price)
