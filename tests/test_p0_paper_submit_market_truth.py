@@ -1903,34 +1903,76 @@ class TestRearmOwnershipFencingP0_3:
 
 
 class TestMarketTruthOwnershipResolution:
-    """PR #391 amendment (P0-2): _resolve_market_truth_ownership must return
-    (None, None) for any missing or malformed ownership metadata so the
-    ExecutionCore guard can refuse to mutate the row. The prior code coerced
-    missing generation to 0 and missing token to '', which combined with the
-    old permissive CAS let a worker without proven watcher ownership advance
-    the order."""
+    """PR #391 amendment HH2 (Blockers 2 + 3): _resolve_market_truth_ownership
+    must (a) reject any missing/malformed ownership metadata, (b) reject
+    generation < 1 (materialized submit CAS requires >= 1), and (c) reject a
+    durable token that does not equal the current callback identity."""
 
-    def test_valid_generation_and_token_are_proven(self):
+    def test_valid_generation_and_matching_token_are_proven(self):
         from ap_execution_core import _resolve_market_truth_ownership
+        # HH2 Blocker 3: generation must be >= 1. Old test used gen=0 which
+        # is invalid for the materialized submit contract.
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 1, "watcher_token": "watcher:abc"},
+            current_watcher_token="watcher:abc",
+        ) == (1, "watcher:abc")
 
-        assert _resolve_market_truth_ownership({
-            "materialization_generation": 0,
-            "watcher_token": "watcher:abc",
-        }) == (0, "watcher:abc")
+    def test_generation_zero_is_rejected_even_with_matching_token(self):
+        """HH2 Blocker 3: gen 0 sits outside the materialized-submit CAS
+        contract (persist_materialized_submit_intent requires gen >= 1) and
+        is falsy in the deferred-detection truthiness check."""
+        from ap_execution_core import _resolve_market_truth_ownership
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 0, "watcher_token": "watcher:abc"},
+            current_watcher_token="watcher:abc",
+        ) == (None, None)
 
-    @pytest.mark.parametrize("meta", [
-        None,
-        {},
-        {"watcher_token": "watcher:abc"},                              # no gen key
-        {"materialization_generation": "bad", "watcher_token": "watcher:abc"},
-        {"materialization_generation": -1, "watcher_token": "watcher:abc"},
-        {"materialization_generation": 1, "watcher_token": ""},
-        {"materialization_generation": 1, "watcher_token": "   "},
+    def test_durable_token_not_equal_current_is_unproven(self):
+        """HH2 Blocker 2: durable token alone is not proof. A stale callback
+        reading someone else's owner_token must not be allowed to mutate."""
+        from ap_execution_core import _resolve_market_truth_ownership
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 3, "watcher_token": "watcher:PEER"},
+            current_watcher_token="watcher:SELF",
+        ) == (None, None)
+
+    def test_blank_current_token_is_unproven(self):
+        from ap_execution_core import _resolve_market_truth_ownership
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 3, "watcher_token": "watcher:abc"},
+            current_watcher_token="",
+        ) == (None, None)
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 3, "watcher_token": "watcher:abc"},
+            current_watcher_token="   ",
+        ) == (None, None)
+
+    def test_legacy_read_only_mode_still_returns_durable_identity(self):
+        """When current_watcher_token=None (legacy audit callers, not on
+        the mutation path) the identity check is skipped and the durable
+        token is returned. Callers on the mutation path MUST pass a real
+        current token instead of None."""
+        from ap_execution_core import _resolve_market_truth_ownership
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 5, "watcher_token": "watcher:abc"},
+            current_watcher_token=None,
+        ) == (5, "watcher:abc")
+
+    @pytest.mark.parametrize("meta,current_tok", [
+        (None, "watcher:abc"),
+        ({}, "watcher:abc"),
+        ({"watcher_token": "watcher:abc"}, "watcher:abc"),
+        ({"materialization_generation": "bad", "watcher_token": "watcher:abc"}, "watcher:abc"),
+        ({"materialization_generation": -1, "watcher_token": "watcher:abc"}, "watcher:abc"),
+        ({"materialization_generation": 0, "watcher_token": "watcher:abc"}, "watcher:abc"),
+        ({"materialization_generation": 1, "watcher_token": ""}, "watcher:abc"),
+        ({"materialization_generation": 1, "watcher_token": "   "}, "watcher:abc"),
     ])
-    def test_missing_or_invalid_owner_is_unproven(self, meta):
+    def test_missing_or_invalid_owner_is_unproven(self, meta, current_tok):
         from ap_execution_core import _resolve_market_truth_ownership
-
-        assert _resolve_market_truth_ownership(meta) == (None, None)
+        assert _resolve_market_truth_ownership(
+            meta, current_watcher_token=current_tok
+        ) == (None, None)
 
 
 class TestProductionTradierQuoteShape:
@@ -2138,6 +2180,7 @@ def _amend_execution_core(monkeypatch, *, order_meta, quote):
 
 def _amend_submit_ready_watched(plan):
     from ap_entry_watcher import WatchedSignal
+    from types import SimpleNamespace
 
     watched = WatchedSignal(
         {
@@ -2160,6 +2203,10 @@ def _amend_submit_ready_watched(plan):
         overnight=False,
     )
     watched.MOMENTUM_POLLS_REQUIRED = 2
+    # HH2: attach a minimal watcher_ref carrying an owner_token so identity
+    # comparison in the pre-mutation gate can succeed. Tests that need to
+    # verify mismatch behavior overwrite this owner_token in place.
+    watched._watcher_ref = SimpleNamespace(owner_token="watcher:integration-a")
     return watched
 
 
@@ -2189,12 +2236,19 @@ class TestExecutionCoreTradierShapeWiring:
         core, osm, plan = _amend_execution_core(
             monkeypatch,
             order_meta={
-                "materialization_generation": 0,
+                # HH2 Blocker 3: generation >= 1 required for materialized submit.
+                "materialization_generation": 1,
                 "watcher_token": "watcher:integration-a",
             },
             quote=quote,
         )
         watched = _amend_submit_ready_watched(plan)
+        # HH2 Blocker 2: force the callback's identity to equal the durable
+        # token so the ownership guard passes and submit proceeds to the
+        # transport-identity assertion below.
+        wref = getattr(watched, "_watcher_ref", None)
+        if wref is not None:
+            wref.owner_token = "watcher:integration-a"
 
         core_mod.APExecutionCore._on_entry_trigger(core, watched)
 
@@ -2317,86 +2371,97 @@ class TestValidQuoteOwnershipGuard:
     truth gate passes. Valid bid/ask geometry must not authorize a broker POST
     if generation or watcher_token is absent or blank."""
 
-    def _run_valid_quote(self, monkeypatch, *, order_meta):
+    def _run_valid_quote(self, monkeypatch, *, order_meta,
+                         current_watcher_token=None):
         """Build a PAPER core with a passing quote geometry and run
-        _on_entry_trigger. Returns (result, osm)."""
+        _on_entry_trigger. Returns (result, osm).
+
+        HH2: `current_watcher_token`, when provided, is forced onto the
+        watcher's owner_token so the identity comparison sees a specific
+        callback identity. When None the default uuid-based owner_token
+        stays in place (and thus differs from any 'watcher:integration-a'
+        style durable token).
+        """
         import ap_execution_core as core_mod
 
         # Quote that passes the market-truth gate: CALL, bid above trigger.
         passing_quote = {
-            "symbol": "SPY",
-            "bid": 600.20,
-            "ask": 600.22,
-            "last": 600.21,
+            "symbol": "SPY", "bid": 600.20, "ask": 600.22, "last": 600.21,
             "quote_age_ms": 10,
         }
         core, osm, plan = _amend_execution_core(
-            monkeypatch,
-            order_meta=order_meta,
-            quote=passing_quote,
+            monkeypatch, order_meta=order_meta, quote=passing_quote,
         )
         watched = _amend_submit_ready_watched(plan)
+        if current_watcher_token is not None:
+            wref = getattr(watched, "_watcher_ref", None)
+            if wref is not None:
+                wref.owner_token = current_watcher_token
         result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
         return result, osm
 
     def test_valid_quote_proven_ownership_reaches_submit(self, monkeypatch):
-        """PAPER production quote + valid ownership → submit_existing_entry
-        called exactly once. This is the acceptance test that proves the
-        ownership guard does NOT block a legitimately owned row."""
+        """PAPER production quote + valid ownership + matching identity →
+        submit_existing_entry called exactly once.
+
+        HH2 Blocker 3: gen=1 (not 0 — 0 is invalid for materialized submit).
+        HH2 Blocker 2: current_watcher_token forced to equal durable token.
+        """
         _result, osm = self._run_valid_quote(
             monkeypatch,
             order_meta={
-                "materialization_generation": 0,
+                "materialization_generation": 1,
                 "watcher_token": "watcher:integration-a",
             },
+            current_watcher_token="watcher:integration-a",
         )
         osm.submit_existing_entry.assert_called_once()
 
     def test_valid_quote_missing_generation_zero_submission(self, monkeypatch):
-        """Valid market quote + missing materialization_generation key →
-        _resolve_market_truth_ownership returns (None, None) →
-        SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE → zero broker POST."""
+        """Valid quote + missing generation → SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE."""
         result, osm = self._run_valid_quote(
             monkeypatch,
-            order_meta={
-                # No materialization_generation key at all.
-                "watcher_token": "watcher:has-token-no-gen",
-            },
+            order_meta={"watcher_token": "watcher:has-token-no-gen"},
+            current_watcher_token="watcher:has-token-no-gen",
         )
-        assert isinstance(result, dict)
         assert result.get("disposition") == "KEEP_WATCHER"
         assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
         assert result.get("broker_post_attempted") is False
         osm.submit_existing_entry.assert_not_called()
 
     def test_valid_quote_blank_watcher_token_zero_submission(self, monkeypatch):
-        """Valid market quote + blank watcher_token →
-        _resolve_market_truth_ownership returns (None, None) →
-        SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE → zero broker POST."""
         result, osm = self._run_valid_quote(
             monkeypatch,
-            order_meta={
-                "materialization_generation": 0,
-                "watcher_token": "   ",  # whitespace only
-            },
+            order_meta={"materialization_generation": 1, "watcher_token": "   "},
+            current_watcher_token="watcher:anything",
         )
-        assert isinstance(result, dict)
         assert result.get("disposition") == "KEEP_WATCHER"
         assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
-        assert result.get("broker_post_attempted") is False
         osm.submit_existing_entry.assert_not_called()
 
     def test_valid_quote_negative_generation_zero_submission(self, monkeypatch):
-        """Negative generation is unproven ownership even with a valid token."""
         result, osm = self._run_valid_quote(
             monkeypatch,
-            order_meta={
-                "materialization_generation": -1,
-                "watcher_token": "watcher:valid",
-            },
+            order_meta={"materialization_generation": -1,
+                        "watcher_token": "watcher:valid"},
+            current_watcher_token="watcher:valid",
         )
         assert result.get("disposition") == "KEEP_WATCHER"
         assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        osm.submit_existing_entry.assert_not_called()
+
+    def test_valid_quote_generation_zero_is_blocked(self, monkeypatch):
+        """HH2 Blocker 3: generation 0 alone is not proof of a materialized
+        row (persist_materialized_submit_intent rejects gen<1)."""
+        result, osm = self._run_valid_quote(
+            monkeypatch,
+            order_meta={"materialization_generation": 0,
+                        "watcher_token": "watcher:v"},
+            current_watcher_token="watcher:v",
+        )
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("submit_ownership_failure_kind") == "generation_below_one"
         osm.submit_existing_entry.assert_not_called()
 
 
@@ -2511,10 +2576,16 @@ class TestModuleErrorOwnershipGuard:
         end = src.index("submit_res = self.order_state_machine.submit_existing_entry(", start)
         body = src[start:end]
 
-        # The strict resolver must appear in the handler.
-        assert "_resolve_market_truth_ownership(_module_meta)" in body, (
-            "Module-exception handler must call _resolve_market_truth_ownership(_module_meta); "
+        # HH2: the strict resolver must appear in the handler with the
+        # current_watcher_token identity plumbed through. A call without
+        # the identity kwarg would be back to durable-token-only "proof".
+        assert "_resolve_market_truth_ownership(" in body and "_module_meta" in body, (
+            "Module-exception handler must call _resolve_market_truth_ownership; "
             "int(... or 0) coercion was the P0 Blocker 2 bug"
+        )
+        assert "current_watcher_token=_module_current_watcher_token" in body, (
+            "HH2 Blocker 2: module-exception handler must plumb the current "
+            "callback identity into the resolver"
         )
 
         # The old coercion pattern must NOT appear in the handler.
@@ -2656,147 +2727,269 @@ class TestNoLiveUnknownExemptionInGateSource:
 
 
 # =============================================================================
-# PR #391 amendment — dual ownership authority on the SUBMIT path.
+# =============================================================================
+# PR #391 amendment HH2 — dual ownership authority + identity comparison on
+# the SUBMIT path.
 #
-# Discovered while implementing P0 Blocker 1: requiring watcher_token
-# unconditionally before submit_existing_entry() permanently blocks every
-# recovery-adopted BROKER_READY row from ever submitting. Those rows prove
-# ownership via recovery_submit_owner + generation (the PR #332 contract,
-# asserted by test_332_broker_ready_recovery_owner_generation_reaches_fresh_sync_gate).
-#
-# _resolve_submit_ownership() therefore requires a strict generation ALWAYS,
-# plus at least one non-blank owner identity — watcher_token OR
-# recovery_submit_owner. An anonymous worker with neither still cannot POST.
+# The submit resolver accepts either watcher_token OR recovery_submit_owner
+# as the durable identity (recovery-adopted BROKER_READY rows have only
+# recovery_submit_owner; PR #332 contract). BUT durable identity alone is
+# not proof — the caller must pass current_watcher_token / current_recovery_owner
+# and the resolver requires equality. Generation is always required and
+# must be >= 1 (materialized submit CAS contract).
 # =============================================================================
 
 
 class TestResolveSubmitOwnership:
-    """Unit contract for _resolve_submit_ownership()."""
+    """Unit contract for _resolve_submit_ownership() after HH2."""
 
-    def test_watcher_token_is_proven_authority(self):
+    # ── watcher-owned path ──────────────────────────────────────────────
+    def test_watcher_token_matching_current_is_proven(self):
         from ap_execution_core import _resolve_submit_ownership
-        assert _resolve_submit_ownership({
-            "materialization_generation": 3,
-            "watcher_token": "watcher:abc",
-        }) == (3, "watcher:abc", "watcher_token")
+        assert _resolve_submit_ownership(
+            {"materialization_generation": 3, "watcher_token": "watcher:abc"},
+            current_watcher_token="watcher:abc",
+            current_recovery_owner=None,
+        ) == (3, "watcher:abc", "watcher_token")
 
-    def test_recovery_submit_owner_is_proven_authority(self):
-        """PR #332 recovery-adopted shape: generation + recovery_submit_owner,
-        NO watcher_token. Must be accepted."""
+    def test_watcher_token_mismatch_is_blocked(self):
+        """HH2 Blocker 2: durable token that does not equal current callback
+        identity is a stale/foreign worker; must not submit."""
         from ap_execution_core import _resolve_submit_ownership
-        assert _resolve_submit_ownership({
-            "materialization_generation": 7,
-            "recovery_submit_owner": "broker-ready-owner-1",
-        }) == (7, "broker-ready-owner-1", "recovery_submit_owner")
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 3, "watcher_token": "watcher:PEER"},
+            current_watcher_token="watcher:SELF",
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "watcher_token_mismatch"
 
-    def test_watcher_token_takes_precedence_over_recovery_owner(self):
-        """When both are present the watcher token is the primary identity."""
+    def test_watcher_token_current_missing_is_blocked(self):
         from ap_execution_core import _resolve_submit_ownership
-        gen, owner, kind = _resolve_submit_ownership({
-            "materialization_generation": 2,
-            "watcher_token": "watcher:primary",
-            "recovery_submit_owner": "recovery:secondary",
-        })
-        assert (gen, owner, kind) == (2, "watcher:primary", "watcher_token")
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 3, "watcher_token": "watcher:abc"},
+            current_watcher_token=None,
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "current_watcher_token_missing"
 
-    @pytest.mark.parametrize("meta", [
-        # Generation present but NO owner identity of any kind — this is
-        # the exact P0 Blocker 1 attack shape.
-        {"materialization_generation": 0},
-        {"materialization_generation": 5, "watcher_token": "",
-         "recovery_submit_owner": ""},
-        {"materialization_generation": 5, "watcher_token": "   ",
-         "recovery_submit_owner": "   "},
-        # Owner markers present but generation missing / malformed / negative.
-        {"watcher_token": "watcher:abc"},
-        {"recovery_submit_owner": "recovery:abc"},
-        {"materialization_generation": "bad", "watcher_token": "watcher:abc"},
-        {"materialization_generation": -1, "watcher_token": "watcher:abc"},
-        {"materialization_generation": -1,
-         "recovery_submit_owner": "recovery:abc"},
-        # Deferred marker without any proven owner.
+    # ── recovery-owned path ─────────────────────────────────────────────
+    def test_recovery_owner_matching_current_is_proven(self):
+        """PR #332 shape: gen + recovery_submit_owner, no watcher_token."""
+        from ap_execution_core import _resolve_submit_ownership
+        assert _resolve_submit_ownership(
+            {"materialization_generation": 7,
+             "recovery_submit_owner": "broker-ready-owner-1"},
+            current_watcher_token=None,
+            current_recovery_owner="broker-ready-owner-1",
+        ) == (7, "broker-ready-owner-1", "recovery_submit_owner")
+
+    def test_recovery_owner_mismatch_is_blocked(self):
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 7,
+             "recovery_submit_owner": "broker-ready-owner-1"},
+            current_watcher_token=None,
+            current_recovery_owner="broker-ready-owner-DIFFERENT",
+        )
+        assert gen is None and owner is None
+        assert kind == "recovery_owner_mismatch"
+
+    def test_recovery_owner_current_missing_is_blocked(self):
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 7,
+             "recovery_submit_owner": "broker-ready-owner-1"},
+            current_watcher_token=None,
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "current_recovery_owner_missing"
+
+    # ── precedence ──────────────────────────────────────────────────────
+    def test_recovery_takes_precedence_when_caller_is_recovery(self):
+        """HH2: when the CALLER provides a current_recovery_owner AND the
+        row has a matching recovery_submit_owner, recovery authority wins
+        even if the row also carries a stale watcher_token from before the
+        recovery claim. This is the real production shape: after
+        claim_deferred_materialization the row's watcher_token is
+        overwritten to the recovery worker's owner label, but the row also
+        gains a recovery_submit_owner entry; the recovery worker has no
+        _watcher_ref, only plan.metadata.recovery_submit_owner."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 2,
+             "watcher_token": "watcher:stale-from-before-claim",
+             "recovery_submit_owner": "recovery:current"},
+            current_watcher_token=None,
+            current_recovery_owner="recovery:current",
+        )
+        assert (gen, owner, kind) == (2, "recovery:current", "recovery_submit_owner")
+
+    def test_watcher_takes_precedence_when_only_watcher_identity_provided(self):
+        """Symmetric case: only the watcher identity is provided by the
+        caller; even if the row has a lingering recovery_submit_owner
+        marker, the watcher route is used (the watcher is the current
+        callback context, and its owner_token is fenced against the
+        durable watcher_token)."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 2,
+             "watcher_token": "watcher:current",
+             "recovery_submit_owner": "recovery:stale"},
+            current_watcher_token="watcher:current",
+            current_recovery_owner=None,
+        )
+        assert (gen, owner, kind) == (2, "watcher:current", "watcher_token")
+
+    # ── generation contract ─────────────────────────────────────────────
+    @pytest.mark.parametrize("gen_val,expected_kind", [
+        (0, "generation_below_one"),
+        (-1, "negative_generation"),
+        ("bad", "malformed_generation"),
+    ])
+    def test_invalid_generations_are_blocked(self, gen_val, expected_kind):
+        """HH2 Blocker 3: generation must be >= 1 for materialized submit."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": gen_val, "watcher_token": "watcher:abc"},
+            current_watcher_token="watcher:abc",
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == expected_kind
+
+    # ── Blocker 1 attack shape ──────────────────────────────────────────
+    def test_generation_without_owner_is_blocked(self):
+        """HH2 Blocker 1: materialized row (generation present) with NO
+        owner identity of any kind is unproven."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 5},
+            current_watcher_token="watcher:abc",
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "generation_without_owner"
+
+    def test_generation_with_blank_owners_is_blocked(self):
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 5, "watcher_token": "",
+             "recovery_submit_owner": "   "},
+            current_watcher_token="watcher:abc",
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "generation_without_owner"
+
+    # ── ownership regime scoping (Blocker 5 partial) ────────────────────
+    @pytest.mark.parametrize("meta", [None])
+    def test_none_meta_returns_no_meta_kind(self, meta):
+        """Distinct from 'not_under_ownership_regime': None means the caller
+        did not or could not read a dict at all, and MUST be treated as
+        unknown by the caller (Blocker 5). Kind 'no_meta' is diagnostic."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            meta,
+            current_watcher_token="watcher:abc",
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "no_meta"
+
+    def test_empty_dict_is_not_under_ownership_regime(self):
+        """Only an empty dict from a KNOWN-good read is the ordinary-entry
+        allow signal. The caller separately verifies read success (Blocker 5)."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(
+            {},
+            current_watcher_token="watcher:abc",
+            current_recovery_owner=None,
+        )
+        assert gen is None and owner is None
+        assert kind == "not_under_ownership_regime"
+
+    @pytest.mark.parametrize("regime_marker", [
         {"contract_deferred": True},
         {"materialization_status": "RUNNING"},
+        {"materialization_owner": "someone"},
     ])
-    def test_unproven_ownership_regime_shapes_are_blocked(self, meta):
-        """Under the ownership regime, an unproven shape must yield no
-        generation and no owner. The third element is a diagnostic kind
-        (never 'not_under_ownership_regime', which would allow submit)."""
+    def test_regime_marker_without_generation_is_blocked(self, regime_marker):
+        """Ownership regime marker present but generation missing → partial /
+        corrupt ownership; blocked."""
         from ap_execution_core import _resolve_submit_ownership
-        gen, owner, kind = _resolve_submit_ownership(meta)
-        assert gen is None
-        assert owner is None
-        assert kind != "not_under_ownership_regime"
-
-    @pytest.mark.parametrize("meta", [None, {}])
-    def test_no_ownership_regime_is_not_blocked(self, meta):
-        """PR #391 amendment scoping fix: create_entry_order() does not stamp
-        materialization_generation or watcher_token, so a plain NON-DEFERRED
-        entry legitimately has no ownership fields. It must be reported as
-        'not_under_ownership_regime' so the submit guard lets it through —
-        blocking it would halt all normal non-deferred trading."""
-        from ap_execution_core import _resolve_submit_ownership
-        gen, owner, kind = _resolve_submit_ownership(meta)
-        assert gen is None
-        assert owner is None
-        assert kind in ("not_under_ownership_regime", "no_meta")
-
-    def test_generation_is_never_coerced_to_zero(self):
-        """The P0 Blocker 1/2 bug was coercing a missing generation to 0.
-        A row bearing an owner token but no generation key is partial/corrupt
-        ownership and must be blocked — not silently treated as generation 0."""
-        from ap_execution_core import _resolve_submit_ownership
-        gen, owner, kind = _resolve_submit_ownership({
-            "watcher_token": "watcher:perfectly-valid",
-        })
-        assert gen is None
-        assert owner is None
+        gen, owner, kind = _resolve_submit_ownership(
+            regime_marker,
+            current_watcher_token="watcher:abc",
+            current_recovery_owner="recovery:abc",
+        )
+        assert gen is None and owner is None
         assert kind == "ownership_markers_without_generation"
 
 
 class TestRecoveryOwnerReachesSubmit:
-    """End-to-end: a recovery-adopted row (generation + recovery_submit_owner,
-    no watcher_token) must still reach exactly one submit_existing_entry call.
-    This is the regression guard against re-tightening the submit guard to
-    watcher_token-only and stranding every recovered order."""
+    """End-to-end: a recovery-adopted row (generation >= 1 + matching
+    recovery_submit_owner, no watcher_token) must still reach exactly one
+    submit_existing_entry call. Regression guard against re-tightening the
+    submit guard to watcher_token-only and stranding every recovered order."""
 
-    def _run(self, monkeypatch, *, order_meta):
+    def _run(self, monkeypatch, *, order_meta, current_recovery_owner=None,
+             current_watcher_token=None):
         import ap_execution_core as core_mod
         passing_quote = {
-            "symbol": "SPY",
-            "bid": 600.20,
-            "ask": 600.22,
-            "last": 600.21,
+            "symbol": "SPY", "bid": 600.20, "ask": 600.22, "last": 600.21,
             "quote_age_ms": 10,
         }
         core, osm, plan = _amend_execution_core(
             monkeypatch, order_meta=order_meta, quote=passing_quote,
         )
+        # Inject the current identity into the plan so the callback resolves
+        # it back out at the pre-mutation gate.
+        if current_recovery_owner is not None:
+            plan.recovery_submit_owner = current_recovery_owner
         watched = _amend_submit_ready_watched(plan)
+        if current_watcher_token is not None:
+            wref = getattr(watched, "_watcher_ref", None)
+            if wref is not None:
+                wref.owner_token = current_watcher_token
         result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
         return result, osm
 
     def test_recovery_owner_without_watcher_token_submits_once(self, monkeypatch):
-        _result, osm = self._run(
+        _r, osm = self._run(
             monkeypatch,
             order_meta={
                 "materialization_generation": 7,
                 "recovery_submit_owner": "broker-ready-owner-1",
                 # Deliberately NO watcher_token — the recovery shape.
             },
+            current_recovery_owner="broker-ready-owner-1",
         )
         osm.submit_existing_entry.assert_called_once()
 
-    def test_no_owner_of_either_kind_blocks_submit(self, monkeypatch):
-        """Neither watcher_token nor recovery_submit_owner → zero POST.
-        The security property from P0 Blocker 1 is preserved."""
+    def test_recovery_owner_mismatch_blocks_submit(self, monkeypatch):
+        """A recovery worker whose plan.recovery_submit_owner does not equal
+        the row's durable owner is a stale worker and must NOT submit."""
         result, osm = self._run(
             monkeypatch,
             order_meta={
                 "materialization_generation": 7,
-                "watcher_token": "",
-                "recovery_submit_owner": "",
+                "recovery_submit_owner": "broker-ready-owner-1",
             },
+            current_recovery_owner="broker-ready-owner-DIFFERENT",
+        )
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("submit_ownership_failure_kind") == "recovery_owner_mismatch"
+        osm.submit_existing_entry.assert_not_called()
+
+    def test_no_owner_of_either_kind_blocks_submit(self, monkeypatch):
+        result, osm = self._run(
+            monkeypatch,
+            order_meta={"materialization_generation": 7, "watcher_token": "",
+                        "recovery_submit_owner": ""},
         )
         assert result.get("disposition") == "KEEP_WATCHER"
         assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
@@ -2805,40 +2998,186 @@ class TestRecoveryOwnerReachesSubmit:
 
 
 class TestSubmitOwnershipResolverIsDistinctFromMarketTruth:
-    """The two resolvers must remain deliberately different. Collapsing them
-    would either strand recovery rows (if submit adopts the watcher-only
-    rule) or weaken the REARM/HOLD CAS fence (if market-truth adopts the
-    dual rule, since those CAS on meta->>'watcher_token' specifically)."""
+    """The two resolvers stay deliberately different. The market-truth
+    resolver enforces watcher_token equality specifically because REARM/HOLD
+    CAS on meta->>'watcher_token'; a recovery-only row cannot satisfy
+    that predicate and must be reported as unproven for market truth."""
 
     def test_market_truth_resolver_rejects_recovery_only_shape(self):
-        """_resolve_market_truth_ownership must stay watcher-token-strict:
-        REARM/HOLD CAS on watcher_token and cannot match a recovery-only row."""
         from ap_execution_core import _resolve_market_truth_ownership
-        assert _resolve_market_truth_ownership({
-            "materialization_generation": 7,
-            "recovery_submit_owner": "broker-ready-owner-1",
-        }) == (None, None)
+        assert _resolve_market_truth_ownership(
+            {"materialization_generation": 7,
+             "recovery_submit_owner": "broker-ready-owner-1"},
+            current_watcher_token="watcher:whatever",
+        ) == (None, None)
 
     def test_submit_resolver_accepts_recovery_only_shape(self):
         from ap_execution_core import _resolve_submit_ownership
-        gen, owner, kind = _resolve_submit_ownership({
-            "materialization_generation": 7,
-            "recovery_submit_owner": "broker-ready-owner-1",
-        })
+        gen, owner, kind = _resolve_submit_ownership(
+            {"materialization_generation": 7,
+             "recovery_submit_owner": "broker-ready-owner-1"},
+            current_watcher_token=None,
+            current_recovery_owner="broker-ready-owner-1",
+        )
         assert gen == 7
         assert kind == "recovery_submit_owner"
 
     def test_both_resolvers_reject_anonymous_worker(self):
-        """The shared security floor: a MATERIALIZED row (generation present)
-        with no owner identity of any kind is unproven for both resolvers.
-        This is the P0 Blocker 1 attack shape."""
+        """A MATERIALIZED row (generation >= 1) with no durable owner of
+        any kind is unproven for both resolvers — the Blocker 1 attack."""
         from ap_execution_core import (
             _resolve_market_truth_ownership,
             _resolve_submit_ownership,
         )
         anonymous = {"materialization_generation": 7}
-        assert _resolve_market_truth_ownership(anonymous) == (None, None)
-        gen, owner, kind = _resolve_submit_ownership(anonymous)
-        assert gen is None
-        assert owner is None
+        assert _resolve_market_truth_ownership(
+            anonymous, current_watcher_token="watcher:abc"
+        ) == (None, None)
+        gen, owner, kind = _resolve_submit_ownership(
+            anonymous, current_watcher_token="watcher:abc",
+            current_recovery_owner="rec:abc",
+        )
+        assert gen is None and owner is None
         assert kind == "generation_without_owner"
+
+
+# =============================================================================
+# HH2 Blocker 2: end-to-end — a stale watcher token on the ROW cannot be
+# used by a callback whose OWN owner_token differs. Neither REARM/HOLD SQL
+# nor submit_existing_entry may fire.
+# =============================================================================
+
+
+class TestBlocker2StaleCallbackIdentity:
+
+    def test_valid_quote_stale_watcher_identity_blocks_submit(self, monkeypatch):
+        """The row's durable watcher_token is 'watcher:PEER' but the current
+        callback's owner_token is 'watcher:SELF'. Even with a valid quote and
+        proper generation, submit must NOT fire."""
+        import ap_execution_core as core_mod
+        passing_quote = {
+            "symbol": "SPY", "bid": 600.20, "ask": 600.22, "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch,
+            order_meta={"materialization_generation": 3,
+                        "watcher_token": "watcher:PEER"},
+            quote=passing_quote,
+        )
+        watched = _amend_submit_ready_watched(plan)
+        # Force the callback's identity to be DIFFERENT.
+        wref = getattr(watched, "_watcher_ref", None)
+        assert wref is not None
+        wref.owner_token = "watcher:SELF"
+
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("submit_ownership_failure_kind") == "watcher_token_mismatch"
+        osm.submit_existing_entry.assert_not_called()
+        # Blocker 4 corollary: no lifecycle metadata mutated either.
+        # last_confirmed_trigger_at write comes AFTER the guard, so no update.
+        for call in osm.update_order_meta.call_args_list:
+            _, kwargs = call.args, call.kwargs
+            patch = call.args[1] if len(call.args) > 1 else kwargs.get("patch", {})
+            assert "last_confirmed_trigger_at" not in patch, (
+                "Blocker 4: stale callback wrote confirmation anchor before "
+                "the ownership guard fired"
+            )
+
+
+# =============================================================================
+# HH2 Blocker 4: durable mutation must be gated behind the ownership guard.
+# =============================================================================
+
+
+class TestBlocker4NoDurableMutationBeforeOwnershipGuard:
+
+    def test_missing_generation_prevents_last_confirmed_trigger_write(self, monkeypatch):
+        """Row has NO materialization_generation key at all. Under HH2 that
+        yields 'ownership_markers_without_generation' when a watcher_token
+        is present, or 'not_under_ownership_regime' when none of the regime
+        markers exist. The presence of a watcher_token establishes the
+        regime, so the guard must fire and NO last_confirmed_trigger_at
+        update may occur."""
+        import ap_execution_core as core_mod
+        passing_quote = {
+            "symbol": "SPY", "bid": 600.20, "ask": 600.22, "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch,
+            order_meta={
+                # Regime marker present (watcher_token) but no generation key.
+                "watcher_token": "watcher:whoever",
+            },
+            quote=passing_quote,
+        )
+        watched = _amend_submit_ready_watched(plan)
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        for call in osm.update_order_meta.call_args_list:
+            patch = call.args[1] if len(call.args) > 1 else {}
+            assert "last_confirmed_trigger_at" not in patch, (
+                "Blocker 4: confirmation anchor written despite unproven ownership"
+            )
+            assert "last_trigger_confirmation_quote" not in patch, (
+                "Blocker 4: confirmation quote written despite unproven ownership"
+            )
+        osm.submit_existing_entry.assert_not_called()
+
+
+# =============================================================================
+# HH2 Blocker 5: a FAILED durable read must not fall through to the
+# ordinary-entry exemption.
+# =============================================================================
+
+
+class TestBlocker5FailedReadDoesNotAllowSubmit:
+
+    def test_get_order_raises_returns_keep_watcher_no_submit(self, monkeypatch):
+        """The durable row read raises inside the callback. _order_row_read_proven
+        must be False, which forces the guard to treat this as unknown and
+        return KEEP_WATCHER — not treat the empty meta as 'not_under_ownership_regime'."""
+        import ap_execution_core as core_mod
+        passing_quote = {
+            "symbol": "SPY", "bid": 600.20, "ask": 600.22, "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch, order_meta={}, quote=passing_quote,
+        )
+
+        def _boom(*_a, **_kw):
+            raise RuntimeError("simulated get_order failure")
+
+        osm.get_order.side_effect = _boom
+
+        watched = _amend_submit_ready_watched(plan)
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_ORDER_ROW_READ_UNPROVEN"
+        assert result.get("order_row_read_proven") is False
+        osm.submit_existing_entry.assert_not_called()
+
+    def test_get_order_returns_none_returns_keep_watcher_no_submit(self, monkeypatch):
+        """The row is missing entirely (get_order returns None). Same fail-
+        closed behavior — an unknown row is not an ordinary entry."""
+        import ap_execution_core as core_mod
+        passing_quote = {
+            "symbol": "SPY", "bid": 600.20, "ask": 600.22, "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch, order_meta={}, quote=passing_quote,
+        )
+        osm.get_order.side_effect = None
+        osm.get_order.return_value = None
+
+        watched = _amend_submit_ready_watched(plan)
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_ORDER_ROW_READ_UNPROVEN"
+        osm.submit_existing_entry.assert_not_called()

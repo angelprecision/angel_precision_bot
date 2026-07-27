@@ -2299,6 +2299,7 @@ class APOrderStateMachine:
         signal_id: str,
         payload_hash: str,
         broker_submit_key: str,
+        expected_watcher_token: str | None = None,
     ) -> bool:
         """Atomically claim broker submit intent for a watcher-owned BROKER_READY row.
 
@@ -2311,6 +2312,13 @@ class APOrderStateMachine:
         submit_key = canonical_broker_submit_key(broker_submit_key)
         mode = str(execution_mode or "").strip().lower()
         durable_signal_id = str(signal_id or "").strip()
+        # HH2 defense-in-depth (Blocker 2): the watcher_token fence in SQL
+        # prevents a stale/foreign worker from succeeding the CAS on a row
+        # whose durable watcher_token has advanced. Optional for backward
+        # compatibility with callers that have not yet plumbed it through;
+        # when passed non-blank, it is fenced exactly.
+        _fence_watcher_token = str(expected_watcher_token or "").strip() if expected_watcher_token is not None else ""
+        _apply_watcher_token_fence = bool(expected_watcher_token) and bool(_fence_watcher_token)
         try:
             generation = int(generation)
         except (TypeError, ValueError):
@@ -2322,6 +2330,11 @@ class APOrderStateMachine:
             or not payload_hash
             or not submit_key
         ):
+            return False
+        # If the caller explicitly opted in to the watcher-token fence by
+        # passing a value at all, but the value they passed is blank, treat
+        # that as a bug and fail closed.
+        if expected_watcher_token is not None and not _fence_watcher_token:
             return False
         now = now_utc_iso()
         patch = _json_local.dumps({
@@ -2353,10 +2366,13 @@ class APOrderStateMachine:
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'submit_intent_at','') = ''
                       AND COALESCE(meta->>'recovery_submit_owner','') = ''
+                      AND (%s = '' OR COALESCE(meta->>'watcher_token','') = %s)
                     """,
                     (
                         patch, local_order_id, self.client_id, mode,
                         durable_signal_id, generation,
+                        _fence_watcher_token if _apply_watcher_token_fence else '',
+                        _fence_watcher_token if _apply_watcher_token_fence else '',
                     ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
@@ -4371,6 +4387,10 @@ class APOrderStateMachine:
             _materialization_generation = int(_raw_meta.get("materialization_generation") or 0)
         except (TypeError, ValueError):
             _materialization_generation = 0
+        # HH2 defense-in-depth (Blocker 2): pin the CAS to the durable
+        # watcher_token so a stale/foreign worker cannot succeed the
+        # materialized-submit CAS on a row that has been re-owned.
+        _durable_watcher_token = str(_raw_meta.get("watcher_token") or "").strip()
         if _is_recovery_submit:
             _intent_ok = self.persist_deferred_submit_intent(
                 local_order_id,
@@ -4391,6 +4411,9 @@ class APOrderStateMachine:
                     signal_id=str(current.get("signal_id") or ""),
                     payload_hash=_payload_hash,
                     broker_submit_key=_submit_key,
+                    expected_watcher_token=(
+                        _durable_watcher_token if _durable_watcher_token else None
+                    ),
                 )
             )
             if not _intent_ok:

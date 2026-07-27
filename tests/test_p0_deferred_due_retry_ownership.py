@@ -1769,13 +1769,23 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "meta": before_meta,
     }
 
-    # After claim: row is MATERIALIZING with gen=2, attempt=2
+    # After claim: row is MATERIALIZING with gen=2, attempt=2.
+    # HH2 scaffold parity with production: claim_deferred_materialization
+    # rewrites meta.watcher_token to the claim owner label (see
+    # ap/order_state_machine.py:2624 "watcher_token": _owner) and the
+    # recovery-retry seam additionally stamps recovery_submit_owner (see
+    # ap_execution_core.py resume_deferred_materialization_retry).
+    _claim_owner = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3"
     claimed_meta = dict(before_meta)
     claimed_meta.update({
         "lifecycle_state": "MATERIALIZING",
         "materialization_status": "RUNNING",
         "materialization_generation": 2,
-        "materialization_owner": f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3",
+        "materialization_owner": _claim_owner,
+        "watcher_token": _claim_owner,           # HH2: production rewrite
+        "current_owner": _claim_owner,
+        "recovery_submit_owner": _claim_owner,   # HH2: recovery claim marker
+        "recovery_submit_generation": 2,
         "materialization_in_flight": True,
         "retry_attempt": 2,
     })

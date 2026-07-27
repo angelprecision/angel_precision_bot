@@ -137,17 +137,31 @@ def _submit_quote_source_from_transport(transport_proof: dict) -> str:
 
 def _resolve_market_truth_ownership(
     order_meta,
+    current_watcher_token: str | None = None,
 ) -> tuple[int | None, str | None]:
-    """Resolve the exact generation and watcher token needed for CAS.
+    """Resolve the exact generation and watcher token needed for the
+    REARM / HOLD CAS on a watcher-owned materialized row.
 
-    PR #391 amendment (P0-2): missing metadata, a missing generation key, a
-    malformed/negative generation, or a blank/whitespace watcher token is
-    unproven ownership. Returns (None, None) in that case so the caller can
-    treat the row as un-ownable and skip every lifecycle mutation.
+    PR #391 amendment HH2 (Blocker 2 + 3): a nonblank durable watcher_token
+    proves only that SOMEONE owned the row at read time. It does not prove
+    that THIS callback belongs to that owner. The caller must pass
+    current_watcher_token (this process's APEntryWatcher.owner_token). If it
+    is not exactly equal to the durable watcher_token, the caller is a
+    stale/foreign worker reading someone else's ownership marker and MUST
+    not mutate the row.
 
-    The previous code coerced a missing generation to 0 and a missing token
-    to "", which combined with the old permissive CAS predicate allowed a
-    worker without proven watcher ownership to mutate an eligible order.
+    Also (Blocker 3): the materialized submit-intent contract in
+    persist_materialized_submit_intent() requires generation >= 1. Generation
+    0 is not a valid materialized row and must be rejected here.
+
+    Returns (generation, watcher_token) on proven ownership; (None, None)
+    on ANY of: missing/malformed meta, missing/malformed/zero/negative
+    generation, blank durable token, blank current token, or durable token
+    not equal to current token. Callers that pass current_watcher_token=None
+    (legacy audits that only need to read the durable identity, not act on
+    it) get the legacy behavior of returning the durable token when durable
+    values are internally consistent — but current callers on the mutation
+    path MUST pass a real current token.
     """
     if not isinstance(order_meta, dict):
         return None, None
@@ -160,52 +174,83 @@ def _resolve_market_truth_ownership(
     except (TypeError, ValueError):
         return None, None
 
-    watcher_token = str(order_meta.get("watcher_token") or "").strip()
-
-    if generation < 0 or not watcher_token:
+    # Blocker 3: materialized ownership requires generation >= 1. Generation
+    # 0 sits outside the materialized CAS contract and cannot fence anything.
+    if generation < 1:
         return None, None
 
-    return generation, watcher_token
+    durable_watcher_token = str(order_meta.get("watcher_token") or "").strip()
+    if not durable_watcher_token:
+        return None, None
+
+    if current_watcher_token is None:
+        # Legacy read-only audit path: caller is not on a mutation path and
+        # explicitly opts out of the identity comparison. Callers on the
+        # mutation path (REARM / HOLD / SUBMIT dispatch) must NEVER pass
+        # None; the amendment plumbs the current owner_token through.
+        return generation, durable_watcher_token
+
+    current = str(current_watcher_token or "").strip()
+    if not current:
+        return None, None
+
+    if durable_watcher_token != current:
+        # A stale callback is looking at someone else's row. Do not mutate.
+        return None, None
+
+    return generation, durable_watcher_token
 
 
 def _resolve_submit_ownership(
     order_meta,
-) -> tuple[int | None, str | None, str | None]:
+    *,
+    current_watcher_token: str | None,
+    current_recovery_owner: str | None,
+) -> tuple[int | None, str | None, str]:
     """Resolve proven ownership for the SUBMIT path.
 
-    PR #391 amendment (P0 Blocker 1): a broker POST requires proof that
-    this worker legitimately owns the row — WHEN the row is under the
-    materialization/ownership regime at all.
+    PR #391 amendment HH2 (Blockers 2, 3, 5): a broker POST requires proof
+    that the CALLBACK making the decision belongs to the owner recorded on
+    the row. Non-null durable identity is not sufficient — a stale callback
+    can read the current owner's token and echo it back at the CAS. Both
+    resolvers now demand equality between durable identity and the callback
+    identity supplied by the caller.
 
-    Returns (generation, owner_identity, owner_kind). On failure returns
-    (None, None, <diagnostic_kind>) where diagnostic_kind explains why, so
-    the caller can distinguish "no ownership contract exists" (allow, the
-    non-deferred path) from "ownership contract exists but is unproven"
-    (block, the P0 Blocker 1 attack).
+    Contract for the third element (owner_kind), stable strings the caller
+    uses to route dispatch:
+      "watcher_token"                       — proven, watcher-owned regime.
+      "recovery_submit_owner"               — proven, recovery-owned regime.
+      "not_under_ownership_regime"          — plain non-deferred entry;
+                                              create_entry_order stamps
+                                              none of these fields. submit_
+                                              existing_entry's own submit-
+                                              intent CAS is the fence here.
+      "no_meta"                             — order_meta is not a dict.
+                                              Caller MUST NOT trust this
+                                              same as no-regime; see below.
+      "ownership_markers_without_generation"— partial/corrupt: owner marker
+                                              present but no generation key.
+      "malformed_generation" / "negative_generation" / "generation_below_one"
+      "generation_without_owner"            — Blocker 1 attack shape:
+                                              materialized row, no durable
+                                              owner identity of any kind.
+      "watcher_token_mismatch"              — Blocker 2: durable token
+                                              non-blank but not equal to
+                                              this callback's owner_token.
+      "recovery_owner_mismatch"             — Blocker 2, recovery variant.
+      "current_watcher_token_missing"       — durable side has a watcher
+                                              token but caller passed no
+                                              current identity.
+      "current_recovery_owner_missing"      — same, recovery variant.
 
-    This is deliberately NOT the same predicate as
-    _resolve_market_truth_ownership(). That helper is watcher-token-specific
-    because the REARM and HOLD authority writes CAS directly on
-    `meta->>'watcher_token'` — a row without that exact token cannot satisfy
-    their WHERE clause, so demanding it there is correct.
+    The caller distinguishes "not_under_ownership_regime" (allow submit) from
+    every other None-tuple kind (block submit).
 
-    The submit path is different. submit_existing_entry() fences on durable
-    submit-intent plus generation / mode / signal / broker-state, and the
-    OSM treats `recovery_submit_owner` as a first-class ownership authority
-    (see _submit_ownership_is_claimed and terminalize_recovered_entry, whose
-    CAS validates owner + generation + lease atomically). A recovery-adopted
-    BROKER_READY row legitimately carries recovery_submit_owner and NO
-    watcher_token — that is the PR #332 contract proven by
-    test_332_broker_ready_recovery_owner_generation_reaches_fresh_sync_gate.
-
-    Requiring watcher_token unconditionally here would permanently block
-    every recovery-adopted row from ever submitting: a P0 availability bug
-    that strands client capital in un-fillable orders.
-
-    So the rule is: a strict generation is ALWAYS required (never coerced to
-    0), plus at least ONE non-blank owner identity. An anonymous worker with
-    neither identity still cannot reach a broker POST, which is the security
-    property P0 Blocker 1 demanded.
+    Blocker 5 note: this function does not know whether the durable read
+    succeeded. That is the caller's responsibility — an empty dict from a
+    FAILED read must be treated as "unknown, fail closed" by the caller,
+    NOT converted here into "not_under_ownership_regime". The caller tracks
+    _order_row_read_proven separately.
     """
     if not isinstance(order_meta, dict):
         return None, None, "no_meta"
@@ -214,18 +259,6 @@ def _resolve_submit_ownership(
     recovery_owner = str(order_meta.get("recovery_submit_owner") or "").strip()
     has_generation_key = "materialization_generation" in order_meta
 
-    # Is this row under the materialization / ownership regime at all?
-    #
-    # create_entry_order() does NOT stamp materialization_generation or
-    # watcher_token. Those are written by claim_deferred_materialization()
-    # and claim_deferred_broker_ready_submit(). A plain NON-DEFERRED entry
-    # (contract already selected at creation) therefore legitimately reaches
-    # submit with none of these fields — and is fenced instead by
-    # submit_existing_entry()'s durable submit-intent CAS.
-    #
-    # Requiring ownership proof unconditionally would permanently block every
-    # non-deferred entry: a far larger P0 than the one being fixed. So the
-    # guard applies only where an ownership contract actually exists.
     under_ownership_regime = bool(
         has_generation_key
         or watcher_token
@@ -236,16 +269,9 @@ def _resolve_submit_ownership(
     )
 
     if not under_ownership_regime:
-        # Non-deferred legacy path — no ownership contract to violate.
         return None, None, "not_under_ownership_regime"
 
-    # From here the row IS under the ownership regime, so ownership must be
-    # fully proven. This is exactly the P0 Blocker 1 gap: a materialized row
-    # whose generation is present but whose watcher token is missing/blank
-    # previously sailed past into submit_existing_entry(), whose materialized
-    # CAS checks generation/mode/signal/broker-state but NOT the owner token.
     if not has_generation_key:
-        # Partial/corrupt ownership: owner markers present but no generation.
         return None, None, "ownership_markers_without_generation"
 
     try:
@@ -256,10 +282,53 @@ def _resolve_submit_ownership(
     if generation < 0:
         return None, None, "negative_generation"
 
+    # Blocker 3: materialized submit-intent CAS in
+    # persist_materialized_submit_intent() rejects generation < 1. A
+    # generation-0 row can also be misrouted through the ordinary-entry
+    # path because integer 0 is falsy in the truthiness detection used
+    # by submit_existing_entry(). Both resolvers now require gen >= 1.
+    if generation < 1:
+        return None, None, "generation_below_one"
+
+    _cur_watcher = str(current_watcher_token or "").strip()
+    _cur_recovery = str(current_recovery_owner or "").strip()
+
+    # Route by which authority the CALLER is presenting. A recovery worker
+    # passes current_recovery_owner (from plan.metadata.recovery_submit_owner);
+    # a watcher passes current_watcher_token (from watcher.owner_token).
+    # When both are non-blank we prefer whichever matches the durable side.
+    # The reason: after a recovery claim, the row can carry BOTH a stale
+    # watcher_token (from the original watcher, never cleared) AND a fresh
+    # recovery_submit_owner (written by the claim). Routing by watcher_token
+    # first would block every recovery worker.
+    _recovery_regime = bool(recovery_owner) and (
+        bool(_cur_recovery) or not bool(_cur_watcher)
+    )
+
+    if _recovery_regime:
+        # Blocker 2 for the recovery regime: prove the callback belongs to
+        # the same recovery worker that claimed the row.
+        if not _cur_recovery:
+            return None, None, "current_recovery_owner_missing"
+        if recovery_owner != _cur_recovery:
+            return None, None, "recovery_owner_mismatch"
+        return generation, recovery_owner, "recovery_submit_owner"
+
     if watcher_token:
+        # Blocker 2: prove the callback IS this watcher.
+        if not _cur_watcher:
+            return None, None, "current_watcher_token_missing"
+        if watcher_token != _cur_watcher:
+            return None, None, "watcher_token_mismatch"
         return generation, watcher_token, "watcher_token"
 
     if recovery_owner:
+        # Fallback: recovery_owner present but caller supplied no recovery
+        # identity AND no watcher identity — still block.
+        if not _cur_recovery:
+            return None, None, "current_recovery_owner_missing"
+        if recovery_owner != _cur_recovery:
+            return None, None, "recovery_owner_mismatch"
         return generation, recovery_owner, "recovery_submit_owner"
 
     return None, None, "generation_without_owner"
@@ -7146,20 +7215,40 @@ class APExecutionCore:
             # locals().get("watched") pattern.
             try:
                 # Tier 1: durable orders.meta (most reliable)
+                #
+                # HH2 Blocker 5: track whether the read actually succeeded.
+                # A row-missing / exception / malformed-meta result is NOT
+                # equivalent to "row exists with no ownership markers" and
+                # must not receive the ordinary-entry exemption below. The
+                # submit-ownership guard reads _order_row_read_proven and
+                # fails closed when it is False.
                 _meta_for_ts = {}
+                _order_row_read_proven = False
                 try:
                     _get_order = getattr(self.order_state_machine, "get_order", None)
                     if callable(_get_order) and queue_local_order_id:
                         _order_row = _get_order(str(queue_local_order_id)) or {}
-                        _meta_for_ts = _order_row.get("meta") or {}
-                        if isinstance(_meta_for_ts, str):
-                            import json as _json
-                            try:
-                                _meta_for_ts = _json.loads(_meta_for_ts)
-                            except Exception:
+                        if _order_row:
+                            _raw_meta = _order_row.get("meta") or {}
+                            if isinstance(_raw_meta, str):
+                                import json as _json
+                                try:
+                                    _meta_for_ts = _json.loads(_raw_meta)
+                                    _order_row_read_proven = isinstance(_meta_for_ts, dict)
+                                    if not _order_row_read_proven:
+                                        _meta_for_ts = {}
+                                except Exception:
+                                    _meta_for_ts = {}
+                                    _order_row_read_proven = False
+                            elif isinstance(_raw_meta, dict):
+                                _meta_for_ts = _raw_meta
+                                _order_row_read_proven = True
+                            else:
                                 _meta_for_ts = {}
+                                _order_row_read_proven = False
                 except Exception:
                     _meta_for_ts = {}
+                    _order_row_read_proven = False
                 _ta_crossed_at, _ta_confirmed_at = resolve_trigger_timestamps(
                     order_meta=_meta_for_ts,
                     approved_plan_watched_signal=getattr(approved_plan, "_watched_signal", None),
@@ -7528,20 +7617,13 @@ class APExecutionCore:
                 # (None, None) — the ownership guard below will treat that
                 # as unproven ownership and return KEEP_WATCHER before any
                 # lifecycle mutation.
-                (
-                    _market_truth_generation,
-                    _market_truth_watcher_token,
-                ) = _resolve_market_truth_ownership(_meta_for_ts)
                 _deferred_contract = f"DEFERRED:{str(ticker).upper()}"
 
-                # HARD-HOLD amendment (remaining blocker 1): the watcher
-                # reference must also be captured in outer scope. Inside
-                # the nested helper, locals().get("watched") returns None
-                # because "watched" is the OUTER _on_entry_trigger parameter,
-                # not a nested-scope local. Resolve now from the three
-                # canonical sources: the callback argument itself, the
-                # plan's _watched_signal (underscore prefix — canonical
-                # attachment), and the fallback attr without underscore.
+                # HARD-HOLD amendment HH2 (Blocker 2): resolve the current
+                # callback identity BEFORE the ownership resolver runs so we
+                # can pass it in. A durable token is not proof — it must
+                # equal this watcher's owner_token to prove that the
+                # callback making the mutation is the actual owner.
                 _market_truth_watcher = (
                     getattr(watched, "_watcher_ref", None)
                     or getattr(
@@ -7552,6 +7634,17 @@ class APExecutionCore:
                         getattr(approved_plan, "watched_signal", None),
                         "_watcher_ref", None,
                     )
+                )
+                _current_watcher_token = str(
+                    getattr(_market_truth_watcher, "owner_token", "") or ""
+                ).strip()
+
+                (
+                    _market_truth_generation,
+                    _market_truth_watcher_token,
+                ) = _resolve_market_truth_ownership(
+                    _meta_for_ts,
+                    current_watcher_token=_current_watcher_token,
                 )
 
                 # PR #391 amendment: ownership proof is a hard prerequisite
@@ -7974,6 +8067,117 @@ class APExecutionCore:
                 _terminalize_breach_failure("live_submit_gate:ENTRY_CUTOFF_EXCEEDED")
                 return
 
+            # ─────────────────────────────────────────────────────────────
+            # HH2 Blockers 2 + 3 + 4 + 5: prove submit-path ownership BEFORE
+            # any durable mutation.
+            #
+            # The old ordering wrote last_confirmed_trigger_at and
+            # last_trigger_confirmation_quote to durable meta first, then
+            # proved ownership only right before submit_existing_entry().
+            # A stale / foreign callback could therefore still alter the
+            # confirmation anchor and audit even while being denied the
+            # broker POST — a real corruption of retry timing and audit.
+            #
+            # Move the guard here. It must also fail closed when the
+            # durable row read did not succeed (Blocker 5), and it must
+            # compare durable identity against THIS callback's identity
+            # (Blocker 2) with generation >= 1 (Blocker 3).
+            _pre_mut_watcher_ref = (
+                getattr(watched, "_watcher_ref", None)
+                or getattr(
+                    getattr(approved_plan, "_watched_signal", None),
+                    "_watcher_ref", None,
+                )
+                or getattr(
+                    getattr(approved_plan, "watched_signal", None),
+                    "_watcher_ref", None,
+                )
+            )
+            _pre_mut_current_watcher_token = str(
+                getattr(_pre_mut_watcher_ref, "owner_token", "") or ""
+            ).strip()
+            # Recovery-retry path: the callback is a recovery worker with no
+            # watcher_ref, but the durable row was claimed by that worker and
+            # its watcher_token was rewritten to the recovery owner label
+            # (claim_deferred_materialization overwrites meta.watcher_token
+            # with the claim owner). So the recovery owner label IS the
+            # current callback identity for BOTH the watcher-token and the
+            # recovery-owner comparisons. Read it from all canonical carriers.
+            _pre_mut_recovery_from_plan = str(
+                (getattr(approved_plan, "metadata", None) or {}).get("recovery_submit_owner")
+                or getattr(approved_plan, "recovery_submit_owner", "")
+                or ""
+            ).strip()
+            _pre_mut_recovery_from_signal = ""
+            _watched_signal_obj = getattr(watched, "signal", None)
+            if isinstance(_watched_signal_obj, dict):
+                _pre_mut_recovery_from_signal = str(
+                    _watched_signal_obj.get("recovery_submit_owner")
+                    or _watched_signal_obj.get("owner")
+                    or ""
+                ).strip()
+            _pre_mut_current_recovery_owner = (
+                _pre_mut_recovery_from_plan or _pre_mut_recovery_from_signal
+            )
+            # If the callback is a recovery worker with no watcher_ref, use
+            # the recovery owner label as the current watcher token too —
+            # after claim_deferred_materialization the durable watcher_token
+            # equals the claim owner. This avoids blocking a legitimate
+            # recovery worker whose row now has watcher_token == owner label.
+            if not _pre_mut_current_watcher_token and _pre_mut_current_recovery_owner:
+                _pre_mut_current_watcher_token = _pre_mut_current_recovery_owner
+
+            (
+                _pre_mut_gen,
+                _pre_mut_owner,
+                _pre_mut_kind,
+            ) = _resolve_submit_ownership(
+                _meta_for_ts,
+                current_watcher_token=_pre_mut_current_watcher_token,
+                current_recovery_owner=_pre_mut_current_recovery_owner,
+            )
+
+            # Blocker 5: a failed row/meta read must NEVER be treated as
+            # "ordinary entry, allowed to submit". The exemption applies only
+            # when the read succeeded AND the row proves it has no ownership
+            # regime marker.
+            _pre_mut_ownership_required = (
+                _pre_mut_kind != "not_under_ownership_regime"
+                or not _order_row_read_proven
+            )
+            _pre_mut_ownership_proven = (
+                _pre_mut_gen is not None
+                and _pre_mut_owner is not None
+                and _pre_mut_kind in ("watcher_token", "recovery_submit_owner")
+            )
+
+            if _pre_mut_ownership_required and not _pre_mut_ownership_proven:
+                _pre_mut_reason = (
+                    "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+                    if _order_row_read_proven
+                    else "SUBMIT_ORDER_ROW_READ_UNPROVEN"
+                )
+                log.critical(
+                    "[%s] %s — pre-mutation guard fired; zero durable "
+                    "mutation, zero broker POST; order=%s read_proven=%s kind=%s "
+                    "generation=%r current_watcher_token_present=%s",
+                    ticker, _pre_mut_reason,
+                    str(queue_local_order_id or ""),
+                    _order_row_read_proven,
+                    _pre_mut_kind,
+                    _pre_mut_gen,
+                    bool(_pre_mut_current_watcher_token),
+                )
+                return {
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": _pre_mut_reason,
+                    "submit_ownership_failure_kind": _pre_mut_kind,
+                    "order_row_read_proven": _order_row_read_proven,
+                    "broker_post_attempted": False,
+                    "retry_after_seconds": 5,
+                }
+            # ─────────────────────────────────────────────────────────────
+
             _last_confirmed_candidate = _confirm_now.isoformat()
             if not self.order_state_machine.update_order_meta(
                 str(queue_local_order_id or ""),
@@ -8146,19 +8350,32 @@ class APExecutionCore:
                 ))
             ).isoformat()
             _module_meta = _meta_for_ts if isinstance(locals().get("_meta_for_ts"), dict) else {}
-            # PR #391 amendment (P0 Blocker 2): use the strict ownership
-            # resolver — no coercion of missing generation to 0 or missing
-            # token to "". A missing generation key or blank token yields
-            # (None, None). The HOLD argument-validation guard will then
-            # reject the call (expected_generation=-1 check or blank token
-            # check), and the watcher-missing guard below will
-            # short-circuit to KEEP_WATCHER. The old int(... or 0) /
-            # str(... or "") coercions let a worker without proven
-            # ownership pass the HOLD CAS on any generation-0 row.
+            # PR #391 amendment HH2 (Blocker 2): resolve the current
+            # watcher's owner_token and pass it in. A durable token that
+            # differs from this callback's own owner_token means we are a
+            # stale/foreign worker looking at someone else's row and must
+            # NOT mutate it. Blocker 3: generation < 1 is also rejected.
+            _module_watcher_ref = (
+                getattr(watched, "_watcher_ref", None)
+                or getattr(
+                    getattr(approved_plan, "_watched_signal", None),
+                    "_watcher_ref", None,
+                )
+                or getattr(
+                    getattr(approved_plan, "watched_signal", None),
+                    "_watcher_ref", None,
+                )
+            )
+            _module_current_watcher_token = str(
+                getattr(_module_watcher_ref, "owner_token", "") or ""
+            ).strip()
             (
                 _module_generation,
                 _module_watcher_token,
-            ) = _resolve_market_truth_ownership(_module_meta)
+            ) = _resolve_market_truth_ownership(
+                _module_meta,
+                current_watcher_token=_module_current_watcher_token,
+            )
 
             # PR #391 amendment (P0 Blocker 2): guard — if resolver returns
             # (None, None) the module-exception handler has no proven
@@ -8328,43 +8545,88 @@ class APExecutionCore:
         # a missing or blank watcher_token / generation could therefore
         # reach a broker POST on a valid quote.
         #
-        # Resolve ownership from the same _meta_for_ts dict used by the
-        # failed-gate branch. (None, None) from _resolve_market_truth_ownership
-        # means the row's materialization_generation key is absent, the
-        # generation is negative, or the watcher_token is blank/whitespace
-        # — any of which is unproven ownership; zero POST is enforced.
+        # HH2 defense-in-depth: repeat the identity+ownership check right
+        # before the broker POST. The pre-mutation gate already fired for
+        # unproven ownership at the top of the passing-quote path, so under
+        # normal control flow this second check is redundant. It exists to
+        # catch two edge cases:
+        #   1. Any future code path that would reach submit without the
+        #      pre-mutation gate (e.g. a partial refactor).
+        #   2. A row whose meta somehow changed under us between the
+        #      pre-mutation read and here — an OSM CAS mismatch will still
+        #      block, but blocking here as well keeps the reasoning local.
+        _submit_watcher_ref = (
+            getattr(watched, "_watcher_ref", None)
+            or getattr(
+                getattr(approved_plan, "_watched_signal", None),
+                "_watcher_ref", None,
+            )
+            or getattr(
+                getattr(approved_plan, "watched_signal", None),
+                "_watcher_ref", None,
+            )
+        )
+        _submit_current_watcher_token = str(
+            getattr(_submit_watcher_ref, "owner_token", "") or ""
+        ).strip()
+        _submit_recovery_from_plan = str(
+            (getattr(approved_plan, "metadata", None) or {}).get("recovery_submit_owner")
+            or getattr(approved_plan, "recovery_submit_owner", "")
+            or ""
+        ).strip()
+        _submit_recovery_from_signal = ""
+        _sub_watched_signal_obj = getattr(watched, "signal", None)
+        if isinstance(_sub_watched_signal_obj, dict):
+            _submit_recovery_from_signal = str(
+                _sub_watched_signal_obj.get("recovery_submit_owner")
+                or _sub_watched_signal_obj.get("owner")
+                or ""
+            ).strip()
+        _submit_current_recovery_owner = (
+            _submit_recovery_from_plan or _submit_recovery_from_signal
+        )
+        if not _submit_current_watcher_token and _submit_current_recovery_owner:
+            _submit_current_watcher_token = _submit_current_recovery_owner
         (
             _submit_gate_generation,
             _submit_gate_owner,
             _submit_gate_owner_kind,
-        ) = _resolve_submit_ownership(_meta_for_ts)
-        # "not_under_ownership_regime" means this is a plain NON-DEFERRED
-        # entry that never went through materialization. There is no
-        # ownership contract to prove, and submit_existing_entry()'s durable
-        # submit-intent CAS is the authoritative fence for that path.
-        # Blocking it here would halt all normal non-deferred trading.
+        ) = _resolve_submit_ownership(
+            _meta_for_ts,
+            current_watcher_token=_submit_current_watcher_token,
+            current_recovery_owner=_submit_current_recovery_owner,
+        )
         _submit_ownership_required = (
             _submit_gate_owner_kind != "not_under_ownership_regime"
+            or not _order_row_read_proven
         )
-        _submit_ownership_proven = bool(
+        _submit_ownership_proven = (
             _submit_gate_generation is not None
             and _submit_gate_owner is not None
+            and _submit_gate_owner_kind in ("watcher_token", "recovery_submit_owner")
         )
 
         if _submit_ownership_required and not _submit_ownership_proven:
+            _reason = (
+                "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+                if _order_row_read_proven
+                else "SUBMIT_ORDER_ROW_READ_UNPROVEN"
+            )
             log.critical(
-                "[%s] SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE — row is under the "
-                "materialization ownership regime but ownership is unproven "
-                "(%s); zero broker POST order=%s generation=%r",
-                ticker,
+                "[%s] %s — row is under the materialization ownership regime "
+                "but ownership is unproven (kind=%s, read_proven=%s); zero "
+                "broker POST order=%s generation=%r",
+                ticker, _reason,
                 _submit_gate_owner_kind,
+                _order_row_read_proven,
                 str(queue_local_order_id or ""),
                 _submit_gate_generation,
             )
             return {
                 "disposition": "KEEP_WATCHER",
-                "reason_code": "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE",
+                "reason_code": _reason,
                 "submit_ownership_failure_kind": _submit_gate_owner_kind,
+                "order_row_read_proven": _order_row_read_proven,
                 "broker_post_attempted": False,
                 "retry_after_seconds": 5,
             }
