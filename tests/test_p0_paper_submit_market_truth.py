@@ -472,15 +472,25 @@ class TestOSMRearmAuthority:
         assert "WATCHER_TOKEN" in where
         assert "LIFECYCLE_STATE" in where and "PENDING_TRIGGER" in where and "BROKER_READY" in where
 
+        # PR #391 amendment: the optional-owner bypass predicate must be
+        # gone. Only strict equality on watcher_token is permitted.
+        normalized_where = " ".join(where.split())
+        assert "%S = '' OR" not in normalized_where
+        assert (
+            "COALESCE(META->>'WATCHER_TOKEN', '') = %S"
+            in normalized_where
+        )
+
         # Params carry the fence values in order.
         assert params[0] == _REARM_KW["deferred_contract"]  # contract set
-        # patch_json at params[1]; then LOID, client, mode, signal, gen, token, token
+        # patch_json at params[1]; then LOID, client, mode, signal, gen, token
         assert params[2] == "LOID-1"
         assert params[4] == _REARM_KW["execution_mode"]
         assert params[5] == _REARM_KW["signal_id"]
         assert params[6] == _REARM_KW["expected_generation"]
         assert params[7] == _REARM_KW["expected_watcher_token"]
-        assert params[8] == _REARM_KW["expected_watcher_token"]
+        # PR #391 amendment: tuple no longer duplicates the token.
+        assert len(params) == 8
 
         import json
         patch = json.loads(params[1])
@@ -520,6 +530,11 @@ class TestOSMRearmAuthority:
         {"expected_generation": -1},
         {"deferred_contract": "AAPL260626C00100000"},  # not DEFERRED:
         {"reason_code": ""},
+        # PR #391 amendment: blank/whitespace watcher token now fails
+        # closed — the previous permissive predicate (%s = '' OR ...)
+        # let a worker without proven ownership advance the row.
+        {"expected_watcher_token": ""},
+        {"expected_watcher_token": "   "},
     ])
     def test_rearm_refuses_bad_args(self, osm, kw_override):
         args = dict(_REARM_KW)
@@ -556,6 +571,14 @@ class TestOSMHoldAuthority:
         assert "MATERIALIZATION_GENERATION" in where
         assert "WATCHER_TOKEN" in where
         assert "LIFECYCLE_STATE" in where
+
+        # PR #391 amendment: same strict-fence guarantee as REARM.
+        normalized_where = " ".join(where.split())
+        assert "%S = '' OR" not in normalized_where
+        assert (
+            "COALESCE(META->>'WATCHER_TOKEN', '') = %S"
+            in normalized_where
+        )
 
         import json
         patch = json.loads(params[0])
@@ -600,6 +623,10 @@ class TestOSMHoldAuthority:
         {"next_retry_at": ""},
         {"max_attempts": 0},
         {"reason_code": ""},
+        # PR #391 amendment: blank/whitespace watcher token now fails
+        # closed for HOLD too.
+        {"expected_watcher_token": ""},
+        {"expected_watcher_token": "   "},
     ])
     def test_hold_refuses_bad_args(self, osm, kw_override):
         args = dict(_HOLD_KW)
@@ -1704,6 +1731,10 @@ class TestOSMHoldDirectlyOnGateModuleErrorReason:
     accepts that reason and writes the canonical HOLD schema."""
 
     def test_hold_accepts_module_error_reason(self, osm):
+        # PR #391 amendment: blank watcher_token is now a hard-fail
+        # ownership signal. This test proves HOLD accepts the specific
+        # MARKET_TRUTH_GATE_MODULE_ERROR reason code, so it uses a real
+        # token; separate tests cover the blank-token fail-closed path.
         ok = osm.hold_entry_for_market_truth_unavailable(
             "LOID-EXC",
             reason_code="MARKET_TRUTH_GATE_MODULE_ERROR",
@@ -1711,7 +1742,7 @@ class TestOSMHoldDirectlyOnGateModuleErrorReason:
             execution_mode="paper",
             signal_id="SIG-EXC",
             expected_generation=0,
-            expected_watcher_token="",
+            expected_watcher_token="watcher:module-err",
             next_retry_at="2026-07-26T18:30:00+00:00",
             max_attempts=10,
         )
@@ -1856,3 +1887,402 @@ class TestRearmOwnershipFencingP0_3:
         # Params carry the fence values (gen and both token slots).
         assert 7 in params
         assert "watcher:P03" in params
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PR #391 amendment (transport + ownership hardening) — new regressions
+# ═════════════════════════════════════════════════════════════════════════════
+
+
+class TestMarketTruthOwnershipResolution:
+    """PR #391 amendment (P0-2): _resolve_market_truth_ownership must return
+    (None, None) for any missing or malformed ownership metadata so the
+    ExecutionCore guard can refuse to mutate the row. The prior code coerced
+    missing generation to 0 and missing token to '', which combined with the
+    old permissive CAS let a worker without proven watcher ownership advance
+    the order."""
+
+    def test_valid_generation_and_token_are_proven(self):
+        from ap_execution_core import _resolve_market_truth_ownership
+
+        assert _resolve_market_truth_ownership({
+            "materialization_generation": 0,
+            "watcher_token": "watcher:abc",
+        }) == (0, "watcher:abc")
+
+    @pytest.mark.parametrize("meta", [
+        None,
+        {},
+        {"watcher_token": "watcher:abc"},                              # no gen key
+        {"materialization_generation": "bad", "watcher_token": "watcher:abc"},
+        {"materialization_generation": -1, "watcher_token": "watcher:abc"},
+        {"materialization_generation": 1, "watcher_token": ""},
+        {"materialization_generation": 1, "watcher_token": "   "},
+    ])
+    def test_missing_or_invalid_owner_is_unproven(self, meta):
+        from ap_execution_core import _resolve_market_truth_ownership
+
+        assert _resolve_market_truth_ownership(meta) == (None, None)
+
+
+class TestProductionTradierQuoteShape:
+    """PR #391 amendment (P0-1): the real Tradier /markets/quotes payload
+    normalized by TradierBroker.get_quote() has bid/ask/last only — no custom
+    source/quote_source/provider field. The previous quote-source lookup
+    fell through to 'unknown' for every correctly configured PAPER pod and
+    routed valid entries to CURRENT_PRICE_SOURCE_UNPROVEN → HOLD forever.
+
+    Transport identity is now the source of truth."""
+
+    def test_real_tradier_shape_uses_proven_transport_identity(self):
+        from types import SimpleNamespace
+        from datetime import datetime, timezone
+
+        from ap_execution_core import (
+            _market_data_transport_proof,
+            _submit_quote_source_from_transport,
+        )
+
+        adapter = SimpleNamespace(
+            cfg=SimpleNamespace(
+                base_url="https://api.tradier.com",
+            )
+        )
+
+        # Real adapter shape intentionally has no custom source/provider key.
+        quote = {
+            "symbol": "AAPL",
+            "type": "stock",
+            "bid": 100.95,
+            "ask": 101.05,
+            "last": 101.00,
+        }
+
+        assert "source" not in quote
+        assert "quote_source" not in quote
+        assert "provider" not in quote
+
+        proof = _market_data_transport_proof(adapter)
+        source = _submit_quote_source_from_transport(proof)
+
+        assert proof["proven"] is True
+        assert source == "tradier_live_transport"
+
+        result = check_market_validity_gate(
+            side="CALL",
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=quote["bid"],
+            current_ask=quote["ask"],
+            quote_age_ms=None,
+            quote_source=source,
+            quote_fetched_at=datetime.now(timezone.utc).isoformat(),
+            quote_provenance="synchronous_submit_fetch",
+            execution_mode="paper",
+        )
+
+        assert result.passed is True
+        assert result.reason_code == GateOutcome.PASS
+
+    def test_unproven_transport_cannot_claim_live_source(self):
+        from types import SimpleNamespace
+
+        from ap_execution_core import (
+            _market_data_transport_proof,
+            _submit_quote_source_from_transport,
+        )
+
+        adapter = SimpleNamespace(
+            cfg=SimpleNamespace(
+                base_url="https://sandbox.tradier.com",
+            )
+        )
+
+        proof = _market_data_transport_proof(adapter)
+
+        assert proof["proven"] is False
+        assert _submit_quote_source_from_transport(proof) == "unknown"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ExecutionCore wiring integration tests (Correction 5)
+#
+# These prove the runtime wiring, not just the helper composition. A green
+# unit test on _submit_quote_source_from_transport() is necessary but not
+# sufficient — the reviewer required that _on_entry_trigger() itself route
+# a real-shaped PAPER quote through the transport-derived source, and that
+# missing ownership metadata short-circuit BEFORE any OSM mutation or
+# broker POST.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _amend_execution_core(monkeypatch, *, order_meta, quote):
+    """Build an APExecutionCore instance wired for the amendment wiring
+    tests. Mirrors the pattern in
+    tests/test_p0_watcher_recovery_execution_ownership.py::_execution_core,
+    but uses a real-shaped Tradier quote (no source key) and lets the caller
+    control the row's meta so the ownership guard can be exercised.
+    """
+    import sys, types as _types
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import ap_execution_core as core_mod
+
+    fake_execution_mod = _types.ModuleType("ap.execution")
+    fake_execution_mod._refresh_ask_at_submit = lambda broker, contract: (
+        1.02, 5, True, "ok",
+        {"submit_bid": 1.00, "submit_ask": 1.02, "submit_last": 1.01,
+         "submit_mid": 1.01, "spread_pct": 0.0198},
+    )
+    monkeypatch.setitem(sys.modules, "ap.execution", fake_execution_mod)
+
+    plan = SimpleNamespace(
+        contract_symbol="SPY260717C00600000",
+        limit_price=1.01,
+        contracts=1,
+        max_position_usd=500.0,
+        side="CALL",
+        execution_mode="paper",
+        client_id="client@example.com",
+        signal_id="sig-1",
+        trigger_price=600.0,
+        metadata={"broker_ready": True, "materialization_status": "SELECTED"},
+        ticker="SPY",
+    )
+
+    osm = MagicMock()
+    osm.client_id = "client@example.com"
+    osm.execution_mode = "paper"
+    order_row = {
+        "local_order_id": "oid-1",
+        "client_id": "client@example.com",
+        "execution_mode": "paper",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "contract": "SPY260717C00600000",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "broker_ready": True,
+            "materialization_status": "SELECTED",
+            "trigger_crossed_at": "2026-07-14T13:29:55+00:00",
+            "trigger_confirmed_at": "2026-07-14T13:30:00+00:00",
+            **order_meta,
+        },
+    }
+    osm.get_order.return_value = order_row
+
+    def _update_order_meta(_oid, patch):
+        order_row["meta"].update(patch)
+        return True
+
+    osm.update_order_meta.side_effect = _update_order_meta
+    osm.submit_existing_entry.return_value = {
+        "ok": True,
+        "local_order_id": "oid-1",
+        "broker_order_id": "BRK-1",
+    }
+    osm.cancel_pending_entry.return_value = True
+    osm.expire_pending_entry.return_value = True
+    osm.rearm_entry_for_direction_reversal = MagicMock(return_value=True)
+    osm.hold_entry_for_market_truth_unavailable = MagicMock(return_value=True)
+
+    core = core_mod.APExecutionCore.__new__(core_mod.APExecutionCore)
+    core.paper = True
+    core.mode = "PAPER"
+    core.execution_mode = "paper"
+    core.email = "client@example.com"
+    core.client_id = "client@example.com"
+
+    # PAPER execution broker → sandbox transport (correctly UNPROVEN as
+    # market-data authority; execution-only).
+    core.broker = SimpleNamespace(
+        cfg=SimpleNamespace(base_url="https://sandbox.tradier.com"),
+        sandbox=True,
+        get_quote=MagicMock(return_value=dict(quote)),
+    )
+    # Distinct proven-live data broker — Tradier real-shape quote (no
+    # source/quote_source/provider field).
+    core.data_broker = SimpleNamespace(
+        cfg=SimpleNamespace(base_url="https://api.tradier.com"),
+        sandbox=False,
+        get_quote=MagicMock(return_value=dict(quote)),
+    )
+    core.store = MagicMock()
+    core.order_state_machine = osm
+    core.contract_selector = None
+    core._breach_risk_check = MagicMock(return_value=True)
+    core._recover_plan_for_revalidation = MagicMock(return_value=plan)
+    core._alert_degraded = MagicMock()
+    core._cleanup_pending_entry_order = (
+        core_mod.APExecutionCore._cleanup_pending_entry_order.__get__(
+            core, type(core)
+        )
+    )
+    core._classify_recovered_ownership_loss = (
+        core_mod.APExecutionCore._classify_recovered_ownership_loss.__get__(
+            core, type(core)
+        )
+    )
+    return core, osm, plan
+
+
+def _amend_submit_ready_watched(plan):
+    from ap_entry_watcher import WatchedSignal
+
+    watched = WatchedSignal(
+        {
+            "ticker": "SPY",
+            "side": "CALL",
+            "entry_price": 600.0,
+            "stop_price": 595.0,
+            "target_price": 610.0,
+            "signal_id": "sig-1",
+            "canonical_signal_id": "sig-1",
+            "local_order_id": "oid-1",
+            "client_id": "client@example.com",
+            "execution_mode": "paper",
+            "contract_symbol": "SPY260717C00600000",
+            "contract_deferred": False,
+            "timeframe": "1d",
+            "score": 88,
+            "_approved_plan": plan,
+        },
+        overnight=False,
+    )
+    watched.MOMENTUM_POLLS_REQUIRED = 2
+    return watched
+
+
+class TestExecutionCoreTradierShapeWiring:
+    """PR #391 amendment (Correction 5): _on_entry_trigger must route a
+    real-shape Tradier PAPER quote through the transport-derived source and
+    reach the gate audit as 'tradier_live_transport'. The pure helper test
+    on _submit_quote_source_from_transport is insufficient — this proves
+    the runtime wiring."""
+
+    def test_paper_real_tradier_quote_uses_transport_identity(self, monkeypatch):
+        import ap_execution_core as core_mod
+
+        # Real Tradier shape — no source/quote_source/provider key.
+        quote = {
+            "symbol": "SPY",
+            "type": "stock",
+            "bid": 600.20,
+            "ask": 600.22,
+            "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        assert "source" not in quote
+        assert "quote_source" not in quote
+        assert "provider" not in quote
+
+        core, osm, plan = _amend_execution_core(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 0,
+                "watcher_token": "watcher:integration-a",
+            },
+            quote=quote,
+        )
+        watched = _amend_submit_ready_watched(plan)
+
+        core_mod.APExecutionCore._on_entry_trigger(core, watched)
+
+        # The proven data broker served the quote; the sandbox execution
+        # broker was NOT consulted for market truth.
+        core.data_broker.get_quote.assert_called_once()
+        core.broker.get_quote.assert_not_called()
+
+        # The final durable meta carries the transport identity — proving
+        # the gate audit received 'tradier_live_transport' from the
+        # transport-derived source, not payload 'source' field.
+        final_meta = osm.get_order.return_value["meta"]
+        # Successful gate → final_market_validity persisted with transport
+        # identity in the quote_source field.
+        assert final_meta.get("final_market_validity", {}).get(
+            "quote_source"
+        ) == "tradier_live_transport"
+        assert final_meta.get("final_market_validity", {}).get(
+            "submit_quote_transport_proven"
+        ) is True
+        assert final_meta.get("final_market_validity", {}).get(
+            "submit_quote_transport_host"
+        ) == "api.tradier.com"
+
+
+class TestExecutionCoreOwnershipProof:
+    """PR #391 amendment (Correction 5): a market-truth failure with
+    missing or blank ownership metadata must short-circuit to KEEP_WATCHER
+    BEFORE any OSM mutation or broker POST attempt."""
+
+    def _run_with_missing_owner(
+        self, monkeypatch, *, order_meta,
+    ):
+        import ap_execution_core as core_mod
+
+        # Reverse the geometry so the market-validity gate fails —
+        # forcing dispatch to the authority-class branch where the
+        # ownership guard lives. For a CALL, ask below trigger =
+        # CALL_NO_LONGER_ABOVE_TRIGGER.
+        stale_quote = {
+            "symbol": "SPY",
+            "bid": 599.00,
+            "ask": 599.10,
+            "last": 599.05,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch,
+            order_meta=order_meta,
+            quote=stale_quote,
+        )
+        watched = _amend_submit_ready_watched(plan)
+
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        return result, osm, core
+
+    def test_missing_generation_returns_keep_watcher_without_lifecycle(
+        self, monkeypatch,
+    ):
+        result, osm, core = self._run_with_missing_owner(
+            monkeypatch,
+            order_meta={
+                # No materialization_generation.
+                "watcher_token": "watcher:has-token-but-no-gen",
+            },
+        )
+
+        assert isinstance(result, dict)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == (
+            "MARKET_TRUTH_OWNERSHIP_PROOF_UNAVAILABLE"
+        )
+        assert result.get("broker_post_attempted") is False
+
+        # Zero lifecycle mutation.
+        osm.rearm_entry_for_direction_reversal.assert_not_called()
+        osm.hold_entry_for_market_truth_unavailable.assert_not_called()
+        osm.submit_existing_entry.assert_not_called()
+
+    def test_blank_watcher_token_returns_keep_watcher_without_lifecycle(
+        self, monkeypatch,
+    ):
+        result, osm, core = self._run_with_missing_owner(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 0,
+                "watcher_token": "   ",  # whitespace only
+            },
+        )
+
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == (
+            "MARKET_TRUTH_OWNERSHIP_PROOF_UNAVAILABLE"
+        )
+        assert result.get("broker_post_attempted") is False
+
+        osm.rearm_entry_for_direction_reversal.assert_not_called()
+        osm.hold_entry_for_market_truth_unavailable.assert_not_called()
+        osm.submit_existing_entry.assert_not_called()

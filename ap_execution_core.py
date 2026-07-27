@@ -106,6 +106,68 @@ def _market_data_transport_proof(adapter) -> dict:
     }
 
 
+def _submit_quote_source_from_transport(transport_proof: dict) -> str:
+    """Return the submit-gate source identity from proven transport.
+
+    PR #391 amendment (P0-1): provider payload strings are not authority.
+    The real TradierBroker.get_quote() copies the Tradier payload and
+    normalizes only bid/ask/last; it does NOT stamp a custom source,
+    quote_source, or provider field. Reading source identity from those
+    optional decorations meant a correctly configured PAPER pod using the
+    real Tradier live adapter would derive source="unknown" and continually
+    HOLD valid entries with CURRENT_PRICE_SOURCE_UNPROVEN.
+
+    A quote is proven live when the adapter that returned it was configured
+    for the canonical Tradier live HTTPS transport. That transport identity
+    is the source of truth. When the transport is proven, we stamp the
+    canonical string "tradier_live_transport"; otherwise "unknown" so the
+    gate's existing unproven-source fence engages.
+    """
+    if (
+        isinstance(transport_proof, dict)
+        and bool(transport_proof.get("proven"))
+        and str(transport_proof.get("host") or "").strip().lower()
+        == "api.tradier.com"
+        and not bool(transport_proof.get("sandbox"))
+    ):
+        return "tradier_live_transport"
+
+    return "unknown"
+
+
+def _resolve_market_truth_ownership(
+    order_meta,
+) -> tuple[int | None, str | None]:
+    """Resolve the exact generation and watcher token needed for CAS.
+
+    PR #391 amendment (P0-2): missing metadata, a missing generation key, a
+    malformed/negative generation, or a blank/whitespace watcher token is
+    unproven ownership. Returns (None, None) in that case so the caller can
+    treat the row as un-ownable and skip every lifecycle mutation.
+
+    The previous code coerced a missing generation to 0 and a missing token
+    to "", which combined with the old permissive CAS predicate allowed a
+    worker without proven watcher ownership to mutate an eligible order.
+    """
+    if not isinstance(order_meta, dict):
+        return None, None
+
+    if "materialization_generation" not in order_meta:
+        return None, None
+
+    try:
+        generation = int(order_meta.get("materialization_generation"))
+    except (TypeError, ValueError):
+        return None, None
+
+    watcher_token = str(order_meta.get("watcher_token") or "").strip()
+
+    if generation < 0 or not watcher_token:
+        return None, None
+
+    return generation, watcher_token
+
+
 def _safe_reread_market_truth(osm, local_order_id: str) -> tuple[str | None, str | None]:
     """PR #391 (blocker 4): reread the order after a REARM/HOLD write returned
     False. Returns (authority_or_none, reason).
@@ -7069,52 +7131,152 @@ class APExecutionCore:
             _data_proof = _market_data_transport_proof(_data_broker)
             _execution_proof = _market_data_transport_proof(_execution_broker)
 
+            # PR #391 amendment (Correction 1): initialize selected-transport
+            # state BEFORE entering the try block. If source-list construction
+            # raises, the later audit code must not see unbound locals.
+            _mv_selected_adapter = None
+            _mv_selected_transport_proof = {
+                "base_url": None,
+                "host": None,
+                "sandbox": False,
+                "proven": False,
+            }
+            _quote_errors: list[str] = []
+
             try:
                 _quote_sources = []
+
                 if _gate_is_live:
-                    # LIVE: production quote path is the execution broker
-                    # itself. A separate live data broker is an extra fallback.
+                    # LIVE normally uses the execution broker. A distinct
+                    # proven live data broker may serve as fallback.
                     if hasattr(_execution_broker, "get_quote"):
-                        _quote_sources.append(("broker.get_quote", _execution_broker.get_quote))
-                    if _data_broker is not None and _data_broker is not _execution_broker \
-                       and hasattr(_data_broker, "get_quote"):
-                        _quote_sources.append(("data_broker.get_quote", _data_broker.get_quote))
+                        _quote_sources.append(
+                            (
+                                "broker.get_quote",
+                                _execution_broker.get_quote,
+                                _execution_proof,
+                            )
+                        )
+
+                    if (
+                        _data_broker is not None
+                        and _data_broker is not _execution_broker
+                        and hasattr(_data_broker, "get_quote")
+                    ):
+                        _quote_sources.append(
+                            (
+                                "data_broker.get_quote",
+                                _data_broker.get_quote,
+                                _data_proof,
+                            )
+                        )
                 else:
-                    # PAPER: require a distinct, proven-live data broker.
-                    # No fallback to the execution broker for market truth —
-                    # that adapter is the sandbox and cannot authorize submit.
+                    # PAPER market truth must come from a separate adapter
+                    # whose transport is proven canonical Tradier live HTTPS.
                     if (
                         _data_broker is None
                         or _data_broker is _execution_broker
                         or not _data_proof["proven"]
                     ):
                         _mv_quote_fetch_failed = True
-                        _mv_quote_fetch_error = "paper_live_data_broker_unavailable_or_sandbox"
+                        _mv_quote_fetch_error = (
+                            "paper_live_data_broker_unavailable_or_sandbox"
+                        )
                     elif hasattr(_data_broker, "get_quote"):
-                        _quote_sources.append(("data_broker.get_quote", _data_broker.get_quote))
-                # Alternate adapter shapes (LIVE fallback only)
-                if _gate_is_live and not _quote_sources and hasattr(_execution_broker, "get_bid_ask"):
-                    _quote_sources.append(("broker.get_bid_ask", _execution_broker.get_bid_ask))
-                if _gate_is_live and not _quote_sources and hasattr(_execution_broker, "quote"):
-                    _quote_sources.append(("broker.quote", _execution_broker.quote))
+                        _quote_sources.append(
+                            (
+                                "data_broker.get_quote",
+                                _data_broker.get_quote,
+                                _data_proof,
+                            )
+                        )
+
+                # Legacy LIVE adapter shapes remain fallback-only.
+                if (
+                    _gate_is_live
+                    and not _quote_sources
+                    and hasattr(_execution_broker, "get_bid_ask")
+                ):
+                    _quote_sources.append(
+                        (
+                            "broker.get_bid_ask",
+                            _execution_broker.get_bid_ask,
+                            _execution_proof,
+                        )
+                    )
+
+                if (
+                    _gate_is_live
+                    and not _quote_sources
+                    and hasattr(_execution_broker, "quote")
+                ):
+                    _quote_sources.append(
+                        (
+                            "broker.quote",
+                            _execution_broker.quote,
+                            _execution_proof,
+                        )
+                    )
 
                 _mv_raw_q = None
-                _adapter_name = None
-                for _adapter_name, _fetch in _quote_sources:
-                    _mv_received_at = datetime.now(timezone.utc).isoformat()
-                    _mv_quote_fetched_at = _mv_received_at
-                    _r = _fetch(ticker)
-                    if _adapter_name == "broker.get_bid_ask" and isinstance(_r, dict):
-                        _r = {
-                            "bid": _r.get("bid"),
-                            "ask": _r.get("ask"),
-                            "quote_age_ms": _r.get("quote_age_ms"),
-                            "source": _r.get("source", "get_bid_ask"),
-                            "provider_timestamp": _r.get("provider_timestamp"),
+
+                for _adapter_name, _fetch, _transport_proof in _quote_sources:
+                    try:
+                        _candidate = _fetch(ticker)
+                        _candidate_received_at = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
+                    except Exception as _source_exc:
+                        _quote_errors.append(
+                            f"{_adapter_name}:"
+                            f"{type(_source_exc).__name__}:"
+                            f"{str(_source_exc)[:160]}"
+                        )
+                        log.warning(
+                            "[%s] SUBMIT_QUOTE_SOURCE_FAILED "
+                            "adapter=%s error=%s",
+                            ticker,
+                            _adapter_name,
+                            _source_exc,
+                        )
+                        continue
+
+                    if _adapter_name == "broker.get_bid_ask" and isinstance(
+                        _candidate, dict
+                    ):
+                        _candidate = {
+                            "bid": _candidate.get("bid"),
+                            "ask": _candidate.get("ask"),
+                            "quote_age_ms": _candidate.get("quote_age_ms"),
+                            "provider_timestamp": _candidate.get(
+                                "provider_timestamp"
+                            ),
                         }
-                    if isinstance(_r, dict):
-                        _mv_raw_q = _r
-                        break
+
+                    if not isinstance(_candidate, dict):
+                        _quote_errors.append(
+                            f"{_adapter_name}:invalid_response_type:"
+                            f"{type(_candidate).__name__}"
+                        )
+                        continue
+
+                    # Do not let an empty first adapter prevent a valid
+                    # secondary LIVE adapter from being tried.
+                    if (
+                        _candidate.get("bid") is None
+                        or _candidate.get("ask") is None
+                    ):
+                        _quote_errors.append(
+                            f"{_adapter_name}:missing_bid_or_ask"
+                        )
+                        continue
+
+                    _mv_raw_q = _candidate
+                    _mv_selected_adapter = _adapter_name
+                    _mv_selected_transport_proof = dict(_transport_proof)
+                    _mv_received_at = _candidate_received_at
+                    _mv_quote_fetched_at = _candidate_received_at
+                    break
 
                 if isinstance(_mv_raw_q, dict):
                     _mv_q = _mv_raw_q
@@ -7124,12 +7286,18 @@ class APExecutionCore:
                     _mv_bid = _mv_q.get("bid")
                     _mv_ask = _mv_q.get("ask")
                     _mv_quote_age_ms = _mv_q.get("quote_age_ms")
-                    _mv_quote_source = (
-                        _mv_q.get("source")
-                        or _mv_q.get("quote_source")
-                        or _mv_q.get("provider")
-                        or "unknown"
+
+                    # PR #391 amendment (P0-1): the actual transport is
+                    # authority. The real Tradier payload is not required
+                    # to invent a custom `source` field, so deriving source
+                    # from quote.get("source") produced "unknown" for every
+                    # correctly configured PAPER pod. Derive from the
+                    # proven transport of the adapter that served the
+                    # quote instead.
+                    _mv_quote_source = _submit_quote_source_from_transport(
+                        _mv_selected_transport_proof
                     )
+
                     # True provider timestamp when supplied by the adapter;
                     # NEVER a rewrite of the local receipt time. Missing
                     # provider ts is fine as long as quote_age_ms is present
@@ -7141,13 +7309,15 @@ class APExecutionCore:
                         or _mv_q.get("quote_time")
                         or None
                     )
-                elif _mv_quote_fetched_at is not None:
-                    _mv_quote_fetch_error = (
-                        f"invalid_quote_response_type:{type(_mv_raw_q).__name__}"
-                    )
+                elif _quote_errors:
+                    _mv_quote_fetch_failed = True
+                    _mv_quote_fetch_error = ";".join(_quote_errors)[:500]
                 elif not _quote_sources and not _gate_is_live:
                     # PAPER with no live data source and no fallback adapter.
-                    _mv_quote_fetch_error = "paper_live_data_broker_unavailable"
+                    _mv_quote_fetch_failed = True
+                    _mv_quote_fetch_error = (
+                        "paper_live_data_broker_unavailable"
+                    )
             except Exception as _mv_exc:
                 _mv_quote_fetch_failed = True
                 _mv_quote_fetch_error = f"{type(_mv_exc).__name__}:{_mv_exc}"
@@ -7177,6 +7347,25 @@ class APExecutionCore:
                 quote_fetch_error=_mv_quote_fetch_error,
                 execution_mode=_gate_exec_mode,
             )
+            # PR #391 amendment (Correction 2): the selected-transport
+            # diagnostics belong in the canonical gate audit dict, not just
+            # in _durable_truth_patch. Downstream persistence uses
+            # gate_audit / final_market_validity / market_validity_gate in
+            # multiple sites (REARM CAS, HOLD CAS, terminal handling,
+            # successful submission), so a single mutation here reaches
+            # every write.
+            _mv_res.audit.update({
+                "submit_quote_adapter": _mv_selected_adapter,
+                "submit_quote_transport_proven": bool(
+                    _mv_selected_transport_proof.get("proven")
+                ),
+                "submit_quote_transport_base_url": (
+                    _mv_selected_transport_proof.get("base_url")
+                ),
+                "submit_quote_transport_host": (
+                    _mv_selected_transport_proof.get("host")
+                ),
+            })
             _final_market_validity_audit = _mv_res.audit
             if not _mv_res.passed:
                 # ── PR #391: authority-class dispatch ──────────────────────
@@ -7236,12 +7425,16 @@ class APExecutionCore:
                 # BEFORE the nested function is defined. locals() inside a
                 # nested def resolves to the nested scope, not the outer
                 # one, so any lookup done inside must not use locals().
-                _market_truth_generation = int(
-                    (_meta_for_ts or {}).get("materialization_generation") or 0
-                )
-                _market_truth_watcher_token = str(
-                    (_meta_for_ts or {}).get("watcher_token") or ""
-                )
+                #
+                # PR #391 amendment (P0-2): resolve with strict validation.
+                # Missing/malformed generation or blank watcher token yields
+                # (None, None) — the ownership guard below will treat that
+                # as unproven ownership and return KEEP_WATCHER before any
+                # lifecycle mutation.
+                (
+                    _market_truth_generation,
+                    _market_truth_watcher_token,
+                ) = _resolve_market_truth_ownership(_meta_for_ts)
                 _deferred_contract = f"DEFERRED:{str(ticker).upper()}"
 
                 # HARD-HOLD amendment (remaining blocker 1): the watcher
@@ -7263,6 +7456,43 @@ class APExecutionCore:
                         "_watcher_ref", None,
                     )
                 )
+
+                # PR #391 amendment: ownership proof is a hard prerequisite
+                # for any lifecycle mutation (REARM, HOLD, TERMINAL) OR any
+                # broker POST attempt. Without a proven local_order_id +
+                # signal_id + generation + watcher_token, a worker cannot
+                # advance the row; it may only retain its watcher and let
+                # recovery or a re-owning peer act. This runs BEFORE
+                # _degrade_market_truth_block_to_hold is defined so it
+                # cannot be bypassed by nested calls.
+                _market_truth_identity_proven = bool(
+                    str(queue_local_order_id or "").strip()
+                    and _plan_signal_id
+                    and _market_truth_generation is not None
+                    and _market_truth_watcher_token is not None
+                )
+
+                if not _market_truth_identity_proven:
+                    log.critical(
+                        "[%s] MARKET_TRUTH_OWNERSHIP_PROOF_UNAVAILABLE "
+                        "order=%s signal_id=%s generation=%r "
+                        "watcher_token_present=%s authority=%s — "
+                        "zero POST; retaining watcher without DB mutation",
+                        ticker,
+                        str(queue_local_order_id or ""),
+                        _plan_signal_id,
+                        _market_truth_generation,
+                        bool(_market_truth_watcher_token),
+                        _authority,
+                    )
+                    return {
+                        "disposition": "KEEP_WATCHER",
+                        "reason_code": (
+                            "MARKET_TRUTH_OWNERSHIP_PROOF_UNAVAILABLE"
+                        ),
+                        "broker_post_attempted": False,
+                        "retry_after_seconds": 5,
+                    }
 
                 # PR #391 blocker 4/5/7: unified degrade path.
                 #   * The reread only short-circuits on broker evidence. A
@@ -7527,7 +7757,13 @@ class APExecutionCore:
                                     "authority": _authority,
                                 },
                                 "final_market_validity": _mv_res.audit,
-                                **_durable_truth_patch,
+                                # PR #391 amendment (§5): do NOT rewrite the
+                                # canonical durable authority fields through
+                                # this generic update_order_meta after the
+                                # REARM CAS already wrote them. The CAS is
+                                # fenced by generation + watcher_token; this
+                                # generic write is fenced only by LOID+client
+                                # and could clobber a peer's fresh advance.
                             },
                         )
                     except Exception as _rearm_diag_exc:
@@ -7564,7 +7800,10 @@ class APExecutionCore:
                                         "authority": _authority,
                                     },
                                     "final_market_validity": _mv_res.audit,
-                                    **_durable_truth_patch,
+                                    # PR #391 amendment (§5): see REARM branch.
+                                    # HOLD CAS already wrote the canonical
+                                    # durable authority fields; do not rewrite
+                                    # them through the generic seam.
                                 },
                             )
                         except Exception as _hold_diag_exc:

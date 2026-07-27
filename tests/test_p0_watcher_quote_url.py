@@ -6,6 +6,10 @@ import os, re, sys, types, threading, pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from ap.live_submit_gates import (
+    MarketDataTransportConfigurationError,
+)
+
 _REPO  = Path(__file__).resolve().parents[1]
 EW_SRC = (_REPO / "ap_entry_watcher.py").read_text()
 APP_SRC = (_REPO / "app.py").read_text()
@@ -34,12 +38,27 @@ def test_watcher_quote_identity_uses_resolve_helper():
     body = EW_SRC[idx:end]
     assert "_current_watcher_quote_proof()" in body
 
-def test_sandbox_guard_present():
-    idx = EW_SRC.find("def _resolve_watcher_quote_transport(")
+def test_watcher_uses_shared_strict_transport_validator():
+    """PR #391 amendment (Correction 4): the watcher's transport resolver
+    must delegate to require_proven_market_data_transport and reference
+    CANONICAL_TRADIER_MARKET_DATA_BASE_URL. The prior sandbox-substring
+    guard that silently rewrote URLs to live has been removed."""
+    idx = EW_SRC.find(
+        "def _resolve_watcher_quote_transport("
+    )
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    assert "WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED" in body
-    assert "Forcing https://api.tradier.com" in body
+
+    assert "require_proven_market_data_transport" in body
+    assert (
+        "CANONICAL_TRADIER_MARKET_DATA_BASE_URL"
+        in body
+    )
+    assert (
+        "WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED"
+        not in body
+    )
+    assert "Forcing https://api.tradier.com" not in body
 
 def test_paper_fail_closed_present():
     idx = EW_SRC.find("def _fetch_quotes(")
@@ -55,19 +74,16 @@ def test_preflight_failure_message_present():
     assert "PAPER_WATCHER_NO_MARKET_DATA_TOKEN" in body
     assert "TRADIER_MARKET_DATA_TOKEN or TRADIER_DATA_TOKEN" in body
 
-def test_resolve_helper_default_is_live():
-    """Hardcoded fallback must be api.tradier.com; sandbox guard must reject any sandbox URL."""
+def test_resolve_helper_delegates_to_strict_validator():
+    """PR #391 amendment: proof of shared authority. The resolver must
+    import both CANONICAL_TRADIER_MARKET_DATA_BASE_URL and
+    require_proven_market_data_transport. No sandbox rewrite is allowed."""
     idx = EW_SRC.find("def _resolve_watcher_quote_transport(")
     end = EW_SRC.find("\n    def ", idx + 1)
     body = EW_SRC[idx:end]
-    # Default fallback must be api.tradier.com
-    assert "api.tradier.com" in body
-    # Guard: the function must detect sandbox and replace it — look for both the
-    # check and the forced replacement value
-    assert "sandbox.tradier.com" in body,    "guard must check for sandbox URL"
-    assert "Forcing https://api.tradier.com" in body or \
-           "_LIVE_QUOTE_URL" in body,         "guard must force to live URL"
-    # The guard must never RETURN sandbox — verified by test_sandbox_env_forced_to_live
+    assert "require_proven_market_data_transport" in body
+    assert "CANONICAL_TRADIER_MARKET_DATA_BASE_URL" in body
+    assert "Forcing https://api.tradier.com" not in body
 
 def test_audit_fields_still_present():
     for field in [
@@ -156,25 +172,89 @@ def _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com",
         return None
 
 
-# ── Test 1: sandbox env → forced to api.tradier.com ──────────────────────────
+# ── Test 1 (rewritten): sandbox / hostile env → rejected before token use ────
 
-def test_sandbox_env_forced_to_live():
-    """
-    TRADIER_MARKET_DATA_BASE_URL=https://sandbox.tradier.com must be rejected
-    and forced to https://api.tradier.com.
-    """
-    w = _make_watcher(mode="PAPER", broker_base="https://sandbox.tradier.com")
+
+@pytest.mark.parametrize(
+    "configured_url",
+    [
+        "https://api.tradier.com",
+        "https://api.tradier.com/",
+        "https://api.tradier.com/v1",
+        "https://api.tradier.com/v1/",
+        "https://api.tradier.com:443",
+    ],
+)
+def test_watcher_normalizes_accepted_urls_to_canonical_origin(configured_url):
+    """PR #391 amendment: every accepted operator variant normalizes to
+    the canonical origin. TradierBroker concatenates base_url + '/v1/...',
+    so returning '/v1' or a trailing slash would produce '/v1/v1/...' at
+    request time. There is exactly one accepted output form."""
+    w = _make_watcher(
+        mode="PAPER",
+        broker_base="https://sandbox.tradier.com",
+    )
     if w is None:
         pytest.skip("APEntryWatcher not importable in test env")
-    with patch.dict(os.environ, {
-        "TRADIER_MARKET_DATA_BASE_URL": "https://sandbox.tradier.com",
-        "TRADIER_MARKET_DATA_TOKEN":    "some_tok",
-    }):
-        base_url, _ = w._resolve_watcher_quote_url()
-    assert "sandbox" not in base_url.lower(), (
-        f"Sandbox env must be overridden to api.tradier.com, got {base_url!r}"
+
+    with patch.dict(
+        os.environ,
+        {
+            "TRADIER_MARKET_DATA_TOKEN": "live_data_tok",
+            "TRADIER_MARKET_DATA_BASE_URL": configured_url,
+        },
+        clear=True,
+    ):
+        transport = w._resolve_watcher_quote_transport()
+
+    assert transport["watcher_quote_base_url"] == "https://api.tradier.com"
+    assert transport["watcher_sandbox_mode"] is False
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://sandbox.tradier.com",
+        "https://evil.example",
+        "https://api.tradier.com.evil.example",
+        "http://api.tradier.com",
+        "ftp://api.tradier.com",
+        "https://user:pass@api.tradier.com",
+        "https://api.tradier.com:8443",
+        "https://api.tradier.com?redirect=x",
+        "https://api.tradier.com#fragment",
+        "https://api.tradier.com/v2",
+        "https://api.tradier.com/foo",
+        "https://api.tradier.com/v1/markets",
+        "https://api.tradier.com//evil",
+    ],
+)
+def test_watcher_rejects_untrusted_url_before_token_bearing_request(bad_url):
+    """PR #391 amendment: an invalid explicit env var must raise
+    MarketDataTransportConfigurationError BEFORE any credential-bearing
+    request. Neither requests.get nor broker.session.get may fire — the
+    prior silent-rewrite behavior would have attached the live market-data
+    bearer token to arbitrary hosts."""
+    w = _make_watcher(
+        mode="PAPER",
+        broker_base="https://sandbox.tradier.com",
     )
-    assert "api.tradier.com" in base_url
+    if w is None:
+        pytest.skip("APEntryWatcher not importable in test env")
+
+    with patch.dict(
+        os.environ,
+        {
+            "TRADIER_MARKET_DATA_TOKEN": "live_data_tok",
+            "TRADIER_MARKET_DATA_BASE_URL": bad_url,
+        },
+        clear=True,
+    ), patch("requests.get") as requests_get:
+        with pytest.raises(MarketDataTransportConfigurationError):
+            w._fetch_quotes(["SPY"])
+
+    requests_get.assert_not_called()
+    w.broker.session.get.assert_not_called()
 
 
 # ── Test 2: PAPER + no token → hard failure (fail closed) ────────────────────

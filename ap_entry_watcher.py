@@ -35,6 +35,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+# PR #391 amendment: strict market-data transport validator — same authority
+# as client_runner and ap_execution_core. Re-imported at module top so the
+# exception type is available to _fetch_quotes without a delayed import.
+from ap.live_submit_gates import (
+    MarketDataTransportConfigurationError,
+)
+
 # ── Lifecycle + health wiring (defensive — watcher runs standalone if missing) ──
 try:
     from ap_lifecycle import (
@@ -1830,27 +1837,40 @@ class APEntryWatcher:
     #   Logs with persisted=false when local_order_id is absent or order not found.
 
     def _resolve_watcher_quote_transport(self) -> dict:
-        """Resolve the watcher quote transport without leaking credentials."""
+        """Resolve and prove the watcher market-data transport.
+
+        PR #391 amendment: the watcher now uses the same strict allowlist
+        as client_runner and ExecutionCore. The market-data bearer token
+        may only be used with the canonical Tradier live HTTPS origin.
+        Accepted operator variants (with or without trailing slash, with
+        the /v1 prefix, with the default port explicit) all normalize to
+        the origin form before endpoint concatenation. Sandbox and
+        hostile URLs raise MarketDataTransportConfigurationError before
+        any token is attached — no silent rewrite.
+        """
         import os as _os
-        _LIVE_QUOTE_URL = "https://api.tradier.com"
-        base_url = str(
+
+        from ap.live_submit_gates import (
+            CANONICAL_TRADIER_MARKET_DATA_BASE_URL,
+            require_proven_market_data_transport,
+        )
+
+        configured_base_url = str(
             _os.getenv("TRADIER_MARKET_DATA_BASE_URL")
             or _os.getenv("TRADIER_DATA_BASE_URL")
-            or _LIVE_QUOTE_URL
-        ).rstrip("/")
-        if "sandbox.tradier.com" in base_url.lower():
-            log.error(
-                "[watcher_quotes] WATCHER_QUOTE_URL_SANDBOX_GUARD_TRIGGERED "
-                "resolved_url=%s — sandbox URL must not be used for watcher "
-                "quote/trigger/stop/invalidation decisions. "
-                "Forcing https://api.tradier.com. "
-                "Set TRADIER_MARKET_DATA_BASE_URL=https://api.tradier.com to silence.",
-                base_url,
-            )
-            base_url = _LIVE_QUOTE_URL
+            or CANONICAL_TRADIER_MARKET_DATA_BASE_URL
+        ).strip()
+
+        # Validate before resolving or using a bearer token. The returned
+        # base_url is always the canonical credential-free origin.
+        transport_proof = require_proven_market_data_transport(
+            configured_base_url
+        )
+        base_url = str(transport_proof["base_url"])
 
         token = None
         token_source_name = "missing"
+
         if _os.getenv("TRADIER_MARKET_DATA_TOKEN"):
             token = _os.getenv("TRADIER_MARKET_DATA_TOKEN")
             token_source_name = "TRADIER_MARKET_DATA_TOKEN"
@@ -1860,8 +1880,16 @@ class APEntryWatcher:
         elif getattr(self.broker, "live_access_token", None):
             token = getattr(self.broker, "live_access_token", None)
             token_source_name = "broker.live_access_token"
-        elif getattr(getattr(self.broker, "cfg", None), "live_access_token", None):
-            token = getattr(getattr(self.broker, "cfg", None), "live_access_token", None)
+        elif getattr(
+            getattr(self.broker, "cfg", None),
+            "live_access_token",
+            None,
+        ):
+            token = getattr(
+                getattr(self.broker, "cfg", None),
+                "live_access_token",
+                None,
+            )
             token_source_name = "broker.cfg.live_access_token"
 
         return {
@@ -6151,6 +6179,14 @@ class APEntryWatcher:
                 _quote["quote_fetch_status"] = "success"
                 normalized_quotes[str(q.get("symbol", "")).upper()] = _quote
             return normalized_quotes
+        except MarketDataTransportConfigurationError:
+            # PR #391 amendment (Correction 3): invalid transport
+            # configuration must propagate. It represents an unsafe
+            # runtime environment; it must NOT be converted to an
+            # ordinary empty-quote result, because the caller would
+            # then evaluate stops/triggers against silently missing
+            # data and never learn the URL was rejected.
+            raise
         except Exception as exc:
             _existing_fetch_status = str(
                 (getattr(self, "_last_quote_fetch_proof", {}) or {}).get("quote_fetch_status") or ""

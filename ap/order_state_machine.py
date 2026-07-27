@@ -1758,6 +1758,7 @@ class APOrderStateMachine:
             or not reason_code
             or execution_mode not in {"paper", "live"}
             or not signal_id
+            or not expected_watcher_token
             or expected_generation < 0
             or not deferred_contract.startswith("DEFERRED:")
         ):
@@ -1836,10 +1837,7 @@ class APOrderStateMachine:
                             (meta->>'materialization_generation')::int,
                             0
                           ) = %s
-                      AND (
-                            %s = ''
-                            OR COALESCE(meta->>'watcher_token', '') = %s
-                          )
+                      AND COALESCE(meta->>'watcher_token', '') = %s
                       AND UPPER(
                             COALESCE(
                                 meta->>'lifecycle_state',
@@ -1855,7 +1853,6 @@ class APOrderStateMachine:
                         execution_mode,
                         signal_id,
                         expected_generation,
-                        expected_watcher_token,
                         expected_watcher_token,
                     ),
                 )
@@ -1951,6 +1948,7 @@ class APOrderStateMachine:
             or not reason_code
             or execution_mode not in {"paper", "live"}
             or not signal_id
+            or not expected_watcher_token
             or expected_generation < 0
             or max_attempts < 1
             or not next_retry_at
@@ -2078,10 +2076,7 @@ class APOrderStateMachine:
                             (meta->>'materialization_generation')::int,
                             0
                           ) = %s
-                      AND (
-                            %s = ''
-                            OR COALESCE(meta->>'watcher_token', '') = %s
-                          )
+                      AND COALESCE(meta->>'watcher_token', '') = %s
                       AND UPPER(
                             COALESCE(
                                 meta->>'lifecycle_state',
@@ -2097,7 +2092,6 @@ class APOrderStateMachine:
                         execution_mode,
                         signal_id,
                         expected_generation,
-                        expected_watcher_token,
                         expected_watcher_token,
                     ),
                 )
