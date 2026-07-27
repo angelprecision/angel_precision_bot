@@ -859,19 +859,18 @@ def check_market_validity_gate(
     # is blank, unknown, or sandbox is not proven live-market truth and must
     # not authorize a submit — PAPER or LIVE. HOLD for bounded retry.
     #
-    # P0-1 exception (Jason's real LIVE shape): a LIVE synchronous_submit_fetch
-    # whose adapter did not populate an explicit source string arrives here
-    # as quote_source="unknown" (the caller's fallback). Freshness, bid/ask,
-    # stop, target, and direction are already checked separately, so the
-    # "unknown + LIVE + synchronous_submit_fetch" triple is provably a fresh
-    # live-broker quote even without an explicit provider name. Every other
-    # unproven combination stays blocked.
+    # PR #391 amendment (P0 Blocker 3): the previous "unknown + LIVE +
+    # synchronous_submit_fetch" exemption existed because Jason's real
+    # LIVE adapter did not populate a source string, so every valid LIVE
+    # quote arrived as quote_source="unknown". That problem is now solved
+    # by transport-derived identity: _submit_quote_source_from_transport()
+    # produces "tradier_live_transport" for a proven canonical Tradier
+    # transport and "unknown" only when the transport is unproven. Keeping
+    # the exemption would allow an unproven transport to pass the gate in
+    # LIVE mode, directly contradicting the new authority model. The
+    # exemption is removed unconditionally.
     _source_lc = (str(quote_source or "").strip().lower())
-    if _source_lc in _UNPROVEN_SOURCES and not (
-        _live
-        and _source_lc == "unknown"
-        and provenance == "synchronous_submit_fetch"
-    ):
+    if _source_lc in _UNPROVEN_SOURCES:
         return _fail(
             GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN,
             f"quote_source={quote_source!r} is unproven "

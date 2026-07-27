@@ -681,19 +681,27 @@ class TestProvenanceEnforcement:
             assert r.passed is False
             assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
 
-    def test_live_unknown_with_sync_fetch_is_allowed(self):
-        # P0-1: Jason's real LIVE shape — unknown + synchronous_submit_fetch.
+    def test_live_unknown_with_sync_fetch_now_holds(self):
+        # PR #391 amendment (P0 Blocker 3): the old exemption for
+        # "unknown + LIVE + synchronous_submit_fetch" is removed. Transport-
+        # derived identity now produces "tradier_live_transport" for a
+        # correctly configured adapter — "unknown" exclusively signals an
+        # unproven transport, which must not authorize a submit in any mode.
         r = _gate("live",
                   side="CALL", trigger_price=100.0, stop_price=95.0,
                   target_price=110.0,
                   current_bid=100.95, current_ask=101.05,
                   quote_age_ms=100, quote_source="unknown",
                   quote_provenance="synchronous_submit_fetch")
-        assert r.passed is True
-        assert r.reason_code == GateOutcome.PASS
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+        assert (
+            classify_market_truth(r.reason_code)
+            == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+        )
 
     def test_live_unknown_without_sync_fetch_still_holds(self):
-        # P0-1 exception is scoped tightly: unknown+cached still fails.
+        # Remains blocked — was already blocked before the amendment.
         r = _gate("live",
                   side="CALL", trigger_price=100.0, stop_price=95.0,
                   target_price=110.0,
@@ -2286,3 +2294,551 @@ class TestExecutionCoreOwnershipProof:
         osm.rearm_entry_for_direction_reversal.assert_not_called()
         osm.hold_entry_for_market_truth_unavailable.assert_not_called()
         osm.submit_existing_entry.assert_not_called()
+
+
+# =============================================================================
+# PR #391 amendment — P0 Blocker 1: ownership guard on the VALID-QUOTE path.
+#
+# When _mv_res.passed is True the old code went straight to
+# submit_existing_entry(). A missing/blank generation or watcher_token was
+# never checked, so a worker without proven ownership could reach a broker
+# POST. The amendment adds _resolve_market_truth_ownership() before
+# submit_existing_entry() on the happy path too.
+#
+# Required tests (from the HARD HOLD review):
+#   1. PAPER production quote → submit_existing_entry called exactly once.
+#   2. Valid quote + missing generation → zero submission, KEEP_WATCHER.
+#   3. Valid quote + blank watcher_token → zero submission, KEEP_WATCHER.
+# =============================================================================
+
+
+class TestValidQuoteOwnershipGuard:
+    """PR #391 P0 Blocker 1: ownership proof is required even when the market-
+    truth gate passes. Valid bid/ask geometry must not authorize a broker POST
+    if generation or watcher_token is absent or blank."""
+
+    def _run_valid_quote(self, monkeypatch, *, order_meta):
+        """Build a PAPER core with a passing quote geometry and run
+        _on_entry_trigger. Returns (result, osm)."""
+        import ap_execution_core as core_mod
+
+        # Quote that passes the market-truth gate: CALL, bid above trigger.
+        passing_quote = {
+            "symbol": "SPY",
+            "bid": 600.20,
+            "ask": 600.22,
+            "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch,
+            order_meta=order_meta,
+            quote=passing_quote,
+        )
+        watched = _amend_submit_ready_watched(plan)
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        return result, osm
+
+    def test_valid_quote_proven_ownership_reaches_submit(self, monkeypatch):
+        """PAPER production quote + valid ownership → submit_existing_entry
+        called exactly once. This is the acceptance test that proves the
+        ownership guard does NOT block a legitimately owned row."""
+        _result, osm = self._run_valid_quote(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 0,
+                "watcher_token": "watcher:integration-a",
+            },
+        )
+        osm.submit_existing_entry.assert_called_once()
+
+    def test_valid_quote_missing_generation_zero_submission(self, monkeypatch):
+        """Valid market quote + missing materialization_generation key →
+        _resolve_market_truth_ownership returns (None, None) →
+        SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE → zero broker POST."""
+        result, osm = self._run_valid_quote(
+            monkeypatch,
+            order_meta={
+                # No materialization_generation key at all.
+                "watcher_token": "watcher:has-token-no-gen",
+            },
+        )
+        assert isinstance(result, dict)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("broker_post_attempted") is False
+        osm.submit_existing_entry.assert_not_called()
+
+    def test_valid_quote_blank_watcher_token_zero_submission(self, monkeypatch):
+        """Valid market quote + blank watcher_token →
+        _resolve_market_truth_ownership returns (None, None) →
+        SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE → zero broker POST."""
+        result, osm = self._run_valid_quote(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 0,
+                "watcher_token": "   ",  # whitespace only
+            },
+        )
+        assert isinstance(result, dict)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("broker_post_attempted") is False
+        osm.submit_existing_entry.assert_not_called()
+
+    def test_valid_quote_negative_generation_zero_submission(self, monkeypatch):
+        """Negative generation is unproven ownership even with a valid token."""
+        result, osm = self._run_valid_quote(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": -1,
+                "watcher_token": "watcher:valid",
+            },
+        )
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        osm.submit_existing_entry.assert_not_called()
+
+
+# =============================================================================
+# PR #391 amendment — P0 Blocker 2: module-exception path uses strict
+# resolver, not coercing generation to 0 or token to "".
+#
+# Required tests (from the HARD HOLD review):
+#   4. Module-error + missing generation → hold_entry NOT called, KEEP_WATCHER.
+#   5. Module-error + blank token → hold_entry NOT called, KEEP_WATCHER.
+# =============================================================================
+
+
+class TestModuleErrorOwnershipGuard:
+    """PR #391 P0 Blocker 2: the outer gate-exception handler now calls
+    _resolve_market_truth_ownership() instead of int(... or 0). A missing
+    generation key or blank watcher token must produce KEEP_WATCHER without
+    any HOLD SQL being emitted — previously the coercion let generation=0
+    pass the OSM HOLD argument-validation guard and write to the DB.
+
+    Scaffolding notes:
+    • check_market_validity_gate is re-imported locally inside _on_entry_trigger
+      via `from ap.live_submit_gates import check_market_validity_gate`. Patching
+      ap_execution_core.check_market_validity_gate (module-level import) does NOT
+      reach that local binding. We patch ap.live_submit_gates directly so the
+      per-call re-import picks up the mock.
+    • _build_gate_exception_scaffold sets osm.get_order.side_effect which
+      overrides return_value. We reset side_effect to a lambda that returns
+      our controlled meta dict so _meta_for_ts inside the exception handler
+      carries the correct generation / watcher_token values.
+    """
+
+    def _run_gate_exception_with_meta(self, monkeypatch, *, order_meta):
+        """Build a scaffold where check_market_validity_gate raises.
+        Returns (result, osm).
+
+        Patching strategy: the function does a per-call
+          from ap.live_submit_gates import check_market_validity_gate
+        inside a try block, so we must patch the attribute on the source
+        module — not on ap_execution_core — so the fresh import resolves
+        to our stub.
+        """
+        import ap.live_submit_gates as _gates_mod
+        import ap_execution_core as core_mod
+
+        core, watched, osm, _durable = _build_gate_exception_scaffold(
+            monkeypatch, "paper"
+        )
+
+        # Reset the side_effect set by the scaffold so return_value governs.
+        controlled_row = {
+            "local_order_id": "LOID-GATE-EXC",
+            "client_id": "client@example.com",
+            "meta": {**order_meta},
+        }
+        osm.get_order.side_effect = None
+        osm.get_order.return_value = controlled_row
+
+        # Patch at the source module so the per-call import resolves to the stub.
+        def _raising_gate(*_a, **_kw):
+            raise RuntimeError("injected gate failure for blocker-2 test")
+
+        monkeypatch.setattr(_gates_mod, "check_market_validity_gate", _raising_gate)
+
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        return result, osm
+
+    def test_module_error_missing_generation_no_hold_sql(self, monkeypatch):
+        """Gate raises + no materialization_generation key → resolver returns
+        (None, None) → hold_entry_for_market_truth_unavailable NOT called
+        (the expected_generation=None fails the OSM arg-validation guard) →
+        KEEP_WATCHER is the only valid disposition."""
+        result, osm = self._run_gate_exception_with_meta(
+            monkeypatch,
+            order_meta={
+                # No materialization_generation key at all.
+                "watcher_token": "watcher:has-token-no-gen",
+            },
+        )
+        # HOLD must not fire: the pre-HOLD ownership guard short-circuits
+        # before any OSM call when generation or token is None.
+        osm.hold_entry_for_market_truth_unavailable.assert_not_called()
+        assert isinstance(result, dict)
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "MODULE_ERROR_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("broker_post_attempted") is False
+
+    def test_module_error_blank_token_no_hold_sql(self, monkeypatch):
+        """Gate raises + blank watcher_token → resolver returns (None, None) →
+        pre-HOLD guard short-circuits → hold_entry NOT called → KEEP_WATCHER."""
+        result, osm = self._run_gate_exception_with_meta(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 0,
+                "watcher_token": "",  # blank
+            },
+        )
+        osm.hold_entry_for_market_truth_unavailable.assert_not_called()
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "MODULE_ERROR_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("broker_post_attempted") is False
+
+    def test_module_error_resolver_called_via_source_inspection(self):
+        """Static proof: the module-exception handler's source must call
+        _resolve_market_truth_ownership(_module_meta) — not the old
+        int(... or 0) / str(... or "") coercion pattern."""
+        with open("ap_execution_core.py") as fh:
+            src = fh.read()
+
+        # Locate the module-exception handler body.
+        start = src.index("MARKET_TRUTH_GATE_MODULE_ERROR_BLOCKED")
+        end = src.index("submit_res = self.order_state_machine.submit_existing_entry(", start)
+        body = src[start:end]
+
+        # The strict resolver must appear in the handler.
+        assert "_resolve_market_truth_ownership(_module_meta)" in body, (
+            "Module-exception handler must call _resolve_market_truth_ownership(_module_meta); "
+            "int(... or 0) coercion was the P0 Blocker 2 bug"
+        )
+
+        # The old coercion pattern must NOT appear in the handler.
+        assert "_module_generation = int(" not in body, (
+            "Old int(...) coercion for _module_generation still present "
+            "in module-exception handler; was the P0 Blocker 2 bug"
+        )
+
+
+# =============================================================================
+# PR #391 amendment — P0 Blocker 3: unknown source no longer passes in LIVE
+# mode. Now that transport-derived identity supplies "tradier_live_transport"
+# for a proven adapter, "unknown" is exclusively the signal of an unproven
+# transport and must never authorize a submit in either mode.
+# =============================================================================
+
+
+class TestUnknownSourceRemovedInLive:
+    """PR #391 P0 Blocker 3: the 'unknown + LIVE + synchronous_submit_fetch'
+    exemption is gone. Any quote_source in _UNPROVEN_SOURCES now fails closed
+    regardless of mode or provenance. A correctly configured LIVE adapter
+    produces 'tradier_live_transport', not 'unknown'."""
+
+    def test_live_unknown_with_sync_fetch_now_holds(self):
+        """The old exemption allowed this to PASS. After the amendment it
+        must HOLD — unknown means the transport is unproven."""
+        r = _gate(
+            "live",
+            side="CALL",
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.95,
+            current_ask=101.05,
+            quote_age_ms=100,
+            quote_source="unknown",
+            quote_provenance="synchronous_submit_fetch",
+        )
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+        assert (
+            classify_market_truth(r.reason_code)
+            == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+        )
+
+    def test_live_tradier_live_transport_passes(self):
+        """The canonical transport-derived source must still pass in LIVE
+        mode. This is the replacement for the old unknown exemption."""
+        r = _gate(
+            "live",
+            side="CALL",
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.95,
+            current_ask=101.05,
+            quote_age_ms=100,
+            quote_source="tradier_live_transport",
+            quote_provenance="synchronous_submit_fetch",
+        )
+        assert r.passed is True
+        assert r.reason_code == GateOutcome.PASS
+
+    def test_paper_unknown_still_holds(self):
+        """Sanity: PAPER + unknown was already blocked before the amendment;
+        it must remain blocked after."""
+        r = _gate(
+            "paper",
+            side="CALL",
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.95,
+            current_ask=101.05,
+            quote_age_ms=100,
+            quote_source="unknown",
+            quote_provenance="synchronous_submit_fetch",
+        )
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+
+    @pytest.mark.parametrize("mode", ["paper", "live"])
+    @pytest.mark.parametrize(
+        "bad_source",
+        ["unknown", "", "sandbox", "tradier_sandbox", "sim", "mock", "test"],
+    )
+    def test_all_unproven_sources_hold_in_both_modes(self, mode, bad_source):
+        """No mode or provenance combination may rescue an unproven source."""
+        r = _gate(
+            mode,
+            side="CALL",
+            trigger_price=100.0,
+            stop_price=95.0,
+            target_price=110.0,
+            current_bid=100.95,
+            current_ask=101.05,
+            quote_age_ms=100,
+            quote_source=bad_source,
+            quote_provenance="synchronous_submit_fetch",
+        )
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_PRICE_SOURCE_UNPROVEN
+
+
+# =============================================================================
+# PR #391 amendment — source-shape static regression: no exemption remains
+# in the gate module source. Catches future regressions that re-introduce
+# the old exemption pattern.
+# =============================================================================
+
+
+class TestNoLiveUnknownExemptionInGateSource:
+    """The gate module's source must not contain the old exemption pattern.
+    If it reappears the test fails immediately without needing a live run."""
+
+    def _gate_source(self) -> str:
+        with open("ap/live_submit_gates.py") as fh:
+            return fh.read()
+
+    def test_old_exemption_not_in_gate_source(self):
+        src = self._gate_source()
+        forbidden_patterns = [
+            # The exact three-line conditional that was removed.
+            "_live\n        and _source_lc == \"unknown\"\n        and provenance == \"synchronous_submit_fetch\"",
+            # Alternate one-liner forms that would achieve the same effect.
+            '_source_lc == "unknown" and provenance == "synchronous_submit_fetch"',
+            "unknown + LIVE + synchronous_submit_fetch",
+        ]
+        for pattern in forbidden_patterns:
+            assert pattern not in src, (
+                f"Removed LIVE unknown exemption reintroduced in gate source: {pattern!r}"
+            )
+
+    def test_unproven_sources_denylist_contains_unknown(self):
+        """'unknown' must remain in _UNPROVEN_SOURCES so the simple
+        membership check correctly blocks it."""
+        from ap.live_submit_gates import _UNPROVEN_SOURCES
+        assert "unknown" in _UNPROVEN_SOURCES
+
+
+# =============================================================================
+# PR #391 amendment — dual ownership authority on the SUBMIT path.
+#
+# Discovered while implementing P0 Blocker 1: requiring watcher_token
+# unconditionally before submit_existing_entry() permanently blocks every
+# recovery-adopted BROKER_READY row from ever submitting. Those rows prove
+# ownership via recovery_submit_owner + generation (the PR #332 contract,
+# asserted by test_332_broker_ready_recovery_owner_generation_reaches_fresh_sync_gate).
+#
+# _resolve_submit_ownership() therefore requires a strict generation ALWAYS,
+# plus at least one non-blank owner identity — watcher_token OR
+# recovery_submit_owner. An anonymous worker with neither still cannot POST.
+# =============================================================================
+
+
+class TestResolveSubmitOwnership:
+    """Unit contract for _resolve_submit_ownership()."""
+
+    def test_watcher_token_is_proven_authority(self):
+        from ap_execution_core import _resolve_submit_ownership
+        assert _resolve_submit_ownership({
+            "materialization_generation": 3,
+            "watcher_token": "watcher:abc",
+        }) == (3, "watcher:abc", "watcher_token")
+
+    def test_recovery_submit_owner_is_proven_authority(self):
+        """PR #332 recovery-adopted shape: generation + recovery_submit_owner,
+        NO watcher_token. Must be accepted."""
+        from ap_execution_core import _resolve_submit_ownership
+        assert _resolve_submit_ownership({
+            "materialization_generation": 7,
+            "recovery_submit_owner": "broker-ready-owner-1",
+        }) == (7, "broker-ready-owner-1", "recovery_submit_owner")
+
+    def test_watcher_token_takes_precedence_over_recovery_owner(self):
+        """When both are present the watcher token is the primary identity."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership({
+            "materialization_generation": 2,
+            "watcher_token": "watcher:primary",
+            "recovery_submit_owner": "recovery:secondary",
+        })
+        assert (gen, owner, kind) == (2, "watcher:primary", "watcher_token")
+
+    @pytest.mark.parametrize("meta", [
+        # Generation present but NO owner identity of any kind — this is
+        # the exact P0 Blocker 1 attack shape.
+        {"materialization_generation": 0},
+        {"materialization_generation": 5, "watcher_token": "",
+         "recovery_submit_owner": ""},
+        {"materialization_generation": 5, "watcher_token": "   ",
+         "recovery_submit_owner": "   "},
+        # Owner markers present but generation missing / malformed / negative.
+        {"watcher_token": "watcher:abc"},
+        {"recovery_submit_owner": "recovery:abc"},
+        {"materialization_generation": "bad", "watcher_token": "watcher:abc"},
+        {"materialization_generation": -1, "watcher_token": "watcher:abc"},
+        {"materialization_generation": -1,
+         "recovery_submit_owner": "recovery:abc"},
+        # Deferred marker without any proven owner.
+        {"contract_deferred": True},
+        {"materialization_status": "RUNNING"},
+    ])
+    def test_unproven_ownership_regime_shapes_are_blocked(self, meta):
+        """Under the ownership regime, an unproven shape must yield no
+        generation and no owner. The third element is a diagnostic kind
+        (never 'not_under_ownership_regime', which would allow submit)."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(meta)
+        assert gen is None
+        assert owner is None
+        assert kind != "not_under_ownership_regime"
+
+    @pytest.mark.parametrize("meta", [None, {}])
+    def test_no_ownership_regime_is_not_blocked(self, meta):
+        """PR #391 amendment scoping fix: create_entry_order() does not stamp
+        materialization_generation or watcher_token, so a plain NON-DEFERRED
+        entry legitimately has no ownership fields. It must be reported as
+        'not_under_ownership_regime' so the submit guard lets it through —
+        blocking it would halt all normal non-deferred trading."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership(meta)
+        assert gen is None
+        assert owner is None
+        assert kind in ("not_under_ownership_regime", "no_meta")
+
+    def test_generation_is_never_coerced_to_zero(self):
+        """The P0 Blocker 1/2 bug was coercing a missing generation to 0.
+        A row bearing an owner token but no generation key is partial/corrupt
+        ownership and must be blocked — not silently treated as generation 0."""
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership({
+            "watcher_token": "watcher:perfectly-valid",
+        })
+        assert gen is None
+        assert owner is None
+        assert kind == "ownership_markers_without_generation"
+
+
+class TestRecoveryOwnerReachesSubmit:
+    """End-to-end: a recovery-adopted row (generation + recovery_submit_owner,
+    no watcher_token) must still reach exactly one submit_existing_entry call.
+    This is the regression guard against re-tightening the submit guard to
+    watcher_token-only and stranding every recovered order."""
+
+    def _run(self, monkeypatch, *, order_meta):
+        import ap_execution_core as core_mod
+        passing_quote = {
+            "symbol": "SPY",
+            "bid": 600.20,
+            "ask": 600.22,
+            "last": 600.21,
+            "quote_age_ms": 10,
+        }
+        core, osm, plan = _amend_execution_core(
+            monkeypatch, order_meta=order_meta, quote=passing_quote,
+        )
+        watched = _amend_submit_ready_watched(plan)
+        result = core_mod.APExecutionCore._on_entry_trigger(core, watched)
+        return result, osm
+
+    def test_recovery_owner_without_watcher_token_submits_once(self, monkeypatch):
+        _result, osm = self._run(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 7,
+                "recovery_submit_owner": "broker-ready-owner-1",
+                # Deliberately NO watcher_token — the recovery shape.
+            },
+        )
+        osm.submit_existing_entry.assert_called_once()
+
+    def test_no_owner_of_either_kind_blocks_submit(self, monkeypatch):
+        """Neither watcher_token nor recovery_submit_owner → zero POST.
+        The security property from P0 Blocker 1 is preserved."""
+        result, osm = self._run(
+            monkeypatch,
+            order_meta={
+                "materialization_generation": 7,
+                "watcher_token": "",
+                "recovery_submit_owner": "",
+            },
+        )
+        assert result.get("disposition") == "KEEP_WATCHER"
+        assert result.get("reason_code") == "SUBMIT_OWNERSHIP_PROOF_UNAVAILABLE"
+        assert result.get("broker_post_attempted") is False
+        osm.submit_existing_entry.assert_not_called()
+
+
+class TestSubmitOwnershipResolverIsDistinctFromMarketTruth:
+    """The two resolvers must remain deliberately different. Collapsing them
+    would either strand recovery rows (if submit adopts the watcher-only
+    rule) or weaken the REARM/HOLD CAS fence (if market-truth adopts the
+    dual rule, since those CAS on meta->>'watcher_token' specifically)."""
+
+    def test_market_truth_resolver_rejects_recovery_only_shape(self):
+        """_resolve_market_truth_ownership must stay watcher-token-strict:
+        REARM/HOLD CAS on watcher_token and cannot match a recovery-only row."""
+        from ap_execution_core import _resolve_market_truth_ownership
+        assert _resolve_market_truth_ownership({
+            "materialization_generation": 7,
+            "recovery_submit_owner": "broker-ready-owner-1",
+        }) == (None, None)
+
+    def test_submit_resolver_accepts_recovery_only_shape(self):
+        from ap_execution_core import _resolve_submit_ownership
+        gen, owner, kind = _resolve_submit_ownership({
+            "materialization_generation": 7,
+            "recovery_submit_owner": "broker-ready-owner-1",
+        })
+        assert gen == 7
+        assert kind == "recovery_submit_owner"
+
+    def test_both_resolvers_reject_anonymous_worker(self):
+        """The shared security floor: a MATERIALIZED row (generation present)
+        with no owner identity of any kind is unproven for both resolvers.
+        This is the P0 Blocker 1 attack shape."""
+        from ap_execution_core import (
+            _resolve_market_truth_ownership,
+            _resolve_submit_ownership,
+        )
+        anonymous = {"materialization_generation": 7}
+        assert _resolve_market_truth_ownership(anonymous) == (None, None)
+        gen, owner, kind = _resolve_submit_ownership(anonymous)
+        assert gen is None
+        assert owner is None
+        assert kind == "generation_without_owner"
