@@ -18,6 +18,10 @@ class FakeDecision:
     pnl_pct: float
     reason_code: str = ""
 
+    @property
+    def should_act(self):
+        return self.action != "HOLD"
+
 
 def _position(**overrides):
     now = datetime.now(timezone.utc)
@@ -174,6 +178,32 @@ def test_paper_touched_profit_behavior_is_unchanged():
     assert result is decision
 
 
+@pytest.mark.parametrize("mode", ["", "unknown", "malformed"])
+def test_unknown_mode_is_protected_as_live_risk(mode):
+    pos = _position(execution_mode=mode)
+    decision = _decision("TOUCHED_PROFIT_STOP")
+    wrapped = _wrapped([decision])
+
+    result = wrapped(pos)
+
+    assert result is not decision
+    assert result.action == "HOLD"
+    assert result.reason_code == "TOUCHED_PROFIT_STOP_CONFIRMING"
+
+
+def test_synthetic_confirmation_hold_never_reaches_submit_boundary():
+    pos = _position(execution_mode="")
+    wrapped = _wrapped([_decision("TOUCHED_PROFIT_STOP")])
+    submitted = []
+
+    result = wrapped(pos)
+    if result.should_act:
+        submitted.append(result)
+
+    assert result.reason_code == "TOUCHED_PROFIT_STOP_CONFIRMING"
+    assert submitted == []
+
+
 def test_feature_off_returns_original_decision(monkeypatch):
     monkeypatch.setenv("TOUCHED_PROFIT_BREACH_CONFIRMATION_ENABLED", "0")
     pos = _position()
@@ -195,7 +225,7 @@ def test_confirmation_count_is_bounded(monkeypatch, raw, expected):
 
 
 def test_lifecycle_manifest_marks_guard_required():
-    from ap.trade_lifecycle_guards import _GUARDS
+    from ap.trade_lifecycle_guards import _GUARDS, _MANDATORY_LIVE_GUARDS
 
     rows = {name: (module, installer, required) for name, module, installer, required in _GUARDS}
     assert rows["touched_profit_bid_confirmation"] == (
@@ -203,3 +233,117 @@ def test_lifecycle_manifest_marks_guard_required():
         "install_touched_profit_confirmation_guard",
         True,
     )
+    assert _MANDATORY_LIVE_GUARDS == {"touched_profit_bid_confirmation"}
+
+
+def test_missing_touched_profit_guard_blocks_live_but_not_paper(monkeypatch):
+    from ap import trade_lifecycle_guards as lifecycle
+
+    manifest = {
+        "touched_profit_bid_confirmation": {
+            "status": "absent",
+            "required_when_present": True,
+        },
+    }
+    monkeypatch.setattr(
+        lifecycle,
+        "install_trade_lifecycle_guards",
+        lambda: manifest,
+    )
+    monkeypatch.setattr(lifecycle, "_generation_claims_table_exists", lambda: True)
+
+    live_ok, live_diagnostic = lifecycle.lifecycle_guard_preflight("live")
+    paper_ok, paper_diagnostic = lifecycle.lifecycle_guard_preflight("paper")
+
+    assert live_ok is False
+    assert live_diagnostic["missing_required_guards"] == [
+        "touched_profit_bid_confirmation",
+    ]
+    assert paper_ok is True
+    assert paper_diagnostic["missing_required_guards"] == [
+        "touched_profit_bid_confirmation",
+    ]
+
+
+def _live_reconciler_with_seeded_position(monkeypatch):
+    import ap_reconciler
+
+    class ExitEngine:
+        def __init__(self):
+            self.positions = []
+
+        def add_position(self, pos):
+            self.positions.append(pos)
+
+    monkeypatch.setattr(
+        ap_reconciler.APBrokerReconciler,
+        "_register_health",
+        lambda self: None,
+    )
+    reconciler = ap_reconciler.APBrokerReconciler(
+        broker=None,
+        client_id="live-client@example.com",
+        osm=None,
+        pm=None,
+        execution_mode="LIVE",
+    )
+    reconciler.exit_engine = ExitEngine()
+    monkeypatch.setattr(
+        reconciler,
+        "_get_current_underlying_price",
+        lambda _symbol: 202.0,
+    )
+    monkeypatch.setattr(reconciler, "_record_position_reseeded", lambda **_kwargs: None)
+    monkeypatch.setattr(reconciler, "_heartbeat", lambda *_args, **_kwargs: None)
+
+    reconciler._seed_exit_engine_from_import(
+        pos_id="position-live-recovered",
+        contract="NVDA260727P00202500",
+        underlying="NVDA",
+        side="PUT",
+        qty=2,
+        entry_px=0.85,
+        underlying_entry=202.0,
+    )
+    assert len(reconciler.exit_engine.positions) == 1
+    return reconciler.exit_engine.positions[0]
+
+
+def test_reconciler_propagates_canonical_live_mode(monkeypatch):
+    pos = _live_reconciler_with_seeded_position(monkeypatch)
+
+    assert pos.execution_mode == "live"
+
+
+def test_recovered_live_position_requires_distinct_real_exit_observations(monkeypatch):
+    import ap_exit_engine as engine
+
+    pos = _live_reconciler_with_seeded_position(monkeypatch)
+    first_ts = datetime.now(timezone.utc)
+    pos.opened_at = first_ts - timedelta(minutes=10)
+    pos.quantity_remaining = 2
+    pos.touched_profit = True
+    pos.peak_pnl_pct = 0.0588
+    pos.max_profit_seen = 0.0588
+    pos.current_bid = 0.72
+    pos.current_option_price = 0.72
+    pos.current_underlying = 202.0
+    pos.option_bid_valid = True
+    pos.option_quote_fresh = True
+    pos.underlying_available = True
+    pos.underlying_fresh = True
+    pos.last_option_bid_update_ts = first_ts
+    pos.last_option_quote_update_ts = first_ts
+    pos.last_underlying_quote_update_ts = first_ts
+    evaluation_time = datetime(2026, 7, 27, 11, 0, tzinfo=engine.ET)
+
+    first = engine.evaluate_exit(pos, evaluation_time)
+    repeated = engine.evaluate_exit(pos, evaluation_time)
+    pos.last_option_bid_update_ts = first_ts + timedelta(seconds=2)
+    pos.last_option_quote_update_ts = first_ts + timedelta(seconds=2)
+    second = engine.evaluate_exit(pos, evaluation_time)
+
+    assert first.reason_code == "TOUCHED_PROFIT_STOP_CONFIRMING"
+    assert repeated.reason_code == "TOUCHED_PROFIT_STOP_CONFIRMING"
+    assert second.action == "CLOSE_ALL"
+    assert engine._classify_exit_decision(second) == "TOUCHED_PROFIT_STOP"

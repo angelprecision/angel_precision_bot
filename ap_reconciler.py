@@ -4193,6 +4193,7 @@ class APBrokerReconciler:
             mp.position_id              = str(pos_id or "")
             mp.client_id                = self.client_id
             mp.signal_id                = f"reconciled:{contract}"
+            mp.execution_mode           = str(self.execution_mode or "").strip().lower()
             mp.current_option_price     = float(entry_px)
             mp.price_untrusted          = bool(price_untrusted)
             mp.underlying_entry_untrusted = bool(underlying_entry_u <= 0)

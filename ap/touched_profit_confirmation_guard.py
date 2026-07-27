@@ -4,11 +4,12 @@ The native exit engine intentionally evaluates hard stops, confirmed underlying
 stops, EOD exits, and runner trails before or independently from the low-profit
 ``TOUCHED_PROFIT_STOP`` branch.  Those authorities remain unchanged.
 
-This guard owns one narrow production seam: a LIVE position that merely armed
-``touched_profit`` must not be fully liquidated from one transient executable
-BID observation below its profit floor.  The candidate exit must be reproduced
-on a configurable number of *distinct* BID observations.  A recovered quote
-resets the confirmation state.
+This guard owns one narrow production seam: a LIVE or mode-unproven position
+that merely armed ``touched_profit`` must not be fully liquidated from one
+transient executable BID observation below its profit floor.  Canonical PAPER
+positions remain unchanged.  The candidate exit must be reproduced on a
+configurable number of *distinct* BID observations.  A recovered quote resets
+the confirmation state.
 
 The July 27 NVDA incident is the motivating production shape:
 
@@ -110,9 +111,11 @@ def _decision_code(decision: Any, classify_decision: Callable[[Any], str]) -> st
     return str(code or "").strip().upper()
 
 
-def _is_live_touched_profit_stop(pos: Any, decision: Any, code: str) -> bool:
+def _is_protected_touched_profit_stop(pos: Any, decision: Any, code: str) -> bool:
+    mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+    protected_mode = mode != "paper"
     return bool(
-        str(getattr(pos, "execution_mode", "") or "").strip().lower() == "live"
+        protected_mode
         and code == "TOUCHED_PROFIT_STOP"
         and str(getattr(decision, "action", "") or "").strip().upper() == "CLOSE_ALL"
     )
@@ -134,7 +137,7 @@ def wrap_evaluate_exit(
             return decision
 
         code = _decision_code(decision, classify_decision)
-        if not _is_live_touched_profit_stop(pos, decision, code):
+        if not _is_protected_touched_profit_stop(pos, decision, code):
             # A recovered quote returns HOLD, while genuine hard/runner/EOD exits
             # return their own code. Either way, an interrupted sequence is not
             # durable and must restart from observation one.
@@ -210,7 +213,7 @@ def startup_policy_diagnostic() -> dict[str, Any]:
     diagnostic = {
         "enabled": _enabled(),
         "required_distinct_bid_observations": _required_confirmations(),
-        "scope": "live_touched_profit_stop_only",
+        "scope": "non_paper_touched_profit_stop_only",
         "hard_exits_unchanged": True,
         "runner_trails_unchanged": True,
     }

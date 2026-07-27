@@ -29,6 +29,10 @@ _GUARDS: tuple[tuple[str, str, str, bool], ...] = (
     ("ambiguous_position_resolution", "ap.exit_position_ambiguity_guard", "install_exit_position_ambiguity_guard", True),
 )
 
+_MANDATORY_LIVE_GUARDS = frozenset({
+    "touched_profit_bid_confirmation",
+})
+
 _LAST_INSTALLATION_MANIFEST: dict[str, dict[str, str | bool]] = {}
 
 
@@ -120,12 +124,20 @@ def lifecycle_guard_preflight(execution_mode: str) -> tuple[bool, dict]:
     """Fail LIVE deployment when present required guards or migration are absent."""
     mode = str(execution_mode or "").strip().lower()
     manifest = install_trade_lifecycle_guards()
-    missing = [
+    missing = sorted({
         name
         for name, record in manifest.items()
-        if record.get("required_when_present") is True
-        and record.get("status") not in {"installed", "absent"}
-    ]
+        if (
+            (
+                record.get("required_when_present") is True
+                and record.get("status") not in {"installed", "absent"}
+            )
+            or (
+                name in _MANDATORY_LIVE_GUARDS
+                and record.get("status") != "installed"
+            )
+        )
+    })
     migration_ok = False
     migration_error = ""
     try:
