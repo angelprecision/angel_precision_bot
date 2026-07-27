@@ -1315,15 +1315,18 @@ class TestInvalidDirectionFailsClosed:
     option direction other than exactly CALL or PUT.
 
     Prior behavior fell through the CALL/PUT branches and returned PASS on
-    unknown side. A fresh quote fetch does not heal an unknown direction,
-    so this failure is terminal (TERMINAL_SETUP_COMPLETE), not a retryable
-    HOLD — zero broker POST either way.
+    unknown side. A malformed side is a data-shape problem, not proof of
+    economic completion — so the failure is reported as CURRENT_PRICE_INVALID
+    and routed to HOLD_MARKET_TRUTH_UNAVAILABLE (bounded retry, zero broker
+    POST). It must not terminalize: doing so would permanently discard a
+    potentially valid setup because an upstream metadata field arrived
+    malformed once.
     """
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
     @pytest.mark.parametrize(
         "side",
-        [None, "", "UNKNOWN", "CALLS", "PUTT", "0"],
+        [None, "", "UNKNOWN", "CALLS", "PUTT", "BUY", "0"],
     )
     def test_invalid_direction_never_authorizes_submit(self, mode, side):
         result = check_market_validity_gate(
@@ -1340,9 +1343,9 @@ class TestInvalidDirectionFailsClosed:
         )
 
         assert result.passed is False
-        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert result.reason_code == GateOutcome.CURRENT_PRICE_INVALID
         assert classify_market_truth(result.reason_code) == (
-            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
         )
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
@@ -1401,9 +1404,9 @@ class TestInvalidDirectionFailsClosed:
             quote_fetch_error="provider unavailable",
             quote_source="unknown",
         )
-        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert result.reason_code == GateOutcome.CURRENT_PRICE_INVALID
         assert classify_market_truth(result.reason_code) == (
-            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
         )
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
@@ -1421,9 +1424,9 @@ class TestInvalidDirectionFailsClosed:
             quote_source="live_broker",
             quote_provenance="synchronous_submit_fetch",
         )
-        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert result.reason_code == GateOutcome.CURRENT_PRICE_INVALID
         assert classify_market_truth(result.reason_code) == (
-            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
         )
 
     @pytest.mark.parametrize("mode", ["paper", "live"])
@@ -1441,9 +1444,9 @@ class TestInvalidDirectionFailsClosed:
             quote_source="",  # blank ⇒ CURRENT_PRICE_SOURCE_UNPROVEN if it ran
             quote_provenance="synchronous_submit_fetch",
         )
-        assert result.reason_code == GateOutcome.ENTRY_DIRECTION_INVALID
+        assert result.reason_code == GateOutcome.CURRENT_PRICE_INVALID
         assert classify_market_truth(result.reason_code) == (
-            MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+            MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
         )
 
 

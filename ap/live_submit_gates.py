@@ -266,12 +266,6 @@ class GateOutcome:
     PUT_NO_LONGER_BELOW_TRIGGER            = "PUT_NO_LONGER_BELOW_TRIGGER"
     PUT_STOP_ALREADY_BROKEN                = "PUT_STOP_ALREADY_BROKEN"
 
-    # PR #391 amendment: option direction (side) is missing, blank, or
-    # anything other than exactly "CALL" or "PUT" after normalization.
-    # Terminal, not retryable — a fresh quote fetch does not heal an
-    # unknown side, and the identity gate does not inspect direction.
-    ENTRY_DIRECTION_INVALID                = "ENTRY_DIRECTION_INVALID"
-
     # PR #391 (blocker 2): provenance failure — quote_source unknown, blank,
     # sandbox-only, or otherwise unproven. Bounded retry, not terminal.
     CURRENT_PRICE_SOURCE_UNPROVEN          = "CURRENT_PRICE_SOURCE_UNPROVEN"
@@ -317,7 +311,6 @@ _TERMINAL_REASONS: frozenset[str] = frozenset({
     GateOutcome.PUT_STOP_ALREADY_BROKEN,
     GateOutcome.TARGET_ALREADY_INVALID,
     GateOutcome.REMAINING_OPPORTUNITY_TOO_SMALL,
-    GateOutcome.ENTRY_DIRECTION_INVALID,
 })
 
 _HOLD_REASONS: frozenset[str] = frozenset({
@@ -803,18 +796,20 @@ def check_market_validity_gate(
 
     # Rule: option direction MUST be exactly CALL or PUT after normalization.
     #
-    # PR #391 amendment (precedence fix): the direction check runs BEFORE
-    # every quote-dependent check. A malformed side will not heal after
-    # another quote fetch, so it must not be masked by transient quote
-    # failures (CURRENT_PRICE_FETCH_FAILED, CURRENT_PRICE_MISSING,
-    # CURRENT_PRICE_STALE, CURRENT_PRICE_AGE_UNKNOWN,
-    # CURRENT_PRICE_SOURCE_UNPROVEN, CURRENT_PRICE_INVALID). Terminalization
-    # authority (TERMINAL_SETUP_COMPLETE) must attach to the true root cause.
+    # PR #391 amendment: an unknown/malformed side is a data-shape problem,
+    # not proof of economic completion. It must NOT terminalize a setup —
+    # doing so would permanently discard a potentially valid trade because
+    # an upstream metadata field arrived malformed. Report as
+    # CURRENT_PRICE_INVALID so the classifier routes it to
+    # HOLD_MARKET_TRUTH_UNAVAILABLE (bounded retry, zero broker POST). The
+    # check still runs BEFORE quote-dependent checks so a bad side is not
+    # masked by transient quote failures and the audit reason code is the
+    # true root cause.
     _side = str(side or "").strip().upper()
     if _side not in {"CALL", "PUT"}:
         return _fail(
-            GateOutcome.ENTRY_DIRECTION_INVALID,
-            f"side={side!r} is invalid; expected exactly CALL or PUT",
+            GateOutcome.CURRENT_PRICE_INVALID,
+            f"unsupported option side={side!r}; expected CALL or PUT",
         )
 
     # Rule: fetch transport completed successfully.
@@ -939,7 +934,7 @@ def check_market_validity_gate(
                 f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
             )
     # No other branch is reachable here: side is guaranteed to be exactly
-    # "CALL" or "PUT" by the ENTRY_DIRECTION_INVALID fail-closed above.
+    # "CALL" or "PUT" by the direction fail-closed at the top of the gate.
 
     # Rule: remaining opportunity
     rem_pct = _remaining_opportunity_pct(_side, mid, tr, tg)
