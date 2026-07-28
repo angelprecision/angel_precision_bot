@@ -85,6 +85,39 @@ def test_dispatch_paper_overnight_only_payload_restores_watching_instead_of_dire
 
     monkeypatch.setattr(queue_mod, "_mark_job", lambda job_id, status, *, result=None, error=None: calls.append((status, error)))
 
+    # P0 queue-deferral-truth: the PAPER overnight rescue route now persists the
+    # ap_signals WATCHING row (via the single deferral authority) BEFORE marking
+    # the queue row WATCHING — the overnight reeval only discovers the row via
+    # ap_signals.decision_status='WATCHING'. Provide a working ap_signals writer
+    # so the persistence confirms and the queue row is allowed to become WATCHING.
+    signal_writes: list[dict] = []
+
+    class _Tbl:
+        def upsert(self, row, *a, **kw):
+            signal_writes.append(row)
+            return self
+
+        def execute(self):
+            return {"data": [{"signal_id": "sig-paper"}]}
+
+    class _Sbc:
+        def table(self, _name):
+            return _Tbl()
+
+    monkeypatch.setattr(queue_mod, "_get_sb_client", lambda: _Sbc())
+
+    # P0 #398 amendment: _persist_watching_deferral now routes the WATCHING
+    # queue transition through _checked_watching_cas (a direct SQL UPDATE), not
+    # _mark_job("WATCHING", ...). Stub the CAS so the test does not require a
+    # live Postgres connection.
+    cas_calls: list[dict] = []
+
+    def _fake_cas(job_id, *, watching_error=None, watching_result=None):
+        cas_calls.append({"job_id": job_id, "watching_error": watching_error})
+        return queue_mod.WATCHING_CAS_TRANSITIONED
+
+    monkeypatch.setattr(queue_mod, "_checked_watching_cas", _fake_cas)
+
     queue_mod._dispatch(
         99,
         "paper-client",
@@ -109,8 +142,21 @@ def test_dispatch_paper_overnight_only_payload_restores_watching_instead_of_dire
     )
 
     assert ("evaluate", 99) not in calls
-    assert ("WATCHING", "after_hours_deferred:awaiting_overnight_reeval") in calls
     assert ("REJECTED", "restart_guard:overnight_skip") not in calls
+    # No ERROR mark — the deferral completed successfully.
+    assert not any(status == "ERROR" for status, _ in calls), (
+        f"rescue route must not produce ERROR — got {calls}"
+    )
+    # CAS was called — the WATCHING queue transition was attempted via the
+    # single deferral authority (_persist_watching_deferral → _checked_watching_cas).
+    assert cas_calls, "CAS must be called — WATCHING transition goes through _checked_watching_cas"
+    assert cas_calls[0]["watching_error"] == "after_hours_deferred:awaiting_overnight_reeval", (
+        f"watching_error must carry the stable after-hours reason — got {cas_calls[0]}"
+    )
+    # Discoverability proven: the ap_signals WATCHING row was written before the
+    # queue row was marked WATCHING (single deferral authority, fail-closed).
+    assert signal_writes, "ap_signals WATCHING row must be persisted for the rescue"
+    assert signal_writes[0].get("decision_status") == "WATCHING"
 
 
 def test_manual_restart_guard_bypass_disabled_without_marker():
