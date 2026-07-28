@@ -89,7 +89,12 @@ class _Selector:
         self._last_failure = None
         self.dte_ladder_enabled = True
 
-    def select(self, _approved_plan):
+    def select(self, _approved_plan, *, request_context=None):
+        assert request_context is not None
+        assert (
+            request_context.selector_request_kind
+            == "DEFERRED_BREACH_MATERIALIZATION"
+        )
         self.calls += 1
         if self.calls == 1:
             self._last_failure = {
@@ -916,7 +921,7 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
     selector = _Selector()
 
     monkeypatch.setenv("ALLOW_CHEAP_CONTRACT_IF_ONLY_CHOICE", "0")
-    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "0")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
     monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
     monkeypatch.setenv("LIVE_CONFIRMATION_REQUIRED", "1")
     monkeypatch.setenv("PRE_SUBMIT_PROOF_RETRY_DELAY_SECONDS", "0")
@@ -963,6 +968,11 @@ def test_real_watcher_to_recovery_to_single_post_call_graph(monkeypatch):
         assert meta_after_first_trigger["selector_failure"]["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
         assert row_after_first_trigger["status"] == "PENDING_TRIGGER"
         assert row_after_first_trigger["broker_order_id"] is None
+        # Make the persisted retry due without weakening the production rule
+        # that zero/non-positive delay values fall back to the safe default.
+        due_at = _iso(_now() - timedelta(seconds=1))
+        osm.row["meta"]["next_retry_at"] = due_at
+        osm.row["meta"]["materialization_next_retry_at"] = due_at
 
         core2 = _build_core(osm, broker, selector)
         watcher2 = _build_watcher(osm, core2)

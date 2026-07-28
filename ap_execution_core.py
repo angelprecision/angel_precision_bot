@@ -4223,8 +4223,14 @@ class APExecutionCore:
                                 "".join(str(symbol or "").upper().split())[-15:-9],
                                 "%y%m%d",
                             ).date().isoformat()
-                        except Exception:
-                            pass
+                        except Exception as _cursor_symbol_exc:
+                            log.debug(
+                                "[%s] selector cursor could not parse OCC expiration "
+                                "symbol=%s error=%s",
+                                ticker,
+                                symbol,
+                                _cursor_symbol_exc,
+                            )
                         _selector_recovery_cursor = record_selector_recovery_attempt(
                             _selector_recovery_cursor,
                             symbol=symbol,
@@ -4238,8 +4244,12 @@ class APExecutionCore:
                         _selector_request_context.recovery_cursor = (
                             _selector_recovery_cursor
                         )
-                    except (NameError, UnboundLocalError):
-                        pass
+                    except (NameError, UnboundLocalError) as _cursor_bind_exc:
+                        log.debug(
+                            "[%s] selector cursor context not bound yet error=%s",
+                            ticker,
+                            _cursor_bind_exc,
+                        )
                     _persist_cursor = getattr(
                         self.order_state_machine,
                         "persist_selector_recovery_cursor",
