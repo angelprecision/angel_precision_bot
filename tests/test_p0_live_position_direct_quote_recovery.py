@@ -143,6 +143,59 @@ class _StaleOrdinaryBidBroker(_RecoveryBroker):
         return {}
 
 
+class _StalerProviderRecoveryBroker:
+    """
+    Ordinary poll (single-symbol batch): returns empty so the option bid is
+    absent and _ordinary_quote_is_fresh returns False, triggering recovery.
+
+    Recovery fetch (two-symbol batch [UNDERLYING, OPTION]): returns provider
+    truth that passes _quote_has_fresh_provider_truth (bid > 0, within
+    STALE_MAX_SEC) but with timestamps that can be configured to be older
+    than the position's existing observation timestamps, exercising the
+    value-cohesion gate added in PR #400.
+
+    option_bid defaults to 0.70 to make regression obvious if the gated
+    write fires unexpectedly.
+    """
+
+    def __init__(
+        self,
+        *,
+        option_provider_ts: float,
+        underlying_provider_ts: float,
+        option_bid: float = 0.70,
+        underlying_last: float = 545.0,
+    ):
+        self.option_provider_ts = option_provider_ts
+        self.underlying_provider_ts = underlying_provider_ts
+        self.option_bid = option_bid
+        self.underlying_last = underlying_last
+        self.calls = []
+        self.submit_order = MagicMock()
+        self.cancel_order = MagicMock()
+
+    def get_quotes(self, symbols):
+        symbols = list(symbols)
+        self.calls.append(symbols)
+        if len(symbols) != 2:
+            return {}
+        return {
+            OPTION: {
+                "symbol": OPTION,
+                "bid": self.option_bid,
+                "ask": self.option_bid + 0.10,
+                "last": self.option_bid + 0.05,
+                "bid_date": self.option_provider_ts,
+                "trade_date": self.option_provider_ts,
+            },
+            UNDERLYING: {
+                "symbol": UNDERLYING,
+                "last": self.underlying_last,
+                "trade_date": self.underlying_provider_ts,
+            },
+        }
+
+
 def _monitor(position, broker):
     engine = _ExitEngine([position])
     monitor = APPositionQuoteMonitor(
@@ -431,3 +484,194 @@ def test_identical_recovery_provider_time_is_one_bid_observation():
 
     assert distinct is candidate
     assert distinct.reason_code == "TOUCHED_PROFIT_STOP"
+
+
+# ── PR #400 value-cohesion gate regressions ───────────────────────────────────
+# The four regressions required by the HOLD review (comment 4792832035).
+# Each test name encodes the exact invariant it protects.
+
+
+def test_older_option_provider_ts_cannot_overwrite_bid_or_price_and_cannot_wake():
+    """
+    Older lower option BID cannot overwrite current_bid or current_option_price
+    and cannot create a runner wake.
+
+    Position has an existing BID observation 3 s ago.  Recovery fetch returns
+    a fresh-enough quote (passes _quote_has_fresh_provider_truth) but the
+    option bid_date is 8 s ago — strictly OLDER than the existing 3 s
+    observation.  The value-cohesion gate must treat this as a no-op: numeric
+    values unchanged, no wake.
+    """
+    now_epoch = time.time()
+
+    # Plant a recent BID observation so the gate has an existing reference.
+    opt_obs_epoch = now_epoch - 3.0
+    opt_obs_dt = datetime.fromtimestamp(opt_obs_epoch, tz=timezone.utc)
+    position = _position()
+    position.current_bid = 1.05
+    position.currentbid = 1.05
+    position.current_option_price = 1.05
+    position.currentoptionprice = 1.05
+    position.last_option_bid_update_ts = opt_obs_dt
+    position.lastoptionbidupdatets = opt_obs_dt
+
+    # Recovery provider_ts is 8 s ago: older than the existing 3 s obs but
+    # within STALE_MAX_SEC=15 s, so _maybe_direct_recover_position → ok=True.
+    older_opt_epoch = now_epoch - 8.0
+    broker = _StalerProviderRecoveryBroker(
+        option_provider_ts=older_opt_epoch,
+        underlying_provider_ts=now_epoch - 2.0,  # fresh underlying
+        option_bid=0.70,  # lower than existing 1.05 — must NOT be written
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    # Numeric values must not have regressed.
+    assert position.current_bid == 1.05, (
+        "older option provider_ts must not overwrite current_bid"
+    )
+    assert position.currentbid == 1.05
+    # current_option_price is overridden by the executable-price path from
+    # cur_bid_now (still 1.05, unmodified), so it also stays at 1.05.
+    assert position.current_option_price == 1.05, (
+        "older option provider_ts must not lower current_option_price"
+    )
+    assert position.currentoptionprice == 1.05
+
+    # BID observation timestamp must not have changed.
+    assert position.last_option_bid_update_ts == opt_obs_dt
+    assert position.lastoptionbidupdatets == opt_obs_dt
+
+    # Recovery did not complete — no success increment, no runner wake.
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set(), (
+        "stale option recovery must not wake the exit engine"
+    )
+
+
+def test_older_underlying_provider_ts_cannot_overwrite_underlying_and_cannot_wake():
+    """
+    Older underlying price cannot overwrite current_underlying and cannot
+    create a stop/target wake.
+
+    Position has an existing underlying observation 3 s ago.  Recovery fetch
+    returns fresh-enough underlying quote but with trade_date 8 s ago —
+    strictly OLDER.  The underlying value must not be overwritten and the
+    engine must not be woken.
+    """
+    now_epoch = time.time()
+
+    und_obs_epoch = now_epoch - 3.0
+    und_obs_dt = datetime.fromtimestamp(und_obs_epoch, tz=timezone.utc)
+    position = _position()
+    position.current_underlying = 555.0
+    position.currentunderlying = 555.0
+    position.last_underlying_quote_update_ts = und_obs_dt
+    position.lastunderlyingquoteupdatets = und_obs_dt
+
+    # Option provider_ts is newer than any existing option obs (none planted)
+    # so _apply_opt=True; only the underlying component is stale.
+    older_und_epoch = now_epoch - 8.0
+    broker = _StalerProviderRecoveryBroker(
+        option_provider_ts=now_epoch - 2.0,
+        underlying_provider_ts=older_und_epoch,  # older than existing 3 s obs
+        underlying_last=530.0,  # lower — must NOT be written
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    assert position.current_underlying == 555.0, (
+        "older underlying provider_ts must not overwrite current_underlying"
+    )
+    assert position.currentunderlying == 555.0
+
+    # recovery_complete = (option_fresh OR _apply_opt) AND (underlying_fresh OR _apply_und)
+    #                   = (False OR True) AND (False OR False) = False
+    # → no success increment, no stop/target wake.
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set(), (
+        "stale underlying recovery must not wake the exit engine"
+    )
+
+
+def test_equal_provider_ts_second_recovery_leaves_values_and_wake_unchanged():
+    """
+    Equal provider timestamps produce no second value mutation or recovery wake
+    while remaining one #399 observation.
+
+    The first recovery succeeds (provider_ts is strictly newer than no existing
+    obs).  A second call with the identical epoch must be a complete no-op for
+    all numeric writes and must not set the wake event again.
+    """
+    provider_epoch = time.time() - 5.0
+    position = _position()
+    broker = _RecoveryBroker(provider_ts=provider_epoch)
+    monitor, engine = _monitor(position, broker)
+
+    # First call: no existing BID obs → strictly newer → succeeds.
+    monitor._refresh_once()
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
+    bid_after_first = position.current_bid
+    und_after_first = position.current_underlying
+
+    # Second call: same provider_epoch — equal, NOT strictly newer → must be a
+    # complete no-op for numeric values and the wake event.
+    engine.quote_arrived_event.clear()
+    monitor._last_direct_recovery_attempt_ts.clear()
+    monitor._refresh_once()
+
+    assert position.current_bid == bid_after_first, (
+        "equal provider_ts must not mutate current_bid"
+    )
+    assert position.currentbid == bid_after_first
+    assert position.current_underlying == und_after_first, (
+        "equal provider_ts must not mutate current_underlying"
+    )
+    assert monitor._metrics["direct_recovery_successes"] == 1, (
+        "equal provider_ts must not increment direct_recovery_successes"
+    )
+    assert not engine.quote_arrived_event.is_set(), (
+        "equal provider_ts must not trigger a second recovery wake"
+    )
+
+
+def test_strictly_newer_provider_ts_applies_values_and_wakes_exactly_once():
+    """
+    Strictly newer option and underlying provider truth still applies values
+    and wakes the exit engine exactly once.
+
+    Gate regression: verifying the cohesion gate does not block legitimate
+    recoveries where both option and underlying provider timestamps are
+    strictly newer than the position's existing observations.
+    """
+    now_epoch = time.time()
+
+    # Plant an existing BID observation 10 s ago.
+    opt_obs_epoch = now_epoch - 10.0
+    opt_obs_dt = datetime.fromtimestamp(opt_obs_epoch, tz=timezone.utc)
+    position = _position()
+    position.current_bid = 0.50
+    position.currentbid = 0.50
+    position.last_option_bid_update_ts = opt_obs_dt
+    position.lastoptionbidupdatets = opt_obs_dt
+
+    # Recovery provider_ts is 4 s ago — strictly newer than opt_obs (10 s ago)
+    # and within STALE_MAX_SEC=15 s, so both option and underlying gates pass.
+    newer_epoch = now_epoch - 4.0
+    broker = _RecoveryBroker(provider_ts=newer_epoch)  # bid=1.00
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    # Values must have advanced to the recovered truth.
+    assert position.current_bid == 1.00, (
+        "strictly newer provider_ts must update current_bid"
+    )
+    assert position.currentbid == 1.00
+
+    # Recovery completes, wake fires exactly once.
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
