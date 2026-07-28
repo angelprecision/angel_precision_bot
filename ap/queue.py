@@ -274,6 +274,25 @@ WATCHING_CAS_TERMINAL              = "TERMINAL"               # row is in a term
 WATCHING_CAS_MISSING_OR_UNEXPECTED = "MISSING_OR_UNEXPECTED"  # row missing or unexpected state
 WATCHING_CAS_DB_ERROR              = "DB_ERROR"               # UPDATE or classification SELECT raised
 
+# P0 #405 — _compensate_watching_signal_if_unchanged outcome constants.
+# Expected-state ap_signals compensation: only writes ERROR when the row is
+# still exactly WATCHING. Replaces the prior blind _log_signal_to_db upsert.
+SIGNAL_COMP_TRANSITIONED       = "SIGNAL_COMP_TRANSITIONED"      # 1 row updated to ERROR
+SIGNAL_COMP_ALREADY_ADVANCED   = "SIGNAL_COMP_ALREADY_ADVANCED"  # row advanced past WATCHING; preserved
+SIGNAL_COMP_MISSING            = "SIGNAL_COMP_MISSING"           # row not found
+SIGNAL_COMP_DB_ERROR           = "SIGNAL_COMP_DB_ERROR"          # update or reread raised
+
+# P0 #405 — _checked_processing_error_cas outcome constants.
+# Guarded queue ERROR transition: only writes ERROR when the row is still PROCESSING.
+# Replaces the prior unconditional _mark_job(ERROR) on early failure paths inside
+# _persist_watching_deferral(), which could overwrite concurrently-advanced rows.
+ERROR_CAS_TRANSITIONED         = "ERROR_CAS_TRANSITIONED"         # 1 row updated; now ERROR
+ERROR_CAS_ALREADY_ERROR        = "ERROR_CAS_ALREADY_ERROR"        # row was already ERROR
+ERROR_CAS_TERMINAL             = "ERROR_CAS_TERMINAL"             # other terminal status; preserved
+ERROR_CAS_WATCHING_OR_ADVANCED = "ERROR_CAS_WATCHING_OR_ADVANCED" # WATCHING or other non-PROCESSING state
+ERROR_CAS_MISSING              = "ERROR_CAS_MISSING"              # row not found
+ERROR_CAS_DB_ERROR             = "ERROR_CAS_DB_ERROR"             # UPDATE or classification SELECT raised
+
 _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
     "manual_requeue_after_overnight_reeval_timeout",
     "manual_rescue_current_session",
@@ -1017,6 +1036,100 @@ def _log_rejection_to_db(
     )
 
 
+def _compensate_watching_signal_if_unchanged(
+    *,
+    signal_id: str,
+    client_email: str,
+    context_notes: str,
+) -> str:
+    """Expected-state compensation: update ap_signals.decision_status to ERROR
+    only if the row is still exactly WATCHING for this (signal_id, client_email).
+
+    P0 #405 — replaces the prior blind _log_signal_to_db(decision_status='ERROR')
+    upsert that could overwrite any later valid lifecycle state (e.g. queued,
+    triggered, submitted, filled, rejected) with ERROR.
+
+    Contract:
+      1. Uses an expected-state UPDATE … WHERE decision_status = 'WATCHING'.
+      2. Never upserts; never touches a row that advanced past WATCHING.
+      3. On zero rows updated: rerereads the row and logs the observed state.
+      4. Returns an explicit outcome constant — never raises.
+      5. Only touches ap_signals; never touches trade_queue, OSM, orders,
+         positions, exits, proof_trades, or any other table.
+
+    Returns:
+      SIGNAL_COMP_TRANSITIONED     – exactly 1 row updated to ERROR.
+      SIGNAL_COMP_ALREADY_ADVANCED – 0 rows updated; row advanced past WATCHING (state preserved).
+      SIGNAL_COMP_MISSING          – 0 rows updated; no row found for (signal_id, client_email).
+      SIGNAL_COMP_DB_ERROR         – update or re-read raised; Supabase client unavailable.
+    """
+    try:
+        _sb = _get_sb_client()
+        if _sb is None:
+            log.critical(
+                "_compensate_watching_signal_if_unchanged: no Supabase client — "
+                "cannot compensate signal_id=%s client_email=%s",
+                signal_id, client_email,
+            )
+            return SIGNAL_COMP_DB_ERROR
+
+        resp = (
+            _sb.table("ap_signals")
+            .update({
+                "decision_status": "ERROR",
+                "context_notes": context_notes,
+            })
+            .eq("signal_id", signal_id)
+            .eq("client_email", client_email)
+            .eq("decision_status", "WATCHING")
+            .execute()
+        )
+
+        rows_updated = getattr(resp, "data", None) or []
+        if len(rows_updated) == 1:
+            log.info(
+                "_compensate_watching_signal_if_unchanged: TRANSITIONED "
+                "signal_id=%s client_email=%s → ERROR",
+                signal_id, client_email,
+            )
+            return SIGNAL_COMP_TRANSITIONED
+
+        # Zero rows updated — classify without mutating anything further.
+        reread = (
+            _sb.table("ap_signals")
+            .select("decision_status")
+            .eq("signal_id", signal_id)
+            .eq("client_email", client_email)
+            .execute()
+        )
+        existing = getattr(reread, "data", None) or []
+        if not existing:
+            log.warning(
+                "_compensate_watching_signal_if_unchanged: zero-row update AND no "
+                "row found for signal_id=%s client_email=%s — MISSING.",
+                signal_id, client_email,
+            )
+            return SIGNAL_COMP_MISSING
+
+        observed_status = existing[0].get("decision_status", "<unknown>")
+        log.warning(
+            "_compensate_watching_signal_if_unchanged: zero-row update for "
+            "signal_id=%s client_email=%s — observed decision_status=%r "
+            "(row advanced past WATCHING; newer state preserved).",
+            signal_id, client_email, observed_status,
+        )
+        return SIGNAL_COMP_ALREADY_ADVANCED
+
+    except Exception:
+        log.critical(
+            "_compensate_watching_signal_if_unchanged raised for "
+            "signal_id=%s client_email=%s — returning SIGNAL_COMP_DB_ERROR",
+            signal_id, client_email,
+            exc_info=True,
+        )
+        return SIGNAL_COMP_DB_ERROR
+
+
 def _persist_watching_deferral(
     *,
     job_id: int,
@@ -1094,10 +1207,16 @@ def _persist_watching_deferral(
     if not str(client_id or "").strip() or _client == "__shared__":
         log.error(
             "DEFERRAL_REFUSED_INVALID_CLIENT job_id=%s signal_id=%s client=%r — "
-            "marking queue ERROR (a WATCHING row must have an exact client owner).",
+            "guarded queue ERROR (a WATCHING row must have an exact client owner).",
             job_id, signal_id, client_id,
         )
-        _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_client")
+        _err_cas = _checked_processing_error_cas(job_id, error=f"{_fail}:invalid_client")
+        if _err_cas != ERROR_CAS_TRANSITIONED:
+            log.warning(
+                "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s (invalid_client) — "
+                "queue row was not PROCESSING; state preserved.",
+                _err_cas, job_id,
+            )
         return False
 
     # (2) valid execution mode — exactly paper or live.
@@ -1105,10 +1224,16 @@ def _persist_watching_deferral(
     if _mode not in ("paper", "live"):
         log.error(
             "DEFERRAL_REFUSED_INVALID_MODE job_id=%s signal_id=%s mode=%r — "
-            "marking queue ERROR.",
+            "guarded queue ERROR.",
             job_id, signal_id, execution_mode,
         )
-        _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_mode")
+        _err_cas = _checked_processing_error_cas(job_id, error=f"{_fail}:invalid_mode")
+        if _err_cas != ERROR_CAS_TRANSITIONED:
+            log.warning(
+                "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s (invalid_mode) — "
+                "queue row was not PROCESSING; state preserved.",
+                _err_cas, job_id,
+            )
         return False
 
     # (3) canonical signal identity — MANDATORY. Never invent one: a random
@@ -1119,10 +1244,16 @@ def _persist_watching_deferral(
     if not _sig:
         log.error(
             "DEFERRAL_REFUSED_INVALID_SIGNAL job_id=%s client=%s mode=%s — "
-            "marking queue ERROR (no canonical signal identity to defer).",
+            "guarded queue ERROR (no canonical signal identity to defer).",
             job_id, _client, _mode,
         )
-        _mark_job(job_id, "ERROR", error=f"{_fail}:invalid_signal_id")
+        _err_cas = _checked_processing_error_cas(job_id, error=f"{_fail}:invalid_signal_id")
+        if _err_cas != ERROR_CAS_TRANSITIONED:
+            log.warning(
+                "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s (invalid_signal_id) — "
+                "queue row was not PROCESSING; state preserved.",
+                _err_cas, job_id,
+            )
         return False
 
     # (4)+(5) persist/confirm the ap_signals WATCHING row FIRST. Stamp the
@@ -1160,14 +1291,22 @@ def _persist_watching_deferral(
     )
 
     # (7) fail closed — no phantom WATCHING, no split truth, no money-path action.
+    # P0 #405: guarded ERROR CAS — only overwrites if the row is still PROCESSING.
     if not _signals_ok:
         log.critical(
             "WATCHING_SIGNAL_PERSISTENCE_FAILED job_id=%s signal_id=%s client=%s "
             "mode=%s stage=%s reason=%s — refusing to mark queue WATCHING; "
-            "marking queue ERROR so the operator sees the failure.",
+            "guarded queue ERROR so the operator sees the failure.",
             job_id, _sig, _client, _mode, stage, reason_code,
         )
-        _mark_job(job_id, "ERROR", error=_fail)
+        _err_cas = _checked_processing_error_cas(job_id, error=_fail)
+        if _err_cas != ERROR_CAS_TRANSITIONED:
+            log.warning(
+                "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s "
+                "(signal_persistence_failure) — queue row was not PROCESSING; "
+                "state preserved.",
+                _err_cas, job_id,
+            )
         return False
 
     # (6) CAS the queue row to WATCHING, confirmed. A bare _mark_job call cannot
@@ -1201,27 +1340,37 @@ def _persist_watching_deferral(
             "Best-effort ap_signals revert attempted. Terminal queue state preserved.",
             job_id, _sig, _client, _mode,
         )
-        # Best-effort: remove the WATCHING ap_signals row so the terminal queue row
-        # is not paired with a discoverable WATCHING signal. _log_signal_to_db
-        # absorbs exceptions and returns False — capture it explicitly.
-        _signal_revert_ok = _log_signal_to_db(
+        # P0 #405: Best-effort expected-state compensation — only transitions the
+        # ap_signals row to ERROR if it is still exactly WATCHING. A blind upsert
+        # here could overwrite any newer valid lifecycle state (e.g. queued,
+        # triggered, submitted, filled) that a concurrent owner may have written.
+        _comp_outcome = _compensate_watching_signal_if_unchanged(
             signal_id=_sig,
-            client_id=_client,
-            ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
-            side=str(_payload.get("side") or _payload.get("direction") or ""),
-            score=_score,
-            stage=stage,
-            reason_code="PERSISTENCE_FAILURE",
-            human_reason="Queue row is terminal — ap_signals reverted from WATCHING.",
-            payload=_payload,
-            decision_status="ERROR",
-            queued_at=datetime.now(timezone.utc).isoformat(),
+            client_email=_client,
+            context_notes=(
+                f"stage={stage} | DEFERRAL_QUEUE_CAS_TERMINAL | "
+                "Queue row is terminal — ap_signals compensation attempted from WATCHING."
+            ),
         )
-        if not _signal_revert_ok:
-            log.critical(
-                "DEFERRAL_SIGNAL_REVERT_FAILED job_id=%s — ap_signals may remain "
-                "WATCHING paired with a terminal queue row. Operator action required.",
+        if _comp_outcome == SIGNAL_COMP_TRANSITIONED:
+            log.info(
+                "DEFERRAL_SIGNAL_COMP_OK job_id=%s — ap_signals set to ERROR "
+                "(was WATCHING; queue row is terminal).",
                 job_id,
+            )
+        elif _comp_outcome == SIGNAL_COMP_ALREADY_ADVANCED:
+            log.warning(
+                "DEFERRAL_SIGNAL_COMP_ADVANCED job_id=%s — ap_signals row advanced "
+                "past WATCHING before compensation; newer state preserved. "
+                "Manual review recommended.",
+                job_id,
+            )
+        else:
+            log.critical(
+                "DEFERRAL_SIGNAL_COMP_FAILED job_id=%s outcome=%r — ap_signals may "
+                "remain WATCHING paired with a terminal queue row. "
+                "Operator action required.",
+                job_id, _comp_outcome,
             )
         # Do NOT call _mark_job — the terminal queue state is authoritative and
         # must remain untouched.
@@ -1235,35 +1384,145 @@ def _persist_watching_deferral(
         "required.",
         job_id, _sig, _client, _mode, _cas_outcome,
     )
-    # Best-effort: overwrite the ap_signals WATCHING row with ERROR so it is not
-    # silently discoverable as a valid overnight deferral. _log_signal_to_db
-    # absorbs exceptions and returns False — capture it explicitly; do NOT rely
-    # on try/except alone.
-    _signal_revert_ok = _log_signal_to_db(
+    # P0 #405: Best-effort expected-state compensation — only transitions the
+    # ap_signals row to ERROR if it is still exactly WATCHING. A blind upsert
+    # here could overwrite any newer valid lifecycle state that a concurrent
+    # owner may have written after we set WATCHING earlier in this call.
+    _comp_outcome = _compensate_watching_signal_if_unchanged(
         signal_id=_sig,
-        client_id=_client,
-        ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
-        side=str(_payload.get("side") or _payload.get("direction") or ""),
-        score=_score,
-        stage=stage,
-        reason_code="PERSISTENCE_FAILURE",
-        human_reason=(
-            f"Queue CAS outcome={_cas_outcome!r} — ap_signals reverted from WATCHING."
+        client_email=_client,
+        context_notes=(
+            f"stage={stage} | DEFERRAL_QUEUE_CAS_FAILED outcome={_cas_outcome!r} | "
+            "ap_signals compensation attempted from WATCHING."
         ),
-        payload=_payload,
-        decision_status="ERROR",
-        queued_at=datetime.now(timezone.utc).isoformat(),
     )
-    if not _signal_revert_ok:
+    if _comp_outcome == SIGNAL_COMP_TRANSITIONED:
+        log.info(
+            "DEFERRAL_SIGNAL_COMP_OK job_id=%s — ap_signals set to ERROR "
+            "(was WATCHING; queue CAS outcome=%r).",
+            job_id, _cas_outcome,
+        )
+    elif _comp_outcome == SIGNAL_COMP_ALREADY_ADVANCED:
+        log.warning(
+            "DEFERRAL_SIGNAL_COMP_ADVANCED job_id=%s outcome=%r — ap_signals row "
+            "advanced past WATCHING before compensation; newer state preserved. "
+            "Manual review recommended.",
+            job_id, _cas_outcome,
+        )
+    else:
         log.critical(
-            "DEFERRAL_SIGNAL_REVERT_FAILED job_id=%s — ap_signals may remain "
-            "WATCHING with no matching queue row. Operator action required.",
-            job_id,
+            "DEFERRAL_SIGNAL_COMP_FAILED job_id=%s cas_outcome=%r comp_outcome=%r — "
+            "ap_signals may remain WATCHING with no matching queue row. "
+            "Operator action required.",
+            job_id, _cas_outcome, _comp_outcome,
         )
     # Do NOT blindly call _mark_job — the queue row's current state was not
     # confirmed to be PROCESSING. Overwriting WATCHING, a terminal status, or a
     # missing row with ERROR would create or deepen split truth.
     return False
+
+
+def _checked_processing_error_cas(
+    job_id: int,
+    *,
+    error: str,
+    result: dict | None = None,
+) -> str:
+    """Guarded queue ERROR transition: UPDATE trade_queue SET status='ERROR'
+    WHERE id=%s AND status='PROCESSING'.
+
+    P0 #405 — replaces the unconditional _mark_job(job_id, 'ERROR', ...) calls on
+    early failure paths inside _persist_watching_deferral(). The prior code updated
+    by id only, so a row concurrently advanced from PROCESSING (to WATCHING,
+    SUBMITTED, FILLED, REJECTED, EXPIRED, DONE, ERROR, etc.) could be blindly
+    overwritten with ERROR.
+
+    Contract:
+      1. Only transitions a row that is still exactly PROCESSING.
+      2. On zero rows updated: reads current status and classifies the outcome.
+      3. Never overwrites WATCHING, SUBMITTED, FILLED, CANCELED, CANCELLED,
+         EXPIRED, DONE, REJECTED, or an already-ERROR row.
+      4. Returns an explicit outcome constant — never raises.
+      5. Only touches trade_queue; never touches ap_signals or any other table.
+
+    Returns:
+      ERROR_CAS_TRANSITIONED         – 1 row updated; row is now ERROR.
+      ERROR_CAS_ALREADY_ERROR        – 0 rows; row was already ERROR (no-op, benign).
+      ERROR_CAS_TERMINAL             – 0 rows; row is in another terminal status (preserved).
+      ERROR_CAS_WATCHING_OR_ADVANCED – 0 rows; row advanced to WATCHING or other non-PROCESSING state.
+      ERROR_CAS_MISSING              – 0 rows; row not found.
+      ERROR_CAS_DB_ERROR             – UPDATE or classification SELECT raised.
+    """
+    try:
+        def _fn() -> tuple:
+            with _conn()() as c:
+                # 1. Guarded PROCESSING → ERROR transition.
+                c.execute(
+                    """
+                    UPDATE trade_queue
+                    SET   status      = 'ERROR',
+                          finished_ts = NOW(),
+                          last_error  = %s,
+                          meta        = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                    WHERE id     = %s
+                      AND status = 'PROCESSING'
+                    """,
+                    (
+                        error,
+                        _json_dumps(result or {}),
+                        job_id,
+                    ),
+                )
+                if c.rowcount == 1:
+                    return (1, None)
+                # 2. Zero rows — read current status without mutating anything.
+                c.execute(
+                    "SELECT status FROM trade_queue WHERE id = %s",
+                    (job_id,),
+                )
+                row = c.fetchone()
+                current = str(row["status"]).upper() if row else None
+                return (0, current)
+
+        updated, current_status = _run_with_retry(_fn)
+
+        if updated == 1:
+            return ERROR_CAS_TRANSITIONED
+
+        if current_status is None:
+            log.warning(
+                "_checked_processing_error_cas: job_id=%s not found — ERROR_CAS_MISSING",
+                job_id,
+            )
+            return ERROR_CAS_MISSING
+        if current_status == "ERROR":
+            log.info(
+                "_checked_processing_error_cas: job_id=%s already ERROR — "
+                "ERROR_CAS_ALREADY_ERROR (no-op)",
+                job_id,
+            )
+            return ERROR_CAS_ALREADY_ERROR
+        if current_status in _TERMINAL_QUEUE_STATUSES:
+            log.warning(
+                "_checked_processing_error_cas: job_id=%s is terminal (status=%r) — "
+                "ERROR transition refused; terminal state preserved. ERROR_CAS_TERMINAL",
+                job_id, current_status,
+            )
+            return ERROR_CAS_TERMINAL
+        # WATCHING, PENDING_TRIGGER, or another nonterminal-advanced state.
+        log.warning(
+            "_checked_processing_error_cas: job_id=%s has status=%r — not PROCESSING; "
+            "ERROR transition refused (row advanced). ERROR_CAS_WATCHING_OR_ADVANCED",
+            job_id, current_status,
+        )
+        return ERROR_CAS_WATCHING_OR_ADVANCED
+
+    except Exception:
+        log.exception(
+            "_checked_processing_error_cas raised for job_id=%s — returning ERROR_CAS_DB_ERROR",
+            job_id,
+        )
+        return ERROR_CAS_DB_ERROR
 
 
 def _checked_watching_cas(
@@ -1965,64 +2224,51 @@ def _dispatch(
                     "contract selection deferred. Informational only.",
                     ticker, signal_id,
                 )
-            # PR F / queue truth hardening: write ap_signals FIRST, then mark
-            # the queue job WATCHING — and ONLY if the write succeeded. The
-            # previous order (mark WATCHING, then log) silently created a
-            # WATCHING queue job with no ap_signals row whenever the upsert
-            # failed (network blip, schema drift, no supabase client). Because
-            # overnight_reeval discovers signals via
-            #   ap_signals WHERE decision_status='WATCHING'
-            # such signals were invisible — never armed at 9 AM ET.
+            # P0 #405 / P1: route through _persist_watching_deferral — the single
+            # authority for all WATCHING deferrals. This removes the last direct
+            # _log_signal_to_db + _mark_job(WATCHING) caller in _dispatch, so the
+            # after-hours path now inherits:
+            #   • guarded PROCESSING→WATCHING queue CAS (_checked_watching_cas)
+            #   • guarded early ERROR CAS (_checked_processing_error_cas)
+            #   • expected-state ap_signals compensation
+            #     (_compensate_watching_signal_if_unchanged)
+            #   • malformed-score sanitization
+            #   • explicit outcome logging
             #
-            # New contract:
-            #   1. _log_signal_to_db(...) returns bool.
-            #   2. On True  → _mark_job(WATCHING, ...after_hours_deferred...).
-            #   3. On False → _mark_job terminal with the explicit reason
-            #      'ap_signals_write_failed:after_hours_deferred' so the
-            #      operator sees the failure instead of a phantom WATCHING.
-            _signals_ok = _log_signal_to_db(
-                signal_id=signal_id, client_id=client_id, ticker=ticker,
-                side=payload.get("side", ""), score=float(payload.get("score") or 0),
-                stage="contract_selection", reason_code="market_closed_deferred",
-                human_reason="After market hours — deferred to next session. No action needed.",
+            # track_counterfactual_signal is called only after durable deferral
+            # success — if _persist_watching_deferral returns False the signal
+            # is not in a valid WATCHING state and counterfactual tracking would
+            # record a phantom overnight candidate.
+            _watching_ok = _persist_watching_deferral(
+                job_id=job_id,
+                client_id=client_id,
+                signal_id=signal_id,
+                execution_mode=str(getattr(master_control, "mode", "PAPER") or "PAPER"),
                 payload=payload,
-                decision_status="WATCHING",
-                queued_at=datetime.now(timezone.utc).isoformat(),
+                stage="contract_selection",
+                reason_code="market_closed_deferred",
+                human_reason="After market hours — deferred to next session. No action needed.",
+                watching_error=_PAPER_OVERNIGHT_REEVAL_ONLY_ERROR,
+                watching_result={"after_hours_deferred": True},
+                failure_error="ap_signals_write_failed:after_hours_deferred",
             )
-            if not _signals_ok:
-                log.critical(
-                    "[%s] AP_SIGNALS WRITE FAILED for after-hours deferred signal "
-                    "%s — refusing to mark queue job WATCHING (overnight_reeval "
-                    "would never find it). Marking job terminal so operator sees the failure.",
-                    ticker, signal_id,
-                )
-                _mark_job(
-                    job_id, "ERROR",
-                    error="ap_signals_write_failed:after_hours_deferred",
-                )
-                return
-            try:
-                from ap.counterfactual_tracker import track_counterfactual_signal
+            if _watching_ok:
+                try:
+                    from ap.counterfactual_tracker import track_counterfactual_signal
 
-                payload_copy = dict(payload or {})
-                payload_copy["signal_id"] = signal_id
-                track_counterfactual_signal(
-                    signal=payload_copy,
-                    client_id=client_id,
-                    execution_mode=str(getattr(master_control, "mode", "PAPER") or "PAPER"),
-                    block_stage="contract_selection",
-                    block_reason="market_closed_deferred",
-                    reason_code="market_closed_deferred",
-                    source="watch",
-                )
-            except Exception:
-                pass
-            # Status: WATCHING — signal is valid, awaiting 9 AM overnight reeval to arm.
-            # The overnight reeval queries WHERE status='WATCHING' to find these signals.
-            # WATCHING here means: master control approved, contract selection deferred to breach.
-            # The overnight reeval at 9 AM will run contract selection with live quotes and
-            # arm the entry watcher. This is the correct overnight pipeline for daily scanner signals.
-            _mark_job(job_id, "WATCHING", error="after_hours_deferred:awaiting_overnight_reeval")
+                    payload_copy = dict(payload or {})
+                    payload_copy["signal_id"] = signal_id
+                    track_counterfactual_signal(
+                        signal=payload_copy,
+                        client_id=client_id,
+                        execution_mode=str(getattr(master_control, "mode", "PAPER") or "PAPER"),
+                        block_stage="contract_selection",
+                        block_reason="market_closed_deferred",
+                        reason_code="market_closed_deferred",
+                        source="watch",
+                    )
+                except Exception:
+                    pass
             return
     except Exception as _mkt_err:
         log.warning("[%s] Market hours check failed: %s — proceeding", ticker, _mkt_err)

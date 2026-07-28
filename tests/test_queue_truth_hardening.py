@@ -87,100 +87,64 @@ def test_log_signal_to_db_has_return_true_and_return_false():
     )
 
 
-def test_after_hours_writes_ap_signals_before_marking_watching():
-    """
-    In the after-hours deferred branch (market_closed_deferred),
-    _log_signal_to_db(..., decision_status="WATCHING", ...) MUST be called
-    BEFORE _mark_job(job_id, "WATCHING", ...). Today the order is reversed:
-    queue says WATCHING but ap_signals may be empty, so overnight_reeval
-    can never find the signal.
+
+def test_after_hours_routes_through_persist_watching_deferral():
+    """P0 #405 / P1: the after-hours contract-selection block must route through
+    _persist_watching_deferral — the single WATCHING authority.
+
+    Previous contract (pre-#405): _log_signal_to_db(WATCHING) + _mark_job(WATCHING).
+    New contract: _persist_watching_deferral(...) handles both atomically with
+    guarded CAS, expected-state compensation, and malformed-score sanitization.
+
+    Three structural assertions:
+    1. _persist_watching_deferral appears in the after-hours block.
+    2. No direct _mark_job(job_id, 'WATCHING') remains in the block.
+    3. No direct _log_signal_to_db(decision_status='WATCHING') remains in the block.
     """
     src = _src()
 
-    # Find the after-hours block by anchor on the deferral comment + call.
-    # The block lives inside _dispatch() under the contract-selection skip.
+    disp_match = re.search(r"def\s+_dispatch\s*\(.*?(?=\ndef\s+\w)", src, re.DOTALL)
+    assert disp_match, "Could not locate _dispatch in ap/queue.py"
+    disp = disp_match.group(0)
+
+    # Locate the after-hours intraday block.
     block_match = re.search(
-        r"market_closed_deferred[^\n]*\n.*?(?=\nelse:|\n    except|\n\n\s{4}if contract_selector)",
-        src,
-        re.DOTALL,
-    )
-    # Fallback: just inspect the entire _dispatch body around the deferral.
-    if not block_match:
-        block_match = re.search(
-            r"after_hours_deferred:awaiting_overnight_reeval(.*?)return\b",
-            src,
-            re.DOTALL,
-        )
-    assert block_match, "Could not locate the after-hours deferred block"
-
-    # Find positions of the two relevant calls inside _dispatch's after-hours
-    # branch. We scan the whole _dispatch span for safety.
-    disp_match = re.search(r"def\s+_dispatch\s*\(.*?(?=\ndef\s+\w)", src, re.DOTALL)
-    assert disp_match, "Could not locate _dispatch in ap/queue.py"
-    disp = disp_match.group(0)
-
-    # Locate the after-hours WATCHING flow:
-    #   - the _log_signal_to_db(..., decision_status="WATCHING"...) call
-    #   - the _mark_job(job_id, "WATCHING", error="after_hours_deferred...") call
-    # Find the after-hours _log_signal_to_db call (allow nested parens in args).
-    # Anchor on the call name and the WATCHING decision_status kwarg; positions
-    # are sufficient for the ordering check.
-    log_iter = list(re.finditer(
-        r"_log_signal_to_db\s*\(",
-        disp,
-    ))
-    # Filter to the call that has decision_status="WATCHING" in its args.
-    def _is_watching_log(m):
-        # Look ahead ~800 chars for the WATCHING kwarg
-        window = disp[m.start():m.start() + 1200]
-        return re.search(r'decision_status\s*=\s*["\']WATCHING["\']', window) is not None
-    log_iter = [m for m in log_iter if _is_watching_log(m)]
-
-    mark_iter = list(re.finditer(
-        r"_mark_job\s*\([^)]*[\"']WATCHING[\"'][^)]*after_hours_deferred",
+        r"contract_selection_deferred.*?(?=\n    except Exception as _mkt_err)",
         disp,
         re.DOTALL,
-    ))
-    assert log_iter, (
-        "After-hours flow must call _log_signal_to_db with decision_status='WATCHING'"
     )
-    assert mark_iter, (
-        "After-hours flow must call _mark_job(..., 'WATCHING', ...after_hours_deferred...)"
-    )
+    assert block_match, "Could not locate after-hours block in _dispatch"
+    block = block_match.group(0)
 
-    log_pos = log_iter[0].start()
-    mark_pos = mark_iter[0].start()
-    assert log_pos < mark_pos, (
-        "After-hours order is wrong: _mark_job(WATCHING) currently runs BEFORE "
-        "_log_signal_to_db(WATCHING). If the ap_signals write fails, the queue "
-        "is marked WATCHING with no signals row — overnight_reeval can never "
-        "find the signal. Reorder so ap_signals is written FIRST, then mark "
-        "WATCHING only if the write returned True."
+    # 1. Must call _persist_watching_deferral.
+    assert "_persist_watching_deferral" in block, (
+        "After-hours block must call _persist_watching_deferral "
+        "(single WATCHING authority, P0 #405 / P1)"
     )
 
-
-def test_after_hours_failure_marks_job_terminal_with_explicit_reason():
-    """
-    On _log_signal_to_db returning False in the after-hours branch, the
-    queue job MUST be marked terminal with reason
-    'ap_signals_write_failed:after_hours_deferred'. Operators must see
-    failures, not a silent WATCHING job.
-    """
-    src = _src()
-    disp_match = re.search(r"def\s+_dispatch\s*\(.*?(?=\ndef\s+\w)", src, re.DOTALL)
-    assert disp_match, "Could not locate _dispatch in ap/queue.py"
-    disp = disp_match.group(0)
-    assert "ap_signals_write_failed:after_hours_deferred" in disp, (
-        "After-hours failure path missing required reason string "
-        "'ap_signals_write_failed:after_hours_deferred'. The branch must "
-        "mark the job terminal (REJECTED or ERROR) with this exact reason "
-        "when _log_signal_to_db returns False."
+    # 2. Must NOT directly call _mark_job(job_id, 'WATCHING').
+    direct_watching = re.search(
+        r'_mark_job\s*\(\s*job_id\s*,\s*["\'\']WATCHING["\'\']',
+        block,
+    )
+    assert direct_watching is None, (
+        "After-hours block must NOT directly call _mark_job(job_id, \'WATCHING\') — "
+        "all WATCHING writes route through _persist_watching_deferral. "
+        f"Found: {direct_watching.group(0) if direct_watching else ''}"
     )
 
+    # 3. Must NOT directly call _log_signal_to_db with decision_status=WATCHING.
+    direct_log = re.search(
+        r'decision_status\s*=\s*["\'\']WATCHING["\'\']',
+        block,
+    )
+    assert direct_log is None, (
+        "After-hours block must NOT directly pass decision_status=\'WATCHING\' to "
+        "_log_signal_to_db — score sanitization and ap_signals write are owned by "
+        "_persist_watching_deferral. "
+        f"Found: {direct_log.group(0) if direct_log else ''}"
+    )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FIX-2: 3:15 PM ET cutoff runs BEFORE create_entry_order()
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_cutoff_runs_before_create_entry_order():
     """
