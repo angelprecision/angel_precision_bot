@@ -1701,24 +1701,33 @@ class APPositionQuoteMonitor:
                     # onto the position.
                     if _apply_opt:
                         recovery["expected_option_bid"] = bid
-                        recovery["expected_option_price"] = _safe_float(
-                            _get_attr(
-                                pos,
-                                "currentoptionprice",
-                                "current_option_price",
-                                default=None,
-                            ),
-                            0.0,
-                        )
+                        # LIVE option decision price is the accepted recovered
+                        # executable BID. Derive proof from the source value,
+                        # never from a post-write readback that can certify a
+                        # failed assignment.
+                        recovery["expected_option_price"] = bid
                         recovery["expected_option_bid_valid"] = bool(
                             _opt_bid_valid
                         )
                         recovery["expected_exit_executable_mark"] = (
                             _exec_exit_mark if _opt_bid_valid else None
                         )
-                        recovery["expected_option_price_source"] = (
-                            price_source
+                        recovery["expected_option_price_source"] = "bid"
+                        self._write_field_unconditional(
+                            pos, "last_option_price_source", "bid"
                         )
+                        self._write_field_unconditional(
+                            pos, "lastoptionpricesource", "bid"
+                        )
+                        # Under DIRECT_POSITION_WRITES=0 the canonical exit
+                        # engine receives price truth only through this
+                        # snapshot. Carry the recovered LIVE BID explicitly.
+                        snapshots[-1]["current_option_price"] = bid
+                        snapshots[-1]["currentoptionprice"] = bid
+                        snapshots[-1]["price_source"] = "bid"
+                        snapshots[-1]["pricesource"] = "bid"
+                        snapshots[-1]["last_option_price_source"] = "bid"
+                        snapshots[-1]["lastoptionpricesource"] = "bid"
                         self._write_field_unconditional(
                             pos,
                             "last_option_provider_quote_ts",
@@ -1742,7 +1751,10 @@ class APPositionQuoteMonitor:
                         ] = recovery["underlying_provider_ts"]
                     recovery["position"] = pos
                     recovery["snapshot"] = snapshots[-1]
-                    if recovery.get("recovery_complete", False):
+                    # Verify and wake every applied component independently.
+                    # A chronology-rejected underlying component must not
+                    # swallow an accepted option BID update (or vice versa).
+                    if _apply_opt or _apply_und:
                         recovery_candidates.append(recovery)
                     else:
                         self._record_direct_recovery_failure(

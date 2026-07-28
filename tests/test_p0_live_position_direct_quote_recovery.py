@@ -621,6 +621,14 @@ def test_older_option_provider_ts_cannot_overwrite_bid_or_price_and_cannot_wake(
     position.currentoptionprice = 1.05
     position.last_option_bid_update_ts = opt_obs_dt
     position.lastoptionbidupdatets = opt_obs_dt
+    position.current_underlying = 555.0
+    position.currentunderlying = 555.0
+    position.last_underlying_quote_update_ts = datetime.fromtimestamp(
+        now_epoch - 1.0, tz=timezone.utc
+    )
+    position.lastunderlyingquoteupdatets = (
+        position.last_underlying_quote_update_ts
+    )
 
     # Recovery provider_ts is 8 s ago: OLDER than the existing 3 s obs but
     # within STALE_MAX_SEC=15 s, so _maybe_direct_recover_position → ok=True.
@@ -680,6 +688,14 @@ def test_older_underlying_provider_ts_cannot_overwrite_underlying_and_cannot_wak
     position.currentunderlying = 555.0
     position.last_underlying_quote_update_ts = und_obs_dt
     position.lastunderlyingquoteupdatets = und_obs_dt
+    position.current_bid = 1.05
+    position.currentbid = 1.05
+    position.current_option_price = 1.05
+    position.currentoptionprice = 1.05
+    position.last_option_bid_update_ts = datetime.fromtimestamp(
+        now_epoch - 1.0, tz=timezone.utc
+    )
+    position.lastoptionbidupdatets = position.last_option_bid_update_ts
 
     # Option provider_ts is newer than any existing option obs (none planted)
     # so _apply_opt=True; only the underlying component is stale.
@@ -923,6 +939,14 @@ def test_rejected_option_recovery_leaves_hard_ref_executable_peak_touched_profit
     position.currentoptionprice = 1.05
     position.last_option_bid_update_ts = opt_obs_dt
     position.lastoptionbidupdatets = opt_obs_dt
+    position.current_underlying = 555.0
+    position.currentunderlying = 555.0
+    position.last_underlying_quote_update_ts = datetime.fromtimestamp(
+        now_epoch - 1.0, tz=timezone.utc
+    )
+    position.lastunderlyingquoteupdatets = (
+        position.last_underlying_quote_update_ts
+    )
 
     prior_hard_ref_price = 1.10
     prior_hard_ref_source = "bid"
@@ -1029,6 +1053,14 @@ def test_rejected_underlying_recovery_does_not_reach_persistence_availability_or
     position.currentunderlying = 555.0
     position.last_underlying_quote_update_ts = und_obs_dt
     position.lastunderlyingquoteupdatets = und_obs_dt
+    position.current_bid = 1.05
+    position.currentbid = 1.05
+    position.current_option_price = 1.05
+    position.currentoptionprice = 1.05
+    position.last_option_bid_update_ts = datetime.fromtimestamp(
+        now_epoch - 1.0, tz=timezone.utc
+    )
+    position.lastoptionbidupdatets = position.last_option_bid_update_ts
 
     # Recovery underlying provider_ts is 8 s ago: OLDER than existing 3 s obs.
     # Option recovery is fresh so recovery call succeeds overall.
@@ -1090,6 +1122,10 @@ def test_equal_provider_bid_preserves_pending_confirmation_without_advancing():
     position.currentoptionprice = 1.00
     position.last_option_bid_update_ts = provider_ts
     position.lastoptionbidupdatets = provider_ts
+    position.current_underlying = 550.0
+    position.currentunderlying = 550.0
+    position.last_underlying_quote_update_ts = provider_ts
+    position.lastunderlyingquoteupdatets = provider_ts
     broker = _RecoveryBroker(provider_ts=provider_epoch)
     monitor, engine = _monitor(position, broker)
     confirmation_key = f"{CLIENT_ID}|live|{POSITION_ID}"
@@ -1218,3 +1254,81 @@ def test_numeric_assignment_failure_blocks_recovery_success_and_wake():
         "exact_position_not_updated"
     )
     assert not engine.quote_arrived_event.is_set()
+
+
+def test_option_price_assignment_failure_blocks_recovery_success_and_wake():
+    position = _position()
+    monitor, engine = _monitor(position, _RecoveryBroker())
+    real_write = monitor._write_field
+
+    def drop_option_price_assignment(target, field, value):
+        if field in {"currentoptionprice", "current_option_price"}:
+            return
+        return real_write(target, field, value)
+
+    monitor._write_field = drop_option_price_assignment
+    monitor._refresh_once()
+
+    assert position.current_bid == 1.00
+    assert position.current_option_price == 0.0
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert monitor._last_direct_recovery_result["reason"] == (
+        "exact_position_not_updated"
+    )
+    assert not engine.quote_arrived_event.is_set()
+
+
+def test_snapshot_propagation_applies_recovered_bid_as_live_option_price(
+    monkeypatch,
+):
+    from ap_exit_engine import APExitEngine
+
+    monkeypatch.setattr(qpm_module, "DIRECT_POSITION_WRITES", False)
+    position = _position()
+    broker = _RecoveryBroker()
+    engine = APExitEngine(broker=broker, email=CLIENT_ID)
+    engine._positions = [position]
+    engine._positions_by_id = {POSITION_ID: position}
+    monitor = APPositionQuoteMonitor(
+        broker=broker,
+        client_id=CLIENT_ID,
+        exit_engine=engine,
+        poll_interval_sec=0.01,
+    )
+    monitor._persist_quote_to_db = MagicMock(return_value=False)
+    monitor._persist_mfe_mae_to_orders = MagicMock(return_value=False)
+    monitor._mark_mfe_mae_unavailable = MagicMock(return_value=False)
+    monitor._refresh_once()
+
+    assert position.current_option_price == 1.00
+    assert position.currentoptionprice == 1.00
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine._quote_arrived_event.is_set()
+
+
+def test_applied_option_recovery_wakes_when_underlying_chronology_rejects():
+    now_epoch = time.time()
+    position = _position()
+    prior_underlying_ts = datetime.fromtimestamp(
+        now_epoch - 3.0, tz=timezone.utc
+    )
+    position.current_underlying = 555.0
+    position.currentunderlying = 555.0
+    position.last_underlying_quote_update_ts = prior_underlying_ts
+    position.lastunderlyingquoteupdatets = prior_underlying_ts
+    broker = _StalerProviderRecoveryBroker(
+        option_provider_ts=now_epoch - 2.0,
+        underlying_provider_ts=now_epoch - 8.0,
+        option_bid=0.90,
+        underlying_last=530.0,
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    assert position.current_bid == 0.90
+    assert position.current_option_price == 0.90
+    assert position.exit_executable_mark == 0.90
+    assert position.current_underlying == 555.0
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
