@@ -719,8 +719,8 @@ class PendingTriggerRestartRecovery:
                  materialization_attempt_count, materialization_retry_reason
                  (none of these exist in stamp_retry_pending).
         """
-        _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 20)
-        _max   = _env_int(_MAT_MAX_ATTEMPTS_ENV, 3)
+        _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
+        _max   = _env_int(_MAT_MAX_ATTEMPTS_ENV, 5)
         _now   = datetime.now(timezone.utc)
 
         _meta     = _extract_meta(row)
@@ -949,7 +949,7 @@ class PendingTriggerRestartRecovery:
         except (TypeError, ValueError):
             return None
 
-        _max = _env_int(_MAT_MAX_ATTEMPTS_ENV, 3)
+        _max = _env_int(_MAT_MAX_ATTEMPTS_ENV, 5)
         if mat_status != "RETRY_PENDING":
             return None
         if broker_ready is not False:

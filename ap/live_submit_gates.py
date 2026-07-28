@@ -70,6 +70,7 @@ import os
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
 
 from ap.logger import get_logger
@@ -130,6 +131,33 @@ class GateResult:
     reason_code: str = GateOutcome.PASS
     detail: str = ""
     audit: dict = field(default_factory=dict)
+
+
+class MarketTruthAuthority(str, Enum):
+    SUBMIT_VALID = "SUBMIT_VALID"
+    REARM_DIRECTION_REVERSAL = "REARM_DIRECTION_REVERSAL"
+    HOLD_MARKET_TRUTH_UNAVAILABLE = "HOLD_MARKET_TRUTH_UNAVAILABLE"
+    TERMINAL_SETUP_COMPLETE = "TERMINAL_SETUP_COMPLETE"
+
+
+def classify_market_truth(result: GateResult) -> MarketTruthAuthority:
+    """Map the pure market gate into the deferred-retry authority contract."""
+    reason = str(getattr(result, "reason_code", "") or "")
+    if bool(getattr(result, "passed", False)) and reason == GateOutcome.PASS:
+        return MarketTruthAuthority.SUBMIT_VALID
+    if reason in {
+        GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
+        GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+    }:
+        return MarketTruthAuthority.REARM_DIRECTION_REVERSAL
+    if reason in {
+        GateOutcome.CALL_STOP_ALREADY_BROKEN,
+        GateOutcome.PUT_STOP_ALREADY_BROKEN,
+        GateOutcome.TARGET_ALREADY_INVALID,
+        GateOutcome.REMAINING_OPPORTUNITY_TOO_SMALL,
+    }:
+        return MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+    return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,11 +621,6 @@ def check_market_validity_gate(
     # geometry (which is symmetric on both sides).
     if _side == "CALL":
         _trigger_check = ask if ask and ask > 0 else mid
-        if _trigger_check is not None and _trigger_check < tr:
-            return _fail(
-                GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
-                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
-            )
         if st is not None and st > 0 and mid is not None and mid <= st:
             return _fail(
                 GateOutcome.CALL_STOP_ALREADY_BROKEN,
@@ -608,13 +631,13 @@ def check_market_validity_gate(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"CALL mid={mid:.4f} >= target={tg:.4f} — move complete",
             )
+        if _trigger_check is not None and _trigger_check < tr:
+            return _fail(
+                GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
+                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
+            )
     elif _side == "PUT":
         _trigger_check = bid if bid and bid > 0 else mid
-        if _trigger_check is not None and _trigger_check > tr:
-            return _fail(
-                GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
-                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
-            )
         if st is not None and st > 0 and mid is not None and mid >= st:
             return _fail(
                 GateOutcome.PUT_STOP_ALREADY_BROKEN,
@@ -624,6 +647,11 @@ def check_market_validity_gate(
             return _fail(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"PUT mid={mid:.4f} <= target={tg:.4f} — move complete",
+            )
+        if _trigger_check is not None and _trigger_check > tr:
+            return _fail(
+                GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
             )
     # Unknown side: pass (identity gate would have blocked this earlier)
 

@@ -116,7 +116,7 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # Reason codes in this set mean the chain provider had a temporary data miss —
 # NOT a real contract-quality or risk reject.  On a retryable miss the deferred
 # row must NOT be expired/cancelled; instead it is rearmed for retry up to
-# MAX_BREACH_SELECTOR_RETRIES times (default 3) before giving up.
+# MAX_BREACH_SELECTOR_RETRIES total attempts (default 5) before giving up.
 #
 # Quality rejects (SPREAD_TOO_WIDE, DELTA_OUT_OF_RANGE, OI_TOO_LOW, etc.) and
 # fundamental blocks (EARNINGS_LOCKOUT, UNTRADEABLE_FOR_ACCOUNT_SIZE, etc.) are
@@ -133,8 +133,8 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # emitted by older selector paths that could still surface in edge cases.
 #
 # Env overrides:
-#   MAX_BREACH_SELECTOR_RETRIES          default 3
-#   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
+#   MAX_BREACH_SELECTOR_RETRIES          default 5 total attempts
+#   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 8
 #   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 1530 (= 3:30 PM ET; last-entry
 #                                        boundary — see _breach_retry_cutoff_hhmm)
 # ── Seam 3 (PR #323): canonical retry taxonomy now lives in one place ──────────
@@ -479,11 +479,34 @@ def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
 # (matches ap_entry_watcher EOD disarm and ap/order_monitor
 # _PT_ORPHAN_EOD_CUTOFF). Total retry span per order remains bounded by
 # MAX_BREACH_SELECTOR_RETRIES × BREACH_SELECTOR_RETRY_DELAY_SECONDS
-# (default 3 × 20s = ~60s), so this cannot cause open-ended retry loops;
+# (default 5 × 8s = ~40s), so this cannot cause open-ended retry loops;
 # the cutoff only stops NEW retries from being scheduled into the close.
 # Env var name is unchanged so the operational kill-switch muscle memory
 # ("set BREACH_SELECTOR_RETRY_CUTOFF_ET=0 to stop all retries") still works.
 _BREACH_RETRY_CUTOFF_DEFAULT_HHMM = 1530
+
+
+def _positive_int_env_config(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "DEFERRED_RETRY_ENV_PARSE_ERROR key=%s value=%r default=%s",
+            name,
+            raw,
+            default,
+        )
+        return int(default)
+    if value <= 0:
+        log.warning(
+            "DEFERRED_RETRY_ENV_PARSE_ERROR key=%s value=%r default=%s",
+            name,
+            raw,
+            default,
+        )
+        return int(default)
+    return value
 
 
 def _breach_retry_cutoff_hhmm() -> int:
@@ -2436,7 +2459,9 @@ class APExecutionCore:
             _durable_max = 0
         if _durable_max <= 0:
             try:
-                _durable_max = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+                _durable_max = _positive_int_env_config(
+                    "MAX_BREACH_SELECTOR_RETRIES", 5
+                )
             except (TypeError, ValueError):
                 _durable_max = 3
         max_attempts = _durable_max
@@ -2554,7 +2579,9 @@ class APExecutionCore:
         # transitions out of MATERIALIZING before we return — never
         # leave the row stranded at MATERIALIZING until lease expiry.
         try:
-            _retry_delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+            _retry_delay = _positive_int_env_config(
+                "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
+            )
         except (TypeError, ValueError):
             _retry_delay = 20
 
@@ -4114,6 +4141,356 @@ class APExecutionCore:
                         "retry_after_seconds": 5,
                     }
             try:
+                # PR #401: bind this explicitly-owned deferred attempt to one
+                # durable selector cursor.  Ordinary selector calls never
+                # receive this request kind or cursor behavior.
+                from ap.contract_selector import (
+                    SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+                    _new_selector_request_context,
+                )
+                from ap.selector_retry_policy import (
+                    load_selector_recovery_cursor,
+                    record_selector_recovery_attempt,
+                    record_selector_structural_skip,
+                )
+
+                _cursor_enabled = str(
+                    os.getenv("SELECTOR_DURABLE_RECOVERY_CURSOR_ENABLED", "1")
+                ).strip().lower() in {"1", "true", "yes"}
+                _cursor_row = self.order_state_machine.get_order(
+                    str(queue_local_order_id or "")
+                )
+                _cursor_meta = (
+                    (_cursor_row or {}).get("meta") or {}
+                    if isinstance(_cursor_row, dict)
+                    else {}
+                )
+                if isinstance(_cursor_meta, str):
+                    try:
+                        _cursor_meta = json.loads(_cursor_meta)
+                    except Exception:
+                        _cursor_meta = {}
+                if not isinstance(_cursor_meta, dict):
+                    _cursor_meta = {}
+                _selector_attempt_number = max(
+                    1,
+                    int(
+                        _cursor_meta.get("retry_attempt")
+                        or _cursor_meta.get("materialization_attempts")
+                        or (sig.get("_recovery_pre_claimed_attempt") if isinstance(sig, dict) else 0)
+                        or 1
+                    ),
+                )
+                _cursor_candidate = (
+                    _cursor_meta.get("selector_recovery_cursor_v1")
+                    if _cursor_enabled
+                    else None
+                )
+                _selector_recovery_cursor, _cursor_load_reason = (
+                    load_selector_recovery_cursor(
+                        _cursor_candidate,
+                        local_order_id=str(queue_local_order_id or ""),
+                        client_id=str(_breach_client_id or ""),
+                        execution_mode=_mat_exec_mode,
+                        signal_id=str(getattr(approved_plan, "signal_id", "") or ""),
+                        materialization_generation=_mat_generation,
+                        selector_attempt_count=_selector_attempt_number,
+                        allow_previous_generation=bool(_recovery_pre_claimed),
+                    )
+                )
+
+                def _persist_selector_cursor_progress(
+                    *,
+                    symbol: str,
+                    result_reason: str = "",
+                    transient: bool = False,
+                    provider_timestamp=None,
+                    structural_skip_reason: str = "",
+                ) -> None:
+                    nonlocal _selector_recovery_cursor
+                    if not _cursor_enabled:
+                        return
+                    if structural_skip_reason:
+                        _selector_recovery_cursor = record_selector_structural_skip(
+                            _selector_recovery_cursor,
+                            symbol=symbol,
+                            skip_reason=structural_skip_reason,
+                        )
+                    else:
+                        _cursor_expiration = ""
+                        try:
+                            _cursor_expiration = datetime.strptime(
+                                "".join(str(symbol or "").upper().split())[-15:-9],
+                                "%y%m%d",
+                            ).date().isoformat()
+                        except Exception:
+                            pass
+                        _selector_recovery_cursor = record_selector_recovery_attempt(
+                            _selector_recovery_cursor,
+                            symbol=symbol,
+                            attempt_number=_selector_attempt_number,
+                            expiration=_cursor_expiration,
+                            result_reason=result_reason,
+                            transient=transient,
+                            provider_timestamp=provider_timestamp,
+                        )
+                    try:
+                        _selector_request_context.recovery_cursor = (
+                            _selector_recovery_cursor
+                        )
+                    except (NameError, UnboundLocalError):
+                        pass
+                    _persist_cursor = getattr(
+                        self.order_state_machine,
+                        "persist_selector_recovery_cursor",
+                        None,
+                    )
+                    if callable(_persist_cursor):
+                        _persist_cursor(
+                            str(queue_local_order_id or ""),
+                            owner=_mat_owner,
+                            generation=_mat_generation,
+                            signal_id=str(
+                                getattr(approved_plan, "signal_id", "") or ""
+                            ),
+                            execution_mode=_mat_exec_mode,
+                            cursor=_selector_recovery_cursor,
+                        )
+
+                _selector_request_context = _new_selector_request_context(
+                    ticker,
+                    _mat_exec_mode,
+                    selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+                    recovery_attempt_number=_selector_attempt_number,
+                    recovery_cursor=(
+                        _selector_recovery_cursor if _cursor_enabled else None
+                    ),
+                    recovery_cursor_persist=_persist_selector_cursor_progress,
+                )
+
+                # Attempts 2..5 must prove the chart is still valid before
+                # spending any option-selector or direct-quote capacity.
+                if _selector_attempt_number > 1:
+                    from ap.live_submit_gates import (
+                        MarketTruthAuthority,
+                        check_market_validity_gate,
+                        classify_market_truth,
+                    )
+
+                    _truth_bid = _truth_ask = _truth_age = _truth_source = None
+                    _truth_fetched_at = None
+                    _truth_fetch_failed = True
+                    _truth_fetch_error = "approved_market_data_transport_unavailable"
+                    try:
+                        _truth_transport = getattr(
+                            self.contract_selector, "data_broker", None
+                        )
+                        if _truth_transport is None or not hasattr(
+                            _truth_transport, "get_quote"
+                        ):
+                            raise RuntimeError(
+                                "selector data broker has no get_quote"
+                            )
+                        _truth_quote = _truth_transport.get_quote(ticker)
+                        _truth_fetched_at = datetime.now(timezone.utc).isoformat()
+                        if not isinstance(_truth_quote, dict):
+                            raise RuntimeError(
+                                f"invalid quote type {type(_truth_quote).__name__}"
+                            )
+                        _truth_bid = _truth_quote.get("bid")
+                        _truth_ask = _truth_quote.get("ask")
+                        _truth_age = _truth_quote.get("quote_age_ms")
+                        _truth_source = (
+                            _truth_quote.get("source")
+                            or _truth_quote.get("quote_source")
+                            or _truth_quote.get("provider")
+                            or "approved_selector_data_broker"
+                        )
+                        _truth_fetch_failed = False
+                        _truth_fetch_error = None
+                    except Exception as _truth_exc:
+                        _truth_fetch_error = (
+                            f"{type(_truth_exc).__name__}:{_truth_exc}"
+                        )
+                    _truth_result = check_market_validity_gate(
+                        side=str(getattr(approved_plan, "side", "") or ""),
+                        trigger_price=float(
+                            getattr(approved_plan, "trigger_price", 0) or 0
+                        ),
+                        stop_price=(
+                            float(
+                                getattr(approved_plan, "stop_underlying", 0) or 0
+                            )
+                            if getattr(approved_plan, "stop_underlying", None)
+                            else None
+                        ),
+                        target_price=(
+                            float(
+                                getattr(approved_plan, "target_underlying", 0) or 0
+                            )
+                            if getattr(approved_plan, "target_underlying", None)
+                            else None
+                        ),
+                        current_bid=_truth_bid,
+                        current_ask=_truth_ask,
+                        quote_age_ms=_truth_age,
+                        quote_source=_truth_source,
+                        quote_fetched_at=_truth_fetched_at,
+                        quote_provenance="synchronous_submit_fetch",
+                        quote_fetch_failed=_truth_fetch_failed,
+                        quote_fetch_error=_truth_fetch_error,
+                        # Retry classification must fail closed identically for
+                        # PAPER and LIVE; this is market truth, not execution.
+                        execution_mode="live",
+                    )
+                    _truth_authority = classify_market_truth(_truth_result)
+                    _selector_recovery_cursor["last_market_truth_outcome"] = (
+                        _truth_authority.value
+                    )
+                    _selector_recovery_cursor["last_market_truth_checked_at"] = (
+                        datetime.now(timezone.utc).isoformat()
+                    )
+                    if _cursor_enabled:
+                        _persist_cursor = getattr(
+                            self.order_state_machine,
+                            "persist_selector_recovery_cursor",
+                            None,
+                        )
+                        if callable(_persist_cursor):
+                            _persist_cursor(
+                                str(queue_local_order_id or ""),
+                                owner=_mat_owner,
+                                generation=_mat_generation,
+                                signal_id=str(
+                                    getattr(approved_plan, "signal_id", "") or ""
+                                ),
+                                execution_mode=_mat_exec_mode,
+                                cursor=_selector_recovery_cursor,
+                            )
+                    if (
+                        _truth_authority
+                        == MarketTruthAuthority.REARM_DIRECTION_REVERSAL
+                    ):
+                        _rearm = getattr(
+                            self.order_state_machine,
+                            "rearm_deferred_materialization_direction_reversal",
+                            None,
+                        )
+                        _rearmed = bool(
+                            callable(_rearm)
+                            and _rearm(
+                                str(queue_local_order_id or ""),
+                                owner=_mat_owner,
+                                generation=_mat_generation,
+                                signal_id=str(
+                                    getattr(approved_plan, "signal_id", "") or ""
+                                ),
+                                execution_mode=_mat_exec_mode,
+                                market_truth_audit=_truth_result.audit,
+                            )
+                        )
+                        return {
+                            "disposition": (
+                                "KEEP_WATCHER"
+                                if _rearmed
+                                else "MATERIALIZATION_REARM_WRITE_FAILED"
+                            ),
+                            "reason_code": "REARM_DIRECTION_REVERSAL",
+                        }
+                    if (
+                        _truth_authority
+                        == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+                    ):
+                        _terminalize_deferred_breach_failure(
+                            "MARKET_SETUP_INVALIDATED",
+                            extra_meta={
+                                "final_market_truth": _truth_result.audit,
+                                "final_market_truth_reason": _truth_result.reason_code,
+                                "selector_calls": 0,
+                                "broker_post_count": 0,
+                            },
+                        )
+                        return {
+                            "disposition": "TERMINAL_DURABLE",
+                            "reason_code": "MARKET_SETUP_INVALIDATED",
+                        }
+                    if (
+                        _truth_authority
+                        == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+                    ):
+                        _max_attempts_truth = _positive_int_env_config(
+                            "MAX_BREACH_SELECTOR_RETRIES", 5
+                        )
+                        if _selector_attempt_number >= _max_attempts_truth:
+                            _terminalize_deferred_breach_failure(
+                                f"BREACH_RETRY_EXHAUSTED:{_truth_result.reason_code}",
+                                extra_meta={
+                                    "final_market_truth": _truth_result.audit,
+                                    "selector_calls": 0,
+                                    "broker_post_count": 0,
+                                },
+                            )
+                            return {
+                                "disposition": "TERMINAL_DURABLE",
+                                "reason_code": _truth_result.reason_code,
+                            }
+                        _truth_delay = _positive_int_env_config(
+                            "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
+                        )
+                        _truth_next = (
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=_truth_delay)
+                        ).isoformat()
+                        _schedule_truth = getattr(
+                            self.order_state_machine,
+                            "schedule_deferred_materialization_retry",
+                            None,
+                        )
+                        _truth_failure = _build_deferred_retry_schedule_meta(
+                            reason_code=str(_truth_result.reason_code),
+                            selector_audit={
+                                "market_truth_outcome": _truth_authority.value,
+                                "market_truth_reason": _truth_result.reason_code,
+                                "market_truth_audit": _truth_result.audit,
+                            },
+                            attempt=_selector_attempt_number,
+                            max_attempts=_max_attempts_truth,
+                            delay_seconds=_truth_delay,
+                            client_id=str(_breach_client_id or ""),
+                            execution_mode=_mat_exec_mode,
+                            local_order_id=str(queue_local_order_id or ""),
+                            signal_id=str(
+                                getattr(approved_plan, "signal_id", "") or ""
+                            ),
+                        )
+                        _truth_scheduled = bool(
+                            callable(_schedule_truth)
+                            and _schedule_truth(
+                                str(queue_local_order_id or ""),
+                                owner=_mat_owner,
+                                generation=_mat_generation,
+                                reason_code=str(_truth_result.reason_code),
+                                attempt=_selector_attempt_number,
+                                max_attempts=_max_attempts_truth,
+                                next_retry_at=_truth_next,
+                                selector_failure=_truth_failure,
+                                selector_recovery_cursor=(
+                                    _selector_recovery_cursor
+                                    if _cursor_enabled
+                                    else None
+                                ),
+                            )
+                        )
+                        return {
+                            "disposition": (
+                                "RETRY_WAIT"
+                                if _truth_scheduled
+                                else "RETRY_SCHEDULE_FAILED"
+                            ),
+                            "reason_code": _truth_result.reason_code,
+                            "next_retry_at": _truth_next,
+                        }
+
                 log.info(
                     "[%s] Overnight deferred signal — selecting contract at breach "
                     "with live quotes (trigger=%.4f side=%s)",
@@ -4145,7 +4522,10 @@ class APExecutionCore:
                             pass
                 except Exception:
                     pass
-                _sel = self.contract_selector.select(approved_plan)
+                _sel = self.contract_selector.select(
+                    approved_plan,
+                    request_context=_selector_request_context,
+                )
                 (
                     _sel_result_valid,
                     _sel_contract,
@@ -4547,8 +4927,12 @@ class APExecutionCore:
                     # an emergency kill switch (set to "0" to disable without
                     # a code deploy).
                     _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
-                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
-                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+                    _MAX_RETRIES_A = _positive_int_env_config(
+                        "MAX_BREACH_SELECTOR_RETRIES", 5
+                    )
+                    _RETRY_DELAY_A = _positive_int_env_config(
+                        "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
+                    )
                     # P0 (2026-07-02): cutoff default moved 945 → 1530. See
                     # _breach_retry_cutoff_hhmm() for the full forensic note.
                     _RETRY_CUTOFF_A     = _breach_retry_cutoff_hhmm()
@@ -4630,6 +5014,11 @@ class APExecutionCore:
                                             ),
                                         ),
                                     },
+                                    selector_recovery_cursor=(
+                                        _selector_recovery_cursor
+                                        if _cursor_enabled
+                                        else None
+                                    ),
                                 ))
                             except Exception as _schedule_exc:
                                 log.critical(

@@ -85,6 +85,8 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+# Compatibility diagnostic only.  The behavioral request cap is owned by
+# SELECTOR_MAX_DIRECT_QUOTE_CALLS in contract_selector.
 DEFAULT_REVALIDATE_TOP_N = _positive_int_env("CONTRACT_REVALIDATE_TOP_N", 5)
 
 # Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
@@ -211,9 +213,9 @@ def _ctx_update_sink(request_context) -> None:
         getattr(
             request_context,
             "effective_direct_quote_limit",
-            getattr(request_context, "max_direct_quote_calls", 5),
+            getattr(request_context, "max_direct_quote_calls", 40),
         )
-        or 5
+        or 40
     )
     remaining = max(0, effective - used)
     sink["direct_quote_calls"] = used
@@ -243,16 +245,16 @@ def _direct_quote_budget_failure(request_context) -> Optional[dict]:
         return None
     started = float(getattr(request_context, "started_at_monotonic", 0.0) or 0.0)
     elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0) if started else 0.0
-    elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 15000) or 15000)
+    elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 25000) or 25000)
     counts = getattr(request_context, "provider_call_counts", {}) or {}
     used = int(counts.get("direct_quote_calls", 0) or 0)
     call_limit = int(
         getattr(
             request_context,
             "effective_direct_quote_limit",
-            getattr(request_context, "max_direct_quote_calls", 5),
+            getattr(request_context, "max_direct_quote_calls", 40),
         )
-        or 5
+        or 40
     )
     detail = None
     if elapsed_ms >= elapsed_limit:
@@ -291,6 +293,39 @@ def _ctx_note_attempted_symbol(request_context, occ_symbol: str) -> None:
     if isinstance(attempted, list) and occ_symbol not in attempted:
         attempted.append(occ_symbol)
         _ctx_update_sink(request_context)
+
+
+def _ctx_persist_attempt(
+    request_context,
+    occ_symbol: str,
+    *,
+    result_reason: str,
+    transient: bool,
+    provider_timestamp=None,
+) -> None:
+    """Persist completed quote progress through the existing order-state owner."""
+    if request_context is None:
+        return
+    callback = getattr(request_context, "recovery_cursor_persist", None)
+    if not callable(callback):
+        return
+    try:
+        callback(
+            symbol=str(occ_symbol or ""),
+            result_reason=str(result_reason or ""),
+            transient=bool(transient),
+            provider_timestamp=provider_timestamp,
+        )
+    except Exception as exc:
+        # Cursor serialization/persistence may never bypass selector safety or
+        # block terminal cleanup.  The caller keeps the in-memory duplicate
+        # fence even when the durable write is temporarily unavailable.
+        log.warning(
+            "selector recovery cursor persist failed contract=%s reason=%s err=%s",
+            occ_symbol,
+            result_reason,
+            exc,
+        )
 
 
 def _ctx_note_unattempted_symbol(request_context, occ_symbol: str) -> None:
@@ -437,6 +472,11 @@ def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
         "quote_fetch_latency_ms": latency_ms,
         "quote_fetched_at":       fetched_at,
         "quote_age_semantics":    "fetch_latency_not_exchange_age",
+        "provider_timestamp":     (
+            raw.get("provider_timestamp")
+            or raw.get("quote_timestamp")
+            or raw.get("timestamp")
+        ),
         "_quote_payload_empty":   not bool(raw),
     }
 
@@ -818,9 +858,25 @@ def revalidate_with_direct_quote(
                 "opt_updated":       None,
                 "audit":             audit,
             }
+        _failure_reason = quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE
+        _ctx_persist_attempt(
+            request_context,
+            occ_key,
+            result_reason=_failure_reason,
+            transient=bool(
+                quote_meta.get("retryable")
+                or _failure_reason
+                in {
+                    REASON_DIRECT_QUOTE_UNAVAILABLE,
+                    REASON_DIRECT_QUOTE_FETCH_TIMEOUT,
+                    REASON_DIRECT_QUOTE_RATE_LIMITED,
+                    REASON_MARKET_DATA_THROTTLE_UNAVAILABLE,
+                }
+            ),
+        )
         return {
             "action":            "REJECT_UNAVAILABLE",
-            "reason_code":       quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE,
+            "reason_code":       _failure_reason,
             "direct_quote_used": False,
             "opt_updated":       None,
             "audit":             audit,
@@ -841,6 +897,13 @@ def revalidate_with_direct_quote(
             audit["direct_mid"] = None
 
     if not direct_quote_is_valid(quote):
+        _ctx_persist_attempt(
+            request_context,
+            occ_key,
+            result_reason=REASON_DIRECT_QUOTE_ZERO_BID_ASK,
+            transient=True,
+            provider_timestamp=quote.get("provider_timestamp"),
+        )
         return {
             "action":            "REJECT_DIRECT_ZERO",
             "reason_code":       REASON_DIRECT_QUOTE_ZERO_BID_ASK,
@@ -869,6 +932,13 @@ def revalidate_with_direct_quote(
     patched["_chain_ask"] = chain_ask
 
     audit["contract_quote_source"] = "direct"
+    _ctx_persist_attempt(
+        request_context,
+        occ_key,
+        result_reason=REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO,
+        transient=False,
+        provider_timestamp=quote.get("provider_timestamp"),
+    )
     return {
         "action":            "PASS",
         "reason_code":       REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO,

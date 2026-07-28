@@ -1918,7 +1918,16 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
     class _FakeSelector:
         select_count = 0
-        def select(self, plan):
+        data_broker = SimpleNamespace(
+            get_quote=lambda _symbol: {
+                "bid": 130.20,
+                "ask": 130.30,
+                "quote_age_ms": 0,
+                "source": "approved_selector_data_broker",
+            }
+        )
+
+        def select(self, plan, **_kwargs):
             _FakeSelector.select_count += 1
             return SimpleNamespace(
                 contract_symbol="RTX260117C00130000",

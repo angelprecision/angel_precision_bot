@@ -241,7 +241,13 @@ def test_trigger_ready_deferred_quote_refresh_failure_expires_order_with_last_er
 
     core_mod.APExecutionCore._on_entry_trigger(core, watched)
 
-    core.contract_selector.select.assert_called_once_with(plan)
+    core.contract_selector.select.assert_called_once()
+    _select_args, _select_kwargs = core.contract_selector.select.call_args
+    assert _select_args == (plan,)
+    assert (
+        _select_kwargs["request_context"].selector_request_kind
+        == "DEFERRED_BREACH_MATERIALIZATION"
+    )
     core.order_state_machine.submit_existing_entry.assert_not_called()
     core.order_state_machine.terminalize_deferred_breach.assert_called_once()
     assert (

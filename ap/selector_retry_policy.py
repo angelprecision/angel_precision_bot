@@ -61,6 +61,7 @@ Unknown reasons fail closed — they are NOT retryable by default.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 
@@ -652,3 +653,285 @@ def classify_retry_reason_taxonomy(
         "operational_reason": _code if _operational else None,
         "may_retry_with_fresh_budget": _operational,
     }
+
+
+_CURSOR_MAX_SYMBOLS = 200
+_CURSOR_MAX_EXPIRATIONS = 10
+
+
+def _utc_iso(now=None) -> str:
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def new_selector_recovery_cursor(
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    materialization_generation: int,
+    selector_attempt_count: int = 1,
+    now=None,
+) -> dict:
+    """Build the bounded namespaced cursor stored in orders.meta."""
+    return {
+        "version": 1,
+        "local_order_id": str(local_order_id or ""),
+        "client_id": str(client_id or "").strip().lower(),
+        "execution_mode": str(execution_mode or "").strip().lower(),
+        "signal_id": str(signal_id or ""),
+        "materialization_generation": int(materialization_generation or 0),
+        "selector_attempt_count": max(1, int(selector_attempt_count or 1)),
+        "attempted_symbols": {},
+        "structurally_skipped_symbols": {},
+        "expirations_probed": [],
+        "last_ranked_index_by_expiration": {},
+        "last_market_truth_outcome": None,
+        "last_market_truth_checked_at": None,
+        "updated_at": _utc_iso(now),
+    }
+
+
+def load_selector_recovery_cursor(
+    candidate,
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    materialization_generation: int,
+    selector_attempt_count: int,
+    allow_previous_generation: bool = False,
+    now=None,
+) -> tuple[dict, str | None]:
+    """Validate identity and bound untrusted JSON cursor input.
+
+    A mismatched cursor is never reused.  The sole previous-generation
+    allowance supports the existing atomic claim transition N→N+1: callers may
+    opt in only after proving the canonical row is owned by the exact new
+    generation.
+    """
+    fresh = new_selector_recovery_cursor(
+        local_order_id=local_order_id,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        signal_id=signal_id,
+        materialization_generation=materialization_generation,
+        selector_attempt_count=selector_attempt_count,
+        now=now,
+    )
+    if candidate in (None, ""):
+        return fresh, None
+    if not isinstance(candidate, dict):
+        return fresh, "MALFORMED_CURSOR"
+    expected = {
+        "version": 1,
+        "local_order_id": str(local_order_id or ""),
+        "client_id": str(client_id or "").strip().lower(),
+        "execution_mode": str(execution_mode or "").strip().lower(),
+        "signal_id": str(signal_id or ""),
+    }
+    for key, value in expected.items():
+        actual = candidate.get(key)
+        if key in {"client_id", "execution_mode"}:
+            actual = str(actual or "").strip().lower()
+        if actual != value:
+            return fresh, f"IDENTITY_MISMATCH:{key}"
+    try:
+        actual_generation = int(candidate.get("materialization_generation"))
+        expected_generation = int(materialization_generation)
+    except (TypeError, ValueError):
+        return fresh, "IDENTITY_MISMATCH:materialization_generation"
+    allowed_generations = {expected_generation}
+    if allow_previous_generation and expected_generation > 1:
+        allowed_generations.add(expected_generation - 1)
+    if actual_generation not in allowed_generations:
+        return fresh, "IDENTITY_MISMATCH:materialization_generation"
+
+    cursor = dict(candidate)
+    cursor["materialization_generation"] = expected_generation
+    cursor["selector_attempt_count"] = max(
+        int(cursor.get("selector_attempt_count") or 0),
+        max(1, int(selector_attempt_count or 1)),
+    )
+    attempted = cursor.get("attempted_symbols")
+    skipped = cursor.get("structurally_skipped_symbols")
+    expirations = cursor.get("expirations_probed")
+    ranked = cursor.get("last_ranked_index_by_expiration")
+    cursor["attempted_symbols"] = dict(
+        list((attempted if isinstance(attempted, dict) else {}).items())[-_CURSOR_MAX_SYMBOLS:]
+    )
+    cursor["structurally_skipped_symbols"] = dict(
+        list((skipped if isinstance(skipped, dict) else {}).items())[-_CURSOR_MAX_SYMBOLS:]
+    )
+    cursor["expirations_probed"] = list(
+        dict.fromkeys(expirations if isinstance(expirations, list) else [])
+    )[-_CURSOR_MAX_EXPIRATIONS:]
+    cursor["last_ranked_index_by_expiration"] = dict(
+        list((ranked if isinstance(ranked, dict) else {}).items())[-_CURSOR_MAX_EXPIRATIONS:]
+    )
+    cursor["updated_at"] = _utc_iso(now)
+    return cursor, None
+
+
+def selector_symbol_may_retry(
+    record,
+    *,
+    refresh_seconds: int,
+    now=None,
+) -> bool:
+    if not isinstance(record, dict) or not bool(record.get("transient")):
+        return False
+    raw = record.get("attempted_at")
+    try:
+        attempted_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current - attempted_at.astimezone(timezone.utc)).total_seconds() >= max(
+        5, min(120, int(refresh_seconds or 20))
+    )
+
+
+def record_selector_recovery_attempt(
+    cursor: dict,
+    *,
+    symbol: str,
+    attempt_number: int,
+    expiration: str | None,
+    result_reason: str,
+    transient: bool,
+    provider_timestamp=None,
+    now=None,
+) -> dict:
+    out = dict(cursor or {})
+    records = dict(out.get("attempted_symbols") or {})
+    key = "".join(str(symbol or "").upper().split())
+    if key:
+        records.pop(key, None)
+        records[key] = {
+            "attempt_number": max(1, int(attempt_number or 1)),
+            "expiration": str(expiration or ""),
+            "result_reason": str(result_reason or ""),
+            "attempted_at": _utc_iso(now),
+            "provider_timestamp": provider_timestamp,
+            "transient": bool(transient),
+        }
+    out["attempted_symbols"] = dict(list(records.items())[-_CURSOR_MAX_SYMBOLS:])
+    if expiration:
+        expirations = list(out.get("expirations_probed") or [])
+        if str(expiration) not in expirations:
+            expirations.append(str(expiration))
+        out["expirations_probed"] = expirations[-_CURSOR_MAX_EXPIRATIONS:]
+        ranked = dict(out.get("last_ranked_index_by_expiration") or {})
+        ranked[str(expiration)] = int(ranked.get(str(expiration), 0) or 0) + 1
+        out["last_ranked_index_by_expiration"] = dict(
+            list(ranked.items())[-_CURSOR_MAX_EXPIRATIONS:]
+        )
+    out["selector_attempt_count"] = max(
+        int(out.get("selector_attempt_count") or 0),
+        max(1, int(attempt_number or 1)),
+    )
+    out["updated_at"] = _utc_iso(now)
+    return out
+
+
+def record_selector_structural_skip(
+    cursor: dict,
+    *,
+    symbol: str,
+    skip_reason: str,
+    now=None,
+) -> dict:
+    out = dict(cursor or {})
+    records = dict(out.get("structurally_skipped_symbols") or {})
+    key = "".join(str(symbol or "").upper().split())
+    if key:
+        records.pop(key, None)
+        records[key] = {
+            "skip_reason": str(skip_reason or ""),
+            "observed_at": _utc_iso(now),
+        }
+    out["structurally_skipped_symbols"] = dict(
+        list(records.items())[-_CURSOR_MAX_SYMBOLS:]
+    )
+    out["updated_at"] = _utc_iso(now)
+    return out
+
+
+def resolve_selector_recovery_final_reason(evidence: dict) -> str:
+    """Resolve the truthful terminal reason without side effects."""
+    data = evidence if isinstance(evidence, dict) else {}
+    market_outcome = str(data.get("market_truth_outcome") or "").upper()
+    market_reason = str(data.get("market_truth_reason") or "").strip()
+    if market_outcome == "TERMINAL_SETUP_COMPLETE":
+        return market_reason or "MARKET_SETUP_INVALIDATED"
+    if market_reason == "MARKET_SETUP_INVALIDATED":
+        return market_reason
+
+    quality = data.get("quality_rejections")
+    quality = quality if isinstance(quality, dict) else {}
+    attempted = data.get("attempted_results")
+    attempted = attempted if isinstance(attempted, dict) else {}
+    skipped = data.get("structural_skip_results")
+    skipped = skipped if isinstance(skipped, dict) else {}
+
+    terminal_policy = next(
+        (reason for reason in quality if get_policy(reason).classification == TERMINAL_POLICY),
+        None,
+    )
+    if terminal_policy:
+        return terminal_policy
+    eligible = list(data.get("eligible_unattempted_symbols") or [])
+    if (
+        bool(data.get("actual_limit_reached"))
+        and bool(data.get("budget_exhausted_stage"))
+        and eligible
+    ):
+        return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    for reason in ("NO_AFFORDABLE_CONTRACT", "PREMIUM_CAP_EXCEEDED"):
+        if reason in quality or reason in skipped.values():
+            return reason
+    structural_values = set(skipped.values())
+    for structural, canonical in (
+        ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
+        ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
+        ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
+        ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
+        ("STRUCTURAL_PREMIUM_CAP_EXCEEDED", "PREMIUM_CAP_EXCEEDED"),
+        ("STRUCTURAL_CLEARLY_UNAFFORDABLE", "NO_AFFORDABLE_CONTRACT"),
+    ):
+        if structural in structural_values:
+            return canonical
+    terminal_quality = next(
+        (reason for reason in quality if get_policy(reason).classification == TERMINAL_QUALITY),
+        None,
+    )
+    if terminal_quality:
+        return terminal_quality
+
+    transient_counts: dict[str, int] = {}
+    for record in attempted.values():
+        if isinstance(record, dict):
+            reason = str(record.get("result_reason") or "")
+        else:
+            reason = str(record or "")
+        if reason and get_policy(reason).classification == RETRYABLE_DATA:
+            transient_counts[reason] = transient_counts.get(reason, 0) + 1
+    if transient_counts:
+        return sorted(transient_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    retryable_quality = [
+        (str(reason), int(count or 0))
+        for reason, count in quality.items()
+        if get_policy(str(reason)).classification == RETRYABLE_DATA
+    ]
+    if retryable_quality:
+        return sorted(retryable_quality, key=lambda item: (-item[1], item[0]))[0][0]
+    return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
