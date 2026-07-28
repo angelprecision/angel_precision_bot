@@ -1072,8 +1072,19 @@ def _persist_watching_deferral(
          ONLY WATCHING authority and callers invoke it BEFORE any terminalization,
          so no terminal state is ever overwritten.
 
-    Returns True iff the queue row ended WATCHING; False iff it ended ERROR (or
-    the deferral was refused because a required identity/mode was invalid).
+    Returns True iff the queue row ended WATCHING (TRANSITIONED or ALREADY_WATCHING).
+    Returns False for any of the following outcomes — the specific failure is logged:
+
+      * Signal-persistence failure or unverifiable write → queue marked ERROR.
+      * Invalid client, mode, or signal identity → queue marked ERROR.
+      * WATCHING_CAS_TERMINAL → queue row left untouched (terminal state is
+        authoritative); signal revert attempted.
+      * WATCHING_CAS_MISSING_OR_UNEXPECTED or WATCHING_CAS_DB_ERROR → queue row
+        not blindly overwritten (current state was not confirmed as PROCESSING);
+        signal revert attempted.
+
+    In the TERMINAL / MISSING_OR_UNEXPECTED / DB_ERROR cases the queue row is
+    never forced to ERROR — only signal compensation is attempted.
     """
     _fail = failure_error or WATCHING_SIGNAL_PERSISTENCE_FAILED
 
