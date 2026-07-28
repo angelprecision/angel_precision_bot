@@ -60,7 +60,11 @@ def _occ(strike: float, side="CALL", days=2, **extra):
 
 def test_new_bounded_defaults(monkeypatch):
     _clear_capacity_env(monkeypatch)
-    ctx = _new_selector_request_context("SPY", "live")
+    ctx = _new_selector_request_context(
+        "SPY",
+        "live",
+        selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+    )
 
     assert ctx.effective_direct_quote_limit == 40
     assert ctx.max_total_elapsed_ms == 25_000
@@ -68,6 +72,22 @@ def test_new_bounded_defaults(monkeypatch):
     assert ctx.max_chain_calls == 8
     assert _positive_int_env_config("MAX_BREACH_SELECTOR_RETRIES", 5) == 5
     assert _positive_int_env_config("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8) == 8
+
+
+def test_ordinary_request_retains_pre_pr_capacity_even_when_recovery_env_is_40(
+    monkeypatch,
+):
+    _clear_capacity_env(monkeypatch)
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "40")
+    monkeypatch.setenv("SELECTOR_MAX_TOTAL_ELAPSED_MS", "25000")
+    monkeypatch.setenv("SELECTOR_MAX_EXPIRATION_CALLS", "3")
+    monkeypatch.setenv("SELECTOR_MAX_CHAIN_CALLS", "8")
+    ctx = _new_selector_request_context("SPY", "live")
+    assert ctx.selector_request_kind == SELECTOR_REQUEST_KIND_ORDINARY
+    assert ctx.effective_direct_quote_limit == 20
+    assert ctx.max_total_elapsed_ms == 15_000
+    assert ctx.max_expiration_calls == 2
+    assert ctx.max_chain_calls == 6
 
 
 @pytest.mark.parametrize("raw", ["abc", "0", "-7"])
@@ -213,3 +233,19 @@ def test_affordability_headroom_allows_small_chain_ask_overage():
         selector_budget=175.0,
         request_context=ctx,
     ) is None
+
+
+def test_ordinary_request_never_uses_recovery_structural_prefilter():
+    ctx = _new_selector_request_context("SPY", "live")
+    row = _occ(101.0, ask=38.50)
+    assert _structural_direct_quote_skip(
+        _engine(),
+        row,
+        direction="CALL",
+        ticker="SPY",
+        underlying_price=100.0,
+        today=date.today(),
+        selector_budget=175.0,
+        request_context=ctx,
+    ) is None
+    assert ctx.structural_skips == []

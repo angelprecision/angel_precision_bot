@@ -659,6 +659,10 @@ _CURSOR_MAX_SYMBOLS = 200
 _CURSOR_MAX_EXPIRATIONS = 10
 
 
+class SelectorRecoveryOwnershipLost(RuntimeError):
+    """The exact order-owner CAS no longer authorizes selector continuation."""
+
+
 def _utc_iso(now=None) -> str:
     value = now or datetime.now(timezone.utc)
     if value.tzinfo is None:
@@ -889,13 +893,6 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     )
     if terminal_policy:
         return terminal_policy
-    eligible = list(data.get("eligible_unattempted_symbols") or [])
-    if (
-        bool(data.get("actual_limit_reached"))
-        and bool(data.get("budget_exhausted_stage"))
-        and eligible
-    ):
-        return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
     for reason in ("NO_AFFORDABLE_CONTRACT", "PREMIUM_CAP_EXCEEDED"):
         if reason in quality or reason in skipped.values():
             return reason
@@ -916,6 +913,13 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     )
     if terminal_quality:
         return terminal_quality
+    eligible = list(data.get("eligible_unattempted_symbols") or [])
+    if (
+        bool(data.get("actual_limit_reached"))
+        and bool(data.get("budget_exhausted_stage"))
+        and eligible
+    ):
+        return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
 
     transient_counts: dict[str, int] = {}
     for record in attempted.values():

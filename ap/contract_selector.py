@@ -169,10 +169,10 @@ class SelectorRequestContext:
     legacy_fallback_used: bool = False
     execution_mode: str = "unknown"
     selector_request_kind: str = "ORDINARY"
-    max_expiration_calls: int = 3
-    max_chain_calls: int = 8
-    max_direct_quote_calls: int = 40
-    effective_direct_quote_limit: int = 40
+    max_expiration_calls: int = 2
+    max_chain_calls: int = 6
+    max_direct_quote_calls: int = 20
+    effective_direct_quote_limit: int = 20
     direct_quote_budget_source: str = "default"
     direct_quote_budget_conflict: bool = False
     direct_quote_budget_conflict_detail: str | None = None
@@ -192,7 +192,7 @@ class SelectorRequestContext:
     direct_quote_unattempted_set: set[str] = field(default_factory=set)
     direct_quote_unattempted_count: int = 0
     direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
-    max_total_elapsed_ms: int = 25000
+    max_total_elapsed_ms: int = 15000
     budget_exhausted_stage: str | None = None
     budget_exhausted_detail: str | None = None
     expiration_http_status: int | None = None
@@ -712,20 +712,36 @@ def _new_selector_request_context(
     recovery_cursor: dict | None = None,
     recovery_cursor_persist=None,
 ) -> SelectorRequestContext:
+    request_kind = str(
+        selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY
+    ).strip().upper()
+    deferred_recovery = request_kind == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
     budget_cfg = _resolve_direct_quote_budget_config()
+    # PR #401 recovery capacity is explicit deferred-breach behavior.  Ordinary
+    # selection retains the pre-PR production envelope even when deployment
+    # aligns the canonical recovery variable to 40.
+    effective_direct_quote_limit = (
+        budget_cfg.effective_limit if deferred_recovery else 20
+    )
     context = SelectorRequestContext(
         ticker=str(ticker or ""),
-        direct_quote_attempts_remaining=budget_cfg.effective_limit,
+        direct_quote_attempts_remaining=effective_direct_quote_limit,
         started_at_monotonic=time.monotonic(),
         execution_mode=str(execution_mode or "unknown").lower(),
-        selector_request_kind=str(
-            selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY
-        ).strip().upper(),
-        max_expiration_calls=_positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 3),
-        max_chain_calls=_positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 8),
-        max_direct_quote_calls=budget_cfg.effective_limit,
-        effective_direct_quote_limit=budget_cfg.effective_limit,
-        direct_quote_budget_source=budget_cfg.source,
+        selector_request_kind=request_kind,
+        max_expiration_calls=(
+            _positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 3)
+            if deferred_recovery else 2
+        ),
+        max_chain_calls=(
+            _positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 8)
+            if deferred_recovery else 6
+        ),
+        max_direct_quote_calls=effective_direct_quote_limit,
+        effective_direct_quote_limit=effective_direct_quote_limit,
+        direct_quote_budget_source=(
+            budget_cfg.source if deferred_recovery else "ordinary_pre_pr_envelope"
+        ),
         direct_quote_budget_conflict=budget_cfg.conflict,
         direct_quote_budget_conflict_detail=budget_cfg.conflict_detail,
         configured_selector_max_direct_quote_calls=(
@@ -737,7 +753,10 @@ def _new_selector_request_context(
         configured_contract_revalidate_top_n=(
             int(budget_cfg.contract_revalidate_raw) if budget_cfg.contract_revalidate_raw and budget_cfg.contract_revalidate_raw.isdigit() else None
         ),
-        max_total_elapsed_ms=_positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 25000),
+        max_total_elapsed_ms=(
+            _positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 25000)
+            if deferred_recovery else 15000
+        ),
         recovery_attempt_number=max(1, int(recovery_attempt_number or 1)),
         recovery_cursor=dict(recovery_cursor or {}) if recovery_cursor else None,
         recovery_cursor_persist=recovery_cursor_persist,
@@ -1146,6 +1165,12 @@ def _structural_direct_quote_skip(
     request_context: SelectorRequestContext | None,
 ) -> dict | None:
     """Return a diagnostic when known chain facts make a provider call futile."""
+    if (
+        request_context is None
+        or str(request_context.selector_request_kind).strip().upper()
+        != SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+    ):
+        return None
     direction_norm = str(direction or "").strip().upper()
     if direction_norm.startswith("C"):
         direction_norm = "CALL"
@@ -1232,6 +1257,9 @@ def _structural_direct_quote_skip(
             if callable(callback):
                 callback(symbol=symbol, structural_skip_reason=reason)
         except Exception as exc:
+            from ap.selector_retry_policy import SelectorRecoveryOwnershipLost
+            if isinstance(exc, SelectorRecoveryOwnershipLost):
+                raise
             log.warning(
                 "selector recovery structural cursor persist failed symbol=%s err=%s",
                 symbol,

@@ -317,6 +317,9 @@ def _ctx_persist_attempt(
             provider_timestamp=provider_timestamp,
         )
     except Exception as exc:
+        from ap.selector_retry_policy import SelectorRecoveryOwnershipLost
+        if isinstance(exc, SelectorRecoveryOwnershipLost):
+            raise
         # Cursor serialization/persistence may never bypass selector safety or
         # block terminal cleanup.  The caller keeps the in-memory duplicate
         # fence even when the durable write is temporarily unavailable.

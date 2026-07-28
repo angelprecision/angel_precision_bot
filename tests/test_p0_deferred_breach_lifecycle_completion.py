@@ -180,6 +180,8 @@ def test_retry_wait_is_durable_and_releases_materializer_claim(db_spy):
         max_attempts=3,
         next_retry_at=due,
         selector_failure={"provider_status": 503},
+        signal_id="signal-1",
+        execution_mode="live",
     ) is True
     patch = json.loads(sink[-1][1][0])
     assert patch["lifecycle_state"] == "RETRY_WAIT"

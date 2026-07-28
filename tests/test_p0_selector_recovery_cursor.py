@@ -20,6 +20,7 @@ from ap.selector_retry_policy import (
     record_selector_structural_skip,
     selector_symbol_may_retry,
 )
+from ap_execution_core import _selector_cursor_retry_block_reason
 
 
 IDENTITY = {
@@ -204,3 +205,41 @@ def test_recovery_context_does_not_inherit_across_clients():
     fresh, error = _load(cursor, client_id="different")
     assert error == "IDENTITY_MISMATCH:client_id"
     assert fresh["attempted_symbols"] == {}
+
+
+@pytest.mark.parametrize(
+    ("candidate", "load_reason", "expected"),
+    [
+        (None, None, "MISSING_CURSOR_ON_RETRY"),
+        ("bad", "MALFORMED_CURSOR", "MALFORMED_CURSOR"),
+        ({}, "IDENTITY_MISMATCH:client_id", "IDENTITY_MISMATCH:client_id"),
+        (
+            {},
+            "IDENTITY_MISMATCH:materialization_generation",
+            "IDENTITY_MISMATCH:materialization_generation",
+        ),
+    ],
+)
+def test_retry_cursor_failure_blocks_before_selector(
+    candidate, load_reason, expected
+):
+    selector_calls = 0
+    reason = _selector_cursor_retry_block_reason(
+        cursor_enabled=True,
+        selector_attempt_number=2,
+        cursor_candidate=candidate,
+        cursor_load_reason=load_reason,
+    )
+    if reason is None:
+        selector_calls += 1
+    assert reason == expected
+    assert selector_calls == 0
+
+
+def test_cursor_kill_switch_allows_fresh_retry_without_cursor():
+    assert _selector_cursor_retry_block_reason(
+        cursor_enabled=False,
+        selector_attempt_number=2,
+        cursor_candidate=None,
+        cursor_load_reason=None,
+    ) is None

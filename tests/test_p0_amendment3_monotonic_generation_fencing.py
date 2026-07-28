@@ -292,6 +292,8 @@ def test_stale_owner_retry_schedule_blocked_by_generation_cas(db_spy):
         max_attempts=3,
         next_retry_at=(datetime.now(timezone.utc) + timedelta(seconds=20)).isoformat(),
         selector_failure={},
+        signal_id="signal-1",
+        execution_mode="live",
     ) is False
     sql, params = sink[-1]
     assert "COALESCE((meta->>'materialization_generation')::int, 0) = %s" in sql

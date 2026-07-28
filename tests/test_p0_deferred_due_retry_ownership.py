@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 # PR #389 amendment: ap.order_state_machine imports ap.db which requires a
 # DATABASE_URL at import time. Test 11d exercises the real OSM seam so the
@@ -955,6 +956,8 @@ def test_11d_generic_retry_promotes_data_unavailable_and_rejects_contradiction(
         max_attempts=5,
         next_retry_at=due,
         selector_failure={"provider_status": 504},
+        signal_id="signal-data",
+        execution_mode="live",
     ) is True
     patch = json.loads(sink[-1][1][0])
     assert patch["materialization_outcome"] == "RETRY_LATER_DATA_UNAVAILABLE"
@@ -976,6 +979,8 @@ def test_11d_generic_retry_promotes_data_unavailable_and_rejects_contradiction(
             "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
             "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
         },
+        signal_id="signal-contradictory",
+        execution_mode="live",
     ) is False
     assert len(sink) == prior_writes
 
@@ -1146,6 +1151,8 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
             max_attempts=5,
             next_retry_at=next_retry_at,
             selector_failure=selector_meta,
+            signal_id=signal_id,
+            execution_mode="live",
         ) is True
 
         row = osm.get_order(local_order_id)
@@ -1565,7 +1572,20 @@ def test_11e_startup_loader_overlap_runs_one_real_selector_request(monkeypatch):
             }},
             "max_position_usd": 2000.0,
         }
-        selected = selector.select(plan)
+        from ap.contract_selector import (
+            SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+            _new_selector_request_context,
+        )
+        selected = selector.select(
+            plan,
+            request_context=_new_selector_request_context(
+                "BAC",
+                "live",
+                selector_request_kind=(
+                    SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+                ),
+            ),
+        )
         assert selected is not None
         selector_requests.append(plan["metadata"]["selector_request_diagnostics"])
         with osm.lock:
@@ -1789,6 +1809,19 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_selector_failure": {
             "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
         },
+        "selector_recovery_cursor_v1": {
+            "version": 1,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "signal_id": SIGNAL_ID,
+            "materialization_generation": 1,
+            "selector_attempt_count": 1,
+            "attempted_symbols": {},
+            "structurally_skipped_symbols": {},
+            "expirations_probed": [],
+            "last_ranked_index_by_expiration": {},
+        },
     }
     before_row = {
         "local_order_id": LOCAL_ORDER_ID,
@@ -1852,6 +1885,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     claim_call_count = [0]
     copyback_calls = []
     submit_calls = []
+    cursor_persist_calls = []
 
     class _OSM:
         client_id = CLIENT_ID
@@ -1869,6 +1903,14 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
         def update_order_meta(self, oid, patch):
             self.row.setdefault("meta", {}).update(patch)
+            return True
+
+        def persist_selector_recovery_cursor(self, oid, **kw):
+            cursor_persist_calls.append(kw["cursor"])
+            time.sleep(0.01)
+            self.row.setdefault("meta", {})[
+                "selector_recovery_cursor_v1"
+            ] = kw["cursor"]
             return True
 
         def schedule_deferred_materialization_retry(self, oid, **kw):
@@ -1919,16 +1961,25 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     class _FakeSelector:
         select_count = 0
         data_broker = SimpleNamespace(
+            base_url="https://api.tradier.com/v1",
+            cfg=SimpleNamespace(base_url="https://api.tradier.com/v1"),
             get_quote=lambda _symbol: {
                 "bid": 130.20,
                 "ask": 130.30,
-                "quote_age_ms": 0,
-                "source": "approved_selector_data_broker",
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "tradier_live",
             }
         )
 
         def select(self, plan, **_kwargs):
             _FakeSelector.select_count += 1
+            request_context = _kwargs["request_context"]
+            for index in range(12):
+                request_context.recovery_cursor_persist(
+                    symbol=f"RTX260117C{130000 + index:08d}",
+                    result_reason="DIRECT_QUOTE_ZERO_BID_ASK",
+                    transient=True,
+                )
             return SimpleNamespace(
                 contract_symbol="RTX260117C00130000",
                 limit_price=2.10,
@@ -1997,12 +2048,14 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     core.intelligence_context.is_enabled.return_value = False
 
     owner_label = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3"
+    started = time.perf_counter()
     result = core.resume_deferred_materialization_retry(
         local_order_id=LOCAL_ORDER_ID,
         expected_generation=1,
         expected_retry_attempt=2,
         owner=owner_label,
     )
+    selector_elapsed = time.perf_counter() - started
 
     # ── Assertions ────────────────────────────────────────────────────
     # CORE INVARIANT: claim must be called exactly once
@@ -2014,6 +2067,11 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
     )
+    # One market-truth checkpoint + two five-candidate batches + one final
+    # two-candidate flush. Without batching this fixture would perform 13
+    # synchronous writes and spend at least 130ms in the simulated DB.
+    assert len(cursor_persist_calls) == 4
+    assert selector_elapsed < 0.12
     assert copyback_calls, "validated retry selection must reach durable copyback"
     assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
     assert float(copyback_calls[-1]["limit_price"]) > 0.01

@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlparse
 
 from ap.logger import get_logger
 
@@ -138,6 +139,92 @@ class MarketTruthAuthority(str, Enum):
     REARM_DIRECTION_REVERSAL = "REARM_DIRECTION_REVERSAL"
     HOLD_MARKET_TRUTH_UNAVAILABLE = "HOLD_MARKET_TRUTH_UNAVAILABLE"
     TERMINAL_SETUP_COMPLETE = "TERMINAL_SETUP_COMPLETE"
+
+
+def validate_retry_market_quote_authority(
+    quote: object,
+    *,
+    transport: object,
+    now: Optional[datetime] = None,
+    max_age_ms: int = 5000,
+    max_future_skew_ms: int = 1000,
+) -> dict:
+    """Prove an approved LIVE Tradier observation and provider timestamp."""
+    if not isinstance(quote, dict):
+        return {"valid": False, "reason": "MARKET_QUOTE_INVALID_PAYLOAD"}
+    cfg = getattr(transport, "cfg", None)
+    base_url = str(
+        getattr(cfg, "base_url", None)
+        or getattr(transport, "base_url", None)
+        or ""
+    ).strip()
+    parsed = urlparse(base_url)
+    if parsed.scheme.lower() != "https" or parsed.hostname != "api.tradier.com":
+        return {
+            "valid": False,
+            "reason": "MARKET_QUOTE_UNAPPROVED_TRANSPORT",
+            "transport_url": base_url or None,
+        }
+    raw_source = str(
+        quote.get("source")
+        or quote.get("quote_source")
+        or quote.get("provider")
+        or ""
+    ).strip().lower()
+    if raw_source not in {"tradier", "tradier_live", "api.tradier.com"}:
+        return {
+            "valid": False,
+            "reason": "MARKET_QUOTE_SOURCE_UNPROVEN",
+            "quote_source": raw_source or None,
+        }
+    raw_timestamp = (
+        quote.get("provider_timestamp")
+        or quote.get("quote_timestamp")
+        or quote.get("timestamp")
+        or quote.get("ask_date")
+        or quote.get("bid_date")
+        or quote.get("trade_date")
+    )
+    try:
+        if isinstance(raw_timestamp, datetime):
+            observed = raw_timestamp
+        elif isinstance(raw_timestamp, (int, float)):
+            numeric = float(raw_timestamp)
+            if numeric > 10_000_000_000:
+                numeric /= 1000.0
+            observed = datetime.fromtimestamp(numeric, tz=timezone.utc)
+        else:
+            observed = datetime.fromisoformat(
+                str(raw_timestamp).strip().replace("Z", "+00:00")
+            )
+        if observed.tzinfo is None:
+            raise ValueError("provider timestamp missing timezone")
+        observed = observed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return {"valid": False, "reason": "MARKET_QUOTE_TIMESTAMP_UNPROVEN"}
+    current = (now or _now_utc()).astimezone(timezone.utc)
+    age_ms = (current - observed).total_seconds() * 1000.0
+    if not math.isfinite(age_ms) or age_ms < -float(max_future_skew_ms):
+        return {
+            "valid": False,
+            "reason": "MARKET_QUOTE_TIMESTAMP_FUTURE",
+            "provider_timestamp": observed.isoformat(),
+        }
+    if age_ms > float(max_age_ms):
+        return {
+            "valid": False,
+            "reason": "MARKET_QUOTE_STALE",
+            "provider_timestamp": observed.isoformat(),
+            "quote_age_ms": age_ms,
+        }
+    return {
+        "valid": True,
+        "reason": "MARKET_QUOTE_AUTHORITY_PROVEN",
+        "provider_timestamp": observed.isoformat(),
+        "quote_age_ms": max(0.0, age_ms),
+        "quote_source": raw_source,
+        "transport_url": base_url,
+    }
 
 
 def classify_market_truth(result: GateResult) -> MarketTruthAuthority:

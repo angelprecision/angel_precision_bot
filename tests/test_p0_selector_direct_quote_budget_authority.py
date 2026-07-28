@@ -578,7 +578,7 @@ class TestSelectorIntegration:
         assert broker.cancel_order.call_count == 0
         diagnostics = plan["metadata"]["selector_request_diagnostics"]
         assert diagnostics["direct_quote_budget"]["effective_limit"] == 20
-        assert diagnostics["direct_quote_budget"]["source"] == "SELECTOR_MAX_DIRECT_QUOTE_CALLS"
+        assert diagnostics["direct_quote_budget"]["source"] == "ordinary_pre_pr_envelope"
         assert diagnostics["direct_quote_budget"]["conflict"] is True
         assert diagnostics["direct_quote_budget"]["direct_recovery_alias"] == 8
         assert diagnostics["direct_quote_budget"]["used"] == broker.get_quote.call_count
@@ -597,13 +597,13 @@ class TestSelectorIntegration:
         )
 
         assert selected is None
-        assert broker.get_quote.call_count == 9
+        assert broker.get_quote.call_count == 20
         failure = plan["metadata"]["selector_failure"]
         diagnostics = failure["selection_diagnostics"]
-        assert failure["reason_code"] == "MONEYNESS_OUT_OF_RANGE"
-        assert diagnostics["direct_quote_unattempted_count"] == 0
-        assert diagnostics["direct_quote_budget"]["used"] == 9
-        assert diagnostics["direct_quote_budget"]["remaining"] == 11
+        assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert diagnostics["direct_quote_unattempted_count"] > 0
+        assert diagnostics["direct_quote_budget"]["used"] == 20
+        assert diagnostics["direct_quote_budget"]["remaining"] == 0
         assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
         assert "SELECTOR_REQUEST_BUDGET_EXHAUSTED" not in failure["top_reject_buckets"]
 
@@ -700,9 +700,9 @@ class TestSelectorIntegration:
         )
 
         assert selected is None, name
-        assert broker.get_quote.call_count == (
-            0 if name in {"delta_out_of_range", "moneyness_out_of_range"} else 1
-        )
+        # This helper intentionally exercises the ordinary selector path.
+        # Recovery-only structural skips must not suppress its direct quote.
+        assert broker.get_quote.call_count == 1
         failure = plan["metadata"]["selector_failure"]
         assert failure["reason_code"] == expected_reason
         assert broker.submit_order.call_count == 0
@@ -795,7 +795,15 @@ class TestAggregateAuditTruthfulness:
             min_volume=0,
         )
         plan = _plan("CALL")
-        selected = selector.select(plan)
+        from ap.contract_selector import SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+        selected = selector.select(
+            plan,
+            request_context=_new_selector_request_context(
+                "SPY",
+                "live",
+                selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+            ),
+        )
 
         assert selected is not None
         assert selected.contract_symbol == first_symbol
@@ -1044,7 +1052,16 @@ class TestJuly23FleetAcceptanceReplay:
             min_oi=1,
             min_volume=0,
         )
-        selected = selector.select(plan)
+        from ap.contract_selector import SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+        selected = selector.select(
+            plan,
+            request_context=_new_selector_request_context(
+                ticker,
+                execution_mode,
+                selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+                recovery_attempt_number=attempt,
+            ),
+        )
         return selected, broker, plan, fixture, ranked_symbols
 
     def test_24_requests_each_exhaust_independent_selector_budget(

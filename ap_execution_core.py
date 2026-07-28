@@ -509,6 +509,21 @@ def _positive_int_env_config(name: str, default: int) -> int:
     return value
 
 
+def _selector_cursor_retry_block_reason(
+    *,
+    cursor_enabled: bool,
+    selector_attempt_number: int,
+    cursor_candidate,
+    cursor_load_reason: str | None,
+) -> str | None:
+    """Return the stable fail-closed reason before any retry selector call."""
+    if not cursor_enabled or int(selector_attempt_number or 1) <= 1:
+        return None
+    if cursor_candidate in (None, ""):
+        return "MISSING_CURSOR_ON_RETRY"
+    return str(cursor_load_reason) if cursor_load_reason else None
+
+
 def _breach_retry_cutoff_hhmm() -> int:
     """
     HHMM (ET) after which NO new deferred-breach selector retries may be
@@ -2622,6 +2637,8 @@ class APExecutionCore:
                             **(selector_failure or {}),
                             **_schedule_meta,
                         },
+                        signal_id=signal_id,
+                        execution_mode=row_mode,
                     ))
                 except Exception as _sch_exc:
                     log.critical(
@@ -4149,6 +4166,7 @@ class APExecutionCore:
                     _new_selector_request_context,
                 )
                 from ap.selector_retry_policy import (
+                    SelectorRecoveryOwnershipLost,
                     load_selector_recovery_cursor,
                     record_selector_recovery_attempt,
                     record_selector_structural_skip,
@@ -4198,6 +4216,65 @@ class APExecutionCore:
                         allow_previous_generation=bool(_recovery_pre_claimed),
                     )
                 )
+                _cursor_failure_reason = _selector_cursor_retry_block_reason(
+                    cursor_enabled=_cursor_enabled,
+                    selector_attempt_number=_selector_attempt_number,
+                    cursor_candidate=_cursor_candidate,
+                    cursor_load_reason=_cursor_load_reason,
+                )
+                if _cursor_failure_reason:
+                    _terminalize_deferred_breach_failure(
+                        f"SELECTOR_RECOVERY_CURSOR_INVALID:{_cursor_failure_reason}",
+                        extra_meta={
+                            "selector_recovery_cursor_load_reason": (
+                                _cursor_failure_reason
+                            ),
+                            "selector_calls": 0,
+                            "direct_quote_calls": 0,
+                            "broker_post_count": 0,
+                        },
+                    )
+                    return {
+                        "disposition": "TERMINAL_DURABLE",
+                        "reason_code": (
+                            f"SELECTOR_RECOVERY_CURSOR_INVALID:"
+                            f"{_cursor_failure_reason}"
+                        ),
+                    }
+
+                _cursor_pending_updates = 0
+
+                def _flush_selector_cursor(*, force: bool = False) -> bool:
+                    nonlocal _cursor_pending_updates
+                    if not _cursor_enabled or _cursor_pending_updates <= 0:
+                        return True
+                    if not force and _cursor_pending_updates < 5:
+                        return True
+                    _persist_cursor = getattr(
+                        self.order_state_machine,
+                        "persist_selector_recovery_cursor",
+                        None,
+                    )
+                    if not callable(_persist_cursor):
+                        raise SelectorRecoveryOwnershipLost(
+                            "cursor persistence authority unavailable"
+                        )
+                    persisted = bool(_persist_cursor(
+                        str(queue_local_order_id or ""),
+                        owner=_mat_owner,
+                        generation=_mat_generation,
+                        signal_id=str(
+                            getattr(approved_plan, "signal_id", "") or ""
+                        ),
+                        execution_mode=_mat_exec_mode,
+                        cursor=_selector_recovery_cursor,
+                    ))
+                    if not persisted:
+                        raise SelectorRecoveryOwnershipLost(
+                            "cursor exact-owner CAS missed"
+                        )
+                    _cursor_pending_updates = 0
+                    return True
 
                 def _persist_selector_cursor_progress(
                     *,
@@ -4207,7 +4284,7 @@ class APExecutionCore:
                     provider_timestamp=None,
                     structural_skip_reason: str = "",
                 ) -> None:
-                    nonlocal _selector_recovery_cursor
+                    nonlocal _selector_recovery_cursor, _cursor_pending_updates
                     if not _cursor_enabled:
                         return
                     if structural_skip_reason:
@@ -4250,22 +4327,8 @@ class APExecutionCore:
                             ticker,
                             _cursor_bind_exc,
                         )
-                    _persist_cursor = getattr(
-                        self.order_state_machine,
-                        "persist_selector_recovery_cursor",
-                        None,
-                    )
-                    if callable(_persist_cursor):
-                        _persist_cursor(
-                            str(queue_local_order_id or ""),
-                            owner=_mat_owner,
-                            generation=_mat_generation,
-                            signal_id=str(
-                                getattr(approved_plan, "signal_id", "") or ""
-                            ),
-                            execution_mode=_mat_exec_mode,
-                            cursor=_selector_recovery_cursor,
-                        )
+                    _cursor_pending_updates += 1
+                    _flush_selector_cursor()
 
                 _selector_request_context = _new_selector_request_context(
                     ticker,
@@ -4285,6 +4348,7 @@ class APExecutionCore:
                         MarketTruthAuthority,
                         check_market_validity_gate,
                         classify_market_truth,
+                        validate_retry_market_quote_authority,
                     )
 
                     _truth_bid = _truth_ask = _truth_age = _truth_source = None
@@ -4302,20 +4366,30 @@ class APExecutionCore:
                                 "selector data broker has no get_quote"
                             )
                         _truth_quote = _truth_transport.get_quote(ticker)
-                        _truth_fetched_at = datetime.now(timezone.utc).isoformat()
                         if not isinstance(_truth_quote, dict):
                             raise RuntimeError(
                                 f"invalid quote type {type(_truth_quote).__name__}"
                             )
+                        _truth_authority_proof = (
+                            validate_retry_market_quote_authority(
+                                _truth_quote,
+                                transport=_truth_transport,
+                            )
+                        )
+                        if not _truth_authority_proof.get("valid"):
+                            raise RuntimeError(
+                                str(
+                                    _truth_authority_proof.get("reason")
+                                    or "market quote authority unproven"
+                                )
+                            )
                         _truth_bid = _truth_quote.get("bid")
                         _truth_ask = _truth_quote.get("ask")
-                        _truth_age = _truth_quote.get("quote_age_ms")
-                        _truth_source = (
-                            _truth_quote.get("source")
-                            or _truth_quote.get("quote_source")
-                            or _truth_quote.get("provider")
-                            or "approved_selector_data_broker"
-                        )
+                        _truth_age = _truth_authority_proof["quote_age_ms"]
+                        _truth_source = _truth_authority_proof["quote_source"]
+                        _truth_fetched_at = _truth_authority_proof[
+                            "provider_timestamp"
+                        ]
                         _truth_fetch_failed = False
                         _truth_fetch_error = None
                     except Exception as _truth_exc:
@@ -4346,7 +4420,7 @@ class APExecutionCore:
                         quote_age_ms=_truth_age,
                         quote_source=_truth_source,
                         quote_fetched_at=_truth_fetched_at,
-                        quote_provenance="synchronous_submit_fetch",
+                        quote_provenance="provider_timestamp",
                         quote_fetch_failed=_truth_fetch_failed,
                         quote_fetch_error=_truth_fetch_error,
                         # Retry classification must fail closed identically for
@@ -4361,22 +4435,21 @@ class APExecutionCore:
                         datetime.now(timezone.utc).isoformat()
                     )
                     if _cursor_enabled:
-                        _persist_cursor = getattr(
-                            self.order_state_machine,
-                            "persist_selector_recovery_cursor",
-                            None,
-                        )
-                        if callable(_persist_cursor):
-                            _persist_cursor(
-                                str(queue_local_order_id or ""),
-                                owner=_mat_owner,
-                                generation=_mat_generation,
-                                signal_id=str(
-                                    getattr(approved_plan, "signal_id", "") or ""
-                                ),
-                                execution_mode=_mat_exec_mode,
-                                cursor=_selector_recovery_cursor,
+                        _cursor_pending_updates += 1
+                        try:
+                            _flush_selector_cursor(force=True)
+                        except SelectorRecoveryOwnershipLost as _cursor_lost:
+                            log.critical(
+                                "[%s] SELECTOR_RECOVERY_OWNERSHIP_LOST order=%s "
+                                "stage=market_truth error=%s",
+                                ticker,
+                                queue_local_order_id,
+                                _cursor_lost,
                             )
+                            return {
+                                "disposition": "MATERIALIZATION_OWNERSHIP_LOST",
+                                "reason_code": "SELECTOR_RECOVERY_OWNERSHIP_LOST",
+                            }
                     if (
                         _truth_authority
                         == MarketTruthAuthority.REARM_DIRECTION_REVERSAL
@@ -4411,8 +4484,12 @@ class APExecutionCore:
                         _truth_authority
                         == MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
                     ):
+                        _terminal_market_reason = str(
+                            _truth_result.reason_code
+                            or "MARKET_SETUP_INVALIDATED"
+                        )
                         _terminalize_deferred_breach_failure(
-                            "MARKET_SETUP_INVALIDATED",
+                            _terminal_market_reason,
                             extra_meta={
                                 "final_market_truth": _truth_result.audit,
                                 "final_market_truth_reason": _truth_result.reason_code,
@@ -4422,7 +4499,7 @@ class APExecutionCore:
                         )
                         return {
                             "disposition": "TERMINAL_DURABLE",
-                            "reason_code": "MARKET_SETUP_INVALIDATED",
+                            "reason_code": _terminal_market_reason,
                         }
                     if (
                         _truth_authority
@@ -4484,6 +4561,10 @@ class APExecutionCore:
                                 max_attempts=_max_attempts_truth,
                                 next_retry_at=_truth_next,
                                 selector_failure=_truth_failure,
+                                signal_id=str(
+                                    getattr(approved_plan, "signal_id", "") or ""
+                                ),
+                                execution_mode=_mat_exec_mode,
                                 selector_recovery_cursor=(
                                     _selector_recovery_cursor
                                     if _cursor_enabled
@@ -4532,10 +4613,24 @@ class APExecutionCore:
                             pass
                 except Exception:
                     pass
-                _sel = self.contract_selector.select(
-                    approved_plan,
-                    request_context=_selector_request_context,
-                )
+                try:
+                    _sel = self.contract_selector.select(
+                        approved_plan,
+                        request_context=_selector_request_context,
+                    )
+                    _flush_selector_cursor(force=True)
+                except SelectorRecoveryOwnershipLost as _cursor_lost:
+                    log.critical(
+                        "[%s] SELECTOR_RECOVERY_OWNERSHIP_LOST order=%s "
+                        "stage=selector error=%s",
+                        ticker,
+                        queue_local_order_id,
+                        _cursor_lost,
+                    )
+                    return {
+                        "disposition": "MATERIALIZATION_OWNERSHIP_LOST",
+                        "reason_code": "SELECTOR_RECOVERY_OWNERSHIP_LOST",
+                    }
                 (
                     _sel_result_valid,
                     _sel_contract,
@@ -5029,6 +5124,10 @@ class APExecutionCore:
                                         if _cursor_enabled
                                         else None
                                     ),
+                                    signal_id=str(
+                                        getattr(approved_plan, "signal_id", "") or ""
+                                    ),
+                                    execution_mode=_mat_exec_mode,
                                 ))
                             except Exception as _schedule_exc:
                                 log.critical(

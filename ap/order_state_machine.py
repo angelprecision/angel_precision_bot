@@ -2650,6 +2650,8 @@ class APOrderStateMachine:
         next_retry_at: str,
         selector_failure: dict,
         selector_recovery_cursor: dict | None = None,
+        signal_id: str = "",
+        execution_mode: str = "",
     ) -> bool:
         """Durably transfer a fenced materializer claim to retry ownership."""
         import json as _json_local
@@ -2659,6 +2661,12 @@ class APOrderStateMachine:
         _selector_failure = (
             dict(selector_failure) if isinstance(selector_failure, dict) else {}
         )
+        _signal_id = str(
+            signal_id or _selector_failure.get("signal_id") or ""
+        ).strip()
+        _execution_mode = str(
+            execution_mode or _selector_failure.get("execution_mode") or ""
+        ).strip().lower()
         _expected_outcome = (
             "RETRY_LATER_SELECTOR_BUDGET"
             if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
@@ -2681,7 +2689,13 @@ class APOrderStateMachine:
             _max_attempts = max(_attempt, int(max_attempts or _attempt))
         except (TypeError, ValueError):
             return False
-        if not _owner or not _reason or not str(next_retry_at or "").strip():
+        if (
+            not _owner
+            or not _reason
+            or not _signal_id
+            or _execution_mode not in {"live", "paper"}
+            or not str(next_retry_at or "").strip()
+        ):
             return False
         if (
             _outcome not in {
@@ -2757,6 +2771,8 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(COALESCE(execution_mode, meta->>'execution_mode','')) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -2765,7 +2781,15 @@ class APOrderStateMachine:
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
                     """,
-                    (_patch_json, local_order_id, self.client_id, _owner, _generation),
+                    (
+                        _patch_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal_id,
+                        _execution_mode,
+                        _owner,
+                        _generation,
+                    ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
