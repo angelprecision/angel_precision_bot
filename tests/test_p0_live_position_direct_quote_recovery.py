@@ -313,6 +313,55 @@ class _PartialOrdinaryBroker:
         return {}
 
 
+class _BidOnlyRecoveryWithDirtySidesBroker:
+    def __init__(self):
+        now = time.time()
+        self.ordinary_ts = now - 3.0
+        self.recovery_bid_ts = now - 1.0
+        self.recovery_side_ts = now - 10.0
+        self.calls = []
+        self.submit_order = MagicMock()
+        self.cancel_order = MagicMock()
+
+    def get_quotes(self, symbols):
+        symbols = list(symbols)
+        self.calls.append(symbols)
+        if len(symbols) == 2:
+            return {
+                OPTION: {
+                    "symbol": OPTION,
+                    "bid": 1.00,
+                    "ask": 1.80,
+                    "last": 0.50,
+                    "mark": 1.40,
+                    "bid_date": self.recovery_bid_ts,
+                    "trade_date": self.recovery_side_ts,
+                }
+            }
+        if symbols == [OPTION]:
+            return {
+                OPTION: {
+                    "symbol": OPTION,
+                    "ask": 1.10,
+                    "mark": 1.05,
+                    "last": 1.04,
+                    "ask_date": self.ordinary_ts,
+                    "mark_ts": self.ordinary_ts,
+                    "trade_date": self.ordinary_ts,
+                    "_ap_receipt_epoch": time.time(),
+                }
+            }
+        if symbols == [UNDERLYING]:
+            return {
+                UNDERLYING: {
+                    "symbol": UNDERLYING,
+                    "last": 550.0,
+                    "trade_date": time.time(),
+                }
+            }
+        return {}
+
+
 def test_missing_live_quote_gets_one_uncached_fetch_and_exact_position_apply():
     position = _position()
     broker = _RecoveryBroker()
@@ -1332,3 +1381,37 @@ def test_applied_option_recovery_wakes_when_underlying_chronology_rejects():
     assert position.current_underlying == 555.0
     assert monitor._metrics["direct_recovery_successes"] == 1
     assert engine.quote_arrived_event.is_set()
+
+
+def test_recovered_bid_preserves_ordinary_option_sides_and_quote_authority():
+    from ap_quote_authority import QUOTES
+
+    broker = _BidOnlyRecoveryWithDirtySidesBroker()
+    position = _position()
+    position.entry_price = 1.00
+    position.entryprice = 1.00
+    monitor, engine = _monitor(position, broker)
+    with QUOTES._quote_lock:
+        QUOTES._quotes.pop(OPTION, None)
+
+    monitor._refresh_once()
+    snapshot = QUOTES.get(OPTION)
+
+    assert position.current_bid == 1.00
+    assert position.last_option_bid_update_ts == (
+        qpm_module.normalize_hard_ref_ts(broker.recovery_bid_ts)
+    )
+    assert position.current_ask == 1.10
+    assert snapshot is not None
+    assert snapshot.bid == 1.00
+    assert snapshot.ask == 1.10
+    assert snapshot.mid == 1.05
+    assert snapshot.last == 1.04
+    assert snapshot.ask != 1.80
+    assert snapshot.last != 0.50
+    assert position.hard_exit_reference_price == 1.00
+    assert position.hard_exit_reference_source == "bid"
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()

@@ -976,8 +976,29 @@ class APPositionQuoteMonitor:
                         # components are suppressed identically to the
                         # recovery-failure branch below.
                         if _apply_opt:
-                            oq = dict(recovery["option_quote"])
-                            oq["bid_ts"] = recovery["option_provider_ts"]
+                            # Recovery proves BID authority only. Preserve the
+                            # ordinary ASK/MARK/LAST values, their individual
+                            # provider timestamps, and receipt metadata. An
+                            # unverified recovery side must not acquire fresh
+                            # QuoteAuthority provenance by travelling with a
+                            # valid recovered BID.
+                            recovery_oq = dict(
+                                recovery["option_quote"]
+                            )
+                            accepted_oq = dict(oq)
+                            accepted_oq["symbol"] = (
+                                accepted_oq.get("symbol")
+                                or recovery_oq.get("symbol")
+                                or c
+                            )
+                            accepted_oq["bid"] = recovery_oq["bid"]
+                            accepted_oq["bid_ts"] = recovery[
+                                "option_provider_ts"
+                            ]
+                            accepted_oq["bid_date"] = recovery[
+                                "option_provider_ts"
+                            ]
+                            oq = accepted_oq
                         elif not option_fresh:
                             # Equal/older provider time is not a new
                             # observation, but it also does not revoke the
