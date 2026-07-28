@@ -889,6 +889,8 @@ class APPositionQuoteMonitor:
                         execution_mode=position_mode,
                         option_symbol=c,
                         underlying_symbol=t,
+                        need_option=not option_fresh,
+                        need_underlying=not underlying_fresh,
                         now_utc=now_utc,
                     )
                     if recovery.get("ok"):
@@ -952,6 +954,18 @@ class APPositionQuoteMonitor:
                         )
                         recovery["apply_recovered_option"] = _apply_opt
                         recovery["apply_recovered_underlying"] = _apply_und
+                        recovery["option_value_accepted"] = bool(
+                            option_fresh or _apply_opt
+                        )
+                        recovery["option_observation_advanced"] = bool(
+                            _apply_opt
+                        )
+                        recovery["underlying_value_accepted"] = bool(
+                            underlying_fresh or _apply_und
+                        )
+                        recovery["underlying_observation_advanced"] = bool(
+                            _apply_und
+                        )
                         recovery["recovery_complete"] = (
                             (option_fresh or _apply_opt)
                             and (underlying_fresh or _apply_und)
@@ -965,11 +979,58 @@ class APPositionQuoteMonitor:
                             oq = dict(recovery["option_quote"])
                             oq["bid_ts"] = recovery["option_provider_ts"]
                         elif not option_fresh:
-                            oq = dict(oq)
-                            oq["bid"] = 0.0
-                            oq.pop("bid_ts", None)
-                            oq.pop("bid_date", None)
-                            oq.pop("bid_timestamp", None)
+                            # Equal/older provider time is not a new
+                            # observation, but it also does not revoke the
+                            # last accepted executable BID while that BID is
+                            # still inside the exit freshness window. Carry
+                            # the accepted value and its original identity;
+                            # downstream confirmation/wake logic consumes the
+                            # explicit observation_advanced flag above.
+                            _prior_bid_ts = _exist_opt_obs
+                            _prior_bid = _safe_float(
+                                _get_attr(
+                                    pos,
+                                    "currentbid",
+                                    "current_bid",
+                                    default=None,
+                                ),
+                                0.0,
+                            )
+                            _prior_bid_fresh = bool(
+                                _prior_bid > 0
+                                and _prior_bid_ts is not None
+                                and 0.0
+                                <= (now_utc - _prior_bid_ts).total_seconds()
+                                <= float(
+                                    os.getenv(
+                                        "EXIT_ENGINE_STALE_OPTION_QUOTE_SEC",
+                                        "20",
+                                    )
+                                )
+                            )
+                            if _prior_bid_fresh:
+                                oq = {
+                                    "symbol": c,
+                                    "bid": _prior_bid,
+                                    "ask": _safe_float(
+                                        _get_attr(
+                                            pos,
+                                            "currentask",
+                                            "current_ask",
+                                            default=None,
+                                        ),
+                                        0.0,
+                                    ),
+                                    "bid_ts": _prior_bid_ts,
+                                    "_ap_preserved_accepted_bid": True,
+                                }
+                                recovery["option_value_accepted"] = True
+                            else:
+                                oq = dict(oq)
+                                oq["bid"] = 0.0
+                                oq.pop("bid_ts", None)
+                                oq.pop("bid_date", None)
+                                oq.pop("bid_timestamp", None)
                         # else: option_fresh — keep ordinary oq as-is.
 
                         if _apply_und:
@@ -1059,16 +1120,36 @@ class APPositionQuoteMonitor:
                     and recovery.get("apply_recovered_underlying")
                 )
                 _is_recovery_ok = bool(recovery and recovery.get("ok"))
+                _preserved_accepted_bid = bool(
+                    oq.get("_ap_preserved_accepted_bid")
+                )
 
                 option_observation_ts = (
                     recovery["option_provider_ts"] if _apply_opt else now_utc
                 )
+                if _preserved_accepted_bid:
+                    option_observation_ts = (
+                        _get_attr(
+                            pos,
+                            "lastoptionquoteupdatets",
+                            "last_option_quote_update_ts",
+                            default=None,
+                        )
+                        or prior_opt_ts
+                    )
                 underlying_observation_ts = (
                     recovery["underlying_provider_ts"]
                     if _apply_und
                     else now_utc
                 )
                 bid_observation_ts = option_observation_ts
+                if _preserved_accepted_bid:
+                    bid_observation_ts = _get_attr(
+                        pos,
+                        "lastoptionbidupdatets",
+                        "last_option_bid_update_ts",
+                        default=option_observation_ts,
+                    )
                 if _apply_opt:
                     bid_observation_ts = (
                         self._monotonic_bid_observation_ts(
@@ -1147,15 +1228,19 @@ class APPositionQuoteMonitor:
                         log.debug("[%s] QuoteAuthority write failed for %s: %s",
                                   self.client_id, c, _qa_err)
 
-                    # Ordinary wake condition: only when this cycle is NOT a
-                    # recovery cycle. When _is_recovery_ok is True, the wake
-                    # fires at end-of-recovery only if recovery_complete=True.
-                    if (
-                        not _is_recovery_ok
-                        and self._should_wake(c, opt_price)
-                    ):
-                        wake_engine = True
-                    self._last_push_price[c] = opt_price
+                    # A valid ordinary option update owns its normal wake even
+                    # when an unrelated underlying recovery is incomplete.
+                    # Recovered option updates own the verified forced-wake
+                    # path below. A preserved accepted BID is neither a new
+                    # wake nor a new baseline.
+                    if option_fresh and not _apply_opt:
+                        if self._should_wake(c, opt_price):
+                            wake_engine = True
+                        self._last_push_price[c] = opt_price
+                    elif not _is_recovery_ok and not _preserved_accepted_bid:
+                        if self._should_wake(c, opt_price):
+                            wake_engine = True
+                        self._last_push_price[c] = opt_price
                 else:
                     self._write_field_unconditional(pos, "lastoptionquotemissingts", now_utc)
                     self._write_field_unconditional(pos, "last_option_quote_missing_ts", now_utc)
@@ -1452,7 +1537,14 @@ class APPositionQuoteMonitor:
                     and _exec_exit_pnl is not None
                     and _exec_exit_pnl >= TOUCHED_PROFIT_ARM_PCT
                 )
-                if _tp_key and not _tp_qualifies:
+                _new_bid_observation = not _preserved_accepted_bid
+                if (
+                    recovery
+                    and recovery.get("need_option")
+                    and not recovery.get("option_observation_advanced")
+                ):
+                    _new_bid_observation = False
+                if _tp_key and not _tp_qualifies and _new_bid_observation:
                     # Bid unavailable, stale, or below threshold on THIS cycle
                     # breaks consecutive confirmation for THIS position only.
                     # touched_profit, once True, is never reset here.
@@ -1491,7 +1583,7 @@ class APPositionQuoteMonitor:
                     # see constant docstring; NOT the immediate-TP trail threshold).
                     # Any interruption (bid missing, stale, or below threshold) resets
                     # pending state for THIS position only.
-                    if _tp_qualifies:
+                    if _tp_qualifies and _new_bid_observation:
                         if not self._tp_pending_confirm.get(_tp_key, False):
                             # First qualifying observation — set pending, do NOT arm yet.
                             self._tp_pending_confirm[_tp_key] = True
@@ -1608,6 +1700,25 @@ class APPositionQuoteMonitor:
                     # rejected recovery component does not launder provider_ts
                     # onto the position.
                     if _apply_opt:
+                        recovery["expected_option_bid"] = bid
+                        recovery["expected_option_price"] = _safe_float(
+                            _get_attr(
+                                pos,
+                                "currentoptionprice",
+                                "current_option_price",
+                                default=None,
+                            ),
+                            0.0,
+                        )
+                        recovery["expected_option_bid_valid"] = bool(
+                            _opt_bid_valid
+                        )
+                        recovery["expected_exit_executable_mark"] = (
+                            _exec_exit_mark if _opt_bid_valid else None
+                        )
+                        recovery["expected_option_price_source"] = (
+                            price_source
+                        )
                         self._write_field_unconditional(
                             pos,
                             "last_option_provider_quote_ts",
@@ -1617,6 +1728,10 @@ class APPositionQuoteMonitor:
                             "option_provider_ts"
                         ]
                     if _apply_und:
+                        recovery["expected_underlying_price"] = und_last
+                        recovery["expected_underlying_available"] = bool(
+                            _und_available
+                        )
                         self._write_field_unconditional(
                             pos,
                             "last_underlying_provider_quote_ts",
@@ -1669,6 +1784,10 @@ class APPositionQuoteMonitor:
                         recovery, position
                     )
                 )
+                exact_position_updated = bool(
+                    exact_position_updated
+                    and position_state_propagation_ok
+                )
                 if exact_position_updated:
                     # Per-component: only verify the fields that were actually
                     # supposed to be written for this recovery.  A partial
@@ -1713,6 +1832,108 @@ class APPositionQuoteMonitor:
                         getattr(position, field, None) == expected
                         for field, expected in expected_fields.items()
                     )
+                    if (
+                        exact_position_updated
+                        and recovery.get("apply_recovered_option")
+                    ):
+                        exact_position_updated = (
+                            math.isclose(
+                                _safe_float(
+                                    _get_attr(
+                                        position,
+                                        "currentbid",
+                                        "current_bid",
+                                        default=None,
+                                    ),
+                                    float("nan"),
+                                ),
+                                recovery["expected_option_bid"],
+                                rel_tol=1e-9,
+                                abs_tol=1e-9,
+                            )
+                            and math.isclose(
+                                _safe_float(
+                                    _get_attr(
+                                        position,
+                                        "currentoptionprice",
+                                        "current_option_price",
+                                        default=None,
+                                    ),
+                                    float("nan"),
+                                ),
+                                recovery["expected_option_price"],
+                                rel_tol=1e-9,
+                                abs_tol=1e-9,
+                            )
+                            and bool(
+                                _get_attr(
+                                    position,
+                                    "option_bid_valid",
+                                    "optionbidvalid",
+                                    default=False,
+                                )
+                            )
+                            == recovery["expected_option_bid_valid"]
+                            and math.isclose(
+                                _safe_float(
+                                    _get_attr(
+                                        position,
+                                        "exit_executable_mark",
+                                        default=None,
+                                    ),
+                                    float("nan"),
+                                ),
+                                _safe_float(
+                                    recovery[
+                                        "expected_exit_executable_mark"
+                                    ],
+                                    float("nan"),
+                                ),
+                                rel_tol=1e-9,
+                                abs_tol=1e-9,
+                            )
+                            and str(
+                                _get_attr(
+                                    position,
+                                    "last_option_price_source",
+                                    "lastoptionpricesource",
+                                    default="",
+                                )
+                                or ""
+                            )
+                            == recovery["expected_option_price_source"]
+                        )
+                    if (
+                        exact_position_updated
+                        and recovery.get("apply_recovered_underlying")
+                    ):
+                        exact_position_updated = (
+                            math.isclose(
+                                _safe_float(
+                                    _get_attr(
+                                        position,
+                                        "currentunderlying",
+                                        "current_underlying",
+                                        default=None,
+                                    ),
+                                    float("nan"),
+                                ),
+                                recovery["expected_underlying_price"],
+                                rel_tol=1e-9,
+                                abs_tol=1e-9,
+                            )
+                            and bool(
+                                _get_attr(
+                                    position,
+                                    "underlying_available",
+                                    "underlyingavailable",
+                                    default=False,
+                                )
+                            )
+                            == recovery[
+                                "expected_underlying_available"
+                            ]
+                        )
             if exact_position_updated:
                 self._metrics["direct_recovery_successes"] = (
                     self._metrics.get("direct_recovery_successes", 0) + 1
@@ -1723,6 +1944,10 @@ class APPositionQuoteMonitor:
                     "reason": "fresh_provider_truth_applied",
                     "at": time.time(),
                 }
+                if recovery.get("apply_recovered_option"):
+                    self._last_push_price[
+                        recovery["option_symbol"]
+                    ] = recovery["expected_option_price"]
                 wake_engine = True
             else:
                 self._record_direct_recovery_failure(
@@ -2458,6 +2683,8 @@ class APPositionQuoteMonitor:
         execution_mode: str,
         option_symbol: str,
         underlying_symbol: str,
+        need_option: bool,
+        need_underlying: bool,
         now_utc: datetime,
     ) -> dict:
         key = "|".join(
@@ -2564,7 +2791,7 @@ class APPositionQuoteMonitor:
         underlying_provider_ts = self._provider_quote_ts(
             underlying_quote, require_bid=False
         )
-        if not self._quote_has_fresh_provider_truth(
+        if need_option and not self._quote_has_fresh_provider_truth(
             option_quote,
             require_bid=True,
             now_utc=validation_now_utc,
@@ -2572,7 +2799,7 @@ class APPositionQuoteMonitor:
             return self._record_direct_recovery_failure(
                 key, "option_provider_truth_stale_or_missing"
             )
-        if not self._quote_has_fresh_provider_truth(
+        if need_underlying and not self._quote_has_fresh_provider_truth(
             underlying_quote,
             require_bid=False,
             now_utc=validation_now_utc,
@@ -2590,6 +2817,8 @@ class APPositionQuoteMonitor:
             "underlying_symbol": str(
                 underlying_symbol or ""
             ).strip().upper(),
+            "need_option": bool(need_option),
+            "need_underlying": bool(need_underlying),
             "option_quote": option_quote,
             "underlying_quote": underlying_quote,
             "option_provider_ts": option_provider_ts,

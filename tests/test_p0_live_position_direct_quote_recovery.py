@@ -197,6 +197,8 @@ class _StalerProviderRecoveryBroker:
 
 
 def _monitor(position, broker):
+    with qpm_module._SHARED_CACHE_LOCK:
+        qpm_module._SHARED_CACHE.clear()
     engine = _ExitEngine([position])
     monitor = APPositionQuoteMonitor(
         broker=broker,
@@ -236,6 +238,8 @@ class _PartialOrdinaryBroker:
         recovery_underlying_last: float = 545.0,
         recovery_option_provider_ts=None,
         recovery_underlying_provider_ts=None,
+        include_recovery_option: bool = True,
+        include_recovery_underlying: bool = True,
     ):
         now = time.time()
         self.ordinary_option_fresh = ordinary_option_fresh
@@ -244,6 +248,8 @@ class _PartialOrdinaryBroker:
         self.ordinary_underlying_last = ordinary_underlying_last
         self.recovery_option_bid = recovery_option_bid
         self.recovery_underlying_last = recovery_underlying_last
+        self.include_recovery_option = include_recovery_option
+        self.include_recovery_underlying = include_recovery_underlying
         self.recovery_option_provider_ts = (
             recovery_option_provider_ts
             if recovery_option_provider_ts is not None
@@ -264,21 +270,23 @@ class _PartialOrdinaryBroker:
         now = time.time()
         if len(symbols) == 2:
             # Recovery batch
-            return {
-                OPTION: {
+            recovered = {}
+            if self.include_recovery_option:
+                recovered[OPTION] = {
                     "symbol": OPTION,
                     "bid": self.recovery_option_bid,
                     "ask": self.recovery_option_bid + 0.10,
                     "last": self.recovery_option_bid + 0.05,
                     "bid_date": self.recovery_option_provider_ts,
                     "trade_date": self.recovery_option_provider_ts,
-                },
-                UNDERLYING: {
+                }
+            if self.include_recovery_underlying:
+                recovered[UNDERLYING] = {
                     "symbol": UNDERLYING,
                     "last": self.recovery_underlying_last,
                     "trade_date": self.recovery_underlying_provider_ts,
-                },
-            }
+                }
+            return recovered
         if symbols == [OPTION]:
             if self.ordinary_option_fresh:
                 return {
@@ -633,13 +641,12 @@ def test_older_option_provider_ts_cannot_overwrite_bid_or_price_and_cannot_wake(
     assert position.currentbid != 0.70
     assert position.current_option_price != 0.70
 
-    # BID is cycle truth: no fresh executable BID this cycle → 0.0.
-    # (This is identical to the pre-existing recovery-failure invariant.)
-    assert position.current_bid == 0.0, (
-        "suppressed option component must produce current_bid=0.0 per "
-        "the BID-cycle-truth invariant, matching recovery-failure semantics"
+    # The last accepted BID remains executable while its original timestamp
+    # is still fresh. The older recovery value is not a new observation.
+    assert position.current_bid == 1.05, (
+        "equal/older provider truth must preserve the still-fresh accepted BID"
     )
-    assert position.currentbid == 0.0
+    assert position.currentbid == 1.05
 
     # Preserved BID observation timestamp: must not have advanced.
     assert position.last_option_bid_update_ts == opt_obs_dt, (
@@ -711,11 +718,8 @@ def test_equal_provider_ts_second_recovery_leaves_values_and_wake_unchanged():
     no success, no wake, and the position's existing observation
     timestamps stay pinned at the first call's provider_ts.
 
-    Note on current_bid: under the correct architecture the second call's
-    oq is suppressed (bid → 0.0), so current_bid becomes 0.0 per the
-    BID-cycle-truth invariant — identically to a recovery-failure cycle.
-    The assertion here is that the REJECTED recovery value never reaches
-    current_bid, not that current_bid preserves the first-call value.
+    The second call preserves the accepted executable BID and its timestamp,
+    but does not advance observation identity, confirmation, or wakes.
     """
     provider_epoch = time.time() - 5.0
     provider_ts_expected = qpm_module.normalize_hard_ref_ts(provider_epoch)
@@ -746,6 +750,8 @@ def test_equal_provider_ts_second_recovery_leaves_values_and_wake_unchanged():
     assert position.last_underlying_quote_update_ts == provider_ts_expected, (
         "equal provider_ts must not advance last_underlying_quote_update_ts"
     )
+    assert position.current_bid == 1.00
+    assert position.currentbid == 1.00
 
     # No second recovery success, no wake.
     assert monitor._metrics["direct_recovery_successes"] == 1, (
@@ -782,7 +788,7 @@ def test_strictly_newer_provider_ts_applies_values_and_wakes_exactly_once():
     broker = _RecoveryBroker(provider_ts=newer_epoch)  # bid=1.00
     monitor, engine = _monitor(position, broker)
 
-    monitor._refresh_once()
+    result = monitor._refresh_once()
 
     # Values must have advanced to the recovered truth.
     assert position.current_bid == 1.00, (
@@ -1035,7 +1041,7 @@ def test_rejected_underlying_recovery_does_not_reach_persistence_availability_or
     )
     monitor, engine = _monitor(position, broker)
 
-    monitor._refresh_once()
+    result = monitor._refresh_once()
 
     # Persistence: _persist_quote_to_db must NEVER have been called with
     # the rejected recovery underlying_last=530.0.  It may be called with
@@ -1057,7 +1063,7 @@ def test_rejected_underlying_recovery_does_not_reach_persistence_availability_or
     # underlying is stale-with-rejected-recovery.  If the rejected recovery
     # payload had reached _und_available, positions_fully_fresh could have
     # incremented incorrectly.
-    assert monitor._metrics["positions_fully_fresh"] == 0, (
+    assert result["positions_fully_fresh"] == 0, (
         "rejected recovery must not contribute to positions_fully_fresh"
     )
 
@@ -1069,4 +1075,146 @@ def test_rejected_underlying_recovery_does_not_reach_persistence_availability_or
 
     # No recovery success, no wake.
     assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set()
+
+
+def test_equal_provider_bid_preserves_pending_confirmation_without_advancing():
+    provider_epoch = time.time() - 3.0
+    provider_ts = datetime.fromtimestamp(provider_epoch, tz=timezone.utc)
+    position = _position()
+    position.entry_price = 0.90
+    position.entryprice = 0.90
+    position.current_bid = 1.00
+    position.currentbid = 1.00
+    position.current_option_price = 1.00
+    position.currentoptionprice = 1.00
+    position.last_option_bid_update_ts = provider_ts
+    position.lastoptionbidupdatets = provider_ts
+    broker = _RecoveryBroker(provider_ts=provider_epoch)
+    monitor, engine = _monitor(position, broker)
+    confirmation_key = f"{CLIENT_ID}|live|{POSITION_ID}"
+    monitor._tp_pending_confirm[confirmation_key] = True
+
+    monitor._refresh_once()
+
+    assert position.current_bid == 1.00
+    assert position.last_option_bid_update_ts == provider_ts
+    assert monitor._tp_pending_confirm[confirmation_key] is True
+    assert position.touched_profit is False
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set()
+
+
+def test_fresh_ordinary_option_wakes_when_underlying_recovery_is_rejected():
+    now_epoch = time.time()
+    position = _position()
+    recent_underlying_ts = datetime.fromtimestamp(
+        now_epoch - 2.0, tz=timezone.utc
+    )
+    position.current_underlying = 555.0
+    position.currentunderlying = 555.0
+    position.last_underlying_quote_update_ts = recent_underlying_ts
+    position.lastunderlyingquoteupdatets = recent_underlying_ts
+    broker = _PartialOrdinaryBroker(
+        ordinary_option_fresh=True,
+        ordinary_underlying_fresh=False,
+        ordinary_option_bid=1.05,
+        recovery_underlying_provider_ts=now_epoch - 8.0,
+        include_recovery_option=False,
+    )
+    monitor, engine = _monitor(position, broker)
+    monitor._last_push_price[OPTION] = 0.50
+
+    monitor._refresh_once()
+
+    assert position.current_bid == 1.05
+    assert engine.quote_arrived_event.is_set()
+    assert monitor._last_push_price[OPTION] > 1.05
+    assert monitor._metrics["direct_recovery_successes"] == 0
+
+
+def test_option_only_recovery_does_not_require_underlying_payload():
+    position = _position()
+    broker = _PartialOrdinaryBroker(
+        ordinary_option_fresh=False,
+        ordinary_underlying_fresh=True,
+        ordinary_underlying_last=555.0,
+        recovery_option_bid=0.80,
+        include_recovery_underlying=False,
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    assert position.current_bid == 0.80
+    assert position.current_underlying == 555.0
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
+
+
+def test_underlying_only_recovery_does_not_require_option_payload():
+    position = _position()
+    broker = _PartialOrdinaryBroker(
+        ordinary_option_fresh=True,
+        ordinary_underlying_fresh=False,
+        ordinary_option_bid=1.05,
+        recovery_underlying_last=545.0,
+        include_recovery_option=False,
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    assert position.current_bid == 1.05
+    assert position.current_underlying == 545.0
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
+
+
+def test_recovery_cannot_succeed_without_any_propagation_path(monkeypatch):
+    monkeypatch.setattr(qpm_module, "DIRECT_POSITION_WRITES", False)
+    position = _position()
+    monitor, engine = _monitor(position, _RecoveryBroker())
+
+    monitor._refresh_once()
+
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert monitor._last_direct_recovery_result["reason"] == (
+        "exact_position_not_updated"
+    )
+    assert not engine.quote_arrived_event.is_set()
+
+
+def test_recovery_cannot_succeed_when_snapshot_propagation_fails(monkeypatch):
+    monkeypatch.setattr(qpm_module, "DIRECT_POSITION_WRITES", False)
+    position = _position()
+    monitor, engine = _monitor(position, _RecoveryBroker())
+
+    def fail_snapshots(_snapshots):
+        raise RuntimeError("snapshot apply failed")
+
+    engine.apply_quote_snapshots = fail_snapshots
+    monitor._refresh_once()
+
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set()
+
+
+def test_numeric_assignment_failure_blocks_recovery_success_and_wake():
+    position = _position()
+    monitor, engine = _monitor(position, _RecoveryBroker())
+    real_write = monitor._write_field_unconditional
+
+    def drop_bid_assignment(target, field, value):
+        if field in {"currentbid", "current_bid"}:
+            return
+        return real_write(target, field, value)
+
+    monitor._write_field_unconditional = drop_bid_assignment
+    monitor._refresh_once()
+
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert monitor._last_direct_recovery_result["reason"] == (
+        "exact_position_not_updated"
+    )
     assert not engine.quote_arrived_event.is_set()
