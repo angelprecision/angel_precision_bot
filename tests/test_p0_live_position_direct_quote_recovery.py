@@ -210,6 +210,101 @@ def _monitor(position, broker):
     return monitor, engine
 
 
+class _PartialOrdinaryBroker:
+    """
+    Returns fresh ordinary data for ONE component (option OR underlying) and
+    empty for the other, so exactly one component's ordinary quote is fresh
+    and the other triggers recovery. The recovery two-symbol batch returns
+    configurable provider truth for BOTH components regardless, so the tests
+    can verify that fresh ordinary sources remain authoritative and are not
+    displaced by the recovery payload.
+
+    Ordinary single-symbol polls carry provider timestamps at now()
+    (definitively fresh).  Recovery batch timestamps are configurable so
+    tests can also exercise strictly-newer / older / equal-vs-existing gate
+    cases at the same time.
+    """
+
+    def __init__(
+        self,
+        *,
+        ordinary_option_fresh: bool,
+        ordinary_underlying_fresh: bool,
+        ordinary_option_bid: float = 1.05,
+        ordinary_underlying_last: float = 555.0,
+        recovery_option_bid: float = 0.70,
+        recovery_underlying_last: float = 545.0,
+        recovery_option_provider_ts=None,
+        recovery_underlying_provider_ts=None,
+    ):
+        now = time.time()
+        self.ordinary_option_fresh = ordinary_option_fresh
+        self.ordinary_underlying_fresh = ordinary_underlying_fresh
+        self.ordinary_option_bid = ordinary_option_bid
+        self.ordinary_underlying_last = ordinary_underlying_last
+        self.recovery_option_bid = recovery_option_bid
+        self.recovery_underlying_last = recovery_underlying_last
+        self.recovery_option_provider_ts = (
+            recovery_option_provider_ts
+            if recovery_option_provider_ts is not None
+            else now - 2.0
+        )
+        self.recovery_underlying_provider_ts = (
+            recovery_underlying_provider_ts
+            if recovery_underlying_provider_ts is not None
+            else now - 2.0
+        )
+        self.calls = []
+        self.submit_order = MagicMock()
+        self.cancel_order = MagicMock()
+
+    def get_quotes(self, symbols):
+        symbols = list(symbols)
+        self.calls.append(symbols)
+        now = time.time()
+        if len(symbols) == 2:
+            # Recovery batch
+            return {
+                OPTION: {
+                    "symbol": OPTION,
+                    "bid": self.recovery_option_bid,
+                    "ask": self.recovery_option_bid + 0.10,
+                    "last": self.recovery_option_bid + 0.05,
+                    "bid_date": self.recovery_option_provider_ts,
+                    "trade_date": self.recovery_option_provider_ts,
+                },
+                UNDERLYING: {
+                    "symbol": UNDERLYING,
+                    "last": self.recovery_underlying_last,
+                    "trade_date": self.recovery_underlying_provider_ts,
+                },
+            }
+        if symbols == [OPTION]:
+            if self.ordinary_option_fresh:
+                return {
+                    OPTION: {
+                        "symbol": OPTION,
+                        "bid": self.ordinary_option_bid,
+                        "ask": self.ordinary_option_bid + 0.10,
+                        "last": self.ordinary_option_bid + 0.05,
+                        "bid_date": now,
+                        "trade_date": now,
+                    }
+                }
+            return {}
+        if symbols == [UNDERLYING]:
+            if self.ordinary_underlying_fresh:
+                return {
+                    UNDERLYING: {
+                        "symbol": UNDERLYING,
+                        "last": self.ordinary_underlying_last,
+                        "trade_date": now,
+                    }
+                }
+            return {}
+        return {}
+
+
 def test_missing_live_quote_gets_one_uncached_fetch_and_exact_position_apply():
     position = _position()
     broker = _RecoveryBroker()
@@ -493,18 +588,22 @@ def test_identical_recovery_provider_time_is_one_bid_observation():
 
 def test_older_option_provider_ts_cannot_overwrite_bid_or_price_and_cannot_wake():
     """
-    Older lower option BID cannot overwrite current_bid or current_option_price
-    and cannot create a runner wake.
+    Older lower option BID must not overwrite current_bid or
+    current_option_price and must not trigger a runner wake.
 
-    Position has an existing BID observation 3 s ago.  Recovery fetch returns
-    a fresh-enough quote (passes _quote_has_fresh_provider_truth) but the
-    option bid_date is 8 s ago — strictly OLDER than the existing 3 s
-    observation.  The value-cohesion gate must treat this as a no-op: numeric
-    values unchanged, no wake.
+    Under the correct architecture, when recovery is rejected for the
+    option component, oq is suppressed at the SOURCE (bid → 0.0, bid_ts
+    popped), identically to the recovery-failure path.  The "BID is cycle
+    truth" invariant then writes current_bid = 0.0 (NOT the rejected
+    0.70).  The preserved 1.05 is not asserted as the new current_bid
+    value — the invariant that matters is that the REJECTED 0.70 never
+    reaches current_bid, and the preserved observation timestamp never
+    advances to the rejected provider_ts.
     """
     now_epoch = time.time()
 
-    # Plant a recent BID observation so the gate has an existing reference.
+    # Plant a recent BID observation so the gate has an existing reference
+    # strictly newer than the rejected recovery provider_ts.
     opt_obs_epoch = now_epoch - 3.0
     opt_obs_dt = datetime.fromtimestamp(opt_obs_epoch, tz=timezone.utc)
     position = _position()
@@ -515,35 +614,40 @@ def test_older_option_provider_ts_cannot_overwrite_bid_or_price_and_cannot_wake(
     position.last_option_bid_update_ts = opt_obs_dt
     position.lastoptionbidupdatets = opt_obs_dt
 
-    # Recovery provider_ts is 8 s ago: older than the existing 3 s obs but
+    # Recovery provider_ts is 8 s ago: OLDER than the existing 3 s obs but
     # within STALE_MAX_SEC=15 s, so _maybe_direct_recover_position → ok=True.
     older_opt_epoch = now_epoch - 8.0
     broker = _StalerProviderRecoveryBroker(
         option_provider_ts=older_opt_epoch,
-        underlying_provider_ts=now_epoch - 2.0,  # fresh underlying
-        option_bid=0.70,  # lower than existing 1.05 — must NOT be written
+        underlying_provider_ts=now_epoch - 2.0,  # underlying is fresh
+        option_bid=0.70,                          # rejected value — must NOT reach position
     )
     monitor, engine = _monitor(position, broker)
 
     monitor._refresh_once()
 
-    # Numeric values must not have regressed.
-    assert position.current_bid == 1.05, (
-        "older option provider_ts must not overwrite current_bid"
+    # The rejected 0.70 must not appear anywhere on the position.
+    assert position.current_bid != 0.70, (
+        "rejected option recovery bid 0.70 must not reach current_bid"
     )
-    assert position.currentbid == 1.05
-    # current_option_price is overridden by the executable-price path from
-    # cur_bid_now (still 1.05, unmodified), so it also stays at 1.05.
-    assert position.current_option_price == 1.05, (
-        "older option provider_ts must not lower current_option_price"
-    )
-    assert position.currentoptionprice == 1.05
+    assert position.currentbid != 0.70
+    assert position.current_option_price != 0.70
 
-    # BID observation timestamp must not have changed.
-    assert position.last_option_bid_update_ts == opt_obs_dt
+    # BID is cycle truth: no fresh executable BID this cycle → 0.0.
+    # (This is identical to the pre-existing recovery-failure invariant.)
+    assert position.current_bid == 0.0, (
+        "suppressed option component must produce current_bid=0.0 per "
+        "the BID-cycle-truth invariant, matching recovery-failure semantics"
+    )
+    assert position.currentbid == 0.0
+
+    # Preserved BID observation timestamp: must not have advanced.
+    assert position.last_option_bid_update_ts == opt_obs_dt, (
+        "rejected recovery must not advance last_option_bid_update_ts"
+    )
     assert position.lastoptionbidupdatets == opt_obs_dt
 
-    # Recovery did not complete — no success increment, no runner wake.
+    # No recovery success increment, no runner wake — recovery_complete=False.
     assert monitor._metrics["direct_recovery_successes"] == 0
     assert not engine.quote_arrived_event.is_set(), (
         "stale option recovery must not wake the exit engine"
@@ -598,38 +702,52 @@ def test_older_underlying_provider_ts_cannot_overwrite_underlying_and_cannot_wak
 
 def test_equal_provider_ts_second_recovery_leaves_values_and_wake_unchanged():
     """
-    Equal provider timestamps produce no second value mutation or recovery wake
-    while remaining one #399 observation.
+    Equal provider timestamps produce no additional recovery observation:
+    no success increment, no wake event, no timestamp advancement.
 
-    The first recovery succeeds (provider_ts is strictly newer than no existing
-    obs).  A second call with the identical epoch must be a complete no-op for
-    all numeric writes and must not set the wake event again.
+    The first recovery succeeds (provider_ts is strictly newer than the
+    absent existing observation).  A second call with the identical epoch
+    must be rejected by the value-cohesion gate: recovery_complete=False,
+    no success, no wake, and the position's existing observation
+    timestamps stay pinned at the first call's provider_ts.
+
+    Note on current_bid: under the correct architecture the second call's
+    oq is suppressed (bid → 0.0), so current_bid becomes 0.0 per the
+    BID-cycle-truth invariant — identically to a recovery-failure cycle.
+    The assertion here is that the REJECTED recovery value never reaches
+    current_bid, not that current_bid preserves the first-call value.
     """
     provider_epoch = time.time() - 5.0
+    provider_ts_expected = qpm_module.normalize_hard_ref_ts(provider_epoch)
     position = _position()
     broker = _RecoveryBroker(provider_ts=provider_epoch)
     monitor, engine = _monitor(position, broker)
 
-    # First call: no existing BID obs → strictly newer → succeeds.
+    # First call: no existing BID obs → strictly newer → recovery accepted.
     monitor._refresh_once()
     assert monitor._metrics["direct_recovery_successes"] == 1
     assert engine.quote_arrived_event.is_set()
-    bid_after_first = position.current_bid
-    und_after_first = position.current_underlying
+    assert position.last_option_bid_update_ts == provider_ts_expected
+    assert position.last_underlying_quote_update_ts == provider_ts_expected
 
-    # Second call: same provider_epoch — equal, NOT strictly newer → must be a
-    # complete no-op for numeric values and the wake event.
+    # Second call: same provider_epoch — equal, NOT strictly newer.  Both
+    # components are rejected → recovery_complete=False.  No success, no
+    # wake, timestamp not advanced.
     engine.quote_arrived_event.clear()
     monitor._last_direct_recovery_attempt_ts.clear()
     monitor._refresh_once()
 
-    assert position.current_bid == bid_after_first, (
-        "equal provider_ts must not mutate current_bid"
+    # The rejected recovery bid (1.00 from the broker) must not have
+    # produced a second observation — timestamp still pinned at first call.
+    assert position.last_option_bid_update_ts == provider_ts_expected, (
+        "equal provider_ts must not advance last_option_bid_update_ts"
     )
-    assert position.currentbid == bid_after_first
-    assert position.current_underlying == und_after_first, (
-        "equal provider_ts must not mutate current_underlying"
+    assert position.lastoptionbidupdatets == provider_ts_expected
+    assert position.last_underlying_quote_update_ts == provider_ts_expected, (
+        "equal provider_ts must not advance last_underlying_quote_update_ts"
     )
+
+    # No second recovery success, no wake.
     assert monitor._metrics["direct_recovery_successes"] == 1, (
         "equal provider_ts must not increment direct_recovery_successes"
     )
@@ -675,3 +793,280 @@ def test_strictly_newer_provider_ts_applies_values_and_wakes_exactly_once():
     # Recovery completes, wake fires exactly once.
     assert monitor._metrics["direct_recovery_successes"] == 1
     assert engine.quote_arrived_event.is_set()
+
+
+# ── PR #400 amendment #2: source-level per-component regressions ──────────────
+# Reviewer HOLD 4792984468: the earlier gate blocked direct field assignments
+# but the rejected recovery payload still reached hard-reference, executable
+# truth, peak, touched-profit, persistence, and coverage via oq/uq/bid/ask/
+# opt_price/und_last locals.  The fix moved the gate to the SOURCE — the
+# first pass — so rejected components never populate those locals in the
+# first place, and fresh ordinary components are never displaced.
+
+
+def test_fresh_ordinary_option_plus_stale_underlying_leaves_option_authoritative():
+    """
+    Fresh ordinary option + stale underlying: only the underlying is
+    recovered; the ordinary option quote remains authoritative.
+
+    The recovery payload includes an option quote too (that's how the
+    two-symbol batch works), but because ordinary option is fresh the
+    gate leaves oq untouched — recovery option payload never reaches
+    current_bid, current_option_price, hard-reference, or executable
+    truth.  Underlying, being stale-with-strictly-newer-recovery, is
+    applied.
+    """
+    broker = _PartialOrdinaryBroker(
+        ordinary_option_fresh=True,
+        ordinary_underlying_fresh=False,
+        ordinary_option_bid=1.05,           # fresh ordinary
+        recovery_option_bid=0.70,           # must NOT reach position
+        recovery_underlying_last=545.0,     # will be applied
+    )
+    position = _position()
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    # Ordinary option authoritative — recovery option value must not appear.
+    assert position.current_bid == 1.05, (
+        "fresh ordinary option must remain authoritative"
+    )
+    assert position.currentbid == 1.05
+    assert position.current_bid != 0.70, (
+        "recovery option bid 0.70 must not have displaced the fresh ordinary quote"
+    )
+
+    # Underlying was recovered — current_underlying updated from recovery.
+    assert position.current_underlying == 545.0
+    assert position.currentunderlying == 545.0
+
+    # Recovery completed: option fresh + underlying applied.
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
+
+
+def test_stale_option_plus_fresh_ordinary_underlying_leaves_underlying_authoritative():
+    """
+    Stale option + fresh ordinary underlying: only the option is
+    recovered; the ordinary underlying quote remains authoritative.
+
+    Recovery underlying payload (530.0) must never reach current_underlying;
+    the fresh ordinary underlying (555.0) stays put.  Option component is
+    stale-with-strictly-newer-recovery, so it applies.
+    """
+    broker = _PartialOrdinaryBroker(
+        ordinary_option_fresh=False,
+        ordinary_underlying_fresh=True,
+        ordinary_underlying_last=555.0,     # fresh ordinary
+        recovery_option_bid=0.70,           # will be applied
+        recovery_underlying_last=530.0,     # must NOT reach position
+    )
+    position = _position()
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    # Ordinary underlying authoritative — recovery underlying must not appear.
+    assert position.current_underlying == 555.0, (
+        "fresh ordinary underlying must remain authoritative"
+    )
+    assert position.currentunderlying == 555.0
+    assert position.current_underlying != 530.0, (
+        "recovery underlying 530.0 must not have displaced the fresh ordinary quote"
+    )
+
+    # Option was recovered — current_bid updated from recovery.
+    assert position.current_bid == 0.70
+    assert position.currentbid == 0.70
+
+    # Recovery completed: option applied + underlying fresh.
+    assert monitor._metrics["direct_recovery_successes"] == 1
+    assert engine.quote_arrived_event.is_set()
+
+
+def test_rejected_option_recovery_leaves_hard_ref_executable_peak_touched_profit_untouched():
+    """
+    Older/equal rejected option: hard-reference, executable mark/P&L,
+    peak_pnl_pct and touched_profit are all untouched.
+
+    The reviewer's Blocker 1 was that the rejected recovered numeric bid
+    could still reach:
+      - hard_exit_reference_price / _source / _pnl_pct
+      - exit_executable_mark / exit_executable_pnl_pct
+      - peak_pnl_pct / max_profit_seen
+      - touched_profit lifecycle
+    This regression asserts none of that occurs.
+    """
+    now_epoch = time.time()
+
+    # Plant a recent BID observation so the gate rejects the recovery.
+    opt_obs_epoch = now_epoch - 3.0
+    opt_obs_dt = datetime.fromtimestamp(opt_obs_epoch, tz=timezone.utc)
+
+    # Plant hard-reference, executable, peak, and touched-profit state that
+    # the rejected recovery must not perturb.  Values chosen so that if the
+    # rejected 0.70 bid reached executable truth it would clearly move
+    # peak/pnl/hard-ref downward.
+    position = _position()
+    position.entry_price = 1.00
+    position.entryprice = 1.00
+    position.current_bid = 1.05
+    position.currentbid = 1.05
+    position.current_option_price = 1.05
+    position.currentoptionprice = 1.05
+    position.last_option_bid_update_ts = opt_obs_dt
+    position.lastoptionbidupdatets = opt_obs_dt
+
+    prior_hard_ref_price = 1.10
+    prior_hard_ref_source = "bid"
+    prior_hard_ref_pnl_pct = 0.10
+    prior_hard_ref_validity = "proven"
+    prior_hard_ref_ts = datetime.fromtimestamp(now_epoch - 2.0, tz=timezone.utc)
+    position.hard_exit_reference_price = prior_hard_ref_price
+    position.hardexitreferenceprice = prior_hard_ref_price
+    position.hard_exit_reference_source = prior_hard_ref_source
+    position.hardexitreferencesource = prior_hard_ref_source
+    position.hard_exit_reference_pnl_pct = prior_hard_ref_pnl_pct
+    position.hardexitreferencepnlpct = prior_hard_ref_pnl_pct
+    position.hard_exit_reference_validity = prior_hard_ref_validity
+    position.hardexitreferencevalidity = prior_hard_ref_validity
+    position.hard_exit_reference_ts = prior_hard_ref_ts
+    position.hardexitreferencets = prior_hard_ref_ts
+
+    position.peak_pnl_pct = 0.12
+    position.peakpnlpct = 0.12
+    position.max_profit_seen = 0.12
+    position.maxprofitseen = 0.12
+    position.touched_profit = True
+    position.touchedprofit = True
+
+    # Recovery provider_ts is 8 s ago: OLDER than the existing 3 s obs → gate
+    # rejects the option component.  Underlying is fresh-enough recovery so
+    # the recovery call succeeds overall.
+    older_opt_epoch = now_epoch - 8.0
+    broker = _StalerProviderRecoveryBroker(
+        option_provider_ts=older_opt_epoch,
+        underlying_provider_ts=now_epoch - 2.0,
+        option_bid=0.70,          # if this reaches executable truth the peak crashes
+        underlying_last=550.0,
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    # Hard-reference must not have been touched.
+    assert position.hard_exit_reference_price == prior_hard_ref_price, (
+        "rejected recovery bid must not overwrite hard_exit_reference_price"
+    )
+    assert position.hard_exit_reference_source == prior_hard_ref_source
+    assert position.hard_exit_reference_pnl_pct == prior_hard_ref_pnl_pct
+    assert position.hard_exit_reference_validity == prior_hard_ref_validity
+    assert position.hard_exit_reference_ts == prior_hard_ref_ts
+
+    # Peak / max_profit_seen must not have regressed.  If the rejected 0.70
+    # had reached executable P&L, the resulting -30% would not have advanced
+    # peak, BUT downstream state (touched_profit lifecycle) could have been
+    # perturbed if the rejected numbers were used.
+    assert position.peak_pnl_pct == 0.12, (
+        "rejected recovery bid must not perturb peak_pnl_pct"
+    )
+    assert position.max_profit_seen == 0.12
+
+    # Touched-profit state: was True, must remain True (nothing this cycle
+    # should have driven a re-evaluation using the rejected value).
+    assert position.touched_profit is True, (
+        "rejected recovery bid must not perturb touched_profit lifecycle"
+    )
+
+    # Executable truth: this cycle has no accepted BID, so exit_executable_*
+    # correctly reflects "no fresh executable BID" — but crucially it MUST
+    # NOT reflect the rejected 0.70 as if it were accepted.
+    exec_mark = getattr(position, "exit_executable_mark", None)
+    assert exec_mark != 0.70, (
+        "rejected recovery bid must not appear in exit_executable_mark"
+    )
+    exec_pnl = getattr(position, "exit_executable_pnl_pct", None)
+    # If exec_pnl is present, it must not be the rejected-bid computation
+    # (0.70 - 1.00) / 1.00 = -0.30.
+    if exec_pnl is not None:
+        assert abs(float(exec_pnl) - (-0.30)) > 1e-6, (
+            "rejected recovery bid must not produce exec_pnl of -30%"
+        )
+
+    # No recovery success, no wake.
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set()
+
+
+def test_rejected_underlying_recovery_does_not_reach_persistence_availability_or_coverage():
+    """
+    Older/equal rejected underlying: persistence, availability, and coverage
+    all reflect the rejected component as absent — not as fresh recovered
+    truth.
+
+    Reviewer's specific concern: even when the direct field write for
+    current_underlying is skipped, the local `und_last` could still flow
+    into `_persist_quote_to_db(underlying_price=und_last)`, into the
+    `_und_available` computation (`und_last > 0`), and into the
+    `positions_fully_fresh` coverage counter.
+    """
+    now_epoch = time.time()
+
+    # Plant a recent underlying observation so the gate rejects the recovery.
+    und_obs_epoch = now_epoch - 3.0
+    und_obs_dt = datetime.fromtimestamp(und_obs_epoch, tz=timezone.utc)
+    position = _position()
+    position.entry_price = 1.00
+    position.entryprice = 1.00
+    position.current_underlying = 555.0
+    position.currentunderlying = 555.0
+    position.last_underlying_quote_update_ts = und_obs_dt
+    position.lastunderlyingquoteupdatets = und_obs_dt
+
+    # Recovery underlying provider_ts is 8 s ago: OLDER than existing 3 s obs.
+    # Option recovery is fresh so recovery call succeeds overall.
+    older_und_epoch = now_epoch - 8.0
+    broker = _StalerProviderRecoveryBroker(
+        option_provider_ts=now_epoch - 2.0,
+        underlying_provider_ts=older_und_epoch,
+        option_bid=1.20,               # legitimately applied
+        underlying_last=530.0,         # must NOT reach persistence
+    )
+    monitor, engine = _monitor(position, broker)
+
+    monitor._refresh_once()
+
+    # Persistence: _persist_quote_to_db must NEVER have been called with
+    # the rejected recovery underlying_last=530.0.  It may be called with
+    # underlying_price=0.0 (correct — no fresh underlying truth this cycle).
+    persist_calls = monitor._persist_quote_to_db.call_args_list
+    for call in persist_calls:
+        underlying_price_arg = call.kwargs.get("underlying_price")
+        assert underlying_price_arg != 530.0, (
+            "rejected recovery underlying 530.0 must not reach persistence"
+        )
+
+    # Availability: rejected underlying → uq={} → und_last=0 → _und_available
+    # must be False on the position and its snapshot.
+    assert getattr(position, "underlying_available", True) is False, (
+        "rejected recovery underlying must produce underlying_available=False"
+    )
+
+    # Coverage: this position must NOT be counted as fully-fresh, since the
+    # underlying is stale-with-rejected-recovery.  If the rejected recovery
+    # payload had reached _und_available, positions_fully_fresh could have
+    # incremented incorrectly.
+    assert monitor._metrics["positions_fully_fresh"] == 0, (
+        "rejected recovery must not contribute to positions_fully_fresh"
+    )
+
+    # Direct assignment: current_underlying stays at the planted 555.0.
+    assert position.current_underlying == 555.0, (
+        "rejected recovery underlying 530.0 must not have displaced current_underlying"
+    )
+    assert position.currentunderlying == 555.0
+
+    # No recovery success, no wake.
+    assert monitor._metrics["direct_recovery_successes"] == 0
+    assert not engine.quote_arrived_event.is_set()
