@@ -6,8 +6,10 @@ import time
 import logging
 import threading
 import math
+import uuid
 from datetime import datetime, timezone, time as dtime
 from typing import Optional, Callable
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from ap.exit_thresholds import effective_thresholds
@@ -372,18 +374,79 @@ def _get_attr(obj, *names, default=None):
     return default
 
 
+def _canonical_execution_mode(value) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in {"live", "paper"} else ""
+
+
+def _object_identity(value) -> str:
+    cls = value.__class__
+    return f"{cls.__module__}.{cls.__qualname__}@{id(value):x}"
+
+
+def _broker_account_id(broker) -> str:
+    cfg = getattr(broker, "cfg", None)
+    return str(
+        getattr(cfg, "account_id", None)
+        or getattr(cfg, "accountid", None)
+        or getattr(broker, "account_id", None)
+        or getattr(broker, "accountid", None)
+        or ""
+    ).strip()
+
+
+def _market_data_source_identity(broker, execution_mode: str) -> str:
+    """Return a stable, non-secret cache namespace for one market-data source."""
+    cfg = getattr(broker, "cfg", None)
+    raw_url = (
+        getattr(cfg, "base_url", None)
+        or getattr(cfg, "baseurl", None)
+        or getattr(broker, "base_url", None)
+        or getattr(broker, "baseurl", None)
+        or ""
+    )
+    normalized_url = ""
+    try:
+        parsed = urlsplit(str(raw_url).strip())
+        host = (parsed.hostname or "").lower()
+        port = f":{parsed.port}" if parsed.port else ""
+        path = parsed.path.rstrip("/")
+        if parsed.scheme and host:
+            normalized_url = f"{parsed.scheme.lower()}://{host}{port}{path}"
+    except Exception:
+        normalized_url = ""
+    cls = broker.__class__
+    broker_type = f"{cls.__module__}.{cls.__qualname__}"
+    mode = _canonical_execution_mode(execution_mode) or "unknown"
+    return f"{mode}|{broker_type}|{normalized_url or 'url-unavailable'}"
+
+
 class APPositionQuoteMonitor:
     def __init__(
         self,
         broker,
         client_id: str,
         exit_engine,
+        execution_mode: str = "",
         alert_fn: Optional[Callable[[str], None]] = None,
         poll_interval_sec: float = POLL_SEC,
     ):
         self.broker = broker
-        self.client_id = client_id
+        self.client_id = str(client_id or "").strip()
         self.exit_engine = exit_engine
+        self.execution_mode = _canonical_execution_mode(execution_mode)
+        self.monitor_instance_id = uuid.uuid4().hex
+        self.started_at = time.time()
+        self.bound_broker_identity = _object_identity(broker)
+        self.bound_exit_engine_identity = _object_identity(exit_engine)
+        self.bound_account_id = _broker_account_id(broker)
+        self._bound_broker = broker
+        self._bound_exit_engine = exit_engine
+        mode_label = self.execution_mode or "unknown"
+        self._health_key = f"ap_quote_monitor:{self.client_id}:{mode_label}"
+        self._cache_namespace = _market_data_source_identity(
+            broker, self.execution_mode
+        )
         self._alert_fn = alert_fn or (lambda m: log.warning(m))
         self._interval = poll_interval_sec
 
@@ -431,7 +494,14 @@ class APPositionQuoteMonitor:
         self._cycles = 0
         self._consecutive_failures = 0
         self._rate_limit_backoff_sec = RATE_LIMIT_BACKOFF_BASE_SEC
-        self._last_cycle_ts = time.time()
+        self._last_cycle_attempt_ts = 0.0
+        self._last_cycle_success_ts = 0.0
+        self._last_cycle_completed_ts = 0.0
+        self._last_cycle_ts = 0.0
+        self._last_cycle_error = ""
+        self._last_cycle_complete_coverage = False
+        self._last_cycle_coverage: dict = {}
+        self._coverage_degraded_reported = False
 
         self._metrics = {
             "cycles": 0,
@@ -448,6 +518,7 @@ class APPositionQuoteMonitor:
             "immediate_retry_coalesced": 0,
             "immediate_retry_evictions": 0,
             "immediate_retry_backoff_suppressed": 0,
+            "coverage_incomplete_cycles": 0,
             "exits_gated_blind": 0,    # bumped by exit engine when it gates
             "exits_gated_stale": 0,    # bumped by exit engine when it gates
         }
@@ -455,6 +526,13 @@ class APPositionQuoteMonitor:
     # ── Lifecycle ────────────────────────────────────────────────────────────
     def start(self):
         if self._thread and self._thread.is_alive():
+            return
+        if self.execution_mode not in {"live", "paper"}:
+            log.critical(
+                "[%s] PositionQuoteMonitor startup blocked: "
+                "execution_mode must be live or paper",
+                self.client_id,
+            )
             return
         self._stop.clear()
         self._kick.clear()
@@ -479,16 +557,61 @@ class APPositionQuoteMonitor:
     def kick(self):
         self._kick.set()
 
+    def binding_matches(
+        self,
+        *,
+        client_id: str,
+        execution_mode: str,
+        broker,
+        exit_engine,
+    ) -> bool:
+        return (
+            self.client_id == str(client_id or "").strip()
+            and self.execution_mode == _canonical_execution_mode(execution_mode)
+            and self._bound_broker is broker
+            and self._bound_exit_engine is exit_engine
+            and self.bound_account_id == _broker_account_id(broker)
+        )
+
+    def binding_snapshot(self) -> dict:
+        return {
+            "monitor_instance_id": self.monitor_instance_id,
+            "client_id": self.client_id,
+            "execution_mode": self.execution_mode or "unknown",
+            "broker_identity": self.bound_broker_identity,
+            "account_id": self.bound_account_id,
+            "exit_engine_identity": self.bound_exit_engine_identity,
+            "started_at": self.started_at,
+        }
+
     def last_cycle_age_sec(self) -> float:
-        return time.time() - self._last_cycle_ts
+        if self._last_cycle_success_ts <= 0:
+            return float("inf")
+        return time.time() - self._last_cycle_success_ts
 
     def is_healthy(self) -> bool:
-        return self.is_alive() and self.last_cycle_age_sec() <= HEARTBEAT_DEGRADED_SEC
+        return (
+            self.is_alive()
+            and self._consecutive_failures == 0
+            and self._last_cycle_complete_coverage
+            and self.last_cycle_age_sec() <= HEARTBEAT_DEGRADED_SEC
+        )
 
     def metrics_snapshot(self) -> dict:
         m = dict(self._metrics)
         m["last_cycle_age_sec"] = round(self.last_cycle_age_sec(), 2)
         m["consecutive_failures"] = self._consecutive_failures
+        m["last_cycle_attempt_ts"] = self._last_cycle_attempt_ts
+        m["last_cycle_success_ts"] = self._last_cycle_success_ts
+        m["last_cycle_completed_ts"] = self._last_cycle_completed_ts
+        m["last_cycle_error"] = self._last_cycle_error
+        m["last_cycle_complete_coverage"] = (
+            self._last_cycle_complete_coverage
+        )
+        m["last_cycle_coverage"] = dict(self._last_cycle_coverage)
+        m["health_key"] = self._health_key
+        m["cache_namespace"] = self._cache_namespace
+        m["binding"] = self.binding_snapshot()
         m["direct_writes"] = DIRECT_POSITION_WRITES
         return m
 
@@ -529,7 +652,10 @@ class APPositionQuoteMonitor:
         if cleaned:
             with _SHARED_CACHE_LOCK:
                 for sym in due:
-                    if _SHARED_CACHE.pop(sym, None) is not None:
+                    if _SHARED_CACHE.pop(self._cache_key(sym), None) is not None:
+                        self._metrics["immediate_retry_evictions"] += 1
+                    elif _SHARED_CACHE.pop(sym, None) is not None:
+                        # Transitional cleanup for pre-namespace cache entries.
                         self._metrics["immediate_retry_evictions"] += 1
                     self._last_immediate_refresh_ts[sym] = now
         self._kick.set()
@@ -567,7 +693,7 @@ class APPositionQuoteMonitor:
         try:
             from ap_health_registry import HEALTH as _QPM_HEALTH, Criticality as _QPM_CRIT
             _QPM_HEALTH.ensure_registered(
-                "ap_quote_monitor", _QPM_CRIT.CRITICAL, stale_after_s=30.0
+                self._health_key, _QPM_CRIT.HIGH, stale_after_s=30.0
             )
             _qpm_health_available = True
         except Exception:
@@ -578,25 +704,62 @@ class APPositionQuoteMonitor:
             interval = self._interval if _is_market_hours() else POLL_OFFHOURS_SEC
             try:
                 self._refresh_in_progress = True
-                self._last_cycle_started_ts = time.time()
-                self._refresh_once()
+                self._last_cycle_attempt_ts = time.time()
+                self._last_cycle_started_ts = self._last_cycle_attempt_ts
+                coverage = self._refresh_once()
                 self._consecutive_failures = 0
-                # Heartbeat on every successful cycle so health registry knows QPM is alive.
-                if _qpm_health_available:
-                    try:
-                        from ap_health_registry import HEALTH as _QPM_HEALTH
-                        _QPM_HEALTH.heartbeat(
-                            "ap_quote_monitor",
-                            metrics={
-                                "cycles":               self._metrics.get("cycles", 0),
-                                "consecutive_failures": self._consecutive_failures,
-                                "positions_tracked":    len(self._health),
-                            },
-                        )
-                    except Exception:
-                        pass
+                self._last_cycle_coverage = (
+                    dict(coverage) if isinstance(coverage, dict) else {}
+                )
+                complete_coverage = bool(
+                    self._last_cycle_coverage.get("complete_coverage", False)
+                )
+                self._last_cycle_complete_coverage = complete_coverage
+                coverage_metrics = {
+                    "cycles": self._metrics.get("cycles", 0),
+                    "consecutive_failures": self._consecutive_failures,
+                    **self._last_cycle_coverage,
+                }
+                if complete_coverage:
+                    self._last_cycle_error = ""
+                    self._last_cycle_success_ts = time.time()
+                    # Compatibility alias: complete-coverage success time.
+                    self._last_cycle_ts = self._last_cycle_success_ts
+                    self._coverage_degraded_reported = False
+                    if _qpm_health_available:
+                        try:
+                            from ap_health_registry import HEALTH as _QPM_HEALTH
+                            _QPM_HEALTH.heartbeat(
+                                self._health_key,
+                                metrics=coverage_metrics,
+                            )
+                        except Exception:
+                            pass
+                else:
+                    self._last_cycle_error = "incomplete_quote_coverage"
+                    self._metrics["coverage_incomplete_cycles"] += 1
+                    if (
+                        _qpm_health_available
+                        and not self._coverage_degraded_reported
+                    ):
+                        try:
+                            from ap_health_registry import (
+                                HEALTH as _QPM_HEALTH,
+                                HealthStatus as _QPM_STATUS,
+                            )
+                            _QPM_HEALTH.set_status(
+                                self._health_key,
+                                _QPM_STATUS.DEGRADED,
+                                reason=self._last_cycle_error,
+                                metrics=coverage_metrics,
+                            )
+                            self._coverage_degraded_reported = True
+                        except Exception:
+                            pass
             except Exception as e:
                 self._consecutive_failures += 1
+                self._last_cycle_complete_coverage = False
+                self._last_cycle_error = f"{type(e).__name__}: {e}"
                 log.error("[%s] QuoteMonitor cycle error (%d): %s",
                           self.client_id, self._consecutive_failures, e,
                           exc_info=self._consecutive_failures <= 3)
@@ -604,7 +767,7 @@ class APPositionQuoteMonitor:
                     try:
                         from ap_health_registry import HEALTH as _QPM_HEALTH
                         _QPM_HEALTH.report_error(
-                            "ap_quote_monitor",
+                            self._health_key,
                             f"cycle_error_x{self._consecutive_failures}: {e}",
                             fatal=False,
                         )
@@ -612,8 +775,7 @@ class APPositionQuoteMonitor:
                         pass
             finally:
                 self._refresh_in_progress = False
-                self._last_cycle_ts = time.time()
-                self._last_cycle_completed_ts = self._last_cycle_ts
+                self._last_cycle_completed_ts = time.time()
 
             triggered = self._kick.wait(timeout=interval)
             if triggered:
@@ -625,12 +787,17 @@ class APPositionQuoteMonitor:
     def _refresh_once(self):
         self._cycles += 1
         self._metrics["cycles"] += 1
-        self._last_cycle_ts = time.time()
 
         positions = list(self.exit_engine.active_positions() or [])
         if not positions:
             self._prune_closed(set(), set())
-            return
+            return {
+                "active_positions": 0,
+                "positions_fully_fresh": 0,
+                "positions_stale_or_blind": 0,
+                "position_state_propagation_ok": True,
+                "complete_coverage": True,
+            }
 
         active_ids: set[str] = set()
         active_contracts: set[str] = set()
@@ -658,6 +825,7 @@ class APPositionQuoteMonitor:
         now_utc = _utc_now()
         wake_engine = False
         snapshots = []
+        positions_fully_fresh = 0
 
         engine_lock = getattr(self.exit_engine, "_lock", None)
         lock_ctx = engine_lock if engine_lock is not None else _NullCtx()
@@ -1156,15 +1324,25 @@ class APPositionQuoteMonitor:
                 })
 
                 self._classify_health(pid, c, t, pos)
+                if (
+                    _opt_bid_valid
+                    and _opt_quote_fresh
+                    and _und_available
+                    and _und_fresh
+                ):
+                    positions_fully_fresh += 1
 
         applier = (
             getattr(self.exit_engine, "applyquotesnapshots", None)
             or getattr(self.exit_engine, "apply_quote_snapshots", None)
         )
+        position_state_propagation_ok = bool(DIRECT_POSITION_WRITES)
         if callable(applier):
             try:
                 applier(snapshots)
+                position_state_propagation_ok = True
             except Exception as exc:
+                position_state_propagation_ok = False
                 log.warning("[%s] apply_quote_snapshots failed: %s", self.client_id, exc)
 
         self._prune_closed(active_ids, active_contracts)
@@ -1180,6 +1358,23 @@ class APPositionQuoteMonitor:
                     waker.set()
                 except Exception as _e:
                     log.debug("quote_monitor_waker_set_failed: %s", _e)
+
+        active_position_count = len(positions)
+        complete_coverage = (
+            positions_fully_fresh == active_position_count
+            and position_state_propagation_ok
+        )
+        return {
+            "active_positions": active_position_count,
+            "positions_fully_fresh": positions_fully_fresh,
+            "positions_stale_or_blind": (
+                active_position_count - positions_fully_fresh
+            ),
+            "position_state_propagation_ok": (
+                position_state_propagation_ok
+            ),
+            "complete_coverage": complete_coverage,
+        }
 
     # ── Wake gating (price threshold + cooldown) ────────────────────────────
     def _should_wake(self, contract: str, opt_price: float) -> bool:
@@ -1681,6 +1876,15 @@ class APPositionQuoteMonitor:
             self._tp_pending_confirm.pop(k, None)
 
     # ── Quote fetch (shared cache + 429 backoff) ─────────────────────────────
+    def _cache_key(self, symbol: str) -> str:
+        namespace = getattr(self, "_cache_namespace", "")
+        if not namespace:
+            namespace = _market_data_source_identity(
+                getattr(self, "broker", None),
+                getattr(self, "execution_mode", ""),
+            )
+        return f"{namespace}|{str(symbol or '').upper().strip()}"
+
     def _fetch_batch_cached(self, symbols: list[str]) -> dict[str, dict]:
         if not symbols:
             return {}
@@ -1690,7 +1894,7 @@ class APPositionQuoteMonitor:
 
         with _SHARED_CACHE_LOCK:
             for s in symbols:
-                row = _SHARED_CACHE.get(s)
+                row = _SHARED_CACHE.get(self._cache_key(s))
                 if row and now - row.get("ts", 0.0) <= CACHE_TTL_SEC:
                     cached = dict(row["quote"] or {})
                     cached["_ap_receipt_epoch"] = row.get("ts", 0.0)
@@ -1714,7 +1918,10 @@ class APPositionQuoteMonitor:
                 for s, q in fresh.items():
                     q_with_receipt = dict(q or {})
                     q_with_receipt["_ap_receipt_epoch"] = ts
-                    _SHARED_CACHE[s] = {"quote": q_with_receipt, "ts": ts}
+                    _SHARED_CACHE[self._cache_key(s)] = {
+                        "quote": q_with_receipt,
+                        "ts": ts,
+                    }
                     out[s] = q_with_receipt
             self._rate_limit_backoff_sec = RATE_LIMIT_BACKOFF_BASE_SEC
         return out
