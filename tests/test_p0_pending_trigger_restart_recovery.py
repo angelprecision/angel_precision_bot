@@ -1216,8 +1216,49 @@ class TestAmendment10Required:
 
     def test_enter_canonical_retry_respects_max_attempts_env(self):
         """Retry exhaustion uses DEFERRED_MATERIALIZATION_MAX_ATTEMPTS, not a
-        PR #328-invented env var."""
+        PR #328-invented env var. Default is 5 total attempts; env override respected.
+        Default retry delay is 8 seconds (BREACH_SELECTOR_RETRY_DELAY_SECONDS)."""
         import os as _os
+        from datetime import datetime, timezone
+
+        # Part 1: default max=5 — attempts=5 + 1 = 6 > max=5 → terminalize.
+        _os.environ.pop("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", None)
+        _os.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+        try:
+            osm = _MockOSM()
+            r5 = _row(meta={"trigger_price": 450.0, _MAT_ATTEMPTS_FIELD: 5})
+            osm.seed(r5)
+            rec5, _ = _make_recovery(r5, osm=osm)
+            outcome5 = rec5._enter_canonical_retry(r5["local_order_id"], r5, reason="exhausted_default")
+            assert outcome5 == _RowOutcome.TERMINALIZED, (
+                f"Default max=5: attempts=5+1=6 > max=5 must terminalize; got {outcome5}"
+            )
+        finally:
+            _os.environ.pop("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", None)
+            _os.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+
+        # Part 2: default delay=8s — verify _MAT_NEXT_RETRY_AT is ~8 seconds ahead.
+        _os.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+        try:
+            osm2 = _MockOSM()
+            r_delay = _row(meta={"trigger_price": 450.0})
+            r_delay["contract"] = "DEFERRED:SPY"
+            osm2.seed(r_delay)
+            rec_delay, _ = _make_recovery(r_delay, osm=osm2)
+            _before = datetime.now(timezone.utc)
+            rec_delay._enter_canonical_retry(r_delay["local_order_id"], r_delay, reason="delay_probe")
+            all_meta2 = {k: v for oid, patch in osm2.meta_writes for k, v in patch.items()}
+            _next_at = all_meta2.get(_MAT_NEXT_RETRY_AT)
+            assert _next_at is not None, "Default delay: _MAT_NEXT_RETRY_AT must be written"
+            _next_dt = datetime.fromisoformat(_next_at)
+            _delta = (_next_dt - _before).total_seconds()
+            assert 5 <= _delta <= 15, (
+                f"Default retry delay must be ~8 seconds; got {_delta:.1f}s"
+            )
+        finally:
+            _os.environ.pop("BREACH_SELECTOR_RETRY_DELAY_SECONDS", None)
+
+        # Part 3: explicit env override (max=1) still respected.
         _os.environ["DEFERRED_MATERIALIZATION_MAX_ATTEMPTS"] = "1"
         try:
             osm = _MockOSM()

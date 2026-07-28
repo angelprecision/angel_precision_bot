@@ -116,7 +116,7 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # Reason codes in this set mean the chain provider had a temporary data miss —
 # NOT a real contract-quality or risk reject.  On a retryable miss the deferred
 # row must NOT be expired/cancelled; instead it is rearmed for retry up to
-# MAX_BREACH_SELECTOR_RETRIES times (default 3) before giving up.
+# MAX_BREACH_SELECTOR_RETRIES times (default 5) before giving up.
 #
 # Quality rejects (SPREAD_TOO_WIDE, DELTA_OUT_OF_RANGE, OI_TOO_LOW, etc.) and
 # fundamental blocks (EARNINGS_LOCKOUT, UNTRADEABLE_FOR_ACCOUNT_SIZE, etc.) are
@@ -133,8 +133,8 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 # emitted by older selector paths that could still surface in edge cases.
 #
 # Env overrides:
-#   MAX_BREACH_SELECTOR_RETRIES          default 3
-#   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 20
+#   MAX_BREACH_SELECTOR_RETRIES          default 5
+#   BREACH_SELECTOR_RETRY_DELAY_SECONDS  default 8
 #   BREACH_SELECTOR_RETRY_CUTOFF_ET      default 1530 (= 3:30 PM ET; last-entry
 #                                        boundary — see _breach_retry_cutoff_hhmm)
 # ── Seam 3 (PR #323): canonical retry taxonomy now lives in one place ──────────
@@ -479,7 +479,7 @@ def _is_ladder_exhaustion_retryable(ladder_audit: Optional[dict]) -> bool:
 # (matches ap_entry_watcher EOD disarm and ap/order_monitor
 # _PT_ORPHAN_EOD_CUTOFF). Total retry span per order remains bounded by
 # MAX_BREACH_SELECTOR_RETRIES × BREACH_SELECTOR_RETRY_DELAY_SECONDS
-# (default 3 × 20s = ~60s), so this cannot cause open-ended retry loops;
+# (default 5 × 8s = ~40s), so this cannot cause open-ended retry loops;
 # the cutoff only stops NEW retries from being scheduled into the close.
 # Env var name is unchanged so the operational kill-switch muscle memory
 # ("set BREACH_SELECTOR_RETRY_CUTOFF_ET=0 to stop all retries") still works.
@@ -2436,9 +2436,9 @@ class APExecutionCore:
             _durable_max = 0
         if _durable_max <= 0:
             try:
-                _durable_max = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
+                _durable_max = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "5"))
             except (TypeError, ValueError):
-                _durable_max = 3
+                _durable_max = 5
         max_attempts = _durable_max
         if _expected_attempt > max_attempts:
             return _term("RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
@@ -2554,9 +2554,9 @@ class APExecutionCore:
         # transitions out of MATERIALIZING before we return — never
         # leave the row stranded at MATERIALIZING until lease expiry.
         try:
-            _retry_delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+            _retry_delay = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "8"))
         except (TypeError, ValueError):
-            _retry_delay = 20
+            _retry_delay = 8
 
         def _schedule_retry_wait(reason_code: str, selector_failure: dict | None = None) -> dict:
             """Write a durable RETRY_WAIT row; return truthful disposition.
@@ -4547,8 +4547,8 @@ class APExecutionCore:
                     # an emergency kill switch (set to "0" to disable without
                     # a code deploy).
                     _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
-                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "3"))
-                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"))
+                    _MAX_RETRIES_A      = int(os.getenv("MAX_BREACH_SELECTOR_RETRIES", "5"))
+                    _RETRY_DELAY_A      = int(os.getenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "8"))
                     # P0 (2026-07-02): cutoff default moved 945 → 1530. See
                     # _breach_retry_cutoff_hhmm() for the full forensic note.
                     _RETRY_CUTOFF_A     = _breach_retry_cutoff_hhmm()

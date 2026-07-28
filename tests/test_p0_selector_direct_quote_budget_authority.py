@@ -269,7 +269,7 @@ class TestConfigurationAuthority:
             ({"SELECTOR_MAX_DIRECT_QUOTE_CALLS": "20"}, 20, "SELECTOR_MAX_DIRECT_QUOTE_CALLS", False),
             ({"DIRECT_QUOTE_RECOVERY_TOP_N": "8"}, 8, "DIRECT_QUOTE_RECOVERY_TOP_N", False),
             ({"CONTRACT_REVALIDATE_TOP_N": "20"}, 20, "CONTRACT_REVALIDATE_TOP_N", False),
-            ({}, 5, "default", False),
+            ({}, 40, "default", False),
         ],
     )
     def test_budget_precedence(self, env, limit, source, conflict):
@@ -305,12 +305,31 @@ class TestConfigurationAuthority:
         assert diag["direct_quote_budget"]["effective_limit"] == 20
         assert diag["direct_quote_budget"]["direct_recovery_alias"] == 8
 
+        # Verify default context (all relevant env vars absent) uses raised limits.
+        for _ev in (
+            "SELECTOR_MAX_DIRECT_QUOTE_CALLS",
+            "DIRECT_QUOTE_RECOVERY_TOP_N",
+            "CONTRACT_REVALIDATE_TOP_N",
+            "SELECTOR_MAX_EXPIRATION_CALLS",
+            "SELECTOR_MAX_CHAIN_CALLS",
+            "SELECTOR_MAX_TOTAL_ELAPSED_MS",
+        ):
+            monkeypatch.delenv(_ev, raising=False)
+        ctx_default = _new_selector_request_context("SPY", "live")
+        assert ctx_default.max_direct_quote_calls == 40
+        assert ctx_default.effective_direct_quote_limit == 40
+        assert ctx_default.max_expiration_calls == 3
+        assert ctx_default.max_chain_calls == 8
+        assert ctx_default.max_total_elapsed_ms == 25000
+
 
 class TestOneAuthority:
     def test_twentieth_call_allowed_twenty_first_skipped(self):
+        # Renamed boundary: now proves 40th call allowed and 41st rejected
+        # (default budget raised from 20 → 40; test name preserved per spec).
         broker = MagicMock()
         broker.get_quote.return_value = {"bid": 1.10, "ask": 1.20}
-        ctx = _ctx(20)
+        ctx = _ctx(40)
 
         results = [
             revalidate_with_direct_quote(
@@ -320,15 +339,15 @@ class TestOneAuthority:
                 market_open_override=True,
                 request_context=ctx,
             )
-            for idx in range(21)
+            for idx in range(41)
         ]
 
-        assert broker.get_quote.call_count == 20
-        assert results[19]["action"] == "PASS"
-        assert results[20]["action"] == "SKIP_BUDGET_EXHAUSTED"
-        assert results[20]["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert broker.get_quote.call_count == 40
+        assert results[39]["action"] == "PASS"
+        assert results[40]["action"] == "SKIP_BUDGET_EXHAUSTED"
+        assert results[40]["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         diag = _selector_request_diagnostics(ctx)
-        assert diag["direct_quote_budget"]["used"] == 20
+        assert diag["direct_quote_budget"]["used"] == 40
         assert diag["direct_quote_budget"]["remaining"] == 0
 
     def test_canonical_twenty_legacy_eight_allows_ninth_call(self, monkeypatch):

@@ -168,10 +168,10 @@ class SelectorRequestContext:
     started_at_monotonic: float = 0.0
     legacy_fallback_used: bool = False
     execution_mode: str = "unknown"
-    max_expiration_calls: int = 2
-    max_chain_calls: int = 6
-    max_direct_quote_calls: int = 5
-    effective_direct_quote_limit: int = 5
+    max_expiration_calls: int = 3
+    max_chain_calls: int = 8
+    max_direct_quote_calls: int = 40
+    effective_direct_quote_limit: int = 40
     direct_quote_budget_source: str = "default"
     direct_quote_budget_conflict: bool = False
     direct_quote_budget_conflict_detail: str | None = None
@@ -191,7 +191,7 @@ class SelectorRequestContext:
     direct_quote_unattempted_set: set[str] = field(default_factory=set)
     direct_quote_unattempted_count: int = 0
     direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
-    max_total_elapsed_ms: int = 15000
+    max_total_elapsed_ms: int = 25000
     budget_exhausted_stage: str | None = None
     budget_exhausted_detail: str | None = None
     expiration_http_status: int | None = None
@@ -656,7 +656,7 @@ def _resolve_direct_quote_budget_config(env=None) -> DirectQuoteBudgetConfig:
         effective = contract_revalidate
         source = "CONTRACT_REVALIDATE_TOP_N"
     else:
-        effective = 5
+        effective = 40
         source = "default"
 
     return DirectQuoteBudgetConfig(
@@ -680,8 +680,8 @@ def _new_selector_request_context(
         direct_quote_attempts_remaining=budget_cfg.effective_limit,
         started_at_monotonic=time.monotonic(),
         execution_mode=str(execution_mode or "unknown").lower(),
-        max_expiration_calls=_positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 2),
-        max_chain_calls=_positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 6),
+        max_expiration_calls=_positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 3),
+        max_chain_calls=_positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 8),
         max_direct_quote_calls=budget_cfg.effective_limit,
         effective_direct_quote_limit=budget_cfg.effective_limit,
         direct_quote_budget_source=budget_cfg.source,
@@ -696,7 +696,7 @@ def _new_selector_request_context(
         configured_contract_revalidate_top_n=(
             int(budget_cfg.contract_revalidate_raw) if budget_cfg.contract_revalidate_raw and budget_cfg.contract_revalidate_raw.isdigit() else None
         ),
-        max_total_elapsed_ms=_positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 15000),
+        max_total_elapsed_ms=_positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 25000),
     )
 
 
@@ -820,7 +820,7 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
     if ctx is None:
         return {}
     direct_quote_used = int(ctx.provider_call_counts.get("direct_quote_calls", 0) or 0)
-    effective_direct_quote_limit = int(ctx.effective_direct_quote_limit or ctx.max_direct_quote_calls or 5)
+    effective_direct_quote_limit = int(ctx.effective_direct_quote_limit or ctx.max_direct_quote_calls or 40)
     direct_quote_remaining = max(0, effective_direct_quote_limit - direct_quote_used)
     return {
         "underlying_quote_calls": int(ctx.provider_call_counts.get("underlying_quote_calls", 0) or 0),

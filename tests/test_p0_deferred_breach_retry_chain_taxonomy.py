@@ -131,9 +131,8 @@ def test_retryable_chain_failure_rearms_without_submit_or_terminalize(monkeypatc
     watched = _make_watched()
     with monkeypatch.context() as m:
         m.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
-        m.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
-        m.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
         m.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "945")
+        # breach_attempt_count=0 (attempt 1 of default max=5): must continue, not terminalize.
         core._on_entry_trigger(watched)
 
     core.order_state_machine.submit_existing_entry.assert_not_called()
@@ -146,6 +145,14 @@ def test_retryable_chain_failure_rearms_without_submit_or_terminalize(monkeypatc
     update_meta = core.order_state_machine.update_order_meta.call_args[0][1]
     assert update_meta["contract_selection_status"] == "CONTRACT_SELECTION_RETRY"
     assert update_meta["last_breach_selector_audit"]["execution_mode"] == "live"
+    # Verify default retry delay is 8 seconds (not 20).
+    src = open("ap_execution_core.py").read()
+    assert 'BREACH_SELECTOR_RETRY_DELAY_SECONDS", "8"' in src, (
+        "Default BREACH_SELECTOR_RETRY_DELAY_SECONDS must be '8', not '20'"
+    )
+    assert 'BREACH_SELECTOR_RETRY_DELAY_SECONDS", "20"' not in src, (
+        "Old default '20' for BREACH_SELECTOR_RETRY_DELAY_SECONDS still present"
+    )
 
 
 def test_no_expiration_in_dte_window_rearms_without_terminalizing(monkeypatch):
@@ -182,11 +189,12 @@ def test_no_expiration_in_dte_window_rearms_without_terminalizing(monkeypatch):
 
 
 def test_max_retry_count_terminalizes_exactly_once(monkeypatch):
+    # Part 1: default max=5 — breach_attempt_count=5 (5th total attempt) must terminalize.
     monkeypatch.setattr(ec_mod.APExecutionCore, "_breach_risk_check", lambda self, watched: True)
     monkeypatch.setattr(
         ec_mod.APExecutionCore,
         "_recover_plan_for_revalidation",
-        lambda self, watched: _make_plan(reason_code="CHAIN_PROVIDER_ERROR", breach_attempt_count=3),
+        lambda self, watched: _make_plan(reason_code="CHAIN_PROVIDER_ERROR", breach_attempt_count=5),
     )
     monkeypatch.setattr("ap.queue.write_deferred_breach_last_error", lambda *args, **kwargs: None)
     recorder = _ThreadRecorder()
@@ -195,10 +203,26 @@ def test_max_retry_count_terminalizes_exactly_once(monkeypatch):
     core = _make_core(_Selector("CHAIN_PROVIDER_ERROR"))
     core._on_entry_trigger(_make_watched())
 
-    assert recorder.starts == 0
+    assert recorder.starts == 0, "5th attempt with default max=5 must terminalize, not retry"
     core.order_state_machine.expire_pending_entry.assert_called_once()
     core.order_state_machine.transition.assert_not_called()
     core.order_state_machine.submit_existing_entry.assert_not_called()
+
+    # Part 2: MAX_BREACH_SELECTOR_RETRIES=3 restores the old 3-attempt behavior.
+    core2 = _make_core(_Selector("CHAIN_PROVIDER_ERROR"))
+    monkeypatch.setattr(
+        ec_mod.APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: _make_plan(reason_code="CHAIN_PROVIDER_ERROR", breach_attempt_count=3),
+    )
+    recorder2 = _ThreadRecorder()
+    monkeypatch.setattr(threading, "Thread", recorder2.factory)
+    with monkeypatch.context() as m:
+        m.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
+        core2._on_entry_trigger(_make_watched())
+    assert recorder2.starts == 0, "With MAX_BREACH_SELECTOR_RETRIES=3, 3rd attempt must terminalize"
+    core2.order_state_machine.expire_pending_entry.assert_called_once()
+    core2.order_state_machine.submit_existing_entry.assert_not_called()
 
 
 def test_cutoff_after_945_terminalizes(monkeypatch):
