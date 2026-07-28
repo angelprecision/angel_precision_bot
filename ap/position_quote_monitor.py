@@ -892,9 +892,91 @@ class APPositionQuoteMonitor:
                         now_utc=now_utc,
                     )
                     if recovery.get("ok"):
-                        oq = dict(recovery["option_quote"])
-                        oq["bid_ts"] = recovery["option_provider_ts"]
-                        uq = recovery["underlying_quote"]
+                        # ── Per-component value-cohesion gate (PR #400 amendment #2) ──
+                        # Applied BEFORE any local substitution so the rejected
+                        # recovery payload cannot reach ANY downstream money-path
+                        # calculation via oq/uq/bid/ask/opt_price/und_last.
+                        #
+                        # A recovery component is applicable ONLY when:
+                        #   (a) the ordinary component was stale, AND
+                        #   (b) its recovery provider_ts is STRICTLY NEWER than
+                        #       this position's newest existing observation for
+                        #       that component.
+                        # A fresh ordinary component is ALWAYS authoritative:
+                        # the recovery payload for that component is not
+                        # substituted, not persisted, and does not reach
+                        # hard-reference, executable truth, peak,
+                        # touched-profit, persistence, snapshots, coverage,
+                        # or wake decisions.
+                        # A rejected recovery component is suppressed
+                        # identically to the recovery-failure path so the
+                        # rejected numeric value cannot laundry through the
+                        # locals.
+                        _exist_opt_obs: Optional[datetime] = None
+                        for _f in (
+                            "last_option_bid_update_ts",
+                            "lastoptionbidupdatets",
+                        ):
+                            _raw = _get_attr(pos, _f, default=None)
+                            _norm = normalize_hard_ref_ts(_raw, now_utc=now_utc)
+                            if _norm is not None and (
+                                _exist_opt_obs is None or _norm > _exist_opt_obs
+                            ):
+                                _exist_opt_obs = _norm
+                        _exist_und_obs: Optional[datetime] = None
+                        for _f in (
+                            "last_underlying_quote_update_ts",
+                            "lastunderlyingquoteupdatets",
+                        ):
+                            _raw = _get_attr(pos, _f, default=None)
+                            _norm = normalize_hard_ref_ts(_raw, now_utc=now_utc)
+                            if _norm is not None and (
+                                _exist_und_obs is None or _norm > _exist_und_obs
+                            ):
+                                _exist_und_obs = _norm
+                        _apply_opt = (
+                            not option_fresh
+                            and recovery["option_provider_ts"] is not None
+                            and (
+                                _exist_opt_obs is None
+                                or recovery["option_provider_ts"] > _exist_opt_obs
+                            )
+                        )
+                        _apply_und = (
+                            not underlying_fresh
+                            and recovery["underlying_provider_ts"] is not None
+                            and (
+                                _exist_und_obs is None
+                                or recovery["underlying_provider_ts"] > _exist_und_obs
+                            )
+                        )
+                        recovery["apply_recovered_option"] = _apply_opt
+                        recovery["apply_recovered_underlying"] = _apply_und
+                        recovery["recovery_complete"] = (
+                            (option_fresh or _apply_opt)
+                            and (underlying_fresh or _apply_und)
+                        )
+
+                        # Per-component substitution. Fresh ordinary quotes
+                        # remain the authoritative source; rejected recovery
+                        # components are suppressed identically to the
+                        # recovery-failure branch below.
+                        if _apply_opt:
+                            oq = dict(recovery["option_quote"])
+                            oq["bid_ts"] = recovery["option_provider_ts"]
+                        elif not option_fresh:
+                            oq = dict(oq)
+                            oq["bid"] = 0.0
+                            oq.pop("bid_ts", None)
+                            oq.pop("bid_date", None)
+                            oq.pop("bid_timestamp", None)
+                        # else: option_fresh — keep ordinary oq as-is.
+
+                        if _apply_und:
+                            uq = recovery["underlying_quote"]
+                        elif not underlying_fresh:
+                            uq = {}
+                        # else: underlying_fresh — keep ordinary uq as-is.
                     else:
                         # Underlying stale truth has no separate emergency
                         # authority, so do not apply it. Option ASK/MARK/LAST
@@ -954,18 +1036,40 @@ class APPositionQuoteMonitor:
                 bid = _safe_float(oq.get("bid"), 0.0)
                 ask = _safe_float(oq.get("ask"), 0.0)
                 opt_price, price_source = self._extract_option_price(oq, bid, ask)
+
+                # Per-component observation timestamps: recovery provider_ts
+                # is used ONLY for a component that was actually accepted by
+                # the value-cohesion gate (first pass). Ordinary or rejected
+                # components use now_utc — the observation identity must
+                # travel with the accepted source. (Rejected components have
+                # already been suppressed at the source: oq bid → 0.0 with
+                # bid_ts popped; uq → {}, so their observation_ts will not
+                # be written by the `if bid > 0` / `if opt_price > 0` /
+                # `if und_last > 0` blocks below.  The prior-timestamp
+                # restore block also runs regardless of the specific
+                # substitution outcome.)
+                _apply_opt = bool(
+                    recovery
+                    and recovery.get("ok")
+                    and recovery.get("apply_recovered_option")
+                )
+                _apply_und = bool(
+                    recovery
+                    and recovery.get("ok")
+                    and recovery.get("apply_recovered_underlying")
+                )
+                _is_recovery_ok = bool(recovery and recovery.get("ok"))
+
                 option_observation_ts = (
-                    recovery["option_provider_ts"]
-                    if recovery and recovery.get("ok")
+                    recovery["option_provider_ts"] if _apply_opt else now_utc
+                )
+                underlying_observation_ts = (
+                    recovery["underlying_provider_ts"]
+                    if _apply_und
                     else now_utc
                 )
                 bid_observation_ts = option_observation_ts
-                underlying_observation_ts = (
-                    recovery["underlying_provider_ts"]
-                    if recovery and recovery.get("ok")
-                    else now_utc
-                )
-                if recovery and recovery.get("ok"):
+                if _apply_opt:
                     bid_observation_ts = (
                         self._monotonic_bid_observation_ts(
                             pos,
@@ -976,154 +1080,98 @@ class APPositionQuoteMonitor:
                     recovery["expected_bid_observation_ts"] = (
                         bid_observation_ts
                     )
-                    # ── Value-cohesion gate (PR #400 amendment) ─────────────────
-                    # _monotonic_bid_observation_ts preserves the correct
-                    # observation identity but does NOT prevent an older recovered
-                    # numeric value from being written below.  A value and its
-                    # timestamp must move as an atomic unit; an older provider
-                    # value must never wear the preserved newer timestamp.
-                    # A recovered component is applicable only when its provider
-                    # timestamp is STRICTLY NEWER than the position's existing
-                    # observation for that component.  Equal or older provider
-                    # events are complete no-ops: no position field writes, no
-                    # QuoteAuthority publish, no _last_push_price mutation, and
-                    # no recovery wake.
-                    _exist_opt_obs: Optional[datetime] = None
-                    for _f in (
-                        "last_option_bid_update_ts",
-                        "lastoptionbidupdatets",
-                    ):
-                        _raw = getattr(pos, _f, None)
-                        _norm = normalize_hard_ref_ts(_raw, now_utc=now_utc)
-                        if _norm is not None and (
-                            _exist_opt_obs is None or _norm > _exist_opt_obs
-                        ):
-                            _exist_opt_obs = _norm
-                    _exist_und_obs: Optional[datetime] = None
-                    for _f in (
-                        "last_underlying_quote_update_ts",
-                        "lastunderlyingquoteupdatets",
-                    ):
-                        _raw = getattr(pos, _f, None)
-                        _norm = normalize_hard_ref_ts(_raw, now_utc=now_utc)
-                        if _norm is not None and (
-                            _exist_und_obs is None or _norm > _exist_und_obs
-                        ):
-                            _exist_und_obs = _norm
-                    _apply_opt = (
-                        recovery["option_provider_ts"] is not None
-                        and (
-                            _exist_opt_obs is None
-                            or recovery["option_provider_ts"] > _exist_opt_obs
-                        )
-                    )
-                    _apply_und = (
-                        recovery["underlying_provider_ts"] is not None
-                        and (
-                            _exist_und_obs is None
-                            or recovery["underlying_provider_ts"] > _exist_und_obs
-                        )
-                    )
-                    recovery["apply_recovered_option"] = _apply_opt
-                    recovery["apply_recovered_underlying"] = _apply_und
-                    recovery["recovery_complete"] = (
-                        (option_fresh or _apply_opt)
-                        and (underlying_fresh or _apply_und)
-                    )
-                _is_recovery_ok = bool(recovery and recovery.get("ok"))
-                _skip_und = (
-                    _is_recovery_ok
-                    and not recovery.get("apply_recovered_underlying", True)
-                )
-                _skip_opt = (
-                    _is_recovery_ok
-                    and not recovery.get("apply_recovered_option", True)
-                )
 
-                if not _skip_und:
-                    if und_last > 0:
-                        self._write_field_unconditional(pos, "currentunderlying", und_last)
-                        self._write_field_unconditional(pos, "current_underlying", und_last)
-                        self._write_field_unconditional(pos, "lastunderlyingquoteupdatets", underlying_observation_ts)
-                        self._write_field_unconditional(pos, "last_underlying_quote_update_ts", underlying_observation_ts)
-                        self._write_field_unconditional(pos, "lastunderlyingquotemissingts", None)
-                        self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", None)
-                    else:
-                        self._write_field_unconditional(pos, "lastunderlyingquotemissingts", now_utc)
-                        self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", now_utc)
+                if und_last > 0:
+                    self._write_field_unconditional(pos, "currentunderlying", und_last)
+                    self._write_field_unconditional(pos, "current_underlying", und_last)
+                    self._write_field_unconditional(pos, "lastunderlyingquoteupdatets", underlying_observation_ts)
+                    self._write_field_unconditional(pos, "last_underlying_quote_update_ts", underlying_observation_ts)
+                    self._write_field_unconditional(pos, "lastunderlyingquotemissingts", None)
+                    self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", None)
+                else:
+                    self._write_field_unconditional(pos, "lastunderlyingquotemissingts", now_utc)
+                    self._write_field_unconditional(pos, "last_underlying_quote_missing_ts", now_utc)
 
                 # ── P0 (PR #385 amendment #2, blocker 1): BID is CYCLE truth ─────────
                 # current_bid/current_ask are ALWAYS overwritten from THIS cycle's
-                # broker response — including 0.0 when the bid is absent.  Retaining
-                # the previous poll's bid while a mark/last/ask-only quote refreshed
-                # the general option timestamp made a stale bid masquerade as fresh
-                # executable truth (peak updates, confirmation completion, exits).
-                # A dedicated last_option_bid_update_ts advances ONLY when a real
-                # positive bid arrives, so bid freshness can never be inherited from
-                # a mark-only quote.
-                # Exception: _skip_opt=True means the recovered option provider_ts
-                # is not strictly newer than the existing BID observation.  An older
-                # value must not overwrite the position; treat as a complete no-op.
-                if not _skip_opt:
-                    self._write_field_unconditional(pos, "currentbid", bid if bid > 0 else 0.0)
-                    self._write_field_unconditional(pos, "current_bid", bid if bid > 0 else 0.0)
-                    self._write_field_unconditional(pos, "currentask", ask if ask > 0 else 0.0)
-                    self._write_field_unconditional(pos, "current_ask", ask if ask > 0 else 0.0)
-                    if bid > 0:
-                        self._write_field_unconditional(pos, "lastoptionbidupdatets", bid_observation_ts)
-                        self._write_field_unconditional(pos, "last_option_bid_update_ts", bid_observation_ts)
+                # accepted-source oq — including 0.0 when the bid is absent
+                # (whether because the ordinary quote was fresh-with-no-bid, or
+                # because the source has already been suppressed by the
+                # first-pass value-cohesion gate).  The dedicated
+                # last_option_bid_update_ts advances ONLY when a real positive
+                # bid arrives, so bid freshness can never be inherited from a
+                # mark-only quote or from a rejected recovery payload.
+                self._write_field_unconditional(pos, "currentbid", bid if bid > 0 else 0.0)
+                self._write_field_unconditional(pos, "current_bid", bid if bid > 0 else 0.0)
+                self._write_field_unconditional(pos, "currentask", ask if ask > 0 else 0.0)
+                self._write_field_unconditional(pos, "current_ask", ask if ask > 0 else 0.0)
+                if bid > 0:
+                    self._write_field_unconditional(pos, "lastoptionbidupdatets", bid_observation_ts)
+                    self._write_field_unconditional(pos, "last_option_bid_update_ts", bid_observation_ts)
 
-                if not _skip_opt:
-                    if opt_price > 0:
-                        self._write_field(pos, "currentoptionprice", opt_price)
-                        self._write_field(pos, "current_option_price", opt_price)
-                        self._write_field_unconditional(pos, "lastoptionquoteupdatets", option_observation_ts)
-                        self._write_field_unconditional(pos, "last_option_quote_update_ts", option_observation_ts)
-                        self._write_field_unconditional(pos, "lastquoteupdatets", option_observation_ts)
-                        self._write_field_unconditional(pos, "last_option_price_source", price_source)
-                        self._write_field_unconditional(pos, "lastoptionpricesource", price_source)
-                        self._write_field_unconditional(pos, "lastoptionquotemissingts", None)
-                        self._write_field_unconditional(pos, "last_option_quote_missing_ts", None)
+                if opt_price > 0:
+                    self._write_field(pos, "currentoptionprice", opt_price)
+                    self._write_field(pos, "current_option_price", opt_price)
+                    self._write_field_unconditional(pos, "lastoptionquoteupdatets", option_observation_ts)
+                    self._write_field_unconditional(pos, "last_option_quote_update_ts", option_observation_ts)
+                    self._write_field_unconditional(pos, "lastquoteupdatets", option_observation_ts)
+                    self._write_field_unconditional(pos, "last_option_price_source", price_source)
+                    self._write_field_unconditional(pos, "lastoptionpricesource", price_source)
+                    self._write_field_unconditional(pos, "lastoptionquotemissingts", None)
+                    self._write_field_unconditional(pos, "last_option_quote_missing_ts", None)
 
-                        # ── Publish to QuoteAuthority so Exit Engine can consume ──
-                        # QPM is the ONLY authorized writer. Exit engine reads from
-                        # QUOTES.get_fresh() — never fetches independently.
-                        # AMENDMENT #6 (blocker 4): 'last' must be raw broker LAST,
-                        # never the synthetic opt_price fallback.  opt_price can
-                        # itself be an ASK-fallback which would launder ASK as LAST
-                        # for downstream hard-exit authority.
-                        _raw_broker_last = _safe_float(oq.get("last"), 0.0)
-                        try:
-                            from ap_quote_authority import QUOTES as _QA
-                            _und_px = _safe_float(
-                                _get_attr(pos, "currentunderlying", "current_underlying", default=None), 0.0
-                            )
-                            _QA.write(
-                                writer_id        = "ap_position_quote_monitor",
-                                symbol           = c,
-                                underlying       = t,
-                                bid              = bid if bid > 0 else 0.0,
-                                ask              = ask if ask > 0 else 0.0,
-                                last             = _raw_broker_last,     # raw, not opt_price
-                                underlying_price = _und_px,
-                                source           = price_source,
-                            )
-                        except Exception as _qa_err:
-                            log.debug("[%s] QuoteAuthority write failed for %s: %s",
-                                      self.client_id, c, _qa_err)
+                    # ── Publish to QuoteAuthority so Exit Engine can consume ──
+                    # QPM is the ONLY authorized writer. Exit engine reads from
+                    # QUOTES.get_fresh() — never fetches independently.
+                    # AMENDMENT #6 (blocker 4): 'last' must be raw broker LAST,
+                    # never the synthetic opt_price fallback.  opt_price can
+                    # itself be an ASK-fallback which would launder ASK as LAST
+                    # for downstream hard-exit authority.
+                    _raw_broker_last = _safe_float(oq.get("last"), 0.0)
+                    try:
+                        from ap_quote_authority import QUOTES as _QA
+                        _und_px = _safe_float(
+                            _get_attr(pos, "currentunderlying", "current_underlying", default=None), 0.0
+                        )
+                        _QA.write(
+                            writer_id        = "ap_position_quote_monitor",
+                            symbol           = c,
+                            underlying       = t,
+                            bid              = bid if bid > 0 else 0.0,
+                            ask              = ask if ask > 0 else 0.0,
+                            last             = _raw_broker_last,     # raw, not opt_price
+                            underlying_price = _und_px,
+                            source           = price_source,
+                        )
+                    except Exception as _qa_err:
+                        log.debug("[%s] QuoteAuthority write failed for %s: %s",
+                                  self.client_id, c, _qa_err)
 
-                        if (
-                            not _is_recovery_ok
-                            and self._should_wake(c, opt_price)
-                        ):
-                            wake_engine = True
-                        self._last_push_price[c] = opt_price
-                    else:
-                        self._write_field_unconditional(pos, "lastoptionquotemissingts", now_utc)
-                        self._write_field_unconditional(pos, "last_option_quote_missing_ts", now_utc)
+                    # Ordinary wake condition: only when this cycle is NOT a
+                    # recovery cycle. When _is_recovery_ok is True, the wake
+                    # fires at end-of-recovery only if recovery_complete=True.
+                    if (
+                        not _is_recovery_ok
+                        and self._should_wake(c, opt_price)
+                    ):
+                        wake_engine = True
+                    self._last_push_price[c] = opt_price
+                else:
+                    self._write_field_unconditional(pos, "lastoptionquotemissingts", now_utc)
+                    self._write_field_unconditional(pos, "last_option_quote_missing_ts", now_utc)
 
-                if recovery and not recovery.get("ok"):
-                    if not option_fresh:
+                # Restore prior timestamps for any component that ended up
+                # stale-and-not-recovered.  This covers both the
+                # recovery-failure path (recovery.get("ok") is False) AND
+                # the recovery-ok-but-component-rejected path (recovery
+                # succeeded but the value-cohesion gate rejected THIS
+                # component).  In either sub-case, the ordinary path may have
+                # written now_utc to option/underlying timestamps via a
+                # fallback price (e.g. ask-only when bid was suppressed) —
+                # roll those forward to prior_*_ts so freshness cannot be
+                # falsified.
+                if recovery:
+                    if not option_fresh and not _apply_opt:
                         self._write_field_unconditional(
                             pos, "lastoptionquoteupdatets", prior_opt_ts
                         )
@@ -1135,7 +1183,7 @@ class APPositionQuoteMonitor:
                         self._write_field_unconditional(
                             pos, "lastquoteupdatets", prior_opt_ts
                         )
-                    if not underlying_fresh:
+                    if not underlying_fresh and not _apply_und:
                         self._write_field_unconditional(
                             pos,
                             "lastunderlyingquoteupdatets",
@@ -1554,22 +1602,29 @@ class APPositionQuoteMonitor:
                 })
 
                 if recovery and recovery.get("ok"):
-                    self._write_field_unconditional(
-                        pos,
-                        "last_option_provider_quote_ts",
-                        recovery["option_provider_ts"],
-                    )
-                    self._write_field_unconditional(
-                        pos,
-                        "last_underlying_provider_quote_ts",
-                        recovery["underlying_provider_ts"],
-                    )
-                    snapshots[-1]["last_option_provider_quote_ts"] = recovery[
-                        "option_provider_ts"
-                    ]
-                    snapshots[-1][
-                        "last_underlying_provider_quote_ts"
-                    ] = recovery["underlying_provider_ts"]
+                    # Per-component: only write provider_quote_ts fields for
+                    # components that were actually applied.  A fresh ordinary
+                    # component keeps its own ordinary-path timestamp; a
+                    # rejected recovery component does not launder provider_ts
+                    # onto the position.
+                    if _apply_opt:
+                        self._write_field_unconditional(
+                            pos,
+                            "last_option_provider_quote_ts",
+                            recovery["option_provider_ts"],
+                        )
+                        snapshots[-1]["last_option_provider_quote_ts"] = recovery[
+                            "option_provider_ts"
+                        ]
+                    if _apply_und:
+                        self._write_field_unconditional(
+                            pos,
+                            "last_underlying_provider_quote_ts",
+                            recovery["underlying_provider_ts"],
+                        )
+                        snapshots[-1][
+                            "last_underlying_provider_quote_ts"
+                        ] = recovery["underlying_provider_ts"]
                     recovery["position"] = pos
                     recovery["snapshot"] = snapshots[-1]
                     if recovery.get("recovery_complete", False):
@@ -1615,35 +1670,45 @@ class APPositionQuoteMonitor:
                     )
                 )
                 if exact_position_updated:
-                    expected_fields = {
-                        "last_option_bid_update_ts": recovery[
-                            "expected_bid_observation_ts"
-                        ],
-                        "lastoptionbidupdatets": recovery[
-                            "expected_bid_observation_ts"
-                        ],
-                        "last_option_quote_update_ts": recovery[
-                            "option_provider_ts"
-                        ],
-                        "lastoptionquoteupdatets": recovery[
-                            "option_provider_ts"
-                        ],
-                        "lastquoteupdatets": recovery[
-                            "option_provider_ts"
-                        ],
-                        "last_underlying_quote_update_ts": recovery[
-                            "underlying_provider_ts"
-                        ],
-                        "lastunderlyingquoteupdatets": recovery[
-                            "underlying_provider_ts"
-                        ],
-                        "last_option_provider_quote_ts": recovery[
-                            "option_provider_ts"
-                        ],
-                        "last_underlying_provider_quote_ts": recovery[
-                            "underlying_provider_ts"
-                        ],
-                    }
+                    # Per-component: only verify the fields that were actually
+                    # supposed to be written for this recovery.  A partial
+                    # recovery (option fresh + underlying recovered, or vice
+                    # versa) legitimately leaves the untouched component's
+                    # timestamps at their ordinary-path or prior value.
+                    expected_fields: dict = {}
+                    if recovery.get("apply_recovered_option"):
+                        expected_fields.update({
+                            "last_option_bid_update_ts": recovery[
+                                "expected_bid_observation_ts"
+                            ],
+                            "lastoptionbidupdatets": recovery[
+                                "expected_bid_observation_ts"
+                            ],
+                            "last_option_quote_update_ts": recovery[
+                                "option_provider_ts"
+                            ],
+                            "lastoptionquoteupdatets": recovery[
+                                "option_provider_ts"
+                            ],
+                            "lastquoteupdatets": recovery[
+                                "option_provider_ts"
+                            ],
+                            "last_option_provider_quote_ts": recovery[
+                                "option_provider_ts"
+                            ],
+                        })
+                    if recovery.get("apply_recovered_underlying"):
+                        expected_fields.update({
+                            "last_underlying_quote_update_ts": recovery[
+                                "underlying_provider_ts"
+                            ],
+                            "lastunderlyingquoteupdatets": recovery[
+                                "underlying_provider_ts"
+                            ],
+                            "last_underlying_provider_quote_ts": recovery[
+                                "underlying_provider_ts"
+                            ],
+                        })
                     exact_position_updated = all(
                         getattr(position, field, None) == expected
                         for field, expected in expected_fields.items()
