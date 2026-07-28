@@ -282,6 +282,42 @@ SIGNAL_COMP_ALREADY_ADVANCED   = "SIGNAL_COMP_ALREADY_ADVANCED"  # row advanced 
 SIGNAL_COMP_MISSING            = "SIGNAL_COMP_MISSING"           # row not found
 SIGNAL_COMP_DB_ERROR           = "SIGNAL_COMP_DB_ERROR"          # update or reread raised
 
+# P0 #405 amendment — _persist_watching_signal_if_eligible outcome constants.
+# The INITIAL ap_signals WATCHING establishment is now a guarded read/update/insert,
+# NOT a blind upsert. A stale deferral worker must never overwrite a newer advanced
+# lifecycle state (queued/triggered/submitted/filled/rejected/ERROR) with WATCHING.
+SIGNAL_WATCH_INSERTED         = "SIGNAL_WATCH_INSERTED"          # create-only insert succeeded
+SIGNAL_WATCH_TRANSITIONED     = "SIGNAL_WATCH_TRANSITIONED"      # approved pre-deferral state → WATCHING
+SIGNAL_WATCH_ALREADY_WATCHING = "SIGNAL_WATCH_ALREADY_WATCHING"  # row already exactly WATCHING (idempotent)
+SIGNAL_WATCH_ALREADY_ADVANCED = "SIGNAL_WATCH_ALREADY_ADVANCED"  # row advanced/terminal — preserved untouched
+SIGNAL_WATCH_CONFLICT         = "SIGNAL_WATCH_CONFLICT"          # concurrent race left an unexpected state
+SIGNAL_WATCH_DB_ERROR         = "SIGNAL_WATCH_DB_ERROR"          # read/update/insert raised, or no unique constraint
+
+# Approved pre-deferral ap_signals statuses that may be TRANSITIONED to WATCHING.
+# PROVEN-MINIMAL: an audit of every ap_signals decision_status literal written in
+# this repository (queue.py, morning_handoff.py, etc.) shows enqueue writes ONLY to
+# trade_queue (status NEW) — the deferral is normally the FIRST ap_signals write.
+# The only pre-existing ap_signals statuses are WATCHING (idempotent), queued
+# (order already created — ADVANCED), rejected/ERROR/blocked_at_breach (terminal).
+# There is NO 'received'/'new' ap_signals status in this codebase. Therefore the
+# approved pre-deferral allowlist is intentionally EMPTY: the only ways to establish
+# WATCHING are (1) insert when missing, or (2) idempotent no-op when already WATCHING.
+# Every other existing status is ADVANCED and preserved untouched.
+#
+# This set is the single source of truth for the transition branch. It is kept as a
+# module-level frozenset (not inlined) so a FUTURE proven pre-deferral status can be
+# added in exactly one place — and so the transition machinery remains covered by
+# tests without loosening production behavior today.
+_PRE_DEFERRAL_TRANSITIONABLE_STATUSES: frozenset[str] = frozenset()
+
+# Advanced / terminal ap_signals statuses that must NEVER be overwritten with WATCHING.
+# Used for explicit classification/logging; any status not WATCHING and not in the
+# transitionable allowlist is treated as advanced regardless of membership here.
+_ADVANCED_SIGNAL_STATUSES: frozenset[str] = frozenset({
+    "queued", "triggered", "submitted", "filled", "rejected",
+    "error", "blocked_at_breach", "canceled", "cancelled", "expired", "done",
+})
+
 # P0 #405 — _checked_processing_error_cas outcome constants.
 # Guarded queue ERROR transition: only writes ERROR when the row is still PROCESSING.
 # Replaces the prior unconditional _mark_job(ERROR) on early failure paths inside
@@ -905,6 +941,107 @@ def _get_sb_client():
     return _sb_client_singleton
 
 
+def _build_ap_signal_decision_row(
+    *,
+    signal_id: str,
+    client_id: str,
+    ticker: str,
+    side: str,
+    score: float,
+    stage: str,
+    reason_code: str,
+    human_reason: str,
+    payload: dict,
+    decision_status: str,
+    queued_at: str | None = None,
+) -> dict:
+    """Pure builder for an ap_signals decision row.
+
+    Extracted (P0 #405 amendment) so BOTH the legacy upsert path
+    (`_log_signal_to_db`) and the new guarded WATCHING helper
+    (`_persist_watching_signal_if_eligible`) construct the exact same canonical
+    row shape — no field drift between the two write paths.
+
+    Never raises on malformed input:
+      * a missing signal_id is replaced with a fresh uuid;
+      * a malformed score (e.g. "A+") is coerced via _safe_float;
+      * an invalid side is normalized to "UNKNOWN" with side_validation_error
+        stamped into raw_payload.
+
+    Does NOT touch the database — callers own the write semantics (idempotent
+    upsert vs. guarded create-only insert / expected-state update).
+    """
+    import uuid as _uuid
+
+    _status = str(decision_status or "rejected").strip() or "rejected"
+
+    # PR #233: writing "CALL" for a missing/invalid side here used to
+    # contaminate ap_signals diagnostics with a phantom direction.  We now
+    # write "UNKNOWN" on invalid and surface the validation error inside
+    # raw_payload so operators can grep on side_validation_error to find
+    # malformed scanner output.
+    _payload_for_row = dict(payload or {})
+    _normalized_side, _side_error = _normalize_queue_side({
+        "side":      side or _payload_for_row.get("side"),
+        "direction": _payload_for_row.get("direction"),
+    })
+    _row_side = _normalized_side or "UNKNOWN"
+    if _side_error:
+        _payload_for_row["side_validation_error"] = _side_error
+        _payload_for_row.pop("side", None)
+        _payload_for_row.pop("direction", None)
+
+    _row: dict = {
+        "signal_id":       str(signal_id or _uuid.uuid4()),
+        "client_email":    canonical_client_email(client_id),
+        "system_version":  "v2",
+        "ticker":          str(ticker),
+        "side":            _row_side,
+        # Malformed scanner scores (e.g. "A+") must never raise inside the
+        # row build — _safe_float coerces bad input to the default rather
+        # than throwing (the caller relies on the True/False return, not an
+        # exception, to make its fail-closed decision).
+        "score":           _safe_float(
+            score if score not in (None, "") else _payload_for_row.get("score"),
+            0.0,
+        ),
+        "tier":            str(_payload_for_row.get("tier") or "B"),
+        "pattern":         str(_payload_for_row.get("pattern") or ""),
+        "timeframe":       str(_payload_for_row.get("timeframe") or "1d"),
+        "decision_status": _status,
+        "context_notes":   f"stage={stage} | code={reason_code} | {human_reason}",
+        "raw_payload": {
+            "stage": stage,
+            "reason_code": reason_code,
+            "human_reason": human_reason,
+            **{k: v for k, v in _payload_for_row.items()
+               if k not in ("raw_payload", "signal_payload") and not callable(v)},
+        },
+    }
+
+    # Preserve trigger/level data when present
+    for _src_key, _dst_key in (
+        ("entry_trigger",    "entry_trigger"),
+        ("entry_price",      "entry_trigger"),
+        ("stop_price",       "stop_price"),
+        ("stop_underlying",  "stop_price"),
+        ("target_price",     "target_price"),
+        ("underlying_at_signal", "underlying_at_signal"),
+        ("underlying_price", "underlying_at_signal"),
+    ):
+        try:
+            val = _payload_for_row.get(_src_key)
+            if val is not None and float(val) > 0 and _dst_key not in _row:
+                _row[_dst_key] = float(val)
+        except Exception:
+            pass
+
+    if queued_at:
+        _row["queued_at"] = queued_at
+
+    return _row
+
+
 def _log_signal_to_db(
     signal_id: str,
     client_id: str,
@@ -936,78 +1073,33 @@ def _log_signal_to_db(
     This fixes the bug where market_closed_deferred signals were logged as rejected
     making them invisible to overnight_reeval which queries ap_signals WHERE
     decision_status='WATCHING'.
+
+    NOTE (P0 #405 amendment): the WATCHING lifecycle establishment inside
+    `_persist_watching_deferral()` no longer flows through this unconditional
+    upsert. It uses `_persist_watching_signal_if_eligible()` which performs a
+    guarded read/update/insert so a stale deferral worker can never overwrite a
+    newer advanced lifecycle state with WATCHING. This function retains the
+    legacy idempotent upsert semantics for ordinary rejection diagnostics and
+    for the terminal/failure compensation paths that intentionally overwrite.
     """
     try:
-        import uuid as _uuid
         _sbc = _get_sb_client()
         if _sbc is None:
             return False
 
-        _status = str(decision_status or "rejected").strip() or "rejected"
-
-        # PR #233: writing "CALL" for a missing/invalid side here used to
-        # contaminate ap_signals diagnostics with a phantom direction.  We now
-        # write "UNKNOWN" on invalid and surface the validation error inside
-        # raw_payload so operators can grep on side_validation_error to find
-        # malformed scanner output.
-        _payload_for_row = dict(payload or {})
-        _normalized_side, _side_error = _normalize_queue_side({
-            "side":      side or _payload_for_row.get("side"),
-            "direction": _payload_for_row.get("direction"),
-        })
-        _row_side = _normalized_side or "UNKNOWN"
-        if _side_error:
-            _payload_for_row["side_validation_error"] = _side_error
-            _payload_for_row.pop("side", None)
-            _payload_for_row.pop("direction", None)
-
-        _row: dict = {
-            "signal_id":       str(signal_id or _uuid.uuid4()),
-            "client_email":    canonical_client_email(client_id),
-            "system_version":  "v2",
-            "ticker":          str(ticker),
-            "side":            _row_side,
-            # Malformed scanner scores (e.g. "A+") must never raise inside the
-            # row build — _safe_float coerces bad input to the default rather
-            # than throwing (the caller relies on the True/False return, not an
-            # exception, to make its fail-closed decision).
-            "score":           _safe_float(
-                score if score not in (None, "") else _payload_for_row.get("score"),
-                0.0,
-            ),
-            "tier":            str(_payload_for_row.get("tier") or "B"),
-            "pattern":         str(_payload_for_row.get("pattern") or ""),
-            "timeframe":       str(_payload_for_row.get("timeframe") or "1d"),
-            "decision_status": _status,
-            "context_notes":   f"stage={stage} | code={reason_code} | {human_reason}",
-            "raw_payload": {
-                "stage": stage,
-                "reason_code": reason_code,
-                "human_reason": human_reason,
-                **{k: v for k, v in _payload_for_row.items()
-                   if k not in ("raw_payload", "signal_payload") and not callable(v)},
-            },
-        }
-
-        # Preserve trigger/level data when present
-        for _src_key, _dst_key in (
-            ("entry_trigger",    "entry_trigger"),
-            ("entry_price",      "entry_trigger"),
-            ("stop_price",       "stop_price"),
-            ("stop_underlying",  "stop_price"),
-            ("target_price",     "target_price"),
-            ("underlying_at_signal", "underlying_at_signal"),
-            ("underlying_price", "underlying_at_signal"),
-        ):
-            try:
-                val = _payload_for_row.get(_src_key)
-                if val is not None and float(val) > 0 and _dst_key not in _row:
-                    _row[_dst_key] = float(val)
-            except Exception:
-                pass
-
-        if queued_at:
-            _row["queued_at"] = queued_at
+        _row = _build_ap_signal_decision_row(
+            signal_id=signal_id,
+            client_id=client_id,
+            ticker=ticker,
+            side=side,
+            score=score,
+            stage=stage,
+            reason_code=reason_code,
+            human_reason=human_reason,
+            payload=payload,
+            decision_status=decision_status,
+            queued_at=queued_at,
+        )
 
         upsert_ap_signal_row_with_fallback(_sbc, _row)
         return True
@@ -1128,6 +1220,273 @@ def _compensate_watching_signal_if_unchanged(
             exc_info=True,
         )
         return SIGNAL_COMP_DB_ERROR
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    """Best-effort detection of a composite-key uniqueness conflict.
+
+    The ap_signals writes go through the Supabase (PostgREST) client, which
+    surfaces a duplicate-key insert as an APIError carrying Postgres code 23505.
+    We also recognize psycopg2's UniqueViolation for defensiveness. Anything we
+    cannot positively identify as a uniqueness conflict is treated as NOT a
+    unique violation, so the caller fails closed (SIGNAL_WATCH_DB_ERROR) rather
+    than falling back to an unsafe upsert.
+    """
+    # Structured attributes first (PostgREST APIError exposes .code; some SDK
+    # versions nest it under .args[0] as a dict).
+    code = getattr(exc, "code", None)
+    if code in ("23505", 23505):
+        return True
+    try:
+        import psycopg2  # type: ignore
+        from psycopg2 import errors as _pg_errors  # type: ignore
+        if isinstance(exc, _pg_errors.UniqueViolation):
+            return True
+        if getattr(exc, "pgcode", None) == "23505":
+            return True
+    except Exception:
+        pass
+    # Fall back to a conservative message scan for the canonical Postgres text.
+    msg = str(getattr(exc, "message", "") or exc).lower()
+    return "23505" in msg or "duplicate key value" in msg or "unique constraint" in msg
+
+
+def _classify_existing_signal_status(observed_status: str | None) -> str:
+    """Map a re-read ap_signals.decision_status to a guarded WATCHING outcome.
+
+    Shared by both the update-race and insert-race reread branches so the
+    classification is identical everywhere:
+
+      * exactly "WATCHING"                 → SIGNAL_WATCH_ALREADY_WATCHING
+      * any other non-empty status         → SIGNAL_WATCH_ALREADY_ADVANCED
+        (queued/triggered/submitted/filled/rejected/ERROR/blocked_at_breach/etc.)
+      * None / empty (row vanished)        → SIGNAL_WATCH_CONFLICT
+    """
+    if observed_status is None or str(observed_status).strip() == "":
+        return SIGNAL_WATCH_CONFLICT
+    if str(observed_status) == "WATCHING":
+        return SIGNAL_WATCH_ALREADY_WATCHING
+    return SIGNAL_WATCH_ALREADY_ADVANCED
+
+
+def _persist_watching_signal_if_eligible(
+    *,
+    signal_id: str,
+    client_email: str,
+    ticker: str,
+    side: str,
+    score: float,
+    stage: str,
+    reason_code: str,
+    human_reason: str,
+    payload: dict,
+    queued_at: str,
+) -> str:
+    """Guarded establishment of the ap_signals WATCHING state.
+
+    P0 #405 amendment — replaces the prior unconditional
+    `_log_signal_to_db(... decision_status=WATCHING)` initial write inside
+    `_persist_watching_deferral()`. A stale deferral worker must never overwrite
+    a newer advanced lifecycle state (queued/triggered/submitted/filled/rejected/
+    ERROR/blocked_at_breach) with WATCHING.
+
+    Owns ONLY ap_signals for this exact (signal_id, client_email). Never touches
+    trade_queue, OSM, orders, positions, exits, proof_trades, or any other table,
+    and never takes the queue job_id.
+
+    Allowed ways to establish WATCHING:
+      1. No (signal_id, client_email) row exists → create-only insert.
+      2. The existing row is already exactly WATCHING → idempotent no-op.
+      3. The existing row is in an approved pre-deferral status
+         (`_PRE_DEFERRAL_TRANSITIONABLE_STATUSES`, intentionally EMPTY today) →
+         expected-state update.
+
+    Never falls back to the legacy single-key upsert: a fallback that could
+    overwrite another client's row or an advanced lifecycle state would defeat
+    the entire correction. If the composite uniqueness constraint is unavailable
+    (create-only insert cannot be enforced), returns SIGNAL_WATCH_DB_ERROR and
+    logs loudly rather than failing open to an unsafe write.
+
+    Returns one of the SIGNAL_WATCH_* outcome constants. Never raises.
+    """
+    _client = str(client_email or "")
+    _sig = str(signal_id or "")
+
+    try:
+        _sbc = _get_sb_client()
+        if _sbc is None:
+            log.critical(
+                "_persist_watching_signal_if_eligible: no Supabase client — "
+                "cannot safely establish WATCHING for signal_id=%s client_email=%s",
+                _sig, _client,
+            )
+            return SIGNAL_WATCH_DB_ERROR
+
+        # Build the canonical WATCHING row via the shared builder so there is no
+        # field drift versus _log_signal_to_db.
+        _watching_row = _build_ap_signal_decision_row(
+            signal_id=_sig,
+            client_id=_client,
+            ticker=ticker,
+            side=side,
+            score=score,
+            stage=stage,
+            reason_code=reason_code,
+            human_reason=human_reason,
+            payload=payload,
+            decision_status=DECISION_WATCHING,
+            queued_at=queued_at,
+        )
+        # canonical_client_email may normalize the address — read back the exact
+        # value the row will carry so every .eq() filter matches precisely.
+        _client = str(_watching_row.get("client_email") or _client)
+        _sig = str(_watching_row.get("signal_id") or _sig)
+
+        # ── (1) read the exact existing row ──────────────────────────────────
+        _existing = (
+            _sbc.table("ap_signals")
+            .select("decision_status")
+            .eq("signal_id", _sig)
+            .eq("client_email", _client)
+            .execute()
+        )
+        _rows = getattr(_existing, "data", None) or []
+
+        if _rows:
+            _observed = str(_rows[0].get("decision_status") or "")
+
+            # Already exactly WATCHING → idempotent success, no destructive rewrite.
+            if _observed == DECISION_WATCHING:
+                log.info(
+                    "_persist_watching_signal_if_eligible: already WATCHING "
+                    "signal_id=%s client_email=%s (idempotent).",
+                    _sig, _client,
+                )
+                return SIGNAL_WATCH_ALREADY_WATCHING
+
+            # Not in the approved pre-deferral allowlist → ADVANCED, preserve untouched.
+            if _observed not in _PRE_DEFERRAL_TRANSITIONABLE_STATUSES:
+                log.warning(
+                    "_persist_watching_signal_if_eligible: existing status=%r is not "
+                    "transitionable for signal_id=%s client_email=%s — preserving "
+                    "advanced state (SIGNAL_WATCH_ALREADY_ADVANCED).",
+                    _observed, _sig, _client,
+                )
+                return SIGNAL_WATCH_ALREADY_ADVANCED
+
+            # Approved pre-deferral state → expected-state update fenced on the
+            # exact observed status (fails to zero rows if it changed under us).
+            _upd = (
+                _sbc.table("ap_signals")
+                .update(_watching_row)
+                .eq("signal_id", _sig)
+                .eq("client_email", _client)
+                .eq("decision_status", _observed)
+                .execute()
+            )
+            _updated = getattr(_upd, "data", None) or []
+            if len(_updated) == 1:
+                log.info(
+                    "_persist_watching_signal_if_eligible: TRANSITIONED %r→WATCHING "
+                    "signal_id=%s client_email=%s.",
+                    _observed, _sig, _client,
+                )
+                return SIGNAL_WATCH_TRANSITIONED
+
+            # Zero rows updated — the row changed between read and update. Reread
+            # and classify without mutating anything.
+            _reread = (
+                _sbc.table("ap_signals")
+                .select("decision_status")
+                .eq("signal_id", _sig)
+                .eq("client_email", _client)
+                .execute()
+            )
+            _rr_rows = getattr(_reread, "data", None) or []
+            _now = str(_rr_rows[0].get("decision_status")) if _rr_rows else None
+            _outcome = _classify_existing_signal_status(_now)
+            log.warning(
+                "_persist_watching_signal_if_eligible: expected-state update race "
+                "signal_id=%s client_email=%s expected=%r now=%r → %s",
+                _sig, _client, _observed, _now, _outcome,
+            )
+            return _outcome
+
+        # ── (2) missing row → create-only insert ─────────────────────────────
+        # A blind upsert here could overwrite a row created concurrently by a
+        # newer worker. We require a create-only insert that fails on the
+        # composite-key uniqueness conflict; on conflict we reread and preserve.
+        try:
+            _ins = (
+                _sbc.table("ap_signals")
+                .insert(_watching_row)
+                .execute()
+            )
+        except Exception as _ins_exc:
+            # A uniqueness conflict means another worker inserted the row first.
+            # Reread and classify. Any OTHER insert failure (e.g. the composite
+            # uniqueness constraint is unavailable, so create-only cannot be
+            # enforced) must NOT fall back to an unsafe upsert.
+            if _is_unique_violation(_ins_exc):
+                _reread = (
+                    _sbc.table("ap_signals")
+                    .select("decision_status")
+                    .eq("signal_id", _sig)
+                    .eq("client_email", _client)
+                    .execute()
+                )
+                _rr_rows = getattr(_reread, "data", None) or []
+                _now = str(_rr_rows[0].get("decision_status")) if _rr_rows else None
+                _outcome = _classify_existing_signal_status(_now)
+                log.warning(
+                    "_persist_watching_signal_if_eligible: insert race "
+                    "signal_id=%s client_email=%s now=%r → %s",
+                    _sig, _client, _now, _outcome,
+                )
+                return _outcome
+            log.critical(
+                "_persist_watching_signal_if_eligible: create-only insert failed "
+                "for signal_id=%s client_email=%s and the error is NOT a uniqueness "
+                "violation — refusing to fall back to an unsafe upsert. err=%s",
+                _sig, _client, _ins_exc,
+            )
+            return SIGNAL_WATCH_DB_ERROR
+
+        _ins_rows = getattr(_ins, "data", None) or []
+        if _ins_rows:
+            log.info(
+                "_persist_watching_signal_if_eligible: INSERTED WATCHING "
+                "signal_id=%s client_email=%s.",
+                _sig, _client,
+            )
+            return SIGNAL_WATCH_INSERTED
+
+        # Insert returned no rows and did not raise — treat as a conflict and
+        # reread to preserve any newer state rather than assuming success.
+        _reread = (
+            _sbc.table("ap_signals")
+            .select("decision_status")
+            .eq("signal_id", _sig)
+            .eq("client_email", _client)
+            .execute()
+        )
+        _rr_rows = getattr(_reread, "data", None) or []
+        _now = str(_rr_rows[0].get("decision_status")) if _rr_rows else None
+        _outcome = _classify_existing_signal_status(_now)
+        log.warning(
+            "_persist_watching_signal_if_eligible: insert returned no rows "
+            "signal_id=%s client_email=%s now=%r → %s",
+            _sig, _client, _now, _outcome,
+        )
+        return _outcome
+
+    except Exception:
+        log.critical(
+            "_persist_watching_signal_if_eligible raised for signal_id=%s "
+            "client_email=%s — returning SIGNAL_WATCH_DB_ERROR",
+            _sig, _client, exc_info=True,
+        )
+        return SIGNAL_WATCH_DB_ERROR
 
 
 def _persist_watching_deferral(
@@ -1256,15 +1615,17 @@ def _persist_watching_deferral(
             )
         return False
 
-    # (4)+(5) persist/confirm the ap_signals WATCHING row FIRST. Stamp the
-    # execution mode into raw_payload for provenance. _log_signal_to_db upserts
-    # on (signal_id, client_email) — inherently idempotent — and returns True
-    # only on a confirmed write.
+    # (4)+(5) establish/confirm the ap_signals WATCHING row FIRST — GUARDED.
+    # Stamp the execution mode into raw_payload for provenance.
     #
-    # NOTE: the (signal_id, client_email) upsert key gives CLIENT isolation; the
-    # execution mode is provenance only, NOT part of the row identity. Cross-mode
-    # isolation for the SAME (signal_id, client_email) is owned by the
-    # runtime/broker mode boundary (PR #397), not by this helper.
+    # P0 #405 AMENDMENT: the initial WATCHING write is NO LONGER an unconditional
+    # upsert. It goes through _persist_watching_signal_if_eligible(), which does a
+    # guarded read/update/insert so a STALE deferral worker can never overwrite a
+    # NEWER advanced lifecycle state (queued/triggered/submitted/filled/rejected/
+    # ERROR) with WATCHING. The (signal_id, client_email) key gives CLIENT
+    # isolation; the execution mode is provenance only, NOT part of the row
+    # identity. Cross-mode isolation for the SAME (signal_id, client_email) is
+    # owned by the runtime/broker mode boundary (PR #397), not by this helper.
     _payload = dict(payload or {})
     _payload["execution_mode"] = _mode
     _payload["signal_id"] = _sig
@@ -1276,9 +1637,9 @@ def _persist_watching_deferral(
         0.0,
     )
     _payload["score"] = _score
-    _signals_ok = _log_signal_to_db(
+    _signal_watch_outcome = _persist_watching_signal_if_eligible(
         signal_id=_sig,
-        client_id=_client,
+        client_email=_client,
         ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
         side=str(_payload.get("side") or _payload.get("direction") or ""),
         score=_score,
@@ -1286,29 +1647,56 @@ def _persist_watching_deferral(
         reason_code=reason_code,
         human_reason=human_reason,
         payload=_payload,
-        decision_status=DECISION_WATCHING,
         queued_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    # (7) fail closed — no phantom WATCHING, no split truth, no money-path action.
-    # P0 #405: guarded ERROR CAS — only overwrites if the row is still PROCESSING.
-    if not _signals_ok:
-        log.critical(
-            "WATCHING_SIGNAL_PERSISTENCE_FAILED job_id=%s signal_id=%s client=%s "
-            "mode=%s stage=%s reason=%s — refusing to mark queue WATCHING; "
-            "guarded queue ERROR so the operator sees the failure.",
-            job_id, _sig, _client, _mode, stage, reason_code,
+    # ── ADVANCED signal: a newer lifecycle state already exists ────────────────
+    # The signal row advanced past WATCHING before this (stale) deferral ran.
+    # Do NOT run the queue WATCHING CAS. Do NOT compensate the signal to ERROR —
+    # the advanced state is authoritative and must be preserved. The still-
+    # PROCESSING queue row for THIS stale job is genuinely dead work, so fail it
+    # via the guarded ERROR CAS (only mutates if status is still PROCESSING).
+    if _signal_watch_outcome == SIGNAL_WATCH_ALREADY_ADVANCED:
+        log.warning(
+            "DEFERRAL_SIGNAL_ALREADY_ADVANCED job_id=%s signal_id=%s client=%s "
+            "mode=%s — ap_signals advanced past WATCHING before this deferral; "
+            "preserving advanced signal, failing the stale queue row (guarded).",
+            job_id, _sig, _client, _mode,
         )
-        _err_cas = _checked_processing_error_cas(job_id, error=_fail)
+        _err_cas = _checked_processing_error_cas(
+            job_id, error="DEFERRAL_SIGNAL_ALREADY_ADVANCED"
+        )
         if _err_cas != ERROR_CAS_TRANSITIONED:
             log.warning(
                 "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s "
-                "(signal_persistence_failure) — queue row was not PROCESSING; "
+                "(signal_already_advanced) — queue row was not PROCESSING; "
                 "state preserved.",
                 _err_cas, job_id,
             )
         return False
 
+    # ── CONFLICT / DB_ERROR: could not safely establish WATCHING ───────────────
+    # Do NOT run the queue WATCHING CAS. Do NOT blindly overwrite the signal.
+    # Guard the queue error transition through _checked_processing_error_cas.
+    if _signal_watch_outcome in {SIGNAL_WATCH_CONFLICT, SIGNAL_WATCH_DB_ERROR}:
+        log.critical(
+            "WATCHING_SIGNAL_PERSISTENCE_FAILED job_id=%s signal_id=%s client=%s "
+            "mode=%s stage=%s reason=%s signal_outcome=%r — refusing to mark queue "
+            "WATCHING; guarded queue ERROR so the operator sees the failure.",
+            job_id, _sig, _client, _mode, stage, reason_code, _signal_watch_outcome,
+        )
+        _err_cas = _checked_processing_error_cas(job_id, error=_fail)
+        if _err_cas != ERROR_CAS_TRANSITIONED:
+            log.warning(
+                "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s signal_outcome=%r "
+                "(signal_persistence_failure) — queue row was not PROCESSING; "
+                "state preserved.",
+                _err_cas, job_id, _signal_watch_outcome,
+            )
+        return False
+
+    # ── SUCCESS: WATCHING established (INSERTED / TRANSITIONED / ALREADY_WATCHING)
+    # Only now may the queue WATCHING CAS run.
     # (6) CAS the queue row to WATCHING, confirmed. A bare _mark_job call cannot
     # verify that the queue row actually transitioned — it returns None regardless
     # of rowcount. A failed or zero-row queue write after a successful ap_signals

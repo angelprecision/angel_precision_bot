@@ -63,12 +63,22 @@ class _FakeResult:
         self.data = data
 
 
+class _FakeAPIError(Exception):
+    """Mimics a PostgREST APIError carrying a Postgres error code (e.g. 23505)."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class _FakeQuery:
     def __init__(self, store):
         self._store = store
         self._filters = []       # list of (op, col, val)
-        self._pending = None     # set by upsert(); consumed by execute()
+        self._pending = None      # set by upsert(); consumed by execute()
         self._update_data = None  # set by update(); consumed by execute()
+        self._insert_row = None   # set by insert(); consumed by execute()
 
     # ── write path — upsert ───────────────────────────────────────────────────
     def upsert(self, row, on_conflict=None):
@@ -79,10 +89,21 @@ class _FakeQuery:
         self._pending = _FakeResult([r])
         return self
 
+    # ── write path — create-only insert ──────────────────────────────────────
+    # Models _persist_watching_signal_if_eligible's create-only insert.
+    # If the store has composite-uniqueness disabled (store._no_unique_constraint),
+    # raise a generic non-23505 error so the helper must fail closed (Test 11).
+    # If a row already exists for the composite key, raise a 23505 uniqueness
+    # violation (Test 6). Otherwise create the row.
+    def insert(self, row):
+        self._insert_row = dict(row)
+        return self
+
     # ── write path — expected-state update ───────────────────────────────────
-    # Models _compensate_watching_signal_if_unchanged:
+    # Models _compensate_watching_signal_if_unchanged AND the expected-state
+    # transition update in _persist_watching_signal_if_eligible:
     #   .update({...}).eq("signal_id", x).eq("client_email", y)
-    #                 .eq("decision_status", "WATCHING").execute()
+    #                 .eq("decision_status", observed).execute()
     # Only rows that match ALL .eq() filters are mutated; all others are
     # untouched. Returns _FakeResult([updated_row]) when exactly one row matched,
     # _FakeResult([]) when no row matches (row advanced / missing).
@@ -113,6 +134,23 @@ class _FakeQuery:
         if self._pending is not None:
             out, self._pending = self._pending, None
             return out
+
+        # 1b. Create-only insert (consumed once).
+        if self._insert_row is not None:
+            row = self._insert_row
+            self._insert_row = None
+            # Simulate a missing composite uniqueness constraint: create-only
+            # cannot be enforced → raise a NON-23505 error so the helper fails
+            # closed rather than falling back to an unsafe upsert (Test 11).
+            if getattr(self._store, "_no_unique_constraint", False):
+                raise RuntimeError("42P10: no unique or exclusion constraint matching")
+            key = (str(row.get("signal_id")), str(row.get("client_email")))
+            if key in self._store.rows:
+                # Duplicate composite key → 23505 uniqueness violation (Test 6).
+                raise _FakeAPIError("23505", "duplicate key value violates unique constraint")
+            row.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+            self._store.rows[key] = row
+            return _FakeResult([dict(row)])
 
         # 2. Expected-state update (consumed once).
         if self._update_data is not None:
@@ -157,6 +195,9 @@ class _BoomSupabase:
 
     def upsert(self, *_a, **_k):
         raise RuntimeError("supabase upsert failed")
+
+    def insert(self, *_a, **_k):
+        raise RuntimeError("supabase insert failed")
 
     def update(self, *_a, **_k):
         raise RuntimeError("supabase update failed")
@@ -1754,4 +1795,444 @@ def test_after_hours_deferral_failure_produces_no_watcher_osm_broker_mutation(
     )
     assert "broker.create_order" not in block, (
         "After-hours block must not call broker.create_order"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 AMENDMENT — guarded initial WATCHING establishment.
+# _persist_watching_signal_if_eligible must never overwrite an advanced signal
+# row with WATCHING. Only insert-if-missing or idempotent-WATCHING may establish.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ELIGIBLE_KWARGS = dict(
+    ticker="SPY", side="CALL", score=72.0, stage="master_control",
+    reason_code="market_closed_deferred",
+    human_reason="after hours — deferred",
+    payload={"ticker": "SPY", "side": "CALL", "score": 72.0, "timeframe": "1d"},
+    queued_at=datetime.now(timezone.utc).isoformat(),
+)
+
+
+def _seed_signal(sb, signal_id, client_email, decision_status):
+    sb.rows[(signal_id, client_email)] = {
+        "signal_id": signal_id,
+        "client_email": client_email,
+        "decision_status": decision_status,
+        "ticker": "SPY",
+    }
+
+
+# ── Test 1: advanced submitted row is preserved ──────────────────────────────
+def test_watch_eligible_submitted_preserved(sb):
+    _seed_signal(sb, "watch-sig-1", "a@x.com", "submitted")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-1", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"submitted must be preserved — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-1", "a@x.com")]["decision_status"] == "submitted", (
+        "submitted row must not be overwritten with WATCHING"
+    )
+
+
+# ── Test 2: advanced filled row is preserved ─────────────────────────────────
+def test_watch_eligible_filled_preserved(sb):
+    _seed_signal(sb, "watch-sig-2", "a@x.com", "filled")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-2", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED
+    assert sb.rows[("watch-sig-2", "a@x.com")]["decision_status"] == "filled"
+
+
+# ── Test 2b: triggered/queued/rejected/ERROR also preserved (parametrized) ───
+@pytest.mark.parametrize("advanced", ["triggered", "queued", "rejected", "ERROR"])
+def test_watch_eligible_all_advanced_preserved(sb, advanced):
+    _seed_signal(sb, "watch-sig-2b", "a@x.com", advanced)
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-2b", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"{advanced} must be preserved — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-2b", "a@x.com")]["decision_status"] == advanced
+
+
+# ── Test 3: existing WATCHING is idempotent ──────────────────────────────────
+def test_watch_eligible_watching_idempotent(sb):
+    _seed_signal(sb, "watch-sig-3", "a@x.com", "WATCHING")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-3", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING, (
+        f"existing WATCHING must be idempotent — got {outcome!r}"
+    )
+    # Idempotent: still WATCHING, no destructive rewrite via broad upsert.
+    assert sb.rows[("watch-sig-3", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 4: approved pre-deferral state transitions ──────────────────────────
+def test_watch_eligible_approved_pre_deferral_transitions(sb, monkeypatch):
+    """The transition machinery must work when a status IS in the allowlist.
+
+    Production ships with an EMPTY allowlist (no proven pre-deferral status in
+    the live path). This test monkeypatches the module-level allowlist to prove
+    the expected-state update branch establishes WATCHING correctly."""
+    monkeypatch.setattr(
+        queue, "_PRE_DEFERRAL_TRANSITIONABLE_STATUSES", frozenset({"received"})
+    )
+    _seed_signal(sb, "watch-sig-4", "a@x.com", "received")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-4", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_TRANSITIONED, (
+        f"approved pre-deferral status must transition — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-4", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 5: missing row inserts ──────────────────────────────────────────────
+def test_watch_eligible_missing_inserts(sb):
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-5", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_INSERTED, (
+        f"missing row must insert — got {outcome!r}"
+    )
+    assert ("watch-sig-5", "a@x.com") in sb.rows
+    assert sb.rows[("watch-sig-5", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 6: insert race loses to newer advanced state ────────────────────────
+def test_watch_eligible_insert_race_loses_to_advanced(sb, monkeypatch):
+    """Initial read finds no row; a concurrent writer inserts 'submitted' before
+    our create-only insert fires; the insert 23505-conflicts; helper rereads and
+    preserves the submitted row."""
+    # Patch _get_sb_client's table() to inject a concurrent insert between the
+    # initial SELECT and our INSERT. We do this by wrapping execute on the query.
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            # After the FIRST select returns empty, a concurrent writer inserts
+            # 'submitted' so our create-only insert will 23505-conflict.
+            if q._insert_row is None and q._update_data is None and q._pending is None:
+                # This is a select/read.
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent writer wins the race.
+                    _seed_signal(sb, "watch-sig-6", "a@x.com", "submitted")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-6", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"insert race must preserve advanced state — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-6", "a@x.com")]["decision_status"] == "submitted"
+
+
+# ── Test 7: expected-state update race ───────────────────────────────────────
+def test_watch_eligible_update_race_loses_to_advanced(sb, monkeypatch):
+    """Initial read sees an approved pre-deferral state; a concurrent writer
+    changes it to 'triggered'; the conditional update affects zero rows; helper
+    rereads and preserves the triggered row."""
+    monkeypatch.setattr(
+        queue, "_PRE_DEFERRAL_TRANSITIONABLE_STATUSES", frozenset({"received"})
+    )
+    _seed_signal(sb, "watch-sig-7", "a@x.com", "received")
+
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            is_read = (
+                q._insert_row is None and q._update_data is None and q._pending is None
+            )
+            if is_read:
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent writer advances the row after our initial read.
+                    _seed_signal(sb, "watch-sig-7", "a@x.com", "triggered")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-7", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"update race must preserve advanced state — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-7", "a@x.com")]["decision_status"] == "triggered"
+
+
+# ── Test 8: full deferral does not CAS queue after advanced signal ───────────
+def test_deferral_no_queue_cas_after_advanced_signal(monkeypatch, sb):
+    """When the signal helper returns ALREADY_ADVANCED, _persist_watching_deferral
+    must NOT run _checked_watching_cas and must NOT compensate the signal to ERROR.
+    The still-PROCESSING queue row is failed via the guarded ERROR CAS."""
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_ALREADY_ADVANCED,
+    )
+    watching_cas_calls: list = []
+    comp_calls: list = []
+    error_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_compensate_watching_signal_if_unchanged",
+        lambda **k: comp_calls.append(1) or queue.SIGNAL_COMP_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_checked_processing_error_cas",
+        lambda job_id, *, error, result=None:
+            error_cas_calls.append({"error": error}) or queue.ERROR_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("_mark_job must not be called")),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40580,
+        client_id="a@x.com",
+        signal_id="sig-adv-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="advanced signal test",
+    )
+    assert ok is False, "deferral must return False when signal already advanced"
+    assert watching_cas_calls == [], "_checked_watching_cas must NOT run after ALREADY_ADVANCED"
+    assert comp_calls == [], "_compensate_watching_signal_if_unchanged must NOT run"
+    assert len(error_cas_calls) == 1, "guarded queue ERROR CAS must run once"
+    assert error_cas_calls[0]["error"] == "DEFERRAL_SIGNAL_ALREADY_ADVANCED", (
+        f"error must be the stable DEFERRAL_SIGNAL_ALREADY_ADVANCED reason — "
+        f"got {error_cas_calls[0]['error']!r}"
+    )
+
+
+# ── Test 9: full deferral proceeds after idempotent WATCHING ─────────────────
+def test_deferral_proceeds_after_idempotent_watching(monkeypatch, sb):
+    """When the signal helper returns ALREADY_WATCHING, the queue WATCHING CAS
+    must run and a successful CAS returns True."""
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_ALREADY_WATCHING,
+    )
+    watching_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(queue, "_mark_job", lambda *a, **k: None)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40590,
+        client_id="a@x.com",
+        signal_id="sig-idem-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="idempotent watching test",
+    )
+    assert ok is True, "deferral must return True on ALREADY_WATCHING + successful CAS"
+    assert watching_cas_calls == [1], "_checked_watching_cas must run exactly once"
+
+
+# ── Test 9b: full deferral proceeds after INSERTED ───────────────────────────
+def test_deferral_proceeds_after_inserted(monkeypatch, sb):
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_INSERTED,
+    )
+    watching_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(queue, "_mark_job", lambda *a, **k: None)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40591,
+        client_id="a@x.com",
+        signal_id="sig-ins-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="inserted test",
+    )
+    assert ok is True
+    assert watching_cas_calls == [1]
+
+
+# ── Test 9c: CONFLICT / DB_ERROR fail closed with guarded queue ERROR ─────────
+@pytest.mark.parametrize("bad_outcome", ["SIGNAL_WATCH_CONFLICT", "SIGNAL_WATCH_DB_ERROR"])
+def test_deferral_fails_closed_on_signal_conflict_or_db_error(monkeypatch, sb, bad_outcome):
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: getattr(queue, bad_outcome),
+    )
+    watching_cas_calls: list = []
+    error_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_checked_processing_error_cas",
+        lambda job_id, *, error, result=None:
+            error_cas_calls.append({"error": error}) or queue.ERROR_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("_mark_job must not be called")),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40592,
+        client_id="a@x.com",
+        signal_id="sig-conflict-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="conflict/db_error test",
+    )
+    assert ok is False, f"{bad_outcome} must return False"
+    assert watching_cas_calls == [], "_checked_watching_cas must NOT run on conflict/db_error"
+    assert len(error_cas_calls) == 1, "guarded queue ERROR CAS must run once"
+
+
+# ── Test 10: client isolation ────────────────────────────────────────────────
+def test_watch_eligible_client_isolation(sb):
+    """Same signal_id, two clients. Advancing/watching one must never mutate the other."""
+    _seed_signal(sb, "shared-sig", "client-a@example.com", "submitted")
+
+    # Establish WATCHING for client-b (missing → insert).
+    outcome_b = queue._persist_watching_signal_if_eligible(
+        signal_id="shared-sig", client_email="client-b@example.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome_b == queue.SIGNAL_WATCH_INSERTED
+    # client-a's submitted row must be untouched.
+    assert sb.rows[("shared-sig", "client-a@example.com")]["decision_status"] == "submitted", (
+        "client-a's advanced row must not be mutated by client-b's deferral"
+    )
+    # client-b's row must be WATCHING.
+    assert sb.rows[("shared-sig", "client-b@example.com")]["decision_status"] == "WATCHING"
+
+    # Now attempt WATCHING for client-a — must be preserved as advanced.
+    outcome_a = queue._persist_watching_signal_if_eligible(
+        signal_id="shared-sig", client_email="client-a@example.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome_a == queue.SIGNAL_WATCH_ALREADY_ADVANCED
+    assert sb.rows[("shared-sig", "client-a@example.com")]["decision_status"] == "submitted"
+    # client-b unchanged.
+    assert sb.rows[("shared-sig", "client-b@example.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 11: no legacy unsafe fallback when composite uniqueness unavailable ──
+def test_watch_eligible_no_legacy_fallback_on_missing_constraint(sb):
+    """If the composite uniqueness constraint is unavailable (create-only insert
+    cannot be enforced), the helper must return SIGNAL_WATCH_DB_ERROR and must NOT
+    fall back to a single-key upsert that could overwrite another row."""
+    sb._no_unique_constraint = True   # fake signals: insert raises non-23505
+
+    # Pre-seed a DIFFERENT client's advanced row to prove no cross-client mutation.
+    _seed_signal(sb, "watch-sig-11", "other@example.com", "filled")
+
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-11", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_DB_ERROR, (
+        f"missing constraint must fail closed to DB_ERROR — got {outcome!r}"
+    )
+    # No new WATCHING row for a@x.com (unsafe upsert would have created one).
+    assert ("watch-sig-11", "a@x.com") not in sb.rows, (
+        "helper must NOT fall back to an upsert that writes a WATCHING row"
+    )
+    # The other client's advanced row must be untouched.
+    assert sb.rows[("watch-sig-11", "other@example.com")]["decision_status"] == "filled"
+
+
+# ── Test 12: DB unavailable → DB_ERROR (no client) ───────────────────────────
+def test_watch_eligible_no_supabase_client_db_error(monkeypatch):
+    monkeypatch.setattr(queue, "_get_sb_client", lambda: None)
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-12", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_DB_ERROR
+
+
+# ── Test 13: helper never takes job_id (signature guard) ─────────────────────
+def test_watch_eligible_signature_excludes_job_id():
+    import inspect
+    sig = inspect.signature(queue._persist_watching_signal_if_eligible)
+    assert "job_id" not in sig.parameters, (
+        "_persist_watching_signal_if_eligible must NOT take job_id — it owns only ap_signals"
+    )
+    # Must be keyword-only for the documented params.
+    for name in ("signal_id", "client_email", "queued_at"):
+        assert name in sig.parameters, f"missing required param {name!r}"
+
+
+# ── Test 14: no direct _log_signal_to_db(WATCHING) inside _persist_watching_deferral
+def test_deferral_no_direct_log_signal_watching_write():
+    """Source-code guard: _persist_watching_deferral must establish WATCHING via
+    _persist_watching_signal_if_eligible, NOT via a direct _log_signal_to_db(
+    decision_status=WATCHING/DECISION_WATCHING) call."""
+    import re
+    src = (Path(__file__).resolve().parents[1] / "ap" / "queue.py").read_text()
+
+    # Isolate the _persist_watching_deferral function body.
+    m = re.search(
+        r"\ndef _persist_watching_deferral\(.*?(?=\ndef _checked_watching_cas)",
+        src, re.DOTALL,
+    )
+    assert m, "Could not locate _persist_watching_deferral body"
+    body = m.group(0)
+
+    # It must call the guarded helper.
+    assert "_persist_watching_signal_if_eligible(" in body, (
+        "_persist_watching_deferral must call _persist_watching_signal_if_eligible"
+    )
+    # It must NOT call _log_signal_to_db with a WATCHING decision_status for the
+    # INITIAL establishment. (Compensation paths use _compensate_watching_signal_if_unchanged.)
+    initial_watching_log = re.search(
+        r"_log_signal_to_db\([^)]*decision_status\s*=\s*DECISION_WATCHING",
+        body, re.DOTALL,
+    )
+    assert initial_watching_log is None, (
+        "_persist_watching_deferral must NOT establish WATCHING via a direct "
+        "_log_signal_to_db(decision_status=DECISION_WATCHING) call — use the "
+        "guarded _persist_watching_signal_if_eligible helper"
     )
