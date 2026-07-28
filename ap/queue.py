@@ -264,6 +264,16 @@ _TERMINAL_QUEUE_STATUSES = {
     "DONE",
 }
 
+# Explicit CAS outcome constants for _checked_watching_cas.
+# Replaces the prior bool contract so callers can distinguish materially
+# different zero-row outcomes and respond correctly to each without
+# blind compensation that could overwrite valid WATCHING or terminal rows.
+WATCHING_CAS_TRANSITIONED          = "TRANSITIONED"           # PROCESSING→WATCHING: 1 row updated
+WATCHING_CAS_ALREADY_WATCHING      = "ALREADY_WATCHING"       # row was already WATCHING (idempotent)
+WATCHING_CAS_TERMINAL              = "TERMINAL"               # row is in a terminal status
+WATCHING_CAS_MISSING_OR_UNEXPECTED = "MISSING_OR_UNEXPECTED"  # row missing or unexpected state
+WATCHING_CAS_DB_ERROR              = "DB_ERROR"               # UPDATE or classification SELECT raised
+
 _MANUAL_RESTART_GUARD_BYPASS_ERRORS = frozenset({
     "manual_requeue_after_overnight_reeval_timeout",
     "manual_rescue_current_session",
@@ -1159,47 +1169,90 @@ def _persist_watching_deferral(
     # Postgres for trade_queue) means perfect atomicity is impossible. What this
     # guarantees is a checked transition plus loud, best-effort compensation on
     # failure. The PR description no longer claims "atomic consistency".
-    _cas_ok = _checked_watching_cas(
+    _cas_outcome = _checked_watching_cas(
         job_id,
         watching_error=watching_error,
         watching_result=watching_result,
     )
-    if not _cas_ok:
+
+    # ── success paths ──────────────────────────────────────────────────────────
+    # TRANSITIONED: queue row is now canonical WATCHING.
+    # ALREADY_WATCHING: repeated deferral against an already-canonical WATCHING
+    #   row is idempotent success — do NOT revert ap_signals, do NOT mark ERROR.
+    if _cas_outcome in {WATCHING_CAS_TRANSITIONED, WATCHING_CAS_ALREADY_WATCHING}:
+        return True
+
+    # ── terminal queue state — authoritative, must never be overwritten ────────
+    if _cas_outcome == WATCHING_CAS_TERMINAL:
         log.critical(
-            "DEFERRAL_QUEUE_CAS_FAILED job_id=%s signal_id=%s client=%s mode=%s — "
-            "ap_signals is WATCHING but queue CAS confirmed 0 rows updated. "
-            "Best-effort signal revert attempted. Manual reconciliation required.",
+            "DEFERRAL_QUEUE_CAS_TERMINAL job_id=%s signal_id=%s client=%s mode=%s — "
+            "queue row is in a terminal state; WATCHING transition refused. "
+            "Best-effort ap_signals revert attempted. Terminal queue state preserved.",
             job_id, _sig, _client, _mode,
         )
-        # Best-effort: overwrite the ap_signals WATCHING row with ERROR so it
-        # is not silently discoverable as a valid overnight deferral.
-        try:
-            _log_signal_to_db(
-                signal_id=_sig,
-                client_id=_client,
-                ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
-                side=str(_payload.get("side") or _payload.get("direction") or ""),
-                score=_score,
-                stage=stage,
-                reason_code="PERSISTENCE_FAILURE",
-                human_reason="Queue CAS failed — ap_signals reverted from WATCHING.",
-                payload=_payload,
-                decision_status="ERROR",
-                queued_at=datetime.now(timezone.utc).isoformat(),
-            )
-        except Exception:
-            log.exception(
+        # Best-effort: remove the WATCHING ap_signals row so the terminal queue row
+        # is not paired with a discoverable WATCHING signal. _log_signal_to_db
+        # absorbs exceptions and returns False — capture it explicitly.
+        _signal_revert_ok = _log_signal_to_db(
+            signal_id=_sig,
+            client_id=_client,
+            ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
+            side=str(_payload.get("side") or _payload.get("direction") or ""),
+            score=_score,
+            stage=stage,
+            reason_code="PERSISTENCE_FAILURE",
+            human_reason="Queue row is terminal — ap_signals reverted from WATCHING.",
+            payload=_payload,
+            decision_status="ERROR",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        if not _signal_revert_ok:
+            log.critical(
                 "DEFERRAL_SIGNAL_REVERT_FAILED job_id=%s — ap_signals may remain "
-                "WATCHING with no matching queue row. Operator action required.",
+                "WATCHING paired with a terminal queue row. Operator action required.",
                 job_id,
             )
-        # Best-effort: mark queue ERROR so the operator sees the failure.
-        try:
-            _mark_job(job_id, "ERROR", error=f"{_fail}:queue_cas_failed")
-        except Exception:
-            pass
+        # Do NOT call _mark_job — the terminal queue state is authoritative and
+        # must remain untouched.
         return False
-    return True
+
+    # ── genuine failure: MISSING_OR_UNEXPECTED or DB_ERROR ────────────────────
+    log.critical(
+        "DEFERRAL_QUEUE_CAS_FAILED job_id=%s signal_id=%s client=%s mode=%s "
+        "outcome=%r — ap_signals is WATCHING but queue CAS did not confirm a "
+        "transition. Best-effort signal revert attempted. Manual reconciliation "
+        "required.",
+        job_id, _sig, _client, _mode, _cas_outcome,
+    )
+    # Best-effort: overwrite the ap_signals WATCHING row with ERROR so it is not
+    # silently discoverable as a valid overnight deferral. _log_signal_to_db
+    # absorbs exceptions and returns False — capture it explicitly; do NOT rely
+    # on try/except alone.
+    _signal_revert_ok = _log_signal_to_db(
+        signal_id=_sig,
+        client_id=_client,
+        ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
+        side=str(_payload.get("side") or _payload.get("direction") or ""),
+        score=_score,
+        stage=stage,
+        reason_code="PERSISTENCE_FAILURE",
+        human_reason=(
+            f"Queue CAS outcome={_cas_outcome!r} — ap_signals reverted from WATCHING."
+        ),
+        payload=_payload,
+        decision_status="ERROR",
+        queued_at=datetime.now(timezone.utc).isoformat(),
+    )
+    if not _signal_revert_ok:
+        log.critical(
+            "DEFERRAL_SIGNAL_REVERT_FAILED job_id=%s — ap_signals may remain "
+            "WATCHING with no matching queue row. Operator action required.",
+            job_id,
+        )
+    # Do NOT blindly call _mark_job — the queue row's current state was not
+    # confirmed to be PROCESSING. Overwriting WATCHING, a terminal status, or a
+    # missing row with ERROR would create or deepen split truth.
+    return False
 
 
 def _checked_watching_cas(
@@ -1207,20 +1260,29 @@ def _checked_watching_cas(
     *,
     watching_error: str | None = None,
     watching_result: dict | None = None,
-) -> bool:
+) -> str:
     """CAS: UPDATE trade_queue SET status='WATCHING' WHERE id=%s AND status='PROCESSING'.
 
-    Returns True iff exactly 1 row was updated, confirming the queue row now
-    holds WATCHING scoped to this job_id. Returns False if zero rows were updated
-    (row already terminal, wrong owner, or id mismatch) or if the UPDATE raises.
-    Never raises — caller handles compensation.
+    Returns an explicit outcome constant rather than a bare bool so callers can
+    distinguish materially different zero-row outcomes and respond correctly:
 
+      WATCHING_CAS_TRANSITIONED          – 1 row updated; row is now WATCHING.
+      WATCHING_CAS_ALREADY_WATCHING      – 0 rows updated; row was already WATCHING
+                                           (idempotent success — do NOT revert signals).
+      WATCHING_CAS_TERMINAL              – 0 rows updated; row is in a terminal status
+                                           (authoritative — do NOT overwrite the row).
+      WATCHING_CAS_MISSING_OR_UNEXPECTED – 0 rows updated; row is missing or in an
+                                           unexpected nonterminal status.
+      WATCHING_CAS_DB_ERROR              – the UPDATE or classification SELECT raised.
+
+    Never raises — caller handles compensation per outcome.
     Uses non-destructive JSONB meta merge (meta || ...) per standing schema rules.
     Does NOT touch result_json (deprecated column).
     """
     try:
-        def _fn() -> int:
+        def _fn() -> tuple:
             with _conn()() as c:
+                # 1. Attempt the guarded PROCESSING → WATCHING transition.
                 c.execute(
                     """
                     UPDATE trade_queue
@@ -1236,14 +1298,47 @@ def _checked_watching_cas(
                         job_id,
                     ),
                 )
-                return c.rowcount
-        return _run_with_retry(_fn) == 1
+                if c.rowcount == 1:
+                    return (1, None)
+                # 2. Zero rows updated — read current status to classify the outcome.
+                #    Both operations occur in the same connection for consistency.
+                c.execute(
+                    "SELECT status FROM trade_queue WHERE id = %s",
+                    (job_id,),
+                )
+                row = c.fetchone()
+                current = str(row["status"]).upper() if row else None
+                return (0, current)
+
+        updated, current_status = _run_with_retry(_fn)
+
+        if updated == 1:
+            return WATCHING_CAS_TRANSITIONED
+
+        # Classify the zero-row outcome without mutating any row.
+        if current_status == "WATCHING":
+            return WATCHING_CAS_ALREADY_WATCHING
+        if current_status is not None and current_status in _TERMINAL_QUEUE_STATUSES:
+            log.warning(
+                "_checked_watching_cas: job_id=%s is already terminal (status=%r) — "
+                "WATCHING transition refused; terminal state preserved.",
+                job_id, current_status,
+            )
+            return WATCHING_CAS_TERMINAL
+        # Row is missing (current_status is None) or in an unexpected nonterminal state.
+        log.warning(
+            "_checked_watching_cas: zero-row CAS for job_id=%s — current_status=%r "
+            "(missing row or unexpected nonterminal state).",
+            job_id, current_status,
+        )
+        return WATCHING_CAS_MISSING_OR_UNEXPECTED
+
     except Exception:
         log.exception(
-            "_checked_watching_cas raised for job_id=%s — treating as CAS failure",
+            "_checked_watching_cas raised for job_id=%s — returning DB_ERROR",
             job_id,
         )
-        return False
+        return WATCHING_CAS_DB_ERROR
 
 
 def _dispatch(

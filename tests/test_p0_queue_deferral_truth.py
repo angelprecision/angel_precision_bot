@@ -155,16 +155,17 @@ def marks(monkeypatch):
 
     monkeypatch.setattr(queue, "_mark_job", _fake_mark)
 
-    # Default: CAS succeeds (rowcount == 1) AND records a WATCHING mark so that
+    # Default: CAS succeeds (TRANSITIONED) AND records a WATCHING mark so that
     # assertions like `[m["status"] for m in marks if m["job_id"] == X]` still
     # see ["WATCHING"] without requiring a live Postgres connection.
-    # Tests that exercise CAS failure (test_4e, test_4f) override this.
+    # Tests that exercise specific CAS outcomes override this with their own
+    # monkeypatch after the fixture runs.
     def _fake_cas(job_id, *, watching_error=None, watching_result=None):
         recorded.append(
             {"job_id": job_id, "status": "WATCHING",
              "result": watching_result, "error": watching_error}
         )
-        return True
+        return queue.WATCHING_CAS_TRANSITIONED
 
     monkeypatch.setattr(queue, "_checked_watching_cas", _fake_cas)
     return recorded
@@ -677,19 +678,19 @@ def test_2c_malformed_score_in_dispatch_does_not_raise(monkeypatch, sb, marks):
 
 
 def test_4e_queue_cas_raises_returns_false(monkeypatch, sb, marks):
-    """Blocker 2: if _checked_watching_cas returns False because an exception was
-    raised internally (e.g. DB connection lost after ap_signals write succeeded),
+    """Blocker 2: if _checked_watching_cas returns DB_ERROR (because an exception
+    was raised internally, e.g. DB connection lost after ap_signals write succeeded),
     _persist_watching_deferral must return False (not True), attempt best-effort
-    signal revert, and best-effort mark the queue ERROR. No true success can be
+    signal revert, and NOT blindly mark queue ERROR. No true success can be
     returned on an unverifiable queue transition.
 
     NOTE: _checked_watching_cas catches all exceptions internally and returns
-    False — callers of _persist_watching_deferral never see the raw exception.
-    This test simulates that path by patching the CAS to return False directly,
-    mirroring what _checked_watching_cas does when its UPDATE raises."""
+    WATCHING_CAS_DB_ERROR — callers of _persist_watching_deferral never see the
+    raw exception. This test simulates that path by patching the CAS to return
+    WATCHING_CAS_DB_ERROR directly."""
     monkeypatch.setattr(
         queue, "_checked_watching_cas",
-        lambda *a, **k: False,  # mirrors _checked_watching_cas catching an exception
+        lambda *a, **k: queue.WATCHING_CAS_DB_ERROR,
     )
 
     ok = queue._persist_watching_deferral(
@@ -713,12 +714,13 @@ def test_4e_queue_cas_raises_returns_false(monkeypatch, sb, marks):
 
 
 def test_4f_queue_cas_zero_rows_returns_false(monkeypatch, sb, marks):
-    """Blocker 2: if _checked_watching_cas returns False (zero rows updated),
-    _persist_watching_deferral must return False, attempt signal revert, and
-    best-effort mark queue ERROR. No false success."""
+    """Blocker 2: if _checked_watching_cas returns MISSING_OR_UNEXPECTED (zero
+    rows updated, row missing or in an unexpected state), _persist_watching_deferral
+    must return False and attempt signal revert. It must NOT blindly mark queue
+    ERROR — the current queue state was not confirmed to be PROCESSING."""
     monkeypatch.setattr(
         queue, "_checked_watching_cas",
-        lambda *a, **k: False,  # simulates 0 rows updated
+        lambda *a, **k: queue.WATCHING_CAS_MISSING_OR_UNEXPECTED,
     )
 
     ok = queue._persist_watching_deferral(
@@ -731,15 +733,15 @@ def test_4f_queue_cas_zero_rows_returns_false(monkeypatch, sb, marks):
         reason_code="market_closed_deferred",
         human_reason="after hours",
     )
-    assert ok is False, "helper must return False when CAS returns False (0 rows)"
+    assert ok is False, "helper must return False when CAS returns MISSING_OR_UNEXPECTED"
 
     queue_statuses = [m["status"] for m in marks if m["job_id"] == 492]
     assert "WATCHING" not in queue_statuses, (
-        f"WATCHING must not appear when CAS returns False — got {queue_statuses}"
+        f"WATCHING must not appear when CAS returns MISSING_OR_UNEXPECTED — got {queue_statuses}"
     )
-    # Compensation must attempt ERROR.
-    assert any(m["status"] == "ERROR" for m in marks if m["job_id"] == 492), (
-        "compensation must best-effort mark queue ERROR after CAS failure"
+    # Must NOT blindly mark queue ERROR — current state not confirmed as PROCESSING.
+    assert "ERROR" not in queue_statuses, (
+        f"must not blindly mark queue ERROR on MISSING_OR_UNEXPECTED — got {queue_statuses}"
     )
 
 
@@ -808,3 +810,324 @@ def test_10_no_money_path_effects(monkeypatch, sb):
                  "replace_order", "replace"):
         getattr(broker, meth).assert_not_called()
     mc.evaluate.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# CAS outcome tests (A–F) — exercise _checked_watching_cas classification
+# directly by controlling _run_with_retry's return value.
+# These tests do not require a live Postgres connection.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_cas_A_processing_transitioned(monkeypatch):
+    """A: PROCESSING row → UPDATE returns 1 row → TRANSITIONED.
+    _persist_watching_deferral must return True."""
+    monkeypatch.setattr(
+        queue, "_run_with_retry",
+        lambda fn: (1, None),  # simulate: 1 row updated
+    )
+    outcome = queue._checked_watching_cas(job_id=1001)
+    assert outcome == queue.WATCHING_CAS_TRANSITIONED
+
+
+def test_cas_B_already_watching_classification(monkeypatch):
+    """B: Row already WATCHING → UPDATE returns 0, SELECT returns 'WATCHING'
+    → ALREADY_WATCHING."""
+    monkeypatch.setattr(
+        queue, "_run_with_retry",
+        lambda fn: (0, "WATCHING"),
+    )
+    outcome = queue._checked_watching_cas(job_id=1002)
+    assert outcome == queue.WATCHING_CAS_ALREADY_WATCHING
+
+
+@pytest.mark.parametrize("terminal_status", ["REJECTED", "ERROR", "DONE"])
+def test_cas_C_terminal_classification(monkeypatch, terminal_status):
+    """C: Terminal row → UPDATE returns 0, SELECT returns terminal status → TERMINAL."""
+    monkeypatch.setattr(
+        queue, "_run_with_retry",
+        lambda fn: (0, terminal_status),
+    )
+    outcome = queue._checked_watching_cas(job_id=1003)
+    assert outcome == queue.WATCHING_CAS_TERMINAL
+
+
+def test_cas_D_missing_row(monkeypatch):
+    """D: Row not found → UPDATE returns 0, SELECT returns None
+    → MISSING_OR_UNEXPECTED."""
+    monkeypatch.setattr(
+        queue, "_run_with_retry",
+        lambda fn: (0, None),  # simulate: row missing
+    )
+    outcome = queue._checked_watching_cas(job_id=1004)
+    assert outcome == queue.WATCHING_CAS_MISSING_OR_UNEXPECTED
+
+
+@pytest.mark.parametrize("unexpected_status", ["NEW", "PENDING_TRIGGER"])
+def test_cas_E_unexpected_nonterminal(monkeypatch, unexpected_status):
+    """E: Unexpected nonterminal state → MISSING_OR_UNEXPECTED.
+    Row must not be mutated (only classification SELECT is issued)."""
+    monkeypatch.setattr(
+        queue, "_run_with_retry",
+        lambda fn: (0, unexpected_status),
+    )
+    outcome = queue._checked_watching_cas(job_id=1005)
+    assert outcome == queue.WATCHING_CAS_MISSING_OR_UNEXPECTED
+
+
+def test_cas_F_db_exception(monkeypatch):
+    """F: DB exception inside _run_with_retry → DB_ERROR; never re-raises."""
+    def _raising(fn):
+        raise RuntimeError("connection lost mid-transaction")
+
+    monkeypatch.setattr(queue, "_run_with_retry", _raising)
+    outcome = queue._checked_watching_cas(job_id=1006)
+    assert outcome == queue.WATCHING_CAS_DB_ERROR
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# _persist_watching_deferral integration tests for explicit CAS outcomes (B–G)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_persist_B_already_watching_idempotent_success(monkeypatch, sb):
+    """B integration: CAS outcome ALREADY_WATCHING → helper returns True.
+    ap_signals WATCHING row is NOT reverted, queue is NOT marked ERROR.
+    A repeated deferral against an already-canonical WATCHING row is success."""
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: queue.WATCHING_CAS_ALREADY_WATCHING,
+    )
+    mark_calls: list[dict] = []
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda job_id, status, *, result=None, error=None:
+            mark_calls.append({"job_id": job_id, "status": status, "error": error}),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=2001,
+        client_id="alice@example.com",
+        signal_id="sig-persist-B",
+        execution_mode="paper",
+        payload={"ticker": "AAPL", "side": "CALL", "score": 72, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="already watching — idempotent",
+    )
+
+    assert ok is True, "ALREADY_WATCHING must be idempotent success"
+    # No _mark_job calls at all — no ERROR compensation, no spurious marks.
+    assert not mark_calls, (
+        f"_mark_job must not be called on ALREADY_WATCHING — got {mark_calls}"
+    )
+    # ap_signals WATCHING row written by initial signal persistence must not be
+    # reverted; it should remain WATCHING.
+    assert _signal_rows(sb, "WATCHING"), (
+        "WATCHING signal must remain — must not be reverted on ALREADY_WATCHING"
+    )
+    assert not _signal_rows(sb, "ERROR"), (
+        "signal must not be reverted to ERROR on ALREADY_WATCHING"
+    )
+
+
+def test_persist_C_terminal_queue_never_overwritten(monkeypatch, sb):
+    """C integration: CAS outcome TERMINAL → helper False.
+    _mark_job must NOT be called — terminal queue state is authoritative.
+    Signal revert is attempted."""
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: queue.WATCHING_CAS_TERMINAL,
+    )
+    mark_calls: list[dict] = []
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda job_id, status, *, result=None, error=None:
+            mark_calls.append({"job_id": job_id, "status": status, "error": error}),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=2002,
+        client_id="bob@example.com",
+        signal_id="sig-persist-C",
+        execution_mode="live",
+        payload={"ticker": "NVDA", "side": "PUT", "score": 68, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="queue terminal",
+    )
+
+    assert ok is False, "TERMINAL must return False"
+    # _mark_job must NEVER be called — do not overwrite the terminal queue row.
+    assert not mark_calls, (
+        f"_mark_job must not be called when CAS outcome is TERMINAL — got {mark_calls}"
+    )
+    # Signal revert attempted — ap_signals ERROR row written (best-effort).
+    assert _signal_rows(sb, "ERROR"), (
+        "signal revert must be attempted (ERROR row) when queue row is terminal"
+    )
+
+
+def test_persist_D_missing_row_no_blind_error_mark(monkeypatch, sb):
+    """D integration: CAS outcome MISSING_OR_UNEXPECTED (row not found) →
+    helper False. _mark_job must NOT be called blindly."""
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: queue.WATCHING_CAS_MISSING_OR_UNEXPECTED,
+    )
+    mark_calls: list[dict] = []
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda job_id, status, *, result=None, error=None:
+            mark_calls.append({"job_id": job_id, "status": status, "error": error}),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=2004,
+        client_id="carol@example.com",
+        signal_id="sig-persist-D",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="row missing",
+    )
+
+    assert ok is False, "MISSING_OR_UNEXPECTED must return False"
+    # No blind _mark_job — we do not know the current queue state.
+    assert not mark_calls, (
+        f"_mark_job must not be called on MISSING_OR_UNEXPECTED — got {mark_calls}"
+    )
+
+
+def test_persist_E_unexpected_nonterminal_queue_unchanged(monkeypatch, sb):
+    """E integration: CAS outcome MISSING_OR_UNEXPECTED (unexpected nonterminal
+    state, e.g. NEW) → helper False. Queue row must not be mutated."""
+    # Same outcome as D from _persist_watching_deferral's perspective.
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: queue.WATCHING_CAS_MISSING_OR_UNEXPECTED,
+    )
+    mark_calls: list[dict] = []
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda job_id, status, *, result=None, error=None:
+            mark_calls.append({"job_id": job_id, "status": status, "error": error}),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=2005,
+        client_id="dave@example.com",
+        signal_id="sig-persist-E",
+        execution_mode="paper",
+        payload={"ticker": "QQQ", "side": "PUT", "score": 65},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="unexpected nonterminal",
+    )
+
+    assert ok is False
+    # Queue row left untouched — no blind ERROR overwrite.
+    assert not any(m.get("status") == "ERROR" for m in mark_calls), (
+        f"must not blindly overwrite queue row on MISSING_OR_UNEXPECTED — got {mark_calls}"
+    )
+
+
+def test_persist_F_db_error_no_false_success(monkeypatch, sb):
+    """F integration: CAS outcome DB_ERROR → helper False.
+    Signal compensation attempted. No claim of successful deferral."""
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: queue.WATCHING_CAS_DB_ERROR,
+    )
+    mark_calls: list[dict] = []
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda job_id, status, *, result=None, error=None:
+            mark_calls.append({"job_id": job_id, "status": status, "error": error}),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=2006,
+        client_id="erin@example.com",
+        signal_id="sig-persist-F",
+        execution_mode="live",
+        payload={"ticker": "TSLA", "side": "CALL", "score": 77, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="db error",
+    )
+
+    assert ok is False, "DB_ERROR must return False — never silent success"
+    # Signal compensation attempted (ERROR row written to ap_signals).
+    assert _signal_rows(sb, "ERROR"), (
+        "signal compensation must be attempted on DB_ERROR"
+    )
+    # No blind _mark_job.
+    assert not mark_calls, (
+        f"_mark_job must not be called on DB_ERROR — got {mark_calls}"
+    )
+
+
+def test_persist_G_compensation_bool_failure_emits_critical(monkeypatch, sb, caplog):
+    """G: Initial WATCHING write succeeds; CAS returns MISSING_OR_UNEXPECTED;
+    compensation write returns False. Critical DEFERRAL_SIGNAL_REVERT_FAILED
+    diagnostic must be emitted; helper must return False; no silent success."""
+    import logging
+
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: queue.WATCHING_CAS_MISSING_OR_UNEXPECTED,
+    )
+
+    call_count = [0]
+
+    def _fake_log_signal(*, decision_status, **kwargs):
+        call_count[0] += 1
+        if decision_status == queue.DECISION_WATCHING:
+            return True   # initial WATCHING write succeeds
+        return False      # compensation write fails — returns False, not exception
+
+    monkeypatch.setattr(queue, "_log_signal_to_db", _fake_log_signal)
+
+    mark_calls: list[dict] = []
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda job_id, status, *, result=None, error=None:
+            mark_calls.append({"job_id": job_id, "status": status}),
+    )
+
+    with caplog.at_level(logging.CRITICAL, logger="ap.queue"):
+        ok = queue._persist_watching_deferral(
+            job_id=2007,
+            client_id="frank@example.com",
+            signal_id="sig-persist-G",
+            execution_mode="paper",
+            payload={"ticker": "BAC", "side": "PUT", "score": 71, "timeframe": "1d"},
+            stage="master_control",
+            reason_code="market_closed_deferred",
+            human_reason="compensation will fail",
+        )
+
+    assert ok is False, "helper must return False — not silent success"
+
+    # DEFERRAL_SIGNAL_REVERT_FAILED critical log must be emitted because the
+    # compensation write returned False (not an exception — must not rely on
+    # try/except alone to detect this).
+    revert_failed_logs = [
+        r for r in caplog.records
+        if "DEFERRAL_SIGNAL_REVERT_FAILED" in r.message
+    ]
+    assert revert_failed_logs, (
+        "DEFERRAL_SIGNAL_REVERT_FAILED critical log must be emitted when "
+        "compensation write returns False (not just when it raises)"
+    )
+
+    # Both initial write and compensation write must be attempted.
+    assert call_count[0] >= 2, (
+        f"_log_signal_to_db must be called at least twice (initial + compensation) "
+        f"— called {call_count[0]}x"
+    )
+
+    # No blind _mark_job.
+    assert not mark_calls, (
+        f"_mark_job must not be called on MISSING_OR_UNEXPECTED — got {mark_calls}"
+    )
