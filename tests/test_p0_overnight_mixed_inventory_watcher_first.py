@@ -108,6 +108,90 @@ class _Watcher:
         return True
 
 
+class _OpportunityLedger(types.ModuleType):
+    CREATED = "CREATED"
+
+    class _Query:
+        def __init__(self, rows: dict[tuple[str, str], dict]):
+            self._rows = rows
+            self._filters: dict[str, str] = {}
+
+        def select(self, *_args, **_kwargs):
+            return self
+
+        def eq(self, key: str, value: str):
+            self._filters[key] = value
+            return self
+
+        def limit(self, _limit: int):
+            return self
+
+        def execute(self):
+            key = (
+                self._filters.get("canonical_signal_id"),
+                self._filters.get("client_id"),
+            )
+            row = self._rows.get(key)
+            return SimpleNamespace(data=[dict(row)] if row else [])
+
+    class _SB:
+        def __init__(self, rows: dict[tuple[str, str], dict]):
+            self._rows = rows
+
+        def table(self, name: str):
+            assert name == "client_signal_opportunities"
+            return _OpportunityLedger._Query(self._rows)
+
+    def __init__(self):
+        super().__init__("ap.opportunity_ledger")
+        self.rows: dict[tuple[str, str], dict] = {}
+
+    def _get_sb(self):
+        return self._SB(self.rows)
+
+    def create_opportunities(self, signal_id, client_ids, payload, canonical_signal_id=None, **_kwargs):
+        canonical = canonical_signal_id or payload.get("canonical_signal_id") or signal_id
+        for client_id in client_ids:
+            self.rows.setdefault(
+                (canonical, client_id),
+                {
+                    "signal_id": signal_id,
+                    "canonical_signal_id": canonical,
+                    "client_id": client_id,
+                    "opportunity_status": "CREATED",
+                    "metadata": {},
+                },
+            )
+        return len(client_ids)
+
+    def update_opportunity(
+        self,
+        signal_id,
+        client_id,
+        status,
+        *,
+        canonical_signal_id=None,
+        order_local_id=None,
+        extra_meta=None,
+        **_kwargs,
+    ):
+        canonical = canonical_signal_id or signal_id
+        row = self.rows.setdefault(
+            (canonical, client_id),
+            {
+                "signal_id": signal_id,
+                "canonical_signal_id": canonical,
+                "client_id": client_id,
+                "metadata": {},
+            },
+        )
+        row["opportunity_status"] = status
+        if order_local_id is not None:
+            row["order_local_id"] = order_local_id
+        row["metadata"] = {**(row.get("metadata") or {}), **(extra_meta or {})}
+        return True
+
+
 def _run_harness(
     monkeypatch,
     jobs: list[dict],
@@ -168,6 +252,8 @@ def _run_harness(
     auth.LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
     auth.execution_mode_for_broker = lambda _broker: execution_mode
     monkeypatch.setitem(sys.modules, "ap.authorization", auth)
+
+    monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", _OpportunityLedger())
 
     intel = types.ModuleType("ap.intelligence_context_handoff")
     intel.enqueue_preopen_context_best_effort = lambda *args, **kwargs: None

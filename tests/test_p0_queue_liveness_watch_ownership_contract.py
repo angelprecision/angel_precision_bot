@@ -12,6 +12,7 @@ Integration tests A–Q drive the actual production helper seams.
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import types
@@ -20,7 +21,12 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
-# ── Module-level stubs (must precede production imports) ─────────────────────
+os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
+
+import ap_overnight_reeval as overnight
+from ap import order_monitor
+
+
 class _FakeConn:
     def __enter__(self): return self
     def __exit__(self, *_): return False
@@ -28,19 +34,14 @@ class _FakeConn:
     def fetchone(self): return None
     def fetchall(self): return []
 
-_db_mod = types.ModuleType("ap.db")
-_db_mod._stub = True
-_db_mod.conn = lambda *a, **kw: _FakeConn()
-_db_mod.run_with_retry = lambda fn, *a, **kw: fn()
-sys.modules["ap.db"] = _db_mod
 
-if "supabase" not in sys.modules:
-    _supa = types.ModuleType("supabase")
-    _supa.create_client = lambda *a, **kw: None
-    sys.modules["supabase"] = _supa
-
-import ap_overnight_reeval as overnight
-from ap import order_monitor
+@pytest.fixture(autouse=True)
+def _isolated_fake_db(monkeypatch):
+    db_mod = types.ModuleType("ap.db")
+    db_mod._stub = True
+    db_mod.conn = lambda *a, **kw: _FakeConn()
+    db_mod.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", db_mod)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

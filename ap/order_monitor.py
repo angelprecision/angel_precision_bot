@@ -351,8 +351,12 @@ def _classify_pending_entry_ownership(
                         PENDING_OWNER_STALE, False, True,
                         f"orphan_age_{int(age_min)}m_no_ownership",
                     )
-            except Exception:
-                pass
+            except Exception as age_exc:
+                log.debug(
+                    "PENDING_OWNER_CREATED_TS_PARSE_FAILED created_ts=%r err=%s",
+                    created_raw,
+                    age_exc,
+                )
         return _PendingOwnershipResult(PENDING_OWNER_ACTIVE, True, False, "recent_no_ownership_fail_safe")
 
     return _PendingOwnershipResult(PENDING_OWNER_CONFLICT, True, False, f"unknown_status:{status}")

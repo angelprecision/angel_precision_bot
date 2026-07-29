@@ -25,10 +25,11 @@ class _FakeOrderStateMachine:
         self.expire_calls: list[tuple[str, str]] = []
         self.cancel_calls: list[tuple[str, str]] = []
         self.transition_calls: list[tuple[str, str, dict]] = []
+        self.get_order_calls: list[str] = []
 
     def create_entry_order(self, plan, initial_status="CREATED", execution_mode=None, **kwargs):
         self.create_calls += 1
-        local_order_id = "local-ord-1"
+        local_order_id = f"local-ord-{self.create_calls}"
         self.orders[local_order_id] = {
             "status": initial_status,
             "execution_mode": execution_mode,
@@ -40,6 +41,10 @@ class _FakeOrderStateMachine:
     def mark_entry_pending_trigger(self, local_order_id: str) -> bool:
         self.orders.setdefault(local_order_id, {})["status"] = "PENDING_TRIGGER"
         return True
+
+    def get_order(self, local_order_id: str) -> dict:
+        self.get_order_calls.append(local_order_id)
+        return dict(self.orders.get(local_order_id) or {})
 
     def expire_pending_entry(self, local_order_id: str, *, reason: str = "") -> bool:
         self.expire_calls.append((local_order_id, reason))
@@ -66,7 +71,25 @@ class _FakeOrderStateMachine:
         return True
 
 
+class _FakeDBConn:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, *_args, **_kwargs):
+        return None
+
+    def fetchone(self):
+        return None
+
+    def fetchall(self):
+        return []
+
+
 class _FakeOpportunityLedger(types.ModuleType):
+    CREATED = "CREATED"
     WATCHER_ARMED = "WATCHER_ARMED"
     BROKER_SUBMITTED = "BROKER_SUBMITTED"
     BROKER_ACKED = "BROKER_ACKED"
@@ -145,6 +168,39 @@ class _FakeOpportunityLedger(types.ModuleType):
                 },
                 )
         return len(client_ids)
+
+    def update_opportunity(
+        self,
+        signal_id: str,
+        client_id: str,
+        status: str,
+        *,
+        canonical_signal_id: str | None = None,
+        order_local_id: str | None = None,
+        miss_stage: str | None = None,
+        miss_reason: str | None = None,
+        extra_meta: dict | None = None,
+        **_kwargs,
+    ) -> bool:
+        canonical = canonical_signal_id or signal_id
+        row = self.rows.setdefault(
+            (canonical, client_id),
+            {
+                "signal_id": signal_id,
+                "canonical_signal_id": canonical,
+                "client_id": client_id,
+                "metadata": {},
+            },
+        )
+        row["opportunity_status"] = status
+        if order_local_id is not None:
+            row["order_local_id"] = order_local_id
+        if miss_stage is not None:
+            row["miss_stage"] = miss_stage
+        if miss_reason is not None:
+            row["miss_reason"] = miss_reason
+        row["metadata"] = {**(row.get("metadata") or {}), **(extra_meta or {})}
+        return True
 
     def mark_watcher_armed(
         self,
@@ -242,7 +298,11 @@ class _FakeOpportunityLedger(types.ModuleType):
         return True
 
 
-def _install_reeval_stubs(monkeypatch, ledger: _FakeOpportunityLedger | None = None):
+def _install_reeval_stubs(
+    monkeypatch,
+    ledger: _FakeOpportunityLedger | None = None,
+    execution_mode: str = "PAPER",
+):
     fake_validator = types.ModuleType("ap.overnight_daily_validator")
     fake_validator.fetch_market_snapshot = lambda ticker, broker: {"last": 100.0}
     fake_validator.validate_overnight_daily_signal = (
@@ -261,8 +321,13 @@ def _install_reeval_stubs(monkeypatch, ledger: _FakeOpportunityLedger | None = N
     fake_auth.check_live_authorization = lambda client_id: None
     fake_auth.authorization_gate_enforced = lambda: False
     fake_auth.LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
-    fake_auth.execution_mode_for_broker = lambda broker: "PAPER"
+    fake_auth.execution_mode_for_broker = lambda broker: execution_mode
     monkeypatch.setitem(sys.modules, "ap.authorization", fake_auth)
+
+    fake_db = types.ModuleType("ap.db")
+    fake_db.conn = lambda *a, **kw: _FakeDBConn()
+    fake_db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", fake_db)
 
     if ledger is not None:
         monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", ledger)
@@ -334,10 +399,15 @@ def _run_reeval(
     master_decision=None,
     classifier_result=None,
     return_controls: bool = False,
+    osm: _FakeOrderStateMachine | None = None,
+    execution_mode: str = "PAPER",
+    client_id: str = "client-1",
 ):
     import ap_overnight_reeval as ov
 
-    _install_reeval_stubs(monkeypatch, ledger=ledger)
+    if ledger is None:
+        ledger = _FakeOpportunityLedger()
+    _install_reeval_stubs(monkeypatch, ledger=ledger, execution_mode=execution_mode)
     monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
     monkeypatch.setattr(
         ov,
@@ -387,9 +457,9 @@ def _run_reeval(
     contract_selector = MagicMock()
     contract_selector.select.return_value = "AAPL260619C00100000"
 
-    osm = _FakeOrderStateMachine(cleanup_succeeds=cleanup_succeeds)
+    osm = osm or _FakeOrderStateMachine(cleanup_succeeds=cleanup_succeeds)
     result = ov.run_overnight_reeval(
-        client_id="client-1",
+        client_id=client_id,
         broker=broker,
         master_control=master_control,
         contract_selector=contract_selector,
@@ -403,6 +473,7 @@ def _run_reeval(
             "contract_selector": contract_selector,
             "master_control": master_control,
             "watching_calls": watching_calls,
+            "ledger": ledger,
         }
     return result, osm, rejected_calls, error_calls
 
@@ -758,6 +829,291 @@ def test_pending_owner_explicit_stale_release_continues_to_normal_arm_runtime(mo
     assert osm.create_calls == 1
     entry_watcher.watch.assert_called_once()
     assert controls["watching_calls"] == []
+
+
+def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):
+    row = ledger.rows[("CANON-001", client_id)]
+    scopes = row["metadata"]["overnight_watch_arm_attempt_scopes"]
+    return scopes[f"{mode}:2026-06-12"]
+
+
+def _run_watch_false(monkeypatch, *, ledger, osm, cleanup_succeeds=True):
+    watcher = MagicMock()
+    watcher.watch.return_value = False
+    watcher._last_reject_reason = "armed_false"
+    return _run_reeval(
+        monkeypatch,
+        watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        cleanup_succeeds=cleanup_succeeds,
+        return_controls=True,
+    )
+
+
+def test_attempt_first_generic_false_is_retryable_with_durable_count(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+
+    result, osm, rejected_calls, error_calls, controls = _run_watch_false(
+        monkeypatch, ledger=ledger, osm=osm
+    )
+
+    scope = _attempt_scope(ledger)
+    assert osm.create_calls == 1
+    assert scope["count"] == 1
+    assert scope["state"] == "RETRYABLE"
+    assert scope["local_order_id"] == "local-ord-1"
+    assert osm.orders["local-ord-1"]["status"] == "EXPIRED"
+    assert result["retryable_deferred"] == 1
+    assert result["terminal_rejected"] == 0
+    assert rejected_calls == []
+    assert error_calls == []
+    controls["broker"].submit_order.assert_not_called()
+    controls["broker"].cancel_order.assert_not_called()
+
+
+def test_attempt_second_requires_prior_terminal_truth_before_replacement(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+
+    _run_watch_false(monkeypatch, ledger=ledger, osm=osm)
+    result, osm, *_ = _run_watch_false(monkeypatch, ledger=ledger, osm=osm)
+
+    scope = _attempt_scope(ledger)
+    assert "local-ord-1" in osm.get_order_calls
+    assert osm.orders["local-ord-1"]["status"] == "EXPIRED"
+    assert osm.create_calls == 2
+    assert scope["count"] == 2
+    assert scope["state"] == "RETRYABLE"
+    assert scope["local_order_id"] == "local-ord-2"
+    active = [o for o in osm.orders.values() if o["status"] == "PENDING_TRIGGER"]
+    assert active == []
+    assert result["retryable_deferred"] == 1
+
+
+def test_attempt_active_prior_order_blocks_replacement(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1,
+                    "state": "IN_PROGRESS",
+                    "token": "tok-1",
+                    "local_order_id": "active-1",
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    osm.orders["active-1"] = {"status": "PENDING_TRIGGER"}
+    watcher = MagicMock()
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+
+    assert osm.create_calls == 0
+    watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert result["retryable_deferred"] == 1
+
+
+def test_attempt_unknown_prior_order_status_blocks_replacement(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1,
+                    "state": "RETRYABLE",
+                    "token": "tok-1",
+                    "local_order_id": "weird-1",
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    osm.orders["weird-1"] = {"status": "WAT"}
+    watcher = MagicMock()
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+
+    assert osm.create_calls == 0
+    watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert result["retryable_deferred"] == 1
+    assert "weird-1" in osm.get_order_calls
+
+
+def test_attempt_database_failure_blocks_replacement(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    ledger._get_sb = lambda: None
+    watcher = MagicMock()
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, return_controls=True
+    )
+
+    assert osm.create_calls == 0
+    watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert result["retryable_deferred"] == 1
+
+
+def test_attempts_are_bounded_at_three_total(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+
+    for _ in range(3):
+        _run_watch_false(monkeypatch, ledger=ledger, osm=osm)
+    result, osm, rejected_calls, error_calls, controls = _run_watch_false(
+        monkeypatch, ledger=ledger, osm=osm
+    )
+
+    scope = _attempt_scope(ledger)
+    assert osm.create_calls == 3
+    assert scope["count"] == 3
+    assert scope["state"] == "EXHAUSTED"
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert result["rejected"] == 0
+    assert result["terminal_rejected"] == 0
+    assert error_calls == [("job-001", "client-1", "overnight_watch_arm_retry_exhausted")]
+    assert rejected_calls == []
+    controls["broker"].submit_order.assert_not_called()
+
+
+def test_attempt_success_stops_future_creation(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _run_watch_false(monkeypatch, ledger=ledger, osm=osm)
+
+    success_watcher = MagicMock()
+    success_watcher.watch.return_value = True
+    result, osm, *_ = _run_reeval(
+        monkeypatch, success_watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+    assert result["armed"] == 1
+    assert osm.create_calls == 2
+    assert _attempt_scope(ledger)["state"] == "ARMED"
+
+    third_watcher = MagicMock()
+    third, osm, *_ = _run_reeval(
+        monkeypatch, third_watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+    assert osm.create_calls == 2
+    third_watcher.watch.assert_not_called()
+    assert third["armed"] == 1
+    assert third["fresh_armed"] == 0
+
+
+def test_attempt_bind_failure_cleans_new_order_and_marks_error(monkeypatch):
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    watcher = MagicMock()
+    monkeypatch.setattr(ov, "_bind_watch_arm_attempt_order", lambda **kwargs: False)
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+
+    assert osm.create_calls == 1
+    assert osm.orders["local-ord-1"]["status"] == "EXPIRED"
+    assert _attempt_scope(ledger)["state"] == "ERROR"
+    watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert result["retryable_deferred"] == 1
+
+
+def test_attempt_cleanup_failure_cannot_retry(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine(cleanup_succeeds=False)
+    watcher = MagicMock()
+    watcher.watch.return_value = False
+    watcher._last_reject_reason = "armed_false"
+    _run_reeval(monkeypatch, watcher, ledger=ledger, osm=osm)
+
+    second_watcher = MagicMock()
+    result, osm, *_ = _run_reeval(
+        monkeypatch, second_watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+    assert _attempt_scope(ledger)["state"] == "ERROR"
+    assert osm.create_calls == 1
+    second_watcher.watch.assert_not_called()
+    assert result["retryable_deferred"] == 1
+
+
+def test_attempt_exact_owner_dedup_does_not_consume_extra_retry(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    existing = types.SimpleNamespace(
+        signal_id="sig-001",
+        ticker="AAPL",
+        side="CALL",
+        signal={
+            "signal_id": "sig-001",
+            "client_id": "client-1",
+            "execution_mode": "paper",
+            "ticker": "AAPL",
+            "side": "CALL",
+            "local_order_id": "local-ord-1",
+        },
+    )
+    watcher = types.SimpleNamespace(
+        _pending=[existing],
+        _dedup_set={"sig-001"},
+        _lock=None,
+        _last_reject_reason="dedup_block",
+    )
+    watcher.watch = MagicMock(return_value=False)
+
+    result, osm, *_ = _run_reeval(monkeypatch, watcher, ledger=ledger, osm=osm)
+
+    scope = _attempt_scope(ledger)
+    assert scope["count"] == 1
+    assert scope["state"] == "ARMED"
+    assert result["armed"] == 1
+    assert result["fresh_armed"] == 0
+    assert ledger.invalidated_calls == []
+    assert osm.orders["local-ord-1"]["status"] == "EXPIRED"
+
+
+def test_attempt_client_and_mode_isolation(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    for client_id, mode in (
+        ("client-1", "LIVE"),
+        ("client-1", "PAPER"),
+        ("client-2", "LIVE"),
+    ):
+        watcher = MagicMock()
+        watcher.watch.return_value = False
+        watcher._last_reject_reason = "armed_false"
+        _run_reeval(
+            monkeypatch,
+            watcher,
+            ledger=ledger,
+            osm=osm,
+            execution_mode=mode,
+            client_id=client_id,
+        )
+
+    assert _attempt_scope(ledger, client_id="client-1", mode="live")["count"] == 1
+    assert _attempt_scope(ledger, client_id="client-1", mode="paper")["count"] == 1
+    assert _attempt_scope(ledger, client_id="client-2", mode="live")["count"] == 1
 
 
 def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_proof(monkeypatch, caplog):
