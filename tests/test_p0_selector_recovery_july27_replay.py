@@ -106,6 +106,36 @@ def test_market_truth_unavailable_holds_without_selector_or_broker():
     assert result.passed is False
 
 
+@pytest.mark.parametrize("side", ["", "UNKNOWN", "BUY"])
+def test_invalid_option_side_holds_before_retry_work(side):
+    result = _truth(side=side)
+    replay = {
+        "selector_calls": 0,
+        "direct_quote_calls": 0,
+        "cursor_advance_calls": 0,
+        "state_transition_calls": 0,
+        "broker_post_count": 0,
+    }
+
+    if classify_market_truth(result) == MarketTruthAuthority.SUBMIT_VALID:
+        replay["selector_calls"] += 1
+        replay["direct_quote_calls"] += 1
+        replay["cursor_advance_calls"] += 1
+        replay["state_transition_calls"] += 1
+        replay["broker_post_count"] += 1
+
+    assert result.passed is False
+    assert result.reason_code == GateOutcome.CURRENT_OPTION_SIDE_INVALID
+    assert classify_market_truth(result) == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+    assert replay == {
+        "selector_calls": 0,
+        "direct_quote_calls": 0,
+        "cursor_advance_calls": 0,
+        "state_transition_calls": 0,
+        "broker_post_count": 0,
+    }
+
+
 def _live_transport(base_url="https://api.tradier.com/v1"):
     return SimpleNamespace(
         base_url=base_url,

@@ -101,6 +101,7 @@ class GateOutcome:
     CURRENT_PRICE_STALE                    = "CURRENT_PRICE_STALE"
     CURRENT_PRICE_MISSING                  = "CURRENT_PRICE_MISSING"
     CURRENT_PRICE_ZERO                     = "CURRENT_PRICE_ZERO"
+    CURRENT_OPTION_SIDE_INVALID            = "CURRENT_OPTION_SIDE_INVALID"
     TARGET_ALREADY_INVALID                 = "TARGET_ALREADY_INVALID"
     REMAINING_OPPORTUNITY_TOO_SMALL        = "REMAINING_OPPORTUNITY_TOO_SMALL"
     CALL_NO_LONGER_ABOVE_TRIGGER           = "CALL_NO_LONGER_ABOVE_TRIGGER"
@@ -691,6 +692,11 @@ def check_market_validity_gate(
         )
 
     _side = str(side or "").strip().upper()
+    if _side not in {"CALL", "PUT"}:
+        return _fail(
+            GateOutcome.CURRENT_OPTION_SIDE_INVALID,
+            f"option side must be CALL or PUT, got {side!r}",
+        )
     tr = _finite_float(trigger_price)
     tg = _finite_float(target_price)
     st = _finite_float(stop_price)
@@ -740,8 +746,6 @@ def check_market_validity_gate(
                 GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
                 f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
             )
-    # Unknown side: pass (identity gate would have blocked this earlier)
-
     # Rule: remaining opportunity
     rem_pct = _remaining_opportunity_pct(_side, mid, tr, tg)
     if rem_pct is not None:
