@@ -35,6 +35,7 @@ import os
 import sys
 import types
 import importlib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -63,18 +64,52 @@ class _FakeResult:
         self.data = data
 
 
+class _FakeAPIError(Exception):
+    """Mimics a PostgREST APIError carrying a Postgres error code (e.g. 23505)."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class _FakeQuery:
     def __init__(self, store):
         self._store = store
-        self._filters = []  # list of (op, col, val)
+        self._filters = []       # list of (op, col, val)
+        self._pending = None      # set by upsert(); consumed by execute()
+        self._update_data = None  # set by update(); consumed by execute()
+        self._insert_row = None   # set by insert(); consumed by execute()
 
-    # ── write path ────────────────────────────────────────────────────────────
+    # ── write path — upsert ───────────────────────────────────────────────────
     def upsert(self, row, on_conflict=None):
         r = dict(row)
         r.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         key = (str(r.get("signal_id")), str(r.get("client_email")))
         self._store.rows[key] = r  # composite-key upsert → inherently idempotent
         self._pending = _FakeResult([r])
+        return self
+
+    # ── write path — create-only insert ──────────────────────────────────────
+    # Models _persist_watching_signal_if_eligible's create-only insert.
+    # If the store has composite-uniqueness disabled (store._no_unique_constraint),
+    # raise a generic non-23505 error so the helper must fail closed (Test 11).
+    # If a row already exists for the composite key, raise a 23505 uniqueness
+    # violation (Test 6). Otherwise create the row.
+    def insert(self, row):
+        self._insert_row = dict(row)
+        return self
+
+    # ── write path — expected-state update ───────────────────────────────────
+    # Models _compensate_watching_signal_if_unchanged AND the expected-state
+    # transition update in _persist_watching_signal_if_eligible:
+    #   .update({...}).eq("signal_id", x).eq("client_email", y)
+    #                 .eq("decision_status", observed).execute()
+    # Only rows that match ALL .eq() filters are mutated; all others are
+    # untouched. Returns _FakeResult([updated_row]) when exactly one row matched,
+    # _FakeResult([]) when no row matches (row advanced / missing).
+    def update(self, data):
+        self._update_data = dict(data)
         return self
 
     # ── read path ─────────────────────────────────────────────────────────────
@@ -96,13 +131,54 @@ class _FakeQuery:
         return self
 
     def execute(self):
-        if getattr(self, "_pending", None) is not None:
+        def _value(row, col):
+            if col == "raw_payload->>watching_job_id":
+                raw = row.get("raw_payload")
+                if isinstance(raw, dict) and raw.get("watching_job_id") is not None:
+                    return str(raw["watching_job_id"])
+                return None
+            return row.get(col)
+
+        # 1. Pending upsert result (consumed once).
+        if self._pending is not None:
             out, self._pending = self._pending, None
             return out
+
+        # 1b. Create-only insert (consumed once).
+        if self._insert_row is not None:
+            row = self._insert_row
+            self._insert_row = None
+            # Simulate a missing composite uniqueness constraint: create-only
+            # cannot be enforced → raise a NON-23505 error so the helper fails
+            # closed rather than falling back to an unsafe upsert (Test 11).
+            if getattr(self._store, "_no_unique_constraint", False):
+                raise RuntimeError("42P10: no unique or exclusion constraint matching")
+            key = (str(row.get("signal_id")), str(row.get("client_email")))
+            if key in self._store.rows:
+                # Duplicate composite key → 23505 uniqueness violation (Test 6).
+                raise _FakeAPIError("23505", "duplicate key value violates unique constraint")
+            row.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+            self._store.rows[key] = row
+            return _FakeResult([dict(row)])
+
+        # 2. Expected-state update (consumed once).
+        if self._update_data is not None:
+            update_data = self._update_data
+            self._update_data = None
+            filters = list(self._filters)
+            self._filters = []
+            updated = []
+            for key, row in list(self._store.rows.items()):
+                if all(_value(row, col) == val for op, col, val in filters if op == "eq"):
+                    row.update(update_data)
+                    updated.append(dict(row))
+            return _FakeResult(updated)
+
+        # 3. Read / select path.
         rows = list(self._store.rows.values())
         for op, col, val in self._filters:
             if op == "eq":
-                rows = [r for r in rows if r.get(col) == val]
+                rows = [r for r in rows if _value(r, col) == val]
             elif op == "gte":
                 rows = [r for r in rows if str(r.get(col) or "") >= str(val)]
         return _FakeResult(rows)
@@ -117,7 +193,11 @@ class _FakeSupabase:
 
 
 class _BoomSupabase:
-    """A Supabase client whose upsert always raises — simulates write failure."""
+    """A Supabase client whose write methods always raise — simulates failures.
+
+    P0 #405: update() must also raise so _compensate_watching_signal_if_unchanged
+    correctly returns SIGNAL_COMP_DB_ERROR when Supabase is unavailable.
+    """
 
     def table(self, _name):
         return self
@@ -125,8 +205,20 @@ class _BoomSupabase:
     def upsert(self, *_a, **_k):
         raise RuntimeError("supabase upsert failed")
 
-    def execute(self):  # pragma: no cover - never reached
-        raise RuntimeError("never reached")
+    def insert(self, *_a, **_k):
+        raise RuntimeError("supabase insert failed")
+
+    def update(self, *_a, **_k):
+        raise RuntimeError("supabase update failed")
+
+    def select(self, *_a, **_k):
+        return self
+
+    def eq(self, *_a, **_k):
+        return self
+
+    def execute(self):
+        raise RuntimeError("supabase execute failed")
 
 
 @pytest.fixture
@@ -138,13 +230,18 @@ def sb(monkeypatch):
 
 @pytest.fixture
 def marks(monkeypatch):
-    """Capture every _mark_job(job_id, status, error=, result=) call.
+    """Capture every _mark_job / _checked_processing_error_cas /
+    _checked_watching_cas call.
 
-    Also stubs _checked_watching_cas to return True (simulating a successful
-    single-row queue CAS) so tests that exercise _persist_watching_deferral or
-    _dispatch do not require a live Postgres connection.  Tests that specifically
-    exercise CAS failure (test_4e, test_4f) override this with their own
-    monkeypatch after the fixture runs.
+    P0 #405: also stubs _checked_processing_error_cas to return
+    ERROR_CAS_TRANSITIONED (simulating a successful PROCESSING->ERROR CAS) so
+    tests that exercise the early failure paths inside _persist_watching_deferral
+    do not require a live Postgres connection.  Calls are recorded with
+    status='ERROR' so existing assertions against marks remain valid.
+
+    Also stubs _checked_watching_cas to return WATCHING_CAS_TRANSITIONED and
+    records a WATCHING entry.  Tests that exercise specific CAS failure outcomes
+    override these stubs with their own monkeypatch after the fixture runs.
     """
     recorded: list[dict] = []
 
@@ -155,11 +252,18 @@ def marks(monkeypatch):
 
     monkeypatch.setattr(queue, "_mark_job", _fake_mark)
 
-    # Default: CAS succeeds (TRANSITIONED) AND records a WATCHING mark so that
-    # assertions like `[m["status"] for m in marks if m["job_id"] == X]` still
-    # see ["WATCHING"] without requiring a live Postgres connection.
-    # Tests that exercise specific CAS outcomes override this with their own
-    # monkeypatch after the fixture runs.
+    # P0 #405: guarded queue ERROR CAS — replaces unconditional _mark_job(ERROR).
+    # Records an ERROR entry with the same shape so existing assertions remain valid.
+    def _fake_error_cas(job_id, *, error, result=None):
+        recorded.append(
+            {"job_id": job_id, "status": "ERROR", "result": result, "error": error}
+        )
+        return queue.ERROR_CAS_TRANSITIONED
+
+    monkeypatch.setattr(queue, "_checked_processing_error_cas", _fake_error_cas)
+
+    # Default: WATCHING CAS succeeds (TRANSITIONED) AND records a WATCHING mark.
+    # Tests that exercise specific CAS outcomes override this after fixture runs.
     def _fake_cas(job_id, *, watching_error=None, watching_result=None):
         recorded.append(
             {"job_id": job_id, "status": "WATCHING",
@@ -1032,8 +1136,14 @@ def test_persist_E_unexpected_nonterminal_queue_unchanged(monkeypatch, sb):
 
 
 def test_persist_F_db_error_no_false_success(monkeypatch, sb):
-    """F integration: CAS outcome DB_ERROR → helper False.
-    Signal compensation attempted. No claim of successful deferral."""
+    """F integration: CAS outcome DB_ERROR → helper returns False.
+
+    P0 #405: signal compensation is now an expected-state UPDATE via
+    _compensate_watching_signal_if_unchanged (not a blind upsert via
+    _log_signal_to_db).  The _FakeQuery.update() path must transition the
+    WATCHING row to ERROR, confirming the expected-state fencing works end-to-end.
+    No _mark_job call is permitted (queue state not confirmed as PROCESSING).
+    """
     monkeypatch.setattr(
         queue, "_checked_watching_cas",
         lambda *a, **k: queue.WATCHING_CAS_DB_ERROR,
@@ -1057,20 +1167,28 @@ def test_persist_F_db_error_no_false_success(monkeypatch, sb):
     )
 
     assert ok is False, "DB_ERROR must return False — never silent success"
-    # Signal compensation attempted (ERROR row written to ap_signals).
+    # P0 #405: expected-state compensation must have transitioned the WATCHING row
+    # to ERROR via _compensate_watching_signal_if_unchanged (WHERE decision_status=WATCHING).
     assert _signal_rows(sb, "ERROR"), (
-        "signal compensation must be attempted on DB_ERROR"
+        "expected-state compensation must transition ap_signals to ERROR on DB_ERROR"
     )
-    # No blind _mark_job.
+    assert not _signal_rows(sb, "WATCHING"), (
+        "no WATCHING rows must remain after successful compensation"
+    )
+    # No blind _mark_job — queue row state was not confirmed as PROCESSING.
     assert not mark_calls, (
         f"_mark_job must not be called on DB_ERROR — got {mark_calls}"
     )
 
 
-def test_persist_G_compensation_bool_failure_emits_critical(monkeypatch, sb, caplog):
+def test_persist_G_compensation_failure_emits_critical(monkeypatch, sb, caplog):
     """G: Initial WATCHING write succeeds; CAS returns MISSING_OR_UNEXPECTED;
-    compensation write returns False. Critical DEFERRAL_SIGNAL_REVERT_FAILED
-    diagnostic must be emitted; helper must return False; no silent success."""
+    _compensate_watching_signal_if_unchanged returns SIGNAL_COMP_DB_ERROR.
+
+    P0 #405: compensation now goes through _compensate_watching_signal_if_unchanged
+    (not _log_signal_to_db).  DEFERRAL_SIGNAL_COMP_FAILED critical log must be
+    emitted; helper must return False; _mark_job must not be called.
+    """
     import logging
 
     monkeypatch.setattr(
@@ -1078,15 +1196,14 @@ def test_persist_G_compensation_bool_failure_emits_critical(monkeypatch, sb, cap
         lambda *a, **k: queue.WATCHING_CAS_MISSING_OR_UNEXPECTED,
     )
 
-    call_count = [0]
+    # Patch the new expected-state compensation helper to simulate DB failure.
+    comp_calls: list[str] = []
 
-    def _fake_log_signal(*, decision_status, **kwargs):
-        call_count[0] += 1
-        if decision_status == queue.DECISION_WATCHING:
-            return True   # initial WATCHING write succeeds
-        return False      # compensation write fails — returns False, not exception
+    def _fake_comp(*, signal_id, client_email, watching_job_id, context_notes):
+        comp_calls.append(signal_id)
+        return queue.SIGNAL_COMP_DB_ERROR
 
-    monkeypatch.setattr(queue, "_log_signal_to_db", _fake_log_signal)
+    monkeypatch.setattr(queue, "_compensate_watching_signal_if_unchanged", _fake_comp)
 
     mark_calls: list[dict] = []
     monkeypatch.setattr(
@@ -1109,25 +1226,1477 @@ def test_persist_G_compensation_bool_failure_emits_critical(monkeypatch, sb, cap
 
     assert ok is False, "helper must return False — not silent success"
 
-    # DEFERRAL_SIGNAL_REVERT_FAILED critical log must be emitted because the
-    # compensation write returned False (not an exception — must not rely on
-    # try/except alone to detect this).
-    revert_failed_logs = [
+    # P0 #405: DEFERRAL_SIGNAL_COMP_FAILED (not the old DEFERRAL_SIGNAL_REVERT_FAILED).
+    comp_failed_logs = [
         r for r in caplog.records
-        if "DEFERRAL_SIGNAL_REVERT_FAILED" in r.message
+        if "DEFERRAL_SIGNAL_COMP_FAILED" in r.message
     ]
-    assert revert_failed_logs, (
-        "DEFERRAL_SIGNAL_REVERT_FAILED critical log must be emitted when "
-        "compensation write returns False (not just when it raises)"
+    assert comp_failed_logs, (
+        "DEFERRAL_SIGNAL_COMP_FAILED critical log must be emitted when "
+        "_compensate_watching_signal_if_unchanged returns SIGNAL_COMP_DB_ERROR"
     )
 
-    # Both initial write and compensation write must be attempted.
-    assert call_count[0] >= 2, (
-        f"_log_signal_to_db must be called at least twice (initial + compensation) "
-        f"— called {call_count[0]}x"
+    # Compensation helper must have been called exactly once.
+    assert len(comp_calls) == 1, (
+        f"_compensate_watching_signal_if_unchanged must be called once — called {len(comp_calls)}x"
     )
 
-    # No blind _mark_job.
+    # No blind _mark_job — queue row state was not confirmed as PROCESSING.
     assert not mark_calls, (
         f"_mark_job must not be called on MISSING_OR_UNEXPECTED — got {mark_calls}"
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 — Signal compensation fencing
+# _compensate_watching_signal_if_unchanged must be an expected-state UPDATE.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_comp_watching_transitions_to_error(sb):
+    """WATCHING row → compensation transitions to ERROR (SIGNAL_COMP_TRANSITIONED)."""
+    sb.table("ap_signals").upsert({
+        "signal_id": "comp-sig-1", "client_email": "a@x.com",
+        "decision_status": "WATCHING",
+        "raw_payload": {"watching_job_id": 2001},
+    }).execute()
+
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-sig-1",
+        client_email="a@x.com",
+        watching_job_id=2001,
+        context_notes="test compensation",
+    )
+    assert outcome == queue.SIGNAL_COMP_TRANSITIONED, (
+        f"WATCHING row must transition to ERROR — got {outcome!r}"
+    )
+    rows = _signal_rows(sb, "ERROR")
+    assert rows, "ap_signals row must be ERROR after successful compensation"
+    assert not _signal_rows(sb, "WATCHING"), "no WATCHING rows must remain"
+
+
+def test_comp_wrong_queue_owner_preserves_watching(sb):
+    """A stale queue job cannot compensate another job's WATCHING signal."""
+    sb.table("ap_signals").upsert({
+        "signal_id": "comp-owner", "client_email": "a@x.com",
+        "decision_status": "WATCHING",
+        "raw_payload": {"watching_job_id": 3002},
+    }).execute()
+
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-owner",
+        client_email="a@x.com",
+        watching_job_id=3001,
+        context_notes="stale worker",
+    )
+    assert outcome == queue.SIGNAL_COMP_ALREADY_ADVANCED
+    assert sb.rows[("comp-owner", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+@pytest.mark.parametrize("advanced_status", [
+    "queued", "triggered", "submitted", "filled", "rejected", "error",
+])
+def test_comp_advanced_state_preserved(sb, advanced_status):
+    """Row already past WATCHING → zero-row update; state preserved (SIGNAL_COMP_ALREADY_ADVANCED)."""
+    sb.table("ap_signals").upsert({
+        "signal_id": "comp-sig-adv", "client_email": "b@x.com",
+        "decision_status": advanced_status,
+    }).execute()
+
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-sig-adv",
+        client_email="b@x.com",
+        watching_job_id=2002,
+        context_notes="test",
+    )
+    assert outcome == queue.SIGNAL_COMP_ALREADY_ADVANCED, (
+        f"Advanced status {advanced_status!r} must not be overwritten — got {outcome!r}"
+    )
+    # Row must still have the original advanced status.
+    remaining = list(sb.rows.values())
+    assert len(remaining) == 1
+    assert remaining[0]["decision_status"] == advanced_status, (
+        f"Row decision_status must remain {advanced_status!r} — "
+        f"got {remaining[0]['decision_status']!r}"
+    )
+
+
+def test_comp_wrong_client_no_mutation(sb):
+    """Wrong client_email → zero-row update; original row untouched (SIGNAL_COMP_ALREADY_ADVANCED)."""
+    sb.table("ap_signals").upsert({
+        "signal_id": "comp-sig-cli", "client_email": "real@x.com",
+        "decision_status": "WATCHING",
+    }).execute()
+
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-sig-cli",
+        client_email="other@x.com",   # wrong client
+        watching_job_id=2003,
+        context_notes="test",
+    )
+    # No matching row → MISSING (row exists but for a different client).
+    assert outcome in (queue.SIGNAL_COMP_MISSING, queue.SIGNAL_COMP_ALREADY_ADVANCED), (
+        f"Wrong client must not mutate — got {outcome!r}"
+    )
+    real_row = sb.rows.get(("comp-sig-cli", "real@x.com"))
+    assert real_row is not None
+    assert real_row["decision_status"] == "WATCHING", (
+        "Real row must remain WATCHING after wrong-client compensation attempt"
+    )
+
+
+def test_comp_wrong_signal_no_mutation(sb):
+    """Wrong signal_id → SIGNAL_COMP_MISSING; original row untouched."""
+    sb.table("ap_signals").upsert({
+        "signal_id": "comp-sig-real", "client_email": "c@x.com",
+        "decision_status": "WATCHING",
+    }).execute()
+
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-sig-ghost",   # wrong signal
+        client_email="c@x.com",
+        watching_job_id=2004,
+        context_notes="test",
+    )
+    assert outcome == queue.SIGNAL_COMP_MISSING, (
+        f"Wrong signal_id must return MISSING — got {outcome!r}"
+    )
+    real_row = sb.rows.get(("comp-sig-real", "c@x.com"))
+    assert real_row is not None
+    assert real_row["decision_status"] == "WATCHING", (
+        "Real row must remain WATCHING after wrong-signal compensation attempt"
+    )
+
+
+def test_comp_missing_row_returns_missing(sb):
+    """No row at all → SIGNAL_COMP_MISSING; no new row created."""
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-nonexistent", client_email="d@x.com",
+        watching_job_id=2005,
+        context_notes="test",
+    )
+    assert outcome == queue.SIGNAL_COMP_MISSING, (
+        f"Missing row must return SIGNAL_COMP_MISSING — got {outcome!r}"
+    )
+    assert not sb.rows, "No rows must be created by a compensation on a missing signal"
+
+
+def test_comp_db_failure_returns_db_error(monkeypatch):
+    """Supabase client raises → SIGNAL_COMP_DB_ERROR; never raises to caller."""
+    monkeypatch.setattr(queue, "_get_sb_client", lambda: _BoomSupabase())
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-boom", client_email="e@x.com",
+        watching_job_id=2006,
+        context_notes="test",
+    )
+    assert outcome == queue.SIGNAL_COMP_DB_ERROR, (
+        f"DB failure must return SIGNAL_COMP_DB_ERROR — got {outcome!r}"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 — Early queue failure fencing
+# _checked_processing_error_cas must only write ERROR on PROCESSING rows.
+# ═════════════════════════════════════════════════════════════════════════════
+
+def test_early_cas_invalid_client_guards_queue(sb, marks):
+    """invalid_client path uses _checked_processing_error_cas not _mark_job."""
+    # marks fixture stubs _checked_processing_error_cas → ERROR_CAS_TRANSITIONED.
+    ok = queue._persist_watching_deferral(
+        job_id=40501,
+        client_id="   ",   # blank → invalid
+        signal_id="sig-early-cli",
+        execution_mode="paper",
+        payload={"ticker": "AAPL", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="invalid client test",
+    )
+    assert ok is False
+    errors = [m for m in marks if m["job_id"] == 40501 and m["status"] == "ERROR"]
+    assert errors, "guarded ERROR CAS must be recorded for invalid_client"
+    assert errors[0]["error"].endswith(":invalid_client"), (
+        f"error must end with :invalid_client — got {errors[0]['error']!r}"
+    )
+    # No WATCHING marks.
+    assert not any(m["status"] == "WATCHING" for m in marks if m["job_id"] == 40501), (
+        "no WATCHING must appear for invalid_client"
+    )
+
+
+def test_early_cas_invalid_mode_guards_queue(sb, marks):
+    """invalid_mode path uses _checked_processing_error_cas not _mark_job."""
+    ok = queue._persist_watching_deferral(
+        job_id=40502,
+        client_id="valid@x.com",
+        signal_id="sig-early-mode",
+        execution_mode="unknown_mode",   # invalid
+        payload={"ticker": "MSFT", "side": "PUT", "score": 68, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="invalid mode test",
+    )
+    assert ok is False
+    errors = [m for m in marks if m["job_id"] == 40502 and m["status"] == "ERROR"]
+    assert errors, "guarded ERROR CAS must be recorded for invalid_mode"
+    assert errors[0]["error"].endswith(":invalid_mode")
+
+
+def test_early_cas_invalid_signal_guards_queue(sb, marks):
+    """invalid_signal_id path uses _checked_processing_error_cas not _mark_job."""
+    ok = queue._persist_watching_deferral(
+        job_id=40503,
+        client_id="valid@x.com",
+        signal_id="",   # empty → no canonical identity
+        execution_mode="paper",
+        payload={"ticker": "TSLA", "side": "CALL", "score": 65, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="invalid signal test",
+    )
+    assert ok is False
+    errors = [m for m in marks if m["job_id"] == 40503 and m["status"] == "ERROR"]
+    assert errors, "guarded ERROR CAS must be recorded for invalid_signal_id"
+    assert errors[0]["error"].endswith(":invalid_signal_id")
+
+
+def test_early_cas_signal_persistence_failure_guards_queue(monkeypatch, marks):
+    """Failed guarded WATCHING persistence uses _checked_processing_error_cas.
+
+    _persist_watching_deferral no longer calls _log_signal_to_db for the early
+    WATCHING establishment, so this patches the active helper.
+    """
+    monkeypatch.setattr(
+        queue,
+        "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_DB_ERROR,
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40504,
+        client_id="valid@x.com",
+        signal_id="sig-early-persist-fail",
+        execution_mode="live",
+        payload={"ticker": "SPY", "side": "PUT", "score": 72, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="signal persistence failure test",
+    )
+    assert ok is False
+    errors = [m for m in marks if m["job_id"] == 40504 and m["status"] == "ERROR"]
+    assert errors, "guarded ERROR CAS must be recorded for signal persistence failure"
+
+
+def test_early_cas_concurrent_watching_not_overwritten(monkeypatch, sb):
+    """Row concurrently advanced to WATCHING → ERROR_CAS_WATCHING_OR_ADVANCED;
+    the WATCHING state must not be overwritten."""
+    cas_outcomes: list[str] = []
+
+    def _fake_error_cas(job_id, *, error, result=None):
+        # Simulate: row is WATCHING when the CAS fires.
+        cas_outcomes.append(queue.ERROR_CAS_WATCHING_OR_ADVANCED)
+        return queue.ERROR_CAS_WATCHING_OR_ADVANCED
+
+    monkeypatch.setattr(queue, "_checked_processing_error_cas", _fake_error_cas)
+
+    # invalid_client → triggers guarded ERROR CAS
+    ok = queue._persist_watching_deferral(
+        job_id=40505,
+        client_id="   ",
+        signal_id="sig-concurrent-watching",
+        execution_mode="paper",
+        payload={},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="concurrent watching test",
+    )
+    assert ok is False, "must return False regardless of CAS outcome"
+    assert cas_outcomes == [queue.ERROR_CAS_WATCHING_OR_ADVANCED], (
+        "guarded CAS must return WATCHING_OR_ADVANCED when row advanced"
+    )
+
+
+def test_early_cas_concurrent_terminal_not_overwritten(monkeypatch, sb):
+    """Row concurrently advanced to a terminal state → ERROR_CAS_TERMINAL;
+    the terminal state must not be overwritten."""
+    cas_outcomes: list[str] = []
+
+    def _fake_error_cas(job_id, *, error, result=None):
+        cas_outcomes.append(queue.ERROR_CAS_TERMINAL)
+        return queue.ERROR_CAS_TERMINAL
+
+    monkeypatch.setattr(queue, "_checked_processing_error_cas", _fake_error_cas)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40506,
+        client_id="   ",
+        signal_id="sig-concurrent-terminal",
+        execution_mode="paper",
+        payload={},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="concurrent terminal test",
+    )
+    assert ok is False, "must return False regardless of CAS outcome"
+    assert cas_outcomes == [queue.ERROR_CAS_TERMINAL], (
+        "guarded CAS must return TERMINAL when row is in terminal state"
+    )
+
+
+def test_queue_cas_helpers_use_deployed_result_json_shape(monkeypatch):
+    """PostgreSQL contract: deployed trade_queue has result_json and no meta."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    extras = pytest.importorskip("psycopg2.extras")
+    from ap.db import _ConnWrapper
+
+    database_url = (
+        os.getenv("AP_QUEUE_CAS_POSTGRES_TEST_URL")
+        or os.getenv("DATABASE_URL")
+        or ""
+    ).strip()
+    if not database_url:
+        pytest.skip("PostgreSQL URL not configured")
+
+    try:
+        db = psycopg2.connect(database_url, cursor_factory=extras.RealDictCursor)
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL integration unavailable: {exc}")
+
+    try:
+        with db.cursor(cursor_factory=extras.RealDictCursor) as c:
+            c.execute(
+                """
+                CREATE TEMP TABLE trade_queue (
+                    id              BIGINT PRIMARY KEY,
+                    client_id       TEXT,
+                    signal_id       TEXT,
+                    created_ts      TIMESTAMPTZ,
+                    status          TEXT,
+                    payload         JSONB,
+                    started_ts      TIMESTAMPTZ,
+                    finished_ts     TIMESTAMPTZ,
+                    result_json     JSONB,
+                    last_error      TEXT,
+                    idempotency_key TEXT
+                ) ON COMMIT PRESERVE ROWS
+                """
+            )
+            c.execute(
+                """
+                INSERT INTO trade_queue
+                    (id, client_id, signal_id, created_ts, status, payload, result_json)
+                VALUES
+                    (9001, 'cas@example.com', 'sig-watch', NOW(), 'PROCESSING',
+                     '{}'::jsonb, '{"existing":"watch"}'::jsonb),
+                    (9002, 'cas@example.com', 'sig-error', NOW(), 'PROCESSING',
+                     '{}'::jsonb, '{"existing":"error"}'::jsonb)
+                """
+            )
+        db.commit()
+
+        @contextmanager
+        def _pg_conn():
+            cur = db.cursor(cursor_factory=extras.RealDictCursor)
+            try:
+                yield _ConnWrapper(db, cur)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                cur.close()
+
+        monkeypatch.setattr(queue, "_conn", lambda: _pg_conn)
+        monkeypatch.setattr(queue, "_run_with_retry", lambda fn, *a, **k: fn())
+
+        watching = queue._checked_watching_cas(
+            9001,
+            watching_error="after_hours_deferred:awaiting_overnight_reeval",
+            watching_result={"watching": True},
+        )
+        error = queue._checked_processing_error_cas(
+            9002,
+            error="WATCHING_SIGNAL_PERSISTENCE_FAILED",
+            result={"error": True},
+        )
+
+        assert watching == queue.WATCHING_CAS_TRANSITIONED
+        assert error == queue.ERROR_CAS_TRANSITIONED
+        with db.cursor(cursor_factory=extras.RealDictCursor) as c:
+            c.execute(
+                """
+                SELECT id, status, last_error, result_json
+                FROM trade_queue
+                WHERE id IN (9001, 9002)
+                ORDER BY id
+                """
+            )
+            rows = [dict(r) for r in c.fetchall()]
+
+        assert rows[0]["status"] == "WATCHING"
+        assert rows[0]["last_error"] == "after_hours_deferred:awaiting_overnight_reeval"
+        assert rows[0]["result_json"]["existing"] == "watch"
+        assert rows[0]["result_json"]["watching"] is True
+        assert rows[1]["status"] == "ERROR"
+        assert rows[1]["last_error"] == "WATCHING_SIGNAL_PERSISTENCE_FAILED"
+        assert rows[1]["result_json"]["existing"] == "error"
+        assert rows[1]["result_json"]["error"] is True
+    finally:
+        db.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 — Single WATCHING authority: after-hours contract-selection branch
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _make_dispatch_deps(monkeypatch, sb, marks):
+    """Build the minimal stubs needed for _dispatch() after-hours path."""
+    import types
+
+    # master_control stub — approved, mode=PAPER, not after-hours blocked.
+    mc = MagicMock()
+    mc.mode = "PAPER"
+    mc.check.return_value = MagicMock(approved=True, veto_category=None, hard_veto=False)
+
+    # contract_selector stub — forces the after-hours branch via TimeoutError
+    # on select() with _skip_contract_selection=False.  The simplest way to
+    # reach the after-hours block is to have the market-hours check see the
+    # signal arrive outside regular session.
+    cs = MagicMock()
+    cs.select.return_value = None  # not reached in after-hours
+
+    osm = MagicMock()
+    ew = MagicMock()
+    broker = MagicMock()
+
+    return mc, cs, osm, ew, broker
+
+
+def _build_after_hours_payload(signal_id="sig-ah-405"):
+    return {
+        "signal_id": signal_id,
+        "ticker": "NVDA",
+        "side": "CALL",
+        "score": 74,
+        "timeframe": "1d",
+        "tier": "A",
+        "pattern": "3-2U",
+        "direction": "CALL",
+    }
+
+
+def _dispatch_after_hours(
+    *,
+    monkeypatch,
+    signal_id="sig-ah-405",
+    job_id=40530,
+    persist_outcome=True,
+    counterfactual_spy=None,
+):
+    """Run the real _dispatch after-hours contract-selection branch."""
+    _isolate_dispatch(monkeypatch, in_session=False)
+    if counterfactual_spy is not None:
+        sys.modules["ap.counterfactual_tracker"].track_counterfactual_signal = (
+            counterfactual_spy
+        )
+
+    plan = MagicMock()
+    plan.metadata = {}
+    mc = _MC(_Decision(ok=True, stage="ok", reason="", plan=plan), mode="PAPER")
+    selector, osm, watcher, broker = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    persist_calls: list[dict] = []
+
+    def _fake_persist(**kwargs):
+        persist_calls.append(kwargs)
+        return persist_outcome
+
+    monkeypatch.setattr(queue, "_persist_watching_deferral", _fake_persist)
+
+    queue._dispatch(
+        job_id,
+        "afterhours@example.com",
+        signal_id,
+        _build_after_hours_payload(signal_id),
+        master_control=mc,
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher,
+        broker=broker,
+    )
+    return {
+        "plan": plan,
+        "mc": mc,
+        "selector": selector,
+        "osm": osm,
+        "watcher": watcher,
+        "broker": broker,
+        "persist_calls": persist_calls,
+    }
+
+
+def test_after_hours_routes_through_persist_watching_deferral(monkeypatch, sb, marks):
+    """After-hours contract-selection branch must call _persist_watching_deferral
+    exactly once; it must NOT directly call _mark_job(WATCHING) or _log_signal_to_db
+    with decision_status=WATCHING."""
+    direct_watching_marks: list[dict] = []
+
+    def _spy_mark(job_id, status, *, result=None, error=None):
+        if status == "WATCHING":
+            direct_watching_marks.append({"job_id": job_id, "status": status})
+        marks.append({"job_id": job_id, "status": status, "result": result, "error": error})
+
+    monkeypatch.setattr(queue, "_mark_job", _spy_mark)
+
+    result = _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-ah-runtime-405",
+        job_id=40530,
+        persist_outcome=True,
+    )
+
+    assert len(result["persist_calls"]) == 1
+    assert result["persist_calls"][0]["stage"] == "contract_selection"
+    assert result["persist_calls"][0]["reason_code"] == "market_closed_deferred"
+    assert direct_watching_marks == [], (
+        "_dispatch after-hours branch must not call _mark_job(WATCHING) directly"
+    )
+    result["selector"].select.assert_not_called()
+    result["osm"].create_entry_order.assert_not_called()
+    result["watcher"].watch.assert_not_called()
+
+
+def test_after_hours_no_direct_mark_job_watching_in_source():
+    """Source-code guard: the after-hours intraday block in _dispatch must not
+    contain a direct _mark_job(job_id, 'WATCHING', ...) call.
+
+    P0 #405 / P1: _persist_watching_deferral is the single WATCHING authority."""
+    import re
+
+    src = (
+        __import__("pathlib").Path(__file__).resolve().parents[1]
+        / "ap" / "queue.py"
+    ).read_text()
+
+    # Locate the after-hours intraday block (market_closed_deferred, contract
+    # selection deferred).  It ends before the mkt_err except clause.
+    block_match = re.search(
+        r"contract_selection_deferred.*?(?=\n    except Exception as _mkt_err)",
+        src,
+        re.DOTALL,
+    )
+    assert block_match, "Could not locate after-hours block in queue.py"
+    block = block_match.group(0)
+
+    # Strip comments and strings to avoid false negatives from docstrings.
+    import tokenize, io
+    code_lines = set()
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(block).readline))
+        for tok in tokens:
+            if tok.type not in (tokenize.COMMENT, tokenize.STRING, tokenize.NEWLINE,
+                                tokenize.NL, tokenize.INDENT, tokenize.DEDENT,
+                                tokenize.ENCODING):
+                code_lines.add(tok.string)
+    except tokenize.TokenError:
+        pass  # partial block is OK — we just check the direct call pattern
+
+    direct_watching = re.search(
+        r'_mark_job\s*\(\s*job_id\s*,\s*["\']WATCHING["\']',
+        block,
+    )
+    assert direct_watching is None, (
+        "After-hours block must not contain a direct _mark_job(job_id, 'WATCHING') call. "
+        "All WATCHING writes must route through _persist_watching_deferral. "
+        f"Found: {direct_watching.group(0) if direct_watching else 'N/A'}"
+    )
+
+
+def test_after_hours_malformed_score_does_not_raise(sb, marks, monkeypatch):
+    """Malformed score such as 'A+' must not raise in the after-hours path.
+
+    P0 #405 / P1: score sanitization is owned by _persist_watching_deferral
+    (_safe_float); the after-hours branch no longer calls float() directly."""
+    _isolate_dispatch(monkeypatch, in_session=False)
+    plan = MagicMock()
+    plan.metadata = {}
+    mc = _MC(_Decision(ok=True, stage="ok", reason="", plan=plan), mode="PAPER")
+
+    queue._dispatch(
+        40520,
+        "z@x.com",
+        "sig-malformed-score",
+        {"ticker": "SPY", "side": "CALL", "score": "A+", "timeframe": "1d"},
+        master_control=mc,
+        contract_selector=MagicMock(),
+        order_state_machine=MagicMock(),
+        entry_watcher=MagicMock(),
+        broker=MagicMock(),
+    )
+
+    # Signal row must exist with a float score.
+    rows = _signal_rows(sb, "WATCHING")
+    assert rows, "WATCHING signal row must be written"
+    assert isinstance(rows[0].get("score"), float), (
+        f"Score must be a float after sanitization — got {rows[0].get('score')!r}"
+    )
+
+
+def test_after_hours_counterfactual_runs_only_on_deferral_success(monkeypatch, sb, marks):
+    """track_counterfactual_signal must only run when deferral succeeds.
+
+    P0 #405 / P1: counterfactual tracking is a side-effect; it must not fire
+    when _persist_watching_deferral returns False (e.g., CAS failed)."""
+    counterfactual_calls: list[str] = []
+
+    def _spy_track(*a, **kw):
+        counterfactual_calls.append("called")
+
+    _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-counterfactual-success",
+        job_id=40521,
+        persist_outcome=True,
+        counterfactual_spy=_spy_track,
+    )
+    assert len(counterfactual_calls) == 1, (
+        "track_counterfactual_signal must be called once on deferral success"
+    )
+
+    counterfactual_calls.clear()
+    _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-counterfactual-failure",
+        job_id=40522,
+        persist_outcome=False,
+        counterfactual_spy=_spy_track,
+    )
+    assert len(counterfactual_calls) == 0, (
+        "track_counterfactual_signal must NOT be called when deferral fails"
+    )
+
+
+def test_after_hours_deferral_failure_produces_no_watcher_osm_broker_mutation(
+    monkeypatch, sb, marks
+):
+    """When _persist_watching_deferral returns False in the after-hours path,
+    no watcher, OSM, broker, order, position, exit, or proof mutations may occur.
+
+    This test verifies the contract at the _persist_watching_deferral level —
+    a False return means the caller (the after-hours block) must return immediately
+    without arming anything downstream."""
+    result = _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-after-hours-fail",
+        job_id=40523,
+        persist_outcome=False,
+    )
+    assert len(result["persist_calls"]) == 1
+    result["selector"].select.assert_not_called()
+    result["osm"].create_entry_order.assert_not_called()
+    result["watcher"].watch.assert_not_called()
+    result["broker"].create_order.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 AMENDMENT — guarded initial WATCHING establishment.
+# _persist_watching_signal_if_eligible must never overwrite an advanced signal
+# row with WATCHING. Only insert-if-missing or idempotent-WATCHING may establish.
+# ═════════════════════════════════════════════════════════════════════════════
+
+_ELIGIBLE_KWARGS = dict(
+    job_id=40501,
+    execution_mode="live",
+    ticker="SPY", side="CALL", score=72.0, stage="master_control",
+    reason_code="market_closed_deferred",
+    human_reason="after hours — deferred",
+    payload={"ticker": "SPY", "side": "CALL", "score": 72.0, "timeframe": "1d"},
+    queued_at=datetime.now(timezone.utc).isoformat(),
+)
+
+
+def _seed_signal(
+    sb, signal_id, client_email, decision_status,
+    *, execution_mode="live", ticker="SPY", side="CALL", watching_job_id=40501,
+):
+    """Seed an ap_signals row. For WATCHING rows the identity fields
+    (raw_payload.execution_mode, ticker, side) default to match _ELIGIBLE_KWARGS
+    so existing idempotency tests still resolve to ALREADY_WATCHING. Identity-
+    conflict tests pass explicit non-matching values.
+    """
+    sb.rows[(signal_id, client_email)] = {
+        "signal_id": signal_id,
+        "client_email": client_email,
+        "decision_status": decision_status,
+        "ticker": ticker,
+        "side": side,
+        "raw_payload": {
+            "execution_mode": execution_mode,
+            "direction": side,
+            "watching_job_id": watching_job_id,
+        },
+    }
+
+
+# ── Test 1: advanced submitted row is preserved ──────────────────────────────
+def test_watch_eligible_submitted_preserved(sb):
+    _seed_signal(sb, "watch-sig-1", "a@x.com", "submitted")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-1", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"submitted must be preserved — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-1", "a@x.com")]["decision_status"] == "submitted", (
+        "submitted row must not be overwritten with WATCHING"
+    )
+
+
+# ── Test 2: advanced filled row is preserved ─────────────────────────────────
+def test_watch_eligible_filled_preserved(sb):
+    _seed_signal(sb, "watch-sig-2", "a@x.com", "filled")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-2", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED
+    assert sb.rows[("watch-sig-2", "a@x.com")]["decision_status"] == "filled"
+
+
+# ── Test 2b: triggered/queued/rejected/ERROR also preserved (parametrized) ───
+@pytest.mark.parametrize("advanced", ["triggered", "queued", "rejected", "ERROR"])
+def test_watch_eligible_all_advanced_preserved(sb, advanced):
+    _seed_signal(sb, "watch-sig-2b", "a@x.com", advanced)
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-2b", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"{advanced} must be preserved — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-2b", "a@x.com")]["decision_status"] == advanced
+
+
+# ── Test 2c: unknown status conflicts, not "advanced" ───────────────────────
+def test_watch_eligible_unknown_status_conflicts(sb):
+    _seed_signal(sb, "watch-sig-2c", "a@x.com", "mystery_status")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-2c", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"unknown status must conflict, not collapse to advanced — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-2c", "a@x.com")]["decision_status"] == "mystery_status"
+
+
+# ── Test 3: existing WATCHING is idempotent ──────────────────────────────────
+def test_watch_eligible_watching_idempotent(sb):
+    _seed_signal(sb, "watch-sig-3", "a@x.com", "WATCHING")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-3", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING, (
+        f"existing WATCHING must be idempotent — got {outcome!r}"
+    )
+    # Idempotent: still WATCHING, no destructive rewrite via broad upsert.
+    assert sb.rows[("watch-sig-3", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 4: approved pre-deferral state transitions ──────────────────────────
+def test_watch_eligible_approved_pre_deferral_transitions(sb, monkeypatch):
+    """The transition machinery must work when a status IS in the allowlist.
+
+    APSignalStore.insert_signal() defaults to decision_status="received", and
+    production can contain received rows, so received must be transitionable
+    without a test-time monkeypatch."""
+    _seed_signal(sb, "watch-sig-4", "a@x.com", "received")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-4", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_TRANSITIONED, (
+        f"approved pre-deferral status must transition — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-4", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 5: missing row inserts ──────────────────────────────────────────────
+def test_watch_eligible_missing_inserts(sb):
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-5", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_INSERTED, (
+        f"missing row must insert — got {outcome!r}"
+    )
+    assert ("watch-sig-5", "a@x.com") in sb.rows
+    assert sb.rows[("watch-sig-5", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 6: insert race loses to newer advanced state ────────────────────────
+def test_watch_eligible_insert_race_loses_to_advanced(sb, monkeypatch):
+    """Initial read finds no row; a concurrent writer inserts 'submitted' before
+    our create-only insert fires; the insert 23505-conflicts; helper rereads and
+    preserves the submitted row."""
+    # Patch _get_sb_client's table() to inject a concurrent insert between the
+    # initial SELECT and our INSERT. We do this by wrapping execute on the query.
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            # After the FIRST select returns empty, a concurrent writer inserts
+            # 'submitted' so our create-only insert will 23505-conflict.
+            if q._insert_row is None and q._update_data is None and q._pending is None:
+                # This is a select/read.
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent writer wins the race.
+                    _seed_signal(sb, "watch-sig-6", "a@x.com", "submitted")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-6", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"insert race must preserve advanced state — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-6", "a@x.com")]["decision_status"] == "submitted"
+
+
+# ── Test 7: expected-state update race ───────────────────────────────────────
+def test_watch_eligible_update_race_loses_to_advanced(sb, monkeypatch):
+    """Initial read sees an approved pre-deferral state; a concurrent writer
+    changes it to 'triggered'; the conditional update affects zero rows; helper
+    rereads and preserves the triggered row."""
+    _seed_signal(sb, "watch-sig-7", "a@x.com", "received")
+
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            is_read = (
+                q._insert_row is None and q._update_data is None and q._pending is None
+            )
+            if is_read:
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent writer advances the row after our initial read.
+                    _seed_signal(sb, "watch-sig-7", "a@x.com", "triggered")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-7", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_ADVANCED, (
+        f"update race must preserve advanced state — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-7", "a@x.com")]["decision_status"] == "triggered"
+
+
+# ── Test 8: full deferral does not CAS queue after advanced signal ───────────
+def test_deferral_no_queue_cas_after_advanced_signal(monkeypatch, sb):
+    """When the signal helper returns ALREADY_ADVANCED, _persist_watching_deferral
+    must NOT run _checked_watching_cas and must NOT compensate the signal to ERROR.
+    The still-PROCESSING queue row is failed via the guarded ERROR CAS."""
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_ALREADY_ADVANCED,
+    )
+    watching_cas_calls: list = []
+    comp_calls: list = []
+    error_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_compensate_watching_signal_if_unchanged",
+        lambda **k: comp_calls.append(1) or queue.SIGNAL_COMP_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_checked_processing_error_cas",
+        lambda job_id, *, error, result=None:
+            error_cas_calls.append({"error": error}) or queue.ERROR_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("_mark_job must not be called")),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40580,
+        client_id="a@x.com",
+        signal_id="sig-adv-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="advanced signal test",
+    )
+    assert ok is False, "deferral must return False when signal already advanced"
+    assert watching_cas_calls == [], "_checked_watching_cas must NOT run after ALREADY_ADVANCED"
+    assert comp_calls == [], "_compensate_watching_signal_if_unchanged must NOT run"
+    assert len(error_cas_calls) == 1, "guarded queue ERROR CAS must run once"
+    assert error_cas_calls[0]["error"] == "DEFERRAL_SIGNAL_ALREADY_ADVANCED", (
+        f"error must be the stable DEFERRAL_SIGNAL_ALREADY_ADVANCED reason — "
+        f"got {error_cas_calls[0]['error']!r}"
+    )
+
+
+# ── Test 9: full deferral proceeds after idempotent WATCHING ─────────────────
+def test_deferral_proceeds_after_idempotent_watching(monkeypatch, sb):
+    """When the signal helper returns ALREADY_WATCHING, the queue WATCHING CAS
+    must run and a successful CAS returns True."""
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_ALREADY_WATCHING,
+    )
+    watching_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(queue, "_mark_job", lambda *a, **k: None)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40590,
+        client_id="a@x.com",
+        signal_id="sig-idem-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="idempotent watching test",
+    )
+    assert ok is True, "deferral must return True on ALREADY_WATCHING + successful CAS"
+    assert watching_cas_calls == [1], "_checked_watching_cas must run exactly once"
+
+
+# ── Test 9b: full deferral proceeds after INSERTED ───────────────────────────
+def test_deferral_proceeds_after_inserted(monkeypatch, sb):
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_INSERTED,
+    )
+    watching_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(queue, "_mark_job", lambda *a, **k: None)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40591,
+        client_id="a@x.com",
+        signal_id="sig-ins-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="inserted test",
+    )
+    assert ok is True
+    assert watching_cas_calls == [1]
+
+
+# ── Test 9c: CONFLICT / DB_ERROR fail closed with guarded queue ERROR ─────────
+@pytest.mark.parametrize("bad_outcome", ["SIGNAL_WATCH_CONFLICT", "SIGNAL_WATCH_DB_ERROR"])
+def test_deferral_fails_closed_on_signal_conflict_or_db_error(monkeypatch, sb, bad_outcome):
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: getattr(queue, bad_outcome),
+    )
+    watching_cas_calls: list = []
+    error_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_checked_processing_error_cas",
+        lambda job_id, *, error, result=None:
+            error_cas_calls.append({"error": error}) or queue.ERROR_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("_mark_job must not be called")),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40592,
+        client_id="a@x.com",
+        signal_id="sig-conflict-defer",
+        execution_mode="paper",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="conflict/db_error test",
+    )
+    assert ok is False, f"{bad_outcome} must return False"
+    assert watching_cas_calls == [], "_checked_watching_cas must NOT run on conflict/db_error"
+    assert len(error_cas_calls) == 1, "guarded queue ERROR CAS must run once"
+
+
+# ── Test 10: client isolation ────────────────────────────────────────────────
+def test_watch_eligible_client_isolation(sb):
+    """Same signal_id, two clients. Advancing/watching one must never mutate the other."""
+    _seed_signal(sb, "shared-sig", "client-a@example.com", "submitted")
+
+    # Establish WATCHING for client-b (missing → insert).
+    outcome_b = queue._persist_watching_signal_if_eligible(
+        signal_id="shared-sig", client_email="client-b@example.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome_b == queue.SIGNAL_WATCH_INSERTED
+    # client-a's submitted row must be untouched.
+    assert sb.rows[("shared-sig", "client-a@example.com")]["decision_status"] == "submitted", (
+        "client-a's advanced row must not be mutated by client-b's deferral"
+    )
+    # client-b's row must be WATCHING.
+    assert sb.rows[("shared-sig", "client-b@example.com")]["decision_status"] == "WATCHING"
+
+    # Now attempt WATCHING for client-a — must be preserved as advanced.
+    outcome_a = queue._persist_watching_signal_if_eligible(
+        signal_id="shared-sig", client_email="client-a@example.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome_a == queue.SIGNAL_WATCH_ALREADY_ADVANCED
+    assert sb.rows[("shared-sig", "client-a@example.com")]["decision_status"] == "submitted"
+    # client-b unchanged.
+    assert sb.rows[("shared-sig", "client-b@example.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test 11: no legacy unsafe fallback when composite uniqueness unavailable ──
+def test_watch_eligible_no_legacy_fallback_on_missing_constraint(sb):
+    """If the composite uniqueness constraint is unavailable (create-only insert
+    cannot be enforced), the helper must return SIGNAL_WATCH_DB_ERROR and must NOT
+    fall back to a single-key upsert that could overwrite another row."""
+    sb._no_unique_constraint = True   # fake signals: insert raises non-23505
+
+    # Pre-seed a DIFFERENT client's advanced row to prove no cross-client mutation.
+    _seed_signal(sb, "watch-sig-11", "other@example.com", "filled")
+
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-11", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_DB_ERROR, (
+        f"missing constraint must fail closed to DB_ERROR — got {outcome!r}"
+    )
+    # No new WATCHING row for a@x.com (unsafe upsert would have created one).
+    assert ("watch-sig-11", "a@x.com") not in sb.rows, (
+        "helper must NOT fall back to an upsert that writes a WATCHING row"
+    )
+    # The other client's advanced row must be untouched.
+    assert sb.rows[("watch-sig-11", "other@example.com")]["decision_status"] == "filled"
+
+
+# ── Test 12: DB unavailable → DB_ERROR (no client) ───────────────────────────
+def test_watch_eligible_no_supabase_client_db_error(monkeypatch):
+    monkeypatch.setattr(queue, "_get_sb_client", lambda: None)
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-12", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_DB_ERROR
+
+
+# ── Test 13: helper requires job_id for ownership fencing ────────────────────
+def test_watch_eligible_signature_requires_job_id():
+    import inspect
+    sig = inspect.signature(queue._persist_watching_signal_if_eligible)
+    assert "job_id" in sig.parameters
+    assert sig.parameters["job_id"].default is inspect.Parameter.empty
+    # Must be keyword-only for the documented params.
+    for name in ("signal_id", "client_email", "queued_at"):
+        assert name in sig.parameters, f"missing required param {name!r}"
+
+
+# ── Test 14: no direct _log_signal_to_db(WATCHING) inside _persist_watching_deferral
+def test_deferral_no_direct_log_signal_watching_write():
+    """Source-code guard: _persist_watching_deferral must establish WATCHING via
+    _persist_watching_signal_if_eligible, NOT via a direct _log_signal_to_db(
+    decision_status=WATCHING/DECISION_WATCHING) call."""
+    import re
+    src = (Path(__file__).resolve().parents[1] / "ap" / "queue.py").read_text()
+
+    # Isolate the _persist_watching_deferral function body.
+    m = re.search(
+        r"\ndef _persist_watching_deferral\(.*?(?=\ndef _checked_watching_cas)",
+        src, re.DOTALL,
+    )
+    assert m, "Could not locate _persist_watching_deferral body"
+    body = m.group(0)
+
+    # It must call the guarded helper.
+    assert "_persist_watching_signal_if_eligible(" in body, (
+        "_persist_watching_deferral must call _persist_watching_signal_if_eligible"
+    )
+    # It must NOT call _log_signal_to_db with a WATCHING decision_status for the
+    # INITIAL establishment. (Compensation paths use _compensate_watching_signal_if_unchanged.)
+    initial_watching_log = re.search(
+        r"_log_signal_to_db\([^)]*decision_status\s*=\s*DECISION_WATCHING",
+        body, re.DOTALL,
+    )
+    assert initial_watching_log is None, (
+        "_persist_watching_deferral must NOT establish WATCHING via a direct "
+        "_log_signal_to_db(decision_status=DECISION_WATCHING) call — use the "
+        "guarded _persist_watching_signal_if_eligible helper"
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 amendment (identity) — an existing WATCHING row may be accepted as the
+# same lifecycle owner ONLY on exact execution_mode + ticker + side match.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Test A: PAPER existing row, LIVE request → CONFLICT ──────────────────────
+def test_identity_paper_row_live_request_conflict(sb):
+    _seed_signal(sb, "mode-conflict-1", "a@x.com", "WATCHING",
+                 execution_mode="paper", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="mode-conflict-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"PAPER WATCHING must not be accepted by LIVE deferral — got {outcome!r}"
+    )
+    # Existing row unchanged.
+    row = sb.rows[("mode-conflict-1", "a@x.com")]
+    assert row["decision_status"] == "WATCHING"
+    assert row["raw_payload"]["execution_mode"] == "paper"
+
+
+# ── Test B: LIVE existing row, PAPER request → CONFLICT ──────────────────────
+def test_identity_live_row_paper_request_conflict(sb):
+    _seed_signal(sb, "mode-conflict-2", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "paper"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="mode-conflict-2", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"LIVE WATCHING must not be accepted by PAPER deferral — got {outcome!r}"
+    )
+    row = sb.rows[("mode-conflict-2", "a@x.com")]
+    assert row["decision_status"] == "WATCHING"
+    assert row["raw_payload"]["execution_mode"] == "live"
+
+
+# ── Test C: opposite side → CONFLICT ─────────────────────────────────────────
+def test_identity_opposite_side_conflict(sb):
+    _seed_signal(sb, "side-conflict-1", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(execution_mode="live", side="PUT",
+                  payload={"ticker": "SPY", "side": "PUT", "direction": "PUT"})
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="side-conflict-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"opposite-side WATCHING must not be idempotent — got {outcome!r}"
+    )
+    assert sb.rows[("side-conflict-1", "a@x.com")]["side"] == "CALL", (
+        "existing CALL row must be untouched"
+    )
+
+
+# ── Test D: different ticker → CONFLICT ──────────────────────────────────────
+def test_identity_different_ticker_conflict(sb):
+    _seed_signal(sb, "ticker-conflict-1", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(execution_mode="live", ticker="QQQ",
+                  payload={"ticker": "QQQ", "side": "CALL", "direction": "CALL"})
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="ticker-conflict-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"different-ticker WATCHING must not be idempotent — got {outcome!r}"
+    )
+    assert sb.rows[("ticker-conflict-1", "a@x.com")]["ticker"] == "SPY", (
+        "existing SPY row must be untouched"
+    )
+
+
+# ── Test E: exact identity match → ALREADY_WATCHING ──────────────────────────
+def test_identity_exact_match_idempotent(sb):
+    _seed_signal(sb, "exact-1", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    before = dict(sb.rows[("exact-1", "a@x.com")])
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="exact-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING, (
+        f"exact mode+ticker+side match must be idempotent — got {outcome!r}"
+    )
+    # No destructive rewrite: row is byte-for-byte the same.
+    assert sb.rows[("exact-1", "a@x.com")] == before, (
+        "exact-match idempotency must not rewrite the row"
+    )
+
+
+# ── Test F: missing execution-mode provenance → CONFLICT ─────────────────────
+@pytest.mark.parametrize("bad_raw", [{}, None])
+def test_identity_missing_mode_provenance_conflict(sb, bad_raw):
+    sb.rows[("prov-1", "a@x.com")] = {
+        "signal_id": "prov-1",
+        "client_email": "a@x.com",
+        "decision_status": "WATCHING",
+        "ticker": "SPY",
+        "side": "CALL",
+        "raw_payload": bad_raw,
+    }
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="prov-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"missing execution-mode provenance must NOT assume PAPER/LIVE — got {outcome!r}"
+    )
+    # Row untouched.
+    assert sb.rows[("prov-1", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test G: full deferral conflict blocks queue WATCHING CAS ─────────────────
+def test_deferral_identity_conflict_blocks_queue_cas(monkeypatch, sb):
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_CONFLICT,
+    )
+    watching_cas_calls: list = []
+    comp_calls: list = []
+    error_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_compensate_watching_signal_if_unchanged",
+        lambda **k: comp_calls.append(1) or queue.SIGNAL_COMP_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_checked_processing_error_cas",
+        lambda job_id, *, error, result=None:
+            error_cas_calls.append({"error": error}) or queue.ERROR_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("_mark_job must not be called")),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40600,
+        client_id="a@x.com",
+        signal_id="sig-identity-conflict",
+        execution_mode="live",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="identity conflict test",
+    )
+    assert ok is False, "deferral must return False on identity conflict"
+    assert watching_cas_calls == [], "_checked_watching_cas must NOT run on identity conflict"
+    assert comp_calls == [], "conflicting signal row must NOT be compensated"
+    assert len(error_cas_calls) == 1, "guarded queue ERROR CAS must run once"
+    assert error_cas_calls[0]["error"] == "WATCHING_SIGNAL_IDENTITY_CONFLICT", (
+        f"error must be WATCHING_SIGNAL_IDENTITY_CONFLICT — got {error_cas_calls[0]['error']!r}"
+    )
+
+
+# ── Test H: full deferral exact match proceeds ───────────────────────────────
+def test_deferral_identity_exact_match_proceeds(monkeypatch, sb):
+    # Real helper (not patched) against an exact-identity WATCHING row.
+    _seed_signal(sb, "sig-exact-defer", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL",
+                 watching_job_id=40601)
+    watching_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(queue, "_mark_job", lambda *a, **k: None)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40601,
+        client_id="a@x.com",
+        signal_id="sig-exact-defer",
+        execution_mode="live",
+        payload={"ticker": "SPY", "side": "CALL", "direction": "CALL",
+                 "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="exact identity deferral",
+    )
+    assert ok is True, "exact-identity WATCHING must proceed to a successful queue CAS"
+    assert watching_cas_calls == [1], "_checked_watching_cas must run exactly once"
+
+
+# ── Test I: insert race with MATCHING WATCHING winner → ALREADY_WATCHING ──────
+def test_identity_insert_race_matching_watching_winner(sb, monkeypatch):
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            is_read = (
+                q._insert_row is None and q._update_data is None and q._pending is None
+            )
+            if is_read:
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent worker inserts a MATCHING WATCHING row.
+                    _seed_signal(sb, "irace-match", "a@x.com", "WATCHING",
+                                 execution_mode="live", ticker="SPY", side="CALL")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="irace-match", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING, (
+        f"insert race with matching WATCHING winner must be idempotent — got {outcome!r}"
+    )
+
+
+# ── Test J: insert race with CROSS-MODE WATCHING winner → CONFLICT ───────────
+def test_identity_insert_race_cross_mode_watching_winner(sb, monkeypatch):
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            is_read = (
+                q._insert_row is None and q._update_data is None and q._pending is None
+            )
+            if is_read:
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent PAPER worker inserts WATCHING; our request is LIVE.
+                    _seed_signal(sb, "irace-cross", "a@x.com", "WATCHING",
+                                 execution_mode="paper", ticker="SPY", side="CALL")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"   # request is LIVE
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="irace-cross", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"insert race with cross-mode PAPER winner must CONFLICT — got {outcome!r}"
+    )
+    # PAPER row remains untouched.
+    row = sb.rows[("irace-cross", "a@x.com")]
+    assert row["decision_status"] == "WATCHING"
+    assert row["raw_payload"]["execution_mode"] == "paper"
+
+
+# ── Test K: invalid requested mode → CONFLICT (no DB write) ───────────────────
+def test_identity_invalid_requested_mode_conflict(sb):
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "sandbox"   # neither paper nor live
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="bad-mode", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"invalid requested mode must CONFLICT — got {outcome!r}"
+    )
+    assert ("bad-mode", "a@x.com") not in sb.rows, "no ap_signals row may be written"
+
+
+# ── Test L: invalid requested side → CONFLICT (no CALL fallback) ─────────────
+def test_identity_invalid_requested_side_conflict(sb):
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(side="", payload={"ticker": "SPY"})   # no side, no direction
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="bad-side", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"invalid requested side must CONFLICT (no CALL fallback) — got {outcome!r}"
+    )
+    assert ("bad-side", "a@x.com") not in sb.rows, "no ap_signals row may be written"
+
+
+def test_identity_invalid_requested_ticker_conflict(sb):
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(ticker="", payload={"side": "CALL"})
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="bad-ticker", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT
+    assert ("bad-ticker", "a@x.com") not in sb.rows
+
+
+def test_identity_different_queue_job_conflict(sb):
+    _seed_signal(
+        sb, "job-owner-conflict", "a@x.com", "WATCHING",
+        watching_job_id=40599,
+    )
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="job-owner-conflict", client_email="a@x.com",
+        **_ELIGIBLE_KWARGS,
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT
+    assert sb.rows[("job-owner-conflict", "a@x.com")]["raw_payload"]["watching_job_id"] == 40599
+
+
+def test_identity_legacy_queue_id_is_valid_owner_proof(sb):
+    _seed_signal(sb, "legacy-owner", "a@x.com", "WATCHING")
+    raw = sb.rows[("legacy-owner", "a@x.com")]["raw_payload"]
+    raw.pop("watching_job_id")
+    raw["_queue_id"] = _ELIGIBLE_KWARGS["job_id"]
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="legacy-owner", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING
+
+
+# ── Test M: helper signature now requires execution_mode (keyword-only) ───────
+def test_identity_signature_requires_execution_mode():
+    import inspect
+    sig = inspect.signature(queue._persist_watching_signal_if_eligible)
+    assert "execution_mode" in sig.parameters, (
+        "_persist_watching_signal_if_eligible must take execution_mode"
+    )
+    p = sig.parameters["execution_mode"]
+    assert p.kind == inspect.Parameter.KEYWORD_ONLY, "execution_mode must be keyword-only"
+    assert p.default is inspect.Parameter.empty, "execution_mode must NOT be optional"
+    assert "job_id" in sig.parameters, "helper must require queue-job ownership"
