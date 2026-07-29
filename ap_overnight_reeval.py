@@ -69,6 +69,119 @@ _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
 )
 
 
+# ── PR #404: Watcher-arm outcome classification ───────────────────────────────
+
+WATCH_ARMED         = "WATCH_ARMED"
+ALREADY_WATCHING    = "ALREADY_WATCHING"
+RETRYABLE_NOT_ARMED = "RETRYABLE_NOT_ARMED"
+TERMINAL_FAILURE    = "TERMINAL_FAILURE"
+OWNERSHIP_CONFLICT  = "OWNERSHIP_CONFLICT"
+UNKNOWN_FAILURE     = "UNKNOWN_FAILURE"
+
+
+class _WatchArmOutcome(NamedTuple):
+    """Structured watcher-arm result replacing the raw Boolean."""
+    disposition: str   # one of the WATCH_*/RETRYABLE_NOT_ARMED/TERMINAL_FAILURE constants
+    terminal:    bool  # True only when signal is proven permanently invalid
+    retryable:   bool  # True when the slot can be retried
+    reason:      str
+
+
+def _classify_watch_arm_outcome(
+    watch_result: bool,
+    already_watching: bool,
+    terminal_conflict: bool,
+    exception: Optional[Exception],
+) -> _WatchArmOutcome:
+    """Classify watch() result.  Generic False is NEVER TERMINAL_FAILURE."""
+    if watch_result:
+        return _WatchArmOutcome(WATCH_ARMED, False, False, "watch_returned_true")
+    if already_watching:
+        return _WatchArmOutcome(ALREADY_WATCHING, False, True, "already_watching_exact_owner")
+    if terminal_conflict:
+        return _WatchArmOutcome(TERMINAL_FAILURE, True, False, "proven_terminal_conflict")
+    if exception is not None:
+        return _WatchArmOutcome(
+            RETRYABLE_NOT_ARMED, False, True,
+            f"transient_exception:{type(exception).__name__}",
+        )
+    return _WatchArmOutcome(RETRYABLE_NOT_ARMED, False, True, "watch_false_no_evidence")
+
+
+def _classify_pending_entry_for_overnight(
+    ticker: str,
+    client_id: str,
+    execution_mode: str,
+) -> str:
+    """Query orders; return a PENDING_OWNER_* constant. Fail-closed on DB error."""
+    try:
+        from ap.order_monitor import (
+            _classify_pending_entry_ownership,
+            _pending_entry_blocks_candidate,
+            PENDING_OWNER_DB_ERROR,
+        )
+    except ImportError as _ie:
+        log.critical(
+            "[%s] _classify_pending_entry_for_overnight: import failed: %s", ticker, _ie
+        )
+        return "PENDING_OWNER_DB_ERROR"
+
+    mode = str(execution_mode or "").strip().lower()
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _pe_fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT local_order_id, client_id, "
+                    "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
+                    "status, broker_order_id, submitted_ts, created_ts "
+                    "FROM orders "
+                    "WHERE symbol = %s AND kind = 'ENTRY' "
+                    "AND status IN ("
+                    "  'CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL'"
+                    ") "
+                    "ORDER BY created_ts DESC LIMIT 10",
+                    (str(ticker or "").upper(),),
+                )
+                return c.fetchall()
+
+        rows = run_with_retry(_pe_fn) or []
+    except Exception as _dbe:
+        log.warning(
+            "[%s] _classify_pending_entry_for_overnight: DB query failed: %s", ticker, _dbe
+        )
+        return "PENDING_OWNER_DB_ERROR"
+
+    if not rows:
+        return "PENDING_OWNER_MISSING"
+
+    candidate = {"client_id": client_id, "execution_mode": mode}
+    _last = "PENDING_OWNER_MISSING"
+
+    for _raw in rows:
+        row = dict(_raw) if not isinstance(_raw, dict) else _raw
+        row_client = str(row.get("client_id")      or "").strip().lower()
+        row_mode   = str(row.get("execution_mode") or "").strip().lower()
+        cand_c     = str(client_id or "").strip().lower()
+
+        if cand_c and row_client and row_client != cand_c:
+            _last = "PENDING_OWNER_CROSS_CLIENT"
+            continue
+        if mode and row_mode and row_mode != mode:
+            _last = "PENDING_OWNER_CROSS_MODE"
+            continue
+
+        result = _classify_pending_entry_ownership(
+            row, watcher_owned=False, recovery_owned=False, broker_terminal=False,
+        )
+        _last = result.disposition
+        if result.blocks_candidate:
+            return "PENDING_OWNER_ACTIVE"
+
+    return _last
+
+
 def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
     """Build a minimal TradePlan-compatible namespace from a WATCHING signal.
     Used when MC rejects on intel/second-score but recheck is disabled —
@@ -2896,6 +3009,60 @@ def run_overnight_reeval(
                                 score=float(signal.get("score") or 0),
                             )
                         # Fall through to Step 5 (contract selection / arm)
+                    elif "pending_entry_exists" in _r and not _is_hard_safety_block:
+                        # PR #404: classify ownership before terminal rejection.
+                        _pe_class = _classify_pending_entry_for_overnight(
+                            ticker, client_id, _execution_mode
+                        )
+                        if _pe_class == "PENDING_OWNER_ACTIVE":
+                            log.info(
+                                "[%s] pending_entry_owner_active %s — "
+                                "genuine same-client/mode block maintained",
+                                ticker, signal_id,
+                            )
+                            if _paper_rescue_only:
+                                _mark_job_rejected(
+                                    job_id, client_id,
+                                    _paper_rescue_queue_reason("risk_blocked", str(decision.reason or "")),
+                                )
+                            else:
+                                _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
+                            result["rejected"] += 1
+                            result["terminal_rejected"] += 1
+                            continue
+                        elif _pe_class == "PENDING_OWNER_DB_ERROR":
+                            log.critical(
+                                "[%s] pending_entry_ownership_unknown %s — "
+                                "fail closed as retryable_deferred",
+                                ticker, signal_id,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        else:
+                            # Stale/terminal/missing/cross-scope: false suppression.
+                            # Release — signal must still pass all subsequent gates.
+                            _pe_label = _pe_class.lower().replace("pending_owner_", "owner_")
+                            log.info(
+                                "[%s] pending_entry_%s %s — false suppression "
+                                "released; continuing to normal gate sequence",
+                                ticker, _pe_label, signal_id,
+                            )
+                            if getattr(decision, "plan", None) is None:
+                                import types as _types_pe
+                                decision = _types_pe.SimpleNamespace(
+                                    ok=True,
+                                    plan=_hydrate_plan_from_signal(
+                                        signal,
+                                        client_id=client_id,
+                                        execution_mode=_execution_mode,
+                                    ),
+                                    reason=f"pending_entry_released:{_pe_class}",
+                                    score=float(signal.get("score") or 0),
+                                )
+                            else:
+                                decision.ok = True
+                            # Fall through to Step 5
                     else:
                         # Hard safety block OR recheck enabled — reject as before
                         log.info(
@@ -3345,15 +3512,39 @@ def run_overnight_reeval(
                     result["armed"] += 1
                     result["fresh_armed"] += 1
                 else:
+                    # PR #404: classify before any terminal decision.
+                    # Generic False is NEVER automatic terminal rejection.
                     _reject_reason = str(
                         getattr(entry_watcher, "_last_reject_reason", None)
                         or "watch_returned_false"
                     )
+                    # dedup_block = same signal_id already registered → ALREADY_WATCHING.
+                    # overnight NEW arm: terminal stale/stop checks bypassed (pre-market).
+                    _arm_outcome = _classify_watch_arm_outcome(
+                        watch_result=False,
+                        already_watching=(_reject_reason == "dedup_block"),
+                        terminal_conflict=False,
+                        exception=None,
+                    )
+
+                    if _arm_outcome.disposition == ALREADY_WATCHING:
+                        # Watcher already owns this signal_id; the new OSM order
+                        # was canceled by the watcher's dedup path. Idempotent success.
+                        log.info(
+                            "[%s] overnight_watch_already_watching %s reason=%s "
+                            "— idempotent success; original watcher ownership preserved",
+                            ticker, signal_id, _reject_reason,
+                        )
+                        _mark_job_watching_armed(job_id, client_id, _arm_label)
+                        result["armed"] += 1
+                        result["fresh_armed"] += 1
+                        continue
+
                     _full_error = f"overnight_watch_arm_failed:{_reject_reason}"
                     log.error(
                         "[%s] overnight_reeval: entry_watcher.watch() returned False "
-                        "| contract=%s reason=%s",
-                        ticker, _arm_label, _reject_reason,
+                        "| contract=%s reason=%s disposition=%s",
+                        ticker, _arm_label, _reject_reason, _arm_outcome.disposition,
                     )
                     _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                         order_state_machine=order_state_machine,
@@ -3400,27 +3591,38 @@ def run_overnight_reeval(
                         result["errors"] += 1
                         result["terminal_errors"] += 1
                         continue
-                    _record_watch_arm_failure_proof(
-                        signal_id=signal_id,
-                        client_id=client_id,
-                        signal=signal,
-                        reason=_full_error,
-                        local_order_id=str(local_order_id),
-                        job_id=job_id,
-                        is_exception=False,
-                        session_key=session_key,
-                    )
-                    _mark_job_rejected(job_id, client_id, _full_error)
-                    if _lifecycle_ok:
-                        try:
-                            _sig_rejected(signal_id, ticker, _LO.WATCHER,
-                                          "entry_watcher.watch() returned False",
-                                          _RC.EXECUTION, "WATCHER_ARM_FAILED", _RS.WARNING,
-                                          contract=_arm_label)
-                        except Exception:
-                            pass
-                    result["rejected"] += 1
-                    result["terminal_rejected"] += 1
+
+                    if _arm_outcome.disposition == TERMINAL_FAILURE:
+                        _record_watch_arm_failure_proof(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            signal=signal,
+                            reason=_full_error,
+                            local_order_id=str(local_order_id),
+                            job_id=job_id,
+                            is_exception=False,
+                            session_key=session_key,
+                        )
+                        _mark_job_rejected(job_id, client_id, _full_error)
+                        if _lifecycle_ok:
+                            try:
+                                _sig_rejected(signal_id, ticker, _LO.WATCHER,
+                                              "entry_watcher.watch() returned False",
+                                              _RC.EXECUTION, "WATCHER_ARM_FAILED", _RS.WARNING,
+                                              contract=_arm_label)
+                            except Exception:
+                                pass
+                        result["rejected"] += 1
+                        result["terminal_rejected"] += 1
+                    else:
+                        # RETRYABLE_NOT_ARMED: no permanent proof, no terminal reject.
+                        log.critical(
+                            "[%s] overnight_watch_arm_unknown signal=%s reason=%s "
+                            "disp=%s — fail closed as retryable_deferred (not terminal)",
+                            ticker, signal_id, _reject_reason, _arm_outcome.disposition,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
             except Exception as ew_exc:
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(

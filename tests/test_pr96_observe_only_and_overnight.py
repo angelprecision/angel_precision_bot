@@ -213,7 +213,7 @@ def test_15b_hard_safety_block_still_rejects():
     """Hard safety blocks (capital/kill switch/etc) must still reject."""
     assert "_is_hard_safety_block" in OV_SRC
     idx = OV_SRC.find('_is_hard_safety_block')
-    region = OV_SRC[idx:idx+3500]
+    region = OV_SRC[idx:idx+7000]  # PR #404 elif block inserted between this and else
     assert "_mark_job_rejected" in region
     assert "Hard safety block OR recheck enabled" in OV_SRC
 
