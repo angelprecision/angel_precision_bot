@@ -2895,10 +2895,19 @@ def test_am1_durable_3_env_5_attempt_6_exhausted(monkeypatch):
     assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
 
 
-# ── Test 2: durable=7, env=5 → durable 7 preserved; never reduced ────────────
+# ── Test 2: durable=7/500, env=5 → hard capped at 5 (blocker correction) ────
+#
+# Rev-2 policy (P0 blocker 1): configured_max is the HARD CEILING.
+# A durable value above configured_max is CLAMPED, not honoured.
+# "max(configured, durable)" allowed stale/corrupted metadata (e.g.,
+# retry_max_attempts=500) to silently create an unbounded retry loop.
 
-def test_am1_durable_7_env_5_preserved(monkeypatch):
-    """Existing durable max=7 must never be reduced to env=5."""
+def test_am1_durable_7_env_5_clamped_to_5(monkeypatch):
+    """Durable max=7 with env=5 must be clamped to 5, not preserved at 7.
+
+    Prevents stale/historically-high durable values from silently overriding
+    the current production policy ceiling.
+    """
     monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
 
     core, osm = _core_with_row(_base_meta(retry_max_attempts=7, retry_attempt=1), monkeypatch=monkeypatch)
@@ -2908,20 +2917,18 @@ def test_am1_durable_7_env_5_preserved(monkeypatch):
         expected_retry_attempt=2,
         owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
     )
-    # Should not be exhausted at attempt 2 with durable=7
-    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
-        f"Attempt 2 must not be exhausted with durable max=7: {result}"
+    # Attempt 2 is within the clamped max of 5 — must not be exhausted
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Attempt 2 must not be exhausted (resolved max=5): {result}"
 
-    # Confirm schedule call persists max_attempts=7, not 5
+    # Schedule call must persist max_attempts=5, NOT the durable 7
     calls = osm.schedule_deferred_materialization_retry.call_args_list
     if calls:
         _, kwargs = calls[0]
-        assert kwargs.get("max_attempts") == 7, \
-            f"Durable max=7 must not be reduced to 5: got max_attempts={kwargs.get('max_attempts')}"
+        assert kwargs.get("max_attempts") == 5,             f"Durable max=7 must be clamped to env=5: got {kwargs.get('max_attempts')}"
 
 
-def test_am1_durable_7_env_5_attempt_6_still_allowed(monkeypatch):
-    """Attempt 6 must be ALLOWED when durable=7 (env=5 must not cut it off)."""
+def test_am1_durable_7_env_5_attempt_6_clamped_exhausted(monkeypatch):
+    """Attempt 6 must be BLOCKED when durable=7, env=5 (clamped to 5)."""
     monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
 
     core, osm = _core_with_row(_base_meta(retry_max_attempts=7, retry_attempt=5), monkeypatch=monkeypatch)
@@ -2931,8 +2938,57 @@ def test_am1_durable_7_env_5_attempt_6_still_allowed(monkeypatch):
         expected_retry_attempt=6,
         owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
     )
-    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
-        f"Attempt 6 must be allowed when durable max=7: {result}"
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""),         f"Attempt 6 must be exhausted when durable=7 is clamped to env=5: {result}"
+    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+
+
+def test_am1_durable_500_env_5_clamped(monkeypatch):
+    """Corrupted or stale durable max=500 must be clamped to env=5."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=500, retry_attempt=5), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=6,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""),         f"Attempt 6 must be exhausted when durable=500 is clamped to env=5: {result}"
+    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+
+
+# ── Test 2b: durable=5, env=5 → 5 (exact match) ──────────────────────────────
+
+def test_am1_durable_5_env_5_exact_match(monkeypatch):
+    """Durable exactly equal to configured max → still resolves to 5."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=5, retry_attempt=4), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=5,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:5",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Attempt 5 must not be exhausted when durable=5 env=5: {result}"
+
+
+def test_am1_negative_durable_uses_env(monkeypatch):
+    """Negative durable retry_max_attempts is treated as 0; env remains sole authority."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    meta = _base_meta(retry_attempt=1)
+    meta["retry_max_attempts"] = -3
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch)
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # Negative durable clamped to 0; env=5 → max_attempts=5 → attempt 2 allowed
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Negative durable must fall back to env=5: {result}"
 
 
 # ── Test 3: durable missing, env=5 → env is sole authority ───────────────────
@@ -3059,9 +3115,13 @@ def test_am1_terminal_rows_never_reopened(monkeypatch, bad_status, broker_order_
 
 # ── Test 7: restart — resolved raised maximum persists across restarts ────────
 
-def test_am1_raised_max_persists_on_restart(monkeypatch):
-    """After a retry is scheduled with raised max=5, the OSM patch must write
-    retry_max_attempts=5 so the next process observes the same maximum.
+def test_am1_resolved_max_persists_on_restart(monkeypatch):
+    """The bounded resolved max (configured_max=5) must be persisted so that
+    the next process observes the same ceiling after restart.
+
+    With the hard-ceiling policy, max_attempts = configured_max = 5 regardless
+    of the durable value.  This test verifies the OSM call carries max_attempts=5
+    even when the durable row says retry_max_attempts=3.
 
     Drive schedule_deferred_materialization_retry by making _on_entry_trigger
     raise (the exception handler calls _schedule_retry_wait, which calls
@@ -3085,12 +3145,12 @@ def test_am1_raised_max_persists_on_restart(monkeypatch):
     )
 
     # The schedule_deferred_materialization_retry call must pass max_attempts=5
-    # (OSM then persists retry_max_attempts=5 in the JSONB patch so the next
-    # process still observes the raised maximum after restart).
+    # (configured ceiling); OSM persists this as retry_max_attempts=5 so the
+    # next process restart observes the same bounded maximum.
     calls = osm.schedule_deferred_materialization_retry.call_args_list
     assert calls, "schedule_deferred_materialization_retry must have been called"
     _, kwargs = calls[0]
     assert kwargs.get("max_attempts") == 5, (
-        f"Persisted max_attempts must be 5 (raised from durable=3), "
-        f"got {kwargs.get('max_attempts')!r} — next restart would see wrong maximum"
+        f"Persisted max_attempts must equal configured ceiling (5), "
+        f"got {kwargs.get('max_attempts')!r}"
     )

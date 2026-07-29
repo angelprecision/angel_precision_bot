@@ -2468,19 +2468,25 @@ class APExecutionCore:
                 f"RETRY_ATTEMPT_ADVANCED:durable={durable_prior_attempt}:expected_prior={_expected_attempt - 1}"
             )
 
-        # ── Amendment 1: resolve retry maximum as max(configured_env, durable) ──
-        # Policy: the environment value is the configured floor.  An existing
-        # durable value is honoured when it exceeds the env (e.g. an operator
-        # manually granted extra retries), but is RAISED to the env when the
-        # env has been increased.  The old code took the durable value first
-        # and only fell back to env when durable was absent — meaning a row
-        # stamped retry_max_attempts=3 could never benefit from a production
-        # increase to MAX_BREACH_SELECTOR_RETRIES=5.
+        # ── Amendment 1 (rev 2): configured env is the hard ceiling ──────────
+        # Policy: MAX_BREACH_SELECTOR_RETRIES is the sole authoritative bound.
+        # Durable retry_max_attempts is read only to detect stale rows and is
+        # NEVER allowed to raise max_attempts above configured_max.
         #
-        # Examples:
-        #   durable=3, env=5  → max_attempts=5   (env raises the floor)
-        #   durable=7, env=5  → max_attempts=7   (durable preserved; not lowered)
-        #   durable missing   → max_attempts=env (env is the sole authority)
+        # Rationale: "max(configured, durable)" allowed any value in the
+        # JSONB metadata — including stale, corrupted, or experimentally high
+        # values such as 50, 500, 999999 — to silently override the production
+        # policy.  There is no authenticated operator-override path; trusting
+        # arbitrary database metadata to define retry capacity creates an
+        # unbounded recovery lifecycle.
+        #
+        # Hard ceiling examples:
+        #   durable=3, env=5  → 5   (env raises the floor, as before)
+        #   durable=7, env=5  → 5   (durable above env is CLAMPED, not honoured)
+        #   durable=500, env=5→ 5   (corrupted/stale value clamped)
+        #   durable missing   → 5   (env is sole authority)
+        #   malformed durable → 5   (safe default)
+        #   negative durable  → 5   (clamped to zero, then env wins)
         try:
             _configured_max = _positive_int_env_config(
                 "MAX_BREACH_SELECTOR_RETRIES", 5
@@ -2488,11 +2494,15 @@ class APExecutionCore:
         except (TypeError, ValueError):
             _configured_max = 5
         try:
-            _durable_max = int(meta.get("retry_max_attempts") or 0)
+            _durable_raw = int(meta.get("retry_max_attempts") or 0)
         except (TypeError, ValueError):
-            _durable_max = 0
-        _durable_max = max(0, _durable_max)
-        max_attempts = max(_configured_max, _durable_max)
+            _durable_raw = 0
+        # Clamp durable to [0, configured_max].  Values above configured_max
+        # are NOT honoured — they are artifacts of stale or corrupted metadata.
+        _durable_max = max(0, min(_configured_max, _durable_raw))
+        # The resolved maximum is always the configured env value.
+        # _durable_max is clamped but does not raise above configured_max.
+        max_attempts = _configured_max
         if _expected_attempt > max_attempts:
             return _term("RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
                          attempt=_expected_attempt, max_attempts=max_attempts)
