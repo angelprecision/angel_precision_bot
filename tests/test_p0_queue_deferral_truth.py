@@ -1805,6 +1805,7 @@ def test_after_hours_deferral_failure_produces_no_watcher_osm_broker_mutation(
 # ═════════════════════════════════════════════════════════════════════════════
 
 _ELIGIBLE_KWARGS = dict(
+    execution_mode="live",
     ticker="SPY", side="CALL", score=72.0, stage="master_control",
     reason_code="market_closed_deferred",
     human_reason="after hours — deferred",
@@ -1813,12 +1814,22 @@ _ELIGIBLE_KWARGS = dict(
 )
 
 
-def _seed_signal(sb, signal_id, client_email, decision_status):
+def _seed_signal(
+    sb, signal_id, client_email, decision_status,
+    *, execution_mode="live", ticker="SPY", side="CALL",
+):
+    """Seed an ap_signals row. For WATCHING rows the identity fields
+    (raw_payload.execution_mode, ticker, side) default to match _ELIGIBLE_KWARGS
+    so existing idempotency tests still resolve to ALREADY_WATCHING. Identity-
+    conflict tests pass explicit non-matching values.
+    """
     sb.rows[(signal_id, client_email)] = {
         "signal_id": signal_id,
         "client_email": client_email,
         "decision_status": decision_status,
-        "ticker": "SPY",
+        "ticker": ticker,
+        "side": side,
+        "raw_payload": {"execution_mode": execution_mode, "direction": side},
     }
 
 
@@ -2236,3 +2247,313 @@ def test_deferral_no_direct_log_signal_watching_write():
         "_log_signal_to_db(decision_status=DECISION_WATCHING) call — use the "
         "guarded _persist_watching_signal_if_eligible helper"
     )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# P0 #405 amendment (identity) — an existing WATCHING row may be accepted as the
+# same lifecycle owner ONLY on exact execution_mode + ticker + side match.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── Test A: PAPER existing row, LIVE request → CONFLICT ──────────────────────
+def test_identity_paper_row_live_request_conflict(sb):
+    _seed_signal(sb, "mode-conflict-1", "a@x.com", "WATCHING",
+                 execution_mode="paper", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="mode-conflict-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"PAPER WATCHING must not be accepted by LIVE deferral — got {outcome!r}"
+    )
+    # Existing row unchanged.
+    row = sb.rows[("mode-conflict-1", "a@x.com")]
+    assert row["decision_status"] == "WATCHING"
+    assert row["raw_payload"]["execution_mode"] == "paper"
+
+
+# ── Test B: LIVE existing row, PAPER request → CONFLICT ──────────────────────
+def test_identity_live_row_paper_request_conflict(sb):
+    _seed_signal(sb, "mode-conflict-2", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "paper"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="mode-conflict-2", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"LIVE WATCHING must not be accepted by PAPER deferral — got {outcome!r}"
+    )
+    row = sb.rows[("mode-conflict-2", "a@x.com")]
+    assert row["decision_status"] == "WATCHING"
+    assert row["raw_payload"]["execution_mode"] == "live"
+
+
+# ── Test C: opposite side → CONFLICT ─────────────────────────────────────────
+def test_identity_opposite_side_conflict(sb):
+    _seed_signal(sb, "side-conflict-1", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(execution_mode="live", side="PUT",
+                  payload={"ticker": "SPY", "side": "PUT", "direction": "PUT"})
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="side-conflict-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"opposite-side WATCHING must not be idempotent — got {outcome!r}"
+    )
+    assert sb.rows[("side-conflict-1", "a@x.com")]["side"] == "CALL", (
+        "existing CALL row must be untouched"
+    )
+
+
+# ── Test D: different ticker → CONFLICT ──────────────────────────────────────
+def test_identity_different_ticker_conflict(sb):
+    _seed_signal(sb, "ticker-conflict-1", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(execution_mode="live", ticker="QQQ",
+                  payload={"ticker": "QQQ", "side": "CALL", "direction": "CALL"})
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="ticker-conflict-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"different-ticker WATCHING must not be idempotent — got {outcome!r}"
+    )
+    assert sb.rows[("ticker-conflict-1", "a@x.com")]["ticker"] == "SPY", (
+        "existing SPY row must be untouched"
+    )
+
+
+# ── Test E: exact identity match → ALREADY_WATCHING ──────────────────────────
+def test_identity_exact_match_idempotent(sb):
+    _seed_signal(sb, "exact-1", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    before = dict(sb.rows[("exact-1", "a@x.com")])
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="exact-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING, (
+        f"exact mode+ticker+side match must be idempotent — got {outcome!r}"
+    )
+    # No destructive rewrite: row is byte-for-byte the same.
+    assert sb.rows[("exact-1", "a@x.com")] == before, (
+        "exact-match idempotency must not rewrite the row"
+    )
+
+
+# ── Test F: missing execution-mode provenance → CONFLICT ─────────────────────
+@pytest.mark.parametrize("bad_raw", [{}, None])
+def test_identity_missing_mode_provenance_conflict(sb, bad_raw):
+    sb.rows[("prov-1", "a@x.com")] = {
+        "signal_id": "prov-1",
+        "client_email": "a@x.com",
+        "decision_status": "WATCHING",
+        "ticker": "SPY",
+        "side": "CALL",
+        "raw_payload": bad_raw,
+    }
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="prov-1", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"missing execution-mode provenance must NOT assume PAPER/LIVE — got {outcome!r}"
+    )
+    # Row untouched.
+    assert sb.rows[("prov-1", "a@x.com")]["decision_status"] == "WATCHING"
+
+
+# ── Test G: full deferral conflict blocks queue WATCHING CAS ─────────────────
+def test_deferral_identity_conflict_blocks_queue_cas(monkeypatch, sb):
+    monkeypatch.setattr(
+        queue, "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_CONFLICT,
+    )
+    watching_cas_calls: list = []
+    comp_calls: list = []
+    error_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_compensate_watching_signal_if_unchanged",
+        lambda **k: comp_calls.append(1) or queue.SIGNAL_COMP_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_checked_processing_error_cas",
+        lambda job_id, *, error, result=None:
+            error_cas_calls.append({"error": error}) or queue.ERROR_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(
+        queue, "_mark_job",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("_mark_job must not be called")),
+    )
+
+    ok = queue._persist_watching_deferral(
+        job_id=40600,
+        client_id="a@x.com",
+        signal_id="sig-identity-conflict",
+        execution_mode="live",
+        payload={"ticker": "SPY", "side": "CALL", "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="identity conflict test",
+    )
+    assert ok is False, "deferral must return False on identity conflict"
+    assert watching_cas_calls == [], "_checked_watching_cas must NOT run on identity conflict"
+    assert comp_calls == [], "conflicting signal row must NOT be compensated"
+    assert len(error_cas_calls) == 1, "guarded queue ERROR CAS must run once"
+    assert error_cas_calls[0]["error"] == "WATCHING_SIGNAL_IDENTITY_CONFLICT", (
+        f"error must be WATCHING_SIGNAL_IDENTITY_CONFLICT — got {error_cas_calls[0]['error']!r}"
+    )
+
+
+# ── Test H: full deferral exact match proceeds ───────────────────────────────
+def test_deferral_identity_exact_match_proceeds(monkeypatch, sb):
+    # Real helper (not patched) against an exact-identity WATCHING row.
+    _seed_signal(sb, "sig-exact-defer", "a@x.com", "WATCHING",
+                 execution_mode="live", ticker="SPY", side="CALL")
+    watching_cas_calls: list = []
+    monkeypatch.setattr(
+        queue, "_checked_watching_cas",
+        lambda *a, **k: watching_cas_calls.append(1) or queue.WATCHING_CAS_TRANSITIONED,
+    )
+    monkeypatch.setattr(queue, "_mark_job", lambda *a, **k: None)
+
+    ok = queue._persist_watching_deferral(
+        job_id=40601,
+        client_id="a@x.com",
+        signal_id="sig-exact-defer",
+        execution_mode="live",
+        payload={"ticker": "SPY", "side": "CALL", "direction": "CALL",
+                 "score": 70, "timeframe": "1d"},
+        stage="master_control",
+        reason_code="market_closed_deferred",
+        human_reason="exact identity deferral",
+    )
+    assert ok is True, "exact-identity WATCHING must proceed to a successful queue CAS"
+    assert watching_cas_calls == [1], "_checked_watching_cas must run exactly once"
+
+
+# ── Test I: insert race with MATCHING WATCHING winner → ALREADY_WATCHING ──────
+def test_identity_insert_race_matching_watching_winner(sb, monkeypatch):
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            is_read = (
+                q._insert_row is None and q._update_data is None and q._pending is None
+            )
+            if is_read:
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent worker inserts a MATCHING WATCHING row.
+                    _seed_signal(sb, "irace-match", "a@x.com", "WATCHING",
+                                 execution_mode="live", ticker="SPY", side="CALL")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="irace-match", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING, (
+        f"insert race with matching WATCHING winner must be idempotent — got {outcome!r}"
+    )
+
+
+# ── Test J: insert race with CROSS-MODE WATCHING winner → CONFLICT ───────────
+def test_identity_insert_race_cross_mode_watching_winner(sb, monkeypatch):
+    original_table = sb.table
+    state = {"select_count": 0}
+
+    def _racing_table(name):
+        q = original_table(name)
+        original_execute = q.execute
+
+        def _execute():
+            is_read = (
+                q._insert_row is None and q._update_data is None and q._pending is None
+            )
+            if is_read:
+                state["select_count"] += 1
+                result = original_execute()
+                if state["select_count"] == 1:
+                    # Concurrent PAPER worker inserts WATCHING; our request is LIVE.
+                    _seed_signal(sb, "irace-cross", "a@x.com", "WATCHING",
+                                 execution_mode="paper", ticker="SPY", side="CALL")
+                return result
+            return original_execute()
+
+        q.execute = _execute
+        return q
+
+    monkeypatch.setattr(sb, "table", _racing_table)
+
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "live"   # request is LIVE
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="irace-cross", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"insert race with cross-mode PAPER winner must CONFLICT — got {outcome!r}"
+    )
+    # PAPER row remains untouched.
+    row = sb.rows[("irace-cross", "a@x.com")]
+    assert row["decision_status"] == "WATCHING"
+    assert row["raw_payload"]["execution_mode"] == "paper"
+
+
+# ── Test K: invalid requested mode → CONFLICT (no DB write) ───────────────────
+def test_identity_invalid_requested_mode_conflict(sb):
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs["execution_mode"] = "sandbox"   # neither paper nor live
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="bad-mode", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"invalid requested mode must CONFLICT — got {outcome!r}"
+    )
+    assert ("bad-mode", "a@x.com") not in sb.rows, "no ap_signals row may be written"
+
+
+# ── Test L: invalid requested side → CONFLICT (no CALL fallback) ─────────────
+def test_identity_invalid_requested_side_conflict(sb):
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(side="", payload={"ticker": "SPY"})   # no side, no direction
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="bad-side", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"invalid requested side must CONFLICT (no CALL fallback) — got {outcome!r}"
+    )
+    assert ("bad-side", "a@x.com") not in sb.rows, "no ap_signals row may be written"
+
+
+# ── Test M: helper signature now requires execution_mode (keyword-only) ───────
+def test_identity_signature_requires_execution_mode():
+    import inspect
+    sig = inspect.signature(queue._persist_watching_signal_if_eligible)
+    assert "execution_mode" in sig.parameters, (
+        "_persist_watching_signal_if_eligible must take execution_mode"
+    )
+    p = sig.parameters["execution_mode"]
+    assert p.kind == inspect.Parameter.KEYWORD_ONLY, "execution_mode must be keyword-only"
+    assert p.default is inspect.Parameter.empty, "execution_mode must NOT be optional"
+    assert "job_id" not in sig.parameters, "helper must still not take job_id"

@@ -1269,10 +1269,66 @@ def _classify_existing_signal_status(observed_status: str | None) -> str:
     return SIGNAL_WATCH_ALREADY_ADVANCED
 
 
+def _classify_existing_watching_identity(
+    *,
+    row: dict,
+    requested_execution_mode: str,
+    requested_ticker: str,
+    requested_side: str,
+) -> str:
+    """Decide whether an existing ap_signals row may be accepted as the SAME
+    WATCHING lifecycle owner as the requested deferral.
+
+    P0 #405 amendment — a matching (signal_id, client_email) is NOT sufficient
+    for idempotency. A PAPER WATCHING row must not be accepted by a LIVE
+    deferral, a CALL WATCHING row must not be accepted by a PUT deferral, and a
+    SPY WATCHING row must not be accepted by a different-ticker deferral merely
+    because the signal_id was reused or malformed upstream.
+
+    Returns ONLY:
+      SIGNAL_WATCH_ALREADY_WATCHING – exact mode+ticker+side identity match.
+      SIGNAL_WATCH_CONFLICT         – WATCHING but identity differs / provenance missing.
+      SIGNAL_WATCH_ALREADY_ADVANCED – row is not exactly WATCHING (advanced/terminal).
+
+    Never mutates the row. Never backfills missing provenance. Missing existing
+    execution mode is treated as a conflict, NOT a match (no PAPER/LIVE assumption).
+    """
+    status = str(row.get("decision_status") or "")
+    if status != "WATCHING":
+        return SIGNAL_WATCH_ALREADY_ADVANCED
+
+    raw_payload = row.get("raw_payload")
+    if not isinstance(raw_payload, dict):
+        # Missing provenance — cannot prove the existing row is the same mode.
+        existing_mode = ""
+        _existing_direction = None
+    else:
+        existing_mode = str(raw_payload.get("execution_mode") or "").strip().lower()
+        _existing_direction = raw_payload.get("direction")
+
+    existing_ticker = str(row.get("ticker") or "").strip().upper()
+
+    _existing_side, _existing_side_err = _normalize_queue_side({
+        "side": row.get("side"),
+        "direction": _existing_direction,
+    })
+    existing_side = _existing_side or ""
+
+    if (
+        existing_mode == requested_execution_mode
+        and existing_ticker == requested_ticker
+        and existing_side == requested_side
+    ):
+        return SIGNAL_WATCH_ALREADY_WATCHING
+
+    return SIGNAL_WATCH_CONFLICT
+
+
 def _persist_watching_signal_if_eligible(
     *,
     signal_id: str,
     client_email: str,
+    execution_mode: str,
     ticker: str,
     side: str,
     score: float,
@@ -1296,7 +1352,10 @@ def _persist_watching_signal_if_eligible(
 
     Allowed ways to establish WATCHING:
       1. No (signal_id, client_email) row exists → create-only insert.
-      2. The existing row is already exactly WATCHING → idempotent no-op.
+      2. The existing row is already WATCHING with EXACT identity match on
+         execution_mode + ticker + side → idempotent no-op. A WATCHING row whose
+         mode/ticker/side differs (e.g. PAPER vs LIVE, CALL vs PUT, SPY vs QQQ)
+         is a SIGNAL_WATCH_CONFLICT, not idempotent success.
       3. The existing row is in an approved pre-deferral status
          (`_PRE_DEFERRAL_TRANSITIONABLE_STATUSES`, intentionally EMPTY today) →
          expected-state update.
@@ -1311,6 +1370,32 @@ def _persist_watching_signal_if_eligible(
     """
     _client = str(client_email or "")
     _sig = str(signal_id or "")
+
+    # ── Validate the REQUESTED identity BEFORE any DB work ────────────────────
+    # The explicit execution_mode argument is authoritative — not mutable payload.
+    _requested_mode = str(execution_mode or "").strip().lower()
+    if _requested_mode not in {"paper", "live"}:
+        log.critical(
+            "WATCHING_IDENTITY_CONFLICT_INVALID_REQUEST_MODE signal_id=%s "
+            "client_email=%s requested_mode=%r — refusing to establish WATCHING.",
+            _sig, _client, execution_mode,
+        )
+        return SIGNAL_WATCH_CONFLICT
+
+    _requested_ticker = str(ticker or "").strip().upper()
+
+    _requested_side, _side_error = _normalize_queue_side({
+        "side": side,
+        "direction": (payload or {}).get("direction"),
+    })
+    if not _requested_side:
+        log.critical(
+            "WATCHING_IDENTITY_CONFLICT_INVALID_REQUEST_SIDE signal_id=%s "
+            "client_email=%s side=%r err=%r — refusing to establish WATCHING "
+            "(no CALL fallback, no UNKNOWN identity).",
+            _sig, _client, side, _side_error,
+        )
+        return SIGNAL_WATCH_CONFLICT
 
     try:
         _sbc = _get_sb_client()
@@ -1342,10 +1427,40 @@ def _persist_watching_signal_if_eligible(
         _client = str(_watching_row.get("client_email") or _client)
         _sig = str(_watching_row.get("signal_id") or _sig)
 
-        # ── (1) read the exact existing row ──────────────────────────────────
+        def _reread_and_classify() -> str:
+            """Reread the (signal_id, client_email) row after a race and classify.
+
+            Uses the SINGLE pure identity helper so the WATCHING identity
+            comparison is never duplicated across the four race sites:
+              * no row               → SIGNAL_WATCH_CONFLICT (row vanished mid-race)
+              * WATCHING row         → _classify_existing_watching_identity(...)
+                                       (exact mode+ticker+side match required)
+              * any other status     → SIGNAL_WATCH_ALREADY_ADVANCED
+            """
+            _rr = (
+                _sbc.table("ap_signals")
+                .select("decision_status,raw_payload,ticker,side")
+                .eq("signal_id", _sig)
+                .eq("client_email", _client)
+                .execute()
+            )
+            _rr_rows = getattr(_rr, "data", None) or []
+            if not _rr_rows:
+                return SIGNAL_WATCH_CONFLICT
+            _rr_row = _rr_rows[0]
+            if str(_rr_row.get("decision_status") or "") == DECISION_WATCHING:
+                return _classify_existing_watching_identity(
+                    row=_rr_row,
+                    requested_execution_mode=_requested_mode,
+                    requested_ticker=_requested_ticker,
+                    requested_side=_requested_side,
+                )
+            return SIGNAL_WATCH_ALREADY_ADVANCED
+
+        # ── (1) read the exact existing row (with identity fields) ───────────
         _existing = (
             _sbc.table("ap_signals")
-            .select("decision_status")
+            .select("decision_status,raw_payload,ticker,side")
             .eq("signal_id", _sig)
             .eq("client_email", _client)
             .execute()
@@ -1353,16 +1468,40 @@ def _persist_watching_signal_if_eligible(
         _rows = getattr(_existing, "data", None) or []
 
         if _rows:
-            _observed = str(_rows[0].get("decision_status") or "")
+            _existing_row = _rows[0]
+            _observed = str(_existing_row.get("decision_status") or "")
 
-            # Already exactly WATCHING → idempotent success, no destructive rewrite.
+            # Already WATCHING → require EXACT identity match (mode+ticker+side).
+            # A PAPER row must not be accepted by a LIVE deferral, a CALL row by a
+            # PUT deferral, or a SPY row by a different-ticker deferral.
             if _observed == DECISION_WATCHING:
-                log.info(
-                    "_persist_watching_signal_if_eligible: already WATCHING "
-                    "signal_id=%s client_email=%s (idempotent).",
-                    _sig, _client,
+                _identity_outcome = _classify_existing_watching_identity(
+                    row=_existing_row,
+                    requested_execution_mode=_requested_mode,
+                    requested_ticker=_requested_ticker,
+                    requested_side=_requested_side,
                 )
-                return SIGNAL_WATCH_ALREADY_WATCHING
+                if _identity_outcome == SIGNAL_WATCH_ALREADY_WATCHING:
+                    log.info(
+                        "_persist_watching_signal_if_eligible: already WATCHING "
+                        "(exact identity match) signal_id=%s client_email=%s "
+                        "mode=%s ticker=%s side=%s (idempotent).",
+                        _sig, _client, _requested_mode, _requested_ticker, _requested_side,
+                    )
+                else:
+                    log.critical(
+                        "WATCHING_IDENTITY_CONFLICT signal_id=%s client_email=%s — "
+                        "requested(mode=%s ticker=%s side=%s) vs "
+                        "observed(mode=%r ticker=%r side=%r) → %s. Existing WATCHING "
+                        "row preserved untouched.",
+                        _sig, _client,
+                        _requested_mode, _requested_ticker, _requested_side,
+                        (_existing_row.get("raw_payload") or {}).get("execution_mode")
+                        if isinstance(_existing_row.get("raw_payload"), dict) else None,
+                        _existing_row.get("ticker"), _existing_row.get("side"),
+                        _identity_outcome,
+                    )
+                return _identity_outcome
 
             # Not in the approved pre-deferral allowlist → ADVANCED, preserve untouched.
             if _observed not in _PRE_DEFERRAL_TRANSITIONABLE_STATUSES:
@@ -1394,21 +1533,12 @@ def _persist_watching_signal_if_eligible(
                 return SIGNAL_WATCH_TRANSITIONED
 
             # Zero rows updated — the row changed between read and update. Reread
-            # and classify without mutating anything.
-            _reread = (
-                _sbc.table("ap_signals")
-                .select("decision_status")
-                .eq("signal_id", _sig)
-                .eq("client_email", _client)
-                .execute()
-            )
-            _rr_rows = getattr(_reread, "data", None) or []
-            _now = str(_rr_rows[0].get("decision_status")) if _rr_rows else None
-            _outcome = _classify_existing_signal_status(_now)
+            # and classify (identity-aware) without mutating anything.
+            _outcome = _reread_and_classify()
             log.warning(
                 "_persist_watching_signal_if_eligible: expected-state update race "
-                "signal_id=%s client_email=%s expected=%r now=%r → %s",
-                _sig, _client, _observed, _now, _outcome,
+                "signal_id=%s client_email=%s expected=%r → %s",
+                _sig, _client, _observed, _outcome,
             )
             return _outcome
 
@@ -1428,20 +1558,11 @@ def _persist_watching_signal_if_eligible(
             # uniqueness constraint is unavailable, so create-only cannot be
             # enforced) must NOT fall back to an unsafe upsert.
             if _is_unique_violation(_ins_exc):
-                _reread = (
-                    _sbc.table("ap_signals")
-                    .select("decision_status")
-                    .eq("signal_id", _sig)
-                    .eq("client_email", _client)
-                    .execute()
-                )
-                _rr_rows = getattr(_reread, "data", None) or []
-                _now = str(_rr_rows[0].get("decision_status")) if _rr_rows else None
-                _outcome = _classify_existing_signal_status(_now)
+                _outcome = _reread_and_classify()
                 log.warning(
                     "_persist_watching_signal_if_eligible: insert race "
-                    "signal_id=%s client_email=%s now=%r → %s",
-                    _sig, _client, _now, _outcome,
+                    "signal_id=%s client_email=%s → %s",
+                    _sig, _client, _outcome,
                 )
                 return _outcome
             log.critical(
@@ -1462,21 +1583,13 @@ def _persist_watching_signal_if_eligible(
             return SIGNAL_WATCH_INSERTED
 
         # Insert returned no rows and did not raise — treat as a conflict and
-        # reread to preserve any newer state rather than assuming success.
-        _reread = (
-            _sbc.table("ap_signals")
-            .select("decision_status")
-            .eq("signal_id", _sig)
-            .eq("client_email", _client)
-            .execute()
-        )
-        _rr_rows = getattr(_reread, "data", None) or []
-        _now = str(_rr_rows[0].get("decision_status")) if _rr_rows else None
-        _outcome = _classify_existing_signal_status(_now)
+        # reread (identity-aware) to preserve any newer state rather than
+        # assuming success.
+        _outcome = _reread_and_classify()
         log.warning(
             "_persist_watching_signal_if_eligible: insert returned no rows "
-            "signal_id=%s client_email=%s now=%r → %s",
-            _sig, _client, _now, _outcome,
+            "signal_id=%s client_email=%s → %s",
+            _sig, _client, _outcome,
         )
         return _outcome
 
@@ -1640,6 +1753,7 @@ def _persist_watching_deferral(
     _signal_watch_outcome = _persist_watching_signal_if_eligible(
         signal_id=_sig,
         client_email=_client,
+        execution_mode=_mode,
         ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
         side=str(_payload.get("side") or _payload.get("direction") or ""),
         score=_score,
@@ -1675,10 +1789,36 @@ def _persist_watching_deferral(
             )
         return False
 
-    # ── CONFLICT / DB_ERROR: could not safely establish WATCHING ───────────────
-    # Do NOT run the queue WATCHING CAS. Do NOT blindly overwrite the signal.
-    # Guard the queue error transition through _checked_processing_error_cas.
-    if _signal_watch_outcome in {SIGNAL_WATCH_CONFLICT, SIGNAL_WATCH_DB_ERROR}:
+    # ── IDENTITY CONFLICT: existing WATCHING row belongs to a different
+    # mode/ticker/side, or the requested identity was invalid, or a race left an
+    # unexpected state. Do NOT run the queue WATCHING CAS. Do NOT compensate or
+    # mutate the existing conflicting signal row. Fail the still-PROCESSING queue
+    # row via the guarded ERROR CAS with a SPECIFIC identity-conflict reason.
+    if _signal_watch_outcome == SIGNAL_WATCH_CONFLICT:
+        log.critical(
+            "WATCHING_SIGNAL_IDENTITY_CONFLICT job_id=%s signal_id=%s client=%s "
+            "mode=%s stage=%s reason=%s — existing WATCHING identity differs (or "
+            "requested identity invalid); refusing to mark queue WATCHING and "
+            "preserving the existing signal row untouched.",
+            job_id, _sig, _client, _mode, stage, reason_code,
+        )
+        _err_cas = _checked_processing_error_cas(
+            job_id, error="WATCHING_SIGNAL_IDENTITY_CONFLICT"
+        )
+        if _err_cas != ERROR_CAS_TRANSITIONED:
+            log.warning(
+                "DEFERRAL_EARLY_ERROR_CAS outcome=%r job_id=%s "
+                "(watching_signal_identity_conflict) — queue row was not "
+                "PROCESSING; state preserved.",
+                _err_cas, job_id,
+            )
+        return False
+
+    # ── DB_ERROR: could not safely establish WATCHING (no client, no unique
+    # constraint, or an unexpected DB failure). Preserve the existing failure
+    # reason. Do NOT run the queue WATCHING CAS. Do NOT blindly overwrite the
+    # signal. Guard the queue error transition through _checked_processing_error_cas.
+    if _signal_watch_outcome == SIGNAL_WATCH_DB_ERROR:
         log.critical(
             "WATCHING_SIGNAL_PERSISTENCE_FAILED job_id=%s signal_id=%s client=%s "
             "mode=%s stage=%s reason=%s signal_outcome=%r — refusing to mark queue "
