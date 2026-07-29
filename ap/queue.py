@@ -1132,17 +1132,21 @@ def _compensate_watching_signal_if_unchanged(
     *,
     signal_id: str,
     client_email: str,
+    watching_job_id: int,
     context_notes: str,
 ) -> str:
     """Expected-state compensation: update ap_signals.decision_status to ERROR
-    only if the row is still exactly WATCHING for this (signal_id, client_email).
+    only if the row is still exactly WATCHING for this
+    (signal_id, client_email, watching_job_id) owner.
 
     P0 #405 — replaces the prior blind _log_signal_to_db(decision_status='ERROR')
     upsert that could overwrite any later valid lifecycle state (e.g. queued,
     triggered, submitted, filled, rejected) with ERROR.
 
     Contract:
-      1. Uses an expected-state UPDATE … WHERE decision_status = 'WATCHING'.
+      1. Uses an expected-state UPDATE … WHERE decision_status = 'WATCHING'
+         AND raw_payload.watching_job_id matches the queue job that established
+         the row. Status alone is not ownership proof.
       2. Never upserts; never touches a row that advanced past WATCHING.
       3. On zero rows updated: rerereads the row and logs the observed state.
       4. Returns an explicit outcome constant — never raises.
@@ -1174,6 +1178,7 @@ def _compensate_watching_signal_if_unchanged(
             .eq("signal_id", signal_id)
             .eq("client_email", client_email)
             .eq("decision_status", "WATCHING")
+            .eq("raw_payload->>watching_job_id", str(watching_job_id))
             .execute()
         )
 
@@ -1189,7 +1194,7 @@ def _compensate_watching_signal_if_unchanged(
         # Zero rows updated — classify without mutating anything further.
         reread = (
             _sb.table("ap_signals")
-            .select("decision_status")
+            .select("decision_status,raw_payload")
             .eq("signal_id", signal_id)
             .eq("client_email", client_email)
             .execute()
@@ -1204,11 +1209,18 @@ def _compensate_watching_signal_if_unchanged(
             return SIGNAL_COMP_MISSING
 
         observed_status = existing[0].get("decision_status", "<unknown>")
+        observed_payload = existing[0].get("raw_payload")
+        observed_job_id = (
+            observed_payload.get("watching_job_id")
+            if isinstance(observed_payload, dict) else None
+        )
         log.warning(
             "_compensate_watching_signal_if_unchanged: zero-row update for "
             "signal_id=%s client_email=%s — observed decision_status=%r "
-            "(row advanced past WATCHING; newer state preserved).",
-            signal_id, client_email, observed_status,
+            "observed_watching_job_id=%r requested_watching_job_id=%r "
+            "(row advanced or is owned by another queue job; preserved).",
+            signal_id, client_email, observed_status, observed_job_id,
+            watching_job_id,
         )
         return SIGNAL_COMP_ALREADY_ADVANCED
 
@@ -1275,6 +1287,7 @@ def _classify_existing_watching_identity(
     requested_execution_mode: str,
     requested_ticker: str,
     requested_side: str,
+    requested_watching_job_id: int,
 ) -> str:
     """Decide whether an existing ap_signals row may be accepted as the SAME
     WATCHING lifecycle owner as the requested deferral.
@@ -1282,11 +1295,11 @@ def _classify_existing_watching_identity(
     P0 #405 amendment — a matching (signal_id, client_email) is NOT sufficient
     for idempotency. A PAPER WATCHING row must not be accepted by a LIVE
     deferral, a CALL WATCHING row must not be accepted by a PUT deferral, and a
-    SPY WATCHING row must not be accepted by a different-ticker deferral merely
-    because the signal_id was reused or malformed upstream.
+    SPY WATCHING row must not be accepted by a different-ticker or queue-job
+    deferral merely because the signal_id was reused or malformed upstream.
 
     Returns ONLY:
-      SIGNAL_WATCH_ALREADY_WATCHING – exact mode+ticker+side identity match.
+      SIGNAL_WATCH_ALREADY_WATCHING – exact mode+ticker+side+job identity match.
       SIGNAL_WATCH_CONFLICT         – WATCHING but identity differs / provenance missing.
       SIGNAL_WATCH_ALREADY_ADVANCED – row is not exactly WATCHING (advanced/terminal).
 
@@ -1302,9 +1315,15 @@ def _classify_existing_watching_identity(
         # Missing provenance — cannot prove the existing row is the same mode.
         existing_mode = ""
         _existing_direction = None
+        existing_watching_job_id = None
     else:
         existing_mode = str(raw_payload.get("execution_mode") or "").strip().lower()
         _existing_direction = raw_payload.get("direction")
+        existing_watching_job_id = raw_payload.get("watching_job_id")
+        if existing_watching_job_id is None:
+            # Backward-compatible ownership proof for WATCHING rows written by
+            # #398 before #405 introduced the explicit field.
+            existing_watching_job_id = raw_payload.get("_queue_id")
 
     existing_ticker = str(row.get("ticker") or "").strip().upper()
 
@@ -1318,6 +1337,7 @@ def _classify_existing_watching_identity(
         existing_mode == requested_execution_mode
         and existing_ticker == requested_ticker
         and existing_side == requested_side
+        and str(existing_watching_job_id) == str(requested_watching_job_id)
     ):
         return SIGNAL_WATCH_ALREADY_WATCHING
 
@@ -1328,6 +1348,7 @@ def _persist_watching_signal_if_eligible(
     *,
     signal_id: str,
     client_email: str,
+    job_id: int,
     execution_mode: str,
     ticker: str,
     side: str,
@@ -1346,16 +1367,16 @@ def _persist_watching_signal_if_eligible(
     a newer advanced lifecycle state (queued/triggered/submitted/filled/rejected/
     ERROR/blocked_at_breach) with WATCHING.
 
-    Owns ONLY ap_signals for this exact (signal_id, client_email). Never touches
-    trade_queue, OSM, orders, positions, exits, proof_trades, or any other table,
-    and never takes the queue job_id.
+    Owns ONLY ap_signals for this exact (signal_id, client_email). It accepts the
+    queue job_id solely as an ownership token; it never touches trade_queue,
+    OSM, orders, positions, exits, proof_trades, or any other table.
 
     Allowed ways to establish WATCHING:
       1. No (signal_id, client_email) row exists → create-only insert.
       2. The existing row is already WATCHING with EXACT identity match on
-         execution_mode + ticker + side → idempotent no-op. A WATCHING row whose
-         mode/ticker/side differs (e.g. PAPER vs LIVE, CALL vs PUT, SPY vs QQQ)
-         is a SIGNAL_WATCH_CONFLICT, not idempotent success.
+         execution_mode + ticker + side + queue job → idempotent no-op. A
+         WATCHING row whose identity differs is a SIGNAL_WATCH_CONFLICT, not
+         idempotent success.
       3. The existing row is in an approved pre-deferral status
          (`_PRE_DEFERRAL_TRANSITIONABLE_STATUSES`, intentionally EMPTY today) →
          expected-state update.
@@ -1370,6 +1391,17 @@ def _persist_watching_signal_if_eligible(
     """
     _client = str(client_email or "")
     _sig = str(signal_id or "")
+    try:
+        _requested_job_id = int(job_id)
+    except (TypeError, ValueError):
+        _requested_job_id = 0
+    if _requested_job_id <= 0:
+        log.critical(
+            "WATCHING_IDENTITY_CONFLICT_INVALID_REQUEST_JOB signal_id=%s "
+            "client_email=%s requested_job_id=%r — refusing WATCHING.",
+            _sig, _client, job_id,
+        )
+        return SIGNAL_WATCH_CONFLICT
 
     # ── Validate the REQUESTED identity BEFORE any DB work ────────────────────
     # The explicit execution_mode argument is authoritative — not mutable payload.
@@ -1383,6 +1415,13 @@ def _persist_watching_signal_if_eligible(
         return SIGNAL_WATCH_CONFLICT
 
     _requested_ticker = str(ticker or "").strip().upper()
+    if not _requested_ticker:
+        log.critical(
+            "WATCHING_IDENTITY_CONFLICT_INVALID_REQUEST_TICKER signal_id=%s "
+            "client_email=%s ticker=%r — refusing to establish WATCHING.",
+            _sig, _client, ticker,
+        )
+        return SIGNAL_WATCH_CONFLICT
 
     _requested_side, _side_error = _normalize_queue_side({
         "side": side,
@@ -1422,6 +1461,7 @@ def _persist_watching_signal_if_eligible(
             decision_status=DECISION_WATCHING,
             queued_at=queued_at,
         )
+        _watching_row["raw_payload"]["watching_job_id"] = _requested_job_id
         # canonical_client_email may normalize the address — read back the exact
         # value the row will carry so every .eq() filter matches precisely.
         _client = str(_watching_row.get("client_email") or _client)
@@ -1434,7 +1474,7 @@ def _persist_watching_signal_if_eligible(
             comparison is never duplicated across the four race sites:
               * no row               → SIGNAL_WATCH_CONFLICT (row vanished mid-race)
               * WATCHING row         → _classify_existing_watching_identity(...)
-                                       (exact mode+ticker+side match required)
+                                       (exact mode+ticker+side+job match required)
               * any other status     → SIGNAL_WATCH_ALREADY_ADVANCED
             """
             _rr = (
@@ -1454,6 +1494,7 @@ def _persist_watching_signal_if_eligible(
                     requested_execution_mode=_requested_mode,
                     requested_ticker=_requested_ticker,
                     requested_side=_requested_side,
+                    requested_watching_job_id=_requested_job_id,
                 )
             return SIGNAL_WATCH_ALREADY_ADVANCED
 
@@ -1471,7 +1512,7 @@ def _persist_watching_signal_if_eligible(
             _existing_row = _rows[0]
             _observed = str(_existing_row.get("decision_status") or "")
 
-            # Already WATCHING → require EXACT identity match (mode+ticker+side).
+            # Already WATCHING → require exact mode+ticker+side+job identity.
             # A PAPER row must not be accepted by a LIVE deferral, a CALL row by a
             # PUT deferral, or a SPY row by a different-ticker deferral.
             if _observed == DECISION_WATCHING:
@@ -1480,25 +1521,29 @@ def _persist_watching_signal_if_eligible(
                     requested_execution_mode=_requested_mode,
                     requested_ticker=_requested_ticker,
                     requested_side=_requested_side,
+                    requested_watching_job_id=_requested_job_id,
                 )
                 if _identity_outcome == SIGNAL_WATCH_ALREADY_WATCHING:
                     log.info(
                         "_persist_watching_signal_if_eligible: already WATCHING "
                         "(exact identity match) signal_id=%s client_email=%s "
-                        "mode=%s ticker=%s side=%s (idempotent).",
+                        "mode=%s ticker=%s side=%s job_id=%s (idempotent).",
                         _sig, _client, _requested_mode, _requested_ticker, _requested_side,
+                        _requested_job_id,
                     )
                 else:
                     log.critical(
                         "WATCHING_IDENTITY_CONFLICT signal_id=%s client_email=%s — "
-                        "requested(mode=%s ticker=%s side=%s) vs "
-                        "observed(mode=%r ticker=%r side=%r) → %s. Existing WATCHING "
+                        "requested(mode=%s ticker=%s side=%s job_id=%s) vs "
+                        "observed(mode=%r ticker=%r side=%r job_id=%r) → %s. Existing WATCHING "
                         "row preserved untouched.",
                         _sig, _client,
-                        _requested_mode, _requested_ticker, _requested_side,
+                        _requested_mode, _requested_ticker, _requested_side, _requested_job_id,
                         (_existing_row.get("raw_payload") or {}).get("execution_mode")
                         if isinstance(_existing_row.get("raw_payload"), dict) else None,
                         _existing_row.get("ticker"), _existing_row.get("side"),
+                        (_existing_row.get("raw_payload") or {}).get("watching_job_id")
+                        if isinstance(_existing_row.get("raw_payload"), dict) else None,
                         _identity_outcome,
                     )
                 return _identity_outcome
@@ -1642,17 +1687,14 @@ def _persist_watching_deferral(
          queue row ERROR with a stable reason (WATCHING_SIGNAL_PERSISTENCE_FAILED
          unless the caller supplied a more specific one) — never WATCHING, never
          REJECTED+WATCHING split truth. No watcher / OSM / broker action is taken.
-      8. Idempotent — the ap_signals upsert is keyed on (signal_id,
-         client_email) and the queue update is keyed on job_id, so repeating the
-         same deferral updates in place rather than duplicating. A row already
-         canonical WATCHING is upserted to the same values (still success).
+      8. Idempotent only for the same signal, client, mode, ticker, side, and
+         queue job. Missing rows use create-only insert; existing WATCHING rows
+         are never rewritten.
       9. Preserves CLIENT isolation: the canonical client_email is part of the
          ap_signals upsert key and the queue update is scoped to this job_id
          only, so one client's deferral can never claim/update another client's
-         row. The execution mode is stamped into raw_payload for provenance but
-         is NOT part of the row identity — cross-mode isolation for the SAME
-         (signal_id, client_email) is owned by the runtime/broker mode boundary
-         (PR #397), not by this helper.
+         row. Mode, ticker, side, and queue-job ownership must also match before
+         an existing WATCHING row is accepted as idempotent.
      10. Never converts a genuinely terminal rejection into WATCHING — it is the
          ONLY WATCHING authority and callers invoke it BEFORE any terminalization,
          so no terminal state is ever overwritten.
@@ -1736,9 +1778,8 @@ def _persist_watching_deferral(
     # guarded read/update/insert so a STALE deferral worker can never overwrite a
     # NEWER advanced lifecycle state (queued/triggered/submitted/filled/rejected/
     # ERROR) with WATCHING. The (signal_id, client_email) key gives CLIENT
-    # isolation; the execution mode is provenance only, NOT part of the row
-    # identity. Cross-mode isolation for the SAME (signal_id, client_email) is
-    # owned by the runtime/broker mode boundary (PR #397), not by this helper.
+    # isolation. Mode, ticker, side, and queue job are checked ownership
+    # provenance for an existing WATCHING row; none changes the database key.
     _payload = dict(payload or {})
     _payload["execution_mode"] = _mode
     _payload["signal_id"] = _sig
@@ -1753,6 +1794,7 @@ def _persist_watching_deferral(
     _signal_watch_outcome = _persist_watching_signal_if_eligible(
         signal_id=_sig,
         client_email=_client,
+        job_id=job_id,
         execution_mode=_mode,
         ticker=str(_payload.get("ticker") or _payload.get("symbol") or ""),
         side=str(_payload.get("side") or _payload.get("direction") or ""),
@@ -1875,6 +1917,7 @@ def _persist_watching_deferral(
         _comp_outcome = _compensate_watching_signal_if_unchanged(
             signal_id=_sig,
             client_email=_client,
+            watching_job_id=job_id,
             context_notes=(
                 f"stage={stage} | DEFERRAL_QUEUE_CAS_TERMINAL | "
                 "Queue row is terminal — ap_signals compensation attempted from WATCHING."
@@ -1919,6 +1962,7 @@ def _persist_watching_deferral(
     _comp_outcome = _compensate_watching_signal_if_unchanged(
         signal_id=_sig,
         client_email=_client,
+        watching_job_id=job_id,
         context_notes=(
             f"stage={stage} | DEFERRAL_QUEUE_CAS_FAILED outcome={_cas_outcome!r} | "
             "ap_signals compensation attempted from WATCHING."

@@ -130,6 +130,14 @@ class _FakeQuery:
         return self
 
     def execute(self):
+        def _value(row, col):
+            if col == "raw_payload->>watching_job_id":
+                raw = row.get("raw_payload")
+                if isinstance(raw, dict) and raw.get("watching_job_id") is not None:
+                    return str(raw["watching_job_id"])
+                return None
+            return row.get(col)
+
         # 1. Pending upsert result (consumed once).
         if self._pending is not None:
             out, self._pending = self._pending, None
@@ -160,7 +168,7 @@ class _FakeQuery:
             self._filters = []
             updated = []
             for key, row in list(self._store.rows.items()):
-                if all(row.get(col) == val for op, col, val in filters if op == "eq"):
+                if all(_value(row, col) == val for op, col, val in filters if op == "eq"):
                     row.update(update_data)
                     updated.append(dict(row))
             return _FakeResult(updated)
@@ -169,7 +177,7 @@ class _FakeQuery:
         rows = list(self._store.rows.values())
         for op, col, val in self._filters:
             if op == "eq":
-                rows = [r for r in rows if r.get(col) == val]
+                rows = [r for r in rows if _value(r, col) == val]
             elif op == "gte":
                 rows = [r for r in rows if str(r.get(col) or "") >= str(val)]
         return _FakeResult(rows)
@@ -1190,7 +1198,7 @@ def test_persist_G_compensation_failure_emits_critical(monkeypatch, sb, caplog):
     # Patch the new expected-state compensation helper to simulate DB failure.
     comp_calls: list[str] = []
 
-    def _fake_comp(*, signal_id, client_email, context_notes):
+    def _fake_comp(*, signal_id, client_email, watching_job_id, context_notes):
         comp_calls.append(signal_id)
         return queue.SIGNAL_COMP_DB_ERROR
 
@@ -1248,11 +1256,13 @@ def test_comp_watching_transitions_to_error(sb):
     sb.table("ap_signals").upsert({
         "signal_id": "comp-sig-1", "client_email": "a@x.com",
         "decision_status": "WATCHING",
+        "raw_payload": {"watching_job_id": 2001},
     }).execute()
 
     outcome = queue._compensate_watching_signal_if_unchanged(
         signal_id="comp-sig-1",
         client_email="a@x.com",
+        watching_job_id=2001,
         context_notes="test compensation",
     )
     assert outcome == queue.SIGNAL_COMP_TRANSITIONED, (
@@ -1261,6 +1271,24 @@ def test_comp_watching_transitions_to_error(sb):
     rows = _signal_rows(sb, "ERROR")
     assert rows, "ap_signals row must be ERROR after successful compensation"
     assert not _signal_rows(sb, "WATCHING"), "no WATCHING rows must remain"
+
+
+def test_comp_wrong_queue_owner_preserves_watching(sb):
+    """A stale queue job cannot compensate another job's WATCHING signal."""
+    sb.table("ap_signals").upsert({
+        "signal_id": "comp-owner", "client_email": "a@x.com",
+        "decision_status": "WATCHING",
+        "raw_payload": {"watching_job_id": 3002},
+    }).execute()
+
+    outcome = queue._compensate_watching_signal_if_unchanged(
+        signal_id="comp-owner",
+        client_email="a@x.com",
+        watching_job_id=3001,
+        context_notes="stale worker",
+    )
+    assert outcome == queue.SIGNAL_COMP_ALREADY_ADVANCED
+    assert sb.rows[("comp-owner", "a@x.com")]["decision_status"] == "WATCHING"
 
 
 @pytest.mark.parametrize("advanced_status", [
@@ -1276,6 +1304,7 @@ def test_comp_advanced_state_preserved(sb, advanced_status):
     outcome = queue._compensate_watching_signal_if_unchanged(
         signal_id="comp-sig-adv",
         client_email="b@x.com",
+        watching_job_id=2002,
         context_notes="test",
     )
     assert outcome == queue.SIGNAL_COMP_ALREADY_ADVANCED, (
@@ -1300,6 +1329,7 @@ def test_comp_wrong_client_no_mutation(sb):
     outcome = queue._compensate_watching_signal_if_unchanged(
         signal_id="comp-sig-cli",
         client_email="other@x.com",   # wrong client
+        watching_job_id=2003,
         context_notes="test",
     )
     # No matching row → MISSING (row exists but for a different client).
@@ -1323,6 +1353,7 @@ def test_comp_wrong_signal_no_mutation(sb):
     outcome = queue._compensate_watching_signal_if_unchanged(
         signal_id="comp-sig-ghost",   # wrong signal
         client_email="c@x.com",
+        watching_job_id=2004,
         context_notes="test",
     )
     assert outcome == queue.SIGNAL_COMP_MISSING, (
@@ -1339,6 +1370,7 @@ def test_comp_missing_row_returns_missing(sb):
     """No row at all → SIGNAL_COMP_MISSING; no new row created."""
     outcome = queue._compensate_watching_signal_if_unchanged(
         signal_id="comp-nonexistent", client_email="d@x.com",
+        watching_job_id=2005,
         context_notes="test",
     )
     assert outcome == queue.SIGNAL_COMP_MISSING, (
@@ -1352,6 +1384,7 @@ def test_comp_db_failure_returns_db_error(monkeypatch):
     monkeypatch.setattr(queue, "_get_sb_client", lambda: _BoomSupabase())
     outcome = queue._compensate_watching_signal_if_unchanged(
         signal_id="comp-boom", client_email="e@x.com",
+        watching_job_id=2006,
         context_notes="test",
     )
     assert outcome == queue.SIGNAL_COMP_DB_ERROR, (
@@ -1805,6 +1838,7 @@ def test_after_hours_deferral_failure_produces_no_watcher_osm_broker_mutation(
 # ═════════════════════════════════════════════════════════════════════════════
 
 _ELIGIBLE_KWARGS = dict(
+    job_id=40501,
     execution_mode="live",
     ticker="SPY", side="CALL", score=72.0, stage="master_control",
     reason_code="market_closed_deferred",
@@ -1816,7 +1850,7 @@ _ELIGIBLE_KWARGS = dict(
 
 def _seed_signal(
     sb, signal_id, client_email, decision_status,
-    *, execution_mode="live", ticker="SPY", side="CALL",
+    *, execution_mode="live", ticker="SPY", side="CALL", watching_job_id=40501,
 ):
     """Seed an ap_signals row. For WATCHING rows the identity fields
     (raw_payload.execution_mode, ticker, side) default to match _ELIGIBLE_KWARGS
@@ -1829,7 +1863,11 @@ def _seed_signal(
         "decision_status": decision_status,
         "ticker": ticker,
         "side": side,
-        "raw_payload": {"execution_mode": execution_mode, "direction": side},
+        "raw_payload": {
+            "execution_mode": execution_mode,
+            "direction": side,
+            "watching_job_id": watching_job_id,
+        },
     }
 
 
@@ -2204,13 +2242,12 @@ def test_watch_eligible_no_supabase_client_db_error(monkeypatch):
     assert outcome == queue.SIGNAL_WATCH_DB_ERROR
 
 
-# ── Test 13: helper never takes job_id (signature guard) ─────────────────────
-def test_watch_eligible_signature_excludes_job_id():
+# ── Test 13: helper requires job_id for ownership fencing ────────────────────
+def test_watch_eligible_signature_requires_job_id():
     import inspect
     sig = inspect.signature(queue._persist_watching_signal_if_eligible)
-    assert "job_id" not in sig.parameters, (
-        "_persist_watching_signal_if_eligible must NOT take job_id — it owns only ap_signals"
-    )
+    assert "job_id" in sig.parameters
+    assert sig.parameters["job_id"].default is inspect.Parameter.empty
     # Must be keyword-only for the documented params.
     for name in ("signal_id", "client_email", "queued_at"):
         assert name in sig.parameters, f"missing required param {name!r}"
@@ -2417,7 +2454,8 @@ def test_deferral_identity_conflict_blocks_queue_cas(monkeypatch, sb):
 def test_deferral_identity_exact_match_proceeds(monkeypatch, sb):
     # Real helper (not patched) against an exact-identity WATCHING row.
     _seed_signal(sb, "sig-exact-defer", "a@x.com", "WATCHING",
-                 execution_mode="live", ticker="SPY", side="CALL")
+                 execution_mode="live", ticker="SPY", side="CALL",
+                 watching_job_id=40601)
     watching_cas_calls: list = []
     monkeypatch.setattr(
         queue, "_checked_watching_cas",
@@ -2546,6 +2584,40 @@ def test_identity_invalid_requested_side_conflict(sb):
     assert ("bad-side", "a@x.com") not in sb.rows, "no ap_signals row may be written"
 
 
+def test_identity_invalid_requested_ticker_conflict(sb):
+    kwargs = dict(_ELIGIBLE_KWARGS)
+    kwargs.update(ticker="", payload={"side": "CALL"})
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="bad-ticker", client_email="a@x.com", **kwargs
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT
+    assert ("bad-ticker", "a@x.com") not in sb.rows
+
+
+def test_identity_different_queue_job_conflict(sb):
+    _seed_signal(
+        sb, "job-owner-conflict", "a@x.com", "WATCHING",
+        watching_job_id=40599,
+    )
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="job-owner-conflict", client_email="a@x.com",
+        **_ELIGIBLE_KWARGS,
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT
+    assert sb.rows[("job-owner-conflict", "a@x.com")]["raw_payload"]["watching_job_id"] == 40599
+
+
+def test_identity_legacy_queue_id_is_valid_owner_proof(sb):
+    _seed_signal(sb, "legacy-owner", "a@x.com", "WATCHING")
+    raw = sb.rows[("legacy-owner", "a@x.com")]["raw_payload"]
+    raw.pop("watching_job_id")
+    raw["_queue_id"] = _ELIGIBLE_KWARGS["job_id"]
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="legacy-owner", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_ALREADY_WATCHING
+
+
 # ── Test M: helper signature now requires execution_mode (keyword-only) ───────
 def test_identity_signature_requires_execution_mode():
     import inspect
@@ -2556,4 +2628,4 @@ def test_identity_signature_requires_execution_mode():
     p = sig.parameters["execution_mode"]
     assert p.kind == inspect.Parameter.KEYWORD_ONLY, "execution_mode must be keyword-only"
     assert p.default is inspect.Parameter.empty, "execution_mode must NOT be optional"
-    assert "job_id" not in sig.parameters, "helper must still not take job_id"
+    assert "job_id" in sig.parameters, "helper must require queue-job ownership"

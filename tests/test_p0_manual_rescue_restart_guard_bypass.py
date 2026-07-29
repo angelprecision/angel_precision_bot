@@ -93,12 +93,24 @@ def test_dispatch_paper_overnight_only_payload_restores_watching_instead_of_dire
     signal_writes: list[dict] = []
 
     class _Tbl:
-        def upsert(self, row, *a, **kw):
-            signal_writes.append(row)
+        def __init__(self):
+            self._insert = None
+
+        def select(self, *_a, **_kw):
+            return self
+
+        def eq(self, *_a, **_kw):
+            return self
+
+        def insert(self, row):
+            self._insert = dict(row)
             return self
 
         def execute(self):
-            return {"data": [{"signal_id": "sig-paper"}]}
+            if self._insert is not None:
+                signal_writes.append(self._insert)
+                return type("_Result", (), {"data": [self._insert]})()
+            return type("_Result", (), {"data": []})()
 
     class _Sbc:
         def table(self, _name):
@@ -157,6 +169,7 @@ def test_dispatch_paper_overnight_only_payload_restores_watching_instead_of_dire
     # queue row was marked WATCHING (single deferral authority, fail-closed).
     assert signal_writes, "ap_signals WATCHING row must be persisted for the rescue"
     assert signal_writes[0].get("decision_status") == "WATCHING"
+    assert signal_writes[0]["raw_payload"]["watching_job_id"] == 99
 
 
 def test_manual_restart_guard_bypass_disabled_without_marker():
