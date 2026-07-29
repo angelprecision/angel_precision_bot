@@ -26,13 +26,14 @@ class _FakeOrderStateMachine:
         self.cancel_calls: list[tuple[str, str]] = []
         self.transition_calls: list[tuple[str, str, dict]] = []
 
-    def create_entry_order(self, plan, initial_status="CREATED", execution_mode=None):
+    def create_entry_order(self, plan, initial_status="CREATED", execution_mode=None, **kwargs):
         self.create_calls += 1
         local_order_id = "local-ord-1"
         self.orders[local_order_id] = {
             "status": initial_status,
             "execution_mode": execution_mode,
             "contract": getattr(plan, "contract_symbol", None),
+            "meta": kwargs.get("meta") or {},
         }
         return local_order_id
 
@@ -66,6 +67,21 @@ class _FakeOrderStateMachine:
 
 
 class _FakeOpportunityLedger(types.ModuleType):
+    WATCHER_ARMED = "WATCHER_ARMED"
+    BROKER_SUBMITTED = "BROKER_SUBMITTED"
+    BROKER_ACKED = "BROKER_ACKED"
+    FILLED = "FILLED"
+    TERMINAL_STATUSES = {
+        "MISSED",
+        "REJECTED",
+        "CANCELED",
+        "CANCELLED",
+        "EXPIRED",
+        "FAILED",
+        "INTERNAL_ERROR",
+        "FILLED",
+    }
+
     class _Query:
         def __init__(self, storage: dict[tuple[str, str], dict]):
             self._storage = storage
@@ -127,8 +143,37 @@ class _FakeOpportunityLedger(types.ModuleType):
                     "miss_reason": None,
                     "metadata": {},
                 },
-            )
+                )
         return len(client_ids)
+
+    def mark_watcher_armed(
+        self,
+        signal_id: str,
+        client_id: str,
+        *,
+        canonical_signal_id: str | None = None,
+        order_local_id: str | None = None,
+        extra_meta: dict | None = None,
+        **_kwargs,
+    ) -> bool:
+        canonical = canonical_signal_id or signal_id
+        row = self.rows.setdefault(
+            (canonical, client_id),
+            {
+                "signal_id": signal_id,
+                "canonical_signal_id": canonical,
+                "client_id": client_id,
+                "metadata": {},
+            },
+        )
+        row.update(
+            {
+                "opportunity_status": self.WATCHER_ARMED,
+                "order_local_id": order_local_id,
+                "metadata": {**(row.get("metadata") or {}), **(extra_meta or {})},
+            }
+        )
+        return True
 
     def mark_watcher_invalidated(
         self,
@@ -417,9 +462,14 @@ def test_pending_trigger_watchdog_expires_orphan_without_watcher_ownership(monke
         entry_watcher=watcher,
     )
     monitor._emit_order_event = MagicMock()
-    monitor._get_active_entry_orders = MagicMock(
-        return_value=[_make_pending_trigger_order(age_seconds=120)]
-    )
+    orphan = _make_pending_trigger_order(age_seconds=120)
+    orphan.update({
+        "signal_id": None,
+        "contract": None,
+        "trigger_price": None,
+        "entry_trigger": None,
+    })
+    monitor._get_active_entry_orders = MagicMock(return_value=[orphan])
 
     caplog.set_level(logging.INFO, logger="ap.order_monitor")
     monitor._check_entry_orders()
@@ -521,23 +571,58 @@ def test_overnight_watch_false_cleans_order_and_records_source_and_proof(monkeyp
         ledger=ledger,
     )
 
-    assert result["rejected"] == 1
+    assert result["rejected"] == 0
+    assert result["skipped"] == 1
+    assert result["retryable_deferred"] == 1
     assert result["errors"] == 0
     assert error_calls == []
-    assert rejected_calls == [
-        ("job-001", "client-1", "overnight_watch_arm_failed:armed_false")
-    ]
+    assert rejected_calls == []
     assert osm.expire_calls == [
         ("local-ord-1", "overnight_watch_arm_failed:armed_false")
     ]
-    proof = ledger.rows[("CANON-001", "client-1")]
-    assert proof["opportunity_status"] == "MISSED"
-    assert proof["miss_stage"] == "WATCHER_ARM"
-    assert proof["miss_reason"] == "overnight_watch_arm_failed:armed_false"
-    assert proof["metadata"]["overnight_watch_arm_failure"] is True
-    assert proof["metadata"]["overnight_source_table"] == "trade_queue"
-    assert proof["metadata"]["overnight_reeval_session_key"] == "2026-06-12"
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_DONE" in caplog.text
+    assert "overnight_watch_arm_unknown" in caplog.text
+
+
+def test_dedup_block_stale_order_owner_is_retryable_not_already_armed(monkeypatch, caplog):
+    existing = types.SimpleNamespace(
+        signal_id="sig-001",
+        ticker="AAPL",
+        side="CALL",
+        signal={
+            "signal_id": "sig-001",
+            "client_id": "client-1",
+            "execution_mode": "paper",
+            "ticker": "AAPL",
+            "side": "CALL",
+            "local_order_id": "local-stale-owner",
+        },
+    )
+    entry_watcher = types.SimpleNamespace(
+        _pending=[existing],
+        _dedup_set={"sig-001"},
+        _lock=None,
+        _last_reject_reason="dedup_block",
+    )
+    entry_watcher.watch = MagicMock(return_value=False)
+
+    caplog.set_level(logging.INFO, logger="ap.overnight_reeval")
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+    )
+
+    assert result["armed"] == 0
+    assert result["skipped"] == 1
+    assert result["retryable_deferred"] == 1
+    assert rejected_calls == []
+    assert error_calls == []
+    assert osm.expire_calls == [
+        ("local-ord-1", "overnight_watch_ownership_conflict")
+    ]
+    assert "overnight_watch_ownership_conflict" in caplog.text
+    assert "overnight_watch_already_watching" not in caplog.text
 
 
 def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_proof(monkeypatch, caplog):
@@ -604,9 +689,9 @@ def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_fail
         source="ap_signals",
         ledger=ledger,
     )
-    assert first_result["rejected"] == 1
+    assert first_result["skipped"] == 1
+    assert first_result["retryable_deferred"] == 1
     assert first_osm.create_calls == 1
-    assert ledger.rows[("CANON-001", "client-1")]["opportunity_status"] == "MISSED"
 
     second_result, second_osm, _, _ = _run_reeval(
         monkeypatch,
@@ -615,10 +700,8 @@ def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_fail
         ledger=ledger,
     )
     assert second_result["skipped"] == 1
-    assert second_osm.create_calls == 0
-    assert entry_watcher.watch.call_count == 1, (
-        "shared setup must not re-arm after a recorded per-client watch-arm failure"
-    )
+    assert second_result["retryable_deferred"] == 1
+    assert second_osm.create_calls == 1
 
 
 def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch):

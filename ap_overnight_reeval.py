@@ -124,6 +124,7 @@ def _resolve_existing_watcher_ownership(
     side: str,
     generation=None,
     watcher_token=None,
+    local_order_id=None,
 ) -> str:
     """Resolve watcher ownership for a signal_id after a dedup_block rejection.
 
@@ -198,15 +199,22 @@ def _resolve_existing_watcher_ownership(
                 log.warning("[%s] watcher side mismatch sid=%s exp=%s got=%r",
                             ticker, exp_sid, exp_side, w_side)
                 return WATCH_OWNER_CONFLICT
+            if local_order_id:
+                exp_oid = str(local_order_id or "").strip()
+                w_oid = str(_wsig.get("local_order_id") or "").strip()
+                if not w_oid or w_oid != exp_oid:
+                    log.warning("[%s] watcher local_order_id mismatch sid=%s exp=%s got=%r",
+                                ticker, exp_sid, exp_oid, w_oid)
+                    return WATCH_OWNER_CONFLICT
             if generation is not None:
                 try:
                     if int(_wsig.get("trigger_generation") or 0) != int(generation):
                         return WATCH_OWNER_CONFLICT
                 except (TypeError, ValueError):
-                    pass
+                    return WATCH_OWNER_CONFLICT
             if watcher_token:
                 w_tok = str(_wsig.get("watcher_token") or "").strip()
-                if w_tok and w_tok != str(watcher_token).strip():
+                if not w_tok or w_tok != str(watcher_token).strip():
                     return WATCH_OWNER_CONFLICT
             return WATCH_OWNER_EXACT
     except Exception as exc:
@@ -234,6 +242,7 @@ def _classify_pending_entry_for_overnight(
     try:
         from ap.order_monitor import (
             _classify_pending_entry_ownership,
+            PENDING_OWNER_CONFLICT,
             PENDING_OWNER_DB_ERROR,
         )
     except ImportError as _ie:
@@ -272,7 +281,11 @@ def _classify_pending_entry_for_overnight(
         return "PENDING_OWNER_MISSING"
 
     _has_order_fn = getattr(entry_watcher, "has_order", None) if entry_watcher else None
-    _last = "PENDING_OWNER_MISSING"
+    _saw_conflict = False
+    _saw_db_error = False
+    _saw_cross_client = False
+    _saw_cross_mode = False
+    _saw_release = False
 
     for _raw in rows:
         row = dict(_raw) if not isinstance(_raw, dict) else _raw
@@ -281,14 +294,14 @@ def _classify_pending_entry_for_overnight(
 
         # Missing existing row identity → ambiguous, never release
         if not row_client or not row_mode:
-            _last = "PENDING_OWNER_CONFLICT"
+            _saw_conflict = True
             continue
 
         if row_client != cand_c:
-            _last = "PENDING_OWNER_CROSS_CLIENT"
+            _saw_cross_client = True
             continue
         if row_mode != cand_m:
-            _last = "PENDING_OWNER_CROSS_MODE"
+            _saw_cross_mode = True
             continue
 
         # Same client/mode — resolve real watcher and recovery ownership
@@ -318,11 +331,26 @@ def _classify_pending_entry_for_overnight(
             recovery_owned=_recovery_owned,
             broker_terminal=False,
         )
-        _last = result.disposition
         if result.blocks_candidate:
             return "PENDING_OWNER_ACTIVE"
+        if result.disposition == PENDING_OWNER_DB_ERROR:
+            _saw_db_error = True
+        elif result.disposition == PENDING_OWNER_CONFLICT:
+            _saw_conflict = True
+        else:
+            _saw_release = True
 
-    return _last
+    if _saw_db_error:
+        return "PENDING_OWNER_DB_ERROR"
+    if _saw_conflict:
+        return "PENDING_OWNER_CONFLICT"
+    if _saw_release:
+        return "PENDING_OWNER_STALE"
+    if _saw_cross_client:
+        return "PENDING_OWNER_CROSS_CLIENT"
+    if _saw_cross_mode:
+        return "PENDING_OWNER_CROSS_MODE"
+    return "PENDING_OWNER_MISSING"
 
 
 def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
@@ -3665,6 +3693,16 @@ def run_overnight_reeval(
                     # dedup_block requires ownership verification, not direct ALREADY_WATCHING.
                     _already_watching = False
                     if _reject_reason == "dedup_block":
+                        _owner_generation = (
+                            getattr(decision.plan, "trigger_generation", None)
+                            or (_plan_meta.get("trigger_generation") if isinstance(_plan_meta, dict) else None)
+                            or signal.get("trigger_generation")
+                        )
+                        _owner_token = (
+                            getattr(decision.plan, "watcher_token", None)
+                            or (_plan_meta.get("watcher_token") if isinstance(_plan_meta, dict) else None)
+                            or signal.get("watcher_token")
+                        )
                         _owner_result = _resolve_existing_watcher_ownership(
                             entry_watcher=entry_watcher,
                             signal_id=signal_id,
@@ -3672,6 +3710,9 @@ def run_overnight_reeval(
                             execution_mode=_execution_mode,
                             ticker=ticker,
                             side=side,
+                            generation=_owner_generation,
+                            watcher_token=_owner_token,
+                            local_order_id=local_order_id,
                         )
                         if _owner_result == WATCH_OWNER_EXACT:
                             _already_watching = True

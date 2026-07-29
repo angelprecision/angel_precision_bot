@@ -152,6 +152,14 @@ class TestResolveWatcherOwnership:
         w = _make_watcher(pending=[ws], dedup=["SIG-001"])
         assert self._resolve(w, execution_mode="paper") == overnight.WATCH_OWNER_CONFLICT
 
+    def test_C_local_order_id_mismatch_is_conflict(self):
+        ws = _make_watched_signal(
+            "SIG-001", "jason@test.com", "live", "SPY", "CALL",
+            local_order_id="ord-stale",
+        )
+        w = _make_watcher(pending=[ws], dedup=["SIG-001"])
+        assert self._resolve(w, local_order_id="ord-new") == overnight.WATCH_OWNER_CONFLICT
+
     # Test D: opposite side → WATCH_OWNER_CONFLICT
     def test_D_opposite_side_call_vs_put(self):
         ws = _make_watched_signal("SIG-001", "jason@test.com", "live", "SPY", "PUT")
@@ -172,6 +180,11 @@ class TestResolveWatcherOwnership:
             generation=2,
         )
         assert result == overnight.WATCH_OWNER_CONFLICT
+
+    def test_E_missing_expected_token_on_watcher_is_conflict(self):
+        ws = _make_watched_signal("SIG-001", "jason@test.com", "live", "SPY", "CALL")
+        w = _make_watcher(pending=[ws], dedup=["SIG-001"])
+        assert self._resolve(w, watcher_token="tok-new") == overnight.WATCH_OWNER_CONFLICT
 
     # Test F: dedup key held but no matching _pending entry → WATCH_OWNER_MISSING
     def test_F_dedup_held_no_pending_entry_is_missing(self):
@@ -323,6 +336,32 @@ class TestPendingEntryOwnership:
 
         assert result == "PENDING_OWNER_ACTIVE", \
             "must not return CROSS_CLIENT when a later same-client active row exists"
+
+    def test_O2_ambiguous_identity_dominates_later_cross_scope_release(self):
+        fn = getattr(overnight, "_classify_pending_entry_for_overnight", None)
+        assert callable(fn)
+
+        rows = [
+            _make_row(client_id=None, execution_mode="live", status="PENDING_TRIGGER"),
+            _make_row(
+                client_id="other@client.com",
+                execution_mode="live",
+                status="PENDING_TRIGGER",
+                created_ts=_now_iso(),
+            ),
+        ]
+
+        def _stubbed_retry(fn_inner, *a, **kw): return rows
+
+        orig = sys.modules["ap.db"].run_with_retry
+        try:
+            sys.modules["ap.db"].run_with_retry = _stubbed_retry
+            result = fn("SPY", "jasoncosby1@gmail.com", "live")
+        finally:
+            sys.modules["ap.db"].run_with_retry = orig
+
+        assert result == "PENDING_OWNER_CONFLICT", \
+            "ambiguous pending identity must fail closed regardless of later row order"
 
     # Preserve: terminal rows never block
     def test_canceled_row_does_not_block(self):

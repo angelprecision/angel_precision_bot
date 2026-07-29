@@ -163,11 +163,13 @@ def test_15_intel_block_proceeds_to_arm_when_recheck_disabled():
     assert "PROCEED_TO_ARM" in OV_SRC
     assert "second_score_mode=observe_only" in OV_SRC
     idx = OV_SRC.find("decision=PROCEED_TO_ARM")
-    region = OV_SRC[idx:idx+1800]
-    assert "_mark_job_rejected" not in region.split("else:")[0], (
+    assert idx != -1
+    fallthrough_idx = OV_SRC.find("Fall through to Step 5", idx)
+    assert fallthrough_idx != -1
+    region = OV_SRC[idx:fallthrough_idx]
+    assert "_mark_job_rejected" not in region, (
         "PROCEED branch must not reach _mark_job_rejected before else:"
     )
-    assert "Fall through to Step 5" in region
 
 def test_15a_score_block_proceeds_to_arm_when_recheck_disabled():
     """Morning blocked_score rechecks must stay observe-only for WATCHING rows."""
