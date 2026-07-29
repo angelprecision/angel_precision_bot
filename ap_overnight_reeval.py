@@ -78,6 +78,12 @@ TERMINAL_FAILURE    = "TERMINAL_FAILURE"
 OWNERSHIP_CONFLICT  = "OWNERSHIP_CONFLICT"
 UNKNOWN_FAILURE     = "UNKNOWN_FAILURE"
 
+# Watcher ownership resolution constants (used by _resolve_existing_watcher_ownership)
+WATCH_OWNER_EXACT        = "WATCH_OWNER_EXACT"
+WATCH_OWNER_CONFLICT     = "WATCH_OWNER_CONFLICT"
+WATCH_OWNER_MISSING      = "WATCH_OWNER_MISSING"
+WATCH_OWNER_LOOKUP_ERROR = "WATCH_OWNER_LOOKUP_ERROR"
+
 
 class _WatchArmOutcome(NamedTuple):
     """Structured watcher-arm result replacing the raw Boolean."""
@@ -108,16 +114,126 @@ def _classify_watch_arm_outcome(
     return _WatchArmOutcome(RETRYABLE_NOT_ARMED, False, True, "watch_false_no_evidence")
 
 
+def _resolve_existing_watcher_ownership(
+    *,
+    entry_watcher,
+    signal_id: str,
+    client_id: str,
+    execution_mode: str,
+    ticker: str,
+    side: str,
+    generation=None,
+    watcher_token=None,
+) -> str:
+    """Resolve watcher ownership for a signal_id after a dedup_block rejection.
+
+    Iterates entry_watcher._pending (same pattern as _verify_registry_ownership
+    in ap/pending_trigger_restart_recovery.py) and verifies all available
+    identity fields.  Never returns a Boolean.
+
+    Returns:
+        WATCH_OWNER_EXACT        – all identity fields match; idempotent success
+        WATCH_OWNER_CONFLICT     – watcher exists but identity mismatches
+        WATCH_OWNER_MISSING      – dedup key held but no matching watcher in registry
+        WATCH_OWNER_LOOKUP_ERROR – registry access error or incomplete expected identity
+    """
+    if entry_watcher is None:
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    exp_sid    = str(signal_id      or "").strip()
+    exp_client = str(client_id      or "").strip().lower()
+    exp_mode   = str(execution_mode or "").strip().lower()
+    exp_ticker = str(ticker         or "").upper().strip()
+    exp_side   = str(side           or "").upper().strip()
+
+    if not exp_sid or not exp_client or not exp_mode or not exp_ticker or not exp_side:
+        log.warning(
+            "[%s] _resolve_existing_watcher_ownership: incomplete identity "
+            "sid=%s client=%s mode=%s side=%s",
+            ticker, exp_sid, exp_client, exp_mode, exp_side,
+        )
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    try:
+        _dedup = getattr(entry_watcher, "_dedup_set", None)
+        if _dedup is None or exp_sid not in _dedup:
+            return WATCH_OWNER_MISSING
+    except Exception:
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    try:
+        _lock    = getattr(entry_watcher, "_lock", None)
+        _pending = list(getattr(entry_watcher, "_pending", []) or [])
+    except Exception:
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    import contextlib
+    _ctx = _lock if _lock is not None else contextlib.nullcontext()
+
+    try:
+        with _ctx:
+            _snapshot = list(getattr(entry_watcher, "_pending", []) or [])
+        for w in _snapshot:
+            _wsig  = getattr(w, "signal", {}) or {}
+            w_sid  = str(getattr(w, "signal_id", None) or _wsig.get("signal_id") or "").strip()
+            if w_sid != exp_sid:
+                continue
+            w_client = str(_wsig.get("client_id")      or "").strip().lower()
+            w_mode   = str(_wsig.get("execution_mode") or "").strip().lower()
+            w_ticker = str(getattr(w, "ticker", "") or _wsig.get("ticker") or "").upper().strip()
+            w_side   = str(getattr(w, "side",   "") or _wsig.get("side")   or "").upper().strip()
+            if not w_client or w_client != exp_client:
+                log.warning("[%s] watcher client mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_client, w_client)
+                return WATCH_OWNER_CONFLICT
+            if not w_mode or w_mode != exp_mode:
+                log.warning("[%s] watcher mode mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_mode, w_mode)
+                return WATCH_OWNER_CONFLICT
+            if w_ticker and w_ticker != exp_ticker:
+                log.warning("[%s] watcher ticker mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_ticker, w_ticker)
+                return WATCH_OWNER_CONFLICT
+            if w_side and w_side != exp_side:
+                log.warning("[%s] watcher side mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_side, w_side)
+                return WATCH_OWNER_CONFLICT
+            if generation is not None:
+                try:
+                    if int(_wsig.get("trigger_generation") or 0) != int(generation):
+                        return WATCH_OWNER_CONFLICT
+                except (TypeError, ValueError):
+                    pass
+            if watcher_token:
+                w_tok = str(_wsig.get("watcher_token") or "").strip()
+                if w_tok and w_tok != str(watcher_token).strip():
+                    return WATCH_OWNER_CONFLICT
+            return WATCH_OWNER_EXACT
+    except Exception as exc:
+        log.error("[%s] _resolve_existing_watcher_ownership exception sid=%s: %s",
+                  ticker, exp_sid, exc)
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    return WATCH_OWNER_MISSING
+
+
 def _classify_pending_entry_for_overnight(
     ticker: str,
     client_id: str,
     execution_mode: str,
+    entry_watcher=None,
 ) -> str:
     """Query orders; return a PENDING_OWNER_* constant. Fail-closed on DB error."""
+    cand_c = str(client_id      or "").strip().lower()
+    cand_m = str(execution_mode or "").strip().lower()
+    if not cand_c or not cand_m:
+        log.warning("[%s] _classify_pending_entry_for_overnight: missing candidate "
+                    "identity client=%r mode=%r — fail closed", ticker, cand_c, cand_m)
+        return "PENDING_OWNER_DB_ERROR"
+
     try:
         from ap.order_monitor import (
             _classify_pending_entry_ownership,
-            _pending_entry_blocks_candidate,
             PENDING_OWNER_DB_ERROR,
         )
     except ImportError as _ie:
@@ -126,7 +242,6 @@ def _classify_pending_entry_for_overnight(
         )
         return "PENDING_OWNER_DB_ERROR"
 
-    mode = str(execution_mode or "").strip().lower()
     try:
         from ap.db import conn, run_with_retry
 
@@ -135,7 +250,7 @@ def _classify_pending_entry_for_overnight(
                 c.execute(
                     "SELECT local_order_id, client_id, "
                     "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
-                    "status, broker_order_id, submitted_ts, created_ts "
+                    "status, broker_order_id, submitted_ts, created_ts, meta "
                     "FROM orders "
                     "WHERE symbol = %s AND kind = 'ENTRY' "
                     "AND status IN ("
@@ -156,24 +271,52 @@ def _classify_pending_entry_for_overnight(
     if not rows:
         return "PENDING_OWNER_MISSING"
 
-    candidate = {"client_id": client_id, "execution_mode": mode}
+    _has_order_fn = getattr(entry_watcher, "has_order", None) if entry_watcher else None
     _last = "PENDING_OWNER_MISSING"
 
     for _raw in rows:
         row = dict(_raw) if not isinstance(_raw, dict) else _raw
         row_client = str(row.get("client_id")      or "").strip().lower()
         row_mode   = str(row.get("execution_mode") or "").strip().lower()
-        cand_c     = str(client_id or "").strip().lower()
 
-        if cand_c and row_client and row_client != cand_c:
+        # Missing existing row identity → ambiguous, never release
+        if not row_client or not row_mode:
+            _last = "PENDING_OWNER_CONFLICT"
+            continue
+
+        if row_client != cand_c:
             _last = "PENDING_OWNER_CROSS_CLIENT"
             continue
-        if mode and row_mode and row_mode != mode:
+        if row_mode != cand_m:
             _last = "PENDING_OWNER_CROSS_MODE"
             continue
 
+        # Same client/mode — resolve real watcher and recovery ownership
+        row_local_oid = str(row.get("local_order_id") or "").strip()
+        _watcher_owned = (
+            bool(_has_order_fn(row_local_oid))
+            if callable(_has_order_fn) and row_local_oid
+            else False
+        )
+        try:
+            _meta = row.get("meta") or {}
+            if isinstance(_meta, str):
+                import json as _json
+                _meta = _json.loads(_meta) if _meta.strip() else {}
+            _recovery_owned = bool(
+                _meta.get("materialization_next_retry_at")
+                or _meta.get("restart_rearm_next_at")
+                or _meta.get("watcher_retry_owner")
+                or _meta.get("watcher_retry_next_at")
+            )
+        except Exception:
+            _recovery_owned = False
+
         result = _classify_pending_entry_ownership(
-            row, watcher_owned=False, recovery_owned=False, broker_terminal=False,
+            row,
+            watcher_owned=_watcher_owned,
+            recovery_owned=_recovery_owned,
+            broker_terminal=False,
         )
         _last = result.disposition
         if result.blocks_candidate:
@@ -3012,7 +3155,8 @@ def run_overnight_reeval(
                     elif "pending_entry_exists" in _r and not _is_hard_safety_block:
                         # PR #404: classify ownership before terminal rejection.
                         _pe_class = _classify_pending_entry_for_overnight(
-                            ticker, client_id, _execution_mode
+                            ticker, client_id, _execution_mode,
+                            entry_watcher=entry_watcher,
                         )
                         if _pe_class == "PENDING_OWNER_ACTIVE":
                             log.info(
@@ -3518,11 +3662,57 @@ def run_overnight_reeval(
                         getattr(entry_watcher, "_last_reject_reason", None)
                         or "watch_returned_false"
                     )
-                    # dedup_block = same signal_id already registered → ALREADY_WATCHING.
+                    # dedup_block requires ownership verification, not direct ALREADY_WATCHING.
+                    _already_watching = False
+                    if _reject_reason == "dedup_block":
+                        _owner_result = _resolve_existing_watcher_ownership(
+                            entry_watcher=entry_watcher,
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                            ticker=ticker,
+                            side=side,
+                        )
+                        if _owner_result == WATCH_OWNER_EXACT:
+                            _already_watching = True
+                        elif _owner_result == WATCH_OWNER_CONFLICT:
+                            log.warning(
+                                "[%s] overnight_watch_ownership_conflict signal=%s "
+                                "— preserving existing owner, cleaning new duplicate order",
+                                ticker, signal_id,
+                            )
+                            _cleanup_overnight_watch_arm_failure(
+                                order_state_machine=order_state_machine,
+                                client_id=client_id,
+                                signal_id=signal_id,
+                                ticker=ticker,
+                                side=side,
+                                local_order_id=str(local_order_id),
+                                contract=_arm_label,
+                                contract_deferred=contract_deferred,
+                                entry_trigger=entry_trigger,
+                                reason="overnight_watch_ownership_conflict",
+                                done_event="OVERNIGHT_WATCH_OWNERSHIP_CONFLICT_CLEANUP_DONE",
+                            )
+                            _mark_job_watching_reason(
+                                job_id, client_id, "overnight_watch_ownership_conflict"
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        else:
+                            # WATCH_OWNER_MISSING or WATCH_OWNER_LOOKUP_ERROR:
+                            # dedup fired but ownership unverifiable → retryable
+                            log.warning(
+                                "[%s] overnight_watch_owner_unverified signal=%s "
+                                "owner_result=%s", ticker, signal_id, _owner_result,
+                            )
+                            # _already_watching stays False → RETRYABLE_NOT_ARMED below
+
                     # overnight NEW arm: terminal stale/stop checks bypassed (pre-market).
                     _arm_outcome = _classify_watch_arm_outcome(
                         watch_result=False,
-                        already_watching=(_reject_reason == "dedup_block"),
+                        already_watching=_already_watching,
                         terminal_conflict=False,
                         exception=None,
                     )
@@ -3616,10 +3806,14 @@ def run_overnight_reeval(
                         result["terminal_rejected"] += 1
                     else:
                         # RETRYABLE_NOT_ARMED: no permanent proof, no terminal reject.
+                        # Durably preserve WATCHING state for next reeval pickup.
                         log.critical(
                             "[%s] overnight_watch_arm_unknown signal=%s reason=%s "
                             "disp=%s — fail closed as retryable_deferred (not terminal)",
                             ticker, signal_id, _reject_reason, _arm_outcome.disposition,
+                        )
+                        _mark_job_watching_reason(
+                            job_id, client_id, "overnight_watch_arm_retryable"
                         )
                         result["skipped"] = result.get("skipped", 0) + 1
                         result["retryable_deferred"] += 1

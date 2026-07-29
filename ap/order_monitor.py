@@ -290,7 +290,7 @@ _ORPHAN_AGE_MINUTES = 20   # CREATED/PENDING_TRIGGER with no ownership proof
 
 class _PendingOwnershipResult(_NT_om):
     """Result from _classify_pending_entry_ownership."""
-    disposition:      str   # one of PENDING_OWNER_* or "STALE_ORPHAN_CLEANUP"
+    disposition:      str   # one of PENDING_OWNER_* constants
     blocks_candidate: bool  # True → this row genuinely blocks the candidate
     cleanup_required: bool  # True → stale/orphan; durable cleanup is warranted
     reason:           str   # stable diagnostic string
@@ -320,6 +320,14 @@ def _classify_pending_entry_ownership(
     if not str(existing.get("local_order_id") or "").strip():
         return _PendingOwnershipResult(PENDING_OWNER_MISSING, False, True, "missing_local_order_id")
 
+    # Missing row identity → ambiguous, never release
+    _row_client = str(existing.get("client_id")      or "").strip()
+    _row_mode   = str(existing.get("execution_mode") or "").strip()
+    if not _row_client or not _row_mode:
+        return _PendingOwnershipResult(
+            PENDING_OWNER_CONFLICT, True, False, "missing_row_identity"
+        )
+
     if status in _ACTIVE_PE_STATUSES:
         if status in _BROKER_SUBMIT_PE_STATUSES:
             return _PendingOwnershipResult(PENDING_OWNER_ACTIVE, True, False, "broker_submit_status")
@@ -327,6 +335,7 @@ def _classify_pending_entry_ownership(
         submitted_ts = existing.get("submitted_ts")
         if broker_oid or submitted_ts:
             return _PendingOwnershipResult(PENDING_OWNER_ACTIVE, True, False, "broker_id_or_submit_ts")
+        # Active ownership: watcher or recovery always blocks regardless of age
         if watcher_owned or recovery_owned:
             return _PendingOwnershipResult(PENDING_OWNER_ACTIVE, True, False, "watcher_or_recovery_owned")
         created_raw = existing.get("created_ts")
@@ -339,7 +348,7 @@ def _classify_pending_entry_ownership(
                 age_min = (_dt.now(_tz.utc) - _ts).total_seconds() / 60
                 if age_min > _ORPHAN_AGE_MINUTES:
                     return _PendingOwnershipResult(
-                        "STALE_ORPHAN_CLEANUP", False, True,
+                        PENDING_OWNER_STALE, False, True,
                         f"orphan_age_{int(age_min)}m_no_ownership",
                     )
             except Exception:
@@ -358,12 +367,15 @@ def _pending_entry_blocks_candidate(
     """True only when existing genuinely blocks candidate (same client/mode/active)."""
     if not isinstance(existing, dict) or not isinstance(candidate, dict):
         return False
-    ex_client   = str(existing.get("client_id")  or "").strip().lower()
-    cand_client = str(candidate.get("client_id") or "").strip().lower()
+    # Missing candidate identity → fail closed, do not release
+    cand_client = str(candidate.get("client_id")      or "").strip().lower()
+    cand_mode   = str(candidate.get("execution_mode") or "").strip().lower()
+    if not cand_client or not cand_mode:
+        return True  # ambiguous candidate — do not release
+    ex_client = str(existing.get("client_id")  or "").strip().lower()
+    ex_mode   = str(existing.get("execution_mode")  or "").strip().lower()
     if ex_client and cand_client and ex_client != cand_client:
         return False  # CROSS_CLIENT
-    ex_mode   = str(existing.get("execution_mode")  or "").strip().lower()
-    cand_mode = str(candidate.get("execution_mode") or "").strip().lower()
     if ex_mode and cand_mode and ex_mode != cand_mode:
         return False  # CROSS_MODE
     return _classify_pending_entry_ownership(
