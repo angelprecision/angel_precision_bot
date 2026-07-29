@@ -35,6 +35,7 @@ import os
 import sys
 import types
 import importlib
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1459,8 +1460,16 @@ def test_early_cas_invalid_signal_guards_queue(sb, marks):
 
 
 def test_early_cas_signal_persistence_failure_guards_queue(monkeypatch, marks):
-    """Failed ap_signals write uses _checked_processing_error_cas not _mark_job."""
-    monkeypatch.setattr(queue, "_log_signal_to_db", lambda **_kw: False)
+    """Failed guarded WATCHING persistence uses _checked_processing_error_cas.
+
+    _persist_watching_deferral no longer calls _log_signal_to_db for the early
+    WATCHING establishment, so this patches the active helper.
+    """
+    monkeypatch.setattr(
+        queue,
+        "_persist_watching_signal_if_eligible",
+        lambda **_kw: queue.SIGNAL_WATCH_DB_ERROR,
+    )
 
     ok = queue._persist_watching_deferral(
         job_id=40504,
@@ -1533,6 +1542,108 @@ def test_early_cas_concurrent_terminal_not_overwritten(monkeypatch, sb):
     )
 
 
+def test_queue_cas_helpers_use_deployed_result_json_shape(monkeypatch):
+    """PostgreSQL contract: deployed trade_queue has result_json and no meta."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    extras = pytest.importorskip("psycopg2.extras")
+    from ap.db import _ConnWrapper
+
+    database_url = (
+        os.getenv("AP_QUEUE_CAS_POSTGRES_TEST_URL")
+        or os.getenv("DATABASE_URL")
+        or ""
+    ).strip()
+    if not database_url:
+        pytest.skip("PostgreSQL URL not configured")
+
+    try:
+        db = psycopg2.connect(database_url, cursor_factory=extras.RealDictCursor)
+    except Exception as exc:
+        pytest.skip(f"PostgreSQL integration unavailable: {exc}")
+
+    try:
+        with db.cursor(cursor_factory=extras.RealDictCursor) as c:
+            c.execute(
+                """
+                CREATE TEMP TABLE trade_queue (
+                    id              BIGINT PRIMARY KEY,
+                    client_id       TEXT,
+                    signal_id       TEXT,
+                    created_ts      TIMESTAMPTZ,
+                    status          TEXT,
+                    payload         JSONB,
+                    started_ts      TIMESTAMPTZ,
+                    finished_ts     TIMESTAMPTZ,
+                    result_json     JSONB,
+                    last_error      TEXT,
+                    idempotency_key TEXT
+                ) ON COMMIT PRESERVE ROWS
+                """
+            )
+            c.execute(
+                """
+                INSERT INTO trade_queue
+                    (id, client_id, signal_id, created_ts, status, payload, result_json)
+                VALUES
+                    (9001, 'cas@example.com', 'sig-watch', NOW(), 'PROCESSING',
+                     '{}'::jsonb, '{"existing":"watch"}'::jsonb),
+                    (9002, 'cas@example.com', 'sig-error', NOW(), 'PROCESSING',
+                     '{}'::jsonb, '{"existing":"error"}'::jsonb)
+                """
+            )
+        db.commit()
+
+        @contextmanager
+        def _pg_conn():
+            cur = db.cursor(cursor_factory=extras.RealDictCursor)
+            try:
+                yield _ConnWrapper(db, cur)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                cur.close()
+
+        monkeypatch.setattr(queue, "_conn", lambda: _pg_conn)
+        monkeypatch.setattr(queue, "_run_with_retry", lambda fn, *a, **k: fn())
+
+        watching = queue._checked_watching_cas(
+            9001,
+            watching_error="after_hours_deferred:awaiting_overnight_reeval",
+            watching_result={"watching": True},
+        )
+        error = queue._checked_processing_error_cas(
+            9002,
+            error="WATCHING_SIGNAL_PERSISTENCE_FAILED",
+            result={"error": True},
+        )
+
+        assert watching == queue.WATCHING_CAS_TRANSITIONED
+        assert error == queue.ERROR_CAS_TRANSITIONED
+        with db.cursor(cursor_factory=extras.RealDictCursor) as c:
+            c.execute(
+                """
+                SELECT id, status, last_error, result_json
+                FROM trade_queue
+                WHERE id IN (9001, 9002)
+                ORDER BY id
+                """
+            )
+            rows = [dict(r) for r in c.fetchall()]
+
+        assert rows[0]["status"] == "WATCHING"
+        assert rows[0]["last_error"] == "after_hours_deferred:awaiting_overnight_reeval"
+        assert rows[0]["result_json"]["existing"] == "watch"
+        assert rows[0]["result_json"]["watching"] is True
+        assert rows[1]["status"] == "ERROR"
+        assert rows[1]["last_error"] == "WATCHING_SIGNAL_PERSISTENCE_FAILED"
+        assert rows[1]["result_json"]["existing"] == "error"
+        assert rows[1]["result_json"]["error"] is True
+    finally:
+        db.close()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # P0 #405 — Single WATCHING authority: after-hours contract-selection branch
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1573,25 +1684,60 @@ def _build_after_hours_payload(signal_id="sig-ah-405"):
     }
 
 
+def _dispatch_after_hours(
+    *,
+    monkeypatch,
+    signal_id="sig-ah-405",
+    job_id=40530,
+    persist_outcome=True,
+    counterfactual_spy=None,
+):
+    """Run the real _dispatch after-hours contract-selection branch."""
+    _isolate_dispatch(monkeypatch, in_session=False)
+    if counterfactual_spy is not None:
+        sys.modules["ap.counterfactual_tracker"].track_counterfactual_signal = (
+            counterfactual_spy
+        )
+
+    plan = MagicMock()
+    plan.metadata = {}
+    mc = _MC(_Decision(ok=True, stage="ok", reason="", plan=plan), mode="PAPER")
+    selector, osm, watcher, broker = (MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    persist_calls: list[dict] = []
+
+    def _fake_persist(**kwargs):
+        persist_calls.append(kwargs)
+        return persist_outcome
+
+    monkeypatch.setattr(queue, "_persist_watching_deferral", _fake_persist)
+
+    queue._dispatch(
+        job_id,
+        "afterhours@example.com",
+        signal_id,
+        _build_after_hours_payload(signal_id),
+        master_control=mc,
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher,
+        broker=broker,
+    )
+    return {
+        "plan": plan,
+        "mc": mc,
+        "selector": selector,
+        "osm": osm,
+        "watcher": watcher,
+        "broker": broker,
+        "persist_calls": persist_calls,
+    }
+
+
 def test_after_hours_routes_through_persist_watching_deferral(monkeypatch, sb, marks):
     """After-hours contract-selection branch must call _persist_watching_deferral
     exactly once; it must NOT directly call _mark_job(WATCHING) or _log_signal_to_db
     with decision_status=WATCHING."""
-    persist_calls: list[dict] = []
     direct_watching_marks: list[dict] = []
-
-    real_persist = queue._persist_watching_deferral
-
-    def _spy_persist(**kwargs):
-        persist_calls.append(kwargs)
-        return real_persist(**kwargs)
-
-    monkeypatch.setattr(queue, "_persist_watching_deferral", _spy_persist)
-
-    # Intercept _mark_job to catch any stray direct WATCHING write.
-    real_fake_mark = marks  # marks fixture already stubs _mark_job
-
-    original_mark = queue._mark_job  # already patched by marks fixture
 
     def _spy_mark(job_id, status, *, result=None, error=None):
         if status == "WATCHING":
@@ -1600,55 +1746,22 @@ def test_after_hours_routes_through_persist_watching_deferral(monkeypatch, sb, m
 
     monkeypatch.setattr(queue, "_mark_job", _spy_mark)
 
-    # Force the market-hours check to return "after-hours" by patching.
-    import ap.queue as _q
-    monkeypatch.setattr(
-        _q, "_is_regular_session",
-        lambda *a, **k: False,
-        raising=False,
+    result = _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-ah-runtime-405",
+        job_id=40530,
+        persist_outcome=True,
     )
 
-    # Use the dedicated after-hours intraday path in _dispatch by setting
-    # _skip_contract_selection via a plan that has contract_selection_deferred.
-    # The simplest integration point: patch _checked_watching_cas → TRANSITIONED
-    # (already done by marks fixture).
-
-    # Run the dispatch directly at the after-hours block by short-circuiting
-    # to the block that calls _persist_watching_deferral.  We verify at the
-    # source-code level that no direct WATCHING writer remains.
-    import re
-    src = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "ap" / "queue.py"
-    ).read_text()
-
-    # P1 assertion 1: no direct _mark_job(WATCHING) in the after-hours block.
-    # Look for the after-hours contract_selection block.
-    after_hours_block_match = re.search(
-        r"contract_selection_deferred.*?(?=\n    except Exception as _mkt_err)",
-        src,
-        re.DOTALL,
+    assert len(result["persist_calls"]) == 1
+    assert result["persist_calls"][0]["stage"] == "contract_selection"
+    assert result["persist_calls"][0]["reason_code"] == "market_closed_deferred"
+    assert direct_watching_marks == [], (
+        "_dispatch after-hours branch must not call _mark_job(WATCHING) directly"
     )
-    assert after_hours_block_match, "Could not locate after-hours block in queue.py"
-    after_hours_block = after_hours_block_match.group(0)
-
-    assert "_persist_watching_deferral" in after_hours_block, (
-        "After-hours block must call _persist_watching_deferral"
-    )
-    assert '_mark_job(job_id, "WATCHING"' not in after_hours_block, (
-        "After-hours block must NOT directly call _mark_job(job_id, 'WATCHING') — "
-        "all WATCHING writes must route through _persist_watching_deferral"
-    )
-
-    # P1 assertion 2: no direct _log_signal_to_db(decision_status=WATCHING) in block.
-    assert (
-        'decision_status="WATCHING"' not in after_hours_block
-        and "decision_status='WATCHING'" not in after_hours_block
-    ), (
-        "After-hours block must NOT directly call _log_signal_to_db with "
-        "decision_status=WATCHING — score sanitization and upsert are owned by "
-        "_persist_watching_deferral"
-    )
+    result["selector"].select.assert_not_called()
+    result["osm"].create_entry_order.assert_not_called()
+    result["watcher"].watch.assert_not_called()
 
 
 def test_after_hours_no_direct_mark_job_watching_in_source():
@@ -1702,32 +1815,23 @@ def test_after_hours_malformed_score_does_not_raise(sb, marks, monkeypatch):
 
     P0 #405 / P1: score sanitization is owned by _persist_watching_deferral
     (_safe_float); the after-hours branch no longer calls float() directly."""
-    persist_calls: list[dict] = []
+    _isolate_dispatch(monkeypatch, in_session=False)
+    plan = MagicMock()
+    plan.metadata = {}
+    mc = _MC(_Decision(ok=True, stage="ok", reason="", plan=plan), mode="PAPER")
 
-    real_persist = queue._persist_watching_deferral
-
-    def _spy_persist(**kwargs):
-        persist_calls.append(kwargs)
-        return real_persist(**kwargs)
-
-    monkeypatch.setattr(queue, "_persist_watching_deferral", _spy_persist)
-
-    # Simulate the after-hours branch directly via _persist_watching_deferral.
-    ok = queue._persist_watching_deferral(
-        job_id=40520,
-        client_id="z@x.com",
-        signal_id="sig-malformed-score",
-        execution_mode="paper",
-        payload={"ticker": "SPY", "side": "CALL", "score": "A+", "timeframe": "1d"},
-        stage="contract_selection",
-        reason_code="market_closed_deferred",
-        human_reason="after hours — malformed score test",
-        watching_error="after_hours_deferred:awaiting_overnight_reeval",
+    queue._dispatch(
+        40520,
+        "z@x.com",
+        "sig-malformed-score",
+        {"ticker": "SPY", "side": "CALL", "score": "A+", "timeframe": "1d"},
+        master_control=mc,
+        contract_selector=MagicMock(),
+        order_state_machine=MagicMock(),
+        entry_watcher=MagicMock(),
+        broker=MagicMock(),
     )
-    assert ok is True, (
-        "Malformed score 'A+' must not raise — _persist_watching_deferral owns "
-        "score sanitization via _safe_float"
-    )
+
     # Signal row must exist with a float score.
     rows = _signal_rows(sb, "WATCHING")
     assert rows, "WATCHING signal row must be written"
@@ -1743,43 +1847,28 @@ def test_after_hours_counterfactual_runs_only_on_deferral_success(monkeypatch, s
     when _persist_watching_deferral returns False (e.g., CAS failed)."""
     counterfactual_calls: list[str] = []
 
-    import ap.counterfactual_tracker as _ct
-    real_track = _ct.track_counterfactual_signal
-
     def _spy_track(*a, **kw):
         counterfactual_calls.append("called")
 
-    monkeypatch.setattr(_ct, "track_counterfactual_signal", _spy_track, raising=False)
-
-    # Case 1: deferral succeeds (marks fixture stubs CAS → TRANSITIONED).
-    monkeypatch.setattr(queue, "_persist_watching_deferral", lambda **kw: True)
-    # Simulate the _watching_ok branch directly.
-    _watching_ok = True
-    if _watching_ok:
-        try:
-            _ct.track_counterfactual_signal(
-                signal={}, client_id="a@x.com", execution_mode="paper",
-                block_stage="contract_selection", block_reason="market_closed_deferred",
-                reason_code="market_closed_deferred", source="watch",
-            )
-        except Exception:
-            pass
+    _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-counterfactual-success",
+        job_id=40521,
+        persist_outcome=True,
+        counterfactual_spy=_spy_track,
+    )
     assert len(counterfactual_calls) == 1, (
         "track_counterfactual_signal must be called once on deferral success"
     )
 
-    # Case 2: deferral fails.
     counterfactual_calls.clear()
-    _watching_ok = False
-    if _watching_ok:  # must not enter this block
-        try:
-            _ct.track_counterfactual_signal(
-                signal={}, client_id="a@x.com", execution_mode="paper",
-                block_stage="contract_selection", block_reason="market_closed_deferred",
-                reason_code="market_closed_deferred", source="watch",
-            )
-        except Exception:
-            pass
+    _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-counterfactual-failure",
+        job_id=40522,
+        persist_outcome=False,
+        counterfactual_spy=_spy_track,
+    )
     assert len(counterfactual_calls) == 0, (
         "track_counterfactual_signal must NOT be called when deferral fails"
     )
@@ -1794,41 +1883,17 @@ def test_after_hours_deferral_failure_produces_no_watcher_osm_broker_mutation(
     This test verifies the contract at the _persist_watching_deferral level —
     a False return means the caller (the after-hours block) must return immediately
     without arming anything downstream."""
-    watcher_calls: list = []
-    osm_calls: list = []
-    broker_calls: list = []
-
-    monkeypatch.setattr(queue, "_persist_watching_deferral", lambda **_kw: False)
-
-    # The after-hours block in _dispatch does `return` after _persist_watching_deferral.
-    # We verify at the source-code level that no downstream call follows the return.
-    import re
-
-    src = (
-        __import__("pathlib").Path(__file__).resolve().parents[1]
-        / "ap" / "queue.py"
-    ).read_text()
-
-    block_match = re.search(
-        r"contract_selection_deferred.*?(?=\n    except Exception as _mkt_err)",
-        src,
-        re.DOTALL,
+    result = _dispatch_after_hours(
+        monkeypatch=monkeypatch,
+        signal_id="sig-after-hours-fail",
+        job_id=40523,
+        persist_outcome=False,
     )
-    assert block_match, "Could not locate after-hours block"
-    block = block_match.group(0)
-
-    # The block must end with `return` (possibly with whitespace/comment) after
-    # _persist_watching_deferral — and must not contain any watcher, OSM, or
-    # broker arm calls that could fire regardless of the deferral outcome.
-    assert "entry_watcher" not in block or "entry_watcher.arm" not in block, (
-        "After-hours block must not arm entry_watcher"
-    )
-    assert "order_state_machine" not in block or ".submit" not in block, (
-        "After-hours block must not call order_state_machine.submit"
-    )
-    assert "broker.create_order" not in block, (
-        "After-hours block must not call broker.create_order"
-    )
+    assert len(result["persist_calls"]) == 1
+    result["selector"].select.assert_not_called()
+    result["osm"].create_entry_order.assert_not_called()
+    result["watcher"].watch.assert_not_called()
+    result["broker"].create_order.assert_not_called()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1908,6 +1973,18 @@ def test_watch_eligible_all_advanced_preserved(sb, advanced):
     assert sb.rows[("watch-sig-2b", "a@x.com")]["decision_status"] == advanced
 
 
+# ── Test 2c: unknown status conflicts, not "advanced" ───────────────────────
+def test_watch_eligible_unknown_status_conflicts(sb):
+    _seed_signal(sb, "watch-sig-2c", "a@x.com", "mystery_status")
+    outcome = queue._persist_watching_signal_if_eligible(
+        signal_id="watch-sig-2c", client_email="a@x.com", **_ELIGIBLE_KWARGS
+    )
+    assert outcome == queue.SIGNAL_WATCH_CONFLICT, (
+        f"unknown status must conflict, not collapse to advanced — got {outcome!r}"
+    )
+    assert sb.rows[("watch-sig-2c", "a@x.com")]["decision_status"] == "mystery_status"
+
+
 # ── Test 3: existing WATCHING is idempotent ──────────────────────────────────
 def test_watch_eligible_watching_idempotent(sb):
     _seed_signal(sb, "watch-sig-3", "a@x.com", "WATCHING")
@@ -1925,12 +2002,9 @@ def test_watch_eligible_watching_idempotent(sb):
 def test_watch_eligible_approved_pre_deferral_transitions(sb, monkeypatch):
     """The transition machinery must work when a status IS in the allowlist.
 
-    Production ships with an EMPTY allowlist (no proven pre-deferral status in
-    the live path). This test monkeypatches the module-level allowlist to prove
-    the expected-state update branch establishes WATCHING correctly."""
-    monkeypatch.setattr(
-        queue, "_PRE_DEFERRAL_TRANSITIONABLE_STATUSES", frozenset({"received"})
-    )
+    APSignalStore.insert_signal() defaults to decision_status="received", and
+    production can contain received rows, so received must be transitionable
+    without a test-time monkeypatch."""
     _seed_signal(sb, "watch-sig-4", "a@x.com", "received")
     outcome = queue._persist_watching_signal_if_eligible(
         signal_id="watch-sig-4", client_email="a@x.com", **_ELIGIBLE_KWARGS
@@ -1999,9 +2073,6 @@ def test_watch_eligible_update_race_loses_to_advanced(sb, monkeypatch):
     """Initial read sees an approved pre-deferral state; a concurrent writer
     changes it to 'triggered'; the conditional update affects zero rows; helper
     rereads and preserves the triggered row."""
-    monkeypatch.setattr(
-        queue, "_PRE_DEFERRAL_TRANSITIONABLE_STATUSES", frozenset({"received"})
-    )
     _seed_signal(sb, "watch-sig-7", "a@x.com", "received")
 
     original_table = sb.table

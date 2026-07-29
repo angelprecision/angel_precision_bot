@@ -294,28 +294,21 @@ SIGNAL_WATCH_CONFLICT         = "SIGNAL_WATCH_CONFLICT"          # concurrent ra
 SIGNAL_WATCH_DB_ERROR         = "SIGNAL_WATCH_DB_ERROR"          # read/update/insert raised, or no unique constraint
 
 # Approved pre-deferral ap_signals statuses that may be TRANSITIONED to WATCHING.
-# PROVEN-MINIMAL: an audit of every ap_signals decision_status literal written in
-# this repository (queue.py, morning_handoff.py, etc.) shows enqueue writes ONLY to
-# trade_queue (status NEW) — the deferral is normally the FIRST ap_signals write.
-# The only pre-existing ap_signals statuses are WATCHING (idempotent), queued
-# (order already created — ADVANCED), rejected/ERROR/blocked_at_breach (terminal).
-# There is NO 'received'/'new' ap_signals status in this codebase. Therefore the
-# approved pre-deferral allowlist is intentionally EMPTY: the only ways to establish
-# WATCHING are (1) insert when missing, or (2) idempotent no-op when already WATCHING.
-# Every other existing status is ADVANCED and preserved untouched.
-#
-# This set is the single source of truth for the transition branch. It is kept as a
-# module-level frozenset (not inlined) so a FUTURE proven pre-deferral status can be
-# added in exactly one place — and so the transition machinery remains covered by
-# tests without loosening production behavior today.
-_PRE_DEFERRAL_TRANSITIONABLE_STATUSES: frozenset[str] = frozenset()
+# APSignalStore.insert_signal() defaults decision_status to "received", and
+# production can contain received rows before queue deferral ownership is
+# established. Treat received as the only known pre-deferral state.
+_PRE_DEFERRAL_TRANSITIONABLE_STATUSES: frozenset[str] = frozenset({"received"})
 
-# Advanced / terminal ap_signals statuses that must NEVER be overwritten with WATCHING.
-# Used for explicit classification/logging; any status not WATCHING and not in the
-# transitionable allowlist is treated as advanced regardless of membership here.
+# Explicit non-transitionable ap_signals classifications. Unknown statuses are
+# NOT collapsed into advanced; they conflict so new lifecycle words require a
+# deliberate policy update before queue deferral can act on them.
 _ADVANCED_SIGNAL_STATUSES: frozenset[str] = frozenset({
-    "queued", "triggered", "submitted", "filled", "rejected",
-    "error", "blocked_at_breach", "canceled", "cancelled", "expired", "done",
+    "queued", "armed", "triggered", "submitted", "executed", "filled",
+})
+_TERMINAL_SIGNAL_STATUSES: frozenset[str] = frozenset({
+    "rejected", "error", "invalidated", "blocked_at_breach", "expired",
+    "dropped", "submit_failed", "closed", "context_blocked", "canceled",
+    "cancelled", "done",
 })
 
 # P0 #405 — _checked_processing_error_cas outcome constants.
@@ -1266,19 +1259,23 @@ def _is_unique_violation(exc: Exception) -> bool:
 def _classify_existing_signal_status(observed_status: str | None) -> str:
     """Map a re-read ap_signals.decision_status to a guarded WATCHING outcome.
 
-    Shared by both the update-race and insert-race reread branches so the
-    classification is identical everywhere:
-
-      * exactly "WATCHING"                 → SIGNAL_WATCH_ALREADY_WATCHING
-      * any other non-empty status         → SIGNAL_WATCH_ALREADY_ADVANCED
-        (queued/triggered/submitted/filled/rejected/ERROR/blocked_at_breach/etc.)
-      * None / empty (row vanished)        → SIGNAL_WATCH_CONFLICT
+    Known advanced/terminal statuses are preserved as already advanced.
+    Transitionable or unknown statuses conflict on a race reread so they cannot
+    be mislabeled as advanced. The initial guarded read path owns the actual
+    received -> WATCHING expected-state update.
     """
     if observed_status is None or str(observed_status).strip() == "":
         return SIGNAL_WATCH_CONFLICT
-    if str(observed_status) == "WATCHING":
+    _status = str(observed_status).strip()
+    if _status == DECISION_WATCHING:
         return SIGNAL_WATCH_ALREADY_WATCHING
-    return SIGNAL_WATCH_ALREADY_ADVANCED
+    _normalized = _status.lower()
+    if (
+        _normalized in _ADVANCED_SIGNAL_STATUSES
+        or _normalized in _TERMINAL_SIGNAL_STATUSES
+    ):
+        return SIGNAL_WATCH_ALREADY_ADVANCED
+    return SIGNAL_WATCH_CONFLICT
 
 
 def _classify_existing_watching_identity(
@@ -1378,7 +1375,7 @@ def _persist_watching_signal_if_eligible(
          WATCHING row whose identity differs is a SIGNAL_WATCH_CONFLICT, not
          idempotent success.
       3. The existing row is in an approved pre-deferral status
-         (`_PRE_DEFERRAL_TRANSITIONABLE_STATUSES`, intentionally EMPTY today) →
+         (`_PRE_DEFERRAL_TRANSITIONABLE_STATUSES`, currently "received") →
          expected-state update.
 
     Never falls back to the legacy single-key upsert: a fallback that could
@@ -1475,7 +1472,8 @@ def _persist_watching_signal_if_eligible(
               * no row               → SIGNAL_WATCH_CONFLICT (row vanished mid-race)
               * WATCHING row         → _classify_existing_watching_identity(...)
                                        (exact mode+ticker+side+job match required)
-              * any other status     → SIGNAL_WATCH_ALREADY_ADVANCED
+              * known advanced/terminal status → SIGNAL_WATCH_ALREADY_ADVANCED
+              * transitionable/unknown status  → SIGNAL_WATCH_CONFLICT
             """
             _rr = (
                 _sbc.table("ap_signals")
@@ -1488,7 +1486,8 @@ def _persist_watching_signal_if_eligible(
             if not _rr_rows:
                 return SIGNAL_WATCH_CONFLICT
             _rr_row = _rr_rows[0]
-            if str(_rr_row.get("decision_status") or "") == DECISION_WATCHING:
+            _rr_status = str(_rr_row.get("decision_status") or "")
+            if _rr_status == DECISION_WATCHING:
                 return _classify_existing_watching_identity(
                     row=_rr_row,
                     requested_execution_mode=_requested_mode,
@@ -1496,7 +1495,7 @@ def _persist_watching_signal_if_eligible(
                     requested_side=_requested_side,
                     requested_watching_job_id=_requested_job_id,
                 )
-            return SIGNAL_WATCH_ALREADY_ADVANCED
+            return _classify_existing_signal_status(_rr_status)
 
         # ── (1) read the exact existing row (with identity fields) ───────────
         _existing = (
@@ -1548,15 +1547,26 @@ def _persist_watching_signal_if_eligible(
                     )
                 return _identity_outcome
 
-            # Not in the approved pre-deferral allowlist → ADVANCED, preserve untouched.
+            # Explicitly classify non-transitionable statuses. Known advanced
+            # and terminal states are preserved; unknown statuses conflict so
+            # schema/status drift cannot silently masquerade as advancement.
             if _observed not in _PRE_DEFERRAL_TRANSITIONABLE_STATUSES:
+                _classified = _classify_existing_signal_status(_observed)
+                if _classified == SIGNAL_WATCH_CONFLICT:
+                    log.critical(
+                        "_persist_watching_signal_if_eligible: existing unknown "
+                        "status=%r for signal_id=%s client_email=%s — refusing "
+                        "WATCHING (SIGNAL_WATCH_CONFLICT).",
+                        _observed, _sig, _client,
+                    )
+                    return SIGNAL_WATCH_CONFLICT
                 log.warning(
                     "_persist_watching_signal_if_eligible: existing status=%r is not "
                     "transitionable for signal_id=%s client_email=%s — preserving "
-                    "advanced state (SIGNAL_WATCH_ALREADY_ADVANCED).",
+                    "advanced/terminal state (SIGNAL_WATCH_ALREADY_ADVANCED).",
                     _observed, _sig, _client,
                 )
-                return SIGNAL_WATCH_ALREADY_ADVANCED
+                return _classified
 
             # Approved pre-deferral state → expected-state update fenced on the
             # exact observed status (fails to zero rows if it changed under us).
@@ -2035,7 +2045,7 @@ def _checked_processing_error_cas(
                     SET   status      = 'ERROR',
                           finished_ts = NOW(),
                           last_error  = %s,
-                          meta        = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                          result_json = COALESCE(result_json, '{}'::jsonb) || %s::jsonb
                     WHERE id     = %s
                       AND status = 'PROCESSING'
                     """,
@@ -2118,8 +2128,8 @@ def _checked_watching_cas(
       WATCHING_CAS_DB_ERROR              – the UPDATE or classification SELECT raised.
 
     Never raises — caller handles compensation per outcome.
-    Uses non-destructive JSONB meta merge (meta || ...) per standing schema rules.
-    Does NOT touch result_json (deprecated column).
+    Uses the deployed JSONB result_json column. public.trade_queue does not have
+    a meta column, so this helper must not write one.
     """
     try:
         def _fn() -> tuple:
@@ -2129,7 +2139,7 @@ def _checked_watching_cas(
                     """
                     UPDATE trade_queue
                     SET   status     = 'WATCHING',
-                          meta       = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                          result_json = COALESCE(result_json, '{}'::jsonb) || %s::jsonb,
                           last_error = %s
                     WHERE id     = %s
                       AND status = 'PROCESSING'
