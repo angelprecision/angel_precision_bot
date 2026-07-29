@@ -331,6 +331,9 @@ def _run_reeval(
     source: str = "trade_queue",
     ledger: _FakeOpportunityLedger | None = None,
     cleanup_succeeds: bool = True,
+    master_decision=None,
+    classifier_result=None,
+    return_controls: bool = False,
 ):
     import ap_overnight_reeval as ov
 
@@ -344,6 +347,7 @@ def _run_reeval(
 
     rejected_calls: list[tuple[str, str, str]] = []
     error_calls: list[tuple[str, str, str]] = []
+    watching_calls: list[tuple[str, str, str]] = []
     monkeypatch.setattr(
         ov,
         "_mark_job_rejected",
@@ -354,6 +358,17 @@ def _run_reeval(
         "_mark_job_error",
         lambda job_id, client_id, reason: error_calls.append((str(job_id), client_id, reason)),
     )
+    monkeypatch.setattr(
+        ov,
+        "_mark_job_watching_reason",
+        lambda job_id, client_id, reason: watching_calls.append((str(job_id), client_id, reason)),
+    )
+    if classifier_result is not None:
+        monkeypatch.setattr(
+            ov,
+            "_classify_pending_entry_for_overnight",
+            lambda *a, **kw: classifier_result,
+        )
 
     broker = MagicMock()
     broker.get_prior_day_levels.return_value = {
@@ -362,7 +377,7 @@ def _run_reeval(
     }
 
     master_control = MagicMock()
-    master_control.evaluate.return_value = types.SimpleNamespace(
+    master_control.evaluate.return_value = master_decision or types.SimpleNamespace(
         ok=True,
         plan=_make_plan(),
         reason="approved",
@@ -382,6 +397,13 @@ def _run_reeval(
         entry_watcher=entry_watcher,
         force=True,
     )
+    if return_controls:
+        return result, osm, rejected_calls, error_calls, {
+            "broker": broker,
+            "contract_selector": contract_selector,
+            "master_control": master_control,
+            "watching_calls": watching_calls,
+        }
     return result, osm, rejected_calls, error_calls
 
 
@@ -623,6 +645,119 @@ def test_dedup_block_stale_order_owner_is_retryable_not_already_armed(monkeypatc
     ]
     assert "overnight_watch_ownership_conflict" in caplog.text
     assert "overnight_watch_already_watching" not in caplog.text
+
+
+def _pending_entry_decision(reason="pending_entry_exists"):
+    return types.SimpleNamespace(
+        ok=False,
+        plan=None,
+        reason=reason,
+        reason_code="",
+        score=75.0,
+    )
+
+
+def _assert_pending_owner_fail_closed(
+    monkeypatch,
+    *,
+    classifier_result=None,
+):
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        master_decision=_pending_entry_decision(),
+        classifier_result=classifier_result,
+        return_controls=True,
+    )
+
+    assert result["armed"] == 0
+    assert result["skipped"] == 1
+    assert result["retryable_deferred"] == 1
+    assert result["rejected"] == 0
+    assert result["terminal_rejected"] == 0
+    assert rejected_calls == []
+    assert error_calls == []
+    assert controls["watching_calls"] == []
+    controls["contract_selector"].select.assert_not_called()
+    entry_watcher.watch.assert_not_called()
+    assert osm.create_calls == 0
+    controls["broker"].submit_order.assert_not_called()
+
+
+def test_pending_owner_missing_client_conflict_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_CONFLICT",
+    )
+
+
+def test_pending_owner_missing_mode_conflict_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_CONFLICT",
+    )
+
+
+def test_pending_owner_unknown_status_conflict_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_CONFLICT",
+    )
+
+
+def test_pending_owner_mixed_stale_plus_conflict_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_CONFLICT",
+    )
+
+
+def test_pending_owner_mixed_cross_client_plus_conflict_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_CONFLICT",
+    )
+
+
+def test_pending_owner_db_error_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_DB_ERROR",
+    )
+
+
+def test_pending_owner_unexpected_classifier_value_does_not_release_runtime(monkeypatch):
+    _assert_pending_owner_fail_closed(
+        monkeypatch,
+        classifier_result="PENDING_OWNER_NEW_FUTURE_VALUE",
+    )
+
+
+def test_pending_owner_explicit_stale_release_continues_to_normal_arm_runtime(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        master_decision=_pending_entry_decision(),
+        classifier_result="PENDING_OWNER_STALE",
+        return_controls=True,
+    )
+
+    assert result["armed"] == 1
+    assert result["retryable_deferred"] == 0
+    assert rejected_calls == []
+    assert error_calls == []
+    assert osm.create_calls == 1
+    entry_watcher.watch.assert_called_once()
+    assert controls["watching_calls"] == []
 
 
 def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_proof(monkeypatch, caplog):

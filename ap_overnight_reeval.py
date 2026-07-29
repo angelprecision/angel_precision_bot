@@ -3202,16 +3202,22 @@ def run_overnight_reeval(
                             result["rejected"] += 1
                             result["terminal_rejected"] += 1
                             continue
-                        elif _pe_class == "PENDING_OWNER_DB_ERROR":
+                        elif _pe_class in {"PENDING_OWNER_DB_ERROR", "PENDING_OWNER_CONFLICT"}:
                             log.critical(
                                 "[%s] pending_entry_ownership_unknown %s — "
-                                "fail closed as retryable_deferred",
-                                ticker, signal_id,
+                                "class=%s fail closed as retryable_deferred",
+                                ticker, signal_id, _pe_class,
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
                             result["retryable_deferred"] += 1
                             continue
-                        else:
+                        elif _pe_class in {
+                            "PENDING_OWNER_STALE",
+                            "PENDING_OWNER_MISSING",
+                            "PENDING_OWNER_CROSS_CLIENT",
+                            "PENDING_OWNER_CROSS_MODE",
+                            "PENDING_OWNER_TERMINAL",
+                        }:
                             # Stale/terminal/missing/cross-scope: false suppression.
                             # Release — signal must still pass all subsequent gates.
                             _pe_label = _pe_class.lower().replace("pending_owner_", "owner_")
@@ -3235,6 +3241,15 @@ def run_overnight_reeval(
                             else:
                                 decision.ok = True
                             # Fall through to Step 5
+                        else:
+                            log.critical(
+                                "[%s] pending_entry_ownership_unknown %s — "
+                                "unexpected class=%s fail closed as retryable_deferred",
+                                ticker, signal_id, _pe_class,
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
                     else:
                         # Hard safety block OR recheck enabled — reject as before
                         log.info(
