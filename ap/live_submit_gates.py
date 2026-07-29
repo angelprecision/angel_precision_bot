@@ -172,12 +172,16 @@ def validate_retry_market_quote_authority(
         or quote.get("provider")
         or ""
     ).strip().lower()
-    if raw_source not in {"tradier", "tradier_live", "api.tradier.com"}:
+    if raw_source and raw_source not in {"tradier", "tradier_live", "api.tradier.com"}:
         return {
             "valid": False,
             "reason": "MARKET_QUOTE_SOURCE_UNPROVEN",
             "quote_source": raw_source or None,
         }
+    # Tradier production payloads omit provider metadata. The exact approved
+    # HTTPS transport is authoritative for a source-less quote; contradictory
+    # explicit metadata remains rejected above.
+    resolved_source = raw_source or "tradier_live"
     raw_timestamp = (
         quote.get("provider_timestamp")
         or quote.get("quote_timestamp")
@@ -223,7 +227,7 @@ def validate_retry_market_quote_authority(
         "reason": "MARKET_QUOTE_AUTHORITY_PROVEN",
         "provider_timestamp": observed.isoformat(),
         "quote_age_ms": max(0.0, age_ms),
-        "quote_source": raw_source,
+        "quote_source": resolved_source,
         "transport_url": base_url,
     }
 

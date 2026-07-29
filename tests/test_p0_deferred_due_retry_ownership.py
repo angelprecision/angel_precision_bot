@@ -3154,3 +3154,72 @@ def test_am1_resolved_max_persists_on_restart(monkeypatch):
         f"Persisted max_attempts must equal configured ceiling (5), "
         f"got {kwargs.get('max_attempts')!r}"
     )
+
+
+def test_tradier_production_quote_without_source_passes_retry_authority():
+    from ap.brokers.tradier import TradierBroker, TradierConfig
+    from ap.live_submit_gates import validate_retry_market_quote_authority
+
+    now = datetime.now(timezone.utc)
+    broker = TradierBroker(TradierConfig(
+        base_url="https://api.tradier.com/v1",
+        access_token="test-token",
+        account_id="test-account",
+    ))
+    broker._get = MagicMock(return_value={
+        "quotes": {"quote": {
+            "symbol": "SPY",
+            "bid": 637.10,
+            "ask": 637.12,
+            "trade_date": int(now.timestamp() * 1000),
+        }}
+    })
+
+    quote = broker.get_quote("SPY")
+    result = validate_retry_market_quote_authority(quote, transport=broker, now=now)
+
+    assert "source" not in quote
+    assert "quote_source" not in quote
+    assert "provider" not in quote
+    assert result["valid"] is True
+    assert result["quote_source"] == "tradier_live"
+
+
+def test_retry_authority_rejects_contradictory_source_on_approved_transport():
+    from ap.live_submit_gates import validate_retry_market_quote_authority
+
+    now = datetime.now(timezone.utc)
+    result = validate_retry_market_quote_authority(
+        {"bid": 637.10, "ask": 637.12,
+         "trade_date": int(now.timestamp() * 1000),
+         "source": "other_provider"},
+        transport=SimpleNamespace(
+            base_url="https://api.tradier.com/v1",
+            cfg=SimpleNamespace(base_url="https://api.tradier.com/v1"),
+        ),
+        now=now,
+    )
+
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_SOURCE_UNPROVEN"
+
+
+@pytest.mark.parametrize("base_url", [
+    "http://api.tradier.com/v1",
+    "https://api.tradier.com.evil.example/v1",
+    "https://sandbox.tradier.com/v1",
+])
+def test_source_less_quote_still_requires_approved_tradier_transport(base_url):
+    from ap.live_submit_gates import validate_retry_market_quote_authority
+
+    now = datetime.now(timezone.utc)
+    result = validate_retry_market_quote_authority(
+        {"bid": 637.10, "ask": 637.12,
+         "trade_date": int(now.timestamp() * 1000)},
+        transport=SimpleNamespace(
+            base_url=base_url, cfg=SimpleNamespace(base_url=base_url)),
+        now=now,
+    )
+
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"
