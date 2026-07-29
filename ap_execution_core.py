@@ -2468,18 +2468,31 @@ class APExecutionCore:
                 f"RETRY_ATTEMPT_ADVANCED:durable={durable_prior_attempt}:expected_prior={_expected_attempt - 1}"
             )
 
+        # ── Amendment 1: resolve retry maximum as max(configured_env, durable) ──
+        # Policy: the environment value is the configured floor.  An existing
+        # durable value is honoured when it exceeds the env (e.g. an operator
+        # manually granted extra retries), but is RAISED to the env when the
+        # env has been increased.  The old code took the durable value first
+        # and only fell back to env when durable was absent — meaning a row
+        # stamped retry_max_attempts=3 could never benefit from a production
+        # increase to MAX_BREACH_SELECTOR_RETRIES=5.
+        #
+        # Examples:
+        #   durable=3, env=5  → max_attempts=5   (env raises the floor)
+        #   durable=7, env=5  → max_attempts=7   (durable preserved; not lowered)
+        #   durable missing   → max_attempts=env (env is the sole authority)
+        try:
+            _configured_max = _positive_int_env_config(
+                "MAX_BREACH_SELECTOR_RETRIES", 5
+            )
+        except (TypeError, ValueError):
+            _configured_max = 5
         try:
             _durable_max = int(meta.get("retry_max_attempts") or 0)
         except (TypeError, ValueError):
             _durable_max = 0
-        if _durable_max <= 0:
-            try:
-                _durable_max = _positive_int_env_config(
-                    "MAX_BREACH_SELECTOR_RETRIES", 5
-                )
-            except (TypeError, ValueError):
-                _durable_max = 3
-        max_attempts = _durable_max
+        _durable_max = max(0, _durable_max)
+        max_attempts = max(_configured_max, _durable_max)
         if _expected_attempt > max_attempts:
             return _term("RETRY_MAX_ATTEMPTS_EXCEEDED", status="EXPIRED",
                          attempt=_expected_attempt, max_attempts=max_attempts)
