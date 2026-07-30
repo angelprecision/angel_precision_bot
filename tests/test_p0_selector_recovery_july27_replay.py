@@ -349,6 +349,86 @@ def test_all_accounted_candidates_over_premium_cap_terminalizes_truthfully():
     assert reason == "PREMIUM_CAP_EXCEEDED"
 
 
+def test_aggregated_no_affordable_does_not_override_retryable_attempt():
+    # NO_AFFORDABLE_CONTRACT is classified TERMINAL_POLICY, but arriving via
+    # aggregated quality_rejections it must NOT short-circuit the early
+    # terminal-policy veto ahead of a retryable attempted failure.
+    reason = resolve_selector_recovery_final_reason({
+        "quality_rejections": {
+            "NO_AFFORDABLE_CONTRACT": 1,
+        },
+        "attempted_results": {
+            "OCC1": {
+                "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "transient": True,
+            },
+        },
+        "eligible_unattempted_symbols": [],
+    })
+    assert reason == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+
+def test_aggregated_premium_cap_does_not_override_retryable_attempt():
+    # PREMIUM_CAP_EXCEEDED is classified TERMINAL_QUALITY, but arriving via
+    # aggregated quality_rejections it must NOT short-circuit the early
+    # terminal-quality veto ahead of a retryable attempted failure.
+    reason = resolve_selector_recovery_final_reason({
+        "quality_rejections": {
+            "PREMIUM_CAP_EXCEEDED": 1,
+        },
+        "attempted_results": {
+            "OCC1": {
+                "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "transient": True,
+            },
+        },
+        "eligible_unattempted_symbols": [],
+    })
+    assert reason == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+
+def test_affordability_structural_evidence_cannot_terminalize_candidates_remaining():
+    # One structurally-unaffordable candidate with another candidate still
+    # eligible and no budget exhaustion must NOT terminalize as affordability.
+    # There is no structural affordability fallback: it falls through to UNKNOWN.
+    reason = resolve_selector_recovery_final_reason({
+        "structural_skip_results": {
+            "EXPENSIVE": "STRUCTURAL_CLEARLY_UNAFFORDABLE",
+        },
+        "eligible_unattempted_symbols": ["STILL_ELIGIBLE"],
+        "actual_limit_reached": False,
+        "budget_exhausted_stage": None,
+    })
+    assert reason == "UNKNOWN_SELECTOR_RECOVERY_FAILURE"
+    assert reason != "NO_AFFORDABLE_CONTRACT"
+
+
+def test_genuine_terminal_policy_still_outranks_affordability_in_quality():
+    # A real non-affordability TERMINAL_POLICY reason must still win even when an
+    # affordability reason is also present in quality_rejections.
+    reason = resolve_selector_recovery_final_reason({
+        "quality_rejections": {
+            "EARNINGS_LOCKOUT": 1,
+            "NO_AFFORDABLE_CONTRACT": 1,
+        },
+        "eligible_unattempted_symbols": [],
+    })
+    assert reason == "EARNINGS_LOCKOUT"
+
+
+def test_genuine_terminal_quality_still_outranks_affordability_in_quality():
+    # A real non-affordability TERMINAL_QUALITY reason must still win even when
+    # an affordability reason is also present in quality_rejections.
+    reason = resolve_selector_recovery_final_reason({
+        "quality_rejections": {
+            "OI_TOO_LOW": 1,
+            "PREMIUM_CAP_EXCEEDED": 1,
+        },
+        "eligible_unattempted_symbols": [],
+    })
+    assert reason == "OI_TOO_LOW"
+
+
 @pytest.mark.parametrize(
     ("evidence", "expected"),
     [

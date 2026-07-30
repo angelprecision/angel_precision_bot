@@ -895,14 +895,31 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # data, retryable quality) is preserved exactly as it was before PR #401's
     # amendment. Affordability now terminalizes only when the FULL candidate set
     # is accounted for and every accounted candidate is an affordability reason.
-    affordability_structural = {
-        "STRUCTURAL_PREMIUM_CAP_EXCEEDED",
+    #
+    # Affordability reasons are named ONCE here so the terminal-policy and
+    # terminal-quality vetoes below can exclude them. NO_AFFORDABLE_CONTRACT is
+    # classified TERMINAL_POLICY and PREMIUM_CAP_EXCEEDED is TERMINAL_QUALITY;
+    # without this exclusion an affordability reason arriving via
+    # quality_rejections would short-circuit at step 2 or step 4 and bypass the
+    # full-set accounting entirely — the precise defect this amendment closes.
+    no_affordable_reasons = {
+        "NO_AFFORDABLE_CONTRACT",
         "STRUCTURAL_CLEARLY_UNAFFORDABLE",
     }
+    premium_cap_reasons = {
+        "PREMIUM_CAP_EXCEEDED",
+        "STRUCTURAL_PREMIUM_CAP_EXCEEDED",
+    }
+    affordability_reasons = no_affordable_reasons | premium_cap_reasons
 
-    # ── Step 2: terminal policy veto ─────────────────────────────────────────
+    # ── Step 2: terminal policy veto (excluding affordability) ───────────────
     terminal_policy = next(
-        (reason for reason in quality if get_policy(reason).classification == TERMINAL_POLICY),
+        (
+            reason
+            for reason in quality
+            if reason not in affordability_reasons
+            and get_policy(reason).classification == TERMINAL_POLICY
+        ),
         None,
     )
     if terminal_policy:
@@ -922,9 +939,14 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
         if structural in structural_values:
             return canonical
 
-    # ── Step 4: terminal quality veto ────────────────────────────────────────
+    # ── Step 4: terminal quality veto (excluding affordability) ──────────────
     terminal_quality = next(
-        (reason for reason in quality if get_policy(reason).classification == TERMINAL_QUALITY),
+        (
+            reason
+            for reason in quality
+            if reason not in affordability_reasons
+            and get_policy(reason).classification == TERMINAL_QUALITY
+        ),
         None,
     )
     if terminal_quality:
@@ -965,16 +987,8 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     # ── Step 8: affordability terminal — only when the FULL candidate set is
     # accounted for and every accounted candidate is an affordability reason.
     # Do NOT infer the whole set is unaffordable because one candidate is.
-    no_affordable_reasons = {
-        "NO_AFFORDABLE_CONTRACT",
-        "STRUCTURAL_CLEARLY_UNAFFORDABLE",
-    }
-    premium_cap_reasons = {
-        "PREMIUM_CAP_EXCEEDED",
-        "STRUCTURAL_PREMIUM_CAP_EXCEEDED",
-    }
-    affordability_reasons = no_affordable_reasons | premium_cap_reasons
-
+    # (no_affordable_reasons / premium_cap_reasons / affordability_reasons are
+    # declared once near the top of this function.)
     accounted_reasons: list[str] = []
     for record in attempted.values():
         if isinstance(record, dict):
@@ -985,25 +999,24 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     accounted_reasons.extend(str(reason or "") for reason in quality.keys())
     accounted_reasons = [reason for reason in accounted_reasons if reason]
 
-    # Conditions are guaranteed here: eligible-empty is required below; any
-    # retryable attempted-data or quality failure already returned at steps 6-7;
-    # terminal-policy affordability (NO_AFFORDABLE_CONTRACT in quality) already
-    # returned at step 2, and terminal-quality PREMIUM_CAP_EXCEEDED in quality
-    # already returned at step 4 (condition-6 terminal carve-outs).
+    # Affordability is the terminal reason ONLY when the entire candidate set is
+    # accounted for and every accounted candidate is an affordability reason:
+    #   * eligible_unattempted_symbols is empty;
+    #   * no retryable attempted-data failure remains (returned at step 6);
+    #   * no retryable quality failure remains (returned at step 7);
+    #   * at least one accounted reason exists;
+    #   * every accounted attempted, structural, and aggregated-quality reason
+    #     is an affordability reason.
+    # There is deliberately NO structural fallback below this block: a partial
+    # affordability set (candidates still eligible, or non-affordability reasons
+    # present) must never terminalize as affordability. It falls through to the
+    # truthful higher-priority reason above or to UNKNOWN.
     if (
         not eligible
         and accounted_reasons
         and all(reason in affordability_reasons for reason in accounted_reasons)
     ):
         if any(reason in no_affordable_reasons for reason in accounted_reasons):
-            return "NO_AFFORDABLE_CONTRACT"
-        return "PREMIUM_CAP_EXCEEDED"
-
-    # A fully affordability-structural set with candidates still eligible (so
-    # the budget rule above did not fire) preserves the pre-amendment terminal
-    # mapping rather than silently degrading to unknown.
-    if structural_values and structural_values <= affordability_structural:
-        if "STRUCTURAL_CLEARLY_UNAFFORDABLE" in structural_values:
             return "NO_AFFORDABLE_CONTRACT"
         return "PREMIUM_CAP_EXCEEDED"
 

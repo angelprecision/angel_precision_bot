@@ -84,10 +84,16 @@ def test_ordinary_request_retains_pre_pr_capacity_even_when_recovery_env_is_40(
     monkeypatch.setenv("SELECTOR_MAX_CHAIN_CALLS", "8")
     ctx = _new_selector_request_context("SPY", "live")
     assert ctx.selector_request_kind == SELECTOR_REQUEST_KIND_ORDINARY
+    # The invariant this test protects: the ordinary direct-quote CEILING stays
+    # at 20 even when a deferred-scale env of 40 is present (never adopts the
+    # deferred 40 capacity).
     assert ctx.effective_direct_quote_limit == 20
-    assert ctx.max_total_elapsed_ms == 15_000
-    assert ctx.max_expiration_calls == 2
-    assert ctx.max_chain_calls == 6
+    # Explicit expiration/chain/elapsed env overrides ARE authoritative for
+    # ordinary requests (restored base-SHA behavior); only the pre-PR #401
+    # DEFAULTS (2 / 6 / 15000) apply when the env is unset.
+    assert ctx.max_total_elapsed_ms == 25_000
+    assert ctx.max_expiration_calls == 3
+    assert ctx.max_chain_calls == 8
 
 
 def test_ordinary_request_retains_pre_pr_default_when_capacity_env_is_unset(
@@ -111,6 +117,25 @@ def test_selector_request_context_generic_defaults_remain_pre_pr():
     assert ctx.max_direct_quote_calls == 5
     assert ctx.effective_direct_quote_limit == 5
     assert ctx.max_total_elapsed_ms == 15_000
+
+
+def test_ordinary_request_honors_explicit_pre_pr_request_limit_env(monkeypatch):
+    # Base-SHA behavior: ordinary selector requests honor explicit expiration,
+    # chain, and elapsed environment overrides. PR #401 must not hardcode these
+    # for ordinary requests (it previously only read them for deferred recovery).
+    _clear_capacity_env(monkeypatch)
+    monkeypatch.setenv("SELECTOR_MAX_EXPIRATION_CALLS", "2")
+    monkeypatch.setenv("SELECTOR_MAX_CHAIN_CALLS", "4")
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "3")
+    monkeypatch.setenv("SELECTOR_MAX_TOTAL_ELAPSED_MS", "9000")
+    ctx = _new_selector_request_context("SPY", "live")
+    assert ctx.selector_request_kind == SELECTOR_REQUEST_KIND_ORDINARY
+    assert ctx.max_expiration_calls == 2
+    assert ctx.max_chain_calls == 4
+    assert ctx.max_direct_quote_calls == 3
+    assert ctx.effective_direct_quote_limit == 3
+    assert ctx.max_total_elapsed_ms == 9000
+    assert ctx.direct_quote_attempts_remaining == 3
 
 
 @pytest.mark.parametrize("raw", ["abc", "0", "-7"])

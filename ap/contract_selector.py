@@ -754,13 +754,19 @@ def _new_selector_request_context(
         started_at_monotonic=time.monotonic(),
         execution_mode=str(execution_mode or "unknown").lower(),
         selector_request_kind=request_kind,
+        # Ordinary defaults stay pre-PR #401 (expiration 2, chain 6, elapsed
+        # 15000ms), but the explicit environment overrides remain authoritative
+        # for ordinary requests too — restoring the base-SHA behavior. Deferred
+        # recovery keeps its higher defaults (3 / 8 / 25000ms).
         max_expiration_calls=(
             _positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 3)
-            if deferred_recovery else 2
+            if deferred_recovery
+            else _positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 2)
         ),
         max_chain_calls=(
             _positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 8)
-            if deferred_recovery else 6
+            if deferred_recovery
+            else _positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 6)
         ),
         max_direct_quote_calls=effective_direct_quote_limit,
         effective_direct_quote_limit=effective_direct_quote_limit,
@@ -780,7 +786,8 @@ def _new_selector_request_context(
         ),
         max_total_elapsed_ms=(
             _positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 25000)
-            if deferred_recovery else 15000
+            if deferred_recovery
+            else _positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 15000)
         ),
         recovery_attempt_number=max(1, int(recovery_attempt_number or 1)),
         recovery_cursor=dict(recovery_cursor or {}) if recovery_cursor else None,
