@@ -351,9 +351,16 @@ def test_two_processes_single_winner_final_allowed_attempt():
 
 
 def test_exhausted_does_not_acquire():
-    """count == max → EXHAUSTED, no acquisition, count unchanged."""
-    _seed(mode="live", state=S_RETRYABLE, count=3, token="tok-x")
-    claim = _claim(mode="live", max_attempts=3)
+    """count == max → EXHAUSTED, no acquisition, count unchanged.
+
+    A RETRYABLE seed with count > 0 must carry both a token and a bound prior
+    order (strict scope contract); otherwise the strict parser rejects it as a
+    malformed scope, which is a separate assertion covered by
+    test_malformed_or_unknown_attempt_scope_never_acquires.
+    """
+    _seed(mode="live", state=S_RETRYABLE, count=3, token="tok-x", order_id="prior-x")
+    osm = _FakeOSM({"prior-x": {"status": "EXPIRED"}})
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
     assert claim.disposition == EXHAUSTED
     scope = _read_scope(mode="live")
     assert overnight._attempt_state(scope) == S_EXHAUSTED
