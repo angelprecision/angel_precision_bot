@@ -18,10 +18,19 @@ FIXED_ET = datetime(2026, 6, 12, 9, 15, tzinfo=ZoneInfo("America/New_York"))
 
 
 class _FakeOrderStateMachine:
-    def __init__(self, *, cleanup_succeeds: bool = True):
+    def __init__(
+        self,
+        *,
+        cleanup_succeeds: bool = True,
+        client_id: str = "client-1",
+        canonical_signal_id: str = "CANON-001",
+    ):
         self.orders: dict[str, dict] = {}
         self.create_calls = 0
         self.cleanup_succeeds = cleanup_succeeds
+        self.client_id = client_id
+        self.canonical_signal_id = canonical_signal_id
+        self._created_seq = 0
         self.expire_calls: list[tuple[str, str]] = []
         self.cancel_calls: list[tuple[str, str]] = []
         self.transition_calls: list[tuple[str, str, dict]] = []
@@ -29,10 +38,18 @@ class _FakeOrderStateMachine:
 
     def create_entry_order(self, plan, initial_status="CREATED", execution_mode=None, **kwargs):
         self.create_calls += 1
+        self._created_seq += 1
         local_order_id = f"local-ord-{self.create_calls}"
+        # Production-shaped ENTRY order row so the DB fake can answer the
+        # resolver's orders-table fences (active + latest-by-created_ts).
         self.orders[local_order_id] = {
+            "local_order_id": local_order_id,
+            "client_id": self.client_id,
+            "canonical_signal_id": self.canonical_signal_id,
+            "kind": "ENTRY",
             "status": initial_status,
             "execution_mode": execution_mode,
+            "created_ts": self._created_seq,
             "contract": getattr(plan, "contract_symbol", None),
             "meta": kwargs.get("meta") or {},
         }
@@ -83,8 +100,14 @@ class _FakeDBConn:
     as the prior trivial stub did.
     """
 
-    def __init__(self, opp_rows: dict | None = None):
+    # Active-ownership statuses the resolver's active fence filters on.
+    _ACTIVE_ORDER_STATUSES = {
+        "CREATED", "PENDING_TRIGGER", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL",
+    }
+
+    def __init__(self, opp_rows: dict | None = None, orders: dict | None = None):
         self._rows = opp_rows if opp_rows is not None else {}
+        self._orders = orders if orders is not None else {}
         self._result: list[dict] = []
 
     def __enter__(self):
@@ -105,12 +128,45 @@ class _FakeDBConn:
                 return row
         return None
 
+    def _orders_query(self, s, params):
+        # Production-shaped ENTRY fences:
+        #   active: WHERE client_id AND kind='ENTRY' AND mode AND canonical
+        #           AND status IN (...) ORDER BY created_ts DESC LIMIT 1
+        #   latest: WHERE client_id AND mode AND canonical AND kind='ENTRY'
+        #           ORDER BY created_ts DESC LIMIT 1
+        client_id = params[0] if len(params) > 0 else None
+        mode = str(params[1] or "").strip().lower() if len(params) > 1 else ""
+        canonical = params[2] if len(params) > 2 else None
+        status_filter = None
+        if "status in (" in s:
+            status_filter = {str(p).upper() for p in params[3:]}
+
+        matches = []
+        for row in self._orders.values():
+            if str(row.get("client_id") or "") != str(client_id or ""):
+                continue
+            if str(row.get("kind") or "") != "ENTRY":
+                continue
+            if str(row.get("execution_mode") or "").strip().lower() != mode:
+                continue
+            if str(row.get("canonical_signal_id") or "") != str(canonical or ""):
+                continue
+            if status_filter is not None and str(row.get("status") or "").upper() not in status_filter:
+                continue
+            matches.append(row)
+
+        matches.sort(key=lambda r: r.get("created_ts") or 0, reverse=True)
+        self._result = [dict(matches[0])] if matches else []
+
     def execute(self, sql, params=()):
         s = " ".join(str(sql or "").split()).lower()
         params = tuple(params or ())
         self._result = []
+        if "from orders" in s:
+            self._orders_query(s, params)
+            return self
         if "client_signal_opportunities" not in s:
-            return self  # orders / other tables — no rows, as before.
+            return self  # other tables — no rows, as before.
 
         if s.startswith("update client_signal_opportunities"):
             import json
@@ -366,6 +422,7 @@ def _install_reeval_stubs(
     ledger: _FakeOpportunityLedger | None = None,
     execution_mode: str = "PAPER",
     db_raises: bool = False,
+    osm: "_FakeOrderStateMachine | None" = None,
 ):
     fake_validator = types.ModuleType("ap.overnight_daily_validator")
     fake_validator.fetch_market_snapshot = lambda ticker, broker: {"last": 100.0}
@@ -393,10 +450,11 @@ def _install_reeval_stubs(
     # (SELECT ... FOR UPDATE / UPDATE ... RETURNING) sees the same durable
     # client_signal_opportunities rows create_opportunities() seeds.
     _opp_rows = ledger.rows if ledger is not None else {}
+    _order_rows = osm.orders if osm is not None else {}
     if db_raises:
         fake_db.conn = lambda *a, **kw: _RaisingDBConn()
     else:
-        fake_db.conn = lambda *a, **kw: _FakeDBConn(_opp_rows)
+        fake_db.conn = lambda *a, **kw: _FakeDBConn(_opp_rows, _order_rows)
     fake_db.run_with_retry = lambda fn, *a, **kw: fn()
     monkeypatch.setitem(sys.modules, "ap.db", fake_db)
 
@@ -479,8 +537,14 @@ def _run_reeval(
 
     if ledger is None:
         ledger = _FakeOpportunityLedger()
+    # Create the OSM before stubbing so the DB fake and OSM share order storage
+    # (the resolver's orders-table fences read what create_entry_order writes).
+    osm = osm or _FakeOrderStateMachine(
+        cleanup_succeeds=cleanup_succeeds, client_id=client_id
+    )
     _install_reeval_stubs(
-        monkeypatch, ledger=ledger, execution_mode=execution_mode, db_raises=db_raises
+        monkeypatch, ledger=ledger, execution_mode=execution_mode,
+        db_raises=db_raises, osm=osm,
     )
     monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
     monkeypatch.setattr(
@@ -531,7 +595,6 @@ def _run_reeval(
     contract_selector = MagicMock()
     contract_selector.select.return_value = "AAPL260619C00100000"
 
-    osm = osm or _FakeOrderStateMachine(cleanup_succeeds=cleanup_succeeds)
     result = ov.run_overnight_reeval(
         client_id=client_id,
         broker=broker,
@@ -1244,49 +1307,144 @@ def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_pr
     assert "overnight_watch_arm_failed_cleanup_failed" in caplog.text
 
 
+_ACTIVE_ENTRY_STATUSES = {
+    "CREATED", "PENDING_TRIGGER", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL",
+}
+
+
+def _active_entry_count(osm):
+    return sum(
+        1 for row in osm.orders.values()
+        if str(row.get("status") or "").upper() in _ACTIVE_ENTRY_STATUSES
+    )
+
+
 def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_failure(monkeypatch):
-    # PR #404 Blocker 1: shared ap_signals rows now take the SAME durable
-    # cross-process attempt owner as trade_queue. Across reeval runs (durable
-    # OSM) each retryable watch-arm failure creates exactly ONE new local ENTRY,
-    # and only after the prior order is proven terminal — never a duplicate
-    # active ENTRY, and never an unbounded flood of orders.
+    # PR #404 Blocker 1 — full production-shaped ap_signals lifecycle across a
+    # durable OSM + durable client_signal_opportunities. Each retryable watch-arm
+    # failure creates exactly ONE new local ENTRY, and only after the prior order
+    # is proven terminal (via the orders-table fence). Bounded at three total
+    # attempts; the fourth reeval creates nothing and calls no watcher. Never
+    # more than one active ENTRY at a time, and zero broker submissions.
     ledger = _FakeOpportunityLedger()
     osm = _FakeOrderStateMachine()
     entry_watcher = MagicMock()
     entry_watcher.watch.return_value = False
     entry_watcher._last_reject_reason = "armed_false"
 
-    first_result, osm, _, _ = _run_reeval(
-        monkeypatch,
-        entry_watcher,
-        source="ap_signals",
-        ledger=ledger,
-        osm=osm,
-    )
-    assert first_result["skipped"] == 1
-    assert first_result["retryable_deferred"] == 1
-    assert osm.create_calls == 1
-    # Order 1 was cleaned up (terminalized) before the deferral.
-    assert osm.orders["local-ord-1"]["status"] in ("EXPIRED", "CANCELED")
+    def _run():
+        return _run_reeval(
+            monkeypatch,
+            entry_watcher,
+            source="ap_signals",
+            ledger=ledger,
+            osm=osm,
+            return_controls=True,
+        )
 
-    second_result, osm, _, _ = _run_reeval(
+    # ── Run 1: claim count 1, create order 1, watch False, order 1 terminal ──
+    r1, osm, _, _, controls1 = _run()
+    assert osm.create_calls == 1
+    assert osm.orders["local-ord-1"]["status"] in ("EXPIRED", "CANCELED")
+    scope1 = _attempt_scope(ledger)
+    assert scope1["state"] == "RETRYABLE"
+    assert scope1["count"] == 1
+    assert scope1["local_order_id"] == "local-ord-1"
+    assert _active_entry_count(osm) <= 1
+    assert controls1["broker"].submit_order.call_count == 0
+
+    # ── Run 2: resolver proves order 1 terminal → claim count 2, order 2 ──
+    r2, osm, _, _, controls2 = _run()
+    assert osm.create_calls == 2
+    assert osm.orders["local-ord-2"]["status"] in ("EXPIRED", "CANCELED")
+    scope2 = _attempt_scope(ledger)
+    assert scope2["state"] == "RETRYABLE"
+    assert scope2["count"] == 2
+    assert scope2["local_order_id"] == "local-ord-2"
+    assert _active_entry_count(osm) <= 1
+    assert controls2["broker"].submit_order.call_count == 0
+
+    # ── Run 3: claim count 3, order 3, watch False → EXHAUSTED ──
+    r3, osm, _, _, controls3 = _run()
+    assert osm.create_calls == 3
+    assert osm.orders["local-ord-3"]["status"] in ("EXPIRED", "CANCELED")
+    scope3 = _attempt_scope(ledger)
+    assert scope3["state"] == "EXHAUSTED"
+    assert scope3["count"] == 3
+    assert _active_entry_count(osm) <= 1
+    assert controls3["broker"].submit_order.call_count == 0
+
+    # ── Run 4: no order 4, no watcher call, still EXHAUSTED/count 3 ──
+    _watch_calls_before = entry_watcher.watch.call_count
+    r4, osm, _, _, controls4 = _run()
+    assert osm.create_calls == 3
+    assert entry_watcher.watch.call_count == _watch_calls_before
+    scope4 = _attempt_scope(ledger)
+    assert scope4["state"] == "EXHAUSTED"
+    assert scope4["count"] == 3
+    assert _active_entry_count(osm) <= 1
+    assert controls4["broker"].submit_order.call_count == 0
+
+
+def test_watcher_true_but_armed_completion_failure_is_not_reported_armed(monkeypatch):
+    # watch() succeeds but the durable ARMED completion CAS fails. The signal
+    # must NOT be reported armed; it is retryable_deferred and the live
+    # PENDING_TRIGGER order + in-memory watcher are preserved (never cleaned up,
+    # never a second order, never a broker submit).
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
+
+    result, osm, _, _, controls = _run_reeval(
         monkeypatch,
         entry_watcher,
-        source="ap_signals",
+        source="trade_queue",
         ledger=ledger,
         osm=osm,
+        return_controls=True,
     )
-    assert second_result["skipped"] == 1
-    assert second_result["retryable_deferred"] == 1
-    # Exactly one NEW order created on the retry (order 2), gated on order 1
-    # being proven terminal first. No duplicate active ENTRY.
-    assert osm.create_calls == 2
-    _active = [
-        oid for oid, row in osm.orders.items()
-        if str(row.get("status") or "").upper() not in
-        ("EXPIRED", "CANCELED", "CANCELLED", "FILLED", "REJECTED")
-    ]
-    assert _active == []
+
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 1
+    assert result["skipped"] == 1
+    assert osm.create_calls == 1
+    assert osm.orders["local-ord-1"]["status"] == "PENDING_TRIGGER"
+    entry_watcher.watch.assert_called_once()
+    assert controls["broker"].submit_order.call_count == 0
+
+
+def test_retryable_cleanup_completion_failure_is_terminal_error_not_fake_retry(monkeypatch):
+    # watch() False, cleanup succeeds, but the durable RETRYABLE completion CAS
+    # fails. This is a terminal error — never reported as a retryable success,
+    # because a lost durable owner cannot be trusted to bound the next retry.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = False
+    entry_watcher._last_reject_reason = "armed_false"
+
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert controls["broker"].submit_order.call_count == 0
 
 
 def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch):

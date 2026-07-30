@@ -205,6 +205,41 @@ def _seed(*, mode, session=SESSION, state, count, token="", order_id="",
     setup.close()
 
 
+def _seed_raw_scope(scope, *, mode, session=SESSION, client=CLIENT, canonical=CANON):
+    """Seed the EXACT scope dict into metadata without normalizing/repairing it,
+    so the strict parser sees the real malformed/unknown value under the lock."""
+    import json
+    key = overnight._attempt_scope_key(mode, session)
+    meta = {"overnight_watch_arm_attempt_scopes": {key: scope}}
+    setup = psycopg2.connect(_RAW_URL)
+    setup.autocommit = True
+    with setup.cursor() as cur:
+        cur.execute(
+            "INSERT INTO client_signal_opportunities "
+            "(signal_id, canonical_signal_id, client_id, opportunity_status, "
+            " order_local_id, metadata) VALUES (%s,%s,%s,%s,%s,%s::jsonb) "
+            "ON CONFLICT (canonical_signal_id, client_id) DO UPDATE SET "
+            "metadata = EXCLUDED.metadata",
+            (SIGNAL_ID, canonical, client, "CREATED", None, json.dumps(meta)),
+        )
+    setup.close()
+
+
+def _complete(attempt, *, state, order_id, mode="live", reason="test"):
+    return overnight._complete_watch_arm_attempt(
+        signal_id=SIGNAL_ID,
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID},
+        execution_mode=mode,
+        session_key=SESSION,
+        attempt=attempt,
+        state=state,
+        local_order_id=order_id,
+        reason=reason,
+    )
+
+
 def _read_scope(*, mode, session=SESSION, client=CLIENT, canonical=CANON):
     conn = psycopg2.connect(_RAW_URL)
     conn.autocommit = True
@@ -495,3 +530,61 @@ def test_bounded_lifecycle_three_attempts_then_exhausted():
     scope = _read_scope(mode="live")
     assert overnight._attempt_state(scope) == S_EXHAUSTED
     assert overnight._attempt_count(scope) == 3
+
+
+# ── strict scope parsing: malformed/unknown never acquires ────────────────────
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {"state": "RETRIABLE", "count": 1, "token": "tok", "local_order_id": "ord"},
+        {"state": "UNKNOWN", "count": 1, "token": "tok", "local_order_id": "ord"},
+        {"state": "RETRYABLE", "count": "not-an-int", "token": "tok", "local_order_id": "ord"},
+        {"state": "RETRYABLE", "count": -1, "token": "tok", "local_order_id": "ord"},
+        {"state": "", "count": 1, "token": "", "local_order_id": ""},
+        {"state": "", "count": 0, "token": "tok", "local_order_id": ""},
+    ],
+)
+def test_malformed_or_unknown_attempt_scope_never_acquires(scope):
+    _seed_raw_scope(scope, mode="live")
+    claim = _claim(mode="live")
+    assert claim.disposition == CONFLICT
+    durable = _read_scope(mode="live")
+    # The malformed/unknown scope is never silently repaired or acquired.
+    assert durable == scope
+
+
+# ── terminal states cannot reopen ─────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    ("current_state", "requested_state"),
+    [
+        (S_ARMED, S_RETRYABLE),
+        (S_ARMED, overnight.WATCH_ATTEMPT_STATE_ERROR),
+        (S_EXHAUSTED, S_ARMED),
+        (overnight.WATCH_ATTEMPT_STATE_ERROR, S_RETRYABLE),
+    ],
+)
+def test_terminal_attempt_state_cannot_reopen(current_state, requested_state):
+    _seed(mode="live", state=current_state, count=1, token="tok-x", order_id="ord-x")
+    attempt = overnight._WatchAttemptClaim(ACQUIRED, "tok-x", 1, "ord-x")
+    ok = _complete(attempt, state=requested_state, order_id="ord-x")
+    assert ok is False
+    assert overnight._attempt_state(_read_scope(mode="live")) == current_state
+
+
+def test_exact_armed_completion_replay_is_idempotent():
+    _seed(mode="live", state=S_RETRYABLE, count=0)
+    a = _claim(mode="live")
+    assert a.disposition == ACQUIRED
+    bound = overnight._bind_watch_arm_attempt_order(
+        signal_id=SIGNAL_ID, client_id=CLIENT, canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID}, execution_mode="live",
+        session_key=SESSION, attempt=a, local_order_id="ord-a",
+    )
+    assert bound is True
+    first = _complete(a, state=S_ARMED, order_id="ord-a", reason="watcher_armed")
+    second = _complete(a, state=S_ARMED, order_id="ord-a", reason="watcher_armed")
+    assert first is True
+    assert second is True
+    assert overnight._attempt_state(_read_scope(mode="live")) == S_ARMED

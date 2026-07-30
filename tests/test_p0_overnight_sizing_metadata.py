@@ -432,7 +432,13 @@ class TestHydratedPlanMetadata:
         """The hydrate function must set metadata dict on the plan."""
         fn_start = _OVERNIGHT_SRC.find("def _hydrate_plan_from_signal(")
         assert fn_start != -1
-        fn_body = _OVERNIGHT_SRC[fn_start: fn_start + 1600]
+        # Slice up to the next top-level def/class so the assertion is against
+        # the WHOLE function body, not a fixed byte window that unrelated
+        # additions elsewhere in the file can push required text out of.
+        import re as _re
+        _next = _re.search(r"\n(def |class )", _OVERNIGHT_SRC[fn_start + 1:])
+        fn_end = fn_start + 1 + (_next.start() if _next else len(_OVERNIGHT_SRC))
+        fn_body = _OVERNIGHT_SRC[fn_start:fn_end]
         assert "metadata" in fn_body
         assert "overnight" in fn_body
 
