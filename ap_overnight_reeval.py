@@ -1292,6 +1292,397 @@ def _local_order_terminal_state(order_state_machine, local_order_id: str) -> tup
     return WATCH_ATTEMPT_CONFLICT, f"unknown_prior_order_status:{status or 'blank'}"
 
 
+# ── PR #404 amendment: cross-process atomic watcher-arm claim ─────────────────
+# The durable ownership authority is the PostgreSQL row for
+# (canonical_signal_id, client_id) in client_signal_opportunities, locked with
+# SELECT ... FOR UPDATE inside a single transaction. The scoped attempt record
+# under metadata["overnight_watch_arm_attempt_scopes"][mode:session] is the ONLY
+# ownership evidence; top-level mirror keys are operator-facing only. The
+# module-local threading.Lock is a same-process optimization and is NEVER the
+# durable owner — two pods/processes serialize on the Postgres row lock, not the
+# in-process lock.
+
+
+def _coerce_attempt_metadata(raw) -> tuple[dict, bool]:
+    """Return (metadata_dict, malformed). NULL → ({}, False). A JSON object →
+    (dict, False). A non-object (list/number/str-that-is-not-an-object) → ({},
+    True). A malformed non-dict metadata value must NEVER be silently treated as
+    a clean claimable state."""
+    if raw is None:
+        return {}, False
+    if isinstance(raw, dict):
+        return dict(raw), False
+    if isinstance(raw, (bytes, str)):
+        import json as _json
+        try:
+            parsed = _json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            return {}, True
+        if isinstance(parsed, dict):
+            return parsed, False
+        return {}, True
+    return {}, True
+
+
+def _ensure_opportunity_row(
+    signal_id: str, client_id: str, canonical_signal_id: str, signal_payload: dict
+) -> None:
+    """Idempotently ensure the shared opportunity row exists before the locked
+    transaction. Best-effort: create_opportunities uses ignore_duplicates and
+    never regresses an existing row. A failure here is not fatal — the locked
+    SELECT will report attempt_row_missing_after_create if the row truly does
+    not exist."""
+    try:
+        from ap.opportunity_ledger import create_opportunities as _create_opps
+        payload = dict(signal_payload or {})
+        payload.setdefault("signal_id", signal_id)
+        _create_opps(signal_id, [client_id], payload, canonical_signal_id=canonical_signal_id)
+    except Exception as exc:
+        log.debug(
+            "OVERNIGHT_WATCH_ATTEMPT_ENSURE_ROW_BEST_EFFORT client=%s canonical=%s err=%s",
+            client_id, canonical_signal_id, exc,
+        )
+
+
+# Exact ownership row query. The unique index (canonical_signal_id, client_id)
+# guarantees at most one row; FOR UPDATE holds it until the transaction commits.
+_ATTEMPT_LOCK_SQL = (
+    "SELECT id, signal_id, canonical_signal_id, client_id, metadata, "
+    "opportunity_status, order_local_id "
+    "FROM client_signal_opportunities "
+    "WHERE canonical_signal_id = %s AND client_id = %s "
+    "FOR UPDATE"
+)
+
+
+def _lock_attempt_row(c, canonical_signal_id: str, client_id: str):
+    """Return ('FOUND', row) | ('MISSING', None) | ('DUPLICATE', None)."""
+    c.execute(_ATTEMPT_LOCK_SQL, (canonical_signal_id, client_id))
+    rows = c.fetchall() or []
+    if not rows:
+        return "MISSING", None
+    if len(rows) > 1:
+        return "DUPLICATE", None
+    return "FOUND", rows[0]
+
+
+def _read_attempt_scope_unlocked(
+    canonical_signal_id: str, client_id: str, mode: str, session: str
+) -> Optional[tuple]:
+    """Non-locking preliminary read of the scoped attempt state, used ONLY to
+    decide whether prior terminal proof is required before opening the locked
+    transaction. Returns (state, count, token, local_order_id) or None when the
+    row/metadata could not be read. This value is advisory — the locked reread
+    is the sole authority for the acquisition decision."""
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT metadata FROM client_signal_opportunities "
+                    "WHERE canonical_signal_id = %s AND client_id = %s LIMIT 1",
+                    (canonical_signal_id, client_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+    except Exception:
+        return None
+    if not row:
+        return None
+    meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+    if malformed:
+        return None
+    scope = _attempt_meta_scope(meta, mode, session)
+    return (
+        _attempt_state(scope),
+        _attempt_count(scope),
+        str(scope.get("token") or "").strip(),
+        str(scope.get("local_order_id") or "").strip(),
+    )
+
+
+def _atomic_claim_watch_arm_attempt(
+    *,
+    order_state_machine,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    max_attempts: int,
+) -> _WatchAttemptClaim:
+    """Acquire the watcher-arm attempt using a single PostgreSQL compare-and-swap.
+
+    The ownership decision and mutation happen inside one transaction while the
+    (canonical_signal_id, client_id) row is held with SELECT ... FOR UPDATE, so
+    exactly one process can observe the claimable prior state and increment it.
+    Prior terminal-order proof (_local_order_terminal_state, which may reach the
+    OSM) is resolved BEFORE the lock; the locked reread then requires the exact
+    same durable prior order, so stale terminal proof can never authorize
+    replacing a different order.
+    """
+    mode = str(execution_mode or "").strip().lower()
+    session = str(session_key or "").strip()
+    signal_id = str(signal_id or "").strip()
+    client_id = str(client_id or "").strip()
+    canonical_signal_id = str(canonical_signal_id or "").strip()
+    try:
+        max_attempts = int(max_attempts)
+    except (TypeError, ValueError):
+        max_attempts = 0
+    if not (
+        signal_id and client_id and canonical_signal_id
+        and mode in {"live", "paper"} and session and max_attempts >= 1
+    ):
+        return _WatchAttemptClaim(WATCH_ATTEMPT_CONFLICT, reason="missing_attempt_owner_identity")
+
+    # §5.2 — ensure the durable row exists (idempotent) before locking it.
+    _ensure_opportunity_row(signal_id, client_id, canonical_signal_id, signal_payload)
+
+    # §5.5 two-phase — resolve prior terminal-order truth OUTSIDE the row lock so
+    # no OSM/broker-facing work is performed while holding the lock.
+    required_prior_order = None
+    pre = _read_attempt_scope_unlocked(canonical_signal_id, client_id, mode, session)
+    if pre is not None:
+        pre_state, pre_count, pre_token, pre_order = pre
+        if pre_state == WATCH_ATTEMPT_STATE_RETRYABLE and pre_order:
+            terminal_result, terminal_reason = _local_order_terminal_state(order_state_machine, pre_order)
+            if terminal_result != WATCH_ATTEMPT_ACQUIRED:
+                return _WatchAttemptClaim(terminal_result, pre_token, pre_count, pre_order, terminal_reason)
+            required_prior_order = pre_order
+
+    def _log_cas_miss(state, count, reason):
+        log.info(
+            "OVERNIGHT_WATCH_ATTEMPT_CAS_MISS client=%s mode=%s canonical=%s "
+            "session=%s state=%s count=%s reason=%s",
+            client_id, mode, canonical_signal_id, session, state, count, reason,
+        )
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn() -> _WatchAttemptClaim:
+            with conn() as c:
+                status, row = _lock_attempt_row(c, canonical_signal_id, client_id)
+                if status == "MISSING":
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_DB_ERROR, reason="attempt_row_missing_after_create"
+                    )
+                if status == "DUPLICATE":
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, reason="duplicate_attempt_owner_rows"
+                    )
+
+                meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+                if malformed:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, reason="attempt_metadata_malformed"
+                    )
+                scope = _attempt_meta_scope(meta, mode, session)
+                state = _attempt_state(scope)
+                count = _attempt_count(scope)
+                prior_token = str(scope.get("token") or "").strip()
+                prior_order_id = str(scope.get("local_order_id") or "").strip()
+
+                # §5.5 classification under the row lock. No automatic lease
+                # stealing: IN_PROGRESS/ARMED/EXHAUSTED/ERROR are honored as-is.
+                if state == WATCH_ATTEMPT_STATE_ARMED:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_ALREADY_ARMED, prior_token, count, prior_order_id
+                    )
+                if state == WATCH_ATTEMPT_STATE_EXHAUSTED:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_EXHAUSTED, prior_token, count, prior_order_id
+                    )
+                if state == WATCH_ATTEMPT_STATE_ERROR:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, prior_token, count, prior_order_id,
+                        "attempt_state_error",
+                    )
+                if state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_ALREADY_IN_PROGRESS, prior_token, count, prior_order_id
+                    )
+
+                # Claimable (RETRYABLE or empty/absent scope). A prior order may
+                # be replaced ONLY when the durable order at lock time is the
+                # exact one we proved terminal before the lock. If a different
+                # order appeared (or none was proven), refuse — stale terminal
+                # proof must not authorize replacing a different order.
+                if prior_order_id and prior_order_id != required_prior_order:
+                    _log_cas_miss(state, count, "attempt_prior_order_changed")
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, prior_token, count, prior_order_id,
+                        "attempt_prior_order_changed",
+                    )
+
+                if count >= max_attempts:
+                    exhausted_meta = _attempt_meta_patch(
+                        existing_meta=meta,
+                        execution_mode=mode,
+                        session_key=session,
+                        state=WATCH_ATTEMPT_STATE_EXHAUSTED,
+                        attempt_count=count,
+                        token=prior_token,
+                        local_order_id=prior_order_id,
+                        reason="overnight_watch_arm_retry_exhausted",
+                    )
+                    if not _write_locked_attempt_meta(c, row["id"], exhausted_meta,
+                                                       mode, session,
+                                                       WATCH_ATTEMPT_STATE_EXHAUSTED,
+                                                       count, prior_token, prior_order_id):
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_DB_ERROR, reason="exhausted_write_failed"
+                        )
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_EXHAUSTED, prior_token, count, prior_order_id
+                    )
+
+                token = uuid.uuid4().hex
+                next_count = count + 1
+                next_meta = _attempt_meta_patch(
+                    existing_meta=meta,
+                    execution_mode=mode,
+                    session_key=session,
+                    state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                    attempt_count=next_count,
+                    token=token,
+                    local_order_id="",
+                    reason="attempt_acquired",
+                )
+                if not _write_locked_attempt_meta(c, row["id"], next_meta,
+                                                   mode, session,
+                                                   WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                                                   next_count, token, ""):
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_DB_ERROR, reason="attempt_claim_write_failed"
+                    )
+                log.info(
+                    "OVERNIGHT_WATCH_ATTEMPT_ACQUIRED client=%s mode=%s canonical=%s "
+                    "session=%s attempt_count=%s token_prefix=%s",
+                    client_id, mode, canonical_signal_id, session, next_count, token[:8],
+                )
+                return _WatchAttemptClaim(WATCH_ATTEMPT_ACQUIRED, token, next_count)
+
+        return run_with_retry(_fn)
+    except Exception as exc:
+        log.warning(
+            "OVERNIGHT_WATCH_ATTEMPT_DB_ERROR client=%s mode=%s canonical=%s session=%s err=%s",
+            client_id, mode, canonical_signal_id, session, exc,
+        )
+        return _WatchAttemptClaim(
+            WATCH_ATTEMPT_DB_ERROR, reason=f"attempt_claim_db_exception:{type(exc).__name__}"
+        )
+
+
+def _write_locked_attempt_meta(
+    c, row_id, next_meta: dict, mode: str, session: str,
+    expect_state: str, expect_count: int, expect_token: str, expect_order_id: str,
+) -> bool:
+    """Write metadata on the already-locked row by primary key and verify the
+    scoped readback matches the intended transition. Called only while the row
+    is held FOR UPDATE in the caller's transaction."""
+    import json as _json
+    c.execute(
+        "UPDATE client_signal_opportunities "
+        "SET metadata = %s::jsonb, updated_at = NOW() "
+        "WHERE id = %s "
+        "RETURNING metadata",
+        (_json.dumps(next_meta), row_id),
+    )
+    rb = c.fetchone()
+    if not rb:
+        return False
+    rb_meta, malformed = _coerce_attempt_metadata(rb.get("metadata"))
+    if malformed:
+        return False
+    rb_scope = _attempt_meta_scope(rb_meta, mode, session)
+    return (
+        _attempt_state(rb_scope) == str(expect_state or "").strip().upper()
+        and _attempt_count(rb_scope) == int(expect_count or 0)
+        and str(rb_scope.get("token") or "") == str(expect_token or "")
+        and str(rb_scope.get("local_order_id") or "") == str(expect_order_id or "")
+    )
+
+
+def _pg_cas_write_attempt(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    predicate,
+    new_state: str,
+    new_count: int,
+    new_token: str,
+    new_local_order_id: str,
+    reason: str,
+) -> bool:
+    """Exact-owner compare-and-swap for post-acquisition transitions (bind /
+    complete). Locks the (canonical_signal_id, client_id) row, evaluates
+    predicate(state, count, token, local_order_id) against the durable scope,
+    and only on a match writes the new scope. Returns False on any predicate
+    miss, missing/duplicate/malformed row, or DB error — the write is atomic
+    under the same row lock, so no other process can replace ownership between
+    the check and the write."""
+    mode = str(execution_mode or "").strip().lower()
+    session = str(session_key or "").strip()
+    canonical_signal_id = str(canonical_signal_id or "").strip()
+    client_id = str(client_id or "").strip()
+    if not (client_id and canonical_signal_id and mode in {"live", "paper"} and session):
+        return False
+
+    _ensure_opportunity_row(signal_id, client_id, canonical_signal_id, signal_payload)
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn() -> bool:
+            with conn() as c:
+                status, row = _lock_attempt_row(c, canonical_signal_id, client_id)
+                if status != "FOUND":
+                    return False
+                meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+                if malformed:
+                    return False
+                scope = _attempt_meta_scope(meta, mode, session)
+                state = _attempt_state(scope)
+                count = _attempt_count(scope)
+                token = str(scope.get("token") or "").strip()
+                order_id = str(scope.get("local_order_id") or "").strip()
+                if not predicate(state, count, token, order_id):
+                    return False
+                next_meta = _attempt_meta_patch(
+                    existing_meta=meta,
+                    execution_mode=mode,
+                    session_key=session,
+                    state=new_state,
+                    attempt_count=new_count,
+                    token=new_token,
+                    local_order_id=new_local_order_id,
+                    reason=reason,
+                )
+                return _write_locked_attempt_meta(
+                    c, row["id"], next_meta, mode, session,
+                    str(new_state or "").strip().upper(), new_count, new_token,
+                    str(new_local_order_id or ""),
+                )
+
+        return bool(run_with_retry(_fn))
+    except Exception as exc:
+        log.warning(
+            "OVERNIGHT_WATCH_ATTEMPT_CAS_WRITE_DB_ERROR client=%s mode=%s canonical=%s "
+            "reason=%s err=%s",
+            client_id, mode, canonical_signal_id, reason, exc,
+        )
+        return False
+
+
 def _claim_watch_arm_attempt(
     *,
     order_state_machine,
@@ -1302,87 +1693,20 @@ def _claim_watch_arm_attempt(
     execution_mode: str,
     session_key: str,
 ) -> _WatchAttemptClaim:
-    mode = str(execution_mode or "").strip().lower()
-    session = str(session_key or "").strip()
-    if not (client_id and canonical_signal_id and signal_id and mode in {"live", "paper"} and session):
-        return _WatchAttemptClaim(WATCH_ATTEMPT_CONFLICT, reason="missing_attempt_owner_identity")
-
+    # The threading.Lock reduces same-process contention only. The PostgreSQL
+    # row lock / CAS inside _atomic_claim_watch_arm_attempt is the authoritative
+    # cross-process (cross-pod, cross-restart) owner.
     with _WATCH_ATTEMPT_LOCK:
-        lookup = _get_client_opportunity_row(signal_id, client_id, signal_payload)
-        if lookup.lookup_status == _LS_LOOKUP_FAILED:
-            return _WatchAttemptClaim(WATCH_ATTEMPT_DB_ERROR, reason=lookup.error or "opportunity_lookup_failed")
-        if lookup.lookup_status == _LS_NOT_FOUND:
-            if not _write_attempt_meta(
-                signal_id=signal_id,
-                client_id=client_id,
-                canonical_signal_id=canonical_signal_id,
-                signal_payload=signal_payload,
-                execution_mode=mode,
-                session_key=session,
-                state=WATCH_ATTEMPT_STATE_RETRYABLE,
-                attempt_count=0,
-                token="",
-                reason="initial_attempt_seed",
-            ):
-                return _WatchAttemptClaim(WATCH_ATTEMPT_DB_ERROR, reason="attempt_seed_write_failed")
-            lookup = _get_client_opportunity_row(signal_id, client_id, signal_payload)
-            if lookup.lookup_status != _LS_FOUND or not isinstance(lookup.row, dict):
-                return _WatchAttemptClaim(WATCH_ATTEMPT_DB_ERROR, reason="attempt_seed_readback_failed")
-
-        row = lookup.row or {}
-        meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-        scope = _attempt_meta_scope(meta, mode, session)
-        state = _attempt_state(scope)
-        count = _attempt_count(scope)
-        prior_order_id = str(scope.get("local_order_id") or "").strip()
-
-        if state == WATCH_ATTEMPT_STATE_ARMED:
-            return _WatchAttemptClaim(WATCH_ATTEMPT_ALREADY_ARMED, str(scope.get("token") or ""), count, prior_order_id)
-        if state == WATCH_ATTEMPT_STATE_EXHAUSTED:
-            return _WatchAttemptClaim(WATCH_ATTEMPT_EXHAUSTED, str(scope.get("token") or ""), count, prior_order_id)
-        if state == WATCH_ATTEMPT_STATE_ERROR:
-            return _WatchAttemptClaim(WATCH_ATTEMPT_CONFLICT, str(scope.get("token") or ""), count, prior_order_id, "attempt_state_error")
-        if state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
-            return _WatchAttemptClaim(WATCH_ATTEMPT_ALREADY_IN_PROGRESS, str(scope.get("token") or ""), count, prior_order_id)
-        if state == WATCH_ATTEMPT_STATE_RETRYABLE and prior_order_id:
-            terminal_result, terminal_reason = _local_order_terminal_state(order_state_machine, prior_order_id)
-            if terminal_result != WATCH_ATTEMPT_ACQUIRED:
-                return _WatchAttemptClaim(terminal_result, str(scope.get("token") or ""), count, prior_order_id, terminal_reason)
-
-        if count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS:
-            if not _write_attempt_meta(
-                signal_id=signal_id,
-                client_id=client_id,
-                canonical_signal_id=canonical_signal_id,
-                signal_payload=signal_payload,
-                execution_mode=mode,
-                session_key=session,
-                state=WATCH_ATTEMPT_STATE_EXHAUSTED,
-                attempt_count=count,
-                token=str(scope.get("token") or ""),
-                local_order_id=prior_order_id,
-                reason="overnight_watch_arm_retry_exhausted",
-            ):
-                return _WatchAttemptClaim(WATCH_ATTEMPT_DB_ERROR, reason="exhausted_write_failed")
-            return _WatchAttemptClaim(WATCH_ATTEMPT_EXHAUSTED, str(scope.get("token") or ""), count, prior_order_id)
-
-        token = uuid.uuid4().hex
-        next_count = count + 1
-        if not _write_attempt_meta(
+        return _atomic_claim_watch_arm_attempt(
+            order_state_machine=order_state_machine,
             signal_id=signal_id,
             client_id=client_id,
             canonical_signal_id=canonical_signal_id,
             signal_payload=signal_payload,
-            execution_mode=mode,
-            session_key=session,
-            state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
-            attempt_count=next_count,
-            token=token,
-            local_order_id="",
-            reason="attempt_acquired",
-        ):
-            return _WatchAttemptClaim(WATCH_ATTEMPT_DB_ERROR, reason="attempt_claim_write_failed")
-        return _WatchAttemptClaim(WATCH_ATTEMPT_ACQUIRED, token, next_count)
+            execution_mode=execution_mode,
+            session_key=session_key,
+            max_attempts=OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS,
+        )
 
 
 def _bind_watch_arm_attempt_order(
@@ -1398,28 +1722,30 @@ def _bind_watch_arm_attempt_order(
 ) -> bool:
     if attempt.disposition != WATCH_ATTEMPT_ACQUIRED or not attempt.token or not local_order_id:
         return False
-    lookup = _get_client_opportunity_row(signal_id, client_id, signal_payload)
-    if lookup.lookup_status != _LS_FOUND or not isinstance(lookup.row, dict):
-        return False
-    meta = lookup.row.get("metadata") if isinstance(lookup.row.get("metadata"), dict) else {}
-    scope = _attempt_meta_scope(meta, execution_mode, session_key)
-    if (
-        _attempt_state(scope) != WATCH_ATTEMPT_STATE_IN_PROGRESS
-        or str(scope.get("token") or "") != attempt.token
-        or _attempt_count(scope) != attempt.attempt_count
-    ):
-        return False
-    return _write_attempt_meta(
+
+    # Atomic exact-owner CAS: bind only when the durable scope is still the
+    # unbound IN_PROGRESS record owned by this exact token+count. Any other
+    # token / count / state, or an already-bound local order, refuses the bind.
+    def _predicate(state, count, token, order_id):
+        return (
+            state == WATCH_ATTEMPT_STATE_IN_PROGRESS
+            and token == attempt.token
+            and count == attempt.attempt_count
+            and not order_id
+        )
+
+    return _pg_cas_write_attempt(
         signal_id=signal_id,
         client_id=client_id,
         canonical_signal_id=canonical_signal_id,
         signal_payload=signal_payload,
         execution_mode=execution_mode,
         session_key=session_key,
-        state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
-        attempt_count=attempt.attempt_count,
-        token=attempt.token,
-        local_order_id=str(local_order_id),
+        predicate=_predicate,
+        new_state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        new_count=attempt.attempt_count,
+        new_token=attempt.token,
+        new_local_order_id=str(local_order_id),
         reason="local_order_bound",
     )
 
@@ -1439,37 +1765,39 @@ def _complete_watch_arm_attempt(
 ) -> bool:
     if not attempt.token:
         return False
-    lookup = _get_client_opportunity_row(signal_id, client_id, signal_payload)
-    if lookup.lookup_status != _LS_FOUND or not isinstance(lookup.row, dict):
-        return False
-    meta = lookup.row.get("metadata") if isinstance(lookup.row.get("metadata"), dict) else {}
-    scope = _attempt_meta_scope(meta, execution_mode, session_key)
-    if (
-        str(scope.get("token") or "") != attempt.token
-        or _attempt_count(scope) != attempt.attempt_count
-    ):
-        return False
-    current_local_order_id = str(scope.get("local_order_id") or "")
+
     next_local_order_id = str(local_order_id or "")
-    if current_local_order_id != next_local_order_id:
-        unbound_error = (
-            str(state or "").strip().upper() == WATCH_ATTEMPT_STATE_ERROR
-            and not current_local_order_id
-            and next_local_order_id
-        )
-        if not unbound_error:
+    want_state = str(state or "").strip().upper()
+
+    # Atomic exact-owner CAS: complete only when the durable scope still matches
+    # this exact token+count AND the bound local order matches (or the special
+    # unbound→ERROR case: no order bound yet, terminalizing a freshly-created
+    # order). A different token, count, or bound order refuses the write.
+    def _predicate(cur_state, count, token, order_id):
+        if token != attempt.token or count != attempt.attempt_count:
             return False
-    return _write_attempt_meta(
+        if order_id != next_local_order_id:
+            unbound_error = (
+                want_state == WATCH_ATTEMPT_STATE_ERROR
+                and not order_id
+                and next_local_order_id
+            )
+            if not unbound_error:
+                return False
+        return True
+
+    return _pg_cas_write_attempt(
         signal_id=signal_id,
         client_id=client_id,
         canonical_signal_id=canonical_signal_id,
         signal_payload=signal_payload,
         execution_mode=execution_mode,
         session_key=session_key,
-        state=state,
-        attempt_count=attempt.attempt_count,
-        token=attempt.token,
-        local_order_id=local_order_id,
+        predicate=_predicate,
+        new_state=state,
+        new_count=attempt.attempt_count,
+        new_token=attempt.token,
+        new_local_order_id=local_order_id,
         reason=reason,
     )
 
@@ -2260,6 +2588,23 @@ def _resolve_shared_setup_disposition(
         return _DispositionResult(_DISPOSITION_NEW)
 
     if _has_current_session_proof:
+        # PR #404 Blocker 1: the current-session evidence may be nothing more
+        # than the durable watcher-arm ATTEMPT SCOPE this same engine writes
+        # (mode + session mirror keys). When the only current-session proof is a
+        # bounded attempt scope — and no active/terminal ENTRY order exists — the
+        # atomic PostgreSQL claim (_atomic_claim_watch_arm_attempt) is the
+        # authority: it classifies RETRYABLE/IN_PROGRESS/ARMED/EXHAUSTED/ERROR
+        # and enforces the max-attempt bound. Delegating here (NEW) lets the
+        # claim decide; failing closed instead would permanently suppress a
+        # legitimately retryable shared signal.
+        _attempt_scope_present = bool(_attempt_meta_scope(_meta, _req_mode, _session_key))
+        if _attempt_scope_present:
+            log.info(
+                "[%s] reeval disposition=NEW (attempt-scope owner present; "
+                "deferring to atomic watch-arm claim) canonical=%s session=%s",
+                client_id, canonical, _session_key,
+            )
+            return _DispositionResult(_DISPOSITION_NEW)
         # Had current-session opportunity evidence but it wasn't classified above
         # (e.g. unrecognised status) — do not guess; fail closed.
         log.warning(
@@ -3845,7 +4190,13 @@ def run_overnight_reeval(
                     continue
 
             _canonical_for_attempt = _resolve_canonical_signal_id(signal_id, signal)
-            _claimed_watch_attempt = job_source == "trade_queue"
+            # PR #404 Blocker 1: shared ap_signals rows must take the SAME durable
+            # cross-process attempt owner as trade_queue rows. Previously only
+            # trade_queue claimed and ap_signals received a fake ACQUIRED with no
+            # token, so its retry state could never persist — a first watcher
+            # False could permanently suppress a legitimate shared signal. Both
+            # sources now claim through the atomic PostgreSQL CAS.
+            _claimed_watch_attempt = job_source in ("trade_queue", "ap_signals")
             _watch_attempt = _WatchAttemptClaim(WATCH_ATTEMPT_ACQUIRED)
             if _claimed_watch_attempt:
                 _watch_attempt = _claim_watch_arm_attempt(

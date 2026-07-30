@@ -174,6 +174,7 @@ jobs:
             tests/test_p0_manual_rescue_restart_guard_bypass.py \
             tests/test_p0_queue_liveness_watch_ownership_contract.py \
             tests/test_p0_overnight_watcher_cleanup.py \
+            tests/test_p0_overnight_watch_attempt_atomicity.py \
             -v --tb=short --color=yes
 
       - name: Summary

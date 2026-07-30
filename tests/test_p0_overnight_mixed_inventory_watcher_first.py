@@ -192,6 +192,66 @@ class _OpportunityLedger(types.ModuleType):
         return True
 
 
+class _OppDBConn:
+    """ap.db.conn shim backing client_signal_opportunities against a shared row
+    store (the fake ledger's `rows`) so the PR #404 atomic watcher-arm CAS
+    (SELECT ... FOR UPDATE / UPDATE ... RETURNING metadata) sees durable rows.
+    Any SQL not targeting that table returns no rows."""
+
+    def __init__(self, opp_rows: dict):
+        self._rows = opp_rows
+        self._result: list[dict] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def _row_for_key(self, canonical, client_id):
+        row = self._rows.get((canonical, client_id))
+        if row is not None and not row.get("id"):
+            row["id"] = f"{canonical}::{client_id}"
+        return row
+
+    def _row_for_id(self, row_id):
+        for row in self._rows.values():
+            if row.get("id") == row_id:
+                return row
+        return None
+
+    def execute(self, sql, params=()):
+        s = " ".join(str(sql or "").split()).lower()
+        params = tuple(params or ())
+        self._result = []
+        if "client_signal_opportunities" not in s:
+            return self
+        if s.startswith("update client_signal_opportunities"):
+            import json
+            raw_meta, row_id = params[0], params[-1]
+            new_meta = json.loads(raw_meta) if isinstance(raw_meta, (str, bytes)) else raw_meta
+            row = self._row_for_id(row_id)
+            if row is not None:
+                row["metadata"] = new_meta
+                self._result = [{"metadata": new_meta}]
+            return self
+        canonical = params[0] if len(params) > 0 else None
+        client_id = params[1] if len(params) > 1 else None
+        row = self._row_for_key(canonical, client_id)
+        if row is not None:
+            if s.startswith("select metadata from client_signal_opportunities"):
+                self._result = [{"metadata": row.get("metadata")}]
+            else:
+                self._result = [dict(row)]
+        return self
+
+    def fetchone(self):
+        return dict(self._result[0]) if self._result else None
+
+    def fetchall(self):
+        return [dict(r) for r in self._result]
+
+
 def _run_harness(
     monkeypatch,
     jobs: list[dict],
@@ -253,7 +313,14 @@ def _run_harness(
     auth.execution_mode_for_broker = lambda _broker: execution_mode
     monkeypatch.setitem(sys.modules, "ap.authorization", auth)
 
-    monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", _OpportunityLedger())
+    _ledger = _OpportunityLedger()
+    monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", _ledger)
+    # PR #404: the atomic watcher-arm claim/bind/complete run against ap.db.conn.
+    # Back client_signal_opportunities with the ledger's shared row store.
+    _db = types.ModuleType("ap.db")
+    _db.conn = lambda *a, **kw: _OppDBConn(_ledger.rows)
+    _db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _db)
 
     intel = types.ModuleType("ap.intelligence_context_handoff")
     intel.enqueue_preopen_context_best_effort = lambda *args, **kwargs: None

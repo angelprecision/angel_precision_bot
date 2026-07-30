@@ -72,20 +72,83 @@ class _FakeOrderStateMachine:
 
 
 class _FakeDBConn:
+    """In-memory shim for ap.db.conn.
+
+    Backs client_signal_opportunities against a shared row store (the fake
+    ledger's `rows`, keyed by (canonical_signal_id, client_id)) so the PR #404
+    atomic claim/bind/complete path — which runs SELECT ... FOR UPDATE and
+    UPDATE ... RETURNING metadata against ap.db.conn — sees durable metadata
+    that persists across repeated reeval runs. Any SQL not targeting
+    client_signal_opportunities (e.g. the orders table) returns no rows, exactly
+    as the prior trivial stub did.
+    """
+
+    def __init__(self, opp_rows: dict | None = None):
+        self._rows = opp_rows if opp_rows is not None else {}
+        self._result: list[dict] = []
+
     def __enter__(self):
         return self
 
     def __exit__(self, *_args):
         return False
 
-    def execute(self, *_args, **_kwargs):
+    def _row_for_key(self, canonical, client_id):
+        row = self._rows.get((canonical, client_id))
+        if row is not None and not row.get("id"):
+            row["id"] = f"{canonical}::{client_id}"
+        return row
+
+    def _row_for_id(self, row_id):
+        for row in self._rows.values():
+            if row.get("id") == row_id:
+                return row
         return None
+
+    def execute(self, sql, params=()):
+        s = " ".join(str(sql or "").split()).lower()
+        params = tuple(params or ())
+        self._result = []
+        if "client_signal_opportunities" not in s:
+            return self  # orders / other tables — no rows, as before.
+
+        if s.startswith("update client_signal_opportunities"):
+            import json
+            raw_meta, row_id = params[0], params[-1]
+            new_meta = json.loads(raw_meta) if isinstance(raw_meta, (str, bytes)) else raw_meta
+            row = self._row_for_id(row_id)
+            if row is not None:
+                row["metadata"] = new_meta
+                self._result = [{"metadata": new_meta}]
+            return self
+
+        # SELECT paths keyed by (canonical_signal_id, client_id).
+        canonical = params[0] if len(params) > 0 else None
+        client_id = params[1] if len(params) > 1 else None
+        row = self._row_for_key(canonical, client_id)
+        if row is not None:
+            if s.startswith("select metadata from client_signal_opportunities"):
+                self._result = [{"metadata": row.get("metadata")}]
+            else:
+                self._result = [dict(row)]
+        return self
 
     def fetchone(self):
-        return None
+        return dict(self._result[0]) if self._result else None
 
     def fetchall(self):
-        return []
+        return [dict(r) for r in self._result]
+
+
+class _RaisingDBConn:
+    """ap.db.conn shim that fails on use — simulates a Postgres outage so the
+    atomic claim CAS (the durable ownership authority) fails closed."""
+
+    def __enter__(self):
+        raise RuntimeError("simulated_postgres_outage")
+
+    def __exit__(self, *_args):
+        return False
 
 
 class _FakeOpportunityLedger(types.ModuleType):
@@ -302,6 +365,7 @@ def _install_reeval_stubs(
     monkeypatch,
     ledger: _FakeOpportunityLedger | None = None,
     execution_mode: str = "PAPER",
+    db_raises: bool = False,
 ):
     fake_validator = types.ModuleType("ap.overnight_daily_validator")
     fake_validator.fetch_market_snapshot = lambda ticker, broker: {"last": 100.0}
@@ -325,7 +389,14 @@ def _install_reeval_stubs(
     monkeypatch.setitem(sys.modules, "ap.authorization", fake_auth)
 
     fake_db = types.ModuleType("ap.db")
-    fake_db.conn = lambda *a, **kw: _FakeDBConn()
+    # Share the ledger's row store so the atomic claim/bind/complete CAS
+    # (SELECT ... FOR UPDATE / UPDATE ... RETURNING) sees the same durable
+    # client_signal_opportunities rows create_opportunities() seeds.
+    _opp_rows = ledger.rows if ledger is not None else {}
+    if db_raises:
+        fake_db.conn = lambda *a, **kw: _RaisingDBConn()
+    else:
+        fake_db.conn = lambda *a, **kw: _FakeDBConn(_opp_rows)
     fake_db.run_with_retry = lambda fn, *a, **kw: fn()
     monkeypatch.setitem(sys.modules, "ap.db", fake_db)
 
@@ -402,12 +473,15 @@ def _run_reeval(
     osm: _FakeOrderStateMachine | None = None,
     execution_mode: str = "PAPER",
     client_id: str = "client-1",
+    db_raises: bool = False,
 ):
     import ap_overnight_reeval as ov
 
     if ledger is None:
         ledger = _FakeOpportunityLedger()
-    _install_reeval_stubs(monkeypatch, ledger=ledger, execution_mode=execution_mode)
+    _install_reeval_stubs(
+        monkeypatch, ledger=ledger, execution_mode=execution_mode, db_raises=db_raises
+    )
     monkeypatch.setattr(ov, "_et_now", lambda: FIXED_ET)
     monkeypatch.setattr(
         ov,
@@ -957,12 +1031,14 @@ def test_attempt_unknown_prior_order_status_blocks_replacement(monkeypatch):
 
 
 def test_attempt_database_failure_blocks_replacement(monkeypatch):
+    # The durable ownership authority is the PostgreSQL row lock/CAS. When that
+    # DB is unavailable the atomic claim must fail closed (WATCH_ATTEMPT_DB_ERROR)
+    # — no order created, no watcher armed, no broker submit (spec Test L).
     ledger = _FakeOpportunityLedger()
-    ledger._get_sb = lambda: None
     watcher = MagicMock()
 
     result, osm, _, _, controls = _run_reeval(
-        monkeypatch, watcher, ledger=ledger, return_controls=True
+        monkeypatch, watcher, ledger=ledger, return_controls=True, db_raises=True
     )
 
     assert osm.create_calls == 0
@@ -1169,30 +1245,48 @@ def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_pr
 
 
 def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_failure(monkeypatch):
+    # PR #404 Blocker 1: shared ap_signals rows now take the SAME durable
+    # cross-process attempt owner as trade_queue. Across reeval runs (durable
+    # OSM) each retryable watch-arm failure creates exactly ONE new local ENTRY,
+    # and only after the prior order is proven terminal — never a duplicate
+    # active ENTRY, and never an unbounded flood of orders.
     ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
     entry_watcher = MagicMock()
     entry_watcher.watch.return_value = False
     entry_watcher._last_reject_reason = "armed_false"
 
-    first_result, first_osm, _, _ = _run_reeval(
+    first_result, osm, _, _ = _run_reeval(
         monkeypatch,
         entry_watcher,
         source="ap_signals",
         ledger=ledger,
+        osm=osm,
     )
     assert first_result["skipped"] == 1
     assert first_result["retryable_deferred"] == 1
-    assert first_osm.create_calls == 1
+    assert osm.create_calls == 1
+    # Order 1 was cleaned up (terminalized) before the deferral.
+    assert osm.orders["local-ord-1"]["status"] in ("EXPIRED", "CANCELED")
 
-    second_result, second_osm, _, _ = _run_reeval(
+    second_result, osm, _, _ = _run_reeval(
         monkeypatch,
         entry_watcher,
         source="ap_signals",
         ledger=ledger,
+        osm=osm,
     )
     assert second_result["skipped"] == 1
     assert second_result["retryable_deferred"] == 1
-    assert second_osm.create_calls == 1
+    # Exactly one NEW order created on the retry (order 2), gated on order 1
+    # being proven terminal first. No duplicate active ENTRY.
+    assert osm.create_calls == 2
+    _active = [
+        oid for oid, row in osm.orders.items()
+        if str(row.get("status") or "").upper() not in
+        ("EXPIRED", "CANCELED", "CANCELLED", "FILLED", "REJECTED")
+    ]
+    assert _active == []
 
 
 def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch):
