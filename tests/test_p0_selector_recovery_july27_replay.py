@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -182,6 +182,98 @@ def test_retry_market_truth_requires_provider_timestamp_and_live_domain():
     assert sandbox["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Amendment 1: every used quote-leg timestamp is validated independently, and
+# the OLDEST used leg controls freshness. A fresh ask must not launder a stale
+# bid (or vice versa) into an accepted quote.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FIXED_NOW = datetime(2026, 7, 27, 14, 30, 0, tzinfo=timezone.utc)
+
+
+def test_retry_authority_rejects_fresh_ask_with_stale_bid():
+    result = validate_retry_market_quote_authority(
+        {
+            "bid": 100.0,
+            "ask": 100.2,
+            "source": "tradier_live",
+            "bid_date": (_FIXED_NOW - timedelta(seconds=10)).isoformat(),
+            "ask_date": _FIXED_NOW.isoformat(),
+        },
+        transport=_live_transport(),
+        now=_FIXED_NOW,
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_STALE"
+
+
+def test_retry_authority_rejects_fresh_bid_with_stale_ask():
+    result = validate_retry_market_quote_authority(
+        {
+            "bid": 100.0,
+            "ask": 100.2,
+            "source": "tradier_live",
+            "bid_date": _FIXED_NOW.isoformat(),
+            "ask_date": (_FIXED_NOW - timedelta(seconds=10)).isoformat(),
+        },
+        transport=_live_transport(),
+        now=_FIXED_NOW,
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_STALE"
+
+
+def test_retry_authority_accepts_when_both_price_legs_are_fresh():
+    older = _FIXED_NOW - timedelta(seconds=2)
+    newer = _FIXED_NOW - timedelta(seconds=1)
+    result = validate_retry_market_quote_authority(
+        {
+            "bid": 100.0,
+            "ask": 100.2,
+            "source": "tradier_live",
+            "bid_date": newer.isoformat(),
+            "ask_date": older.isoformat(),
+        },
+        transport=_live_transport(),
+        now=_FIXED_NOW,
+    )
+    assert result["valid"] is True
+    # The older of the two fresh legs is authoritative — never the newest.
+    assert result["provider_timestamp"] == older.astimezone(timezone.utc).isoformat()
+
+
+def test_retry_authority_rejects_malformed_timestamp_on_one_used_leg():
+    result = validate_retry_market_quote_authority(
+        {
+            "bid": 100.0,
+            "ask": 100.2,
+            "source": "tradier_live",
+            "bid_date": _FIXED_NOW.isoformat(),
+            "ask_date": "not-a-timestamp",
+        },
+        transport=_live_transport(),
+        now=_FIXED_NOW,
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_TIMESTAMP_UNPROVEN"
+
+
+def test_retry_authority_rejects_future_timestamp_on_one_used_leg():
+    result = validate_retry_market_quote_authority(
+        {
+            "bid": 100.0,
+            "ask": 100.2,
+            "source": "tradier_live",
+            "bid_date": _FIXED_NOW.isoformat(),
+            "ask_date": (_FIXED_NOW + timedelta(seconds=10)).isoformat(),
+        },
+        transport=_live_transport(),
+        now=_FIXED_NOW,
+    )
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_TIMESTAMP_FUTURE"
+
+
 def test_chart_invalidation_always_outranks_budget():
     reason = resolve_selector_recovery_final_reason({
         "market_truth_outcome": "TERMINAL_SETUP_COMPLETE",
@@ -193,7 +285,10 @@ def test_chart_invalidation_always_outranks_budget():
     assert reason == "MARKET_SETUP_INVALIDATED"
 
 
-def test_affordability_evidence_outranks_reached_budget_with_candidates_left():
+def test_one_unaffordable_candidate_does_not_terminalize_eligible_candidates_left():
+    # One structurally unaffordable candidate must not terminalize the request
+    # while another eligible candidate remains unattempted after real budget
+    # exhaustion. Real exhaustion outranks a single affordability skip.
     reason = resolve_selector_recovery_final_reason({
         "actual_limit_reached": True,
         "budget_exhausted_stage": "direct_quote",
@@ -203,7 +298,55 @@ def test_affordability_evidence_outranks_reached_budget_with_candidates_left():
             "OCC42": "STRUCTURAL_CLEARLY_UNAFFORDABLE",
         },
     })
+    assert reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+
+
+def test_one_unaffordable_candidate_does_not_override_retryable_quote_failures():
+    # A single unaffordable candidate must not override retryable quote data
+    # failures on other candidates that are still owed a bounded retry.
+    reason = resolve_selector_recovery_final_reason({
+        "structural_skip_results": {
+            "OCC42": "STRUCTURAL_CLEARLY_UNAFFORDABLE",
+        },
+        "attempted_results": {
+            "OCC1": {
+                "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "transient": True,
+            },
+            "OCC2": {
+                "result_reason": "DIRECT_QUOTE_ZERO_BID_ASK",
+                "transient": True,
+            },
+        },
+        "eligible_unattempted_symbols": [],
+    })
+    assert reason == "DIRECT_QUOTE_ZERO_BID_ASK"
+
+
+def test_all_accounted_candidates_unaffordable_terminalizes_truthfully():
+    # When EVERY accounted candidate is unaffordable and no candidate remains
+    # eligible, affordability is the truthful terminal reason.
+    reason = resolve_selector_recovery_final_reason({
+        "structural_skip_results": {
+            f"OCC{i}": "STRUCTURAL_CLEARLY_UNAFFORDABLE"
+            for i in range(4)
+        },
+        "attempted_results": {},
+        "eligible_unattempted_symbols": [],
+    })
     assert reason == "NO_AFFORDABLE_CONTRACT"
+
+
+def test_all_accounted_candidates_over_premium_cap_terminalizes_truthfully():
+    reason = resolve_selector_recovery_final_reason({
+        "structural_skip_results": {
+            f"OCC{i}": "STRUCTURAL_PREMIUM_CAP_EXCEEDED"
+            for i in range(4)
+        },
+        "attempted_results": {},
+        "eligible_unattempted_symbols": [],
+    })
+    assert reason == "PREMIUM_CAP_EXCEEDED"
 
 
 @pytest.mark.parametrize(

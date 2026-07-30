@@ -90,6 +90,29 @@ def test_ordinary_request_retains_pre_pr_capacity_even_when_recovery_env_is_40(
     assert ctx.max_chain_calls == 6
 
 
+def test_ordinary_request_retains_pre_pr_default_when_capacity_env_is_unset(
+    monkeypatch,
+):
+    # Pre-PR #401 the ordinary default was five direct quotes. PR #401 must not
+    # let ordinary requests silently inherit the deferred-recovery capacity when
+    # the canonical env is absent (pods, local runners, recovery processes).
+    _clear_capacity_env(monkeypatch)
+    ctx = _new_selector_request_context("SPY", "live")
+    assert ctx.selector_request_kind == SELECTOR_REQUEST_KIND_ORDINARY
+    assert ctx.effective_direct_quote_limit == 5
+    assert ctx.max_direct_quote_calls == 5
+    assert ctx.max_total_elapsed_ms == 15_000
+    assert ctx.max_expiration_calls == 2
+    assert ctx.max_chain_calls == 6
+
+
+def test_selector_request_context_generic_defaults_remain_pre_pr():
+    ctx = SelectorRequestContext(ticker="SPY")
+    assert ctx.max_direct_quote_calls == 5
+    assert ctx.effective_direct_quote_limit == 5
+    assert ctx.max_total_elapsed_ms == 15_000
+
+
 @pytest.mark.parametrize("raw", ["abc", "0", "-7"])
 def test_bad_canonical_falls_back_to_40_not_alias(monkeypatch, raw):
     _clear_capacity_env(monkeypatch)

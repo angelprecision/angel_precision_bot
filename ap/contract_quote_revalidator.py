@@ -209,13 +209,16 @@ def _ctx_update_sink(request_context) -> None:
     sink["elapsed_ms_by_stage"] = dict(getattr(request_context, "elapsed_ms_by_stage", {}) or {})
     counts = sink["provider_call_counts"]
     used = int(counts.get("direct_quote_calls", 0) or 0)
+    # Generic fallback is the ordinary pre-PR #401 default of five. A real
+    # deferred request carries its explicit 40 on the context, so this fallback
+    # never reduces deferred capacity.
     effective = int(
         getattr(
             request_context,
             "effective_direct_quote_limit",
-            getattr(request_context, "max_direct_quote_calls", 40),
+            getattr(request_context, "max_direct_quote_calls", 5),
         )
-        or 40
+        or 5
     )
     remaining = max(0, effective - used)
     sink["direct_quote_calls"] = used
@@ -245,16 +248,20 @@ def _direct_quote_budget_failure(request_context) -> Optional[dict]:
         return None
     started = float(getattr(request_context, "started_at_monotonic", 0.0) or 0.0)
     elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0) if started else 0.0
-    elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 25000) or 25000)
+    # Generic fallbacks are the ordinary pre-PR #401 defaults (elapsed 15000ms,
+    # five direct quotes). A real deferred request carries its explicit 25000ms
+    # / 40-call values on the context, so these fallbacks never reduce deferred
+    # capacity.
+    elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 15000) or 15000)
     counts = getattr(request_context, "provider_call_counts", {}) or {}
     used = int(counts.get("direct_quote_calls", 0) or 0)
     call_limit = int(
         getattr(
             request_context,
             "effective_direct_quote_limit",
-            getattr(request_context, "max_direct_quote_calls", 40),
+            getattr(request_context, "max_direct_quote_calls", 5),
         )
-        or 40
+        or 5
     )
     detail = None
     if elapsed_ms >= elapsed_limit:

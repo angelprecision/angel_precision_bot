@@ -171,8 +171,12 @@ class SelectorRequestContext:
     selector_request_kind: str = "ORDINARY"
     max_expiration_calls: int = 2
     max_chain_calls: int = 6
-    max_direct_quote_calls: int = 20
-    effective_direct_quote_limit: int = 20
+    # Generic dataclass defaults describe an ORDINARY request with no canonical
+    # capacity env present — the pre-PR #401 default of five direct quotes.
+    # Deferred-recovery contexts receive their explicit computed value in
+    # _new_selector_request_context() and never depend on these defaults.
+    max_direct_quote_calls: int = 5
+    effective_direct_quote_limit: int = 5
     direct_quote_budget_source: str = "default"
     direct_quote_budget_conflict: bool = False
     direct_quote_budget_conflict_detail: str | None = None
@@ -718,26 +722,32 @@ def _new_selector_request_context(
     deferred_recovery = request_kind == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
     budget_cfg = _resolve_direct_quote_budget_config()
     # PR #401 recovery capacity is explicit deferred-breach behavior.  Ordinary
-    # selection retains the pre-PR production envelope cap of 20.
+    # selection retains the pre-PR production default of FIVE direct quotes when
+    # the canonical env is absent — never the deferred-recovery capacity.
     #
     # SELECTOR_MAX_DIRECT_QUOTE_CALLS is the canonical behavioral quote-call
     # authority (Amendment 5).  For ordinary requests it operates as a CEILING:
-    # the env can lower the ordinary cap (e.g. test probes, budget-exhaustion
-    # tests) but must never raise it above 20.  For deferred-breach requests
-    # the full env value is the budget (Amendment 4: default 40).
+    # the env can raise the ordinary cap up to 20 or lower it (e.g. test probes,
+    # budget-exhaustion tests) but must never raise it above 20.  For
+    # deferred-breach requests the full env value is the budget (Amendment 4:
+    # default 40).
     #
     # Examples:
-    #   env=40 ordinary → min(20, 40) = 20  (deferred-recovery env ignored)
-    #   env= 1 ordinary → min(20,  1) =  1  (low test probe honoured)
-    #   env not set    → 20 (ordinary default)
+    #   deferred, no env            → 40
+    #   deferred, canonical env=20  → 20
+    #   deferred, canonical env=40  → 40
+    #   ordinary, no env            → 5   (pre-PR #401 default restored)
+    #   ordinary, canonical env=1   → min(20,  1) =  1
+    #   ordinary, canonical env=20  → min(20, 20) = 20
+    #   ordinary, canonical env=40  → min(20, 40) = 20
     if deferred_recovery:
         effective_direct_quote_limit = budget_cfg.effective_limit
     elif budget_cfg.source == "SELECTOR_MAX_DIRECT_QUOTE_CALLS":
         # Canonical env explicitly set: apply as a ceiling for ordinary.
         effective_direct_quote_limit = min(20, budget_cfg.effective_limit)
     else:
-        # Default ordinary envelope: 20 direct quotes.
-        effective_direct_quote_limit = 20
+        # Ordinary default with no canonical env: pre-PR #401 default of five.
+        effective_direct_quote_limit = 5
     context = SelectorRequestContext(
         ticker=str(ticker or ""),
         direct_quote_attempts_remaining=effective_direct_quote_limit,
@@ -932,7 +942,10 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
     if ctx is None:
         return {}
     direct_quote_used = int(ctx.provider_call_counts.get("direct_quote_calls", 0) or 0)
-    effective_direct_quote_limit = int(ctx.effective_direct_quote_limit or ctx.max_direct_quote_calls or 40)
+    # Generic missing-context fallback is the ordinary pre-PR #401 default of
+    # five. A real deferred request carries its explicit 40 on the context, so
+    # this fallback never reduces deferred capacity.
+    effective_direct_quote_limit = int(ctx.effective_direct_quote_limit or ctx.max_direct_quote_calls or 5)
     direct_quote_remaining = max(0, effective_direct_quote_limit - direct_quote_used)
     return {
         "underlying_quote_calls": int(ctx.provider_call_counts.get("underlying_quote_calls", 0) or 0),

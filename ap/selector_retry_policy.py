@@ -887,32 +887,52 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     skipped = data.get("structural_skip_results")
     skipped = skipped if isinstance(skipped, dict) else {}
 
+    # This amendment is surgical: it demotes ONLY affordability so that one
+    # unaffordable candidate cannot terminalize a request while retryable
+    # candidates, budget exhaustion, or non-affordability terminal geometry are
+    # the truthful story. Every OTHER precedence relationship (terminal policy,
+    # non-affordability structural geometry, terminal quality, budget, transient
+    # data, retryable quality) is preserved exactly as it was before PR #401's
+    # amendment. Affordability now terminalizes only when the FULL candidate set
+    # is accounted for and every accounted candidate is an affordability reason.
+    affordability_structural = {
+        "STRUCTURAL_PREMIUM_CAP_EXCEEDED",
+        "STRUCTURAL_CLEARLY_UNAFFORDABLE",
+    }
+
+    # ── Step 2: terminal policy veto ─────────────────────────────────────────
     terminal_policy = next(
         (reason for reason in quality if get_policy(reason).classification == TERMINAL_POLICY),
         None,
     )
     if terminal_policy:
         return terminal_policy
-    for reason in ("NO_AFFORDABLE_CONTRACT", "PREMIUM_CAP_EXCEEDED"):
-        if reason in quality or reason in skipped.values():
-            return reason
+
+    # ── Step 3: non-affordability terminal structural geometry ───────────────
+    # The affordability structural skips are intentionally EXCLUDED here and
+    # resolved by the full-set affordability accounting below. This preserves
+    # the pre-amendment position of DTE/moneyness/delta/policy geometry.
     structural_values = set(skipped.values())
     for structural, canonical in (
         ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
         ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
         ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
         ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
-        ("STRUCTURAL_PREMIUM_CAP_EXCEEDED", "PREMIUM_CAP_EXCEEDED"),
-        ("STRUCTURAL_CLEARLY_UNAFFORDABLE", "NO_AFFORDABLE_CONTRACT"),
     ):
         if structural in structural_values:
             return canonical
+
+    # ── Step 4: terminal quality veto ────────────────────────────────────────
     terminal_quality = next(
         (reason for reason in quality if get_policy(reason).classification == TERMINAL_QUALITY),
         None,
     )
     if terminal_quality:
         return terminal_quality
+
+    # ── Step 5: actual request-budget exhaustion with candidates left ────────
+    # A single affordability skip may not outrank actual exhaustion while
+    # another eligible candidate remains unattempted.
     eligible = list(data.get("eligible_unattempted_symbols") or [])
     if (
         bool(data.get("actual_limit_reached"))
@@ -921,6 +941,7 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     ):
         return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
 
+    # ── Step 6: retryable attempted-data failure ─────────────────────────────
     transient_counts: dict[str, int] = {}
     for record in attempted.values():
         if isinstance(record, dict):
@@ -931,6 +952,8 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
             transient_counts[reason] = transient_counts.get(reason, 0) + 1
     if transient_counts:
         return sorted(transient_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+    # ── Step 7: retryable quality/data failure ───────────────────────────────
     retryable_quality = [
         (str(reason), int(count or 0))
         for reason, count in quality.items()
@@ -938,4 +961,51 @@ def resolve_selector_recovery_final_reason(evidence: dict) -> str:
     ]
     if retryable_quality:
         return sorted(retryable_quality, key=lambda item: (-item[1], item[0]))[0][0]
+
+    # ── Step 8: affordability terminal — only when the FULL candidate set is
+    # accounted for and every accounted candidate is an affordability reason.
+    # Do NOT infer the whole set is unaffordable because one candidate is.
+    no_affordable_reasons = {
+        "NO_AFFORDABLE_CONTRACT",
+        "STRUCTURAL_CLEARLY_UNAFFORDABLE",
+    }
+    premium_cap_reasons = {
+        "PREMIUM_CAP_EXCEEDED",
+        "STRUCTURAL_PREMIUM_CAP_EXCEEDED",
+    }
+    affordability_reasons = no_affordable_reasons | premium_cap_reasons
+
+    accounted_reasons: list[str] = []
+    for record in attempted.values():
+        if isinstance(record, dict):
+            accounted_reasons.append(str(record.get("result_reason") or ""))
+        else:
+            accounted_reasons.append(str(record or ""))
+    accounted_reasons.extend(str(value or "") for value in skipped.values())
+    accounted_reasons.extend(str(reason or "") for reason in quality.keys())
+    accounted_reasons = [reason for reason in accounted_reasons if reason]
+
+    # Conditions are guaranteed here: eligible-empty is required below; any
+    # retryable attempted-data or quality failure already returned at steps 6-7;
+    # terminal-policy affordability (NO_AFFORDABLE_CONTRACT in quality) already
+    # returned at step 2, and terminal-quality PREMIUM_CAP_EXCEEDED in quality
+    # already returned at step 4 (condition-6 terminal carve-outs).
+    if (
+        not eligible
+        and accounted_reasons
+        and all(reason in affordability_reasons for reason in accounted_reasons)
+    ):
+        if any(reason in no_affordable_reasons for reason in accounted_reasons):
+            return "NO_AFFORDABLE_CONTRACT"
+        return "PREMIUM_CAP_EXCEEDED"
+
+    # A fully affordability-structural set with candidates still eligible (so
+    # the budget rule above did not fire) preserves the pre-amendment terminal
+    # mapping rather than silently degrading to unknown.
+    if structural_values and structural_values <= affordability_structural:
+        if "STRUCTURAL_CLEARLY_UNAFFORDABLE" in structural_values:
+            return "NO_AFFORDABLE_CONTRACT"
+        return "PREMIUM_CAP_EXCEEDED"
+
+    # ── Step 9: unknown recovery failure ─────────────────────────────────────
     return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"

@@ -182,54 +182,121 @@ def validate_retry_market_quote_authority(
     # HTTPS transport is authoritative for a source-less quote; contradictory
     # explicit metadata remains rejected above.
     resolved_source = raw_source or "tradier_live"
-    raw_timestamp = (
+
+    # Validate the timestamp of EVERY price leg downstream market truth may use.
+    # The retry market gate reads the bid for PUT trigger truth, the ask for
+    # CALL trigger truth, and bid+ask for midpoint truth. A single-timestamp
+    # "first nonblank wins" selection could accept a stale bid while reading a
+    # fresh ask (or vice versa); the oldest USED leg must control freshness.
+    #
+    # Common/provider-level timestamp candidates. bid_date/ask_date are
+    # leg-specific and are deliberately excluded from this common chain.
+    common_timestamp_raw = (
         quote.get("provider_timestamp")
         or quote.get("quote_timestamp")
         or quote.get("timestamp")
-        or quote.get("ask_date")
-        or quote.get("bid_date")
         or quote.get("trade_date")
     )
-    try:
-        if isinstance(raw_timestamp, datetime):
-            observed = raw_timestamp
-        elif isinstance(raw_timestamp, (int, float)):
-            numeric = float(raw_timestamp)
-            if numeric > 10_000_000_000:
-                numeric /= 1000.0
-            observed = datetime.fromtimestamp(numeric, tz=timezone.utc)
-        else:
-            observed = datetime.fromisoformat(
-                str(raw_timestamp).strip().replace("Z", "+00:00")
-            )
-        if observed.tzinfo is None:
-            raise ValueError("provider timestamp missing timezone")
-        observed = observed.astimezone(timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        return {"valid": False, "reason": "MARKET_QUOTE_TIMESTAMP_UNPROVEN"}
+
+    def _finite_positive(value) -> bool:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(numeric) and numeric > 0.0
+
+    def _parse_provider_timestamp(raw) -> Optional[datetime]:
+        try:
+            if isinstance(raw, datetime):
+                observed = raw
+            elif isinstance(raw, (int, float)):
+                numeric = float(raw)
+                if numeric > 10_000_000_000:
+                    numeric /= 1000.0
+                observed = datetime.fromtimestamp(numeric, tz=timezone.utc)
+            else:
+                observed = datetime.fromisoformat(
+                    str(raw).strip().replace("Z", "+00:00")
+                )
+            if observed.tzinfo is None:
+                # Naive datetime / timezone-less ISO string is not accepted.
+                return None
+            return observed.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    bid_used = _finite_positive(quote.get("bid"))
+    ask_used = _finite_positive(quote.get("ask"))
+
+    # Each required leg is (diagnostic_field, raw_timestamp_source).
+    required_legs: list = []
+    if bid_used:
+        required_legs.append(
+            ("bid", quote.get("bid_date") or common_timestamp_raw)
+        )
+    if ask_used:
+        required_legs.append(
+            ("ask", quote.get("ask_date") or common_timestamp_raw)
+        )
+    if not required_legs:
+        # No positive bid or ask: preserve existing authority behavior by
+        # validating the common timestamp. Missing/zero prices remain the
+        # responsibility of the downstream market-validity gate.
+        required_legs.append(("common", common_timestamp_raw))
+
+    parsed_legs: list = []
+    for leg_name, raw in required_legs:
+        observed = _parse_provider_timestamp(raw)
+        if observed is None:
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_TIMESTAMP_UNPROVEN",
+            }
+        parsed_legs.append((leg_name, observed))
+
     current = (now or _now_utc()).astimezone(timezone.utc)
-    age_ms = (current - observed).total_seconds() * 1000.0
-    if not math.isfinite(age_ms) or age_ms < -float(max_future_skew_ms):
-        return {
-            "valid": False,
-            "reason": "MARKET_QUOTE_TIMESTAMP_FUTURE",
-            "provider_timestamp": observed.isoformat(),
-        }
-    if age_ms > float(max_age_ms):
-        return {
-            "valid": False,
-            "reason": "MARKET_QUOTE_STALE",
-            "provider_timestamp": observed.isoformat(),
-            "quote_age_ms": age_ms,
-        }
-    return {
+
+    # Age is calculated independently for every required timestamp.
+    aged_legs: list = []
+    for leg_name, observed in parsed_legs:
+        age_ms = (current - observed).total_seconds() * 1000.0
+        if not math.isfinite(age_ms) or age_ms < -float(max_future_skew_ms):
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_TIMESTAMP_FUTURE",
+                "provider_timestamp": observed.isoformat(),
+                "timestamp_field": leg_name,
+            }
+        aged_legs.append((age_ms, leg_name, observed))
+    for age_ms, leg_name, observed in aged_legs:
+        if age_ms > float(max_age_ms):
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_STALE",
+                "provider_timestamp": observed.isoformat(),
+                "quote_age_ms": age_ms,
+                "timestamp_field": leg_name,
+            }
+
+    # The oldest used price leg controls freshness. Do not average or pick the
+    # newest timestamp.
+    oldest_age_ms, oldest_leg, oldest_observed = max(
+        aged_legs, key=lambda item: item[0]
+    )
+    result = {
         "valid": True,
         "reason": "MARKET_QUOTE_AUTHORITY_PROVEN",
-        "provider_timestamp": observed.isoformat(),
-        "quote_age_ms": max(0.0, age_ms),
+        "provider_timestamp": oldest_observed.isoformat(),
+        "quote_age_ms": max(0.0, oldest_age_ms),
         "quote_source": resolved_source,
         "transport_url": base_url,
     }
+    for leg_name, observed in parsed_legs:
+        if leg_name == "bid":
+            result["bid_provider_timestamp"] = observed.isoformat()
+        elif leg_name == "ask":
+            result["ask_provider_timestamp"] = observed.isoformat()
+    return result
 
 
 def classify_market_truth(result: GateResult) -> MarketTruthAuthority:
