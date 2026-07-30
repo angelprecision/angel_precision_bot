@@ -586,6 +586,13 @@ class TestSelectorIntegration:
         assert diagnostics["direct_quote_candidate_ranking"][8]["symbol"] == expected_symbol
 
     def test_no_survivor_selector_replay_terminates_budget_exhausted_but_keeps_row_reasons(self, monkeypatch):
+        # ORDINARY selector requests MUST NOT adopt recovery-only final reasons
+        # (Blocker 2 scopes resolve_selector_recovery_final_reason strictly to
+        # deferred-breach contexts). The truthful ordinary terminal reason for
+        # a no-survivor replay is the aggregated top-quality rejection
+        # (CHAIN_ROW_ZERO_BID_ASK), not the deferred-recovery
+        # SELECTOR_REQUEST_BUDGET_EXHAUSTED that previously leaked from the
+        # recovery resolver.
         chain, _ = _production_shaped_chain("CALL")
 
         selected, selector, broker, plan = _select_with_chain(
@@ -600,7 +607,9 @@ class TestSelectorIntegration:
         assert broker.get_quote.call_count == 20
         failure = plan["metadata"]["selector_failure"]
         diagnostics = failure["selection_diagnostics"]
-        assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert failure["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        # The budget diagnostics remain preserved even though the final reason
+        # is the truthful ordinary quality rejection.
         assert diagnostics["direct_quote_unattempted_count"] > 0
         assert diagnostics["direct_quote_budget"]["used"] == 20
         assert diagnostics["direct_quote_budget"]["remaining"] == 0

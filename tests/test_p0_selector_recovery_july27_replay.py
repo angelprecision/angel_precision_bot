@@ -653,9 +653,14 @@ def test_july27_runtime_selector_replay(
     assert all(count <= 40 for count in direct_calls_by_attempt)
     assert broker.submit_order.call_count == 0
     if clearly_unaffordable:
-        assert sum(direct_calls_by_attempt) == 0
-        assert structural_skips == candidate_count
-        assert final_reason == "NO_AFFORDABLE_CONTRACT"
+        # A high chain ask MUST NOT suppress the fresh direct quote at the
+        # structural seam (removed price-derived skips). The direct quote fires
+        # for every candidate, the broker fixture returns zero bid/ask for
+        # non-valid symbols, and the truthful terminal reason is the retryable
+        # data reason, not an inferred affordability terminal.
+        assert sum(direct_calls_by_attempt) == candidate_count
+        assert structural_skips == 0
+        assert final_reason == "DIRECT_QUOTE_ZERO_BID_ASK"
     else:
         assert len(cursor["attempted_symbols"]) == candidate_count
         assert final_reason == "DIRECT_QUOTE_ZERO_BID_ASK"

@@ -1250,15 +1250,15 @@ def _structural_direct_quote_skip(
     if reason is None and symbol and request_context is not None:
         if symbol in request_context.revalidated_contracts:
             reason = "STRUCTURAL_ALREADY_ATTEMPTED"
-    if (
-        reason is None
-        and estimated_cost is not None
-        and selector_budget > 0
-        and estimated_cost > float(selector_budget) * (1.0 + headroom)
-    ):
-        reason = "STRUCTURAL_CLEARLY_UNAFFORDABLE"
-    if reason is None and estimated_cost is not None and estimated_cost > float(ticker_cap):
-        reason = "STRUCTURAL_PREMIUM_CAP_EXCEEDED"
+    # Affordability and premium-cap MUST NOT be derived from the chain ask at
+    # this seam: this prefilter is only reached because the chain row already
+    # failed a revalidatable quote-quality rule (zero/missing bid/ask, etc.).
+    # A stale or broken chain ask cannot suppress the fresh direct quote that
+    # may itself be affordable. Affordability and premium cap are authoritative
+    # only against the fresh direct-quote ask, which the existing live-quote
+    # quality / sizing paths evaluate after _revalidate_direct() succeeds.
+    # chain_ask / estimated_contract_cost / ticker_cap remain in diagnostics
+    # below but must never gate the provider call.
     if reason is None:
         return None
 
@@ -3458,7 +3458,19 @@ class APContractSelectionEngine:
                     )
             except Exception:
                 pass
-            if request_context is not None:
+            # The recovery final-reason resolver applies deferred-recovery-only
+            # precedence (budget exhaustion, transient dominance, full-set
+            # affordability accounting). Running it against ORDINARY selector
+            # failures would rewrite the truthful base-SHA _obs_reason and
+            # pollute paper/live diagnostics and downstream retry classification.
+            # Scope it strictly to deferred-breach contexts.
+            if (
+                request_context is not None
+                and str(
+                    getattr(request_context, "selector_request_kind", "")
+                ).strip().upper()
+                == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+            ):
                 try:
                     from ap.selector_retry_policy import (
                         resolve_selector_recovery_final_reason,
