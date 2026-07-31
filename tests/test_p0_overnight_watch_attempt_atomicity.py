@@ -686,6 +686,138 @@ def test_terminal_proof_missing_identity_fields_is_conflict():
     assert overnight._attempt_count(scope) == 1
 
 
+# ── isolated identity-field-by-field fences (every other field valid) ─────────
+# Each of these proves ONE missing/wrong identity field independently blocks the
+# replacement claim. "Missing identity fields" bundled above fails via client
+# mismatch first; these tests prove kind AND local_order_id fail closed on their
+# own, even when everything else is valid.
+
+def test_terminal_proof_missing_kind_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": {
+            "local_order_id": "prior-1",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+            "status": "EXPIRED",
+        }
+    })
+    _watch_calls_before = 0  # atomic-claim path never calls watchers directly
+
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    assert claim.reason == "prior_order_kind_missing", claim.reason
+
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_state(scope) == S_RETRYABLE
+    # No OSM create, no watcher call, no broker submit occurs on the claim path.
+    assert _watch_calls_before == 0
+
+
+def test_terminal_proof_blank_kind_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": {
+            "local_order_id": "prior-1",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+            "kind": "",
+            "status": "EXPIRED",
+        }
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    assert claim.reason == "prior_order_kind_missing", claim.reason
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_state(scope) == S_RETRYABLE
+
+
+def test_terminal_proof_missing_local_order_id_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": {
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+            "kind": "ENTRY",
+            "status": "EXPIRED",
+        }
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    assert claim.reason == "prior_order_local_id_missing", claim.reason
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_state(scope) == S_RETRYABLE
+
+
+def test_terminal_proof_blank_local_order_id_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": {
+            "local_order_id": "",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+            "kind": "ENTRY",
+            "status": "EXPIRED",
+        }
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    assert claim.reason == "prior_order_local_id_missing", claim.reason
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_state(scope) == S_RETRYABLE
+
+
+def test_terminal_proof_wrong_nonblank_local_order_id_is_conflict():
+    """OSM lookup key is 'prior-1' but the row's own local_order_id names a
+    different order → not proof of THIS order's termination. Mismatch."""
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": {
+            "local_order_id": "different-order",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+            "kind": "ENTRY",
+            "status": "EXPIRED",
+        }
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    assert claim.reason == "prior_order_local_id_mismatch", claim.reason
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_state(scope) == S_RETRYABLE
+
+
+def test_terminal_proof_exact_valid_identity_control_acquires():
+    """Positive control: all identity fields match, kind=ENTRY, status=EXPIRED
+    → exactly one acquisition, count 1 → 2."""
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": {
+            "local_order_id": "prior-1",
+            "client_id": CLIENT,
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+            "kind": "ENTRY",
+            "status": "EXPIRED",
+        }
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == ACQUIRED, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 2
+    assert overnight._attempt_state(scope) == S_IN_PROGRESS
+
+
 # ── blocker 3: malformed CONTAINER / scope-value shapes never acquire ─────────
 
 @pytest.mark.parametrize(

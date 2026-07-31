@@ -1465,8 +1465,11 @@ def _local_order_terminal_state(
         (expected_client_id, expected_execution_mode, expected_canonical_signal_id)
     )
     if requires_identity:
+        expected_order_id = str(local_order_id or "").strip()
         row_order_id = str(row.get("local_order_id") or "").strip()
-        if row_order_id and row_order_id != str(local_order_id).strip():
+        if not row_order_id:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_local_id_missing"
+        if row_order_id != expected_order_id:
             return WATCH_ATTEMPT_CONFLICT, "prior_order_local_id_mismatch"
         row_client = str(row.get("client_id") or "").strip()
         if str(expected_client_id or "").strip() and row_client != str(expected_client_id).strip():
@@ -1480,8 +1483,13 @@ def _local_order_terminal_state(
         if exp_canonical and row_canonical != exp_canonical:
             return WATCH_ATTEMPT_CONFLICT, "prior_order_canonical_mismatch"
         row_kind = str(row.get("kind") or "").strip().upper()
-        if row_kind and row_kind != "ENTRY":
-            return WATCH_ATTEMPT_CONFLICT, f"prior_order_kind_not_entry:{row_kind}"
+        if not row_kind:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_kind_missing"
+        if row_kind != "ENTRY":
+            return (
+                WATCH_ATTEMPT_CONFLICT,
+                f"prior_order_kind_not_entry:{row_kind}",
+            )
 
     status = str(row.get("status") or "").strip().upper()
     if status in _TERMINAL_ENTRY_STATUSES:
