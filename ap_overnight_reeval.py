@@ -385,28 +385,36 @@ def _terminalize_stale_pending_orders(
         if not oid:
             return False, "stale_row_missing_local_order_id"
 
+        # The classifier read carries the exact status and updated_ts (row
+        # version) the classifier saw. The cleanup write must atomically fence
+        # on both — if either changed between the classifier read and this
+        # write, another actor (broker submit intent, recovery owner, anything)
+        # touched the row and terminalizing here would kill the rightful new
+        # owner. expire_stale_pending_entry_cas() preserves the pending-entry
+        # ownership guard AND adds row-version fencing; any refusal is a
+        # legitimate ownership signal and MUST fail the cleanup.
+        expected_status = str((_row or {}).get("status") or "").strip().upper()
+        expected_updated_ts = (_row or {}).get("updated_ts")
+        if not expected_status:
+            return False, f"stale_row_missing_status:{oid}"
+        if expected_updated_ts is None or (
+            isinstance(expected_updated_ts, str) and not expected_updated_ts.strip()
+        ):
+            # Without a row-version fence the CAS can't detect a concurrent
+            # writer. Refuse rather than falling back to a weaker write.
+            return False, f"stale_row_missing_updated_ts:{oid}"
+
         terminalized = False
+        failure_detail = ""
         try:
-            # Only the ownership-guarded pending-entry APIs may terminalize a
-            # pending ENTRY. Both expire_pending_entry() and cancel_pending_
-            # entry() intentionally refuse when broker or recovery ownership
-            # has become active between our classifier read and this write —
-            # that refusal is the whole point of the guard. The prior raw
-            # transition('EXPIRED', ...) fallback bypassed those guards and
-            # could force a live recovery-owned row terminal, killing the
-            # rightful owner and authorizing a replacement local ENTRY. Never
-            # do that. A refusal here is a legitimate ownership signal and
-            # must fail the cleanup so the caller does NOT release the
-            # candidate.
-            if hasattr(order_state_machine, "expire_pending_entry"):
-                terminalized = bool(
-                    order_state_machine.expire_pending_entry(oid, reason=reason)
+            if hasattr(order_state_machine, "expire_stale_pending_entry_cas"):
+                ok, failure_detail = order_state_machine.expire_stale_pending_entry_cas(
+                    oid,
+                    expected_status=expected_status,
+                    expected_updated_ts=expected_updated_ts,
+                    reason=reason,
                 )
-            if (not terminalized
-                    and hasattr(order_state_machine, "cancel_pending_entry")):
-                terminalized = bool(
-                    order_state_machine.cancel_pending_entry(oid, reason=reason)
-                )
+                terminalized = bool(ok)
         except Exception as _cleanup_exc:
             log.error(
                 "pending_entry_stale_terminalize_exception local_order_id=%s "
@@ -416,7 +424,10 @@ def _terminalize_stale_pending_orders(
             return False, f"terminalize_exception:{type(_cleanup_exc).__name__}"
 
         if not terminalized:
-            return False, f"terminalize_returned_false:{oid}"
+            return False, (
+                f"terminalize_returned_false:{oid}:"
+                f"{failure_detail or 'no_cas_helper'}"
+            )
 
         # Verify readback: the row must actually be in a terminal status.
         try:
@@ -531,7 +542,7 @@ def _classify_pending_entry_for_overnight(
     _sql = (
         "SELECT local_order_id, client_id, "
         "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
-        "status, broker_order_id, submitted_ts, created_ts, meta, "
+        "status, broker_order_id, submitted_ts, created_ts, updated_ts, meta, "
         "direction, canonical_signal_id "
         "FROM orders "
         "WHERE symbol = %s AND kind = 'ENTRY' "
@@ -602,24 +613,75 @@ def _classify_pending_entry_for_overnight(
             continue
 
         row_local_oid = str(row.get("local_order_id") or "").strip()
-        _watcher_owned = (
-            bool(_has_order_fn(row_local_oid))
-            if callable(_has_order_fn) and row_local_oid
-            else False
-        )
+        # P1: a watcher-registry exception is NOT evidence-of-no-owner. A
+        # registry/lock/internal-state failure must surface as a structured
+        # PENDING_OWNER_DB_ERROR so the caller preserves the exact diagnostic
+        # and never authorizes a destructive stale-row cleanup on unproven
+        # ownership.
+        if callable(_has_order_fn) and row_local_oid:
+            try:
+                _watcher_owned = bool(_has_order_fn(row_local_oid))
+            except Exception as _wexc:
+                log.error(
+                    "[%s] _classify_pending_entry_for_overnight: watcher "
+                    "registry lookup failed local_order_id=%s err=%s",
+                    ticker, row_local_oid, _wexc,
+                )
+                return _PendingEntryOutcome(
+                    "PENDING_OWNER_DB_ERROR",
+                    (),
+                    f"watcher_registry_error:{type(_wexc).__name__}",
+                )
+        else:
+            _watcher_owned = False
+
+        # P1: unreadable / unexpected-shape metadata is NOT proof of "no
+        # owner". For a destructive stale-row cleanup path, an unparseable
+        # blob is ownership CONFLICT — the row must not be terminalized. A
+        # JSONB scalar (string/list/number/bool) reaches Python as a non-dict
+        # value even when JSON decoding succeeds; that shape carries no
+        # ownership evidence we can read, so it too must fail closed.
         try:
-            _meta = row.get("meta") or {}
-            if isinstance(_meta, str):
+            _meta_raw = row.get("meta")
+            if _meta_raw is None or (
+                isinstance(_meta_raw, str) and not _meta_raw.strip()
+            ):
+                _meta = {}
+            elif isinstance(_meta_raw, dict):
+                _meta = _meta_raw
+            elif isinstance(_meta_raw, str):
                 import json as _json
-                _meta = _json.loads(_meta) if _meta.strip() else {}
-            # P0-4: real ownership check against production fields + lease
-            # freshness — stale timestamps and dead in-flight leases no longer
-            # register as owned; live materialization/recovery owners are
-            # honored regardless of which retry-timestamp field name is used.
+                _decoded = _json.loads(_meta_raw)
+                if not isinstance(_decoded, dict):
+                    _saw_conflict = True
+                    _failure_reason = (
+                        _failure_reason
+                        or f"meta_non_object_shape:{type(_decoded).__name__}"
+                    )
+                    continue
+                _meta = _decoded
+            else:
+                # Any other shape (list, int, float, bool coming back from
+                # the driver) is unreadable ownership evidence — fail closed.
+                _saw_conflict = True
+                _failure_reason = (
+                    _failure_reason
+                    or f"meta_unexpected_type:{type(_meta_raw).__name__}"
+                )
+                continue
             _recovery_owned, _owner_reason = _pending_owner_lease_active(_meta)
-        except Exception:
-            _recovery_owned = False
-            _owner_reason = "meta_parse_error"
+        except Exception as _mexc:
+            log.error(
+                "[%s] _classify_pending_entry_for_overnight: metadata parse "
+                "failed local_order_id=%s err=%s",
+                ticker, row_local_oid, _mexc,
+            )
+            _saw_conflict = True
+            _failure_reason = (
+                _failure_reason
+                or f"meta_parse_exception:{type(_mexc).__name__}"
+            )
+            continue
 
         result = _classify_pending_entry_ownership(
             row,
@@ -646,6 +708,7 @@ def _classify_pending_entry_for_overnight(
                 "client_id": row_client,
                 "execution_mode": row_mode,
                 "status": str(row.get("status") or "").strip().upper(),
+                "updated_ts": row.get("updated_ts"),
                 "canonical_signal_id": str(row.get("canonical_signal_id") or "").strip(),
                 "direction": str(row.get("direction") or "").strip().upper(),
                 "created_ts": row.get("created_ts"),

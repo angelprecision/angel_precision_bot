@@ -933,6 +933,121 @@ class APOrderStateMachine:
             return False
         return self.transition(local_order_id, OrderStatus.CANCELED, last_error=reason)
 
+    def expire_stale_pending_entry_cas(
+        self,
+        local_order_id: str,
+        *,
+        expected_status: str,
+        expected_updated_ts,
+        reason: str,
+    ) -> tuple[bool, str]:
+        """Atomic stale-pending-entry expiration with row-version fencing.
+
+        A CAS variant of expire_pending_entry() intended for the overnight-reeval
+        stale-release path. Preserves the ownership guard (broker/recovery
+        ownership always blocks) AND additionally atomically fences the write on:
+
+          - the exact status the classifier observed
+          - the exact updated_ts (row version) the classifier observed
+
+        If another actor mutated the row between the classifier read and this
+        write (a broker submit intent landed, a recovery owner claimed it, or
+        anything else updated the row), the CAS matches zero rows and the
+        method returns (False, "row_version_changed"). No transition is
+        attempted through any other path — the caller MUST treat this as a
+        cleanup failure and MUST NOT authorize a replacement.
+
+        Returns (ok, failure_reason). failure_reason is a stable operator
+        diagnostic when ok is False.
+        """
+        if not local_order_id:
+            return False, "missing_local_order_id"
+        if not expected_status:
+            return False, "missing_expected_status"
+
+        current = self._get_order(local_order_id)
+        if not current:
+            return False, "order_not_found"
+        current = dict(current)
+        kind = str(current.get("kind") or "").upper()
+        status = str(current.get("status") or "").upper()
+        if kind != "ENTRY":
+            log.critical(
+                "[%s] expire_stale_pending_entry_cas blocked -- wrong kind %s | %s",
+                self.client_id, kind, local_order_id,
+            )
+            return False, f"wrong_kind:{kind}"
+        if status == OrderStatus.EXPIRED:
+            return True, "already_expired"
+        if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
+            return False, f"not_pending:{status}"
+        if str(status) != str(expected_status).upper():
+            return False, f"status_changed:{status}"
+        if self._pending_entry_has_submit_or_recovery_owner(current):
+            log.warning(
+                "[%s] expire_stale_pending_entry_cas refused -- broker/recovery "
+                "ownership active | %s", self.client_id, local_order_id,
+            )
+            return False, "broker_or_recovery_owner_active"
+
+        # Row-version fence. updated_ts is either an ISO string, a datetime,
+        # or None; compare canonicalized string representations so timezone
+        # normalization / serialization does not create phantom mismatches.
+        def _canon(v):
+            if v is None:
+                return ""
+            try:
+                if hasattr(v, "isoformat"):
+                    return v.isoformat()
+            except Exception:
+                pass
+            return str(v)
+
+        observed = _canon(current.get("updated_ts"))
+        expected = _canon(expected_updated_ts)
+        if not expected:
+            return False, "missing_expected_updated_ts"
+        if observed != expected:
+            return False, "row_version_changed"
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "UPDATE orders "
+                    "SET status = %s, updated_ts = NOW(), last_error = %s "
+                    "WHERE local_order_id = %s "
+                    "AND client_id = %s "
+                    "AND kind = 'ENTRY' "
+                    "AND status = %s "
+                    "AND updated_ts = %s",
+                    (
+                        OrderStatus.EXPIRED,
+                        reason,
+                        local_order_id,
+                        self.client_id,
+                        expected_status,
+                        expected_updated_ts,
+                    ),
+                )
+                return c.rowcount
+
+        try:
+            rowcount = run_with_retry(_fn) or 0
+        except Exception as exc:
+            log.error(
+                "[%s] expire_stale_pending_entry_cas: DB exception %s | %s",
+                self.client_id, exc, local_order_id,
+            )
+            return False, f"db_exception:{type(exc).__name__}"
+
+        if int(rowcount) != 1:
+            # Zero rows updated means the observed row is no longer at the
+            # observed version — another actor beat us to it. Do NOT retry
+            # with a weaker condition; report the conflict up.
+            return False, "cas_lost_row_version_changed"
+
+        return True, ""
+
     @staticmethod
     def _pending_entry_has_submit_or_recovery_owner(order: dict) -> bool:
         """Protect generic pending cleanup from broker-ambiguous ownership."""

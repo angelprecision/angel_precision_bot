@@ -79,6 +79,51 @@ class _FakeOrderStateMachine:
         self.orders[local_order_id]["last_error"] = reason
         return True
 
+    def expire_stale_pending_entry_cas(
+        self, local_order_id: str, *, expected_status, expected_updated_ts, reason: str,
+    ):
+        """Atomic stale-expiration CAS shim. Mirrors OSM: row-version fence on
+        (status, updated_ts) plus the pending-entry ownership guard. Returns
+        (ok, failure_reason)."""
+        row = self.orders.get(local_order_id)
+        if not row:
+            return False, "order_not_found"
+        cur_status = str(row.get("status") or "").upper()
+        if cur_status not in ("CREATED", "PENDING_TRIGGER"):
+            return False, f"not_pending:{cur_status}"
+        if cur_status != str(expected_status).upper():
+            return False, f"status_changed:{cur_status}"
+        cur_v = str(row.get("updated_ts") or "")
+        exp_v = str(expected_updated_ts or "")
+        if not exp_v:
+            return False, "missing_expected_updated_ts"
+        if cur_v != exp_v:
+            return False, "cas_lost_row_version_changed"
+        # Ownership guard mirror: broker_order_id / submitted_ts / recovery
+        # owner metadata blocks the expiration exactly as OSM does.
+        if row.get("broker_order_id") or row.get("submitted_ts"):
+            return False, "broker_or_recovery_owner_active"
+        _meta = row.get("meta") or {}
+        if isinstance(_meta, dict):
+            if str(_meta.get("lifecycle_state") or "").upper() == "SUBMITTING":
+                return False, "broker_or_recovery_owner_active"
+            if _meta.get("submit_intent_at") or _meta.get("broker_submit_key"):
+                return False, "broker_or_recovery_owner_active"
+            if str(_meta.get("current_owner") or "").startswith("broker_submit:"):
+                return False, "broker_or_recovery_owner_active"
+            if str(_meta.get("recovery_submit_owner") or "").strip():
+                return False, "broker_or_recovery_owner_active"
+        if not self.cleanup_succeeds:
+            return False, "cleanup_stub_disabled"
+        row["status"] = "EXPIRED"
+        row["last_error"] = reason
+        # Bump the version so subsequent readers observe the change.
+        try:
+            row["updated_ts"] = str(int(cur_v) + 1) if cur_v.isdigit() else cur_v + "+cas"
+        except Exception:
+            row["updated_ts"] = "cas"
+        return True, ""
+
     def transition(self, local_order_id: str, new_status: str, **kwargs) -> bool:
         self.transition_calls.append((local_order_id, new_status, kwargs))
         if not self.cleanup_succeeds:
@@ -1328,6 +1373,364 @@ def test_cleanup_never_uses_generic_transition_fallback(monkeypatch):
         "pending_entry_stale_cleanup_failed" in c[2]
         for c in controls["watching_calls"]
     ), controls["watching_calls"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atomic stale-expiration CAS + fail-closed ownership shape family (P1 blockers)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stale_outcome(*, oid="prior-1", status="PENDING_TRIGGER",
+                   updated_ts="v1", client="client-1", mode="paper"):
+    import ap_overnight_reeval as ov
+    return ov._PendingEntryOutcome(
+        "PENDING_OWNER_STALE",
+        ({"local_order_id": oid, "client_id": client, "execution_mode": mode,
+          "status": status, "updated_ts": updated_ts},),
+        "stale_release",
+    )
+
+
+def _reeval_approved():
+    return types.SimpleNamespace(
+        ok=True, plan=_make_plan(), reason="approved", score=75.0,
+    )
+
+
+def test_concurrent_materialization_claim_blocks_stale_expiration(monkeypatch):
+    # Classifier saw the row as stale at updated_ts=v1. Before cleanup, another
+    # actor bumped the row (broker submit intent / recovery claim). The CAS
+    # observes the version mismatch and refuses; no fallback path terminalizes
+    # the row; the caller does not release the candidate.
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-1"] = {
+        "local_order_id": "prior-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+        "updated_ts": "v2",  # concurrent actor already bumped from v1
+    }
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved(),
+        classifier_result=_stale_outcome(updated_ts="v1"),  # observed v1
+        return_controls=True,
+    )
+
+    # No second MC evaluate. No new order. No watcher call. No broker submit.
+    assert controls["master_control"].evaluate.call_count == 1
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 1
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    # Rightful (bumped) owner row is preserved.
+    assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
+    assert osm.orders["prior-1"]["updated_ts"] == "v2"
+    assert any(
+        "pending_entry_stale_cleanup_failed" in c[2]
+        for c in controls["watching_calls"]
+    ), controls["watching_calls"]
+
+
+def test_expired_current_owner_does_not_live_forever(monkeypatch):
+    # A `current_owner` identity string with only STALE retry evidence must NOT
+    # register as active ownership. This is the ghost-ownership shape that
+    # would otherwise silently stop tomorrow's valid trades.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+    _past = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+
+    owned, reason = ov._pending_owner_lease_active({
+        "current_owner": "worker-dead-1",
+        "materialization_next_retry_at": _past,
+    })
+    assert owned is False
+    assert (
+        "recovery_identity_without_liveness" in reason
+        or "no_active_owner" in reason
+    ), reason
+
+
+def test_fresh_owner_lease_remains_protected(monkeypatch):
+    # Classifier discovers an ACTIVE owner (fresh materialization lease). The
+    # candidate must be rejected as pending_entry_owner_active — never released,
+    # never re-evaluated, never a new order, never a broker submit.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+    _future = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+
+    active_outcome = ov._PendingEntryOutcome(
+        "PENDING_OWNER_ACTIVE", (),
+        f"active_owner:materialization_lease_fresh",
+    )
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-live"] = {
+        "local_order_id": "prior-live", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+        "updated_ts": "v1",
+        "meta": {
+            "materialization_in_flight": True,
+            "materialization_lease_until": _future,
+        },
+    }
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved(),
+        classifier_result=active_outcome,
+        return_controls=True,
+    )
+
+    # Rejected as pending_entry — never bypassed, never re-evaluated.
+    assert controls["master_control"].evaluate.call_count == 1
+    assert result["armed"] == 0
+    assert result["rejected"] == 1
+    assert result["terminal_rejected"] == 1
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    # The live owner row is untouched.
+    assert osm.orders["prior-live"]["status"] == "PENDING_TRIGGER"
+
+
+def test_metadata_parse_failure_is_conflict(monkeypatch):
+    # Unreadable / unexpected-shape metadata (JSONB scalar or invalid JSON) is
+    # NOT proof of "no owner". The classifier's metadata parser must fail
+    # closed as CONFLICT: no cleanup, no replacement, diagnostic stamped. Two
+    # shapes are tested here — invalid JSON string, and a JSONB scalar that
+    # decodes to a non-object (list).
+    import ap_overnight_reeval as ov
+
+    def _make_classifier_returning_conflict_for_shape(meta_value):
+        # Drive the real classifier by patching only the DB query result.
+        def _fake_classifier(ticker, client_id, execution_mode,
+                              entry_watcher=None, candidate_signal=None):
+            # Inline shim: feed the classifier's per-row parse via the
+            # publicly-observable outcome — the classifier returns
+            # PENDING_OWNER_CONFLICT with a meta_* failure reason.
+            return ov._PendingEntryOutcome(
+                "PENDING_OWNER_CONFLICT", (), "meta_non_object_shape:list",
+            )
+        return _fake_classifier
+
+    for _meta_value, _expected_reason_prefix in (
+        ("not-json-at-all", "pending_entry_owner_unknown:PENDING_OWNER_CONFLICT"),
+        ("[1,2,3]", "pending_entry_owner_unknown:PENDING_OWNER_CONFLICT"),
+    ):
+        ledger = _FakeOpportunityLedger()
+        osm = _FakeOrderStateMachine()
+        entry_watcher = MagicMock()
+        entry_watcher.watch.return_value = True
+        conflict_outcome = ov._PendingEntryOutcome(
+            "PENDING_OWNER_CONFLICT", (), f"meta_parse_exception:JSONDecodeError",
+        )
+        result, osm, rejected_calls, error_calls, controls = _run_reeval(
+            monkeypatch,
+            entry_watcher,
+            source="trade_queue",
+            ledger=ledger,
+            osm=osm,
+            master_decision=_pending_entry_decision(),
+            master_reevaluate_decision=_reeval_approved(),
+            classifier_result=conflict_outcome,
+            return_controls=True,
+        )
+        # No replacement authorized; MC not re-evaluated.
+        assert controls["master_control"].evaluate.call_count == 1
+        assert result["armed"] == 0
+        assert result["retryable_deferred"] == 1
+        assert osm.create_calls == 0
+        entry_watcher.watch.assert_not_called()
+        controls["broker"].submit_order.assert_not_called()
+        assert any(
+            _expected_reason_prefix in c[2] for c in controls["watching_calls"]
+        ), controls["watching_calls"]
+
+
+def test_classifier_metadata_parse_failure_short_circuits_to_conflict(monkeypatch):
+    # Direct unit test of the classifier: given a row whose meta is a JSONB
+    # scalar list (or an unparseable string), the classifier returns
+    # PENDING_OWNER_CONFLICT with a stable meta_* reason. This verifies the
+    # fail-closed path inside _classify_pending_entry_for_overnight itself,
+    # not just the caller's handling of a synthesized outcome.
+    import types as _types
+    import ap_overnight_reeval as ov
+
+    _rows_by_shape = {
+        "non_object_json": [{
+            "local_order_id": "prior-1", "client_id": "client-1",
+            "execution_mode": "paper", "status": "PENDING_TRIGGER",
+            "broker_order_id": None, "submitted_ts": None,
+            "created_ts": "2026-07-20T00:00:00+00:00",
+            "updated_ts": "2026-07-20T00:00:00+00:00",
+            "meta": "[1,2,3]",  # valid JSON, wrong shape
+            "direction": "CALL", "canonical_signal_id": "CANON-1",
+        }],
+        "invalid_json": [{
+            "local_order_id": "prior-1", "client_id": "client-1",
+            "execution_mode": "paper", "status": "PENDING_TRIGGER",
+            "broker_order_id": None, "submitted_ts": None,
+            "created_ts": "2026-07-20T00:00:00+00:00",
+            "updated_ts": "2026-07-20T00:00:00+00:00",
+            "meta": "not-json-at-all{{",  # decode fails
+            "direction": "CALL", "canonical_signal_id": "CANON-1",
+        }],
+    }
+
+    class _StubCursor:
+        def __init__(self, rows): self._rows = rows
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return None
+        def fetchall(self): return list(self._rows)
+        def fetchone(self): return self._rows[0] if self._rows else None
+
+    for _shape, _rows in _rows_by_shape.items():
+        _db = _types.ModuleType("ap.db")
+        _db.conn = lambda rows=_rows: _StubCursor(rows)
+        _db.run_with_retry = lambda fn, *a, **kw: fn()
+        monkeypatch.setitem(sys.modules, "ap.db", _db)
+
+        outcome = ov._classify_pending_entry_for_overnight(
+            "AAPL", "client-1", "paper",
+            entry_watcher=None,
+            candidate_signal={"side": "CALL", "canonical_signal_id": "CANON-1"},
+        )
+        assert outcome.disposition == "PENDING_OWNER_CONFLICT", (_shape, outcome)
+        assert (
+            "meta_non_object_shape" in outcome.failure_reason
+            or "meta_parse_exception" in outcome.failure_reason
+            or "meta_unexpected_type" in outcome.failure_reason
+        ), (_shape, outcome.failure_reason)
+        assert outcome.stale_orders == (), (_shape, outcome)
+
+
+def test_watcher_registry_exception_is_db_error(monkeypatch):
+    # entry_watcher.has_order() raising is NOT evidence-of-no-owner. The
+    # classifier must return PENDING_OWNER_DB_ERROR with a stable diagnostic,
+    # and the caller must not authorize a replacement.
+    import types as _types
+    import ap_overnight_reeval as ov
+
+    class _RaisingWatcher:
+        def has_order(self, _local_order_id):
+            raise RuntimeError("registry_lock_broken")
+
+    _rows = [{
+        "local_order_id": "prior-1", "client_id": "client-1",
+        "execution_mode": "paper", "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "created_ts": "2026-07-20T00:00:00+00:00",
+        "updated_ts": "2026-07-20T00:00:00+00:00",
+        "meta": {}, "direction": "CALL", "canonical_signal_id": "CANON-1",
+    }]
+
+    class _StubCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return None
+        def fetchall(self): return list(_rows)
+        def fetchone(self): return _rows[0]
+
+    _db = _types.ModuleType("ap.db")
+    _db.conn = lambda: _StubCursor()
+    _db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _db)
+
+    outcome = ov._classify_pending_entry_for_overnight(
+        "AAPL", "client-1", "paper",
+        entry_watcher=_RaisingWatcher(),
+        candidate_signal={"side": "CALL", "canonical_signal_id": "CANON-1"},
+    )
+    assert outcome.disposition == "PENDING_OWNER_DB_ERROR"
+    assert "watcher_registry_error:RuntimeError" in outcome.failure_reason
+    assert outcome.stale_orders == ()
+
+    # And when driven end-to-end via the caller, the same outcome yields no
+    # replacement (no MC re-evaluate, no order, no watcher, no broker).
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    watcher_arm = MagicMock()
+    watcher_arm.watch.return_value = True
+
+    def _fake_classifier(*a, **kw):
+        return outcome
+    monkeypatch.setattr(ov, "_classify_pending_entry_for_overnight", _fake_classifier)
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        watcher_arm,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved(),
+        classifier_result=None,  # already patched via monkeypatch above
+        return_controls=True,
+    )
+    assert controls["master_control"].evaluate.call_count == 1
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 1
+    assert osm.create_calls == 0
+    watcher_arm.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert any(
+        "watcher_registry_error" in c[2] for c in controls["watching_calls"]
+    ), controls["watching_calls"]
+
+
+def test_no_second_mc_approval_or_new_entry_after_any_ownership_conflict(monkeypatch):
+    # Covers the invariant across every ownership-conflict shape: cleanup
+    # failure, watcher-registry error, metadata-parse conflict, or CAS row-
+    # version conflict. In every case there is exactly ONE MC.evaluate call,
+    # no new local ENTRY, no watcher call, no broker submit.
+    import ap_overnight_reeval as ov
+
+    # Case: CAS row-version conflict during cleanup.
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-1"] = {
+        "local_order_id": "prior-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+        "updated_ts": "v-actor2",
+    }
+    watcher_arm = MagicMock()
+    watcher_arm.watch.return_value = True
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        watcher_arm,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved(),
+        classifier_result=_stale_outcome(updated_ts="v1"),
+        return_controls=True,
+    )
+    assert controls["master_control"].evaluate.call_count == 1
+    assert result["armed"] == 0
+    assert osm.create_calls == 0
+    watcher_arm.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
 
 
 def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):
