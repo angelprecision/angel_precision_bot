@@ -996,11 +996,8 @@ class APOrderStateMachine:
         def _canon(v):
             if v is None:
                 return ""
-            try:
-                if hasattr(v, "isoformat"):
-                    return v.isoformat()
-            except Exception:
-                pass
+            if hasattr(v, "isoformat"):
+                return v.isoformat()
             return str(v)
 
         observed = _canon(current.get("updated_ts"))
