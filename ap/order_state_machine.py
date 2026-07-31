@@ -240,6 +240,40 @@ def _normalize_entry_direction(plan) -> str:
     return direction
 
 
+def _is_true(value) -> bool:
+    """Explicit boolean parser for metadata values that may arrive as raw
+    booleans, strings, or ints from JSONB serializers upstream. Only the
+    stable truthy tokens count; bool('false') and bool('0') do NOT.
+    """
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    return False
+
+
+# ── Force-CONFLICT signal from lease-liveness helpers ─────────────────────────
+# Some diagnostic reasons emitted by liveness predicates are STRONGER than
+# plain "unowned": they represent recognized-but-blocked ownership shapes
+# whose terminalization is reserved for a designated recovery consumer, not
+# for generic admission cleanup. Callers that see one of these reasons MUST
+# short-circuit to PENDING_OWNER_CONFLICT rather than fall through to stale
+# classification.
+LEASE_REASONS_FORCE_CONFLICT = frozenset({
+    # PRE_SUBMIT_PROOF_RETRY with an expired deadline — recovery consumer
+    # (ap_recovery) is the sole terminalization authority.
+    "proof_retry_deadline_expired",
+    # PRE_SUBMIT_PROOF_RETRY with next_at after deadline — malformed shape;
+    # do not authorize generic cleanup on a broken ownership record.
+    "proof_retry_next_at_after_deadline",
+    # Durable recovery_scheduler retention with blank owner — recognized
+    # canonical ownership kind but malformed identity; must fail closed.
+    "durable_recovery_owner_missing",
+})
+
+
 def _parse_iso_ts_for_proof_retry(raw) -> Optional[datetime]:
     """Best-effort ISO timestamp parser used by the shared proof-retry
     ownership predicate. Returns None if the value is missing / unparseable /
@@ -298,7 +332,10 @@ def is_proof_retry_owner_active(
         return False, "proof_retry_lifecycle_mismatch"
     if str(meta.get("materialization_status") or "").strip().upper() != "SELECTED":
         return False, "proof_retry_materialization_status_not_selected"
-    if not bool(meta.get("broker_ready")):
+    if not _is_true(meta.get("broker_ready")):
+        # Explicit truth parse: bool() alone would accept the strings
+        # "false" / "0" / "no" as truthy, silently upgrading a metadata
+        # bug into apparent ownership.
         return False, "proof_retry_broker_not_ready"
     if not str(meta.get("proof_retry_owner") or "").strip():
         return False, "proof_retry_owner_missing"
@@ -321,6 +358,47 @@ def is_proof_retry_owner_active(
         return False, "proof_retry_deadline_expired"
 
     return True, "proof_retry_active"
+
+
+def is_durable_recovery_owner_active(meta: dict) -> tuple[bool, str]:
+    """Shared durable-recovery ownership predicate.
+
+    ap_recovery persists a canonical durable retention marker so a future
+    recovery pass resumes the exact pending ENTRY row:
+
+        recovery_ownership       == "recovery_scheduler"
+        recovery_owner           == "recovery_scheduler:<client_id>"
+        recovery_retained_at     ISO timestamp
+        recovery_retention_reason
+        recovery_retention_mode
+
+    This is a distinct ownership contract from PRE_SUBMIT_PROOF_RETRY and
+    from broker-submit ownership. It has no per-row expiration — retention
+    persists until the recovery scheduler either resumes the row or writes
+    a canonical release marker. Generic admission cleanup MUST NOT
+    terminalize a row bearing this marker.
+
+    Returns (owned, reason). A recognized ownership kind with a BLANK owner
+    is a malformed canonical state that must fail closed as CONFLICT; the
+    caller detects that reason via LEASE_REASONS_FORCE_CONFLICT rather than
+    falling through to stale classification. Both layers (overnight
+    liveness helper AND OSM pending-entry cleanup guard) consult this same
+    function so there is one source of truth for this evidence.
+    """
+    if not isinstance(meta, dict):
+        return False, "durable_recovery_no_meta"
+
+    ownership = str(meta.get("recovery_ownership") or "").strip().lower()
+    if ownership != "recovery_scheduler":
+        return False, "durable_recovery_kind_mismatch"
+
+    owner = str(meta.get("recovery_owner") or "").strip()
+    if not owner:
+        # Recognized canonical kind, malformed identity → fail closed as
+        # conflict via LEASE_REASONS_FORCE_CONFLICT.
+        return False, "durable_recovery_owner_missing"
+
+    return True, "durable_recovery_scheduler_active"
 
 
 class OrderStatus:
@@ -1092,6 +1170,14 @@ class APOrderStateMachine:
 
         def _fn():
             with conn() as c:
+                # SQL defense-in-depth: even if a future classifier or a
+                # bug in the Python-side guard incorrectly authorized this
+                # CAS, the UPDATE itself refuses when the row carries the
+                # canonical durable recovery_scheduler retention marker
+                # with a nonblank owner. This invariant is enforced at
+                # the database exactly as it is enforced in Python, so
+                # any single-point failure upstream cannot terminalize a
+                # rightful recovery-owned row.
                 c.execute(
                     "UPDATE orders "
                     "SET status = %s, updated_ts = NOW(), last_error = %s "
@@ -1099,7 +1185,14 @@ class APOrderStateMachine:
                     "AND client_id = %s "
                     "AND kind = 'ENTRY' "
                     "AND status = %s "
-                    "AND updated_ts = %s",
+                    "AND updated_ts = %s "
+                    "AND NOT ("
+                    "  LOWER(BTRIM(COALESCE(meta->>'recovery_ownership', ''))) "
+                    "    = 'recovery_scheduler' "
+                    "  AND NULLIF("
+                    "    BTRIM(COALESCE(meta->>'recovery_owner', '')), ''"
+                    "  ) IS NOT NULL"
+                    ")",
                     (
                         OrderStatus.EXPIRED,
                         reason,
@@ -1164,6 +1257,13 @@ class APOrderStateMachine:
         # function so both layers agree on ownership.
         _proof_active, _ = is_proof_retry_owner_active(meta)
         if _proof_active:
+            return True
+        # Durable recovery_scheduler retention is a separate canonical
+        # ownership contract. ap_recovery writes it precisely so a future
+        # recovery pass can resume the exact row; generic cleanup MUST
+        # refuse. Same shared predicate as the overnight liveness helper.
+        _dr_active, _ = is_durable_recovery_owner_active(meta)
+        if _dr_active:
             return True
         return False
 

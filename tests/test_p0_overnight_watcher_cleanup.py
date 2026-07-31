@@ -113,14 +113,25 @@ class _FakeOrderStateMachine:
                 return False, "broker_or_recovery_owner_active"
             if str(_meta.get("recovery_submit_owner") or "").strip():
                 return False, "broker_or_recovery_owner_active"
-            # Mirror the OSM guard's PRE_SUBMIT_PROOF_RETRY protection via
-            # the shared predicate so integration tests reflect production.
-            try:
-                from ap.order_state_machine import is_proof_retry_owner_active
-                if is_proof_retry_owner_active(_meta)[0]:
-                    return False, "broker_or_recovery_owner_active"
-            except Exception:
-                pass
+            # Mirror the OSM guard's PRE_SUBMIT_PROOF_RETRY + durable
+            # recovery_scheduler protections via the same shared predicates
+            # so integration tests reflect production.
+            from ap.order_state_machine import (
+                is_proof_retry_owner_active,
+                is_durable_recovery_owner_active,
+            )
+            if is_proof_retry_owner_active(_meta)[0]:
+                return False, "broker_or_recovery_owner_active"
+            if is_durable_recovery_owner_active(_meta)[0]:
+                return False, "broker_or_recovery_owner_active"
+            # SQL-side defense-in-depth mirror: even if the Python guard
+            # above ever regresses, the UPDATE itself rejects when the
+            # canonical durable retention marker is present with a
+            # nonblank owner. Model that here.
+            _ro_kind = str(_meta.get("recovery_ownership") or "").strip().lower()
+            _ro_owner = str(_meta.get("recovery_owner") or "").strip()
+            if _ro_kind == "recovery_scheduler" and _ro_owner:
+                return False, "cas_sql_defense_recovery_scheduler_owner"
         if not self.cleanup_succeeds:
             return False, "cleanup_stub_disabled"
         row["status"] = "EXPIRED"
@@ -1961,14 +1972,359 @@ def test_expired_proof_retry_deadline_is_not_permanent_ownership(monkeypatch):
     assert ok is False
     assert reason == "proof_retry_deadline_expired"
 
-    # Overnight lease helper: also not active (proof-retry branch declines,
-    # then no other liveness signal in this meta shape → falls through to
-    # bare-identity-without-liveness rule → not owned).
+    # Overnight lease helper: NOT active. The reason surfaces the exact
+    # deadline-expired signal so the classifier can escalate to CONFLICT
+    # via LEASE_REASONS_FORCE_CONFLICT (recovery consumer remains the sole
+    # terminalization authority — generic admission cleanup must not
+    # proceed). This is P1-2's tri-state disposition:
+    #   PROOF_RETRY_ACTIVE                 → is_proof_retry_owner_active → True
+    #   PROOF_RETRY_EXPIRED_RECOVERY_REQ   → helper returns False + reason,
+    #                                        classifier escalates to CONFLICT
+    #   NOT_PROOF_RETRY                    → helper falls through to other checks
+    from ap.order_state_machine import LEASE_REASONS_FORCE_CONFLICT
     owned, over_reason = ov._pending_owner_lease_active(_expired)
     assert owned is False
-    # Reason must not lie about ownership — this must be a clear "not owned"
-    # diagnostic, either the bare-identity ghost tag or a comparable label.
-    assert "without_liveness" in over_reason or over_reason == "no_active_owner", over_reason
+    assert over_reason == "proof_retry_deadline_expired"
+    assert over_reason in LEASE_REASONS_FORCE_CONFLICT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Contract B: durable recovery_scheduler retention. Written by ap_recovery so
+# a future recovery pass resumes the exact pending ENTRY row. Distinct from
+# PRE_SUBMIT_PROOF_RETRY. Protected by the shared predicate in both layers +
+# SQL defense-in-depth in the CAS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _durable_recovery_meta(*, client_id="client-1", owner_suffix=None,
+                            reason="restart_pending_entry_deferred",
+                            recovery_mode="restart"):
+    """Exact producer shape from ap_recovery._retain_recovery_ownership()."""
+    from datetime import datetime, timezone as _tz
+    owner = f"recovery_scheduler:{client_id}" if owner_suffix is None else owner_suffix
+    return {
+        "recovery_ownership": "recovery_scheduler",
+        "recovery_owner": owner,
+        "recovery_retained_at": datetime.now(_tz.utc).isoformat(),
+        "recovery_retention_reason": reason,
+        "recovery_retention_mode": recovery_mode,
+    }
+
+
+def test_durable_recovery_scheduler_predicate_recognizes_exact_producer_shape():
+    from ap.order_state_machine import is_durable_recovery_owner_active
+
+    # Full producer shape → owned.
+    ok, reason = is_durable_recovery_owner_active(_durable_recovery_meta())
+    assert ok is True, reason
+    assert reason == "durable_recovery_scheduler_active"
+
+    # Wrong ownership kind.
+    m = _durable_recovery_meta(); m["recovery_ownership"] = "operator"
+    assert is_durable_recovery_owner_active(m) == (False, "durable_recovery_kind_mismatch")
+
+    # Missing ownership key.
+    m = _durable_recovery_meta(); m.pop("recovery_ownership")
+    assert is_durable_recovery_owner_active(m) == (False, "durable_recovery_kind_mismatch")
+
+    # Recognized kind, blank owner → conflict-worthy reason.
+    m = _durable_recovery_meta(owner_suffix="")
+    assert is_durable_recovery_owner_active(m) == (False, "durable_recovery_owner_missing")
+
+    # Non-dict input.
+    assert is_durable_recovery_owner_active(None) == (False, "durable_recovery_no_meta")
+
+
+def test_overnight_lease_helper_honors_durable_recovery_scheduler_ownership():
+    import ap_overnight_reeval as ov
+    owned, reason = ov._pending_owner_lease_active(_durable_recovery_meta())
+    assert owned is True
+    assert reason == "durable_recovery_scheduler_active"
+
+
+def test_durable_recovery_scheduler_row_classified_active(monkeypatch):
+    """Real classifier + real DB shim + real caller path. A pending ENTRY row
+    carrying only the durable recovery_scheduler retention marker (no proof-
+    retry, no fresh lease, no fresh retry timestamps) must be classified as
+    PENDING_OWNER_ACTIVE. Stale-expiration CAS is NEVER called. MC runs
+    exactly once (initial reject). No new order, no watcher, no broker. The
+    existing row and its ownership metadata are preserved."""
+    import types as _types
+    import ap_overnight_reeval as ov
+
+    _meta = _durable_recovery_meta()
+
+    _rows = [{
+        "local_order_id": "prior-recov-1", "client_id": "client-1",
+        "execution_mode": "paper", "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "created_ts": "2026-07-20T00:00:00+00:00",  # older than 20 min
+        "updated_ts": "2026-07-20T00:00:00+00:00",
+        "meta": _meta,
+        "direction": "CALL", "canonical_signal_id": "CANON-001",
+    }]
+
+    class _StubCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return None
+        def fetchall(self): return list(_rows)
+        def fetchone(self): return _rows[0]
+
+    _db = _types.ModuleType("ap.db")
+    _db.conn = lambda: _StubCursor()
+    _db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _db)
+
+    outcome = ov._classify_pending_entry_for_overnight(
+        "AAPL", "client-1", "paper",
+        entry_watcher=None,
+        candidate_signal={"side": "CALL", "canonical_signal_id": "CANON-001"},
+    )
+    assert outcome.disposition == "PENDING_OWNER_ACTIVE", outcome
+    assert outcome.stale_orders == ()
+
+
+def test_durable_recovery_scheduler_row_never_reaches_cleanup(monkeypatch):
+    """End-to-end: classifier returns ACTIVE → caller rejects the candidate,
+    CAS never runs, MC called exactly once, no new order / watcher / broker
+    submit, row + ownership metadata untouched."""
+    import ap_overnight_reeval as ov
+
+    _meta = _durable_recovery_meta()
+    active_outcome = ov._PendingEntryOutcome(
+        "PENDING_OWNER_ACTIVE", (),
+        "active_owner:durable_recovery_scheduler_active",
+    )
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-recov-1"] = {
+        "local_order_id": "prior-recov-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+        "updated_ts": "v1",
+        "contract": "AAPL260619C00100000",
+        "meta": _meta,
+    }
+    orig_cas = osm.expire_stale_pending_entry_cas
+    cas_calls = []
+    def _cas_spy(local_order_id, **kw):
+        cas_calls.append((local_order_id, kw))
+        return orig_cas(local_order_id, **kw)
+    osm.expire_stale_pending_entry_cas = _cas_spy
+
+    watcher_arm = MagicMock()
+    watcher_arm.watch.return_value = True
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        watcher_arm,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved(),
+        classifier_result=active_outcome,
+        return_controls=True,
+    )
+
+    assert cas_calls == []
+    assert controls["master_control"].evaluate.call_count == 1
+    assert result["armed"] == 0
+    assert result["rejected"] == 1
+    assert result["terminal_rejected"] == 1
+    assert osm.create_calls == 0
+    watcher_arm.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert osm.orders["prior-recov-1"]["status"] == "PENDING_TRIGGER"
+    assert osm.orders["prior-recov-1"]["contract"] == "AAPL260619C00100000"
+    # Ownership metadata itself is preserved.
+    assert osm.orders["prior-recov-1"]["meta"]["recovery_ownership"] == "recovery_scheduler"
+    assert osm.orders["prior-recov-1"]["meta"]["recovery_owner"] == "recovery_scheduler:client-1"
+
+
+def test_direct_cas_refuses_durable_recovery_scheduler_owner(monkeypatch):
+    """Even if a future classifier accidentally authorizes cleanup for a
+    durable-recovery-owned row, the OSM CAS refuses via the shared predicate
+    (Python guard) — and would additionally refuse via SQL defense-in-depth
+    against real Postgres. Here the fake mirrors both."""
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-recov-1"] = {
+        "local_order_id": "prior-recov-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+        "updated_ts": "v1",
+        "meta": _durable_recovery_meta(),
+    }
+    ok, reason = osm.expire_stale_pending_entry_cas(
+        "prior-recov-1",
+        expected_status="PENDING_TRIGGER",
+        expected_updated_ts="v1",
+        reason="test_cleanup",
+    )
+    assert ok is False
+    assert reason == "broker_or_recovery_owner_active"
+    # Row untouched.
+    assert osm.orders["prior-recov-1"]["status"] == "PENDING_TRIGGER"
+
+
+def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(monkeypatch):
+    """Blank recovery_owner on an otherwise canonical recovery_ownership
+    row is a malformed durable-recovery state. The overnight helper must
+    surface the malformed reason; the classifier must escalate it to
+    CONFLICT (not stale) via LEASE_REASONS_FORCE_CONFLICT."""
+    import types as _types
+    import ap_overnight_reeval as ov
+    from ap.order_state_machine import (
+        is_durable_recovery_owner_active,
+        LEASE_REASONS_FORCE_CONFLICT,
+    )
+
+    _meta = _durable_recovery_meta(owner_suffix="")
+    # Predicate: recognized shape, malformed identity.
+    ok, reason = is_durable_recovery_owner_active(_meta)
+    assert ok is False
+    assert reason == "durable_recovery_owner_missing"
+    assert reason in LEASE_REASONS_FORCE_CONFLICT
+
+    # Overnight lease helper surfaces the reason.
+    owned, over_reason = ov._pending_owner_lease_active(_meta)
+    assert owned is False
+    assert over_reason == "durable_recovery_owner_missing"
+
+    # End-to-end: classifier escalates to PENDING_OWNER_CONFLICT (never stale).
+    _rows = [{
+        "local_order_id": "prior-mal-1", "client_id": "client-1",
+        "execution_mode": "paper", "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "created_ts": "2026-07-20T00:00:00+00:00",
+        "updated_ts": "2026-07-20T00:00:00+00:00",
+        "meta": _meta,
+        "direction": "CALL", "canonical_signal_id": "CANON-001",
+    }]
+
+    class _StubCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return None
+        def fetchall(self): return list(_rows)
+        def fetchone(self): return _rows[0]
+
+    _db = _types.ModuleType("ap.db")
+    _db.conn = lambda: _StubCursor()
+    _db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _db)
+
+    outcome = ov._classify_pending_entry_for_overnight(
+        "AAPL", "client-1", "paper",
+        entry_watcher=None,
+        candidate_signal={"side": "CALL", "canonical_signal_id": "CANON-001"},
+    )
+    assert outcome.disposition == "PENDING_OWNER_CONFLICT", outcome
+    assert "lease_forced_conflict" in outcome.failure_reason
+    assert outcome.stale_orders == ()
+
+
+def test_explicitly_released_recovery_scheduler_marker_can_become_stale(monkeypatch):
+    """If ap_recovery explicitly RELEASES its retention (removes both
+    recovery_ownership and recovery_owner from meta), the durable-recovery
+    predicate no longer fires and the row is eligible for normal admission
+    handling. This proves the shared predicate does not accidentally over-
+    protect after release."""
+    import ap_overnight_reeval as ov
+    from ap.order_state_machine import is_durable_recovery_owner_active
+
+    _released = {
+        # Marker was removed; only stale audit fields remain.
+        "recovery_retained_at": "2026-07-19T00:00:00+00:00",
+        "recovery_retention_reason": "restart_pending_entry_deferred",
+        "recovery_retention_mode": "restart",
+    }
+    ok, reason = is_durable_recovery_owner_active(_released)
+    assert ok is False
+    assert reason == "durable_recovery_kind_mismatch"
+
+    owned, over_reason = ov._pending_owner_lease_active(_released)
+    assert owned is False
+    # Reason must not be one of the force-conflict shapes — the row has
+    # been explicitly released and generic handling can proceed.
+    from ap.order_state_machine import LEASE_REASONS_FORCE_CONFLICT
+    assert over_reason not in LEASE_REASONS_FORCE_CONFLICT
+
+
+def test_expired_proof_retry_deadline_forces_conflict_not_stale(monkeypatch):
+    """P1-2 correction: an expired proof-retry deadline is NOT plain
+    unowned. Recovery consumer remains the sole terminalization authority,
+    so generic admission cleanup must not proceed. The overnight helper
+    surfaces the "proof_retry_deadline_expired" reason; the classifier
+    escalates to PENDING_OWNER_CONFLICT via LEASE_REASONS_FORCE_CONFLICT."""
+    import types as _types
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone as _tz
+
+    _now = datetime.now(_tz.utc)
+    _expired = _proof_retry_meta()
+    _expired["proof_retry_next_at"] = (_now - timedelta(minutes=30)).isoformat()
+    _expired["proof_retry_deadline"] = (_now - timedelta(minutes=15)).isoformat()
+
+    _rows = [{
+        "local_order_id": "prior-exp-1", "client_id": "client-1",
+        "execution_mode": "paper", "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "created_ts": "2026-07-20T00:00:00+00:00",
+        "updated_ts": "2026-07-20T00:00:00+00:00",
+        "meta": _expired,
+        "direction": "CALL", "canonical_signal_id": "CANON-001",
+    }]
+
+    class _StubCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return None
+        def fetchall(self): return list(_rows)
+        def fetchone(self): return _rows[0]
+
+    _db = _types.ModuleType("ap.db")
+    _db.conn = lambda: _StubCursor()
+    _db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _db)
+
+    outcome = ov._classify_pending_entry_for_overnight(
+        "AAPL", "client-1", "paper",
+        entry_watcher=None,
+        candidate_signal={"side": "CALL", "canonical_signal_id": "CANON-001"},
+    )
+    assert outcome.disposition == "PENDING_OWNER_CONFLICT", outcome
+    assert "proof_retry_deadline_expired" in outcome.failure_reason
+    assert outcome.stale_orders == ()
+
+
+def test_broker_ready_string_falsehood_is_rejected():
+    """P1-3: bool('false') is True in Python, so the predicate must NOT
+    use bool() alone. Every ambiguous falsy string / int / None must be
+    rejected as broker_not_ready."""
+    from ap.order_state_machine import is_proof_retry_owner_active, _is_true
+
+    # Truth parser sanity.
+    for v in (True, "true", "TRUE", "yes", "on", "1", 1):
+        assert _is_true(v) is True, v
+    for v in (False, "false", "FALSE", "no", "off", "0", 0, None, "", "  "):
+        assert _is_true(v) is False, v
+
+    # Predicate: broker_ready in any falsy shape must be rejected even
+    # though bool(str) is True for non-empty strings.
+    for v in (False, "false", "0", "no", 0, None):
+        m = _proof_retry_meta(); m["broker_ready"] = v
+        ok, reason = is_proof_retry_owner_active(m)
+        assert ok is False, (v, reason)
+        assert reason == "proof_retry_broker_not_ready", (v, reason)
+
+    # Sanity: recognized truthy shapes are accepted.
+    for v in (True, "true", "yes", "1", 1):
+        m = _proof_retry_meta(); m["broker_ready"] = v
+        ok, _ = is_proof_retry_owner_active(m)
+        assert ok is True, v
 
 
 def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):

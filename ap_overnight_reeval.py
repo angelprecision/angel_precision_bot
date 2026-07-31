@@ -314,16 +314,36 @@ def _pending_owner_lease_active(meta: dict) -> tuple[bool, str]:
     # be honored while the proof-retry deadline is still in the future. Uses
     # the SHARED predicate defined in ap/order_state_machine.py so this
     # helper and the OSM stale-expiration guard agree on ownership — no
-    # parallel rule sets.
+    # parallel rule sets. Certain rejection reasons (expired deadline,
+    # malformed shape, malformed durable-recovery owner) are STRONGER than
+    # plain "unowned" — they must force the classifier to CONFLICT, not
+    # allow it to fall through to stale. Those reason strings are surfaced
+    # verbatim; the classifier consults LEASE_REASONS_FORCE_CONFLICT.
     try:
-        from ap.order_state_machine import is_proof_retry_owner_active
+        from ap.order_state_machine import (
+            is_proof_retry_owner_active,
+            is_durable_recovery_owner_active,
+            LEASE_REASONS_FORCE_CONFLICT,  # noqa: F401 imported for callers
+        )
         _proof_active, _proof_reason = is_proof_retry_owner_active(meta)
         if _proof_active:
             return True, _proof_reason
+        if _proof_reason in ("proof_retry_deadline_expired",
+                             "proof_retry_next_at_after_deadline"):
+            # Recognized proof-retry shape but recovery-consumer-owned or
+            # malformed. Surface the reason so the classifier can escalate
+            # to CONFLICT (not stale).
+            return False, _proof_reason
+        # Durable recovery_scheduler retention — separate canonical contract.
+        _dr_active, _dr_reason = is_durable_recovery_owner_active(meta)
+        if _dr_active:
+            return True, _dr_reason
+        if _dr_reason == "durable_recovery_owner_missing":
+            return False, _dr_reason
     except Exception as _pr_exc:
         log.warning(
-            "pending_owner_lease_active: proof-retry predicate import/call "
-            "failed err=%s — treating as no proof-retry evidence",
+            "pending_owner_lease_active: shared ownership predicate import/"
+            "call failed err=%s — treating as no proof-retry evidence",
             _pr_exc,
         )
 
@@ -697,6 +717,21 @@ def _classify_pending_entry_for_overnight(
             _failure_reason = (
                 _failure_reason
                 or f"meta_parse_exception:{type(_mexc).__name__}"
+            )
+            continue
+
+        # A recognized-but-blocked ownership shape (expired proof-retry
+        # deadline, malformed proof-retry shape, malformed durable-recovery
+        # owner) is STRONGER than plain "unowned". Escalate to CONFLICT so
+        # generic admission cleanup does not proceed against a canonical
+        # ownership record whose terminalization belongs to a dedicated
+        # recovery consumer. LEASE_REASONS_FORCE_CONFLICT is the shared
+        # constant defined next to the predicates in ap.order_state_machine.
+        from ap.order_state_machine import LEASE_REASONS_FORCE_CONFLICT
+        if (not _recovery_owned) and _owner_reason in LEASE_REASONS_FORCE_CONFLICT:
+            _saw_conflict = True
+            _failure_reason = (
+                _failure_reason or f"lease_forced_conflict:{_owner_reason}"
             )
             continue
 
