@@ -2327,6 +2327,481 @@ def test_broker_ready_string_falsehood_is_rejected():
         assert ok is True, v
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #404 final amendment: durable-claim lease + stranded IN_PROGRESS
+# recovery, plus watcher-exception retry classification.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_in_progress_claim_has_utc_lease_metadata(monkeypatch):
+    # Initial atomic claim writes parseable UTC lease metadata alongside the
+    # IN_PROGRESS scope; the operator can see both claim_started_at and
+    # claim_lease_until on the durable row.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timezone
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = False
+    entry_watcher._last_reject_reason = "armed_false"
+
+    _run_reeval(monkeypatch, entry_watcher, ledger=ledger, osm=osm)
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] in ("RETRYABLE", "ARMED", "EXHAUSTED", "ERROR", "IN_PROGRESS")
+    # Look at the raw metadata this run wrote through _attempt_meta_patch.
+    row_meta = ledger.rows[("CANON-001", "client-1")]["metadata"]
+    scopes = row_meta.get("overnight_watch_arm_attempt_scopes") or {}
+    _key = f"paper:{FIXED_ET.date().isoformat()}"
+    _scope_dict = scopes.get(_key) or {}
+    # A retryable-terminated run cleared the lease per contract; verify the
+    # helper writes+clears lease correctly by patching an IN_PROGRESS write
+    # and asserting parseable UTC.
+    inp_meta = ov._attempt_meta_patch(
+        existing_meta={},
+        execution_mode="paper", session_key="2026-06-12",
+        state=ov.WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        attempt_count=1, token="tok", local_order_id="",
+        reason="attempt_acquired",
+    )
+    inp_scope = inp_meta["overnight_watch_arm_attempt_scopes"]["paper:2026-06-12"]
+    assert isinstance(inp_scope.get("claim_started_at"), str)
+    assert isinstance(inp_scope.get("claim_lease_until"), str)
+    assert ov._parse_watch_attempt_ts(inp_scope["claim_started_at"]) is not None
+    assert ov._parse_watch_attempt_ts(inp_scope["claim_lease_until"]) is not None
+    # Lease is bounded and in the future.
+    lease = ov._parse_watch_attempt_ts(inp_scope["claim_lease_until"])
+    assert lease > datetime.now(timezone.utc)
+
+    # Non-IN_PROGRESS writes clear both lease fields so a stale timestamp
+    # cannot later masquerade as current ownership.
+    for _state in (ov.WATCH_ATTEMPT_STATE_RETRYABLE,
+                   ov.WATCH_ATTEMPT_STATE_ARMED,
+                   ov.WATCH_ATTEMPT_STATE_EXHAUSTED,
+                   ov.WATCH_ATTEMPT_STATE_ERROR):
+        cleared = ov._attempt_meta_patch(
+            existing_meta=inp_meta,
+            execution_mode="paper", session_key="2026-06-12",
+            state=_state, attempt_count=1, token="tok",
+            local_order_id="oid" if _state != ov.WATCH_ATTEMPT_STATE_RETRYABLE else "oid",
+            reason="test",
+        )["overnight_watch_arm_attempt_scopes"]["paper:2026-06-12"]
+        assert "claim_started_at" not in cleared, _state
+        assert "claim_lease_until" not in cleared, _state
+
+
+def test_fresh_in_progress_claim_cannot_be_stolen(monkeypatch):
+    # Seed a durable IN_PROGRESS scope with a FRESH lease. A second claimant
+    # must receive WATCH_ATTEMPT_ALREADY_IN_PROGRESS with the lease-active
+    # diagnostic; count and token remain unchanged.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+
+    ledger = _FakeOpportunityLedger()
+    _future = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    _now_s = datetime.now(timezone.utc).isoformat()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1, "state": "IN_PROGRESS",
+                    "token": "tok-A", "local_order_id": "",
+                    "last_reason": "attempt_acquired",
+                    "updated_at": _now_s,
+                    "execution_mode": "paper",
+                    "session_key": "2026-06-12",
+                    "claim_started_at": _now_s,
+                    "claim_lease_until": _future,
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, *_ = _run_reeval(
+        monkeypatch, entry_watcher, ledger=ledger, osm=osm,
+        return_controls=True,
+    )
+    # Second claimant was refused; no new order created; watcher not called.
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "IN_PROGRESS"
+    assert scope["token"] == "tok-A"
+    assert scope["count"] == 1
+
+
+def test_malformed_claim_lease_fails_closed(monkeypatch):
+    # IN_PROGRESS with a missing/malformed lease must NEVER be blindly
+    # reclaimed. The atomic claim returns CONFLICT with the stable
+    # attempt_claim_lease_missing_or_malformed diagnostic.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1, "state": "IN_PROGRESS",
+                    "token": "tok-A", "local_order_id": "",
+                    "last_reason": "attempt_acquired",
+                    "updated_at": "2026-07-20T00:00:00+00:00",
+                    "execution_mode": "paper",
+                    "session_key": "2026-06-12",
+                    # No claim_lease_until — malformed by omission.
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, *_ = _run_reeval(
+        monkeypatch, entry_watcher, ledger=ledger, osm=osm,
+        return_controls=True,
+    )
+    # No replacement was authorized.
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "IN_PROGRESS"
+    assert scope["token"] == "tok-A"
+
+
+def test_expired_claim_recovery_does_not_increment_attempt_count(monkeypatch):
+    # A stranded IN_PROGRESS scope with an EXPIRED lease and no bound prior
+    # order should be reacquired by the next run — count UNCHANGED (crash
+    # recovery must not burn a retry), new token, fresh lease. Because the
+    # reacquired attempt then proceeds to arm (watch returns True in this
+    # test), the final scope is ARMED at count=1.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+
+    ledger = _FakeOpportunityLedger()
+    _past = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1, "state": "IN_PROGRESS",
+                    "token": "tok-DEAD", "local_order_id": "",
+                    "last_reason": "attempt_acquired",
+                    "updated_at": _past,
+                    "execution_mode": "paper",
+                    "session_key": "2026-06-12",
+                    "claim_started_at": _past,
+                    "claim_lease_until": _past,
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, *_ = _run_reeval(
+        monkeypatch, entry_watcher, ledger=ledger, osm=osm,
+        return_controls=True,
+    )
+    # Reacquire happened → run proceeded to arm, so final state is ARMED.
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ARMED"
+    # CRITICAL: count did NOT increment during crash recovery.
+    assert scope["count"] == 1
+    # Token rotated on reacquire.
+    assert scope["token"] != "tok-DEAD"
+    assert scope["token"]
+    assert result["armed"] == 1
+
+
+def test_expired_claim_recovery_with_active_prior_order_never_replaces(monkeypatch):
+    # A stranded IN_PROGRESS scope with a BOUND prior order that is STILL
+    # ACTIVE must not be reclaimed. Pre-lock terminal proof returns
+    # WATCH_ATTEMPT_ALREADY_IN_PROGRESS so the run defers, does not create
+    # a replacement, does not call the watcher, does not submit to broker.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+
+    ledger = _FakeOpportunityLedger()
+    _past = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1, "state": "IN_PROGRESS",
+                    "token": "tok-DEAD", "local_order_id": "prior-1",
+                    "last_reason": "local_order_bound",
+                    "updated_at": _past,
+                    "execution_mode": "paper",
+                    "session_key": "2026-06-12",
+                    "claim_started_at": _past,
+                    "claim_lease_until": _past,
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    # Prior order is still active — must block reclaim.
+    osm.orders["prior-1"] = {
+        "local_order_id": "prior-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+    }
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, *_, controls = _run_reeval(
+        monkeypatch, entry_watcher, ledger=ledger, osm=osm,
+        return_controls=True,
+    )
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "IN_PROGRESS"
+    assert scope["token"] == "tok-DEAD"
+    assert scope["count"] == 1
+    # Prior active order untouched.
+    assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
+
+
+def test_expired_claim_recovery_with_terminal_prior_order_reacquires(monkeypatch):
+    # Stranded IN_PROGRESS + bound prior order that is TERMINAL for the exact
+    # identity → reclaim allowed, count unchanged, run continues to arm.
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+
+    ledger = _FakeOpportunityLedger()
+    _past = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": 1, "state": "IN_PROGRESS",
+                    "token": "tok-DEAD", "local_order_id": "prior-1",
+                    "last_reason": "local_order_bound",
+                    "updated_at": _past,
+                    "execution_mode": "paper",
+                    "session_key": "2026-06-12",
+                    "claim_started_at": _past,
+                    "claim_lease_until": _past,
+                }
+            }
+        },
+    }
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-1"] = {
+        "local_order_id": "prior-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "EXPIRED", "execution_mode": "paper",
+    }
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, *_ = _run_reeval(
+        monkeypatch, entry_watcher, ledger=ledger, osm=osm,
+        return_controls=True,
+    )
+    assert result["armed"] == 1
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ARMED"
+    assert scope["count"] == 1  # crash recovery did NOT burn a retry
+    assert scope["token"] != "tok-DEAD"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Watcher-exception retry classification (Fix 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_watcher_exception_with_successful_cleanup_becomes_retryable(monkeypatch):
+    # Watcher throws, cleanup succeeds, exact local ENTRY is proven terminal.
+    # The attempt is completed as RETRYABLE (not ERROR); the job is deferred
+    # for retry; broker POST count is zero.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch, entry_watcher, source="trade_queue",
+        ledger=ledger, osm=osm, return_controls=True,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "RETRYABLE"
+    assert scope["count"] == 1
+    assert result["retryable_deferred"] == 1
+    assert result["terminal_errors"] == 0
+    assert result["errors"] == 0
+    assert result["skipped"] >= 1
+    assert error_calls == []
+    controls["broker"].submit_order.assert_not_called()
+
+
+def test_watcher_exception_at_max_attempts_becomes_exhausted(monkeypatch):
+    # After the FIRST TWO retryable watcher exceptions (count → 1 → 2), the
+    # THIRD exception is completed as EXHAUSTED directly because count == 3
+    # meets the configured cap. A FOURTH run's claim then also returns
+    # EXHAUSTED — the watcher is never invoked, no new order, no broker POST.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+
+    for _i in range(2):
+        entry_watcher = MagicMock()
+        entry_watcher.watch.side_effect = RuntimeError(f"boom-{_i}")
+        _run_reeval(monkeypatch, entry_watcher, source="trade_queue",
+                    ledger=ledger, osm=osm)
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "RETRYABLE"
+    assert scope["count"] == 2
+
+    # Third exception: count reaches the cap → EXHAUSTED completion.
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("boom-final")
+    result, osm, _, error_calls, controls = _run_reeval(
+        monkeypatch, entry_watcher, source="trade_queue",
+        ledger=ledger, osm=osm, return_controls=True,
+    )
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "EXHAUSTED"
+    assert scope["count"] == 3
+    assert result["terminal_errors"] == 1
+    assert any("overnight_watch_arm_retry_exhausted" in c[2] for c in error_calls)
+    controls["broker"].submit_order.assert_not_called()
+
+    # Fourth run: EXHAUSTED short-circuits before the watcher is invoked.
+    entry_watcher_after = MagicMock()
+    entry_watcher_after.watch.side_effect = RuntimeError("should-not-be-called")
+    result2, osm, _, _ = _run_reeval(
+        monkeypatch, entry_watcher_after, source="trade_queue",
+        ledger=ledger, osm=osm,
+    )
+    entry_watcher_after.watch.assert_not_called()
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "EXHAUSTED"
+    assert scope["count"] == 3
+
+
+def test_watcher_exception_cleanup_failure_remains_error(monkeypatch):
+    # Cleanup failure on a watcher exception must remain durable ERROR — the
+    # ambiguous cleanup state is the exact case that must fail closed.
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine(cleanup_succeeds=False)
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch, entry_watcher, source="trade_queue",
+        ledger=ledger, osm=osm,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ERROR"
+    assert result["terminal_errors"] == 1
+    assert result["retryable_deferred"] == 0
+
+
+def test_watcher_exception_terminal_proof_failure_remains_error(monkeypatch):
+    # Cleanup returned success but the terminal readback fails (order still
+    # PENDING_TRIGGER — the shim just doesn't terminalize). Must persist
+    # ERROR (do NOT claim retryability without exact terminal proof).
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+
+    class _CleanupYesButNotTerminalOSM(_FakeOrderStateMachine):
+        def expire_pending_entry(self, local_order_id, *, reason=""):
+            # Say success but do NOT change status. Readback still shows
+            # PENDING_TRIGGER, so terminal proof fails.
+            self.expire_calls.append((local_order_id, reason))
+            return True
+        def cancel_pending_entry(self, local_order_id, *, reason=""):
+            self.cancel_calls.append((local_order_id, reason))
+            return True
+
+    osm = _CleanupYesButNotTerminalOSM()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch, entry_watcher, source="trade_queue",
+        ledger=ledger, osm=osm,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ERROR"
+    assert result["terminal_errors"] == 1
+    assert result["retryable_deferred"] == 0
+
+
+def test_watcher_exception_retry_completion_failure_is_terminal_error(monkeypatch):
+    # If the durable RETRYABLE completion CAS fails after a watcher
+    # exception, the run must be reported as a terminal error, not a fake
+    # retryable success.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
+
+    result, osm, rejected_calls, error_calls = _run_reeval(
+        monkeypatch, entry_watcher, source="trade_queue",
+        ledger=ledger, osm=osm,
+    )
+
+    assert result["retryable_deferred"] == 0
+    assert result["terminal_errors"] == 1
+    assert result["errors"] == 1
+
+
+def test_watcher_exception_never_submits_to_broker(monkeypatch):
+    # Broker submission count is zero throughout the exception and retry
+    # preparation, regardless of classification.
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    _, _, _, _, controls = _run_reeval(
+        monkeypatch, entry_watcher, source="trade_queue",
+        ledger=ledger, osm=osm, return_controls=True,
+    )
+    controls["broker"].submit_order.assert_not_called()
+
+
 def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):
     row = ledger.rows[("CANON-001", client_id)]
     scopes = row["metadata"]["overnight_watch_arm_attempt_scopes"]
@@ -2998,6 +3473,12 @@ def test_shared_setup_retryable_same_session_failure_does_not_block_retry(monkey
 
 
 def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(monkeypatch, caplog):
+    # PR #404 final amendment (Fix 2): a watcher exception with SUCCESSFUL
+    # cleanup and exact terminal proof of the local ENTRY must be classified
+    # RETRYABLE (or EXHAUSTED at max_attempts). It must NOT persist ERROR —
+    # that contradicted _classify_watch_arm_outcome's RETRYABLE_NOT_ARMED
+    # contract and permanently blocked retries. Failure proof + operator log
+    # are still recorded so the exception itself is never hidden.
     ledger = _FakeOpportunityLedger()
     entry_watcher = MagicMock()
     entry_watcher.watch.side_effect = RuntimeError("watcher boom")
@@ -3010,20 +3491,22 @@ def test_overnight_watch_exception_cleans_order_marks_error_and_records_proof(mo
         ledger=ledger,
     )
 
-    assert result["errors"] == 1
+    # Not a terminal error any more — classified retryable_deferred.
+    assert result["errors"] == 0
+    assert result["terminal_errors"] == 0
+    assert result["retryable_deferred"] == 1
+    assert result["skipped"] == 1
     assert rejected_calls == []
-    assert error_calls == [
-        ("job-001", "client-1", "overnight_watch_arm_failed:exception:watcher boom")
-    ]
+    assert error_calls == []
+    # Local ENTRY was still cleanly terminalized before the retryable
+    # classification, so terminal proof holds for the next run.
     assert osm.expire_calls == [
         ("local-ord-1", "overnight_watch_arm_failed:exception:watcher boom")
     ]
-    proof = ledger.rows[("CANON-001", "client-1")]
-    assert proof["opportunity_status"] == "INTERNAL_ERROR"
-    assert proof["miss_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
-    assert proof["metadata"]["overnight_source_table"] == "trade_queue"
-    assert proof["metadata"]["overnight_reeval_session_key"] == "2026-06-12"
+    # Failure proof + cleanup-done event are still emitted so operator
+    # visibility of the exception is preserved.
     assert "OVERNIGHT_WATCH_ARM_EXCEPTION_CLEANUP_DONE" in caplog.text
+    assert "entry_watcher.watch failed" in caplog.text
 
 
 def test_overnight_watch_exception_cleanup_failure_marks_cleanup_failed_error_and_proof(monkeypatch, caplog):
