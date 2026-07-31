@@ -122,15 +122,30 @@ class _FakeOSM:
     """Minimal order-state-machine stub for prior-terminal-order resolution.
 
     orders maps local_order_id -> {"status": ...}. Missing ids look absent.
+    Rows are auto-enriched with production identity fields
+    (local_order_id, client_id, execution_mode, canonical_signal_id, kind)
+    so _local_order_terminal_state's identity fencing (Blocker 2) can match.
     """
 
-    def __init__(self, orders=None):
+    def __init__(self, orders=None, client_id=None, canonical_signal_id=None,
+                 execution_mode="live"):
         self.orders = dict(orders or {})
         self.get_calls: list[str] = []
+        self._default_client = client_id or CLIENT
+        self._default_canonical = canonical_signal_id or CANON
+        self._default_mode = execution_mode
 
     def get_order(self, local_order_id):
         self.get_calls.append(local_order_id)
-        return dict(self.orders.get(local_order_id) or {})
+        row = dict(self.orders.get(local_order_id) or {})
+        if not row:
+            return row
+        row.setdefault("local_order_id", local_order_id)
+        row.setdefault("client_id", self._default_client)
+        row.setdefault("execution_mode", self._default_mode)
+        row.setdefault("canonical_signal_id", self._default_canonical)
+        row.setdefault("kind", "ENTRY")
+        return row
 
 
 @pytest.fixture(autouse=True)
@@ -386,11 +401,12 @@ def test_terminal_proof_of_different_order_is_conflict():
 
     real_terminal = overnight._local_order_terminal_state
 
-    def _swap_then_prove(osm, local_order_id):
+    def _swap_then_prove(osm, local_order_id, **kwargs):
         # After the preliminary read proved prior-1 terminal, a concurrent actor
-        # rebinds the durable scope to a *different* prior order.
+        # rebinds the durable scope to a *different* prior order. Accept the
+        # identity-fencing kwargs (Blocker 2) and forward them unchanged.
         _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-1", order_id="prior-2")
-        return real_terminal(osm, local_order_id)
+        return real_terminal(osm, local_order_id, **kwargs)
 
     osm = _FakeOSM({"prior-1": {"status": "EXPIRED"}, "prior-2": {"status": "PENDING_TRIGGER"}})
     import unittest.mock as mock
