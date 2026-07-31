@@ -240,6 +240,89 @@ def _normalize_entry_direction(plan) -> str:
     return direction
 
 
+def _parse_iso_ts_for_proof_retry(raw) -> Optional[datetime]:
+    """Best-effort ISO timestamp parser used by the shared proof-retry
+    ownership predicate. Returns None if the value is missing / unparseable /
+    the wrong shape — the predicate treats None as "no proof of freshness"
+    and therefore as an unproven owner."""
+    if raw is None:
+        return None
+    try:
+        if hasattr(raw, "tzinfo"):
+            dt = raw
+        else:
+            s = str(raw).strip()
+            if not s:
+                return None
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def is_proof_retry_owner_active(
+    meta: dict, *, now: Optional[datetime] = None,
+) -> tuple[bool, str]:
+    """Shared PRE_SUBMIT_PROOF_RETRY ownership predicate.
+
+    Consulted by BOTH the overnight liveness helper (_pending_owner_lease_
+    active) and the OSM pending-entry cleanup guard (_pending_entry_has_
+    submit_or_recovery_owner). One source of truth; no parallel rule sets.
+
+    Ownership is proved ONLY when every required shape condition holds:
+
+        lifecycle_state       == "PRE_SUBMIT_PROOF_RETRY"
+        materialization_status == "SELECTED"
+        broker_ready          is truthy
+        proof_retry_owner     is nonblank
+        proof_retry_next_at   parseable
+        proof_retry_deadline  parseable
+        proof_retry_next_at   <= proof_retry_deadline
+        proof_retry_deadline  > now
+
+    A future retry timestamp alone does NOT preserve a malformed row forever.
+    Any missing / malformed / expired field fails closed as unowned; the
+    designated proof-retry recovery consumer (ap_recovery) is responsible for
+    terminalizing rows whose deadline expired — not the generic admission
+    cleanup path. Returns (owned, reason) where reason is a stable diagnostic
+    string.
+    """
+    if not isinstance(meta, dict):
+        return False, "proof_retry_no_meta"
+
+    if str(meta.get("lifecycle_state") or "").strip().upper() != "PRE_SUBMIT_PROOF_RETRY":
+        return False, "proof_retry_lifecycle_mismatch"
+    if str(meta.get("materialization_status") or "").strip().upper() != "SELECTED":
+        return False, "proof_retry_materialization_status_not_selected"
+    if not bool(meta.get("broker_ready")):
+        return False, "proof_retry_broker_not_ready"
+    if not str(meta.get("proof_retry_owner") or "").strip():
+        return False, "proof_retry_owner_missing"
+
+    retry_at = _parse_iso_ts_for_proof_retry(meta.get("proof_retry_next_at"))
+    if retry_at is None:
+        return False, "proof_retry_next_at_missing_or_unparseable"
+    deadline = _parse_iso_ts_for_proof_retry(meta.get("proof_retry_deadline"))
+    if deadline is None:
+        return False, "proof_retry_deadline_missing_or_unparseable"
+
+    if retry_at > deadline:
+        return False, "proof_retry_next_at_after_deadline"
+
+    _now = now if now is not None else datetime.now(timezone.utc)
+    if deadline <= _now:
+        # Expired deadline: NOT active ownership. Terminalization belongs to
+        # the designated proof-retry recovery path, not the generic
+        # admission-cleanup path — this method fails closed either way.
+        return False, "proof_retry_deadline_expired"
+
+    return True, "proof_retry_active"
+
+
 class OrderStatus:
     CREATED           = "CREATED"
     PENDING_TRIGGER   = "PENDING_TRIGGER"
@@ -1070,6 +1153,17 @@ class APOrderStateMachine:
             # that an expired-looking claim is safe to supersede. Recovered
             # rows must use terminalize_recovered_entry(), whose CAS validates
             # owner, generation and lease atomically.
+            return True
+        # PRE_SUBMIT_PROOF_RETRY is a real deferred lifecycle whose selected
+        # contract, qty, price, and ownership are intentionally preserved so
+        # the recovery consumer can resume the exact order. Generic
+        # admission cleanup MUST NOT terminalize it while its proof-retry
+        # deadline is still in the future. The shared predicate at module
+        # level (is_proof_retry_owner_active) is the ONE source of truth for
+        # this evidence — the overnight liveness helper consults the same
+        # function so both layers agree on ownership.
+        _proof_active, _ = is_proof_retry_owner_active(meta)
+        if _proof_active:
             return True
         return False
 

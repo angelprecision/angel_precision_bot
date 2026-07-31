@@ -310,6 +310,23 @@ def _pending_owner_lease_active(meta: dict) -> tuple[bool, str]:
     if not isinstance(meta, dict):
         return False, "no_meta"
 
+    # PRE_SUBMIT_PROOF_RETRY: real deferred lifecycle whose ownership must
+    # be honored while the proof-retry deadline is still in the future. Uses
+    # the SHARED predicate defined in ap/order_state_machine.py so this
+    # helper and the OSM stale-expiration guard agree on ownership — no
+    # parallel rule sets.
+    try:
+        from ap.order_state_machine import is_proof_retry_owner_active
+        _proof_active, _proof_reason = is_proof_retry_owner_active(meta)
+        if _proof_active:
+            return True, _proof_reason
+    except Exception as _pr_exc:
+        log.warning(
+            "pending_owner_lease_active: proof-retry predicate import/call "
+            "failed err=%s — treating as no proof-retry evidence",
+            _pr_exc,
+        )
+
     if meta.get("materialization_in_flight"):
         lease = _parse_iso_ts(meta.get("materialization_lease_until"))
         if lease is None:

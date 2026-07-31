@@ -113,6 +113,14 @@ class _FakeOrderStateMachine:
                 return False, "broker_or_recovery_owner_active"
             if str(_meta.get("recovery_submit_owner") or "").strip():
                 return False, "broker_or_recovery_owner_active"
+            # Mirror the OSM guard's PRE_SUBMIT_PROOF_RETRY protection via
+            # the shared predicate so integration tests reflect production.
+            try:
+                from ap.order_state_machine import is_proof_retry_owner_active
+                if is_proof_retry_owner_active(_meta)[0]:
+                    return False, "broker_or_recovery_owner_active"
+            except Exception:
+                pass
         if not self.cleanup_succeeds:
             return False, "cleanup_stub_disabled"
         row["status"] = "EXPIRED"
@@ -1731,6 +1739,236 @@ def test_no_second_mc_approval_or_new_entry_after_any_ownership_conflict(monkeyp
     assert osm.create_calls == 0
     watcher_arm.watch.assert_not_called()
     controls["broker"].submit_order.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRE_SUBMIT_PROOF_RETRY: a real deferred lifecycle whose ownership MUST be
+# honored by both the overnight liveness helper and the OSM cleanup guard.
+# Same predicate (ap.order_state_machine.is_proof_retry_owner_active) is
+# consulted by both layers — no parallel rule sets.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _proof_retry_meta(*, deadline_offset_min=15, retry_offset_min=1,
+                      owner="proof-owner-1", broker_ready=True):
+    """Build a production-shaped PRE_SUBMIT_PROOF_RETRY metadata dict."""
+    from datetime import datetime, timedelta, timezone as _tz
+    _now = datetime.now(_tz.utc)
+    return {
+        "lifecycle_state": "PRE_SUBMIT_PROOF_RETRY",
+        "materialization_status": "SELECTED",
+        "broker_ready": broker_ready,
+        "proof_retry_owner": owner,
+        "current_owner": owner,
+        "materialization_owner": owner,
+        "proof_retry_next_at": (_now + timedelta(minutes=retry_offset_min)).isoformat(),
+        "proof_retry_deadline": (_now + timedelta(minutes=deadline_offset_min)).isoformat(),
+    }
+
+
+def test_proof_retry_shared_predicate_recognizes_active_owner():
+    """Unit test: the shared predicate returns True only when EVERY required
+    shape condition holds. Each malformed variant fails closed."""
+    from ap.order_state_machine import is_proof_retry_owner_active
+    from datetime import datetime, timedelta, timezone as _tz
+    _now = datetime.now(_tz.utc)
+    _future = (_now + timedelta(minutes=15)).isoformat()
+    _future_early = (_now + timedelta(minutes=1)).isoformat()
+    _past = (_now - timedelta(minutes=15)).isoformat()
+
+    # Full valid shape → owned.
+    ok, reason = is_proof_retry_owner_active(_proof_retry_meta())
+    assert ok is True, reason
+    assert reason == "proof_retry_active"
+
+    # Missing lifecycle_state.
+    m = _proof_retry_meta(); m.pop("lifecycle_state")
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # Wrong lifecycle_state.
+    m = _proof_retry_meta(); m["lifecycle_state"] = "SUBMITTING"
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # Wrong materialization_status.
+    m = _proof_retry_meta(); m["materialization_status"] = "RUNNING"
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # broker_ready falsy.
+    m = _proof_retry_meta(broker_ready=False)
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # Blank owner.
+    m = _proof_retry_meta(owner="")
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # Unparseable proof_retry_next_at.
+    m = _proof_retry_meta(); m["proof_retry_next_at"] = "not-a-timestamp"
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # Unparseable proof_retry_deadline.
+    m = _proof_retry_meta(); m["proof_retry_deadline"] = "garbage"
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # proof_retry_next_at AFTER proof_retry_deadline.
+    m = _proof_retry_meta()
+    m["proof_retry_next_at"] = _future
+    m["proof_retry_deadline"] = _future_early
+    assert is_proof_retry_owner_active(m)[0] is False
+
+    # Expired proof_retry_deadline → NOT owned (recovery path is authoritative).
+    # Use retry BEFORE deadline (both in past) so the deadline-expired guard
+    # is the one that fires, not the next_at-after-deadline guard.
+    _past_deep = (_now - timedelta(minutes=30)).isoformat()
+    m = _proof_retry_meta()
+    m["proof_retry_next_at"] = _past_deep
+    m["proof_retry_deadline"] = _past
+    ok, reason = is_proof_retry_owner_active(m)
+    assert ok is False
+    assert reason == "proof_retry_deadline_expired"
+
+
+def test_overnight_lease_helper_honors_proof_retry_ownership():
+    """The overnight liveness helper must consult the shared predicate and
+    treat a valid proof-retry row as OWNED — not as recovery_identity_
+    without_liveness (which was the previous ghost-ownership shape)."""
+    import ap_overnight_reeval as ov
+    owned, reason = ov._pending_owner_lease_active(_proof_retry_meta())
+    assert owned is True, reason
+    assert reason == "proof_retry_active"
+
+
+def test_proof_retry_row_classified_active_and_never_terminalized(monkeypatch):
+    """Positive regression: production-shaped PRE_SUBMIT_PROOF_RETRY row.
+    Classifier returns PENDING_OWNER_ACTIVE. Stale-expiration CAS is NEVER
+    called. Master Control is called exactly once. No new local order, no
+    watcher call, no broker submit. Existing row remains PENDING_TRIGGER
+    with its selected contract intact."""
+    import types as _types
+    import ap_overnight_reeval as ov
+
+    _proof_meta = _proof_retry_meta()
+
+    # Real classifier path against a real DB shim so we exercise both the
+    # SELECT and the shared predicate end-to-end.
+    _rows = [{
+        "local_order_id": "prior-proof-1", "client_id": "client-1",
+        "execution_mode": "paper", "status": "PENDING_TRIGGER",
+        "broker_order_id": None, "submitted_ts": None,
+        "created_ts": "2026-07-20T00:00:00+00:00",   # older than 20 min
+        "updated_ts": "2026-07-20T00:00:00+00:00",
+        "meta": _proof_meta,
+        "direction": "CALL", "canonical_signal_id": "CANON-001",
+    }]
+
+    class _StubCursor:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, *a, **kw): return None
+        def fetchall(self): return list(_rows)
+        def fetchone(self): return _rows[0]
+
+    _db = _types.ModuleType("ap.db")
+    _db.conn = lambda: _StubCursor()
+    _db.run_with_retry = lambda fn, *a, **kw: fn()
+    monkeypatch.setitem(sys.modules, "ap.db", _db)
+
+    outcome = ov._classify_pending_entry_for_overnight(
+        "AAPL", "client-1", "paper",
+        entry_watcher=None,
+        candidate_signal={"side": "CALL", "canonical_signal_id": "CANON-001"},
+    )
+    assert outcome.disposition == "PENDING_OWNER_ACTIVE", outcome
+    assert outcome.stale_orders == ()
+
+    # End-to-end: drive the caller with the classifier stubbed to return the
+    # same PENDING_OWNER_ACTIVE outcome. Prove:
+    #   MC called once, cleanup CAS never called, no new order, no watcher,
+    #   no broker submit, prior row untouched, selected contract preserved.
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    osm.orders["prior-proof-1"] = {
+        "local_order_id": "prior-proof-1",
+        "client_id": "client-1",
+        "canonical_signal_id": "CANON-001",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "execution_mode": "paper",
+        "updated_ts": "v1",
+        "contract": "AAPL260619C00100000",  # selected contract preserved
+        "meta": _proof_meta,
+    }
+
+    # Instrument CAS to fail the test loudly if it is ever called for this row.
+    orig_cas = osm.expire_stale_pending_entry_cas
+    cas_calls = []
+    def _cas_spy(local_order_id, **kw):
+        cas_calls.append((local_order_id, kw))
+        return orig_cas(local_order_id, **kw)
+    osm.expire_stale_pending_entry_cas = _cas_spy
+
+    watcher_arm = MagicMock()
+    watcher_arm.watch.return_value = True
+
+    monkeypatch.setattr(ov, "_classify_pending_entry_for_overnight",
+                        lambda *a, **kw: outcome)
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        watcher_arm,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved(),
+        classifier_result=outcome,
+        return_controls=True,
+    )
+
+    assert controls["master_control"].evaluate.call_count == 1
+    assert cas_calls == []  # stale-expiration CAS never called for active row
+    assert result["armed"] == 0
+    assert result["rejected"] == 1
+    assert result["terminal_rejected"] == 1
+    assert osm.create_calls == 0
+    watcher_arm.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    # Existing row and selected contract are preserved.
+    assert osm.orders["prior-proof-1"]["status"] == "PENDING_TRIGGER"
+    assert osm.orders["prior-proof-1"]["contract"] == "AAPL260619C00100000"
+
+
+def test_expired_proof_retry_deadline_is_not_permanent_ownership(monkeypatch):
+    """Negative control: a proof-retry row whose deadline has expired does
+    NOT establish permanent ownership via the shared predicate. It falls
+    through to the designated recovery-path treatment (bare identity without
+    liveness), NOT the generic admission cleanup. This test proves the
+    predicate correctly rejects an expired-deadline shape, and that the
+    overnight lease helper reports the row as unowned as a result."""
+    import ap_overnight_reeval as ov
+    from ap.order_state_machine import is_proof_retry_owner_active
+
+    from datetime import datetime, timedelta, timezone as _tz
+    _now = datetime.now(_tz.utc)
+    _expired = _proof_retry_meta()
+    # Both retry_at and deadline in the past, retry_at before deadline, so
+    # the deadline-expired guard is the one that decides (not the next_at-
+    # after-deadline shape guard).
+    _expired["proof_retry_next_at"] = (_now - timedelta(minutes=30)).isoformat()
+    _expired["proof_retry_deadline"] = (_now - timedelta(minutes=15)).isoformat()
+
+    # Shared predicate: expired deadline → not active.
+    ok, reason = is_proof_retry_owner_active(_expired)
+    assert ok is False
+    assert reason == "proof_retry_deadline_expired"
+
+    # Overnight lease helper: also not active (proof-retry branch declines,
+    # then no other liveness signal in this meta shape → falls through to
+    # bare-identity-without-liveness rule → not owned).
+    owned, over_reason = ov._pending_owner_lease_active(_expired)
+    assert owned is False
+    # Reason must not lie about ownership — this must be a clear "not owned"
+    # diagnostic, either the bare-identity ghost tag or a comparable label.
+    assert "without_liveness" in over_reason or over_reason == "no_active_owner", over_reason
 
 
 def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):
