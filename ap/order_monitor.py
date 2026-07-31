@@ -309,6 +309,16 @@ def _classify_pending_entry_ownership(
 
     status = str(existing.get("status") or "").upper().strip()
 
+    # Candidate-admission ownership fence: a FILLED ENTRY is a real,
+    # committed owner from the caller's perspective — it must block a
+    # replacement candidate exactly as active statuses do. FILLED remains
+    # in _TERMINAL_PE_STATUSES for generic terminal-order semantics
+    # elsewhere; we override only for admission classification here.
+    if status == "FILLED":
+        return _PendingOwnershipResult(
+            PENDING_OWNER_ACTIVE, True, False, "filled_entry_already_owned",
+        )
+
     if status in _TERMINAL_PE_STATUSES or broker_terminal:
         return _PendingOwnershipResult(
             PENDING_OWNER_TERMINAL, False, False, f"terminal:{status or 'broker_confirmed'}"

@@ -368,8 +368,15 @@ class TestPendingEntryOwnership:
     def test_canceled_row_does_not_block(self):
         assert self._blocks(_make_row(status="CANCELED")) is False
 
-    def test_filled_row_does_not_block(self):
-        assert self._blocks(_make_row(status="FILLED")) is False
+    def test_filled_row_blocks_candidate_admission(self):
+        # PR #404 Blocker 2: a FILLED ENTRY is a real, committed owner and
+        # must block replacement admission for the same client/mode. FILLED
+        # remains in _TERMINAL_PE_STATUSES for generic terminal-order
+        # semantics; here we assert only the candidate-admission fence.
+        assert self._blocks(_make_row(status="FILLED")) is True
+        r = self._classify(_make_row(status="FILLED"))
+        assert r.disposition == order_monitor.PENDING_OWNER_ACTIVE
+        assert r.reason == "filled_entry_already_owned"
 
     def test_paper_pending_never_blocks_live(self):
         row = _make_row(execution_mode="paper", status="PENDING_TRIGGER", created_ts=_now_iso())

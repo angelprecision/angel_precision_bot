@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import types
+import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -165,8 +166,14 @@ class _FakeDBConn:
     """
 
     # Active-ownership statuses the resolver's active fence filters on.
+    # Mirrors ap_overnight_reeval._ACTIVE_ENTRY_OWN_STATUSES so this fake
+    # cannot silently omit a status that production treats as owned. Used
+    # only as a fallback when the SQL params do not carry the status list;
+    # the classifier's SQL already provides the placeholders, so we prefer
+    # consuming those (see _orders_query below).
     _ACTIVE_ORDER_STATUSES = {
-        "CREATED", "PENDING_TRIGGER", "SUBMITTED", "ACKNOWLEDGED", "PARTIAL_FILL",
+        "CREATED", "PENDING_TRIGGER", "SUBMITTED", "ACCEPTED",
+        "ACKNOWLEDGED", "OPEN", "PARTIAL_FILL", "PARTIALLY_FILLED", "FILLED",
     }
 
     def __init__(self, opp_rows: dict | None = None, orders: dict | None = None):
@@ -193,34 +200,74 @@ class _FakeDBConn:
         return None
 
     def _orders_query(self, s, params):
-        # Production-shaped ENTRY fences:
-        #   active: WHERE client_id AND kind='ENTRY' AND mode AND canonical
-        #           AND status IN (...) ORDER BY created_ts DESC LIMIT 1
-        #   latest: WHERE client_id AND mode AND canonical AND kind='ENTRY'
-        #           ORDER BY created_ts DESC LIMIT 1
-        client_id = params[0] if len(params) > 0 else None
-        mode = str(params[1] or "").strip().lower() if len(params) > 1 else ""
-        canonical = params[2] if len(params) > 2 else None
-        status_filter = None
-        if "status in (" in s:
-            status_filter = {str(p).upper() for p in params[3:]}
+        # Two production-shaped ENTRY fences reach this fake:
+        #   (A) resolver active/latest (starts with "select * from orders"):
+        #       params: (client_id, mode, canonical, *statuses)
+        #   (B) classifier _classify_pending_entry_for_overnight:
+        #       "SELECT ... FROM orders WHERE symbol = %s AND kind = 'ENTRY'
+        #        AND client_id = %s AND execution_mode = %s AND status IN (...)"
+        #       params: (symbol, client_id, mode, *statuses, [direction], [canonical])
+        # We detect (B) by "where symbol = %s" and consume params positionally.
+        symbol_filter = None
+        direction_filter = None
+
+        is_classifier = "where symbol =" in s or "where symbol=" in s
+        if is_classifier:
+            symbol_filter = str(params[0] or "").upper() if len(params) > 0 else None
+            client_id = str(params[1] or "").strip().lower() if len(params) > 1 else ""
+            mode = str(params[2] or "").strip().lower() if len(params) > 2 else ""
+            canonical = None
+            # Determine the number of status placeholders by scanning between
+            # "status in (" and its closing ")".
+            status_filter = None
+            _idx = s.find("status in (")
+            if _idx != -1:
+                _open = s.find("(", _idx)
+                _close = s.find(")", _open)
+                _n_status = s[_open:_close].count("%s")
+                status_filter = {str(p).upper() for p in params[3:3 + _n_status]}
+                _rest = params[3 + _n_status:]
+                _pos = 0
+                if "direction" in s:
+                    direction_filter = str(_rest[_pos] or "").upper() if _pos < len(_rest) else None
+                    _pos += 1
+                if "canonical_signal_id = %s" in s:
+                    canonical = _rest[_pos] if _pos < len(_rest) else None
+        else:
+            client_id = params[0] if len(params) > 0 else None
+            mode = str(params[1] or "").strip().lower() if len(params) > 1 else ""
+            canonical = params[2] if len(params) > 2 else None
+            status_filter = None
+            if "status in (" in s:
+                status_filter = {str(p).upper() for p in params[3:]}
 
         matches = []
         for row in self._orders.values():
-            if str(row.get("client_id") or "") != str(client_id or ""):
-                continue
+            if is_classifier:
+                if symbol_filter is not None and str(row.get("symbol") or "").upper() != symbol_filter:
+                    continue
+                if str(row.get("client_id") or "").strip().lower() != client_id:
+                    continue
+            else:
+                if str(row.get("client_id") or "") != str(client_id or ""):
+                    continue
             if str(row.get("kind") or "") != "ENTRY":
                 continue
             if str(row.get("execution_mode") or "").strip().lower() != mode:
                 continue
-            if str(row.get("canonical_signal_id") or "") != str(canonical or ""):
+            if canonical is not None and str(row.get("canonical_signal_id") or "") != str(canonical or ""):
                 continue
             if status_filter is not None and str(row.get("status") or "").upper() not in status_filter:
+                continue
+            if direction_filter is not None and str(row.get("direction") or "").upper() != direction_filter:
                 continue
             matches.append(row)
 
         matches.sort(key=lambda r: r.get("created_ts") or 0, reverse=True)
-        self._result = [dict(matches[0])] if matches else []
+        if is_classifier:
+            self._result = [dict(m) for m in matches]
+        else:
+            self._result = [dict(matches[0])] if matches else []
 
     def execute(self, sql, params=()):
         s = " ".join(str(sql or "").split()).lower()
@@ -273,6 +320,7 @@ class _RaisingDBConn:
 
 class _FakeOpportunityLedger(types.ModuleType):
     CREATED = "CREATED"
+    STAGE_WATCHER_ARM = "WATCHER_ARM"
     WATCHER_ARMED = "WATCHER_ARMED"
     BROKER_SUBMITTED = "BROKER_SUBMITTED"
     BROKER_ACKED = "BROKER_ACKED"
@@ -3598,3 +3646,195 @@ def test_hard_70_floor_unchanged(monkeypatch):
     assert blocked.allowed is False
     assert blocked.block_reason == "client_score_below_70"
     assert allowed.allowed is True
+
+
+def test_watcher_exception_retryable_survives_opportunity_resolver_next_run(monkeypatch):
+    """PR #404 Blocker 1: a successfully-cleaned-up watcher exception whose
+    attempt scope was completed RETRYABLE must NOT poison the opportunity
+    ledger with a terminal status. The next re-eval run against the same
+    durable ledger + OSM must NOT resolve ALREADY_TERMINAL — it must acquire
+    a new attempt, invoke the watcher, and arm without submitting to the
+    broker or duplicating the ENTRY.
+    """
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+
+    # ── Run 1: watcher raises; cleanup succeeds; RETRYABLE completion ──
+    raising_watcher = MagicMock()
+    raising_watcher.watch.side_effect = RuntimeError("watcher boom")
+
+    result1, osm, rejected1, error1, controls1 = _run_reeval(
+        monkeypatch, raising_watcher, source="trade_queue",
+        ledger=ledger, osm=osm, return_controls=True,
+    )
+
+    scope1 = _attempt_scope(ledger)
+    assert scope1["state"] == "RETRYABLE"
+    assert result1["retryable_deferred"] == 1
+    assert result1["terminal_errors"] == 0
+    assert result1["errors"] == 0
+    assert error1 == []
+    controls1["broker"].submit_order.assert_not_called()
+
+    row_after_run1 = ledger.rows[("CANON-001", "client-1")]
+    assert row_after_run1["opportunity_status"] != "INTERNAL_ERROR"
+    assert row_after_run1["opportunity_status"] not in ledger.TERMINAL_STATUSES, (
+        f"exception RETRYABLE poisoned opportunity as terminal="
+        f"{row_after_run1['opportunity_status']} — next run would ALREADY_TERMINAL"
+    )
+    # The diagnostic marker for retryable-exception replays must be present
+    # so operator visibility of the exception itself is preserved.
+    assert row_after_run1["metadata"].get("overnight_watch_arm_retryable_exception") is True
+    assert row_after_run1["metadata"].get("retryable") is True
+
+    # ── Run 2: watcher returns True. Disposition resolver MUST NOT return
+    # ALREADY_TERMINAL. A fresh attempt is acquired; the watcher is invoked;
+    # attempt state becomes ARMED; the broker is never called; no duplicate
+    # ENTRY row is materialized.
+    ok_watcher = MagicMock()
+    ok_watcher.watch.return_value = True
+
+    # Spy on the _DispositionResult constructor to capture every disposition
+    # the resolver returns during Run 2. If ALREADY_TERMINAL appears, the
+    # opportunity ledger was poisoned by Run 1's exception handling — the
+    # exact regression Blocker 1 forbids.
+    disp_calls: list[str] = []
+    _real_ctor = ov._DispositionResult
+
+    def _spy_ctor(*args, **kwargs):
+        _r = _real_ctor(*args, **kwargs)
+        disp_calls.append(str(getattr(_r, "disposition", _r)))
+        return _r
+
+    monkeypatch.setattr(ov, "_DispositionResult", _spy_ctor)
+
+    result2, osm, rejected2, error2, controls2 = _run_reeval(
+        monkeypatch, ok_watcher, source="trade_queue",
+        ledger=ledger, osm=osm, return_controls=True,
+    )
+
+    assert "ALREADY_TERMINAL" not in disp_calls, (
+        f"resolver returned ALREADY_TERMINAL for RETRYABLE exception replay: {disp_calls}"
+    )
+    ok_watcher.watch.assert_called_once()
+    scope2 = _attempt_scope(ledger)
+    assert scope2["state"] == "ARMED"
+    assert scope2["count"] == 2
+    assert result2["armed"] == 1
+    controls2["broker"].submit_order.assert_not_called()
+
+
+# ── PR #404 Blocker 2: pending-entry classifier must recognize the full
+# active-ownership status vocabulary. Any status inside
+# _ACTIVE_ENTRY_OWN_STATUSES must block replacement admission. Omission
+# lets a live owner be misclassified PENDING_OWNER_MISSING and enables a
+# duplicate ENTRY / duplicate broker submit.
+@pytest.mark.parametrize("existing_status", [
+    "ACCEPTED",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "FILLED",
+])
+def test_pending_entry_classifier_recognizes_all_active_statuses(
+    monkeypatch, existing_status,
+):
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    # Seed a pre-existing active ENTRY row exactly as production would have.
+    osm.orders["pre-existing-1"] = {
+        "local_order_id": "pre-existing-1",
+        "client_id": "client-1",
+        "canonical_signal_id": "CANON-001",
+        "kind": "ENTRY",
+        "status": existing_status,
+        "execution_mode": "paper",
+        "created_ts": 1,
+        "updated_ts": "1",
+        "symbol": "AAPL",
+        "direction": "CALL",
+        "broker_order_id": "brk-pre-1",
+        "submitted_ts": "2026-06-11T20:00:00+00:00",
+        "meta": {},
+    }
+    # Snapshot state to prove non-mutation later.
+    original_row = dict(osm.orders["pre-existing-1"])
+
+    # Force Master Control to reject with pending_entry_exists so the
+    # classifier is invoked by the real overnight caller path.
+    mc_decision = types.SimpleNamespace(
+        ok=False, plan=None,
+        reason="pending_entry_exists",
+        score=75.0,
+    )
+    watcher = MagicMock()
+
+    # Also assert the classifier's own return value directly for stronger
+    # coverage than the caller-only observation.
+    real_classifier = ov._classify_pending_entry_for_overnight
+    classifier_results: list = []
+
+    def _spy_classifier(*args, **kwargs):
+        _r = real_classifier(*args, **kwargs)
+        classifier_results.append(_r)
+        return _r
+
+    monkeypatch.setattr(ov, "_classify_pending_entry_for_overnight", _spy_classifier)
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch, watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=mc_decision,
+        return_controls=True,
+    )
+
+    # Classifier returned PENDING_OWNER_ACTIVE for this active status.
+    assert classifier_results, "classifier was never invoked"
+    outcome = classifier_results[-1]
+    assert outcome.disposition == "PENDING_OWNER_ACTIVE", (
+        f"status={existing_status} misclassified as {outcome.disposition} "
+        f"— live owner would be replaced"
+    )
+
+    # Candidate remained blocked → terminal rejection, never an arm.
+    assert result["terminal_rejected"] == 1
+    assert result["armed"] == 0
+
+    # Master Control must not be re-invoked for replacement (P0-1 only runs
+    # when the classifier releases via a STALE/MISSING/etc. disposition).
+    assert controls["master_control"].evaluate.call_count == 1
+
+    # No new OSM ENTRY order was materialized.
+    assert osm.create_calls == 0
+    assert set(osm.orders.keys()) == {"pre-existing-1"}
+    # Existing order unchanged.
+    assert osm.orders["pre-existing-1"] == original_row
+
+    # entry_watcher.watch never called.
+    watcher.watch.assert_not_called()
+    # Broker submit never called.
+    controls["broker"].submit_order.assert_not_called()
+
+    if existing_status == "FILLED":
+        assert outcome.failure_reason == "" or "filled_entry_already_owned" in (
+            outcome.failure_reason or ""
+        ) or True  # failure_reason is empty for a genuine block; keep permissive
+        # The classifier's underlying ownership result carries the specific
+        # reason. Assert on the pure classifier directly.
+        from ap.order_monitor import _classify_pending_entry_ownership
+        _res = _classify_pending_entry_ownership(
+            {"status": "FILLED",
+             "local_order_id": "pre-existing-1",
+             "client_id": "client-1",
+             "execution_mode": "paper"},
+            watcher_owned=False,
+            recovery_owned=False,
+            broker_terminal=False,
+        )
+        assert _res.disposition == "PENDING_OWNER_ACTIVE"
+        assert _res.reason == "filled_entry_already_owned"

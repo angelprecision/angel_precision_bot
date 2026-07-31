@@ -615,6 +615,14 @@ def _classify_pending_entry_for_overnight(
             or ""
         ).strip()
 
+    # Full active-ownership status vocabulary. Any status listed in
+    # _ACTIVE_ENTRY_OWN_STATUSES represents an in-flight (or terminally-
+    # owned FILLED) ENTRY that must block admission of a replacement.
+    # Omitting any of these here causes a live owner to be misclassified
+    # PENDING_OWNER_MISSING and an authorized replacement to be issued.
+    _pending_statuses = tuple(sorted(_ACTIVE_ENTRY_OWN_STATUSES))
+    _pending_status_placeholders = ", ".join(["%s"] * len(_pending_statuses))
+
     _sql = (
         "SELECT local_order_id, client_id, "
         "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
@@ -624,11 +632,14 @@ def _classify_pending_entry_for_overnight(
         "WHERE symbol = %s AND kind = 'ENTRY' "
         "AND LOWER(TRIM(COALESCE(client_id, ''))) = %s "
         "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
-        "AND status IN ("
-        "  'CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL'"
-        ") "
+        f"AND status IN ({_pending_status_placeholders}) "
     )
-    _params: list = [str(ticker or "").upper(), cand_c, cand_m]
+    _params: list = [
+        str(ticker or "").upper(),
+        cand_c,
+        cand_m,
+        *_pending_statuses,
+    ]
     if cand_side in {"CALL", "PUT"}:
         _sql += "AND UPPER(TRIM(COALESCE(direction, ''))) = %s "
         _params.append(cand_side)
@@ -3789,12 +3800,16 @@ def _record_watch_arm_failure_proof(
     cleanup_success: Optional[bool] = None,
     cleanup_failed: bool = False,
     original_reason: Optional[str] = None,
+    retryable_exception: bool = False,
 ) -> None:
     try:
         from ap.opportunity_ledger import (
+            CREATED as _OL_CREATED,
+            STAGE_WATCHER_ARM as _OL_STAGE_WATCHER_ARM,
             create_opportunities,
             mark_internal_error,
             mark_watcher_invalidated,
+            update_opportunity,
         )
         canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
         _payload = dict(signal or {})
@@ -3821,7 +3836,30 @@ def _record_watch_arm_failure_proof(
             _extra_meta["overnight_watch_arm_cleanup_failed"] = True
         if original_reason is not None:
             _extra_meta["original_reason"] = str(original_reason)
-        if is_exception:
+        if is_exception and retryable_exception:
+            # A RETRYABLE watcher exception has already been recorded on
+            # the durable attempt scope. Writing INTERNAL_ERROR / any other
+            # terminal opportunity status here would poison the disposition
+            # resolver on the next run (ALREADY_TERMINAL) and permanently
+            # block the retry the attempt scope explicitly authorized.
+            # Merge diagnostic metadata via update_opportunity(..., CREATED, ...)
+            # so the monotonic status rule preserves any higher nonterminal
+            # current status while still surfacing the exception context.
+            update_opportunity(
+                signal_id,
+                client_id,
+                _OL_CREATED,
+                canonical_signal_id=canonical_signal_id,
+                miss_stage=_OL_STAGE_WATCHER_ARM,
+                miss_reason=reason,
+                order_local_id=str(local_order_id or ""),
+                extra_meta={
+                    **_extra_meta,
+                    "overnight_watch_arm_retryable_exception": True,
+                    "retryable": True,
+                },
+            )
+        elif is_exception:
             mark_internal_error(
                 signal_id,
                 client_id,
@@ -6361,6 +6399,10 @@ def run_overnight_reeval(
                     job_id=job_id,
                     is_exception=True,
                     session_key=session_key,
+                    retryable_exception=(
+                        _exception_completion_ok
+                        and _next_state == WATCH_ATTEMPT_STATE_RETRYABLE
+                    ),
                 )
                 log.error(
                     "[%s] overnight_reeval: entry_watcher.watch failed: %s "
