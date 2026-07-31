@@ -526,6 +526,7 @@ def _run_reeval(
     ledger: _FakeOpportunityLedger | None = None,
     cleanup_succeeds: bool = True,
     master_decision=None,
+    master_reevaluate_decision=None,
     classifier_result=None,
     return_controls: bool = False,
     osm: _FakeOrderStateMachine | None = None,
@@ -585,12 +586,22 @@ def _run_reeval(
     }
 
     master_control = MagicMock()
-    master_control.evaluate.return_value = master_decision or types.SimpleNamespace(
+    _default_decision = types.SimpleNamespace(
         ok=True,
         plan=_make_plan(),
         reason="approved",
         score=75.0,
     )
+    if master_reevaluate_decision is not None:
+        # PR #404 P0-1: the caller re-invokes master_control.evaluate() after
+        # cleaning up a stale pending entry. First call gets master_decision,
+        # every subsequent call gets master_reevaluate_decision.
+        _first = master_decision or _default_decision
+        master_control.evaluate.side_effect = (
+            [_first] + [master_reevaluate_decision] * 32
+        )
+    else:
+        master_control.evaluate.return_value = master_decision or _default_decision
 
     contract_selector = MagicMock()
     contract_selector.select.return_value = "AAPL260619C00100000"
@@ -888,7 +899,13 @@ def _assert_pending_owner_fail_closed(
     assert result["terminal_rejected"] == 0
     assert rejected_calls == []
     assert error_calls == []
-    assert controls["watching_calls"] == []
+    # PR #404 P1: DB_ERROR / CONFLICT and unexpected classifier values MUST
+    # durably stamp the exact ownership-unknown class on the queue row so
+    # operators can distinguish DB error from conflict; the prior "silent
+    # defer" behavior (watching_calls == []) was itself the bug this fixes.
+    assert len(controls["watching_calls"]) == 1
+    _wc = controls["watching_calls"][0]
+    assert _wc[2].startswith("pending_entry_owner_unknown:"), _wc
     controls["contract_selector"].select.assert_not_called()
     entry_watcher.watch.assert_not_called()
     assert osm.create_calls == 0
@@ -945,9 +962,18 @@ def test_pending_owner_unexpected_classifier_value_does_not_release_runtime(monk
 
 
 def test_pending_owner_explicit_stale_release_continues_to_normal_arm_runtime(monkeypatch):
+    # PR #404 P0-1: after a PENDING_OWNER_STALE release the caller must
+    # re-invoke master_control.evaluate() so score / 0DTE / priority / context /
+    # tier / intelligence gates all run on the released candidate. The prior
+    # fall-through skipped those gates. This test proves the second MC call
+    # happens and, when it approves, the signal continues to arm.
     ledger = _FakeOpportunityLedger()
     entry_watcher = MagicMock()
     entry_watcher.watch.return_value = True
+
+    _reeval_approved = types.SimpleNamespace(
+        ok=True, plan=_make_plan(), reason="approved_after_stale_release", score=75.0,
+    )
 
     result, osm, rejected_calls, error_calls, controls = _run_reeval(
         monkeypatch,
@@ -955,6 +981,7 @@ def test_pending_owner_explicit_stale_release_continues_to_normal_arm_runtime(mo
         source="trade_queue",
         ledger=ledger,
         master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved,
         classifier_result="PENDING_OWNER_STALE",
         return_controls=True,
     )
@@ -965,7 +992,219 @@ def test_pending_owner_explicit_stale_release_continues_to_normal_arm_runtime(mo
     assert error_calls == []
     assert osm.create_calls == 1
     entry_watcher.watch.assert_called_once()
+    # Master Control was invoked TWICE — once for the initial pending-entry
+    # rejection, once for the post-cleanup re-evaluation (P0-1).
+    assert controls["master_control"].evaluate.call_count >= 2
     assert controls["watching_calls"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #404 P0-1: stale-release must re-invoke Master Control end-to-end.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_stale_release_reevaluate_downstream_gate_rejection_is_honored(monkeypatch):
+    # A stale pending row is released, but on re-evaluation Master Control now
+    # rejects on a DOWNSTREAM gate (e.g. score/0DTE/priority/context/tier/
+    # intelligence) that the original pending-entry short-circuit had skipped.
+    # The candidate MUST NOT arm — the prior fall-through skipped these gates
+    # entirely and could arm signals that failed them.
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    _downstream_reject = types.SimpleNamespace(
+        ok=False,
+        plan=None,
+        reason="blocked_score:priority_floor",
+        reason_code="",
+        score=42.0,
+    )
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_downstream_reject,
+        classifier_result="PENDING_OWNER_STALE",
+        return_controls=True,
+    )
+
+    assert controls["master_control"].evaluate.call_count >= 2
+    assert result["armed"] == 0
+    assert result["rejected"] == 1
+    assert result["terminal_rejected"] == 1
+    assert result["retryable_deferred"] == 0
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert any(
+        "mc_blocked_after_stale_release" in c[2] for c in rejected_calls
+    ), rejected_calls
+
+
+def test_stale_release_reevaluate_still_pending_fails_closed(monkeypatch):
+    # If the re-evaluation somehow still reports pending_entry_exists (another
+    # actor raced in, cleanup didn't actually clear it, etc.), the caller must
+    # fail closed as retryable and NEVER bypass the pending-entry gate a
+    # second time.
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_pending_entry_decision(),
+        classifier_result="PENDING_OWNER_STALE",
+        return_controls=True,
+    )
+
+    assert controls["master_control"].evaluate.call_count >= 2
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 1
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert any(
+        "pending_entry_still_present_after_cleanup" in c[2]
+        for c in controls["watching_calls"]
+    ), controls["watching_calls"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #404 P0-2: stale rows must be terminalized (with readback) before release.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_stale_release_terminalization_failure_blocks_replacement(monkeypatch):
+    # OSM cleanup returns False for the stale row (or the readback is still
+    # non-terminal). No replacement is authorized: no re-evaluation, no new
+    # order, no watcher call, no broker submit. Deferred as retryable with a
+    # diagnostic reason.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    # Stub classifier to synthesize a stale outcome carrying a specific row.
+    stale_outcome = ov._PendingEntryOutcome(
+        "PENDING_OWNER_STALE",
+        ({"local_order_id": "ghost-1", "client_id": "client-1",
+          "execution_mode": "paper"},),
+        "stale_release",
+    )
+
+    class _FailingOSM(_FakeOrderStateMachine):
+        def expire_pending_entry(self, local_order_id, *, reason=""):
+            self.expire_calls.append((local_order_id, reason))
+            return False  # cleanup refuses
+
+        def cancel_pending_entry(self, local_order_id, *, reason=""):
+            self.cancel_calls.append((local_order_id, reason))
+            return False
+
+        def transition(self, local_order_id, new_status, **kwargs):
+            self.transition_calls.append((local_order_id, new_status, kwargs))
+            return False
+
+    osm = _FailingOSM()
+    _reeval_approved = types.SimpleNamespace(
+        ok=True, plan=_make_plan(), reason="approved", score=75.0,
+    )
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved,
+        classifier_result=stale_outcome,
+        return_controls=True,
+    )
+
+    # Master Control was called EXACTLY ONCE — the re-evaluate must not run
+    # because cleanup failed. No replacement is authorized.
+    assert controls["master_control"].evaluate.call_count == 1
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 1
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert any(
+        "pending_entry_stale_cleanup_failed" in c[2]
+        for c in controls["watching_calls"]
+    ), controls["watching_calls"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #404 P0-4: lease-freshness ownership check.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_pending_owner_lease_active_recognizes_production_ownership_fields():
+    import ap_overnight_reeval as ov
+    from datetime import datetime, timedelta, timezone
+
+    _now = datetime.now(timezone.utc)
+    _future = (_now + timedelta(minutes=15)).isoformat()
+    _past = (_now - timedelta(minutes=15)).isoformat()
+
+    # in-flight + fresh lease → owned
+    owned, _ = ov._pending_owner_lease_active({
+        "materialization_in_flight": True,
+        "materialization_lease_until": _future,
+    })
+    assert owned is True
+
+    # in-flight + expired lease → NOT owned (ghost row)
+    owned, reason = ov._pending_owner_lease_active({
+        "materialization_in_flight": True,
+        "materialization_lease_until": _past,
+    })
+    assert owned is False
+    assert "lease_expired" in reason
+
+    # materialization_status=RUNNING with no lease → owned
+    owned, _ = ov._pending_owner_lease_active({"materialization_status": "RUNNING"})
+    assert owned is True
+
+    # materialization_status=RUNNING with expired lease → NOT owned
+    owned, _ = ov._pending_owner_lease_active({
+        "materialization_status": "RUNNING",
+        "materialization_lease_until": _past,
+    })
+    assert owned is False
+
+    # recovery_owner identity present → owned (regardless of timestamps)
+    for _field in (
+        "materialization_owner", "recovery_owner", "recovery_ownership",
+        "current_owner", "watcher_token", "watcher_retry_owner",
+    ):
+        owned, _ = ov._pending_owner_lease_active({_field: "owner-abc"})
+        assert owned is True, _field
+
+    # fresh retry timestamp → owned
+    owned, _ = ov._pending_owner_lease_active(
+        {"materialization_next_retry_at": _future}
+    )
+    assert owned is True
+
+    # stale retry timestamp → NOT owned (this is the "false active" case the
+    # prior implementation could not distinguish).
+    owned, _ = ov._pending_owner_lease_active(
+        {"materialization_next_retry_at": _past}
+    )
+    assert owned is False
+
+    # empty / non-dict → NOT owned
+    assert ov._pending_owner_lease_active({})[0] is False
+    assert ov._pending_owner_lease_active(None)[0] is False
 
 
 def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):

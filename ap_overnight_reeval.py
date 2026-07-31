@@ -262,19 +262,214 @@ def _resolve_existing_watcher_ownership(
     return WATCH_OWNER_MISSING
 
 
+# ── PR #404 P0-4: real production ownership fields (with lease freshness) ────
+#
+# The prior recovery-owned check only looked at four retry-timestamp fields.
+# Live production orders carry ownership in a wider set of fields, and mere
+# presence of a stale timestamp is not evidence of an active owner. The rule:
+# a row is currently owned when it carries either
+#   (a) any of the ownership-identity fields, OR
+#   (b) an unexpired materialization lease, OR
+#   (c) materialization_in_flight is truthy, OR
+#   (d) materialization_status is 'RUNNING' or 'IN_PROGRESS'.
+# All four are checked below.
+
+_RECOVERY_OWNER_IDENTITY_FIELDS = (
+    "materialization_owner",
+    "recovery_owner",
+    "recovery_ownership",
+    "current_owner",
+    "watcher_token",
+    "watcher_retry_owner",
+)
+
+_ACTIVE_MATERIALIZATION_STATUSES = frozenset({"RUNNING", "IN_PROGRESS"})
+
+
+def _parse_iso_ts(raw) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        s = str(raw).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _pending_owner_lease_active(meta: dict) -> tuple[bool, str]:
+    """Return (owned, reason). A row is 'owned' only when the ownership
+    evidence is real AND (for time-bounded fields) still fresh. Reason is
+    the fact that produced the True/False decision for diagnostics."""
+    if not isinstance(meta, dict):
+        return False, "no_meta"
+
+    if meta.get("materialization_in_flight"):
+        lease = _parse_iso_ts(meta.get("materialization_lease_until"))
+        if lease is None:
+            # In-flight flag with no lease → treat as owned but flag it.
+            return True, "materialization_in_flight_no_lease"
+        if lease > datetime.now(timezone.utc):
+            return True, "materialization_lease_fresh"
+        # In-flight but lease expired → not owned; this row is a ghost.
+        return False, "materialization_lease_expired"
+
+    status = str(meta.get("materialization_status") or "").strip().upper()
+    if status in _ACTIVE_MATERIALIZATION_STATUSES:
+        lease = _parse_iso_ts(meta.get("materialization_lease_until"))
+        if lease is None or lease > datetime.now(timezone.utc):
+            return True, f"materialization_status:{status}"
+        return False, f"materialization_status_{status}_lease_expired"
+
+    for _field in _RECOVERY_OWNER_IDENTITY_FIELDS:
+        if str(meta.get(_field) or "").strip():
+            return True, f"recovery_identity:{_field}"
+
+    for _field in ("materialization_next_retry_at",
+                   "restart_rearm_next_at",
+                   "watcher_retry_next_at"):
+        ts = _parse_iso_ts(meta.get(_field))
+        if ts is not None and ts > datetime.now(timezone.utc):
+            return True, f"retry_timestamp_fresh:{_field}"
+
+    return False, "no_active_owner"
+
+
+def _terminalize_stale_pending_orders(
+    *,
+    order_state_machine,
+    stale_orders,
+    reason: str,
+) -> tuple[bool, str]:
+    """P0-2: durably terminalize every stale pending row before authorizing a
+    replacement. For each row: (1) transition via expire_pending_entry (falls
+    back to cancel_pending_entry, then transition('EXPIRED', ...)), (2) verify
+    the readback status is in _TERMINAL_ENTRY_STATUSES. A single row that
+    cannot be proven terminal fails the whole cleanup — the caller must not
+    release the candidate.
+
+    Returns (all_terminalized, failure_reason). failure_reason is stable
+    (operator diagnostic) when the return is False.
+    """
+    if not stale_orders:
+        return True, ""
+
+    for _row in stale_orders:
+        oid = str((_row or {}).get("local_order_id") or "").strip()
+        if not oid:
+            return False, "stale_row_missing_local_order_id"
+
+        terminalized = False
+        try:
+            if hasattr(order_state_machine, "expire_pending_entry"):
+                terminalized = bool(
+                    order_state_machine.expire_pending_entry(oid, reason=reason)
+                )
+            if (not terminalized
+                    and hasattr(order_state_machine, "cancel_pending_entry")):
+                terminalized = bool(
+                    order_state_machine.cancel_pending_entry(oid, reason=reason)
+                )
+            if (not terminalized
+                    and hasattr(order_state_machine, "transition")):
+                terminalized = bool(
+                    order_state_machine.transition(
+                        oid, "EXPIRED", last_error=reason,
+                    )
+                )
+        except Exception as _cleanup_exc:
+            log.error(
+                "pending_entry_stale_terminalize_exception local_order_id=%s "
+                "err=%s reason=%s",
+                oid, _cleanup_exc, reason,
+            )
+            return False, f"terminalize_exception:{type(_cleanup_exc).__name__}"
+
+        if not terminalized:
+            return False, f"terminalize_returned_false:{oid}"
+
+        # Verify readback: the row must actually be in a terminal status.
+        try:
+            row = (
+                order_state_machine.get_order(oid)
+                if hasattr(order_state_machine, "get_order")
+                else None
+            )
+        except Exception as _rb_exc:
+            log.error(
+                "pending_entry_stale_readback_exception local_order_id=%s err=%s",
+                oid, _rb_exc,
+            )
+            return False, f"readback_exception:{type(_rb_exc).__name__}"
+
+        status = str((row or {}).get("status") or "").strip().upper()
+        if status not in _TERMINAL_ENTRY_STATUSES:
+            log.error(
+                "pending_entry_stale_readback_nonterminal local_order_id=%s "
+                "status=%r",
+                oid, status,
+            )
+            return False, f"readback_nonterminal:{oid}:{status or 'blank'}"
+
+    return True, ""
+
+
+class _PendingEntryOutcome(NamedTuple):
+    """Structured result of _classify_pending_entry_for_overnight.
+
+    `disposition` is a PENDING_OWNER_* string constant preserving the existing
+    contract with all callers and tests. `stale_orders` carries the exact
+    same-client/mode rows the classifier saw and released; the caller must
+    durably terminalize each before authorizing a replacement. `failure_reason`
+    is a stable operator-facing string for DB_ERROR and CONFLICT paths.
+    """
+    disposition: str
+    stale_orders: tuple = ()
+    failure_reason: str = ""
+
+    # Preserve legacy string-comparison call sites: `_pe_class == "PENDING_..."`
+    # and `_pe_class in {...}`. Existing tests and callers that treated the
+    # return as a plain string keep working; the new .stale_orders / .failure_
+    # reason attributes are additive.
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.disposition == other
+        return tuple.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self.disposition)
+
+
 def _classify_pending_entry_for_overnight(
     ticker: str,
     client_id: str,
     execution_mode: str,
     entry_watcher=None,
-) -> str:
-    """Query orders; return a PENDING_OWNER_* constant. Fail-closed on DB error."""
+    candidate_signal: Optional[dict] = None,
+) -> "_PendingEntryOutcome":
+    """Query same-client/mode ENTRY orders for the ticker and classify the
+    ownership disposition. Returns _PendingEntryOutcome — callers can still
+    compare directly against PENDING_OWNER_* strings (backward compatible).
+    The stale_orders attribute carries every same-client/mode row the loop
+    released so the caller can terminalize each before authorizing a
+    replacement (P0-2). Fail-closed on DB error."""
     cand_c = str(client_id      or "").strip().lower()
     cand_m = str(execution_mode or "").strip().lower()
     if not cand_c or not cand_m:
         log.warning("[%s] _classify_pending_entry_for_overnight: missing candidate "
                     "identity client=%r mode=%r — fail closed", ticker, cand_c, cand_m)
-        return "PENDING_OWNER_DB_ERROR"
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", (), "missing_candidate_identity"
+        )
 
     try:
         from ap.order_monitor import (
@@ -286,25 +481,63 @@ def _classify_pending_entry_for_overnight(
         log.critical(
             "[%s] _classify_pending_entry_for_overnight: import failed: %s", ticker, _ie
         )
-        return "PENDING_OWNER_DB_ERROR"
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", (), f"import_failed:{type(_ie).__name__}"
+        )
+
+    # P0-3: exact-identity SQL. Filter by symbol AND same client AND same
+    # execution_mode (case-insensitive) before status/kind. Removes the
+    # LIMIT-10-hole (an older same-client/mode active owner can no longer be
+    # dropped by ten newer cross-scope rows). Direction and canonical_signal_id
+    # are used as additional filters when the candidate provides them, so
+    # opposite-side and cross-canonical collisions cannot masquerade as
+    # ownership of this candidate.
+    cand_side = ""
+    cand_canonical = ""
+    if isinstance(candidate_signal, dict):
+        cand_side = str(
+            candidate_signal.get("side") or candidate_signal.get("direction") or ""
+        ).strip().upper()
+        cand_canonical = str(
+            candidate_signal.get("canonical_signal_id")
+            or candidate_signal.get("signal_id")
+            or ""
+        ).strip()
+
+    _sql = (
+        "SELECT local_order_id, client_id, "
+        "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
+        "status, broker_order_id, submitted_ts, created_ts, meta, "
+        "direction, canonical_signal_id "
+        "FROM orders "
+        "WHERE symbol = %s AND kind = 'ENTRY' "
+        "AND LOWER(TRIM(COALESCE(client_id, ''))) = %s "
+        "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+        "AND status IN ("
+        "  'CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL'"
+        ") "
+    )
+    _params: list = [str(ticker or "").upper(), cand_c, cand_m]
+    if cand_side in {"CALL", "PUT"}:
+        _sql += "AND UPPER(TRIM(COALESCE(direction, ''))) = %s "
+        _params.append(cand_side)
+    if cand_canonical:
+        _sql += (
+            "AND ("
+            "canonical_signal_id IS NULL "
+            "OR TRIM(COALESCE(canonical_signal_id, '')) = '' "
+            "OR canonical_signal_id = %s"
+            ") "
+        )
+        _params.append(cand_canonical)
+    _sql += "ORDER BY created_ts DESC"
 
     try:
         from ap.db import conn, run_with_retry
 
         def _pe_fn():
             with conn() as c:
-                c.execute(
-                    "SELECT local_order_id, client_id, "
-                    "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
-                    "status, broker_order_id, submitted_ts, created_ts, meta "
-                    "FROM orders "
-                    "WHERE symbol = %s AND kind = 'ENTRY' "
-                    "AND status IN ("
-                    "  'CREATED','PENDING_TRIGGER','SUBMITTED','ACKNOWLEDGED','PARTIAL_FILL'"
-                    ") "
-                    "ORDER BY created_ts DESC LIMIT 10",
-                    (str(ticker or "").upper(),),
-                )
+                c.execute(_sql, tuple(_params))
                 return c.fetchall()
 
         rows = run_with_retry(_pe_fn) or []
@@ -312,36 +545,37 @@ def _classify_pending_entry_for_overnight(
         log.warning(
             "[%s] _classify_pending_entry_for_overnight: DB query failed: %s", ticker, _dbe
         )
-        return "PENDING_OWNER_DB_ERROR"
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", (), f"db_query_failed:{type(_dbe).__name__}"
+        )
 
     if not rows:
-        return "PENDING_OWNER_MISSING"
+        return _PendingEntryOutcome("PENDING_OWNER_MISSING", (), "no_matching_rows")
 
     _has_order_fn = getattr(entry_watcher, "has_order", None) if entry_watcher else None
     _saw_conflict = False
     _saw_db_error = False
-    _saw_cross_client = False
-    _saw_cross_mode = False
-    _saw_release = False
+    _stale_orders: list[dict] = []
+    _failure_reason = ""
 
     for _raw in rows:
         row = dict(_raw) if not isinstance(_raw, dict) else _raw
         row_client = str(row.get("client_id")      or "").strip().lower()
         row_mode   = str(row.get("execution_mode") or "").strip().lower()
 
-        # Missing existing row identity → ambiguous, never release
+        # Missing existing row identity → ambiguous, never release. (The SQL
+        # filter already restricts to same client/mode; belt-and-suspenders.)
         if not row_client or not row_mode:
             _saw_conflict = True
+            _failure_reason = _failure_reason or "row_missing_identity"
+            continue
+        if row_client != cand_c or row_mode != cand_m:
+            # Should not occur given SQL filter, but preserve fail-closed
+            # semantics if the DB somehow returns a non-matching row.
+            _saw_conflict = True
+            _failure_reason = _failure_reason or "row_scope_mismatch"
             continue
 
-        if row_client != cand_c:
-            _saw_cross_client = True
-            continue
-        if row_mode != cand_m:
-            _saw_cross_mode = True
-            continue
-
-        # Same client/mode — resolve real watcher and recovery ownership
         row_local_oid = str(row.get("local_order_id") or "").strip()
         _watcher_owned = (
             bool(_has_order_fn(row_local_oid))
@@ -353,14 +587,14 @@ def _classify_pending_entry_for_overnight(
             if isinstance(_meta, str):
                 import json as _json
                 _meta = _json.loads(_meta) if _meta.strip() else {}
-            _recovery_owned = bool(
-                _meta.get("materialization_next_retry_at")
-                or _meta.get("restart_rearm_next_at")
-                or _meta.get("watcher_retry_owner")
-                or _meta.get("watcher_retry_next_at")
-            )
+            # P0-4: real ownership check against production fields + lease
+            # freshness — stale timestamps and dead in-flight leases no longer
+            # register as owned; live materialization/recovery owners are
+            # honored regardless of which retry-timestamp field name is used.
+            _recovery_owned, _owner_reason = _pending_owner_lease_active(_meta)
         except Exception:
             _recovery_owned = False
+            _owner_reason = "meta_parse_error"
 
         result = _classify_pending_entry_ownership(
             row,
@@ -369,25 +603,46 @@ def _classify_pending_entry_for_overnight(
             broker_terminal=False,
         )
         if result.blocks_candidate:
-            return "PENDING_OWNER_ACTIVE"
+            return _PendingEntryOutcome(
+                "PENDING_OWNER_ACTIVE", (),
+                f"active_owner:{_owner_reason}" if _recovery_owned else "active_owner",
+            )
         if result.disposition == PENDING_OWNER_DB_ERROR:
             _saw_db_error = True
+            _failure_reason = _failure_reason or f"row_db_error:{result.reason}"
         elif result.disposition == PENDING_OWNER_CONFLICT:
             _saw_conflict = True
+            _failure_reason = _failure_reason or f"row_conflict:{result.reason}"
         else:
-            _saw_release = True
+            # STALE row — track exact identity so the caller can terminalize
+            # it before authorizing a replacement (P0-2).
+            _stale_orders.append({
+                "local_order_id": row_local_oid,
+                "client_id": row_client,
+                "execution_mode": row_mode,
+                "status": str(row.get("status") or "").strip().upper(),
+                "canonical_signal_id": str(row.get("canonical_signal_id") or "").strip(),
+                "direction": str(row.get("direction") or "").strip().upper(),
+                "created_ts": row.get("created_ts"),
+                "reason": result.reason,
+                "owner_check": _owner_reason,
+            })
 
     if _saw_db_error:
-        return "PENDING_OWNER_DB_ERROR"
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", tuple(_stale_orders),
+            _failure_reason or "db_error",
+        )
     if _saw_conflict:
-        return "PENDING_OWNER_CONFLICT"
-    if _saw_release:
-        return "PENDING_OWNER_STALE"
-    if _saw_cross_client:
-        return "PENDING_OWNER_CROSS_CLIENT"
-    if _saw_cross_mode:
-        return "PENDING_OWNER_CROSS_MODE"
-    return "PENDING_OWNER_MISSING"
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_CONFLICT", tuple(_stale_orders),
+            _failure_reason or "conflict",
+        )
+    if _stale_orders:
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_STALE", tuple(_stale_orders), "stale_release",
+        )
+    return _PendingEntryOutcome("PENDING_OWNER_MISSING", (), "no_owner_evidence")
 
 
 def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
@@ -4364,10 +4619,19 @@ def run_overnight_reeval(
                         # Fall through to Step 5 (contract selection / arm)
                     elif "pending_entry_exists" in _r and not _is_hard_safety_block:
                         # PR #404: classify ownership before terminal rejection.
-                        _pe_class = _classify_pending_entry_for_overnight(
+                        # P0-3: pass candidate signal so the classifier can
+                        # scope by exact side + canonical identity.
+                        _pe_outcome = _classify_pending_entry_for_overnight(
                             ticker, client_id, _execution_mode,
                             entry_watcher=entry_watcher,
+                            candidate_signal=signal,
                         )
+                        # Test stubs and older callers may return a plain
+                        # PENDING_OWNER_* string. Wrap so .disposition /
+                        # .stale_orders / .failure_reason are always present.
+                        if isinstance(_pe_outcome, str):
+                            _pe_outcome = _PendingEntryOutcome(_pe_outcome, (), "")
+                        _pe_class = _pe_outcome.disposition
                         if _pe_class == "PENDING_OWNER_ACTIVE":
                             log.info(
                                 "[%s] pending_entry_owner_active %s — "
@@ -4387,8 +4651,18 @@ def run_overnight_reeval(
                         elif _pe_class in {"PENDING_OWNER_DB_ERROR", "PENDING_OWNER_CONFLICT"}:
                             log.critical(
                                 "[%s] pending_entry_ownership_unknown %s — "
-                                "class=%s fail closed as retryable_deferred",
+                                "class=%s reason=%s fail closed as retryable_deferred",
                                 ticker, signal_id, _pe_class,
+                                _pe_outcome.failure_reason,
+                            )
+                            # P1: durably stamp the exact ownership-unknown
+                            # class + reason on the queue row so operators can
+                            # distinguish DB error from conflict and diagnose
+                            # repeated silent deferrals.
+                            _mark_job_watching_reason(
+                                job_id, client_id,
+                                f"pending_entry_owner_unknown:{_pe_class}:"
+                                f"{_pe_outcome.failure_reason or 'unspecified'}",
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
                             result["retryable_deferred"] += 1
@@ -4400,34 +4674,125 @@ def run_overnight_reeval(
                             "PENDING_OWNER_CROSS_MODE",
                             "PENDING_OWNER_TERMINAL",
                         }:
-                            # Stale/terminal/missing/cross-scope: false suppression.
-                            # Release — signal must still pass all subsequent gates.
+                            # False suppression released. Two required steps
+                            # before proceeding, in order:
+                            #   1. P0-2: durably terminalize every stale row
+                            #      the classifier saw. A stale row must not
+                            #      outlive the run that released the candidate.
+                            #   2. P0-1: re-invoke master_control.evaluate() so
+                            #      score / 0DTE / priority / context / tier /
+                            #      intelligence gates all run on the released
+                            #      candidate. The prior fall-through skipped
+                            #      those gates entirely.
                             _pe_label = _pe_class.lower().replace("pending_owner_", "owner_")
                             log.info(
                                 "[%s] pending_entry_%s %s — false suppression "
-                                "released; continuing to normal gate sequence",
+                                "released; terminalizing %d stale row(s) and "
+                                "re-invoking Master Control",
                                 ticker, _pe_label, signal_id,
+                                len(_pe_outcome.stale_orders),
                             )
-                            if getattr(decision, "plan", None) is None:
-                                import types as _types_pe
-                                decision = _types_pe.SimpleNamespace(
-                                    ok=True,
-                                    plan=_hydrate_plan_from_signal(
-                                        signal,
-                                        client_id=client_id,
-                                        execution_mode=_execution_mode,
+
+                            _cleanup_ok, _cleanup_failure = (
+                                _terminalize_stale_pending_orders(
+                                    order_state_machine=order_state_machine,
+                                    stale_orders=_pe_outcome.stale_orders,
+                                    reason=(
+                                        f"overnight_reeval_stale_release:{_pe_class}"
                                     ),
-                                    reason=f"pending_entry_released:{_pe_class}",
-                                    score=float(signal.get("score") or 0),
                                 )
-                            else:
-                                decision.ok = True
-                            # Fall through to Step 5
+                            )
+                            if not _cleanup_ok:
+                                log.critical(
+                                    "[%s] pending_entry_stale_cleanup_failed %s — "
+                                    "class=%s reason=%s; refusing to release "
+                                    "and marking retryable_deferred",
+                                    ticker, signal_id, _pe_class, _cleanup_failure,
+                                )
+                                _mark_job_watching_reason(
+                                    job_id, client_id,
+                                    f"pending_entry_stale_cleanup_failed:{_cleanup_failure}",
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
+                            # P0-1: re-invoke Master Control end-to-end.
+                            # pending_entry_exists is no longer true after the
+                            # cleanup, so the remaining gates (score / 0DTE /
+                            # priority / context / tier / intelligence) can now
+                            # run. Any non-pending-entry rejection is honored.
+                            try:
+                                decision = master_control.evaluate(
+                                    reeval_signal, client_id=client_id,
+                                )
+                            except Exception as _mc_exc:
+                                log.error(
+                                    "[%s] pending_entry_stale_release_reevaluate "
+                                    "failed signal=%s err=%s",
+                                    ticker, signal_id, _mc_exc,
+                                )
+                                _mark_job_watching_reason(
+                                    job_id, client_id,
+                                    "pending_entry_reevaluate_exception:"
+                                    f"{type(_mc_exc).__name__}",
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
+                            if not getattr(decision, "ok", False):
+                                _rr = str(getattr(decision, "reason", "") or "")
+                                # If pending_entry_exists still fires after
+                                # cleanup, something else is holding a row —
+                                # fail closed and never bypass the gate a
+                                # second time.
+                                if "pending_entry_exists" in _rr.lower():
+                                    log.critical(
+                                        "[%s] pending_entry_still_present_after_"
+                                        "cleanup %s reason=%s — fail closed",
+                                        ticker, signal_id, _rr,
+                                    )
+                                    _mark_job_watching_reason(
+                                        job_id, client_id,
+                                        "pending_entry_still_present_after_cleanup",
+                                    )
+                                    result["skipped"] = result.get("skipped", 0) + 1
+                                    result["retryable_deferred"] += 1
+                                    continue
+                                log.info(
+                                    "[%s] pending_entry_release_reevaluate "
+                                    "rejected %s reason=%s — honoring downstream "
+                                    "gate",
+                                    ticker, signal_id, _rr,
+                                )
+                                if _paper_rescue_only:
+                                    _mark_job_rejected(
+                                        job_id, client_id,
+                                        _paper_rescue_queue_reason(
+                                            "mc_reevaluate_blocked", _rr,
+                                        ),
+                                    )
+                                else:
+                                    _mark_job_rejected(
+                                        job_id, client_id,
+                                        f"mc_blocked_after_stale_release:{_rr}",
+                                    )
+                                result["rejected"] += 1
+                                result["terminal_rejected"] += 1
+                                continue
+
+                            # Re-evaluation succeeded end-to-end. Fall through
+                            # to Step 5 with the fresh decision.
                         else:
                             log.critical(
                                 "[%s] pending_entry_ownership_unknown %s — "
                                 "unexpected class=%s fail closed as retryable_deferred",
                                 ticker, signal_id, _pe_class,
+                            )
+                            _mark_job_watching_reason(
+                                job_id, client_id,
+                                f"pending_entry_owner_unknown:unexpected:{_pe_class}",
                             )
                             result["skipped"] = result.get("skipped", 0) + 1
                             result["retryable_deferred"] += 1
