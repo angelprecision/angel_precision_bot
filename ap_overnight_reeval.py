@@ -327,16 +327,36 @@ def _pending_owner_lease_active(meta: dict) -> tuple[bool, str]:
             return True, f"materialization_status:{status}"
         return False, f"materialization_status_{status}_lease_expired"
 
-    for _field in _RECOVERY_OWNER_IDENTITY_FIELDS:
-        if str(meta.get(_field) or "").strip():
-            return True, f"recovery_identity:{_field}"
-
+    # A fresh retry timestamp is a real liveness signal — accept it whether or
+    # not an identity field is also set. This is the "living worker" evidence.
     for _field in ("materialization_next_retry_at",
                    "restart_rearm_next_at",
                    "watcher_retry_next_at"):
         ts = _parse_iso_ts(meta.get(_field))
         if ts is not None and ts > datetime.now(timezone.utc):
             return True, f"retry_timestamp_fresh:{_field}"
+
+    # A bare identity field (materialization_owner / recovery_owner /
+    # recovery_ownership / current_owner / watcher_token / watcher_retry_owner)
+    # is a HISTORICAL claim, not a living worker. Standing alone it can persist
+    # indefinitely after a process dies and silently stop tomorrow's valid
+    # trades. It only counts as an active owner when corroborated by one of:
+    #   - a fresh materialization lease (materialization_lease_until > now)
+    #   - a fresh retry timestamp (any of the retry-*_at fields above)
+    #   - an ACTIVE materialization_status (already handled above)
+    #   - materialization_in_flight (already handled above)
+    # The lease and status checks above already returned early on a positive
+    # match. Reaching this point means no fresh liveness evidence exists, so
+    # bare identity fields alone are treated as ghost ownership.
+    _identity_fields_present = [
+        _f for _f in _RECOVERY_OWNER_IDENTITY_FIELDS
+        if str(meta.get(_f) or "").strip()
+    ]
+    if _identity_fields_present:
+        return False, (
+            "recovery_identity_without_liveness:"
+            + ",".join(_identity_fields_present)
+        )
 
     return False, "no_active_owner"
 
@@ -367,6 +387,17 @@ def _terminalize_stale_pending_orders(
 
         terminalized = False
         try:
+            # Only the ownership-guarded pending-entry APIs may terminalize a
+            # pending ENTRY. Both expire_pending_entry() and cancel_pending_
+            # entry() intentionally refuse when broker or recovery ownership
+            # has become active between our classifier read and this write —
+            # that refusal is the whole point of the guard. The prior raw
+            # transition('EXPIRED', ...) fallback bypassed those guards and
+            # could force a live recovery-owned row terminal, killing the
+            # rightful owner and authorizing a replacement local ENTRY. Never
+            # do that. A refusal here is a legitimate ownership signal and
+            # must fail the cleanup so the caller does NOT release the
+            # candidate.
             if hasattr(order_state_machine, "expire_pending_entry"):
                 terminalized = bool(
                     order_state_machine.expire_pending_entry(oid, reason=reason)
@@ -375,13 +406,6 @@ def _terminalize_stale_pending_orders(
                     and hasattr(order_state_machine, "cancel_pending_entry")):
                 terminalized = bool(
                     order_state_machine.cancel_pending_entry(oid, reason=reason)
-                )
-            if (not terminalized
-                    and hasattr(order_state_machine, "transition")):
-                terminalized = bool(
-                    order_state_machine.transition(
-                        oid, "EXPIRED", last_error=reason,
-                    )
                 )
         except Exception as _cleanup_exc:
             log.error(
@@ -522,13 +546,14 @@ def _classify_pending_entry_for_overnight(
         _sql += "AND UPPER(TRIM(COALESCE(direction, ''))) = %s "
         _params.append(cand_side)
     if cand_canonical:
-        _sql += (
-            "AND ("
-            "canonical_signal_id IS NULL "
-            "OR TRIM(COALESCE(canonical_signal_id, '')) = '' "
-            "OR canonical_signal_id = %s"
-            ") "
-        )
+        # Candidate-admission cleanup targets require EXACT canonical identity.
+        # A NULL or blank canonical_signal_id does not prove the row belongs
+        # to this candidate — it proves the opposite (ownership unknown), and
+        # authorizing a candidate-specific cleanup against it would let a
+        # legacy unidentified row masquerade as this candidate's stale prior.
+        # Legacy unidentified rows are a separate maintenance concern and
+        # must be handled by a dedicated maintenance path, not by admission.
+        _sql += "AND canonical_signal_id = %s "
         _params.append(cand_canonical)
     _sql += "ORDER BY created_ts DESC"
 

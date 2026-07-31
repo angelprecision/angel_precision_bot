@@ -1181,30 +1181,153 @@ def test_pending_owner_lease_active_recognizes_production_ownership_fields():
     })
     assert owned is False
 
-    # recovery_owner identity present → owned (regardless of timestamps)
+    # A bare identity string is a HISTORICAL claim, not a living worker.
+    # Standing alone it can persist indefinitely after a process dies. It is
+    # NOT owned without corroborating liveness (fresh lease, fresh retry
+    # timestamp, active materialization_status, or materialization_in_flight).
     for _field in (
         "materialization_owner", "recovery_owner", "recovery_ownership",
         "current_owner", "watcher_token", "watcher_retry_owner",
     ):
-        owned, _ = ov._pending_owner_lease_active({_field: "owner-abc"})
+        owned, reason = ov._pending_owner_lease_active({_field: "owner-abc"})
+        assert owned is False, _field
+        assert "recovery_identity_without_liveness" in reason, (_field, reason)
+
+    # Same identity field WITH a fresh retry timestamp → owned (liveness proved).
+    for _field in (
+        "materialization_owner", "recovery_owner", "current_owner",
+        "watcher_token",
+    ):
+        owned, _ = ov._pending_owner_lease_active({
+            _field: "owner-abc",
+            "materialization_next_retry_at": _future,
+        })
         assert owned is True, _field
 
-    # fresh retry timestamp → owned
+    # Same identity field WITH a fresh materialization lease → owned.
+    owned, _ = ov._pending_owner_lease_active({
+        "recovery_owner": "worker-1",
+        "materialization_in_flight": True,
+        "materialization_lease_until": _future,
+    })
+    assert owned is True
+
+    # fresh retry timestamp alone → owned
     owned, _ = ov._pending_owner_lease_active(
         {"materialization_next_retry_at": _future}
     )
     assert owned is True
 
-    # stale retry timestamp → NOT owned (this is the "false active" case the
-    # prior implementation could not distinguish).
+    # stale retry timestamp alone → NOT owned
     owned, _ = ov._pending_owner_lease_active(
         {"materialization_next_retry_at": _past}
     )
     assert owned is False
 
+    # Identity + only STALE retry timestamp → NOT owned (identity is
+    # historical, timestamp expired — this is exactly the ghost-ownership
+    # shape that stops tomorrow's valid trades).
+    owned, _ = ov._pending_owner_lease_active({
+        "recovery_owner": "worker-dead",
+        "materialization_next_retry_at": _past,
+    })
+    assert owned is False
+
     # empty / non-dict → NOT owned
     assert ov._pending_owner_lease_active({})[0] is False
     assert ov._pending_owner_lease_active(None)[0] is False
+
+
+def test_cleanup_never_uses_generic_transition_fallback(monkeypatch):
+    # Real production race regression: classifier sees the row as stale, but
+    # BOTH ownership-guarded OSM APIs refuse (recovery/broker ownership
+    # appeared between the classifier read and the cleanup write). The prior
+    # implementation fell back to a raw transition('EXPIRED', ...) which
+    # bypassed the pending-entry ownership guard — killing the rightful owner
+    # and authorizing a replacement local ENTRY. The guarded refusal must now
+    # BE the cleanup failure signal; no bypass is attempted.
+    import ap_overnight_reeval as ov
+
+    stale_outcome = ov._PendingEntryOutcome(
+        "PENDING_OWNER_STALE",
+        ({"local_order_id": "prior-1", "client_id": "client-1",
+          "execution_mode": "paper"},),
+        "stale_release",
+    )
+
+    class _RefusingOSM(_FakeOrderStateMachine):
+        # Both guarded pending-entry APIs refuse (as they do in production
+        # when recovery/broker ownership is active). The generic transition()
+        # MUST NEVER be called from the cleanup path — record all calls and
+        # fail the test if it is.
+        def __init__(self):
+            super().__init__()
+            self.transition_called_from_cleanup = 0
+
+        def expire_pending_entry(self, local_order_id, *, reason=""):
+            self.expire_calls.append((local_order_id, reason))
+            return False
+
+        def cancel_pending_entry(self, local_order_id, *, reason=""):
+            self.cancel_calls.append((local_order_id, reason))
+            return False
+
+        def transition(self, local_order_id, new_status, **kwargs):
+            # A cleanup-initiated raw transition is the exact production
+            # regression we are guarding against.
+            if (str(new_status).upper() == "EXPIRED"
+                    and str(kwargs.get("last_error") or "").startswith(
+                        "overnight_reeval_stale_release")):
+                self.transition_called_from_cleanup += 1
+            return super().transition(local_order_id, new_status, **kwargs)
+
+    osm = _RefusingOSM()
+    # Seed order 'prior-1' as still active — the whole race is that it was
+    # active at cleanup time even though the classifier saw it as stale.
+    osm.orders["prior-1"] = {
+        "local_order_id": "prior-1", "client_id": "client-1",
+        "canonical_signal_id": "CANON-001", "kind": "ENTRY",
+        "status": "PENDING_TRIGGER", "execution_mode": "paper",
+    }
+
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    _reeval_approved = types.SimpleNamespace(
+        ok=True, plan=_make_plan(), reason="approved", score=75.0,
+    )
+
+    ledger = _FakeOpportunityLedger()
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        master_decision=_pending_entry_decision(),
+        master_reevaluate_decision=_reeval_approved,
+        classifier_result=stale_outcome,
+        return_controls=True,
+    )
+
+    # 1. The raw transition() fallback was NEVER invoked.
+    assert osm.transition_called_from_cleanup == 0
+    # 2. Master Control was called EXACTLY ONCE — the re-evaluate must not
+    #    run because cleanup failed.
+    assert controls["master_control"].evaluate.call_count == 1
+    # 3. No replacement was authorized.
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 1
+    assert osm.create_calls == 0
+    entry_watcher.watch.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    # 4. The rightful owner remains active.
+    assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
+    # 5. A stable diagnostic reason is stamped.
+    assert any(
+        "pending_entry_stale_cleanup_failed" in c[2]
+        for c in controls["watching_calls"]
+    ), controls["watching_calls"]
 
 
 def _attempt_scope(ledger: _FakeOpportunityLedger, *, client_id="client-1", mode="paper"):
