@@ -1418,6 +1418,113 @@ def test_watcher_true_but_armed_completion_failure_is_not_reported_armed(monkeyp
     assert controls["broker"].submit_order.call_count == 0
 
 
+def test_bind_failure_completion_cas_failure_is_terminal_error_not_retryable(monkeypatch):
+    # After the ENTRY is created, _bind_watch_arm_attempt_order fails (durable
+    # scope was stolen). Cleanup of the created ENTRY succeeds. But then the
+    # ERROR completion CAS ALSO fails (rare but possible: another actor rewrote
+    # the durable owner between bind-check and completion). If we report this as
+    # retryable_deferred, the durable attempt is stranded IN_PROGRESS and every
+    # future reevaluation returns WATCH_ATTEMPT_ALREADY_IN_PROGRESS forever.
+    # Must be reported as a terminal error so the operator sees the stuck
+    # ownership rather than a fake "will retry" signal.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    monkeypatch.setattr(ov, "_bind_watch_arm_attempt_order", lambda **kw: False)
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    # No second ENTRY, no watcher call, no broker submit — the bind-failure path
+    # must terminate this reevaluation before Step 7.
+    assert osm.create_calls == 1
+    entry_watcher.watch.assert_not_called()
+    assert controls["broker"].submit_order.call_count == 0
+
+    # And the outcome is a terminal error, not a "will retry" lie.
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+
+
+def test_ap_signals_watcher_armed_completion_fail_then_restart_no_duplicate_entry(monkeypatch):
+    # ap_signals path:
+    #   1) watcher.watch() → True
+    #   2) WATCHER_ARMED durable ledger write succeeds
+    #   3) attempt ARMED completion CAS fails → retryable_deferred (PENDING_TRIGGER
+    #      order preserved, in-memory watcher preserved)
+    #   4) Simulate a process restart: clear the in-memory watcher registry.
+    #   5) Next reevaluation MUST reattach (or fail closed) via the active-order
+    #      fence and MUST NOT create a second ENTRY or submit to the broker.
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+
+    # ── run 1: attempt ARMED completion fails, but everything else succeeds ──
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+
+    _real_complete = ov._complete_watch_arm_attempt_checked
+
+    def _fail_only_armed(**kw):
+        if str(kw.get("state") or "").upper() == ov.WATCH_ATTEMPT_STATE_ARMED:
+            return False
+        return _real_complete(**kw)
+
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", _fail_only_armed)
+
+    result1, osm, _, _, controls1 = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="ap_signals",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    assert result1["armed"] == 0
+    assert result1["retryable_deferred"] == 1
+    assert osm.create_calls == 1
+    assert osm.orders["local-ord-1"]["status"] == "PENDING_TRIGGER"
+    entry_watcher.watch.assert_called_once()
+    assert controls1["broker"].submit_order.call_count == 0
+
+    # ── run 2: simulate restart — fresh entry_watcher (no in-memory arm) ──
+    monkeypatch.undo()
+
+    entry_watcher2 = MagicMock()
+    entry_watcher2.watch.return_value = True
+
+    _created_before = osm.create_calls
+
+    result2, osm2, _, _, controls2 = _run_reeval(
+        monkeypatch,
+        entry_watcher2,
+        source="ap_signals",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    # The critical invariant: no second ENTRY, no broker submit. Whether the
+    # next reeval reattaches or fails closed is up to the recovery path; what it
+    # MUST NOT do is trust stale in-memory state and materialize a duplicate.
+    assert osm2.create_calls == _created_before
+    assert controls2["broker"].submit_order.call_count == 0
+
+
 def test_retryable_cleanup_completion_failure_is_terminal_error_not_fake_retry(monkeypatch):
     # watch() False, cleanup succeeds, but the durable RETRYABLE completion CAS
     # fails. This is a terminal error — never reported as a retryable success,

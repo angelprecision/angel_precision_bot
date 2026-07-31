@@ -580,6 +580,191 @@ def test_terminal_attempt_state_cannot_reopen(current_state, requested_state):
     assert overnight._attempt_state(_read_scope(mode="live")) == current_state
 
 
+class _FullFakeOSM:
+    """OSM stub returning production-shaped rows (client/mode/canonical/kind)
+    so _local_order_terminal_state can enforce identity fencing."""
+
+    def __init__(self, orders=None):
+        self.orders = dict(orders or {})
+        self.get_calls: list[str] = []
+
+    def get_order(self, local_order_id):
+        self.get_calls.append(local_order_id)
+        return dict(self.orders.get(local_order_id) or {})
+
+
+def _entry_row(*, local_order_id, client=CLIENT, mode="live", canonical=CANON,
+               kind="ENTRY", status="EXPIRED"):
+    return {
+        "local_order_id": local_order_id,
+        "client_id": client,
+        "execution_mode": mode,
+        "canonical_signal_id": canonical,
+        "kind": kind,
+        "status": status,
+    }
+
+
+# ── blocker 2: terminal-order proof must verify prior order IDENTITY ──────────
+
+def test_terminal_proof_correct_identity_allows_replacement():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({"prior-1": _entry_row(local_order_id="prior-1")})
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == ACQUIRED, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 2
+
+
+def test_terminal_proof_wrong_client_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({"prior-1": _entry_row(local_order_id="prior-1", client="other-client")})
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_state(scope) == S_RETRYABLE
+
+
+def test_terminal_proof_wrong_execution_mode_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({"prior-1": _entry_row(local_order_id="prior-1", mode="paper")})
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+
+
+def test_terminal_proof_wrong_canonical_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    osm = _FullFakeOSM({
+        "prior-1": _entry_row(local_order_id="prior-1", canonical="CANON-OTHER")
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+
+
+def test_terminal_proof_wrong_kind_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    # Same local_order_id resolves an EXIT-kind row → identity mismatch.
+    osm = _FullFakeOSM({
+        "prior-1": _entry_row(local_order_id="prior-1", kind="EXIT")
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+
+
+def test_terminal_proof_missing_identity_fields_is_conflict():
+    _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-prev", order_id="prior-1")
+    # Row has terminal status but omits identity fields the fence requires.
+    osm = _FullFakeOSM({
+        "prior-1": {"local_order_id": "prior-1", "status": "EXPIRED"}
+    })
+    claim = _claim(mode="live", osm=osm, max_attempts=3)
+    assert claim.disposition == CONFLICT, claim
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_count(scope) == 1
+
+
+# ── blocker 3: malformed CONTAINER / scope-value shapes never acquire ─────────
+
+@pytest.mark.parametrize(
+    "scopes_container",
+    [
+        ["not", "a", "dict"],
+        "corrupt-string",
+        42,
+        7.5,
+        True,
+    ],
+)
+def test_malformed_scopes_container_is_conflict(scopes_container):
+    """overnight_watch_arm_attempt_scopes present but not an object → CONFLICT.
+    The strict parser must NOT silently repair this into a first-claim state."""
+    import json
+    setup = psycopg2.connect(_RAW_URL)
+    setup.autocommit = True
+    meta = {"overnight_watch_arm_attempt_scopes": scopes_container}
+    with setup.cursor() as cur:
+        cur.execute(
+            "INSERT INTO client_signal_opportunities "
+            "(signal_id, canonical_signal_id, client_id, opportunity_status, "
+            " order_local_id, metadata) VALUES (%s,%s,%s,%s,%s,%s::jsonb) "
+            "ON CONFLICT (canonical_signal_id, client_id) DO UPDATE SET "
+            "metadata = EXCLUDED.metadata",
+            (SIGNAL_ID, CANON, CLIENT, "CREATED", None, json.dumps(meta)),
+        )
+    setup.close()
+
+    claim = _claim(mode="live")
+    assert claim.disposition == CONFLICT
+
+    # Metadata byte-for-byte preserved — the corrupt container was NEVER
+    # silently normalized into a claim.
+    conn = psycopg2.connect(_RAW_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT metadata FROM client_signal_opportunities "
+        "WHERE canonical_signal_id=%s AND client_id=%s",
+        (CANON, CLIENT),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    assert row["metadata"] == meta
+
+
+@pytest.mark.parametrize(
+    "scope_value",
+    [
+        ["not", "a", "dict"],
+        "corrupt-string",
+        42,
+        7.5,
+        True,
+    ],
+)
+def test_malformed_scope_value_at_key_is_conflict(scope_value):
+    """Container is a dict but the value at our session key is not an object →
+    CONFLICT. The strict extractor MUST NOT return {} silently for this."""
+    import json
+    key = overnight._attempt_scope_key("live", SESSION)
+    meta = {"overnight_watch_arm_attempt_scopes": {key: scope_value}}
+    setup = psycopg2.connect(_RAW_URL)
+    setup.autocommit = True
+    with setup.cursor() as cur:
+        cur.execute(
+            "INSERT INTO client_signal_opportunities "
+            "(signal_id, canonical_signal_id, client_id, opportunity_status, "
+            " order_local_id, metadata) VALUES (%s,%s,%s,%s,%s,%s::jsonb) "
+            "ON CONFLICT (canonical_signal_id, client_id) DO UPDATE SET "
+            "metadata = EXCLUDED.metadata",
+            (SIGNAL_ID, CANON, CLIENT, "CREATED", None, json.dumps(meta)),
+        )
+    setup.close()
+
+    claim = _claim(mode="live")
+    assert claim.disposition == CONFLICT
+
+    conn = psycopg2.connect(_RAW_URL)
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT metadata FROM client_signal_opportunities "
+        "WHERE canonical_signal_id=%s AND client_id=%s",
+        (CANON, CLIENT),
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    assert row["metadata"] == meta
+
+
 def test_exact_armed_completion_replay_is_idempotent():
     _seed(mode="live", state=S_RETRYABLE, count=0)
     a = _claim(mode="live")

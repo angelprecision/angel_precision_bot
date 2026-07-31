@@ -1154,6 +1154,31 @@ def _attempt_meta_scope(meta: dict, execution_mode: str, session_key: str) -> di
     return dict(scope) if isinstance(scope, dict) else {}
 
 
+def _attempt_meta_scope_strict(
+    meta: dict, execution_mode: str, session_key: str
+) -> tuple[dict, bool, str]:
+    """Strict scope extractor. Returns (scope, malformed, reason).
+
+    A missing scopes container OR a present container that omits the requested
+    session key is a clean absent state ({}, False, ""). A container that is
+    present but NOT a JSON object, or a scope value that is present but NOT a
+    JSON object, is malformed and MUST fail closed as WATCH_ATTEMPT_CONFLICT
+    rather than being silently converted into a fresh first-claim.
+    """
+    if "overnight_watch_arm_attempt_scopes" not in (meta or {}):
+        return {}, False, ""
+    scopes = meta.get("overnight_watch_arm_attempt_scopes")
+    if not isinstance(scopes, dict):
+        return {}, True, "attempt_scopes_container_not_object"
+    key = _attempt_scope_key(execution_mode, session_key)
+    if key not in scopes:
+        return {}, False, ""
+    scope = scopes.get(key)
+    if not isinstance(scope, dict):
+        return {}, True, "attempt_scope_value_not_object"
+    return dict(scope), False, ""
+
+
 def _attempt_count(scope: dict) -> int:
     try:
         return max(0, int(scope.get("count") or 0))
@@ -1409,7 +1434,22 @@ def _write_attempt_meta(
         return False
 
 
-def _local_order_terminal_state(order_state_machine, local_order_id: str) -> tuple[str, str]:
+def _local_order_terminal_state(
+    order_state_machine,
+    local_order_id: str,
+    *,
+    expected_client_id: str = "",
+    expected_execution_mode: str = "",
+    expected_canonical_signal_id: str = "",
+) -> tuple[str, str]:
+    """Prove the referenced prior local ENTRY order is durably terminal AND that
+    it belongs to the expected owner. When any expected_* identity is supplied,
+    the OSM row must match on client_id, execution_mode (case-insensitive),
+    canonical_signal_id AND kind == 'ENTRY' before its terminal status can
+    authorize a replacement claim. Any missing or contradictory identity fence
+    is a WATCH_ATTEMPT_CONFLICT — stale or cross-scope terminal proof must
+    never be trusted to reopen a claim.
+    """
     if not local_order_id:
         return WATCH_ATTEMPT_CONFLICT, "missing_prior_local_order_id"
     try:
@@ -1420,6 +1460,29 @@ def _local_order_terminal_state(order_state_machine, local_order_id: str) -> tup
         return WATCH_ATTEMPT_DB_ERROR, f"osm_get_order_exception:{type(exc).__name__}"
     if not isinstance(row, dict) or not row:
         return WATCH_ATTEMPT_CONFLICT, "prior_order_missing"
+
+    requires_identity = any(
+        (expected_client_id, expected_execution_mode, expected_canonical_signal_id)
+    )
+    if requires_identity:
+        row_order_id = str(row.get("local_order_id") or "").strip()
+        if row_order_id and row_order_id != str(local_order_id).strip():
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_local_id_mismatch"
+        row_client = str(row.get("client_id") or "").strip()
+        if str(expected_client_id or "").strip() and row_client != str(expected_client_id).strip():
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_client_mismatch"
+        row_mode = str(row.get("execution_mode") or "").strip().lower()
+        exp_mode = str(expected_execution_mode or "").strip().lower()
+        if exp_mode and row_mode != exp_mode:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_execution_mode_mismatch"
+        row_canonical = str(row.get("canonical_signal_id") or "").strip()
+        exp_canonical = str(expected_canonical_signal_id or "").strip()
+        if exp_canonical and row_canonical != exp_canonical:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_canonical_mismatch"
+        row_kind = str(row.get("kind") or "").strip().upper()
+        if row_kind and row_kind != "ENTRY":
+            return WATCH_ATTEMPT_CONFLICT, f"prior_order_kind_not_entry:{row_kind}"
+
     status = str(row.get("status") or "").strip().upper()
     if status in _TERMINAL_ENTRY_STATUSES:
         return WATCH_ATTEMPT_ACQUIRED, status
@@ -1530,7 +1593,9 @@ def _read_attempt_scope_unlocked(
     meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
     if malformed:
         return None
-    scope = _attempt_meta_scope(meta, mode, session)
+    scope, scope_malformed, _scope_reason = _attempt_meta_scope_strict(meta, mode, session)
+    if scope_malformed:
+        return None
     valid, state, count, token, local_order_id, _reason = (
         _parse_attempt_scope_strict(scope)
     )
@@ -1585,7 +1650,13 @@ def _atomic_claim_watch_arm_attempt(
     if pre is not None:
         pre_state, pre_count, pre_token, pre_order = pre
         if pre_state == WATCH_ATTEMPT_STATE_RETRYABLE and pre_order:
-            terminal_result, terminal_reason = _local_order_terminal_state(order_state_machine, pre_order)
+            terminal_result, terminal_reason = _local_order_terminal_state(
+                order_state_machine,
+                pre_order,
+                expected_client_id=client_id,
+                expected_execution_mode=mode,
+                expected_canonical_signal_id=canonical_signal_id,
+            )
             if terminal_result != WATCH_ATTEMPT_ACQUIRED:
                 return _WatchAttemptClaim(terminal_result, pre_token, pre_count, pre_order, terminal_reason)
             required_prior_order = pre_order
@@ -1617,7 +1688,13 @@ def _atomic_claim_watch_arm_attempt(
                     return _WatchAttemptClaim(
                         WATCH_ATTEMPT_CONFLICT, reason="attempt_metadata_malformed"
                     )
-                scope = _attempt_meta_scope(meta, mode, session)
+                scope, scope_malformed, scope_malformed_reason = (
+                    _attempt_meta_scope_strict(meta, mode, session)
+                )
+                if scope_malformed:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, reason=scope_malformed_reason
+                    )
                 (
                     scope_valid,
                     state,
@@ -4753,7 +4830,7 @@ def run_overnight_reeval(
                     reason=_bind_reason,
                     done_event="OVERNIGHT_WATCH_ARM_ATTEMPT_BIND_FAILED_CLEANUP_DONE",
                 )
-                _complete_watch_arm_attempt_checked(
+                _bind_completion_ok = _complete_watch_arm_attempt_checked(
                     signal_id=signal_id,
                     client_id=client_id,
                     canonical_signal_id=_canonical_for_attempt,
@@ -4769,6 +4846,14 @@ def run_overnight_reeval(
                 )
                 if not _cleanup_success:
                     _mark_job_error(job_id, client_id, f"{_bind_reason}:cleanup_failed:{_cleanup_method}")
+                    result["errors"] += 1
+                    result["terminal_errors"] += 1
+                elif not _bind_completion_ok:
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        "overnight_watch_arm_bind_cleanup_completion_failed",
+                    )
                     result["errors"] += 1
                     result["terminal_errors"] += 1
                 else:
