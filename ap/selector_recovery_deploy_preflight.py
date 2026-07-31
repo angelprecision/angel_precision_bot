@@ -41,9 +41,19 @@ WHERE UPPER(COALESCE(kind, '')) = 'ENTRY'
   AND COALESCE(broker_order_id, '') = ''
   AND submitted_ts IS NULL
   AND LOWER(TRIM(COALESCE(execution_mode, ''))) IN ('live', 'paper')
-  AND COALESCE(meta->>'lifecycle_state', '') IN (
-        'RETRY_WAIT',
-        'MATERIALIZING'
+  -- Match runtime startup-recovery compat: a row enters recovery when either
+  -- lifecycle_state OR materialization_status names an active retry state.
+  -- Selecting on either field prevents a false PASS from a row whose
+  -- lifecycle_state is blank/missing while materialization_status is present.
+  AND (
+        UPPER(TRIM(COALESCE(meta->>'lifecycle_state', ''))) IN (
+            'RETRY_WAIT',
+            'MATERIALIZING'
+          )
+        OR UPPER(TRIM(COALESCE(meta->>'materialization_status', ''))) IN (
+            'RETRY_PENDING',
+            'RUNNING'
+          )
       )
   AND NULLIF(COALESCE(meta->>'submit_intent_at', ''), '') IS NULL
   AND LOWER(COALESCE(meta->>'broker_ready', 'false'))
@@ -210,6 +220,47 @@ def _diagnostic_base(
     }
 
 
+_MATERIALIZATION_STATUS_TO_LIFECYCLE: dict[str, str] = {
+    "RETRY_PENDING": "RETRY_WAIT",
+    "RUNNING": "MATERIALIZING",
+}
+
+
+def _canonical_lifecycle(
+    meta: Mapping[str, Any],
+) -> tuple[str, str | None]:
+    """Resolve the effective startup-recovery lifecycle for a row.
+
+    Mirrors the runtime compat rule: a row is in RETRY_WAIT when either
+    ``lifecycle_state`` says so OR ``materialization_status`` is RETRY_PENDING;
+    a row is MATERIALIZING when either field says so via RUNNING.
+
+    When both fields are present, ``lifecycle_state`` wins (this matches OSM
+    behavior — ``lifecycle_state`` is the field the OSM writes deterministically
+    alongside every legal transition). A LIFECYCLE_STATUS_CONFLICT diagnostic
+    is returned when the two fields disagree so an operator can see the hazard
+    rather than having it silently downgraded.
+    """
+    lifecycle_raw = str(meta.get("lifecycle_state") or "").strip().upper()
+    status_raw = str(
+        meta.get("materialization_status") or ""
+    ).strip().upper()
+    status_lifecycle = _MATERIALIZATION_STATUS_TO_LIFECYCLE.get(status_raw, "")
+
+    if lifecycle_raw in {"RETRY_WAIT", "MATERIALIZING"}:
+        canonical = lifecycle_raw
+        conflict = (
+            bool(status_lifecycle)
+            and status_lifecycle != canonical
+        )
+        return canonical, ("LIFECYCLE_STATUS_CONFLICT" if conflict else None)
+
+    if status_lifecycle:
+        return status_lifecycle, None
+
+    return "", None
+
+
 def classify_selector_recovery_hazard(
     raw_row: Mapping[str, Any],
 ) -> dict[str, Any] | None:
@@ -217,9 +268,7 @@ def classify_selector_recovery_hazard(
 
     row = dict(raw_row or {})
     meta, meta_error = _coerce_meta(row.get("meta"))
-    lifecycle_state = str(
-        meta.get("lifecycle_state") or ""
-    ).strip().upper()
+    lifecycle_state, lifecycle_conflict = _canonical_lifecycle(meta)
 
     if lifecycle_state not in {"RETRY_WAIT", "MATERIALIZING"}:
         return None
@@ -241,7 +290,12 @@ def classify_selector_recovery_hazard(
         persisted_generation=persisted_generation,
     )
 
-    for reason in (meta_error, attempt_error, generation_error):
+    for reason in (
+        meta_error,
+        lifecycle_conflict,
+        attempt_error,
+        generation_error,
+    ):
         if reason:
             return {**base, "reason": reason}
 
@@ -273,6 +327,16 @@ def classify_selector_recovery_hazard(
     if cursor_candidate in (None, ""):
         return {**base, "reason": "MISSING_CURSOR_ON_RETRY"}
 
+    # Runtime accepts a generation N-1 cursor only when the row's retry has
+    # already been transactionally preclaimed by startup recovery (the code
+    # path that sets sig["_recovery_pre_claimed"]=True and drives
+    # allow_previous_generation=bool(_recovery_pre_claimed) in execution core).
+    # That preclaim status is a runtime CAS artifact that cannot be proven
+    # from a read-only SELECT of orders.meta. The preflight therefore requires
+    # the EXACT expected generation to declare a row safe; a genuine
+    # previous-generation cursor is treated as unsafe here and reported so
+    # deployment stays fail-closed rather than silently agreeing with a state
+    # only the running claimant could authorize.
     _, cursor_load_reason = load_selector_recovery_cursor(
         cursor_candidate,
         local_order_id=local_order_id,
@@ -281,10 +345,7 @@ def classify_selector_recovery_hazard(
         signal_id=signal_id,
         materialization_generation=expected_generation,
         selector_attempt_count=selector_attempt,
-        # RETRY_WAIT cursor belongs to the prior generation before the
-        # N -> N+1 retry claim. MATERIALIZING may also be immediately
-        # after that claim. Only the exact previous generation is allowed.
-        allow_previous_generation=True,
+        allow_previous_generation=False,
     )
 
     if cursor_load_reason:

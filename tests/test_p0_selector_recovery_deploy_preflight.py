@@ -15,9 +15,13 @@ CLIENT_ID = "client-preflight-401"
 SIGNAL_ID = "signal-preflight-401"
 
 
+_UNSET = object()
+
+
 def _row(
     *,
     lifecycle_state: str = "RETRY_WAIT",
+    materialization_status=_UNSET,
     execution_mode: str = "live",
     retry_attempt: int | str | None = 1,
     generation: int | str | None = 1,
@@ -26,13 +30,15 @@ def _row(
     materialization_current_attempt: int | None = None,
     materialization_owner: str = "materializer-owner",
 ) -> dict:
+    if materialization_status is _UNSET:
+        status_default = (
+            "RETRY_PENDING" if lifecycle_state == "RETRY_WAIT" else "RUNNING"
+        )
+    else:
+        status_default = materialization_status
     meta = {
         "lifecycle_state": lifecycle_state,
-        "materialization_status": (
-            "RETRY_PENDING"
-            if lifecycle_state == "RETRY_WAIT"
-            else "RUNNING"
-        ),
+        "materialization_status": status_default,
         "materialization_owner": (
             ""
             if lifecycle_state == "RETRY_WAIT"
@@ -98,7 +104,13 @@ def test_retry_wait_attempt_one_without_cursor_blocks_next_attempt_two():
     assert hazard["reason"] == "MISSING_CURSOR_ON_RETRY"
 
 
-def test_retry_wait_valid_previous_generation_cursor_is_safe():
+def test_retry_wait_previous_generation_cursor_is_unsafe_without_preclaim():
+    # Runtime only allows a generation N-1 cursor through
+    # load_selector_recovery_cursor(allow_previous_generation=True), and only
+    # sets that flag when _recovery_pre_claimed is True — a transactional
+    # startup-recovery claim that a READ-ONLY preflight cannot prove from
+    # orders.meta. The preflight therefore fails closed on prior-generation
+    # cursors and reports the row for operator review.
     row = _row(
         lifecycle_state="RETRY_WAIT",
         retry_attempt=1,
@@ -108,10 +120,56 @@ def test_retry_wait_valid_previous_generation_cursor_is_safe():
             attempt=1,
         ),
     )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["reason"] == "IDENTITY_MISMATCH:materialization_generation"
 
-    # Recovery will claim generation 2. The exact generation-1 cursor is
-    # permitted only through load_selector_recovery_cursor's explicit
-    # previous-generation allowance.
+
+def test_retry_wait_exact_next_generation_cursor_is_safe():
+    # Positive control: a cursor whose stored generation exactly matches the
+    # generation runtime will claim next (N+1 for RETRY_WAIT) IS safe under
+    # the read-only preflight, because acceptance does not depend on the
+    # preclaim flag.
+    row = _row(
+        lifecycle_state="RETRY_WAIT",
+        retry_attempt=1,
+        generation=1,
+        cursor_marker=_valid_cursor(
+            generation=2,
+            attempt=2,
+        ),
+    )
+    assert preflight.classify_selector_recovery_hazard(row) is None
+
+
+def test_materializing_previous_generation_cursor_is_unsafe_without_preclaim():
+    # Same rule for MATERIALIZING: runtime only accepts a gen N-1 cursor when
+    # preclaim is proven. The preflight must not silently accept it.
+    row = _row(
+        lifecycle_state="MATERIALIZING",
+        retry_attempt=2,
+        generation=2,
+        cursor_marker=_valid_cursor(
+            generation=1,
+            attempt=1,
+        ),
+    )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["reason"] == "IDENTITY_MISMATCH:materialization_generation"
+
+
+def test_materializing_exact_current_generation_cursor_is_safe():
+    # Positive control: exact-current-generation cursor is safe.
+    row = _row(
+        lifecycle_state="MATERIALIZING",
+        retry_attempt=2,
+        generation=2,
+        cursor_marker=_valid_cursor(
+            generation=2,
+            attempt=2,
+        ),
+    )
     assert preflight.classify_selector_recovery_hazard(row) is None
 
 
@@ -383,3 +441,143 @@ def test_module_has_no_runtime_trade_or_mutation_authority():
         "DELETE FROM orders",
     ):
         assert forbidden not in source
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical-lifecycle regressions (reviewer follow-up).
+# Runtime startup recovery treats materialization_status as an equal peer of
+# lifecycle_state. A read-only preflight that only reads lifecycle_state would
+# silently omit real recovery-eligible rows and print a false PASS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_missing_lifecycle_with_retry_pending_status_is_unsafe():
+    row = _row(
+        lifecycle_state="",
+        materialization_status="RETRY_PENDING",
+        retry_attempt=1,
+        generation=1,
+    )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["lifecycle_state"] == "RETRY_WAIT"
+    assert hazard["selector_attempt_number"] == 2
+    assert hazard["reason"] == "MISSING_CURSOR_ON_RETRY"
+
+
+def test_blank_lifecycle_with_running_status_is_materializing_and_inspected():
+    row = _row(
+        lifecycle_state="",
+        materialization_status="RUNNING",
+        retry_attempt=2,
+        generation=2,
+    )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["lifecycle_state"] == "MATERIALIZING"
+    assert hazard["selector_attempt_number"] == 2
+    assert hazard["reason"] == "MISSING_CURSOR_ON_RETRY"
+
+
+def test_contradictory_lifecycle_and_materialization_status_is_conflict():
+    # lifecycle_state says MATERIALIZING but materialization_status says
+    # RETRY_PENDING. The canonical resolver keeps lifecycle_state (matches OSM
+    # write order) and surfaces LIFECYCLE_STATUS_CONFLICT rather than silently
+    # picking one field.
+    row = _row(
+        lifecycle_state="MATERIALIZING",
+        materialization_status="RETRY_PENDING",
+        retry_attempt=1,
+        generation=1,
+    )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["reason"] == "LIFECYCLE_STATUS_CONFLICT"
+
+
+def test_status_only_attempt_two_missing_cursor_is_unsafe():
+    # A legacy/compat row that carries only materialization_status must still
+    # be inspected at attempt 2+. Confirms the SQL population expansion is
+    # actually exercised by the classifier.
+    row = _row(
+        lifecycle_state="",
+        materialization_status="RUNNING",
+        retry_attempt=0,
+        materialization_attempts=2,
+        generation=2,
+    )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["lifecycle_state"] == "MATERIALIZING"
+    assert hazard["selector_attempt_number"] == 2
+    assert hazard["attempt_source"] == "materialization_attempts"
+    assert hazard["reason"] == "MISSING_CURSOR_ON_RETRY"
+
+
+def test_non_preclaimed_materializing_row_with_only_previous_generation_cursor_is_unsafe():
+    # Explicit reviewer regression: a MATERIALIZING attempt-2 row carrying only
+    # a valid generation-1 cursor must NOT be accepted as safe. Runtime accepts
+    # this only when _recovery_pre_claimed is True (the preflight cannot prove
+    # that from a read-only SELECT), so the preflight must fail closed.
+    row = _row(
+        lifecycle_state="MATERIALIZING",
+        retry_attempt=2,
+        generation=2,
+        cursor_marker=_valid_cursor(
+            generation=1,
+            attempt=1,
+        ),
+    )
+    hazard = preflight.classify_selector_recovery_hazard(row)
+    assert hazard is not None
+    assert hazard["reason"] == "IDENTITY_MISMATCH:materialization_generation"
+
+
+def test_exact_current_generation_positive_control_materializing():
+    # Positive control for Fix 2: an exact-current-generation cursor is safe.
+    row = _row(
+        lifecycle_state="MATERIALIZING",
+        retry_attempt=3,
+        generation=3,
+        cursor_marker=_valid_cursor(
+            generation=3,
+            attempt=3,
+        ),
+    )
+    assert preflight.classify_selector_recovery_hazard(row) is None
+
+
+def test_sql_covers_status_only_recovery_population():
+    # Blocker 1 required the SQL to include materialization_status-only rows.
+    sql = " ".join(
+        preflight.ACTIVE_SELECTOR_RECOVERY_ROWS_SQL.upper().split()
+    )
+    assert "MATERIALIZATION_STATUS" in sql
+    assert "RETRY_PENDING" in sql
+    assert "RUNNING" in sql
+
+
+def test_cli_flags_status_only_hazard():
+    """CLI-level regression that a status-only recovery row is not silently
+    dropped by the JSON output — a false PASS is precisely the failure mode
+    Blocker 1 warned about."""
+    import pytest as _pytest
+
+    payload = None
+
+    def _fake_rows():
+        return [_row(
+            lifecycle_state="",
+            materialization_status="RETRY_PENDING",
+            retry_attempt=1,
+            generation=1,
+        )]
+
+    monkey = _pytest.MonkeyPatch()
+    monkey.setattr(preflight, "_fetch_active_rows", _fake_rows)
+    try:
+        exit_code = preflight.main()
+    finally:
+        monkey.undo()
+    # Just prove the classification path is exercised end-to-end here; the
+    # dedicated capsys-based CLI tests above assert the JSON contents.
+    assert exit_code == 2
