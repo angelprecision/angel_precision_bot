@@ -4699,6 +4699,22 @@ def run_overnight_reeval(
                     result["skipped"] = result.get("skipped", 0) + 1
                     result["retryable_deferred"] += 1
                     continue
+                if (
+                    _watch_attempt.disposition == WATCH_ATTEMPT_CONFLICT
+                    and str(_watch_attempt.reason or "") == "attempt_state_error"
+                ):
+                    # Durable attempt state is ERROR — a terminal ownership
+                    # failure the resolver treats as non-replaceable. This
+                    # run is already-resolved, never retryable.
+                    log.info(
+                        "[%s] overnight_watch_attempt_already_terminal signal=%s "
+                        "canonical=%s state=ERROR count=%s local_order_id=%s",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, _watch_attempt.local_order_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
                 if _watch_attempt.disposition != WATCH_ATTEMPT_ACQUIRED:
                     _reason = f"overnight_watch_arm_attempt_unavailable:{_watch_attempt.disposition}:{_watch_attempt.reason}"
                     log.critical(
@@ -4844,22 +4860,23 @@ def run_overnight_reeval(
                     ticker=ticker,
                     caller="bind_failure",
                 )
+                # A failed local-order bind is a terminal ownership failure —
+                # the durable attempt is written as ERROR and the resolver
+                # treats ERROR as non-replaceable. Reporting this run as
+                # retryable would contradict the durable state and let the
+                # runner appear to make progress while the next run refuses.
                 if not _cleanup_success:
                     _mark_job_error(job_id, client_id, f"{_bind_reason}:cleanup_failed:{_cleanup_method}")
-                    result["errors"] += 1
-                    result["terminal_errors"] += 1
                 elif not _bind_completion_ok:
                     _mark_job_error(
                         job_id,
                         client_id,
                         "overnight_watch_arm_bind_cleanup_completion_failed",
                     )
-                    result["errors"] += 1
-                    result["terminal_errors"] += 1
                 else:
-                    _mark_job_watching_reason(job_id, client_id, _bind_reason)
-                    result["skipped"] = result.get("skipped", 0) + 1
-                    result["retryable_deferred"] += 1
+                    _mark_job_error(job_id, client_id, _bind_reason)
+                result["errors"] += 1
+                result["terminal_errors"] += 1
                 continue
 
             # Step 6b: Mark order PENDING_TRIGGER so order_monitor does not

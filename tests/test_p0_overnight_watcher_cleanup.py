@@ -1158,6 +1158,10 @@ def test_attempt_success_stops_future_creation(monkeypatch):
 
 
 def test_attempt_bind_failure_cleans_new_order_and_marks_error(monkeypatch):
+    # A failed local-order bind is a TERMINAL ownership failure — the durable
+    # attempt is written as ERROR, which the resolver treats as non-replaceable
+    # — so this run must not report retryable_deferred. Prior behavior returned
+    # retryable while writing ERROR, which contradicted the next run's refusal.
     import ap_overnight_reeval as ov
 
     ledger = _FakeOpportunityLedger()
@@ -1174,7 +1178,23 @@ def test_attempt_bind_failure_cleans_new_order_and_marks_error(monkeypatch):
     assert _attempt_scope(ledger)["state"] == "ERROR"
     watcher.watch.assert_not_called()
     controls["broker"].submit_order.assert_not_called()
-    assert result["retryable_deferred"] == 1
+
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+
+    # Second run against the same durable ledger + OSM: the resolver / claim
+    # must honor the ERROR terminal, create no new order, never call the
+    # watcher, never submit to the broker, and never claim retryable success.
+    second_watcher = MagicMock()
+    second_result, osm, _, _, controls2 = _run_reeval(
+        monkeypatch, second_watcher, ledger=ledger, osm=osm, return_controls=True
+    )
+    assert osm.create_calls == 1
+    second_watcher.watch.assert_not_called()
+    controls2["broker"].submit_order.assert_not_called()
+    assert _attempt_scope(ledger)["state"] == "ERROR"
+    assert second_result["retryable_deferred"] == 0
 
 
 def test_attempt_cleanup_failure_cannot_retry(monkeypatch):
@@ -1192,7 +1212,11 @@ def test_attempt_cleanup_failure_cannot_retry(monkeypatch):
     assert _attempt_scope(ledger)["state"] == "ERROR"
     assert osm.create_calls == 1
     second_watcher.watch.assert_not_called()
-    assert result["retryable_deferred"] == 1
+    # Durable ERROR is a terminal ownership failure — the second run is
+    # already-resolved, never retryable (a fake retryable would contradict
+    # the non-replaceable ERROR state and would hide the underlying failure).
+    assert result["retryable_deferred"] == 0
+    assert result["already_resolved"] >= 1
 
 
 def test_attempt_exact_owner_dedup_does_not_consume_extra_retry(monkeypatch):
