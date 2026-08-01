@@ -465,10 +465,14 @@ def test_cross_client_isolation():
     assert overnight._attempt_count(_read_scope(mode="live", client="client-2")) == 1
 
 
-def test_bind_refuses_stolen_owner():
+def test_bind_refuses_stolen_owner(_orders_table):
     """Owner A acquires, but the durable token is replaced by B before bind →
     _bind_watch_arm_attempt_order returns False and does not overwrite B."""
     _seed(mode="live", state=S_RETRYABLE, count=0)
+    _insert_order(
+        local_order_id="ord-a", status="PENDING_TRIGGER",
+        client_id=CLIENT, canonical_signal_id=CANON, signal_id=SIGNAL_ID,
+    )
     a = _claim(mode="live")
     assert a.disposition == ACQUIRED
     # Steal: overwrite the durable scope with a different token/state.
@@ -490,10 +494,14 @@ def test_bind_refuses_stolen_owner():
     assert str(scope.get("local_order_id") or "") == ""
 
 
-def test_complete_refuses_stolen_owner():
+def test_complete_refuses_stolen_owner(_orders_table):
     """Owner A acquires + binds, but the durable token is replaced by B before
     completion → _complete_watch_arm_attempt returns False, no overwrite."""
     _seed(mode="live", state=S_RETRYABLE, count=0)
+    _insert_order(
+        local_order_id="ord-a", status="PENDING_TRIGGER",
+        client_id=CLIENT, canonical_signal_id=CANON, signal_id=SIGNAL_ID,
+    )
     a = _claim(mode="live")
     assert a.disposition == ACQUIRED
     bound = overnight._bind_watch_arm_attempt_order(
@@ -925,8 +933,12 @@ def test_malformed_scope_value_at_key_is_conflict(scope_value):
     assert row["metadata"] == meta
 
 
-def test_exact_armed_completion_replay_is_idempotent():
+def test_exact_armed_completion_replay_is_idempotent(_orders_table):
     _seed(mode="live", state=S_RETRYABLE, count=0)
+    _insert_order(
+        local_order_id="ord-a", status="PENDING_TRIGGER",
+        client_id=CLIENT, canonical_signal_id=CANON, signal_id=SIGNAL_ID,
+    )
     a = _claim(mode="live")
     assert a.disposition == ACQUIRED
     bound = overnight._bind_watch_arm_attempt_order(
@@ -1049,6 +1061,83 @@ def _insert_order(
             ),
         )
     setup.close()
+
+
+@pytest.mark.parametrize(
+    "client_id,execution_mode,canonical_signal_id,kind,status",
+    [
+        ("other-client", "live", CANON, "ENTRY", "PENDING_TRIGGER"),
+        (CLIENT, "paper", CANON, "ENTRY", "PENDING_TRIGGER"),
+        (CLIENT, "live", "OTHER-CANON", "ENTRY", "PENDING_TRIGGER"),
+        (CLIENT, "live", CANON, "EXIT", "PENDING_TRIGGER"),
+        (CLIENT, "live", CANON, "ENTRY", "CREATED"),
+        (CLIENT, "live", CANON, "ENTRY", "SUBMITTED"),
+    ],
+)
+def test_bind_requires_exact_pending_entry_under_same_lock(
+    _orders_table,
+    client_id,
+    execution_mode,
+    canonical_signal_id,
+    kind,
+    status,
+):
+    """A matching attempt token cannot bind an unproven or changed order row."""
+    _seed(mode="live", state=S_RETRYABLE, count=0)
+    attempt = _claim(mode="live")
+    assert attempt.disposition == ACQUIRED
+    _insert_order(
+        local_order_id="ord-bind-fence",
+        status=status,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        canonical_signal_id=canonical_signal_id,
+        signal_id=SIGNAL_ID,
+        kind=kind,
+    )
+
+    bound = overnight._bind_watch_arm_attempt_order(
+        signal_id=SIGNAL_ID,
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=attempt,
+        local_order_id="ord-bind-fence",
+    )
+
+    assert bound is False
+    scope = _read_scope(mode="live")
+    assert overnight._attempt_state(scope) == S_IN_PROGRESS
+    assert str(scope.get("local_order_id") or "") == ""
+
+
+def test_bind_accepts_exact_pending_entry_and_persists_identity(_orders_table):
+    _seed(mode="live", state=S_RETRYABLE, count=0)
+    attempt = _claim(mode="live")
+    assert attempt.disposition == ACQUIRED
+    _insert_order(
+        local_order_id="ord-bind-exact",
+        status="PENDING_TRIGGER",
+        client_id=CLIENT,
+        execution_mode="live",
+        canonical_signal_id=CANON,
+        signal_id=SIGNAL_ID,
+        kind="ENTRY",
+    )
+
+    assert overnight._bind_watch_arm_attempt_order(
+        signal_id=SIGNAL_ID,
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=attempt,
+        local_order_id="ord-bind-exact",
+    ) is True
+    assert _read_scope(mode="live")["local_order_id"] == "ord-bind-exact"
 
 
 def _order_status(local_order_id: str) -> str:

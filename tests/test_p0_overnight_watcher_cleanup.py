@@ -3932,6 +3932,122 @@ def test_retryable_cleanup_completion_failure_is_terminal_error_not_fake_retry(m
     assert controls["broker"].submit_order.call_count == 0
 
 
+@pytest.mark.parametrize("completion_ok", [True, False])
+def test_late_recovery_preflight_race_completes_acquired_owner(
+    monkeypatch, completion_ok,
+):
+    """An advisory recovery hit followed by a locked ACQUIRED claim is terminal.
+
+    Master Control was intentionally bypassed, so this race cannot create an
+    order. The exact acquired owner must be completed before the caller exits;
+    a lost completion CAS must remain a terminal error, never fake retryable
+    progress.
+    """
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    watcher = MagicMock()
+    monkeypatch.setattr(
+        ov,
+        "_recover_materialized_watch_before_admission",
+        lambda **_kw: ov._EarlyWatchRecoveryResult(False),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_read_attempt_scope_unlocked",
+        lambda *_args: (
+            ov.WATCH_ATTEMPT_STATE_RETRYABLE,
+            1,
+            "prior-token",
+            "existing-order",
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_exact_entry_order_by_local_id",
+        lambda *_args: (
+            ov._LS_FOUND,
+            {"local_order_id": "existing-order", "status": "PENDING_TRIGGER"},
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_claim_watch_arm_attempt",
+        lambda **_kw: ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_ACQUIRED,
+            token="new-token",
+            attempt_count=2,
+            local_order_id="",
+            reason="race_reacquired",
+        ),
+    )
+    complete = MagicMock(return_value=completion_ok)
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", complete)
+
+    result, osm, _, error_calls, controls = _run_reeval(
+        monkeypatch,
+        watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert osm.create_calls == 0
+    watcher.watch.assert_not_called()
+    controls["master_control"].evaluate.assert_not_called()
+    controls["contract_selector"].select.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    complete.assert_called_once()
+    assert complete.call_args.kwargs["state"] == ov.WATCH_ATTEMPT_STATE_ERROR
+    expected_reason = (
+        "overnight_watch_recovery_preflight_changed"
+        if completion_ok
+        else "overnight_watch_arm_attempt_completion_failed:"
+        "recovery_preflight_changed_after_acquire"
+    )
+    assert any(reason == expected_reason for _, _, reason in error_calls)
+
+
+def test_watch_false_terminal_proof_rejects_cross_scope_order(monkeypatch):
+    """Cleanup terminal truth cannot authorize retry for a mismatched owner."""
+    ledger = _FakeOpportunityLedger()
+
+    class _CrossScopeTerminalOSM(_FakeOrderStateMachine):
+        def get_order(self, local_order_id: str) -> dict:
+            row = super().get_order(local_order_id)
+            if row and str(row.get("status") or "").upper() in {"EXPIRED", "CANCELED"}:
+                row["client_id"] = "other-client"
+            return row
+
+    osm = _CrossScopeTerminalOSM()
+    watcher = MagicMock()
+    watcher.watch.return_value = False
+    watcher._last_reject_reason = "armed_false"
+
+    result, osm, _, error_calls, controls = _run_reeval(
+        monkeypatch,
+        watcher,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ERROR"
+    assert "prior_order_client_mismatch" in scope["last_reason"]
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert any("prior_order_client_mismatch" in reason for _, _, reason in error_calls)
+    controls["broker"].submit_order.assert_not_called()
+
+
 def test_early_recovery_missing_order_id_surfaces_completion_cas_failure(monkeypatch):
     """The recovery wrapper must not conceal a lost ERROR completion CAS."""
     import ap_overnight_reeval as ov
@@ -4007,6 +4123,36 @@ def test_every_completion_cas_result_is_consumed_by_its_runtime_caller():
             discarded.append(node.lineno)
 
     assert discarded == [], f"completion CAS result discarded at lines {discarded}"
+
+
+def test_every_terminal_order_proof_supplies_complete_identity_fence():
+    import ast
+    import inspect
+    import ap_overnight_reeval as ov
+
+    source_path = inspect.getsourcefile(ov)
+    assert source_path
+    with open(source_path, encoding="utf-8") as source_file:
+        tree = ast.parse(source_file.read(), source_path)
+
+    required = {
+        "expected_client_id",
+        "expected_execution_mode",
+        "expected_canonical_signal_id",
+    }
+    incomplete = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "_local_order_terminal_state":
+            continue
+        supplied = {kw.arg for kw in node.keywords if kw.arg}
+        if not required.issubset(supplied):
+            incomplete.append(node.lineno)
+
+    assert incomplete == [], f"terminal proof missing identity fence at {incomplete}"
 
 
 def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch):

@@ -87,16 +87,27 @@ class _OSM:
     def __init__(self, *, fail: bool = False):
         self.fail = fail
         self.create_calls: list[dict] = []
+        self.orders: dict[str, dict] = {}
 
     def create_entry_order(self, plan, **kwargs):
         if self.fail:
             raise RuntimeError("insert failed")
         local_order_id = f"local-{len(self.create_calls) + 1}"
         self.create_calls.append({"plan": plan, "local_order_id": local_order_id, **kwargs})
+        self.orders[local_order_id] = {
+            "local_order_id": local_order_id,
+            "client_id": str(getattr(plan, "client_id", "") or ""),
+            "execution_mode": str(kwargs.get("execution_mode") or ""),
+            "canonical_signal_id": str(
+                getattr(plan, "canonical_signal_id", "") or ""
+            ),
+            "kind": "ENTRY",
+            "status": str(kwargs.get("initial_status") or "CREATED"),
+        }
         return local_order_id
 
     def get_order(self, local_order_id: str) -> dict:
-        return {"local_order_id": local_order_id, "status": "PENDING_TRIGGER"}
+        return dict(self.orders.get(local_order_id) or {})
 
 
 class _Watcher:
@@ -198,8 +209,9 @@ class _OppDBConn:
     (SELECT ... FOR UPDATE / UPDATE ... RETURNING metadata) sees durable rows.
     Any SQL not targeting that table returns no rows."""
 
-    def __init__(self, opp_rows: dict):
+    def __init__(self, opp_rows: dict, orders: dict[str, dict]):
         self._rows = opp_rows
+        self._orders = orders
         self._result: list[dict] = []
 
     def __enter__(self):
@@ -224,6 +236,20 @@ class _OppDBConn:
         s = " ".join(str(sql or "").split()).lower()
         params = tuple(params or ())
         self._result = []
+        if "from orders" in s:
+            if "where local_order_id = %s" in s and len(params) >= 4:
+                local_order_id, client_id, mode, canonical = params[:4]
+                row = self._orders.get(str(local_order_id or ""))
+                if row and (
+                    str(row.get("client_id") or "") == str(client_id or "")
+                    and str(row.get("execution_mode") or "").strip().lower()
+                    == str(mode or "").strip().lower()
+                    and str(row.get("canonical_signal_id") or "")
+                    == str(canonical or "")
+                    and str(row.get("kind") or "").upper() == "ENTRY"
+                ):
+                    self._result = [dict(row)]
+            return self
         if "client_signal_opportunities" not in s:
             return self
         if s.startswith("update client_signal_opportunities"):
@@ -314,11 +340,12 @@ def _run_harness(
     monkeypatch.setitem(sys.modules, "ap.authorization", auth)
 
     _ledger = _OpportunityLedger()
+    osm = osm or _OSM()
     monkeypatch.setitem(sys.modules, "ap.opportunity_ledger", _ledger)
     # PR #404: the atomic watcher-arm claim/bind/complete run against ap.db.conn.
     # Back client_signal_opportunities with the ledger's shared row store.
     _db = types.ModuleType("ap.db")
-    _db.conn = lambda *a, **kw: _OppDBConn(_ledger.rows)
+    _db.conn = lambda *a, **kw: _OppDBConn(_ledger.rows, osm.orders)
     _db.run_with_retry = lambda fn, *a, **kw: fn()
     monkeypatch.setitem(sys.modules, "ap.db", _db)
 
@@ -361,7 +388,6 @@ def _run_harness(
     )
 
     selector = MagicMock()
-    osm = osm or _OSM()
     watcher = _Watcher()
     result = ov.run_overnight_reeval(
         client_id=client_id,

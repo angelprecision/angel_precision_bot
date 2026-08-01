@@ -2846,6 +2846,7 @@ def _pg_cas_write_attempt(
     new_token: str,
     new_local_order_id: str,
     reason: str,
+    required_order_status: str = "",
 ) -> bool:
     """Exact-owner compare-and-swap for post-acquisition transitions (bind /
     complete). Locks the (canonical_signal_id, client_id) row, evaluates
@@ -2853,12 +2854,18 @@ def _pg_cas_write_attempt(
     and only on a match writes the new scope. Returns False on any predicate
     miss, missing/duplicate/malformed row, or DB error — the write is atomic
     under the same row lock, so no other process can replace ownership between
-    the check and the write."""
+    the check and the write. When required_order_status is set, the exact ENTRY
+    row is also locked and identity/status validated in this transaction before
+    its local_order_id can be bound to the durable attempt."""
     mode = str(execution_mode or "").strip().lower()
     session = str(session_key or "").strip()
     canonical_signal_id = str(canonical_signal_id or "").strip()
     client_id = str(client_id or "").strip()
+    required_order_status = str(required_order_status or "").strip().upper()
+    new_local_order_id = str(new_local_order_id or "").strip()
     if not (client_id and canonical_signal_id and mode in {"live", "paper"} and session):
+        return False
+    if required_order_status and not new_local_order_id:
         return False
 
     _ensure_opportunity_row(signal_id, client_id, canonical_signal_id, signal_payload)
@@ -2888,6 +2895,21 @@ def _pg_cas_write_attempt(
                     return False
                 if not predicate(state, count, token, order_id):
                     return False
+                if required_order_status:
+                    order_lock_status, locked_order = _lock_exact_entry_order(
+                        c,
+                        local_order_id=new_local_order_id,
+                        client_id=client_id,
+                        execution_mode=mode,
+                        canonical_signal_id=canonical_signal_id,
+                    )
+                    if order_lock_status != "FOUND" or not locked_order:
+                        return False
+                    locked_status = str(
+                        locked_order.get("status") or ""
+                    ).strip().upper()
+                    if locked_status != required_order_status:
+                        return False
                 next_meta = _attempt_meta_patch(
                     existing_meta=meta,
                     execution_mode=mode,
@@ -2978,6 +3000,7 @@ def _bind_watch_arm_attempt_order(
         new_token=attempt.token,
         new_local_order_id=str(local_order_id),
         reason="local_order_bound",
+        required_order_status="PENDING_TRIGGER",
     )
 
 
@@ -6796,12 +6819,35 @@ def run_overnight_reeval(
                     # The advisory preflight saw an existing active owner, but
                     # the locked claim no longer agrees. Never turn that race
                     # into a replacement order that bypassed Master Control.
-                    _mark_job_watching_reason(
-                        job_id, client_id,
-                        "overnight_watch_recovery_preflight_changed",
+                    # The locked claim returned ACQUIRED, so close that exact
+                    # owner before leaving; otherwise this retryable-looking
+                    # exit strands a fresh IN_PROGRESS lease.
+                    _preflight_completion_ok = _complete_watch_arm_attempt_checked(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_payload=signal,
+                        execution_mode=_execution_mode,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
+                        state=WATCH_ATTEMPT_STATE_ERROR,
+                        local_order_id="",
+                        reason="overnight_watch_recovery_preflight_changed",
+                        ticker=ticker,
+                        caller="recovery_preflight_changed_after_acquire",
                     )
-                    result["skipped"] = result.get("skipped", 0) + 1
-                    result["retryable_deferred"] += 1
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        (
+                            "overnight_watch_recovery_preflight_changed"
+                            if _preflight_completion_ok
+                            else "overnight_watch_arm_attempt_completion_failed:"
+                            "recovery_preflight_changed_after_acquire"
+                        ),
+                    )
+                    result["errors"] += 1
+                    result["terminal_errors"] += 1
                     continue
 
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
@@ -7490,7 +7536,11 @@ def run_overnight_reeval(
                         # RETRYABLE_NOT_ARMED: no permanent proof, no terminal reject.
                         # Durably preserve WATCHING state for next reeval pickup.
                         _terminal_result, _terminal_reason = _local_order_terminal_state(
-                            order_state_machine, str(local_order_id)
+                            order_state_machine,
+                            str(local_order_id),
+                            expected_client_id=client_id,
+                            expected_execution_mode=_execution_mode,
+                            expected_canonical_signal_id=_canonical_for_attempt,
                         )
                         if _terminal_result != WATCH_ATTEMPT_ACQUIRED:
                             _unproven_completion_ok = _complete_watch_arm_attempt_checked(
