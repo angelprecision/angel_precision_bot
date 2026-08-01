@@ -139,6 +139,14 @@ WATCH_ATTEMPT_ALREADY_ARMED       = "WATCH_ATTEMPT_ALREADY_ARMED"
 WATCH_ATTEMPT_EXHAUSTED           = "WATCH_ATTEMPT_EXHAUSTED"
 WATCH_ATTEMPT_CONFLICT            = "WATCH_ATTEMPT_CONFLICT"
 WATCH_ATTEMPT_DB_ERROR            = "WATCH_ATTEMPT_DB_ERROR"
+# Returned when an expired IN_PROGRESS claim with blank local_order_id discovers
+# exactly one active PENDING_TRIGGER / CREATED ENTRY in orders.  The claim
+# function has already (a) rotated the token, (b) bound the discovered
+# local_order_id to the scope, and (c) refreshed the claim lease — all under
+# the row lock.  The caller MUST invoke the existing watcher reattachment path
+# against the discovered order; it MUST NOT create a new order or submit to the
+# broker.  On successful reattachment the caller completes the attempt as ARMED.
+WATCH_ATTEMPT_REATTACH_REQUIRED   = "WATCH_ATTEMPT_REATTACH_REQUIRED"
 
 WATCH_ATTEMPT_STATE_IN_PROGRESS = "IN_PROGRESS"
 WATCH_ATTEMPT_STATE_RETRYABLE   = "RETRYABLE"
@@ -2224,10 +2232,12 @@ def _atomic_claim_watch_arm_attempt(
                             "expired_in_progress_active_lookup_failed",
                         )
                     if lookup_status == _LS_FOUND and active_row:
-                        _existing_oid = str(
-                            active_row.get("local_order_id") or ""
-                        ).strip()
-                        stale_ip_active_entry = {"local_order_id": _existing_oid}
+                        # Preserve the full row so the locked branch can
+                        # distinguish reattachable PENDING_TRIGGER / CREATED
+                        # entries from already-owned in-flight statuses
+                        # (SUBMITTED / ACCEPTED / OPEN / PARTIAL / FILLED)
+                        # without issuing a second DB query under the lock.
+                        stale_ip_active_entry = dict(active_row)
                     stale_ip_expected = (pre_count, pre_token, "")
 
     def _log_cas_miss(state, count, reason):
@@ -2377,16 +2387,78 @@ def _atomic_claim_watch_arm_attempt(
                         )
                     # Case B: unbound stale owner. Pre-lock active-entry
                     # lookup already ran. If an exact active ENTRY was
-                    # found, it owns the row — do NOT reclaim or create a
-                    # replacement. Otherwise reacquire, count unchanged.
+                    # found we must NOT create a replacement. Whether the
+                    # caller can reattach depends on the order's status.
                     if stale_ip_active_entry is not None:
                         _existing_oid = str(
                             (stale_ip_active_entry or {}).get("local_order_id") or ""
                         ).strip()
+                        _existing_status = str(
+                            (stale_ip_active_entry or {}).get("status") or ""
+                        ).upper()
+
+                        # Submitted / accepted / open / partially-filled /
+                        # filled orders are already owned by the broker — the
+                        # job is effectively resolved; do not reattach or
+                        # replace. ALREADY_IN_PROGRESS signals that the
+                        # caller should treat the attempt as deferred-resolved
+                        # and not loop into the reattach path.
+                        if _existing_status in _ALREADY_OWNED_STATUSES:
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_ALREADY_IN_PROGRESS,
+                                prior_token, count, _existing_oid,
+                                "expired_in_progress_active_entry_already_owned",
+                            )
+
+                        # PENDING_TRIGGER / CREATED (reattachable): under
+                        # the existing row lock, rotate the claim token,
+                        # bind the discovered local_order_id, and refresh
+                        # the lease — all atomically in one CAS write.
+                        # Return WATCH_ATTEMPT_REATTACH_REQUIRED so the
+                        # caller can invoke the existing watcher reattach
+                        # path without creating a duplicate order or
+                        # submitting to the broker.
+                        if not _existing_oid:
+                            # No usable order ID — cannot safely bind.
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_CONFLICT,
+                                prior_token, count, "",
+                                "expired_in_progress_active_entry_missing_oid",
+                            )
+
+                        _new_token = uuid.uuid4().hex
+                        _reattach_bind_meta = _attempt_meta_patch(
+                            existing_meta=meta,
+                            execution_mode=mode,
+                            session_key=session,
+                            state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                            attempt_count=count,
+                            token=_new_token,
+                            local_order_id=_existing_oid,
+                            reason="expired_in_progress_active_entry_reattach_claimed",
+                        )
+                        if not _write_locked_attempt_meta(
+                            c, row["id"], _reattach_bind_meta, mode, session,
+                            WATCH_ATTEMPT_STATE_IN_PROGRESS, count,
+                            _new_token, _existing_oid,
+                        ):
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_DB_ERROR,
+                                reason="expired_in_progress_reattach_claim_write_failed",
+                            )
+                        log.info(
+                            "OVERNIGHT_WATCH_ATTEMPT_REATTACH_REQUIRED "
+                            "client=%s mode=%s canonical=%s session=%s "
+                            "count=%s token_prefix=%s existing_order=%s "
+                            "existing_status=%s",
+                            client_id, mode, canonical_signal_id, session,
+                            count, _new_token[:8], _existing_oid,
+                            _existing_status,
+                        )
                         return _WatchAttemptClaim(
-                            WATCH_ATTEMPT_ALREADY_IN_PROGRESS,
-                            prior_token, count, _existing_oid,
-                            "expired_in_progress_active_entry_owner",
+                            WATCH_ATTEMPT_REATTACH_REQUIRED,
+                            _new_token, count, _existing_oid,
+                            "expired_in_progress_active_entry_reattach_claimed",
                         )
                     _new_token = uuid.uuid4().hex
                     _reclaim_meta = _attempt_meta_patch(
@@ -5522,6 +5594,358 @@ def run_overnight_reeval(
                     result["skipped"] = result.get("skipped", 0) + 1
                     result["retryable_deferred"] += 1
                     continue
+                if _watch_attempt.disposition == WATCH_ATTEMPT_REATTACH_REQUIRED:
+                    # The claim function found an expired IN_PROGRESS scope with
+                    # blank local_order_id AND an exact active PENDING_TRIGGER /
+                    # CREATED ENTRY in orders.  It already (a) rotated the token,
+                    # (b) bound the discovered local_order_id, and (c) refreshed
+                    # the claim lease — all under the row lock.
+                    #
+                    # We must reattach the existing watcher to that order without
+                    # creating a new order, without running master_control /
+                    # selector / broker, and without cancelling the valid ENTRY.
+                    # On exception the order is intentionally preserved; we
+                    # complete as RETRYABLE / EXHAUSTED with no cleanup required.
+                    _reattach_oid = str(_watch_attempt.local_order_id or "").strip()
+                    log.info(
+                        "[%s] overnight_reeval: REATTACH_REQUIRED signal=%s "
+                        "canonical=%s count=%s existing_order=%s — "
+                        "reusing existing order, no new order or broker submit",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, _reattach_oid,
+                    )
+                    if not _reattach_oid:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED missing "
+                            "local_order_id signal=%s — failing closed retryable",
+                            ticker, signal_id,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    # Look up the full order row for plan construction.
+                    _rr_status, _rr_row = _query_exact_entry_order_by_local_id(
+                        _reattach_oid, client_id, _execution_mode,
+                        _canonical_for_attempt,
+                    )
+                    if _rr_status != _LS_FOUND or not _rr_row:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED order "
+                            "lookup failed local_order_id=%s status=%s — "
+                            "failing closed retryable",
+                            ticker, _reattach_oid, _rr_status,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+                    _rr_order_status = str(_rr_row.get("status") or "").upper()
+                    # Already-owned (in-flight / filled): treat as resolved.
+                    if _rr_order_status in _ALREADY_OWNED_STATUSES:
+                        log.info(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED order "
+                            "already in-flight/filled local_order_id=%s "
+                            "status=%s — classifying already_resolved",
+                            ticker, _reattach_oid, _rr_order_status,
+                        )
+                        _rr_armed_ok = _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=WATCH_ATTEMPT_STATE_ARMED,
+                            local_order_id=_reattach_oid,
+                            reason="reattach_required_already_owned",
+                            ticker=ticker,
+                            caller="reattach_required_already_owned",
+                        )
+                        if not _rr_armed_ok:
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["already_resolved"] += 1
+                        continue
+                    # Terminal: the order is gone; something already cleaned it.
+                    if _rr_order_status in _TERMINAL_ENTRY_STATUSES:
+                        log.warning(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED order "
+                            "terminal local_order_id=%s status=%s — "
+                            "completing attempt RETRYABLE for next reeval",
+                            ticker, _reattach_oid, _rr_order_status,
+                        )
+                        _rr_next_state = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=_rr_next_state,
+                            local_order_id=_reattach_oid,
+                            reason=f"reattach_required_order_terminal:{_rr_order_status}",
+                            ticker=ticker,
+                            caller="reattach_required_terminal",
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    # Build a minimal reattach plan from the existing order row.
+                    _rr_ord_meta = _rr_row.get("meta") or {}
+                    if isinstance(_rr_ord_meta, str):
+                        try:
+                            import json as _rr_json
+                            _rr_ord_meta = _rr_json.loads(_rr_ord_meta)
+                        except Exception:
+                            _rr_ord_meta = {}
+                    if not isinstance(_rr_ord_meta, dict):
+                        _rr_ord_meta = {}
+
+                    _rr_trigger_raw = (
+                        _rr_row.get("trigger_price")
+                        or signal.get("entry_trigger")
+                    )
+                    try:
+                        _rr_trigger = float(_rr_trigger_raw) if _rr_trigger_raw is not None else None
+                    except (TypeError, ValueError):
+                        _rr_trigger = None
+                    if not _rr_trigger or _rr_trigger <= 0:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED cannot "
+                            "resolve trigger price local_order_id=%s — "
+                            "failing closed retryable",
+                            ticker, _reattach_oid,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    def _rr_price(order_key, signal_key):
+                        v = _rr_row.get(order_key)
+                        if v is None:
+                            v = signal.get(signal_key)
+                        try:
+                            return float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            return None
+
+                    _rr_side      = str(_rr_row.get("direction") or side).upper()
+                    _rr_sig_id    = str(_rr_row.get("signal_id") or signal_id)
+                    _rr_canonical = str(
+                        _rr_row.get("canonical_signal_id") or _canonical_for_attempt
+                    )
+                    _rr_metadata = {
+                        **_rr_ord_meta,
+                        "overnight":                        True,
+                        "reattach_watcher":                 True,
+                        "reattach_required_recovery":       True,
+                        "contract_deferred":                True,
+                        "contract_selection_deferred_to":   "breach_time",
+                        "client_id":                        client_id,
+                        "execution_mode":                   _execution_mode,
+                        "overnight_reeval_session_key":     session_key,
+                        "signal_id":                        _rr_sig_id,
+                        "canonical_signal_id":              _rr_canonical,
+                        "late_attachment_policy_eligible":  True,
+                    }
+                    import types as _rr_types
+                    _rr_plan = _rr_types.SimpleNamespace(
+                        ticker            = str(_rr_row.get("symbol") or ticker),
+                        side              = _rr_side,
+                        direction         = _rr_side,
+                        score             = float(_rr_row.get("score") or signal.get("score") or 0),
+                        timeframe         = str(_rr_row.get("timeframe") or signal.get("timeframe") or "1d"),
+                        entry_trigger     = _rr_trigger,
+                        trigger_price     = _rr_trigger,
+                        stop_underlying   = _rr_price("stop_underlying", "stop_price"),
+                        target_underlying = _rr_price("target_underlying", "target_price"),
+                        trigger_type      = "breach",
+                        prior_day_high    = signal.get("prior_day_high"),
+                        prior_day_low     = signal.get("prior_day_low"),
+                        pattern           = _rr_row.get("pattern") or signal.get("pattern"),
+                        tier              = _rr_row.get("tier") or signal.get("tier"),
+                        contract_symbol   = str(_rr_row.get("contract") or f"DEFERRED:{ticker}"),
+                        contracts         = int(_rr_row.get("qty") or 1),
+                        limit_price       = float(_rr_row.get("limit_price") or 0.01),
+                        plan_id           = str(_rr_row.get("plan_id") or ""),
+                        signal_id         = _rr_sig_id,
+                        canonical_signal_id = _rr_canonical,
+                        client_id         = client_id,
+                        execution_mode    = _execution_mode,
+                        late_attachment_policy_eligible = True,
+                        metadata          = _rr_metadata,
+                    )
+
+                    # Idempotent guard: if the watcher already owns this exact
+                    # local_order_id, skip watch() and go directly to proof.
+                    _rr_already_owned = False
+                    try:
+                        _rr_has_fn = getattr(entry_watcher, "has_order", None)
+                        if callable(_rr_has_fn):
+                            _rr_already_owned = bool(_rr_has_fn(_reattach_oid))
+                    except Exception as _rr_has_exc:
+                        log.warning(
+                            "[%s] REATTACH_REQUIRED has_order() check failed %s: %s "
+                            "— proceeding with watch() (safe)",
+                            ticker, _reattach_oid, _rr_has_exc,
+                        )
+
+                    if not _rr_already_owned:
+                        try:
+                            _rr_armed = entry_watcher.watch(
+                                _rr_plan, _reattach_oid,
+                                recovery_rearm=True,
+                                no_cancel_on_reject=True,
+                            )
+                        except Exception as _rr_exc:
+                            # Exception path: the existing PENDING_TRIGGER order
+                            # is untouched — do NOT clean it up.  Complete as
+                            # RETRYABLE / EXHAUSTED so the next run can retry.
+                            log.error(
+                                "[%s] overnight_reeval: REATTACH_REQUIRED "
+                                "watch() exception signal=%s "
+                                "local_order_id=%s: %s",
+                                ticker, signal_id, _reattach_oid, _rr_exc,
+                            )
+                            _rr_next = (
+                                WATCH_ATTEMPT_STATE_EXHAUSTED
+                                if _watch_attempt.attempt_count
+                                >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                                else WATCH_ATTEMPT_STATE_RETRYABLE
+                            )
+                            _complete_watch_arm_attempt_checked(
+                                signal_id=signal_id,
+                                client_id=client_id,
+                                canonical_signal_id=_canonical_for_attempt,
+                                signal_payload=signal,
+                                execution_mode=_execution_mode,
+                                session_key=session_key,
+                                attempt=_watch_attempt,
+                                state=_rr_next,
+                                local_order_id=_reattach_oid,
+                                reason=f"reattach_required_watch_exception:{type(_rr_exc).__name__}",
+                                ticker=ticker,
+                                caller="reattach_required_watch_exception",
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                    else:
+                        _rr_armed = True
+
+                    if not _rr_armed:
+                        # watch() returned False: order is still valid, retry.
+                        log.warning(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED watch() "
+                            "False signal=%s local_order_id=%s "
+                            "— order preserved; classifying retryable",
+                            ticker, signal_id, _reattach_oid,
+                        )
+                        _rr_next = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=_rr_next,
+                            local_order_id=_reattach_oid,
+                            reason="reattach_required_watch_false",
+                            ticker=ticker,
+                            caller="reattach_required_watch_false",
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    # Watcher armed: persist durable proof then complete.
+                    _rr_proof_ok = _persist_watcher_armed_proof(
+                        client_id=client_id,
+                        execution_mode=_execution_mode,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_id=signal_id,
+                        signal_payload=signal,
+                        local_order_id=_reattach_oid,
+                        session_key=session_key,
+                        extra_meta={
+                            "source_table": "trade_queue",
+                            "source_job_id": str(job_id),
+                            "ticker": ticker,
+                            "side": side,
+                            "contract_deferred": True,
+                            "contract_selection_deferred_to": "breach_time",
+                            "reattach_watcher": True,
+                            "reattach_required_recovery": True,
+                            "armed_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    if not _rr_proof_ok:
+                        log.critical(
+                            "OVERNIGHT_REEVAL_REATTACH_REQUIRED_PROOF_FAILED | "
+                            "client=%s mode=%s canonical=%s local_order_id=%s "
+                            "session=%s | watcher reattached but proof NOT "
+                            "persisted — next retry will reattach again (idempotent)",
+                            client_id, _execution_mode, _canonical_for_attempt,
+                            _reattach_oid, session_key,
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    _rr_armed_completion_ok = _complete_watch_arm_attempt_checked(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_payload=signal,
+                        execution_mode=_execution_mode,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
+                        state=WATCH_ATTEMPT_STATE_ARMED,
+                        local_order_id=_reattach_oid,
+                        reason="reattach_required_watcher_armed",
+                        ticker=ticker,
+                        caller="reattach_required_watcher_armed",
+                    )
+                    if not _rr_armed_completion_ok:
+                        _mark_job_watching_reason(
+                            job_id, client_id,
+                            "overnight_watch_arm_attempt_completion_failed:"
+                            "reattach_required_armed",
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
+                        continue
+
+                    log.info(
+                        "[%s] ✅ REATTACH_REQUIRED ARMED — "
+                        "local_order_id=%s canonical=%s",
+                        ticker, _reattach_oid, _canonical_for_attempt,
+                    )
+                    _mark_job_watching_armed(
+                        job_id, client_id, f"reattach_required:{_reattach_oid}"
+                    )
+                    result["armed"] += 1
+                    result["fresh_armed"] += 1
+                    continue
+
                 if (
                     _watch_attempt.disposition == WATCH_ATTEMPT_CONFLICT
                     and str(_watch_attempt.reason or "") == "attempt_state_error"
