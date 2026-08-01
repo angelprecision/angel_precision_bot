@@ -21,7 +21,12 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import json
+import types
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -382,15 +387,16 @@ def test_exhausted_does_not_acquire():
     assert overnight._attempt_count(scope) == 3
 
 
-def test_active_prior_order_blocks_without_increment():
-    """RETRYABLE with a prior order still ACTIVE (PENDING_TRIGGER) →
-    ALREADY_IN_PROGRESS, no increment, no acquisition."""
+def test_active_prior_order_reclaims_same_order_with_increment(_orders_table):
+    """RETRYABLE + exact PENDING_TRIGGER reclaims the same bounded attempt."""
     _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-1", order_id="prior-1")
+    _insert_order(local_order_id="prior-1", status="PENDING_TRIGGER")
     osm = _FakeOSM({"prior-1": {"status": "PENDING_TRIGGER"}})
     claim = _claim(mode="live", osm=osm)
-    assert claim.disposition == IN_PROGRESS
+    assert claim.disposition == REATTACH_REQUIRED
+    assert claim.local_order_id == "prior-1"
     scope = _read_scope(mode="live")
-    assert overnight._attempt_count(scope) == 1
+    assert overnight._attempt_count(scope) == 2
 
 
 def test_terminal_proof_of_different_order_is_conflict():
@@ -1201,6 +1207,7 @@ def test_reattach_required_disposition_on_expired_claim_with_pending_trigger_ent
     # 3–6. Durable scope assertions (read back from real Postgres)
     scope = _read_scope_reattach(mode="live")
     assert overnight._attempt_state(scope) == "IN_PROGRESS"  # 3
+    assert scope["count"] == 2  # a real reattach attempt consumes the next slot
     assert str(scope.get("local_order_id") or "").strip() == _REATTACH_OID  # 4
     assert scope.get("token") != "expired-token-001"  # 5 — rotated
     lease_raw = scope.get("claim_lease_until")
@@ -1342,11 +1349,11 @@ def test_reattach_required_no_retryable_deferred_loop_after_arm(_orders_table):
     )
 
 
-def test_reattach_required_already_owned_status_stays_in_progress(_orders_table):
+def test_reattach_required_broker_owned_status_converges_armed(_orders_table):
     """
     An already-owned in-flight order (SUBMITTED/ACCEPTED/OPEN/PARTIALLY_FILLED/
     FILLED) must NOT produce REATTACH_REQUIRED — those orders are broker-owned
-    and must never be reattached. The claim must return ALREADY_IN_PROGRESS.
+    and must never be reattached. Discovery durably resolves the attempt ARMED.
     No mocks — the orders table is seeded with each status directly; the real
     _query_active_entry_order reads it back.
     """
@@ -1356,10 +1363,243 @@ def test_reattach_required_already_owned_status_stays_in_progress(_orders_table)
         _insert_order(local_order_id=_REATTACH_OID, status=status)
 
         claim = _claim_reattach(mode="live")
-        assert claim.disposition == IN_PROGRESS, (
-            f"status={status}: already-owned order must yield ALREADY_IN_PROGRESS, "
+        assert claim.disposition == ALREADY_ARMED, (
+            f"status={status}: already-owned order must yield ALREADY_ARMED, "
             f"not {claim.disposition!r}. Reattaching a broker-owned order is unsafe."
         )
         assert claim.disposition != REATTACH_REQUIRED, (
             f"status={status}: REATTACH_REQUIRED on a broker-owned order is a bug."
         )
+        scope = _read_scope_reattach(mode="live")
+        assert overnight._attempt_state(scope) == S_ARMED
+        assert scope["local_order_id"] == _REATTACH_OID
+        again = _claim_reattach(mode="live")
+        assert again.disposition == ALREADY_ARMED
+
+
+def test_retryable_bound_pending_trigger_reclaims_and_exhausts(_orders_table):
+    """watch=False retries the same order, increments count, and hits the cap."""
+    _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
+    _seed(
+        mode="live",
+        state=S_RETRYABLE,
+        count=1,
+        token="retry-token-1",
+        order_id=_REATTACH_OID,
+        client=_REATTACH_CLIENT,
+        canonical=_REATTACH_CANON,
+    )
+
+    claim2 = _claim_reattach(mode="live")
+    assert claim2.disposition == REATTACH_REQUIRED
+    assert claim2.attempt_count == 2
+    assert claim2.local_order_id == _REATTACH_OID
+    assert overnight._complete_watch_arm_attempt(
+        signal_id=_REATTACH_SIG,
+        client_id=_REATTACH_CLIENT,
+        canonical_signal_id=_REATTACH_CANON,
+        signal_payload={"signal_id": _REATTACH_SIG},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=claim2,
+        state=S_RETRYABLE,
+        local_order_id=_REATTACH_OID,
+        reason="watch_false",
+    ) is True
+
+    claim3 = _claim_reattach(mode="live")
+    assert claim3.disposition == REATTACH_REQUIRED
+    assert claim3.attempt_count == 3
+    assert overnight._complete_watch_arm_attempt(
+        signal_id=_REATTACH_SIG,
+        client_id=_REATTACH_CLIENT,
+        canonical_signal_id=_REATTACH_CANON,
+        signal_payload={"signal_id": _REATTACH_SIG},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=claim3,
+        state=S_EXHAUSTED,
+        local_order_id=_REATTACH_OID,
+        reason="watch_false_at_cap",
+    ) is True
+    assert _claim_reattach(mode="live").disposition == EXHAUSTED
+    assert _count_orders() == 1
+
+
+def test_created_order_is_never_reattached_and_scope_converges_error(_orders_table):
+    _insert_order(local_order_id=_REATTACH_OID, status="CREATED")
+    _seed_expired_in_progress(mode="live", count=1, order_id="")
+
+    claim = _claim_reattach(mode="live")
+
+    assert claim.disposition == CONFLICT
+    assert claim.reason == "attempt_state_error"
+    scope = _read_scope_reattach(mode="live")
+    assert overnight._attempt_state(scope) == overnight.WATCH_ATTEMPT_STATE_ERROR
+    assert scope["local_order_id"] == _REATTACH_OID
+    assert _order_status(_REATTACH_OID) == "CREATED"
+    assert _count_orders() == 1
+
+
+def test_expired_bound_completion_failure_recovers_same_order(_orders_table):
+    _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
+    _seed_expired_in_progress(
+        mode="live", count=2, order_id=_REATTACH_OID,
+    )
+
+    recovered = _claim_reattach(mode="live")
+
+    assert recovered.disposition == REATTACH_REQUIRED
+    assert recovered.attempt_count == 3
+    assert recovered.local_order_id == _REATTACH_OID
+    assert _count_orders() == 1
+
+
+def test_real_postgres_runtime_reattaches_once_then_observes_armed(
+    monkeypatch, _orders_table,
+):
+    """Drive the real outer caller over real claim/order rows for two runs."""
+    signal = {
+        "signal_id": _REATTACH_SIG,
+        "canonical_signal_id": _REATTACH_CANON,
+        "ticker": "SPY",
+        "symbol": "SPY",
+        "side": "CALL",
+        "direction": "CALL",
+        "timeframe": "1d",
+        "score": 80.0,
+        "entry_trigger": 450.0,
+        "created_at": "2026-07-29T20:00:00+00:00",
+    }
+    job = {
+        "id": "job-reattach-runtime",
+        "signal_id": _REATTACH_SIG,
+        "payload": signal,
+        "_source": "trade_queue",
+    }
+    _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
+    _seed_expired_in_progress(mode="live", count=1, order_id="")
+
+    validator = types.ModuleType("ap.overnight_daily_validator")
+    validator.fetch_market_snapshot = lambda ticker, broker: {"last": 449.0}
+    validator.validate_overnight_daily_signal = lambda **kwargs: types.SimpleNamespace(
+        valid=True, reason_code="", reason_text="",
+    )
+    validator.InvalidationReason = object
+    monkeypatch.setitem(sys.modules, "ap.overnight_daily_validator", validator)
+
+    auth = types.ModuleType("ap.authorization")
+    auth.execution_mode_for_broker = lambda broker: "LIVE"
+    auth.is_live_broker = lambda broker: False
+    auth.broker_live_mode_known = lambda broker: True
+    auth.check_live_authorization = lambda client_id: None
+    auth.authorization_gate_enforced = lambda: False
+    auth.LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
+    monkeypatch.setitem(sys.modules, "ap.authorization", auth)
+
+    monkeypatch.setattr(
+        overnight,
+        "_et_now",
+        lambda: datetime(2026, 7, 29, 9, 15, tzinfo=ZoneInfo("America/New_York")),
+    )
+    monkeypatch.setattr(
+        overnight,
+        "_fetch_watching_signals_with_status",
+        lambda client_id: overnight._FetchWatchingSignalsResult(
+            [job], "SUCCESS", "SUCCESS", None, None,
+        ),
+    )
+    monkeypatch.setattr(overnight, "_mark_job_rejected", lambda *a, **kw: None)
+    monkeypatch.setattr(overnight, "_mark_job_error", lambda *a, **kw: None)
+    monkeypatch.setattr(overnight, "_mark_job_watching_reason", lambda *a, **kw: None)
+    monkeypatch.setattr(overnight, "_mark_job_watching_armed", lambda *a, **kw: None)
+
+    proof_calls = []
+
+    def _persist_real_proof(**kwargs):
+        proof_calls.append(dict(kwargs))
+        proof_meta = {
+            "execution_mode": "live",
+            "overnight_reeval_session_key": SESSION,
+            "local_order_id": _REATTACH_OID,
+        }
+        connection = psycopg2.connect(_RAW_URL)
+        connection.autocommit = True
+        with connection.cursor() as cur:
+            cur.execute(
+                "UPDATE client_signal_opportunities "
+                "SET opportunity_status = 'WATCHER_ARMED', order_local_id = %s, "
+                "metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb "
+                "WHERE canonical_signal_id = %s AND client_id = %s",
+                (
+                    _REATTACH_OID, json.dumps(proof_meta),
+                    _REATTACH_CANON, _REATTACH_CLIENT,
+                ),
+            )
+            updated = cur.rowcount
+        connection.close()
+        return updated == 1
+
+    monkeypatch.setattr(overnight, "_persist_watcher_armed_proof", _persist_real_proof)
+
+    broker = MagicMock()
+    broker.get_prior_day_levels.return_value = {
+        "prior_day_high": 451.0,
+        "prior_day_low": 445.0,
+    }
+    master_control = MagicMock()
+    selector = MagicMock()
+    osm = MagicMock()
+    watcher1 = MagicMock()
+    watcher1.has_order.return_value = False
+    watcher1.watch.return_value = True
+
+    result1 = overnight.run_overnight_reeval(
+        client_id=_REATTACH_CLIENT,
+        broker=broker,
+        master_control=master_control,
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher1,
+        force=True,
+    )
+
+    assert result1["armed"] == 1
+    master_control.evaluate.assert_not_called()
+    selector.select.assert_not_called()
+    osm.create_entry_order.assert_not_called()
+    broker.submit_order.assert_not_called()
+    watcher1.watch.assert_called_once()
+    assert watcher1.watch.call_args.args[1] == _REATTACH_OID
+    assert watcher1.watch.call_args.kwargs == {
+        "recovery_rearm": True,
+        "no_cancel_on_reject": True,
+    }
+    assert len(proof_calls) == 1
+    scope1 = _read_scope_reattach(mode="live")
+    assert overnight._attempt_state(scope1) == S_ARMED
+    assert scope1["count"] == 2
+    assert scope1["local_order_id"] == _REATTACH_OID
+    assert _count_orders() == 1
+
+    watcher2 = MagicMock()
+    watcher2.has_order.return_value = False
+    watcher2.watch.return_value = True
+    result2 = overnight.run_overnight_reeval(
+        client_id=_REATTACH_CLIENT,
+        broker=broker,
+        master_control=master_control,
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher2,
+        force=True,
+    )
+
+    assert result2["armed"] == 1
+    watcher2.watch.assert_not_called()
+    master_control.evaluate.assert_not_called()
+    selector.select.assert_not_called()
+    osm.create_entry_order.assert_not_called()
+    broker.submit_order.assert_not_called()
+    assert len(proof_calls) == 1
+    assert _count_orders() == 1

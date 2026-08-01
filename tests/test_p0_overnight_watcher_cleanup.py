@@ -210,9 +210,17 @@ class _FakeDBConn:
         # We detect (B) by "where symbol = %s" and consume params positionally.
         symbol_filter = None
         direction_filter = None
+        local_order_id_filter = None
 
         is_classifier = "where symbol =" in s or "where symbol=" in s
-        if is_classifier:
+        is_exact_local = "where local_order_id =" in s
+        if is_exact_local:
+            local_order_id_filter = str(params[0] or "") if len(params) > 0 else ""
+            client_id = str(params[1] or "") if len(params) > 1 else ""
+            mode = str(params[2] or "").strip().lower() if len(params) > 2 else ""
+            canonical = params[3] if len(params) > 3 else None
+            status_filter = None
+        elif is_classifier:
             symbol_filter = str(params[0] or "").upper() if len(params) > 0 else None
             client_id = str(params[1] or "").strip().lower() if len(params) > 1 else ""
             mode = str(params[2] or "").strip().lower() if len(params) > 2 else ""
@@ -243,6 +251,9 @@ class _FakeDBConn:
 
         matches = []
         for row in self._orders.values():
+            if local_order_id_filter is not None:
+                if str(row.get("local_order_id") or "") != local_order_id_filter:
+                    continue
             if is_classifier:
                 if symbol_filter is not None and str(row.get("symbol") or "").upper() != symbol_filter:
                     continue
@@ -2578,11 +2589,10 @@ def test_expired_claim_recovery_does_not_increment_attempt_count(monkeypatch):
     assert result["armed"] == 1
 
 
-def test_expired_claim_recovery_with_active_prior_order_never_replaces(monkeypatch):
-    # A stranded IN_PROGRESS scope with a BOUND prior order that is STILL
-    # ACTIVE must not be reclaimed. Pre-lock terminal proof returns
-    # WATCH_ATTEMPT_ALREADY_IN_PROGRESS so the run defers, does not create
-    # a replacement, does not call the watcher, does not submit to broker.
+def test_expired_claim_recovery_with_active_prior_order_reattaches(monkeypatch):
+    # A stranded IN_PROGRESS scope with an exact bound PENDING_TRIGGER order
+    # reclaims the watcher attempt and reattaches that same order. It never
+    # creates a replacement or submits to the broker.
     import ap_overnight_reeval as ov
     from datetime import datetime, timedelta, timezone
 
@@ -2609,13 +2619,14 @@ def test_expired_claim_recovery_with_active_prior_order_never_replaces(monkeypat
         },
     }
     osm = _FakeOrderStateMachine()
-    # Prior order is still active — must block reclaim.
+    # Prior order is still pending — it must be reattached, not replaced.
     osm.orders["prior-1"] = {
         "local_order_id": "prior-1", "client_id": "client-1",
         "canonical_signal_id": "CANON-001", "kind": "ENTRY",
         "status": "PENDING_TRIGGER", "execution_mode": "paper",
     }
     entry_watcher = MagicMock()
+    entry_watcher.has_order.return_value = False
     entry_watcher.watch.return_value = True
 
     result, osm, *_, controls = _run_reeval(
@@ -2623,14 +2634,216 @@ def test_expired_claim_recovery_with_active_prior_order_never_replaces(monkeypat
         return_controls=True,
     )
     assert osm.create_calls == 0
-    entry_watcher.watch.assert_not_called()
+    entry_watcher.watch.assert_called_once()
+    assert entry_watcher.watch.call_args.kwargs == {
+        "recovery_rearm": True,
+        "no_cancel_on_reject": True,
+    }
+    controls["master_control"].evaluate.assert_not_called()
     controls["broker"].submit_order.assert_not_called()
     scope = _attempt_scope(ledger)
-    assert scope["state"] == "IN_PROGRESS"
-    assert scope["token"] == "tok-DEAD"
-    assert scope["count"] == 1
+    assert scope["state"] == "ARMED"
+    assert scope["token"] != "tok-DEAD"
+    assert scope["count"] == 2
     # Prior active order untouched.
     assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
+
+
+def _seed_expired_runtime_reattach(ledger, *, count=1, order_id=""):
+    past = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": {
+            "overnight_watch_arm_attempt_scopes": {
+                "paper:2026-06-12": {
+                    "count": count,
+                    "state": "IN_PROGRESS",
+                    "token": "expired-runtime-token",
+                    "local_order_id": order_id,
+                    "last_reason": "seed_expired_runtime",
+                    "updated_at": past,
+                    "execution_mode": "paper",
+                    "session_key": "2026-06-12",
+                    "claim_started_at": past,
+                    "claim_lease_until": past,
+                }
+            }
+        },
+    }
+
+
+def _seed_runtime_pending_order(osm, *, status="PENDING_TRIGGER"):
+    osm.orders["prior-1"] = {
+        "local_order_id": "prior-1",
+        "client_id": "client-1",
+        "canonical_signal_id": "CANON-001",
+        "signal_id": "sig-001",
+        "kind": "ENTRY",
+        "status": status,
+        "execution_mode": "paper",
+        "symbol": "AAPL",
+        "direction": "CALL",
+        "trigger_price": 101.0,
+        "created_ts": 1,
+        "meta": {},
+    }
+
+
+def test_runtime_reattach_watch_false_retries_same_order_then_exhausts(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _seed_expired_runtime_reattach(ledger)
+    _seed_runtime_pending_order(osm)
+    watcher = MagicMock()
+    watcher.has_order.return_value = False
+    watcher.watch.return_value = False
+
+    result1, osm, _, _, controls1 = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm, return_controls=True,
+    )
+    scope1 = _attempt_scope(ledger)
+    assert scope1["state"] == "RETRYABLE"
+    assert scope1["count"] == 2
+    assert scope1["local_order_id"] == "prior-1"
+    assert result1["retryable_deferred"] == 1
+
+    result2, osm, _, _, controls2 = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm, return_controls=True,
+    )
+    scope2 = _attempt_scope(ledger)
+    assert scope2["state"] == "EXHAUSTED"
+    assert scope2["count"] == 3
+    assert watcher.watch.call_count == 2
+    assert all(call.args[1] == "prior-1" for call in watcher.watch.call_args_list)
+    assert osm.create_calls == 0
+    assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
+    controls1["master_control"].evaluate.assert_not_called()
+    controls2["master_control"].evaluate.assert_not_called()
+    controls1["broker"].submit_order.assert_not_called()
+    controls2["broker"].submit_order.assert_not_called()
+    assert result2["terminal_errors"] == 1
+
+
+def test_runtime_reattach_exception_retries_same_order(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _seed_expired_runtime_reattach(ledger)
+    _seed_runtime_pending_order(osm)
+    watcher1 = MagicMock()
+    watcher1.has_order.return_value = False
+    watcher1.watch.side_effect = RuntimeError("reattach boom")
+
+    result1, osm, *_ = _run_reeval(
+        monkeypatch, watcher1, ledger=ledger, osm=osm,
+    )
+    assert result1["retryable_deferred"] == 1
+    assert _attempt_scope(ledger)["state"] == "RETRYABLE"
+
+    watcher2 = MagicMock()
+    watcher2.has_order.return_value = False
+    watcher2.watch.return_value = True
+    result2, osm, *_ = _run_reeval(
+        monkeypatch, watcher2, ledger=ledger, osm=osm,
+    )
+    assert result2["armed"] == 1
+    assert _attempt_scope(ledger)["state"] == "ARMED"
+    assert _attempt_scope(ledger)["count"] == 3
+    assert osm.create_calls == 0
+    assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
+
+
+def test_runtime_reattach_proof_failure_completes_retryable(monkeypatch):
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _seed_expired_runtime_reattach(ledger)
+    _seed_runtime_pending_order(osm)
+    watcher = MagicMock()
+    watcher.has_order.return_value = False
+    watcher.watch.return_value = True
+    monkeypatch.setattr(ov, "_persist_watcher_armed_proof", lambda **kw: False)
+
+    result, osm, *_ = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "RETRYABLE"
+    assert scope["count"] == 2
+    assert scope["local_order_id"] == "prior-1"
+    assert result["retryable_deferred"] == 1
+    assert osm.create_calls == 0
+
+
+def test_runtime_reattach_completion_cas_failure_recovers_after_lease(monkeypatch):
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _seed_expired_runtime_reattach(ledger)
+    _seed_runtime_pending_order(osm)
+    watcher1 = MagicMock()
+    watcher1.has_order.return_value = False
+    watcher1.watch.return_value = False
+    real_complete = ov._complete_watch_arm_attempt_checked
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
+
+    result1, osm, *_ = _run_reeval(
+        monkeypatch, watcher1, ledger=ledger, osm=osm,
+    )
+    scope1 = _attempt_scope(ledger)
+    assert scope1["state"] == "IN_PROGRESS"
+    assert scope1["count"] == 2
+    assert result1["terminal_errors"] == 1
+    assert result1["retryable_deferred"] == 0
+
+    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    scope1["claim_lease_until"] = past
+    ledger.rows[("CANON-001", "client-1")]["metadata"][
+        "overnight_watch_arm_attempt_scopes"
+    ]["paper:2026-06-12"] = scope1
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", real_complete)
+    watcher2 = MagicMock()
+    watcher2.has_order.return_value = False
+    watcher2.watch.return_value = True
+
+    result2, osm, *_ = _run_reeval(
+        monkeypatch, watcher2, ledger=ledger, osm=osm,
+    )
+    scope2 = _attempt_scope(ledger)
+    assert result2["armed"] == 1
+    assert scope2["state"] == "ARMED"
+    assert scope2["count"] == 3
+    assert scope2["local_order_id"] == "prior-1"
+    assert osm.create_calls == 0
+
+
+def test_runtime_created_order_never_reaches_watcher(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _seed_expired_runtime_reattach(ledger)
+    _seed_runtime_pending_order(osm, status="CREATED")
+    watcher = MagicMock()
+
+    result, osm, _, _, controls = _run_reeval(
+        monkeypatch, watcher, ledger=ledger, osm=osm, return_controls=True,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ERROR"
+    assert scope["local_order_id"] == "prior-1"
+    watcher.watch.assert_not_called()
+    assert osm.cancel_calls == []
+    assert osm.expire_calls == []
+    assert osm.orders["prior-1"]["status"] == "CREATED"
+    assert osm.create_calls == 0
+    controls["master_control"].evaluate.assert_not_called()
+    controls["broker"].submit_order.assert_not_called()
+    assert result["already_resolved"] == 1
 
 
 def test_expired_claim_recovery_with_terminal_prior_order_reacquires(monkeypatch):
