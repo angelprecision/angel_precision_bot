@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import sys
 import types
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -38,6 +40,16 @@ import ap_overnight_reeval as ov
 
 
 EXISTING_LOCAL_OID = "local-existing-pending-1"
+
+
+@pytest.fixture(autouse=True)
+def _fixed_reeval_clock(monkeypatch):
+    """Keep fixed July 27 inventory fresh regardless of the CI wall clock."""
+    monkeypatch.setattr(
+        ov,
+        "_et_now",
+        lambda: datetime(2026, 7, 28, 9, 35, tzinfo=ZoneInfo("America/New_York")),
+    )
 
 
 def _install_reeval_sub_module_stubs(monkeypatch):

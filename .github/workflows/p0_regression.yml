@@ -172,6 +172,11 @@ jobs:
             tests/test_p0_terminal_proof_lock_postgres_concurrency.py \
             tests/test_p0_queue_deferral_truth.py \
             tests/test_p0_manual_rescue_restart_guard_bypass.py \
+            tests/test_p0_queue_liveness_watch_ownership_contract.py \
+            tests/test_p0_overnight_watcher_cleanup.py \
+            tests/test_p0_overnight_watch_attempt_atomicity.py \
+            tests/test_pr239_overnight_reeval_hardening.py \
+            tests/test_p0_overnight_sizing_metadata.py \
             -v --tb=short --color=yes
 
       - name: Summary

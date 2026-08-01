@@ -36,6 +36,8 @@ import logging
 import os
 import inspect
 import time
+import threading
+import uuid
 from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -67,6 +69,793 @@ _OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED = (
     os.getenv("OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED", "false").strip().lower()
     in ("true", "1")
 )
+
+try:
+    OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS = max(
+        1,
+        int(os.getenv("OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS", "3")),
+    )
+except (TypeError, ValueError):
+    OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS = 3
+
+
+# PR #404 final amendment: durable-claim lease for stranded IN_PROGRESS
+# recovery. A process crash after the atomic claim write must not leave the
+# scope permanently owned. A bounded lease timestamp is written alongside the
+# IN_PROGRESS scope; a later worker may reclaim only after the lease has
+# expired AND exact ownership identity of the referenced local ENTRY (if any)
+# has been proven terminal. Minimum lease 30s; default 5 minutes.
+try:
+    OVERNIGHT_WATCH_ARM_CLAIM_LEASE_SECONDS = max(
+        30,
+        int(os.getenv("OVERNIGHT_WATCH_ARM_CLAIM_LEASE_SECONDS", "300")),
+    )
+except (TypeError, ValueError):
+    OVERNIGHT_WATCH_ARM_CLAIM_LEASE_SECONDS = 300
+
+
+def _parse_watch_attempt_ts(raw) -> Optional[datetime]:
+    """Parse a watcher-attempt lease timestamp to a timezone-aware UTC
+    datetime. Accepts datetime objects, ISO strings with optional trailing
+    ``Z``. Returns None for blank / malformed / unsupported values; never
+    raises. Naive datetimes are treated as UTC."""
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, datetime):
+            value = raw
+        else:
+            text = str(raw).strip()
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            value = datetime.fromisoformat(text)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+# ── PR #404: Watcher-arm outcome classification ───────────────────────────────
+
+WATCH_ARMED         = "WATCH_ARMED"
+ALREADY_WATCHING    = "ALREADY_WATCHING"
+RETRYABLE_NOT_ARMED = "RETRYABLE_NOT_ARMED"
+TERMINAL_FAILURE    = "TERMINAL_FAILURE"
+OWNERSHIP_CONFLICT  = "OWNERSHIP_CONFLICT"
+UNKNOWN_FAILURE     = "UNKNOWN_FAILURE"
+
+# Watcher ownership resolution constants (used by _resolve_existing_watcher_ownership)
+WATCH_OWNER_EXACT        = "WATCH_OWNER_EXACT"
+WATCH_OWNER_CONFLICT     = "WATCH_OWNER_CONFLICT"
+WATCH_OWNER_MISSING      = "WATCH_OWNER_MISSING"
+WATCH_OWNER_LOOKUP_ERROR = "WATCH_OWNER_LOOKUP_ERROR"
+
+WATCH_ATTEMPT_ACQUIRED            = "WATCH_ATTEMPT_ACQUIRED"
+WATCH_ATTEMPT_ALREADY_IN_PROGRESS = "WATCH_ATTEMPT_ALREADY_IN_PROGRESS"
+WATCH_ATTEMPT_ALREADY_ARMED       = "WATCH_ATTEMPT_ALREADY_ARMED"
+WATCH_ATTEMPT_EXHAUSTED           = "WATCH_ATTEMPT_EXHAUSTED"
+WATCH_ATTEMPT_CONFLICT            = "WATCH_ATTEMPT_CONFLICT"
+WATCH_ATTEMPT_DB_ERROR            = "WATCH_ATTEMPT_DB_ERROR"
+# Returned when an expired IN_PROGRESS claim with blank local_order_id discovers
+# exactly one active PENDING_TRIGGER / CREATED ENTRY in orders.  The claim
+# function has already (a) rotated the token, (b) bound the discovered
+# local_order_id to the scope, and (c) refreshed the claim lease — all under
+# the row lock.  The caller MUST invoke the existing watcher reattachment path
+# against the discovered order; it MUST NOT create a new order or submit to the
+# broker.  On successful reattachment the caller completes the attempt as ARMED.
+WATCH_ATTEMPT_REATTACH_REQUIRED   = "WATCH_ATTEMPT_REATTACH_REQUIRED"
+
+WATCH_ATTEMPT_STATE_IN_PROGRESS = "IN_PROGRESS"
+WATCH_ATTEMPT_STATE_RETRYABLE   = "RETRYABLE"
+WATCH_ATTEMPT_STATE_ARMED       = "ARMED"
+WATCH_ATTEMPT_STATE_EXHAUSTED   = "EXHAUSTED"
+WATCH_ATTEMPT_STATE_ERROR       = "ERROR"
+_WATCH_ATTEMPT_TERMINAL_STATES = {
+    WATCH_ATTEMPT_STATE_ARMED,
+    WATCH_ATTEMPT_STATE_EXHAUSTED,
+    WATCH_ATTEMPT_STATE_ERROR,
+}
+_WATCH_ATTEMPT_LOCK = threading.Lock()
+
+
+class _WatchAttemptClaim(NamedTuple):
+    disposition: str
+    token: str = ""
+    attempt_count: int = 0
+    local_order_id: str = ""
+    reason: str = ""
+
+
+class _WatchArmOutcome(NamedTuple):
+    """Structured watcher-arm result replacing the raw Boolean."""
+    disposition: str   # one of the WATCH_*/RETRYABLE_NOT_ARMED/TERMINAL_FAILURE constants
+    terminal:    bool  # True only when signal is proven permanently invalid
+    retryable:   bool  # True when the slot can be retried
+    reason:      str
+
+
+def _classify_watch_arm_outcome(
+    watch_result: bool,
+    already_watching: bool,
+    terminal_conflict: bool,
+    exception: Optional[Exception],
+) -> _WatchArmOutcome:
+    """Classify watch() result.  Generic False is NEVER TERMINAL_FAILURE."""
+    if watch_result:
+        return _WatchArmOutcome(WATCH_ARMED, False, False, "watch_returned_true")
+    if already_watching:
+        return _WatchArmOutcome(ALREADY_WATCHING, False, True, "already_watching_exact_owner")
+    if terminal_conflict:
+        return _WatchArmOutcome(TERMINAL_FAILURE, True, False, "proven_terminal_conflict")
+    if exception is not None:
+        return _WatchArmOutcome(
+            RETRYABLE_NOT_ARMED, False, True,
+            f"transient_exception:{type(exception).__name__}",
+        )
+    return _WatchArmOutcome(RETRYABLE_NOT_ARMED, False, True, "watch_false_no_evidence")
+
+
+def _resolve_existing_watcher_ownership(
+    *,
+    entry_watcher,
+    signal_id: str,
+    client_id: str,
+    execution_mode: str,
+    ticker: str,
+    side: str,
+    generation=None,
+    watcher_token=None,
+    local_order_id=None,
+) -> str:
+    """Resolve watcher ownership for a signal_id after a dedup_block rejection.
+
+    Iterates entry_watcher._pending (same pattern as _verify_registry_ownership
+    in ap/pending_trigger_restart_recovery.py) and verifies all available
+    identity fields.  Never returns a Boolean.
+
+    Returns:
+        WATCH_OWNER_EXACT        – all identity fields match; idempotent success
+        WATCH_OWNER_CONFLICT     – watcher exists but identity mismatches
+        WATCH_OWNER_MISSING      – dedup key held but no matching watcher in registry
+        WATCH_OWNER_LOOKUP_ERROR – registry access error or incomplete expected identity
+    """
+    if entry_watcher is None:
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    exp_sid    = str(signal_id      or "").strip()
+    exp_client = str(client_id      or "").strip().lower()
+    exp_mode   = str(execution_mode or "").strip().lower()
+    exp_ticker = str(ticker         or "").upper().strip()
+    exp_side   = str(side           or "").upper().strip()
+
+    if not exp_sid or not exp_client or not exp_mode or not exp_ticker or not exp_side:
+        log.warning(
+            "[%s] _resolve_existing_watcher_ownership: incomplete identity "
+            "sid=%s client=%s mode=%s side=%s",
+            ticker, exp_sid, exp_client, exp_mode, exp_side,
+        )
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    try:
+        _dedup = getattr(entry_watcher, "_dedup_set", None)
+        if _dedup is None or exp_sid not in _dedup:
+            return WATCH_OWNER_MISSING
+    except Exception:
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    try:
+        _lock    = getattr(entry_watcher, "_lock", None)
+        _pending = list(getattr(entry_watcher, "_pending", []) or [])
+    except Exception:
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    import contextlib
+    _ctx = _lock if _lock is not None else contextlib.nullcontext()
+
+    try:
+        with _ctx:
+            _snapshot = list(getattr(entry_watcher, "_pending", []) or [])
+        for w in _snapshot:
+            _wsig  = getattr(w, "signal", {}) or {}
+            w_sid  = str(getattr(w, "signal_id", None) or _wsig.get("signal_id") or "").strip()
+            if w_sid != exp_sid:
+                continue
+            w_client = str(_wsig.get("client_id")      or "").strip().lower()
+            w_mode   = str(_wsig.get("execution_mode") or "").strip().lower()
+            w_ticker = str(getattr(w, "ticker", "") or _wsig.get("ticker") or "").upper().strip()
+            w_side   = str(getattr(w, "side",   "") or _wsig.get("side")   or "").upper().strip()
+            if not w_client or w_client != exp_client:
+                log.warning("[%s] watcher client mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_client, w_client)
+                return WATCH_OWNER_CONFLICT
+            if not w_mode or w_mode != exp_mode:
+                log.warning("[%s] watcher mode mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_mode, w_mode)
+                return WATCH_OWNER_CONFLICT
+            if w_ticker and w_ticker != exp_ticker:
+                log.warning("[%s] watcher ticker mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_ticker, w_ticker)
+                return WATCH_OWNER_CONFLICT
+            if w_side and w_side != exp_side:
+                log.warning("[%s] watcher side mismatch sid=%s exp=%s got=%r",
+                            ticker, exp_sid, exp_side, w_side)
+                return WATCH_OWNER_CONFLICT
+            if local_order_id:
+                exp_oid = str(local_order_id or "").strip()
+                w_oid = str(_wsig.get("local_order_id") or "").strip()
+                if not w_oid or w_oid != exp_oid:
+                    log.warning("[%s] watcher local_order_id mismatch sid=%s exp=%s got=%r",
+                                ticker, exp_sid, exp_oid, w_oid)
+                    return WATCH_OWNER_CONFLICT
+            if generation is not None:
+                try:
+                    if int(_wsig.get("trigger_generation") or 0) != int(generation):
+                        return WATCH_OWNER_CONFLICT
+                except (TypeError, ValueError):
+                    return WATCH_OWNER_CONFLICT
+            if watcher_token:
+                w_tok = str(_wsig.get("watcher_token") or "").strip()
+                if not w_tok or w_tok != str(watcher_token).strip():
+                    return WATCH_OWNER_CONFLICT
+            return WATCH_OWNER_EXACT
+    except Exception as exc:
+        log.error("[%s] _resolve_existing_watcher_ownership exception sid=%s: %s",
+                  ticker, exp_sid, exc)
+        return WATCH_OWNER_LOOKUP_ERROR
+
+    return WATCH_OWNER_MISSING
+
+
+# ── PR #404 P0-4: real production ownership fields (with lease freshness) ────
+#
+# The prior recovery-owned check only looked at four retry-timestamp fields.
+# Live production orders carry ownership in a wider set of fields, and mere
+# presence of a stale timestamp is not evidence of an active owner. The rule:
+# a row is currently owned when it carries either
+#   (a) any of the ownership-identity fields, OR
+#   (b) an unexpired materialization lease, OR
+#   (c) materialization_in_flight is truthy, OR
+#   (d) materialization_status is 'RUNNING' or 'IN_PROGRESS'.
+# All four are checked below.
+
+_RECOVERY_OWNER_IDENTITY_FIELDS = (
+    "materialization_owner",
+    "recovery_owner",
+    "recovery_ownership",
+    "current_owner",
+    "watcher_token",
+    "watcher_retry_owner",
+)
+
+_ACTIVE_MATERIALIZATION_STATUSES = frozenset({"RUNNING", "IN_PROGRESS"})
+
+
+def _parse_iso_ts(raw) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        s = str(raw).strip()
+        if not s:
+            return None
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _pending_owner_lease_active(
+    meta: dict,
+    *,
+    expected_client_id: Optional[str] = None,
+    expected_execution_mode: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Return (owned, reason). A row is 'owned' only when the ownership
+    evidence is real AND (for time-bounded fields) still fresh. Reason is
+    the fact that produced the True/False decision for diagnostics."""
+    if not isinstance(meta, dict):
+        return False, "no_meta"
+
+    # PRE_SUBMIT_PROOF_RETRY: real deferred lifecycle whose ownership must
+    # be honored while the proof-retry deadline is still in the future. Uses
+    # the SHARED predicate defined in ap/order_state_machine.py so this
+    # helper and the OSM stale-expiration guard agree on ownership — no
+    # parallel rule sets. Certain rejection reasons (expired deadline,
+    # malformed shape, malformed durable-recovery owner) are STRONGER than
+    # plain "unowned" — they must force the classifier to CONFLICT, not
+    # allow it to fall through to stale. Those reason strings are surfaced
+    # verbatim; the classifier consults LEASE_REASONS_FORCE_CONFLICT.
+    try:
+        from ap.order_state_machine import (
+            is_proof_retry_owner_active,
+            is_durable_recovery_owner_active,
+            LEASE_REASONS_FORCE_CONFLICT,  # noqa: F401 imported for callers
+        )
+        _proof_active, _proof_reason = is_proof_retry_owner_active(meta)
+        if _proof_active:
+            return True, _proof_reason
+        if _proof_reason in ("proof_retry_deadline_expired",
+                             "proof_retry_next_at_after_deadline"):
+            # Recognized proof-retry shape but recovery-consumer-owned or
+            # malformed. Surface the reason so the classifier can escalate
+            # to CONFLICT (not stale).
+            return False, _proof_reason
+        # Durable recovery_scheduler retention — separate canonical contract.
+        _dr_active, _dr_reason = is_durable_recovery_owner_active(
+            meta,
+            expected_client_id=expected_client_id,
+            expected_execution_mode=expected_execution_mode,
+        )
+        if _dr_active:
+            return True, _dr_reason
+        if _dr_reason in LEASE_REASONS_FORCE_CONFLICT:
+            return False, _dr_reason
+    except Exception as _pr_exc:
+        log.warning(
+            "pending_owner_lease_active: shared ownership predicate import/"
+            "call failed err=%s — treating as no proof-retry evidence",
+            _pr_exc,
+        )
+
+    if meta.get("materialization_in_flight"):
+        lease = _parse_iso_ts(meta.get("materialization_lease_until"))
+        if lease is None:
+            # In-flight flag with no lease → treat as owned but flag it.
+            return True, "materialization_in_flight_no_lease"
+        if lease > datetime.now(timezone.utc):
+            return True, "materialization_lease_fresh"
+        # In-flight but lease expired → not owned; this row is a ghost.
+        return False, "materialization_lease_expired"
+
+    status = str(meta.get("materialization_status") or "").strip().upper()
+    if status in _ACTIVE_MATERIALIZATION_STATUSES:
+        lease = _parse_iso_ts(meta.get("materialization_lease_until"))
+        if lease is None or lease > datetime.now(timezone.utc):
+            return True, f"materialization_status:{status}"
+        return False, f"materialization_status_{status}_lease_expired"
+
+    # A fresh retry timestamp is a real liveness signal — accept it whether or
+    # not an identity field is also set. This is the "living worker" evidence.
+    for _field in ("materialization_next_retry_at",
+                   "restart_rearm_next_at",
+                   "watcher_retry_next_at"):
+        ts = _parse_iso_ts(meta.get(_field))
+        if ts is not None and ts > datetime.now(timezone.utc):
+            return True, f"retry_timestamp_fresh:{_field}"
+
+    # A bare identity field (materialization_owner / recovery_owner /
+    # recovery_ownership / current_owner / watcher_token / watcher_retry_owner)
+    # is a HISTORICAL claim, not a living worker. Standing alone it can persist
+    # indefinitely after a process dies and silently stop tomorrow's valid
+    # trades. It only counts as an active owner when corroborated by one of:
+    #   - a fresh materialization lease (materialization_lease_until > now)
+    #   - a fresh retry timestamp (any of the retry-*_at fields above)
+    #   - an ACTIVE materialization_status (already handled above)
+    #   - materialization_in_flight (already handled above)
+    # The lease and status checks above already returned early on a positive
+    # match. Reaching this point means no fresh liveness evidence exists, so
+    # bare identity fields alone are treated as ghost ownership.
+    _identity_fields_present = [
+        _f for _f in _RECOVERY_OWNER_IDENTITY_FIELDS
+        if str(meta.get(_f) or "").strip()
+    ]
+    if _identity_fields_present:
+        return False, (
+            "recovery_identity_without_liveness:"
+            + ",".join(_identity_fields_present)
+        )
+
+    return False, "no_active_owner"
+
+
+def _terminalize_stale_pending_orders(
+    *,
+    order_state_machine,
+    stale_orders,
+    reason: str,
+) -> tuple[bool, str]:
+    """P0-2: durably terminalize every stale pending row before authorizing a
+    replacement. For each row: (1) transition via expire_pending_entry (falls
+    back to cancel_pending_entry, then transition('EXPIRED', ...)), (2) verify
+    the readback status is in _TERMINAL_ENTRY_STATUSES. A single row that
+    cannot be proven terminal fails the whole cleanup — the caller must not
+    release the candidate.
+
+    Returns (all_terminalized, failure_reason). failure_reason is stable
+    (operator diagnostic) when the return is False.
+    """
+    if not stale_orders:
+        return True, ""
+
+    for _row in stale_orders:
+        oid = str((_row or {}).get("local_order_id") or "").strip()
+        if not oid:
+            return False, "stale_row_missing_local_order_id"
+
+        # The classifier read carries the exact status and updated_ts (row
+        # version) the classifier saw. The cleanup write must atomically fence
+        # on both — if either changed between the classifier read and this
+        # write, another actor (broker submit intent, recovery owner, anything)
+        # touched the row and terminalizing here would kill the rightful new
+        # owner. expire_stale_pending_entry_cas() preserves the pending-entry
+        # ownership guard AND adds row-version fencing; any refusal is a
+        # legitimate ownership signal and MUST fail the cleanup.
+        expected_status = str((_row or {}).get("status") or "").strip().upper()
+        expected_updated_ts = (_row or {}).get("updated_ts")
+        if not expected_status:
+            return False, f"stale_row_missing_status:{oid}"
+        if expected_updated_ts is None or (
+            isinstance(expected_updated_ts, str) and not expected_updated_ts.strip()
+        ):
+            # Without a row-version fence the CAS can't detect a concurrent
+            # writer. Refuse rather than falling back to a weaker write.
+            return False, f"stale_row_missing_updated_ts:{oid}"
+
+        terminalized = False
+        failure_detail = ""
+        try:
+            if hasattr(order_state_machine, "expire_stale_pending_entry_cas"):
+                ok, failure_detail = order_state_machine.expire_stale_pending_entry_cas(
+                    oid,
+                    expected_status=expected_status,
+                    expected_updated_ts=expected_updated_ts,
+                    reason=reason,
+                )
+                terminalized = bool(ok)
+        except Exception as _cleanup_exc:
+            log.error(
+                "pending_entry_stale_terminalize_exception local_order_id=%s "
+                "err=%s reason=%s",
+                oid, _cleanup_exc, reason,
+            )
+            return False, f"terminalize_exception:{type(_cleanup_exc).__name__}"
+
+        if not terminalized:
+            return False, (
+                f"terminalize_returned_false:{oid}:"
+                f"{failure_detail or 'no_cas_helper'}"
+            )
+
+        # Verify readback: the row must actually be in a terminal status.
+        try:
+            row = (
+                order_state_machine.get_order(oid)
+                if hasattr(order_state_machine, "get_order")
+                else None
+            )
+        except Exception as _rb_exc:
+            log.error(
+                "pending_entry_stale_readback_exception local_order_id=%s err=%s",
+                oid, _rb_exc,
+            )
+            return False, f"readback_exception:{type(_rb_exc).__name__}"
+
+        status = str((row or {}).get("status") or "").strip().upper()
+        if status not in _TERMINAL_ENTRY_STATUSES:
+            log.error(
+                "pending_entry_stale_readback_nonterminal local_order_id=%s "
+                "status=%r",
+                oid, status,
+            )
+            return False, f"readback_nonterminal:{oid}:{status or 'blank'}"
+
+    return True, ""
+
+
+class _PendingEntryOutcome(NamedTuple):
+    """Structured result of _classify_pending_entry_for_overnight.
+
+    `disposition` is a PENDING_OWNER_* string constant preserving the existing
+    contract with all callers and tests. `stale_orders` carries the exact
+    same-client/mode rows the classifier saw and released; the caller must
+    durably terminalize each before authorizing a replacement. `failure_reason`
+    is a stable operator-facing string for DB_ERROR and CONFLICT paths.
+    """
+    disposition: str
+    stale_orders: tuple = ()
+    failure_reason: str = ""
+
+    # Preserve legacy string-comparison call sites: `_pe_class == "PENDING_..."`
+    # and `_pe_class in {...}`. Existing tests and callers that treated the
+    # return as a plain string keep working; the new .stale_orders / .failure_
+    # reason attributes are additive.
+    def __eq__(self, other):
+        if isinstance(other, str):
+            return self.disposition == other
+        return tuple.__eq__(self, other)
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self.disposition)
+
+
+def _classify_pending_entry_for_overnight(
+    ticker: str,
+    client_id: str,
+    execution_mode: str,
+    entry_watcher=None,
+    candidate_signal: Optional[dict] = None,
+) -> "_PendingEntryOutcome":
+    """Query same-client/mode ENTRY orders for the ticker and classify the
+    ownership disposition. Returns _PendingEntryOutcome — callers can still
+    compare directly against PENDING_OWNER_* strings (backward compatible).
+    The stale_orders attribute carries every same-client/mode row the loop
+    released so the caller can terminalize each before authorizing a
+    replacement (P0-2). Fail-closed on DB error."""
+    cand_c = str(client_id      or "").strip().lower()
+    cand_m = str(execution_mode or "").strip().lower()
+    if not cand_c or not cand_m:
+        log.warning("[%s] _classify_pending_entry_for_overnight: missing candidate "
+                    "identity client=%r mode=%r — fail closed", ticker, cand_c, cand_m)
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", (), "missing_candidate_identity"
+        )
+
+    try:
+        from ap.order_monitor import (
+            _classify_pending_entry_ownership,
+            PENDING_OWNER_CONFLICT,
+            PENDING_OWNER_DB_ERROR,
+        )
+    except ImportError as _ie:
+        log.critical(
+            "[%s] _classify_pending_entry_for_overnight: import failed: %s", ticker, _ie
+        )
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", (), f"import_failed:{type(_ie).__name__}"
+        )
+
+    # P0-3: exact-identity SQL. Filter by symbol AND same client AND same
+    # execution_mode (case-insensitive) before status/kind. Removes the
+    # LIMIT-10-hole (an older same-client/mode active owner can no longer be
+    # dropped by ten newer cross-scope rows). Direction and canonical_signal_id
+    # are used as additional filters when the candidate provides them, so
+    # opposite-side and cross-canonical collisions cannot masquerade as
+    # ownership of this candidate.
+    cand_side = ""
+    cand_canonical = ""
+    if isinstance(candidate_signal, dict):
+        cand_side = str(
+            candidate_signal.get("side") or candidate_signal.get("direction") or ""
+        ).strip().upper()
+        cand_canonical = str(
+            candidate_signal.get("canonical_signal_id")
+            or candidate_signal.get("signal_id")
+            or ""
+        ).strip()
+
+    # Full active-ownership status vocabulary. Any status listed in
+    # _ACTIVE_ENTRY_OWN_STATUSES represents an in-flight (or terminally-
+    # owned FILLED) ENTRY that must block admission of a replacement.
+    # Omitting any of these here causes a live owner to be misclassified
+    # PENDING_OWNER_MISSING and an authorized replacement to be issued.
+    _pending_statuses = tuple(sorted(_ACTIVE_ENTRY_OWN_STATUSES))
+    _pending_status_placeholders = ", ".join(["%s"] * len(_pending_statuses))
+
+    _sql = (
+        "SELECT local_order_id, client_id, "
+        "LOWER(TRIM(COALESCE(execution_mode, ''))) AS execution_mode, "
+        "status, broker_order_id, submitted_ts, created_ts, updated_ts, meta, "
+        "direction, canonical_signal_id "
+        "FROM orders "
+        "WHERE symbol = %s AND kind = 'ENTRY' "
+        "AND LOWER(TRIM(COALESCE(client_id, ''))) = %s "
+        "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+        f"AND status IN ({_pending_status_placeholders}) "
+    )
+    _params: list = [
+        str(ticker or "").upper(),
+        cand_c,
+        cand_m,
+        *_pending_statuses,
+    ]
+    if cand_side in {"CALL", "PUT"}:
+        _sql += "AND UPPER(TRIM(COALESCE(direction, ''))) = %s "
+        _params.append(cand_side)
+    if cand_canonical:
+        # Candidate-admission cleanup targets require EXACT canonical identity.
+        # A NULL or blank canonical_signal_id does not prove the row belongs
+        # to this candidate — it proves the opposite (ownership unknown), and
+        # authorizing a candidate-specific cleanup against it would let a
+        # legacy unidentified row masquerade as this candidate's stale prior.
+        # Legacy unidentified rows are a separate maintenance concern and
+        # must be handled by a dedicated maintenance path, not by admission.
+        _sql += "AND canonical_signal_id = %s "
+        _params.append(cand_canonical)
+    _sql += "ORDER BY created_ts DESC"
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _pe_fn():
+            with conn() as c:
+                c.execute(_sql, tuple(_params))
+                return c.fetchall()
+
+        rows = run_with_retry(_pe_fn) or []
+    except Exception as _dbe:
+        log.warning(
+            "[%s] _classify_pending_entry_for_overnight: DB query failed: %s", ticker, _dbe
+        )
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", (), f"db_query_failed:{type(_dbe).__name__}"
+        )
+
+    if not rows:
+        return _PendingEntryOutcome("PENDING_OWNER_MISSING", (), "no_matching_rows")
+
+    _has_order_fn = getattr(entry_watcher, "has_order", None) if entry_watcher else None
+    _saw_conflict = False
+    _saw_db_error = False
+    _stale_orders: list[dict] = []
+    _failure_reason = ""
+
+    for _raw in rows:
+        row = dict(_raw) if not isinstance(_raw, dict) else _raw
+        row_client_id = str(row.get("client_id") or "").strip()
+        row_client = row_client_id.lower()
+        row_execution_mode = str(row.get("execution_mode") or "").strip()
+        row_mode = row_execution_mode.lower()
+
+        # Missing existing row identity → ambiguous, never release. (The SQL
+        # filter already restricts to same client/mode; belt-and-suspenders.)
+        if not row_client or not row_mode:
+            _saw_conflict = True
+            _failure_reason = _failure_reason or "row_missing_identity"
+            continue
+        if row_client != cand_c or row_mode != cand_m:
+            # Should not occur given SQL filter, but preserve fail-closed
+            # semantics if the DB somehow returns a non-matching row.
+            _saw_conflict = True
+            _failure_reason = _failure_reason or "row_scope_mismatch"
+            continue
+
+        row_local_oid = str(row.get("local_order_id") or "").strip()
+        # P1: a watcher-registry exception is NOT evidence-of-no-owner. A
+        # registry/lock/internal-state failure must surface as a structured
+        # PENDING_OWNER_DB_ERROR so the caller preserves the exact diagnostic
+        # and never authorizes a destructive stale-row cleanup on unproven
+        # ownership.
+        if callable(_has_order_fn) and row_local_oid:
+            try:
+                _watcher_owned = bool(_has_order_fn(row_local_oid))
+            except Exception as _wexc:
+                log.error(
+                    "[%s] _classify_pending_entry_for_overnight: watcher "
+                    "registry lookup failed local_order_id=%s err=%s",
+                    ticker, row_local_oid, _wexc,
+                )
+                return _PendingEntryOutcome(
+                    "PENDING_OWNER_DB_ERROR",
+                    (),
+                    f"watcher_registry_error:{type(_wexc).__name__}",
+                )
+        else:
+            _watcher_owned = False
+
+        # P1: unreadable / unexpected-shape metadata is NOT proof of "no
+        # owner". For a destructive stale-row cleanup path, an unparseable
+        # blob is ownership CONFLICT — the row must not be terminalized. A
+        # JSONB scalar (string/list/number/bool) reaches Python as a non-dict
+        # value even when JSON decoding succeeds; that shape carries no
+        # ownership evidence we can read, so it too must fail closed.
+        try:
+            _meta_raw = row.get("meta")
+            if _meta_raw is None or (
+                isinstance(_meta_raw, str) and not _meta_raw.strip()
+            ):
+                _meta = {}
+            elif isinstance(_meta_raw, dict):
+                _meta = _meta_raw
+            elif isinstance(_meta_raw, str):
+                import json as _json
+                _decoded = _json.loads(_meta_raw)
+                if not isinstance(_decoded, dict):
+                    _saw_conflict = True
+                    _failure_reason = (
+                        _failure_reason
+                        or f"meta_non_object_shape:{type(_decoded).__name__}"
+                    )
+                    continue
+                _meta = _decoded
+            else:
+                # Any other shape (list, int, float, bool coming back from
+                # the driver) is unreadable ownership evidence — fail closed.
+                _saw_conflict = True
+                _failure_reason = (
+                    _failure_reason
+                    or f"meta_unexpected_type:{type(_meta_raw).__name__}"
+                )
+                continue
+            _recovery_owned, _owner_reason = _pending_owner_lease_active(
+                _meta,
+                expected_client_id=row_client_id,
+                expected_execution_mode=row_execution_mode,
+            )
+        except Exception as _mexc:
+            log.error(
+                "[%s] _classify_pending_entry_for_overnight: metadata parse "
+                "failed local_order_id=%s err=%s",
+                ticker, row_local_oid, _mexc,
+            )
+            _saw_conflict = True
+            _failure_reason = (
+                _failure_reason
+                or f"meta_parse_exception:{type(_mexc).__name__}"
+            )
+            continue
+
+        # A recognized-but-blocked ownership shape (expired proof-retry
+        # deadline, malformed proof-retry shape, malformed durable-recovery
+        # owner) is STRONGER than plain "unowned". Escalate to CONFLICT so
+        # generic admission cleanup does not proceed against a canonical
+        # ownership record whose terminalization belongs to a dedicated
+        # recovery consumer. LEASE_REASONS_FORCE_CONFLICT is the shared
+        # constant defined next to the predicates in ap.order_state_machine.
+        from ap.order_state_machine import LEASE_REASONS_FORCE_CONFLICT
+        if (not _recovery_owned) and _owner_reason in LEASE_REASONS_FORCE_CONFLICT:
+            _saw_conflict = True
+            _failure_reason = (
+                _failure_reason or f"lease_forced_conflict:{_owner_reason}"
+            )
+            continue
+
+        result = _classify_pending_entry_ownership(
+            row,
+            watcher_owned=_watcher_owned,
+            recovery_owned=_recovery_owned,
+            broker_terminal=False,
+        )
+        if result.blocks_candidate:
+            return _PendingEntryOutcome(
+                "PENDING_OWNER_ACTIVE", (),
+                f"active_owner:{_owner_reason}" if _recovery_owned else "active_owner",
+            )
+        if result.disposition == PENDING_OWNER_DB_ERROR:
+            _saw_db_error = True
+            _failure_reason = _failure_reason or f"row_db_error:{result.reason}"
+        elif result.disposition == PENDING_OWNER_CONFLICT:
+            _saw_conflict = True
+            _failure_reason = _failure_reason or f"row_conflict:{result.reason}"
+        else:
+            # STALE row — track exact identity so the caller can terminalize
+            # it before authorizing a replacement (P0-2).
+            _stale_orders.append({
+                "local_order_id": row_local_oid,
+                "client_id": row_client,
+                "execution_mode": row_mode,
+                "status": str(row.get("status") or "").strip().upper(),
+                "updated_ts": row.get("updated_ts"),
+                "canonical_signal_id": str(row.get("canonical_signal_id") or "").strip(),
+                "direction": str(row.get("direction") or "").strip().upper(),
+                "created_ts": row.get("created_ts"),
+                "reason": result.reason,
+                "owner_check": _owner_reason,
+            })
+
+    if _saw_db_error:
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_DB_ERROR", tuple(_stale_orders),
+            _failure_reason or "db_error",
+        )
+    if _saw_conflict:
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_CONFLICT", tuple(_stale_orders),
+            _failure_reason or "conflict",
+        )
+    if _stale_orders:
+        return _PendingEntryOutcome(
+            "PENDING_OWNER_STALE", tuple(_stale_orders), "stale_release",
+        )
+    return _PendingEntryOutcome("PENDING_OWNER_MISSING", (), "no_owner_evidence")
 
 
 def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
@@ -821,6 +1610,1928 @@ _TERMINAL_ENTRY_STATUSES = frozenset({
 })
 
 
+def _attempt_scope_key(execution_mode: str, session_key: str) -> str:
+    return f"{str(execution_mode or '').strip().lower()}:{str(session_key or '').strip()}"
+
+
+def _attempt_meta_scope(meta: dict, execution_mode: str, session_key: str) -> dict:
+    scopes = meta.get("overnight_watch_arm_attempt_scopes")
+    if not isinstance(scopes, dict):
+        return {}
+    scope = scopes.get(_attempt_scope_key(execution_mode, session_key))
+    return dict(scope) if isinstance(scope, dict) else {}
+
+
+def _attempt_meta_scope_strict(
+    meta: dict, execution_mode: str, session_key: str
+) -> tuple[dict, bool, str]:
+    """Strict scope extractor. Returns (scope, malformed, reason).
+
+    A missing scopes container OR a present container that omits the requested
+    session key is a clean absent state ({}, False, ""). A container that is
+    present but NOT a JSON object, or a scope value that is present but NOT a
+    JSON object, is malformed and MUST fail closed as WATCH_ATTEMPT_CONFLICT
+    rather than being silently converted into a fresh first-claim.
+    """
+    if "overnight_watch_arm_attempt_scopes" not in (meta or {}):
+        return {}, False, ""
+    scopes = meta.get("overnight_watch_arm_attempt_scopes")
+    if not isinstance(scopes, dict):
+        return {}, True, "attempt_scopes_container_not_object"
+    key = _attempt_scope_key(execution_mode, session_key)
+    if key not in scopes:
+        return {}, False, ""
+    scope = scopes.get(key)
+    if not isinstance(scope, dict):
+        return {}, True, "attempt_scope_value_not_object"
+    return dict(scope), False, ""
+
+
+def _attempt_count(scope: dict) -> int:
+    try:
+        return max(0, int(scope.get("count") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _attempt_state(scope: dict) -> str:
+    return str(scope.get("state") or "").strip().upper()
+
+
+_KNOWN_WATCH_ATTEMPT_STATES = frozenset({
+    WATCH_ATTEMPT_STATE_IN_PROGRESS,
+    WATCH_ATTEMPT_STATE_RETRYABLE,
+    WATCH_ATTEMPT_STATE_ARMED,
+    WATCH_ATTEMPT_STATE_EXHAUSTED,
+    WATCH_ATTEMPT_STATE_ERROR,
+})
+
+
+def _parse_attempt_scope_strict(
+    scope: dict,
+) -> tuple[bool, str, int, str, str, str]:
+    """Parse one durable watcher-attempt scope without silently repairing it.
+
+    Returns:
+        valid, state, count, token, local_order_id, failure_reason
+
+    An entirely absent scope is represented by an empty dict and is a valid
+    first-claim state. Any partially populated, malformed, or unknown state
+    fails closed.
+    """
+    if not isinstance(scope, dict):
+        return False, "", 0, "", "", "attempt_scope_not_object"
+
+    state = str(scope.get("state") or "").strip().upper()
+    token = str(scope.get("token") or "").strip()
+    local_order_id = str(scope.get("local_order_id") or "").strip()
+
+    raw_count = scope.get("count", 0)
+
+    if isinstance(raw_count, bool):
+        return False, state, 0, token, local_order_id, "attempt_count_boolean"
+
+    if isinstance(raw_count, float) and not raw_count.is_integer():
+        return False, state, 0, token, local_order_id, "attempt_count_fractional"
+
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError, OverflowError):
+        return False, state, 0, token, local_order_id, "attempt_count_invalid"
+
+    if count < 0:
+        return False, state, count, token, local_order_id, "attempt_count_negative"
+
+    # A completely absent scope is the only valid blank-state representation.
+    if not state:
+        if count != 0 or token or local_order_id:
+            return (
+                False,
+                state,
+                count,
+                token,
+                local_order_id,
+                "blank_attempt_state_has_owner_data",
+            )
+        return True, "", 0, "", "", ""
+
+    if state not in _KNOWN_WATCH_ATTEMPT_STATES:
+        return (
+            False,
+            state,
+            count,
+            token,
+            local_order_id,
+            f"unknown_attempt_state:{state}",
+        )
+
+    if state == WATCH_ATTEMPT_STATE_RETRYABLE:
+        if count == 0:
+            if token or local_order_id:
+                return (
+                    False,
+                    state,
+                    count,
+                    token,
+                    local_order_id,
+                    "retryable_zero_count_has_owner_data",
+                )
+        elif not token or not local_order_id:
+            return (
+                False,
+                state,
+                count,
+                token,
+                local_order_id,
+                "retryable_attempt_missing_token_or_order",
+            )
+
+    elif state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
+        if count < 1 or not token:
+            return (
+                False,
+                state,
+                count,
+                token,
+                local_order_id,
+                "in_progress_attempt_missing_owner",
+            )
+        # local_order_id may be blank between claim and bind.
+
+    elif state == WATCH_ATTEMPT_STATE_ARMED:
+        if count < 1 or not token or not local_order_id:
+            return (
+                False,
+                state,
+                count,
+                token,
+                local_order_id,
+                "armed_attempt_missing_owner",
+            )
+
+    elif state == WATCH_ATTEMPT_STATE_EXHAUSTED:
+        if count < 1 or not token or not local_order_id:
+            return (
+                False,
+                state,
+                count,
+                token,
+                local_order_id,
+                "exhausted_attempt_missing_owner",
+            )
+
+    elif state == WATCH_ATTEMPT_STATE_ERROR:
+        if count < 1 or not token:
+            return (
+                False,
+                state,
+                count,
+                token,
+                local_order_id,
+                "error_attempt_missing_owner",
+            )
+
+    return True, state, count, token, local_order_id, ""
+
+
+def _attempt_meta_patch(
+    *,
+    existing_meta: dict,
+    execution_mode: str,
+    session_key: str,
+    state: str,
+    attempt_count: int,
+    token: str,
+    local_order_id: str = "",
+    reason: str = "",
+) -> dict:
+    meta = dict(existing_meta or {})
+    scopes = meta.get("overnight_watch_arm_attempt_scopes")
+    if not isinstance(scopes, dict):
+        scopes = {}
+    key = _attempt_scope_key(execution_mode, session_key)
+    now = datetime.now(timezone.utc)
+    updated_at = now.isoformat()
+    normalized_state = str(state or "").strip().upper()
+    scope = {
+        "count": int(attempt_count or 0),
+        "state": normalized_state,
+        "token": str(token or "").strip(),
+        "local_order_id": str(local_order_id or "").strip(),
+        "last_reason": str(reason or "").strip(),
+        "updated_at": updated_at,
+        "execution_mode": str(execution_mode or "").strip().lower(),
+        "session_key": str(session_key or "").strip(),
+    }
+    # PR #404 final amendment: bounded durable-claim lease on IN_PROGRESS so
+    # a crashed process cannot leave the scope permanently owned. Any non-
+    # IN_PROGRESS write clears the lease so a stale timestamp cannot later
+    # be mistaken for current ownership.
+    if normalized_state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
+        scope["claim_started_at"] = updated_at
+        scope["claim_lease_until"] = (
+            now + timedelta(seconds=OVERNIGHT_WATCH_ARM_CLAIM_LEASE_SECONDS)
+        ).isoformat()
+    else:
+        scope.pop("claim_started_at", None)
+        scope.pop("claim_lease_until", None)
+    scopes[key] = scope
+    meta["overnight_watch_arm_attempt_scopes"] = scopes
+
+    # Mirror the current owner scope into stable top-level keys for operators.
+    meta["overnight_watch_arm_attempt_count"] = scope["count"]
+    meta["overnight_watch_arm_attempt_state"] = scope["state"]
+    meta["overnight_watch_arm_attempt_token"] = scope["token"]
+    meta["overnight_watch_arm_local_order_id"] = scope["local_order_id"]
+    meta["overnight_watch_arm_last_reason"] = scope["last_reason"]
+    meta["overnight_watch_arm_updated_at"] = scope["updated_at"]
+    meta["execution_mode"] = scope["execution_mode"]
+    meta["overnight_reeval_session_key"] = scope["session_key"]
+    return meta
+
+
+def _write_attempt_meta(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    state: str,
+    attempt_count: int,
+    token: str,
+    local_order_id: str = "",
+    reason: str = "",
+) -> bool:
+    try:
+        from ap.opportunity_ledger import CREATED as _OL_CREATED
+        from ap.opportunity_ledger import create_opportunities as _create_opps
+        from ap.opportunity_ledger import update_opportunity as _update_opportunity
+
+        payload = dict(signal_payload or {})
+        payload.setdefault("signal_id", signal_id)
+        _create_opps(signal_id, [client_id], payload, canonical_signal_id=canonical_signal_id)
+
+        lookup = _get_client_opportunity_row(signal_id, client_id, payload)
+        if lookup.lookup_status != _LS_FOUND or not isinstance(lookup.row, dict):
+            return False
+        meta = lookup.row.get("metadata") if isinstance(lookup.row.get("metadata"), dict) else {}
+        patch_meta = _attempt_meta_patch(
+            existing_meta=meta,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            state=state,
+            attempt_count=attempt_count,
+            token=token,
+            local_order_id=local_order_id,
+            reason=reason,
+        )
+        if not _update_opportunity(
+            signal_id,
+            client_id,
+            _OL_CREATED,
+            canonical_signal_id=canonical_signal_id,
+            order_local_id=str(local_order_id or "") or None,
+            extra_meta=patch_meta,
+        ):
+            return False
+
+        readback = _get_client_opportunity_row(signal_id, client_id, payload)
+        if readback.lookup_status != _LS_FOUND or not isinstance(readback.row, dict):
+            return False
+        rb_meta = readback.row.get("metadata") if isinstance(readback.row.get("metadata"), dict) else {}
+        rb_scope = _attempt_meta_scope(rb_meta, execution_mode, session_key)
+        return (
+            _attempt_state(rb_scope) == str(state or "").strip().upper()
+            and _attempt_count(rb_scope) == int(attempt_count or 0)
+            and str(rb_scope.get("token") or "") == str(token or "")
+            and str(rb_scope.get("local_order_id") or "") == str(local_order_id or "")
+        )
+    except Exception as exc:
+        log.warning(
+            "OVERNIGHT_WATCH_ATTEMPT_WRITE_FAILED client=%s mode=%s canonical=%s state=%s err=%s",
+            client_id, execution_mode, canonical_signal_id, state, exc,
+        )
+        return False
+
+
+def _local_order_terminal_state(
+    order_state_machine,
+    local_order_id: str,
+    *,
+    expected_client_id: str = "",
+    expected_execution_mode: str = "",
+    expected_canonical_signal_id: str = "",
+) -> tuple[str, str]:
+    """Prove the referenced prior local ENTRY order is durably terminal AND that
+    it belongs to the expected owner. When any expected_* identity is supplied,
+    the OSM row must match on client_id, execution_mode (case-insensitive),
+    canonical_signal_id AND kind == 'ENTRY' before its terminal status can
+    authorize a replacement claim. Any missing or contradictory identity fence
+    is a WATCH_ATTEMPT_CONFLICT — stale or cross-scope terminal proof must
+    never be trusted to reopen a claim.
+    """
+    if not local_order_id:
+        return WATCH_ATTEMPT_CONFLICT, "missing_prior_local_order_id"
+    try:
+        if not hasattr(order_state_machine, "get_order"):
+            return WATCH_ATTEMPT_CONFLICT, "osm_get_order_unavailable"
+        row = order_state_machine.get_order(local_order_id)
+    except Exception as exc:
+        return WATCH_ATTEMPT_DB_ERROR, f"osm_get_order_exception:{type(exc).__name__}"
+    if not isinstance(row, dict) or not row:
+        return WATCH_ATTEMPT_CONFLICT, "prior_order_missing"
+
+    requires_identity = any(
+        (expected_client_id, expected_execution_mode, expected_canonical_signal_id)
+    )
+    if requires_identity:
+        expected_order_id = str(local_order_id or "").strip()
+        row_order_id = str(row.get("local_order_id") or "").strip()
+        if not row_order_id:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_local_id_missing"
+        if row_order_id != expected_order_id:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_local_id_mismatch"
+        row_client = str(row.get("client_id") or "").strip()
+        if str(expected_client_id or "").strip() and row_client != str(expected_client_id).strip():
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_client_mismatch"
+        row_mode = str(row.get("execution_mode") or "").strip().lower()
+        exp_mode = str(expected_execution_mode or "").strip().lower()
+        if exp_mode and row_mode != exp_mode:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_execution_mode_mismatch"
+        row_canonical = str(row.get("canonical_signal_id") or "").strip()
+        exp_canonical = str(expected_canonical_signal_id or "").strip()
+        if exp_canonical and row_canonical != exp_canonical:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_canonical_mismatch"
+        row_kind = str(row.get("kind") or "").strip().upper()
+        if not row_kind:
+            return WATCH_ATTEMPT_CONFLICT, "prior_order_kind_missing"
+        if row_kind != "ENTRY":
+            return (
+                WATCH_ATTEMPT_CONFLICT,
+                f"prior_order_kind_not_entry:{row_kind}",
+            )
+
+    status = str(row.get("status") or "").strip().upper()
+    if status in _TERMINAL_ENTRY_STATUSES:
+        return WATCH_ATTEMPT_ACQUIRED, status
+    if status in _ACTIVE_ENTRY_OWN_STATUSES:
+        return WATCH_ATTEMPT_ALREADY_IN_PROGRESS, status
+    return WATCH_ATTEMPT_CONFLICT, f"unknown_prior_order_status:{status or 'blank'}"
+
+
+# ── PR #404 amendment: cross-process atomic watcher-arm claim ─────────────────
+# The durable ownership authority is the PostgreSQL row for
+# (canonical_signal_id, client_id) in client_signal_opportunities, locked with
+# SELECT ... FOR UPDATE inside a single transaction. The scoped attempt record
+# under metadata["overnight_watch_arm_attempt_scopes"][mode:session] is the ONLY
+# ownership evidence; top-level mirror keys are operator-facing only. The
+# module-local threading.Lock is a same-process optimization and is NEVER the
+# durable owner — two pods/processes serialize on the Postgres row lock, not the
+# in-process lock.
+
+
+def _coerce_attempt_metadata(raw) -> tuple[dict, bool]:
+    """Return (metadata_dict, malformed). NULL → ({}, False). A JSON object →
+    (dict, False). A non-object (list/number/str-that-is-not-an-object) → ({},
+    True). A malformed non-dict metadata value must NEVER be silently treated as
+    a clean claimable state."""
+    if raw is None:
+        return {}, False
+    if isinstance(raw, dict):
+        return dict(raw), False
+    if isinstance(raw, (bytes, str)):
+        import json as _json
+        try:
+            parsed = _json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+        except Exception:
+            return {}, True
+        if isinstance(parsed, dict):
+            return parsed, False
+        return {}, True
+    return {}, True
+
+
+def _ensure_opportunity_row(
+    signal_id: str, client_id: str, canonical_signal_id: str, signal_payload: dict
+) -> None:
+    """Idempotently ensure the shared opportunity row exists before the locked
+    transaction. Best-effort: create_opportunities uses ignore_duplicates and
+    never regresses an existing row. A failure here is not fatal — the locked
+    SELECT will report attempt_row_missing_after_create if the row truly does
+    not exist."""
+    try:
+        from ap.opportunity_ledger import create_opportunities as _create_opps
+        payload = dict(signal_payload or {})
+        payload.setdefault("signal_id", signal_id)
+        _create_opps(signal_id, [client_id], payload, canonical_signal_id=canonical_signal_id)
+    except Exception as exc:
+        log.debug(
+            "OVERNIGHT_WATCH_ATTEMPT_ENSURE_ROW_BEST_EFFORT client=%s canonical=%s err=%s",
+            client_id, canonical_signal_id, exc,
+        )
+
+
+# Exact ownership row query. The unique index (canonical_signal_id, client_id)
+# guarantees at most one row; FOR UPDATE holds it until the transaction commits.
+_ATTEMPT_LOCK_SQL = (
+    "SELECT id, signal_id, canonical_signal_id, client_id, metadata, "
+    "opportunity_status, order_local_id "
+    "FROM client_signal_opportunities "
+    "WHERE canonical_signal_id = %s AND client_id = %s "
+    "FOR UPDATE"
+)
+
+
+def _lock_attempt_row(c, canonical_signal_id: str, client_id: str):
+    """Return ('FOUND', row) | ('MISSING', None) | ('DUPLICATE', None)."""
+    c.execute(_ATTEMPT_LOCK_SQL, (canonical_signal_id, client_id))
+    rows = c.fetchall() or []
+    if not rows:
+        return "MISSING", None
+    if len(rows) > 1:
+        return "DUPLICATE", None
+    return "FOUND", rows[0]
+
+
+def _lock_exact_entry_order(
+    c,
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
+):
+    """Lock and reread the exact ENTRY before binding it to durable ownership."""
+    c.execute(
+        "SELECT * FROM orders "
+        "WHERE local_order_id = %s "
+        "AND client_id = %s "
+        "AND LOWER(TRIM(COALESCE(execution_mode, ''))) = %s "
+        "AND canonical_signal_id = %s "
+        "AND kind = 'ENTRY' "
+        "FOR UPDATE",
+        (
+            str(local_order_id or "").strip(),
+            str(client_id or "").strip(),
+            str(execution_mode or "").strip().lower(),
+            str(canonical_signal_id or "").strip(),
+        ),
+    )
+    rows = c.fetchall() or []
+    if not rows:
+        return "MISSING", None
+    if len(rows) > 1:
+        return "DUPLICATE", None
+    return "FOUND", rows[0]
+
+
+def _read_attempt_scope_unlocked(
+    canonical_signal_id: str, client_id: str, mode: str, session: str
+) -> Optional[tuple]:
+    """Non-locking preliminary read of the scoped attempt state, used ONLY to
+    decide whether prior terminal proof is required before opening the locked
+    transaction. Returns (state, count, token, local_order_id) or None when the
+    row/metadata could not be read. This value is advisory — the locked reread
+    is the sole authority for the acquisition decision."""
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT metadata FROM client_signal_opportunities "
+                    "WHERE canonical_signal_id = %s AND client_id = %s LIMIT 1",
+                    (canonical_signal_id, client_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+    except Exception:
+        return None
+    if not row:
+        return None
+    meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+    if malformed:
+        return None
+    scope, scope_malformed, _scope_reason = _attempt_meta_scope_strict(meta, mode, session)
+    if scope_malformed:
+        return None
+    valid, state, count, token, local_order_id, _reason = (
+        _parse_attempt_scope_strict(scope)
+    )
+    if not valid:
+        return None
+    return state, count, token, local_order_id
+
+
+def _read_attempt_scope_probe_full(
+    canonical_signal_id: str, client_id: str, mode: str, session: str
+) -> Optional[dict]:
+    """Non-locking probe returning the FULL scope dict (including the
+    claim_lease_until lease field). Advisory only — the locked reread is the
+    sole authority for the acquisition decision. Returns None when the row /
+    metadata / scope cannot be read cleanly."""
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn():
+            with conn() as c:
+                c.execute(
+                    "SELECT metadata FROM client_signal_opportunities "
+                    "WHERE canonical_signal_id = %s AND client_id = %s LIMIT 1",
+                    (canonical_signal_id, client_id),
+                )
+                return c.fetchone()
+
+        row = run_with_retry(_fn)
+    except Exception:
+        return None
+    if not row:
+        return None
+    meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+    if malformed:
+        return None
+    scope, scope_malformed, _scope_reason = _attempt_meta_scope_strict(meta, mode, session)
+    if scope_malformed or not isinstance(scope, dict):
+        return None
+    return dict(scope)
+
+
+def _atomic_claim_watch_arm_attempt(
+    *,
+    order_state_machine,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    max_attempts: int,
+) -> _WatchAttemptClaim:
+    """Acquire the watcher-arm attempt using a single PostgreSQL compare-and-swap.
+
+    The ownership decision and mutation happen inside one transaction while the
+    (canonical_signal_id, client_id) row is held with SELECT ... FOR UPDATE, so
+    exactly one process can observe the claimable prior state and increment it.
+    Prior terminal-order proof (_local_order_terminal_state, which may reach the
+    OSM) is resolved BEFORE the lock; the locked reread then requires the exact
+    same durable prior order, so stale terminal proof can never authorize
+    replacing a different order.
+    """
+    mode = str(execution_mode or "").strip().lower()
+    session = str(session_key or "").strip()
+    signal_id = str(signal_id or "").strip()
+    client_id = str(client_id or "").strip()
+    canonical_signal_id = str(canonical_signal_id or "").strip()
+    try:
+        max_attempts = int(max_attempts)
+    except (TypeError, ValueError):
+        max_attempts = 0
+    if not (
+        signal_id and client_id and canonical_signal_id
+        and mode in {"live", "paper"} and session and max_attempts >= 1
+    ):
+        return _WatchAttemptClaim(WATCH_ATTEMPT_CONFLICT, reason="missing_attempt_owner_identity")
+
+    # §5.2 — ensure the durable row exists (idempotent) before locking it.
+    _ensure_opportunity_row(signal_id, client_id, canonical_signal_id, signal_payload)
+
+    # §5.5 two-phase — resolve prior terminal-order truth OUTSIDE the row lock so
+    # no OSM/broker-facing work is performed while holding the lock.
+    required_prior_order = None
+    retryable_bound_entry = None
+    # PR #404 final amendment: expired IN_PROGRESS lease recovery. Resolve any
+    # exact-terminal-order proof (Case A) OR active-entry lookup (Case B) OUTSIDE
+    # the row lock so the locked reread need only verify identity and reclaim.
+    stale_ip_expected = None          # tuple(count, token, order_id) captured pre-lock
+    stale_ip_active_entry = None      # dict from _query_active_entry_order (Case B)
+    pre = _read_attempt_scope_unlocked(canonical_signal_id, client_id, mode, session)
+    if pre is not None:
+        pre_state, pre_count, pre_token, pre_order = pre
+        if pre_state == WATCH_ATTEMPT_STATE_RETRYABLE and pre_order:
+            terminal_result, terminal_reason = _local_order_terminal_state(
+                order_state_machine,
+                pre_order,
+                expected_client_id=client_id,
+                expected_execution_mode=mode,
+                expected_canonical_signal_id=canonical_signal_id,
+            )
+            if terminal_result == WATCH_ATTEMPT_ACQUIRED:
+                required_prior_order = pre_order
+            elif terminal_result != WATCH_ATTEMPT_ALREADY_IN_PROGRESS:
+                return _WatchAttemptClaim(
+                    terminal_result, pre_token, pre_count, pre_order,
+                    terminal_reason,
+                )
+            else:
+                lookup_status, exact_row = _query_exact_entry_order_by_local_id(
+                    pre_order, client_id, mode, canonical_signal_id,
+                )
+                if lookup_status == _LS_LOOKUP_FAILED:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_DB_ERROR, pre_token, pre_count, pre_order,
+                        "retryable_bound_order_lookup_failed",
+                    )
+                if lookup_status != _LS_FOUND or not exact_row:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, pre_token, pre_count, pre_order,
+                        "retryable_bound_order_missing",
+                    )
+                exact_status = str(exact_row.get("status") or "").strip().upper()
+                if exact_status in _ACTIVE_ENTRY_OWN_STATUSES:
+                    retryable_bound_entry = dict(exact_row)
+                else:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, pre_token, pre_count, pre_order,
+                        f"retryable_bound_order_status_unknown:{exact_status or 'blank'}",
+                    )
+        elif pre_state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
+            # Determine whether the observed IN_PROGRESS claim is stranded by
+            # inspecting its lease. Fresh leases short-circuit the recovery
+            # attempt entirely — the locked reread will surface ALREADY_IN_
+            # PROGRESS if the row is unchanged, and CONFLICT otherwise.
+            pre_scope_probe = None
+            try:
+                _ppr = _read_attempt_scope_probe_full(
+                    canonical_signal_id, client_id, mode, session,
+                )
+                pre_scope_probe = _ppr
+            except Exception:
+                pre_scope_probe = None
+            pre_lease = _parse_watch_attempt_ts(
+                (pre_scope_probe or {}).get("claim_lease_until")
+            )
+            if pre_lease is not None and pre_lease > datetime.now(timezone.utc):
+                # Fresh lease — locked reread will honor ALREADY_IN_PROGRESS.
+                pass
+            elif pre_lease is None:
+                # Missing / malformed lease is ambiguous — do NOT resolve any
+                # OSM state pre-lock. Locked reread will refuse with a stable
+                # diagnostic.
+                pass
+            else:
+                # Expired lease → recovery candidate. Resolve identity proof
+                # OUTSIDE the row lock so the locked reread only verifies.
+                if pre_order:
+                    terminal_result, terminal_reason = _local_order_terminal_state(
+                        order_state_machine,
+                        pre_order,
+                        expected_client_id=client_id,
+                        expected_execution_mode=mode,
+                        expected_canonical_signal_id=canonical_signal_id,
+                    )
+                    if terminal_result == WATCH_ATTEMPT_ACQUIRED:
+                        exact_row = None
+                    elif terminal_result != WATCH_ATTEMPT_ALREADY_IN_PROGRESS:
+                        return _WatchAttemptClaim(
+                            terminal_result, pre_token, pre_count, pre_order,
+                            terminal_reason,
+                        )
+                    else:
+                        lookup_status, exact_row = _query_exact_entry_order_by_local_id(
+                            pre_order, client_id, mode, canonical_signal_id,
+                        )
+                        if lookup_status == _LS_LOOKUP_FAILED:
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_DB_ERROR, pre_token, pre_count, pre_order,
+                                "expired_bound_order_lookup_failed",
+                            )
+                        if lookup_status != _LS_FOUND or not exact_row:
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_CONFLICT, pre_token, pre_count, pre_order,
+                                "expired_bound_order_missing",
+                            )
+                        exact_status = str(exact_row.get("status") or "").strip().upper()
+                        if exact_status in _ACTIVE_ENTRY_OWN_STATUSES:
+                            stale_ip_active_entry = dict(exact_row)
+                        else:
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_CONFLICT, pre_token, pre_count, pre_order,
+                                f"expired_bound_order_status_unknown:{exact_status or 'blank'}",
+                            )
+                    stale_ip_expected = (pre_count, pre_token, pre_order)
+                else:
+                    # Case B: blank local_order_id. Discover whether an exact
+                    # active ENTRY already exists for this canonical/client/
+                    # mode. If it does, do NOT create a replacement — the
+                    # existing order is the owner. If none, reclaim is safe.
+                    lookup_status, active_row = _query_active_entry_order(
+                        client_id, mode, canonical_signal_id,
+                    )
+                    if lookup_status == _LS_LOOKUP_FAILED:
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_DB_ERROR, pre_token, pre_count, "",
+                            "expired_in_progress_active_lookup_failed",
+                        )
+                    if lookup_status == _LS_FOUND and active_row:
+                        # Preserve the full row so the locked branch can
+                        # distinguish reattachable PENDING_TRIGGER entries from
+                        # CREATED handoff recovery and broker-owned statuses
+                        # (SUBMITTED / ACCEPTED / OPEN / PARTIAL / FILLED)
+                        # before the authoritative locked revalidation.
+                        stale_ip_active_entry = dict(active_row)
+                    stale_ip_expected = (pre_count, pre_token, "")
+
+    def _log_cas_miss(state, count, reason):
+        log.info(
+            "OVERNIGHT_WATCH_ATTEMPT_CAS_MISS client=%s mode=%s canonical=%s "
+            "session=%s state=%s count=%s reason=%s",
+            client_id, mode, canonical_signal_id, session, state, count, reason,
+        )
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn() -> _WatchAttemptClaim:
+            with conn() as c:
+                status, row = _lock_attempt_row(c, canonical_signal_id, client_id)
+                if status == "MISSING":
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_DB_ERROR, reason="attempt_row_missing_after_create"
+                    )
+                if status == "DUPLICATE":
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, reason="duplicate_attempt_owner_rows"
+                    )
+
+                meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+                if malformed:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, reason="attempt_metadata_malformed"
+                    )
+                scope, scope_malformed, scope_malformed_reason = (
+                    _attempt_meta_scope_strict(meta, mode, session)
+                )
+                if scope_malformed:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, reason=scope_malformed_reason
+                    )
+                (
+                    scope_valid,
+                    state,
+                    count,
+                    prior_token,
+                    prior_order_id,
+                    scope_failure_reason,
+                ) = _parse_attempt_scope_strict(scope)
+
+                if not scope_valid:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT,
+                        prior_token,
+                        count,
+                        prior_order_id,
+                        scope_failure_reason,
+                    )
+
+                def _resolve_locked_existing_entry(order_hint, *, source: str):
+                    """Converge or reclaim one exact order while both rows are locked."""
+                    existing_oid = str(
+                        (order_hint or {}).get("local_order_id") or ""
+                    ).strip()
+                    if not existing_oid:
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token,
+                            count,
+                            prior_order_id,
+                            f"{source}_active_entry_missing_oid",
+                        )
+
+                    order_lock_status, locked_order = _lock_exact_entry_order(
+                        c,
+                        local_order_id=existing_oid,
+                        client_id=client_id,
+                        execution_mode=mode,
+                        canonical_signal_id=canonical_signal_id,
+                    )
+                    if order_lock_status != "FOUND" or not locked_order:
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token,
+                            count,
+                            prior_order_id,
+                            f"{source}_order_revalidation_{order_lock_status.lower()}",
+                        )
+
+                    locked_status = str(
+                        locked_order.get("status") or ""
+                    ).strip().upper()
+                    if locked_status in _ALREADY_OWNED_STATUSES:
+                        resolved_meta = _attempt_meta_patch(
+                            existing_meta=meta,
+                            execution_mode=mode,
+                            session_key=session,
+                            state=WATCH_ATTEMPT_STATE_ARMED,
+                            attempt_count=count,
+                            token=prior_token,
+                            local_order_id=existing_oid,
+                            reason=f"{source}_broker_owned_resolved:{locked_status}",
+                        )
+                        if not _write_locked_attempt_meta(
+                            c, row["id"], resolved_meta, mode, session,
+                            WATCH_ATTEMPT_STATE_ARMED, count, prior_token,
+                            existing_oid,
+                        ):
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_DB_ERROR,
+                                reason=f"{source}_broker_owned_resolve_write_failed",
+                            )
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_ALREADY_ARMED,
+                            prior_token,
+                            count,
+                            existing_oid,
+                            f"{source}_broker_owned_resolved:{locked_status}",
+                        )
+
+                    if locked_status == "CREATED":
+                        # CREATED is not a pending-trigger watcher contract. It
+                        # belongs to separate OSM handoff recovery and must never
+                        # be sent through APEntryWatcher's pending classifier.
+                        error_meta = _attempt_meta_patch(
+                            existing_meta=meta,
+                            execution_mode=mode,
+                            session_key=session,
+                            state=WATCH_ATTEMPT_STATE_ERROR,
+                            attempt_count=count,
+                            token=prior_token,
+                            local_order_id=existing_oid,
+                            reason=f"{source}_created_requires_osm_recovery",
+                        )
+                        if not _write_locked_attempt_meta(
+                            c, row["id"], error_meta, mode, session,
+                            WATCH_ATTEMPT_STATE_ERROR, count, prior_token,
+                            existing_oid,
+                        ):
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_DB_ERROR,
+                                reason=f"{source}_created_error_write_failed",
+                            )
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token,
+                            count,
+                            existing_oid,
+                            "attempt_state_error",
+                        )
+
+                    if locked_status != "PENDING_TRIGGER":
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token,
+                            count,
+                            existing_oid,
+                            f"{source}_order_status_changed:{locked_status or 'blank'}",
+                        )
+
+                    if count >= max_attempts:
+                        exhausted_meta = _attempt_meta_patch(
+                            existing_meta=meta,
+                            execution_mode=mode,
+                            session_key=session,
+                            state=WATCH_ATTEMPT_STATE_EXHAUSTED,
+                            attempt_count=count,
+                            token=prior_token,
+                            local_order_id=existing_oid,
+                            reason="overnight_watch_arm_retry_exhausted",
+                        )
+                        if not _write_locked_attempt_meta(
+                            c, row["id"], exhausted_meta, mode, session,
+                            WATCH_ATTEMPT_STATE_EXHAUSTED, count, prior_token,
+                            existing_oid,
+                        ):
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_DB_ERROR,
+                                reason=f"{source}_exhausted_write_failed",
+                            )
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_EXHAUSTED,
+                            prior_token,
+                            count,
+                            existing_oid,
+                        )
+
+                    new_token = uuid.uuid4().hex
+                    next_count = count + 1
+                    reattach_meta = _attempt_meta_patch(
+                        existing_meta=meta,
+                        execution_mode=mode,
+                        session_key=session,
+                        state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                        attempt_count=next_count,
+                        token=new_token,
+                        local_order_id=existing_oid,
+                        reason=f"{source}_pending_trigger_reattach_claimed",
+                    )
+                    if not _write_locked_attempt_meta(
+                        c, row["id"], reattach_meta, mode, session,
+                        WATCH_ATTEMPT_STATE_IN_PROGRESS, next_count, new_token,
+                        existing_oid,
+                    ):
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_DB_ERROR,
+                            reason=f"{source}_reattach_claim_write_failed",
+                        )
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_REATTACH_REQUIRED,
+                        new_token,
+                        next_count,
+                        existing_oid,
+                        f"{source}_pending_trigger_reattach_claimed",
+                    )
+
+                # §5.5 classification under the row lock. No automatic lease
+                # stealing: IN_PROGRESS/ARMED/EXHAUSTED/ERROR are honored as-is.
+                if state == WATCH_ATTEMPT_STATE_ARMED:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_ALREADY_ARMED, prior_token, count, prior_order_id
+                    )
+                if state == WATCH_ATTEMPT_STATE_EXHAUSTED:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_EXHAUSTED, prior_token, count, prior_order_id
+                    )
+                if state == WATCH_ATTEMPT_STATE_ERROR:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, prior_token, count, prior_order_id,
+                        "attempt_state_error",
+                    )
+                if state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
+                    # PR #404 final amendment: durable-claim lease + stranded
+                    # IN_PROGRESS recovery. A fresh lease → honor ownership.
+                    # A missing/malformed lease → fail closed (do NOT steal).
+                    # An expired lease → reclaim ONLY when the pre-lock exact
+                    # identity check proved the referenced order (or lack of
+                    # one) safe, AND the locked reread matches the pre-lock
+                    # observation byte-for-byte.
+                    lease_until = _parse_watch_attempt_ts(
+                        scope.get("claim_lease_until")
+                    )
+                    _now = datetime.now(timezone.utc)
+                    if lease_until is not None and lease_until > _now:
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_ALREADY_IN_PROGRESS,
+                            prior_token, count, prior_order_id,
+                            "attempt_claim_lease_active",
+                        )
+                    if lease_until is None:
+                        # Missing / malformed lease — ambiguous. Never steal
+                        # ownership without proving expiration.
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token, count, prior_order_id,
+                            "attempt_claim_lease_missing_or_malformed",
+                        )
+                    # Expired lease. Require that pre-lock resolution
+                    # captured the exact same identity we now see, so stale
+                    # terminal proof or a stale active-lookup cannot
+                    # authorize reclaim against a changed row.
+                    if stale_ip_expected is None:
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_ALREADY_IN_PROGRESS,
+                            prior_token, count, prior_order_id,
+                            "attempt_claim_lease_recover_prelock_missing",
+                        )
+                    _exp_count, _exp_token, _exp_order = stale_ip_expected
+                    if (count != _exp_count or prior_token != _exp_token
+                            or prior_order_id != _exp_order):
+                        _log_cas_miss(state, count, "stale_in_progress_owner_changed")
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token, count, prior_order_id,
+                            "stale_in_progress_owner_changed",
+                        )
+                    if stale_ip_active_entry is not None:
+                        return _resolve_locked_existing_entry(
+                            stale_ip_active_entry,
+                            source="expired_in_progress",
+                        )
+                    if prior_order_id:
+                        # Case A: exact prior order was proven terminal
+                        # pre-lock. The bound order consumed this attempt, so
+                        # replacement must consume the next bounded attempt.
+                        # Only an expired *unbound* claim below keeps count.
+                        if count >= max_attempts:
+                            _exhausted_meta = _attempt_meta_patch(
+                                existing_meta=meta,
+                                execution_mode=mode,
+                                session_key=session,
+                                state=WATCH_ATTEMPT_STATE_EXHAUSTED,
+                                attempt_count=count,
+                                token=prior_token,
+                                local_order_id=prior_order_id,
+                                reason="expired_bound_terminal_attempt_exhausted",
+                            )
+                            if not _write_locked_attempt_meta(
+                                c, row["id"], _exhausted_meta, mode, session,
+                                WATCH_ATTEMPT_STATE_EXHAUSTED, count, prior_token,
+                                prior_order_id,
+                            ):
+                                return _WatchAttemptClaim(
+                                    WATCH_ATTEMPT_DB_ERROR,
+                                    reason="expired_bound_terminal_exhausted_write_failed",
+                                )
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_EXHAUSTED,
+                                prior_token,
+                                count,
+                                prior_order_id,
+                                "expired_bound_terminal_attempt_exhausted",
+                            )
+
+                        _next_count = count + 1
+                        _new_token = uuid.uuid4().hex
+                        _reclaim_meta = _attempt_meta_patch(
+                            existing_meta=meta,
+                            execution_mode=mode,
+                            session_key=session,
+                            state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                            attempt_count=_next_count,
+                            token=_new_token,
+                            local_order_id="",
+                            reason="expired_bound_terminal_attempt_advanced",
+                        )
+                        if not _write_locked_attempt_meta(
+                            c, row["id"], _reclaim_meta, mode, session,
+                            WATCH_ATTEMPT_STATE_IN_PROGRESS, _next_count,
+                            _new_token, "",
+                        ):
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_DB_ERROR,
+                                reason="expired_in_progress_reacquire_write_failed",
+                            )
+                        log.info(
+                            "OVERNIGHT_WATCH_ATTEMPT_EXPIRED_BOUND_TERMINAL_ADVANCED "
+                            "client=%s mode=%s canonical=%s session=%s count=%s "
+                            "token_prefix=%s prior_order=%s",
+                            client_id, mode, canonical_signal_id, session,
+                            _next_count, _new_token[:8], prior_order_id,
+                        )
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_ACQUIRED, _new_token, _next_count, "",
+                            "expired_bound_terminal_attempt_advanced",
+                        )
+                    _new_token = uuid.uuid4().hex
+                    _reclaim_meta = _attempt_meta_patch(
+                        existing_meta=meta,
+                        execution_mode=mode,
+                        session_key=session,
+                        state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                        attempt_count=count,
+                        token=_new_token,
+                        local_order_id="",
+                        reason="expired_in_progress_claim_reacquired",
+                    )
+                    if not _write_locked_attempt_meta(
+                        c, row["id"], _reclaim_meta, mode, session,
+                        WATCH_ATTEMPT_STATE_IN_PROGRESS, count, _new_token, "",
+                    ):
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_DB_ERROR,
+                            reason="expired_in_progress_reacquire_write_failed",
+                        )
+                    log.info(
+                        "OVERNIGHT_WATCH_ATTEMPT_EXPIRED_CLAIM_REACQUIRED "
+                        "client=%s mode=%s canonical=%s session=%s count=%s "
+                        "token_prefix=%s unbound",
+                        client_id, mode, canonical_signal_id, session,
+                        count, _new_token[:8],
+                    )
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_ACQUIRED, _new_token, count, "",
+                        "expired_in_progress_claim_reacquired",
+                    )
+
+                if state not in {"", WATCH_ATTEMPT_STATE_RETRYABLE}:
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT,
+                        prior_token,
+                        count,
+                        prior_order_id,
+                        f"attempt_state_not_claimable:{state or 'blank'}",
+                    )
+
+                if retryable_bound_entry is not None:
+                    expected_oid = str(
+                        retryable_bound_entry.get("local_order_id") or ""
+                    ).strip()
+                    if prior_order_id != expected_oid:
+                        _log_cas_miss(state, count, "retryable_bound_order_changed")
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_CONFLICT,
+                            prior_token,
+                            count,
+                            prior_order_id,
+                            "retryable_bound_order_changed",
+                        )
+                    return _resolve_locked_existing_entry(
+                        retryable_bound_entry,
+                        source="retryable_bound",
+                    )
+
+                # Claimable (RETRYABLE or empty/absent scope). A prior order may
+                # be replaced ONLY when the durable order at lock time is the
+                # exact one we proved terminal before the lock. If a different
+                # order appeared (or none was proven), refuse — stale terminal
+                # proof must not authorize replacing a different order.
+                if prior_order_id and prior_order_id != required_prior_order:
+                    _log_cas_miss(state, count, "attempt_prior_order_changed")
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_CONFLICT, prior_token, count, prior_order_id,
+                        "attempt_prior_order_changed",
+                    )
+
+                if count >= max_attempts:
+                    exhausted_meta = _attempt_meta_patch(
+                        existing_meta=meta,
+                        execution_mode=mode,
+                        session_key=session,
+                        state=WATCH_ATTEMPT_STATE_EXHAUSTED,
+                        attempt_count=count,
+                        token=prior_token,
+                        local_order_id=prior_order_id,
+                        reason="overnight_watch_arm_retry_exhausted",
+                    )
+                    if not _write_locked_attempt_meta(c, row["id"], exhausted_meta,
+                                                       mode, session,
+                                                       WATCH_ATTEMPT_STATE_EXHAUSTED,
+                                                       count, prior_token, prior_order_id):
+                        return _WatchAttemptClaim(
+                            WATCH_ATTEMPT_DB_ERROR, reason="exhausted_write_failed"
+                        )
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_EXHAUSTED, prior_token, count, prior_order_id
+                    )
+
+                token = uuid.uuid4().hex
+                next_count = count + 1
+                next_meta = _attempt_meta_patch(
+                    existing_meta=meta,
+                    execution_mode=mode,
+                    session_key=session,
+                    state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                    attempt_count=next_count,
+                    token=token,
+                    local_order_id="",
+                    reason="attempt_acquired",
+                )
+                if not _write_locked_attempt_meta(c, row["id"], next_meta,
+                                                   mode, session,
+                                                   WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                                                   next_count, token, ""):
+                    return _WatchAttemptClaim(
+                        WATCH_ATTEMPT_DB_ERROR, reason="attempt_claim_write_failed"
+                    )
+                log.info(
+                    "OVERNIGHT_WATCH_ATTEMPT_ACQUIRED client=%s mode=%s canonical=%s "
+                    "session=%s attempt_count=%s token_prefix=%s",
+                    client_id, mode, canonical_signal_id, session, next_count, token[:8],
+                )
+                return _WatchAttemptClaim(WATCH_ATTEMPT_ACQUIRED, token, next_count)
+
+        return run_with_retry(_fn)
+    except Exception as exc:
+        log.warning(
+            "OVERNIGHT_WATCH_ATTEMPT_DB_ERROR client=%s mode=%s canonical=%s session=%s err=%s",
+            client_id, mode, canonical_signal_id, session, exc,
+        )
+        return _WatchAttemptClaim(
+            WATCH_ATTEMPT_DB_ERROR, reason=f"attempt_claim_db_exception:{type(exc).__name__}"
+        )
+
+
+def _write_locked_attempt_meta(
+    c, row_id, next_meta: dict, mode: str, session: str,
+    expect_state: str, expect_count: int, expect_token: str, expect_order_id: str,
+) -> bool:
+    """Write metadata on the already-locked row by primary key and verify the
+    scoped readback matches the intended transition. Called only while the row
+    is held FOR UPDATE in the caller's transaction."""
+    import json as _json
+    c.execute(
+        "UPDATE client_signal_opportunities "
+        "SET metadata = %s::jsonb, updated_at = NOW() "
+        "WHERE id = %s "
+        "RETURNING metadata",
+        (_json.dumps(next_meta), row_id),
+    )
+    rb = c.fetchone()
+    if not rb:
+        return False
+    rb_meta, malformed = _coerce_attempt_metadata(rb.get("metadata"))
+    if malformed:
+        return False
+    rb_scope = _attempt_meta_scope(rb_meta, mode, session)
+    return (
+        _attempt_state(rb_scope) == str(expect_state or "").strip().upper()
+        and _attempt_count(rb_scope) == int(expect_count or 0)
+        and str(rb_scope.get("token") or "") == str(expect_token or "")
+        and str(rb_scope.get("local_order_id") or "") == str(expect_order_id or "")
+    )
+
+
+def _pg_cas_write_attempt(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    predicate,
+    new_state: str,
+    new_count: int,
+    new_token: str,
+    new_local_order_id: str,
+    reason: str,
+) -> bool:
+    """Exact-owner compare-and-swap for post-acquisition transitions (bind /
+    complete). Locks the (canonical_signal_id, client_id) row, evaluates
+    predicate(state, count, token, local_order_id) against the durable scope,
+    and only on a match writes the new scope. Returns False on any predicate
+    miss, missing/duplicate/malformed row, or DB error — the write is atomic
+    under the same row lock, so no other process can replace ownership between
+    the check and the write."""
+    mode = str(execution_mode or "").strip().lower()
+    session = str(session_key or "").strip()
+    canonical_signal_id = str(canonical_signal_id or "").strip()
+    client_id = str(client_id or "").strip()
+    if not (client_id and canonical_signal_id and mode in {"live", "paper"} and session):
+        return False
+
+    _ensure_opportunity_row(signal_id, client_id, canonical_signal_id, signal_payload)
+
+    try:
+        from ap.db import conn, run_with_retry
+
+        def _fn() -> bool:
+            with conn() as c:
+                status, row = _lock_attempt_row(c, canonical_signal_id, client_id)
+                if status != "FOUND":
+                    return False
+                meta, malformed = _coerce_attempt_metadata(row.get("metadata"))
+                if malformed:
+                    return False
+                scope = _attempt_meta_scope(meta, mode, session)
+                (
+                    scope_valid,
+                    state,
+                    count,
+                    token,
+                    order_id,
+                    _scope_failure_reason,
+                ) = _parse_attempt_scope_strict(scope)
+
+                if not scope_valid:
+                    return False
+                if not predicate(state, count, token, order_id):
+                    return False
+                next_meta = _attempt_meta_patch(
+                    existing_meta=meta,
+                    execution_mode=mode,
+                    session_key=session,
+                    state=new_state,
+                    attempt_count=new_count,
+                    token=new_token,
+                    local_order_id=new_local_order_id,
+                    reason=reason,
+                )
+                return _write_locked_attempt_meta(
+                    c, row["id"], next_meta, mode, session,
+                    str(new_state or "").strip().upper(), new_count, new_token,
+                    str(new_local_order_id or ""),
+                )
+
+        return bool(run_with_retry(_fn))
+    except Exception as exc:
+        log.warning(
+            "OVERNIGHT_WATCH_ATTEMPT_CAS_WRITE_DB_ERROR client=%s mode=%s canonical=%s "
+            "reason=%s err=%s",
+            client_id, mode, canonical_signal_id, reason, exc,
+        )
+        return False
+
+
+def _claim_watch_arm_attempt(
+    *,
+    order_state_machine,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+) -> _WatchAttemptClaim:
+    # The threading.Lock reduces same-process contention only. The PostgreSQL
+    # row lock / CAS inside _atomic_claim_watch_arm_attempt is the authoritative
+    # cross-process (cross-pod, cross-restart) owner.
+    with _WATCH_ATTEMPT_LOCK:
+        return _atomic_claim_watch_arm_attempt(
+            order_state_machine=order_state_machine,
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            max_attempts=OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS,
+        )
+
+
+def _bind_watch_arm_attempt_order(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    attempt: _WatchAttemptClaim,
+    local_order_id: str,
+) -> bool:
+    if attempt.disposition != WATCH_ATTEMPT_ACQUIRED or not attempt.token or not local_order_id:
+        return False
+
+    # Atomic exact-owner CAS: bind only when the durable scope is still the
+    # unbound IN_PROGRESS record owned by this exact token+count. Any other
+    # token / count / state, or an already-bound local order, refuses the bind.
+    def _predicate(state, count, token, order_id):
+        return (
+            state == WATCH_ATTEMPT_STATE_IN_PROGRESS
+            and token == attempt.token
+            and count == attempt.attempt_count
+            and not order_id
+        )
+
+    return _pg_cas_write_attempt(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+        predicate=_predicate,
+        new_state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        new_count=attempt.attempt_count,
+        new_token=attempt.token,
+        new_local_order_id=str(local_order_id),
+        reason="local_order_bound",
+    )
+
+
+_ALLOWED_WATCH_ATTEMPT_COMPLETION_STATES = frozenset({
+    WATCH_ATTEMPT_STATE_RETRYABLE,
+    WATCH_ATTEMPT_STATE_ARMED,
+    WATCH_ATTEMPT_STATE_EXHAUSTED,
+    WATCH_ATTEMPT_STATE_ERROR,
+})
+
+
+def _complete_watch_arm_attempt(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    attempt: _WatchAttemptClaim,
+    state: str,
+    local_order_id: str,
+    reason: str,
+) -> bool:
+    """Complete an exact watcher-attempt owner.
+
+    Legal transitions:
+
+        IN_PROGRESS -> ARMED
+        IN_PROGRESS -> RETRYABLE
+        IN_PROGRESS -> EXHAUSTED
+        IN_PROGRESS -> ERROR
+
+    Exact same-state replay is idempotent when token, count, and local order
+    still match. ARMED, EXHAUSTED, and ERROR may never transition to a
+    different state.
+    """
+    if not attempt.token:
+        return False
+
+    want_state = str(state or "").strip().upper()
+    next_local_order_id = str(local_order_id or "").strip()
+
+    if want_state not in _ALLOWED_WATCH_ATTEMPT_COMPLETION_STATES:
+        return False
+
+    def _predicate(cur_state, count, token, order_id):
+        if token != attempt.token:
+            return False
+        if count != attempt.attempt_count:
+            return False
+
+        # Exact same-state replay is idempotent only when the order also matches.
+        if cur_state == want_state:
+            return order_id == next_local_order_id
+
+        # No terminal/durable state may reopen or downgrade.
+        if cur_state != WATCH_ATTEMPT_STATE_IN_PROGRESS:
+            return False
+
+        # Normal bound-owner completion.
+        if order_id == next_local_order_id:
+            return True
+
+        # A local order can exist while the durable bind failed. Only ERROR may
+        # record that exact local order from an otherwise unbound owner.
+        return (
+            want_state == WATCH_ATTEMPT_STATE_ERROR
+            and not order_id
+            and bool(next_local_order_id)
+        )
+
+    return _pg_cas_write_attempt(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+        predicate=_predicate,
+        new_state=want_state,
+        new_count=attempt.attempt_count,
+        new_token=attempt.token,
+        new_local_order_id=next_local_order_id,
+        reason=reason,
+    )
+
+
+def _complete_watch_arm_attempt_checked(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    attempt: _WatchAttemptClaim,
+    state: str,
+    local_order_id: str,
+    reason: str,
+    ticker: str,
+    caller: str,
+) -> bool:
+    ok = _complete_watch_arm_attempt(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+        attempt=attempt,
+        state=state,
+        local_order_id=local_order_id,
+        reason=reason,
+    )
+
+    if not ok:
+        log.critical(
+            "OVERNIGHT_WATCH_ATTEMPT_COMPLETION_FAILED | "
+            "caller=%s ticker=%s client=%s mode=%s canonical=%s "
+            "session=%s intended_state=%s attempt_count=%s "
+            "token_prefix=%s local_order_id=%s reason=%s",
+            caller,
+            ticker,
+            client_id,
+            execution_mode,
+            canonical_signal_id,
+            session_key,
+            str(state or "").strip().upper(),
+            attempt.attempt_count,
+            str(attempt.token or "")[:8],
+            str(local_order_id or ""),
+            reason,
+        )
+
+    return ok
+
+
+class _EarlyWatchRecoveryResult(NamedTuple):
+    handled: bool
+    outcome: str = ""
+    reason: str = ""
+    local_order_id: str = ""
+
+
+def _recover_materialized_watch_before_admission(
+    *,
+    order_state_machine,
+    entry_watcher,
+    signal_id: str,
+    canonical_signal_id: str,
+    client_id: str,
+    execution_mode: str,
+    session_key: str,
+    signal_payload: dict,
+    ticker: str,
+    job_id,
+    job_source: str,
+) -> _EarlyWatchRecoveryResult:
+    """Recover already-admitted durable work before new-admission validation.
+
+    This seam is deliberately recovery-only. It does not claim an empty or
+    otherwise new attempt scope. A claim is made only after the durable scope
+    says recovery is in progress/retryable/armed *and* an exact active ENTRY is
+    visible for the same client, mode, and canonical signal.
+    """
+    probe = _read_attempt_scope_unlocked(
+        canonical_signal_id, client_id, execution_mode, session_key,
+    )
+    if probe is None:
+        return _EarlyWatchRecoveryResult(False)
+
+    state, attempt_count, _token, durable_order_id = probe
+    if state not in {
+        WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        WATCH_ATTEMPT_STATE_RETRYABLE,
+        WATCH_ATTEMPT_STATE_ARMED,
+    }:
+        return _EarlyWatchRecoveryResult(False)
+
+    if durable_order_id:
+        lookup_status, order_row = _query_exact_entry_order_by_local_id(
+            durable_order_id, client_id, execution_mode, canonical_signal_id,
+        )
+    else:
+        lookup_status, order_row = _query_active_entry_order(
+            client_id, execution_mode, canonical_signal_id,
+        )
+
+    if lookup_status == _LS_LOOKUP_FAILED:
+        return _EarlyWatchRecoveryResult(
+            True, "ERROR", "early_recovery_order_lookup_failed",
+            str(durable_order_id or ""),
+        )
+    if lookup_status != _LS_FOUND or not order_row:
+        # No active materialized owner: this is not the recovery-only seam.
+        # Normal admission/replacement logic remains authoritative.
+        return _EarlyWatchRecoveryResult(False)
+
+    observed_status = str(order_row.get("status") or "").strip().upper()
+    if observed_status not in _ACTIVE_ENTRY_OWN_STATUSES:
+        # A bound terminal order normally returns to the validated replacement
+        # path. At the cap, however, the durable claim must be exhausted here,
+        # before Master Control or any other new-admission work can run.
+        if not (
+            state in {
+                WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                WATCH_ATTEMPT_STATE_RETRYABLE,
+            }
+            and bool(durable_order_id)
+            and observed_status in _TERMINAL_ENTRY_STATUSES
+            and attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+        ):
+            return _EarlyWatchRecoveryResult(False)
+
+    attempt = _claim_watch_arm_attempt(
+        order_state_machine=order_state_machine,
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+    )
+
+    if attempt.disposition == WATCH_ATTEMPT_ALREADY_ARMED:
+        return _EarlyWatchRecoveryResult(
+            True, "ARMED", attempt.reason or "early_recovery_already_armed",
+            attempt.local_order_id,
+        )
+    if (
+        attempt.disposition == WATCH_ATTEMPT_CONFLICT
+        and str(attempt.reason or "") == "attempt_state_error"
+    ):
+        return _EarlyWatchRecoveryResult(
+            True, "ALREADY_RESOLVED", attempt.reason, attempt.local_order_id,
+        )
+    if attempt.disposition == WATCH_ATTEMPT_ACQUIRED:
+        # The advisory recovery probe and locked claim disagreed. Close the
+        # accidentally acquired unbound owner and fail closed; never let this
+        # race become a new order that bypassed admission validation.
+        completion_ok = _complete_watch_arm_attempt_checked(
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            attempt=attempt,
+            state=WATCH_ATTEMPT_STATE_ERROR,
+            local_order_id="",
+            reason="early_recovery_preflight_changed",
+            ticker=ticker,
+            caller="early_recovery_preflight_changed",
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR",
+            (
+                "early_recovery_preflight_changed"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
+        )
+    if attempt.disposition != WATCH_ATTEMPT_REATTACH_REQUIRED:
+        outcome = (
+            "ERROR"
+            if attempt.disposition in {
+                WATCH_ATTEMPT_DB_ERROR,
+                WATCH_ATTEMPT_CONFLICT,
+                WATCH_ATTEMPT_EXHAUSTED,
+            }
+            else "RETRYABLE"
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            outcome,
+            f"early_recovery_claim:{attempt.disposition}:{attempt.reason}",
+            attempt.local_order_id,
+        )
+
+    local_order_id = str(attempt.local_order_id or "").strip()
+
+    def _complete(state_value: str, reason: str) -> bool:
+        return _complete_watch_arm_attempt_checked(
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            attempt=attempt,
+            state=state_value,
+            local_order_id=local_order_id,
+            reason=reason,
+            ticker=ticker,
+            caller="early_materialized_recovery",
+        )
+
+    if not local_order_id:
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ERROR,
+            "early_recovery_missing_local_order_id",
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR",
+            (
+                "early_recovery_missing_local_order_id"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
+        )
+
+    # Claim-time FOR UPDATE is authoritative; this caller read constructs the
+    # watcher plan and catches any post-claim status transition before watch().
+    exact_status, exact_order = _query_exact_entry_order_by_local_id(
+        local_order_id, client_id, execution_mode, canonical_signal_id,
+    )
+    if exact_status != _LS_FOUND or not exact_order:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_exact_order_lookup_failed")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok else (
+                "ERROR" if next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE"
+            ),
+            "early_recovery_exact_order_lookup_failed",
+            local_order_id,
+        )
+
+    exact_order_status = str(exact_order.get("status") or "").strip().upper()
+    if exact_order_status in _ALREADY_OWNED_STATUSES:
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ARMED, "early_recovery_broker_owned",
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ARMED" if completion_ok else "ERROR",
+            "early_recovery_broker_owned",
+            local_order_id,
+        )
+    if exact_order_status != "PENDING_TRIGGER":
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ERROR,
+            f"early_recovery_non_pending_trigger:{exact_order_status or 'blank'}",
+        )
+        return _EarlyWatchRecoveryResult(
+            True, "ERROR",
+            (
+                f"early_recovery_non_pending_trigger:{exact_order_status or 'blank'}"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
+            local_order_id,
+        )
+
+    order_meta = exact_order.get("meta") or {}
+    if isinstance(order_meta, str):
+        try:
+            import json as _early_json
+            order_meta = _early_json.loads(order_meta)
+        except Exception:
+            order_meta = {}
+    if not isinstance(order_meta, dict):
+        order_meta = {}
+
+    def _number(order_key, signal_key, default=None):
+        raw = exact_order.get(order_key)
+        if raw is None:
+            raw = signal_payload.get(signal_key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    trigger = _number("trigger_price", "entry_trigger")
+    if not trigger or trigger <= 0:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_invalid_trigger")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_invalid_trigger",
+            local_order_id,
+        )
+
+    try:
+        contracts = int(exact_order.get("qty") or 1)
+    except (TypeError, ValueError, OverflowError):
+        contracts = 0
+    if contracts < 1:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_invalid_contracts")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_invalid_contracts",
+            local_order_id,
+        )
+
+    import types as _early_types
+    side = str(
+        exact_order.get("direction")
+        or signal_payload.get("side")
+        or signal_payload.get("direction")
+        or ""
+    ).strip().upper()
+    plan = _early_types.SimpleNamespace(
+        ticker=str(exact_order.get("symbol") or ticker),
+        side=side,
+        direction=side,
+        score=_number("score", "score", 0.0),
+        timeframe=str(exact_order.get("timeframe") or signal_payload.get("timeframe") or "1d"),
+        entry_trigger=trigger,
+        trigger_price=trigger,
+        stop_underlying=_number("stop_underlying", "stop_price"),
+        target_underlying=_number("target_underlying", "target_price"),
+        trigger_type="breach",
+        prior_day_high=signal_payload.get("prior_day_high"),
+        prior_day_low=signal_payload.get("prior_day_low"),
+        pattern=exact_order.get("pattern") or signal_payload.get("pattern"),
+        tier=exact_order.get("tier") or signal_payload.get("tier"),
+        contract_symbol=str(exact_order.get("contract") or f"DEFERRED:{ticker}"),
+        contracts=contracts,
+        limit_price=_number("limit_price", "limit_price", 0.01),
+        plan_id=str(exact_order.get("plan_id") or ""),
+        signal_id=str(exact_order.get("signal_id") or signal_id),
+        canonical_signal_id=canonical_signal_id,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        late_attachment_policy_eligible=True,
+        metadata={
+            **order_meta,
+            "overnight": True,
+            "reattach_watcher": True,
+            "reattach_required_recovery": True,
+            "contract_deferred": True,
+            "contract_selection_deferred_to": "breach_time",
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "overnight_reeval_session_key": session_key,
+            "canonical_signal_id": canonical_signal_id,
+            "late_attachment_policy_eligible": True,
+        },
+    )
+
+    try:
+        has_order = getattr(entry_watcher, "has_order", None)
+        watcher_armed = bool(has_order(local_order_id)) if callable(has_order) else False
+    except Exception:
+        watcher_armed = False
+
+    if not watcher_armed:
+        try:
+            watcher_armed = bool(entry_watcher.watch(
+                plan,
+                local_order_id,
+                recovery_rearm=True,
+                no_cancel_on_reject=True,
+            ))
+        except Exception as exc:
+            next_state = (
+                WATCH_ATTEMPT_STATE_EXHAUSTED
+                if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                else WATCH_ATTEMPT_STATE_RETRYABLE
+            )
+            completion_ok = _complete(
+                next_state,
+                f"early_recovery_watch_exception:{type(exc).__name__}",
+            )
+            return _EarlyWatchRecoveryResult(
+                True,
+                "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+                f"early_recovery_watch_exception:{type(exc).__name__}",
+                local_order_id,
+            )
+
+    if not watcher_armed:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_watch_false")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_watch_false",
+            local_order_id,
+        )
+
+    try:
+        proof_ok = _persist_watcher_armed_proof(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            canonical_signal_id=canonical_signal_id,
+            signal_id=signal_id,
+            signal_payload=signal_payload,
+            local_order_id=local_order_id,
+            session_key=session_key,
+            extra_meta={
+                "source_table": job_source,
+                "source_job_id": str(job_id),
+                "ticker": ticker,
+                "side": side,
+                "contract_deferred": True,
+                "contract_selection_deferred_to": "breach_time",
+                "reattach_watcher": True,
+                "early_materialized_recovery": True,
+                "armed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception:
+        proof_ok = False
+    if not proof_ok:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_proof_failed")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_proof_failed",
+            local_order_id,
+        )
+
+    completion_ok = _complete(
+        WATCH_ATTEMPT_STATE_ARMED, "early_materialized_recovery_armed",
+    )
+    return _EarlyWatchRecoveryResult(
+        True,
+        "ARMED" if completion_ok else "ERROR",
+        (
+            "early_materialized_recovery_armed"
+            if completion_ok else "early_recovery_completion_failed"
+        ),
+        local_order_id,
+    )
+
+
 def _entry_order_disposition_from_status(
     *,
     client_id: str,
@@ -1397,12 +4108,52 @@ def _resolve_shared_setup_disposition(
 
     # Step 5: If FOUND, inspect durable evidence with exact mode + session guards.
     _has_current_session_proof = False
+    _meta: dict = {}
+    _attempt_scope: dict = {}
+    _attempt_scope_state = ""
+    _attempt_scope_count = 0
+    _attempt_scope_token = ""
+    _attempt_scope_order_id = ""
+    _retry_scope_requires_terminal_proof = False
+
     if lookup.lookup_status == _LS_FOUND:
         row = lookup.row
         _status = str(row.get("opportunity_status") or "").upper()
         _stage  = str(row.get("miss_stage") or "").upper()
         _reason = str(row.get("miss_reason") or "")
         _meta   = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+
+        _attempt_scope = _attempt_meta_scope(
+            _meta,
+            _req_mode,
+            _session_key,
+        )
+        (
+            _attempt_scope_valid,
+            _attempt_scope_state,
+            _attempt_scope_count,
+            _attempt_scope_token,
+            _attempt_scope_order_id,
+            _attempt_scope_failure,
+        ) = _parse_attempt_scope_strict(_attempt_scope)
+
+        if not _attempt_scope_valid:
+            log.critical(
+                "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP "
+                "malformed watcher-attempt scope canonical=%s mode=%s "
+                "session=%s reason=%s",
+                client_id,
+                canonical,
+                _req_mode,
+                _session_key,
+                _attempt_scope_failure,
+            )
+            return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
+
+        _retry_scope_requires_terminal_proof = bool(
+            _attempt_scope_state == WATCH_ATTEMPT_STATE_RETRYABLE
+            and _attempt_scope_order_id
+        )
 
         # Mode isolation: blank stored mode NEVER establishes ownership.
         _recorded_mode = str(_meta.get("execution_mode") or _meta.get("mode") or "").strip().lower()
@@ -1481,6 +4232,14 @@ def _resolve_shared_setup_disposition(
                         "status=%s stage=%s reason=%s",
                         client_id, canonical, _session_key, _status, _stage, _reason,
                     )
+                elif _retry_scope_requires_terminal_proof:
+                    log.info(
+                        "[%s] reeval: deferring terminal opportunity evidence until "
+                        "exact bound prior order is checked canonical=%s session=%s "
+                        "status=%s scope_order=%s",
+                        client_id, canonical, _session_key, _status,
+                        _attempt_scope_order_id,
+                    )
                 else:
                     log.info(
                         "[%s] reeval disposition=ALREADY_TERMINAL canonical=%s session=%s "
@@ -1500,6 +4259,13 @@ def _resolve_shared_setup_disposition(
                         "session=%s reason=%s",
                         client_id, canonical, _session_key, _reason,
                     )
+                elif _retry_scope_requires_terminal_proof:
+                    log.info(
+                        "[%s] reeval: deferring terminal watcher-arm opportunity "
+                        "evidence until exact bound prior order is checked "
+                        "canonical=%s session=%s scope_order=%s",
+                        client_id, canonical, _session_key, _attempt_scope_order_id,
+                    )
                 else:
                     log.info(
                         "[%s] reeval disposition=ALREADY_TERMINAL (watcher-arm-failure) "
@@ -1517,6 +4283,13 @@ def _resolve_shared_setup_disposition(
                         "disposition until exact active-order fence runs canonical=%s "
                         "session=%s reason=%s",
                         client_id, canonical, _session_key, _reason,
+                    )
+                elif _retry_scope_requires_terminal_proof:
+                    log.info(
+                        "[%s] reeval: deferring terminal internal-error opportunity "
+                        "evidence until exact bound prior order is checked "
+                        "canonical=%s session=%s scope_order=%s",
+                        client_id, canonical, _session_key, _attempt_scope_order_id,
                     )
                 else:
                     log.info(
@@ -1573,12 +4346,54 @@ def _resolve_shared_setup_disposition(
         log.warning(
             "[%s] reeval disposition=LOOKUP_FAILED latest-entry query failed "
             "canonical=%s mode=%s",
-            client_id, canonical, _req_mode,
+            client_id,
+            canonical,
+            _req_mode,
         )
         return _DispositionResult(_DISPOSITION_LOOKUP_FAILED)
+
     if _latest_status == _LS_FOUND and _latest_row:
-        _latest_order_status = str(_latest_row.get("status") or "").upper()
-        _latest_local_id = str(_latest_row.get("local_order_id") or "").strip()
+        _latest_order_status = str(
+            _latest_row.get("status") or ""
+        ).upper().strip()
+        _latest_local_id = str(
+            _latest_row.get("local_order_id") or ""
+        ).strip()
+
+        if _retry_scope_requires_terminal_proof:
+            if _latest_local_id != _attempt_scope_order_id:
+                log.critical(
+                    "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP "
+                    "retry-scope order mismatch canonical=%s mode=%s "
+                    "session=%s scope_order=%s latest_order=%s "
+                    "latest_status=%s",
+                    client_id,
+                    canonical,
+                    _req_mode,
+                    _session_key,
+                    _attempt_scope_order_id,
+                    _latest_local_id,
+                    _latest_order_status,
+                )
+                return _DispositionResult(
+                    _DISPOSITION_AMBIGUOUS_OWNERSHIP
+                )
+
+            if _latest_order_status in _TERMINAL_ENTRY_STATUSES:
+                log.info(
+                    "[%s] reeval disposition=NEW exact RETRYABLE owner "
+                    "proved prior order terminal canonical=%s mode=%s "
+                    "session=%s local_order_id=%s status=%s count=%s",
+                    client_id,
+                    canonical,
+                    _req_mode,
+                    _session_key,
+                    _latest_local_id,
+                    _latest_order_status,
+                    _attempt_scope_count,
+                )
+                return _DispositionResult(_DISPOSITION_NEW)
+
         _latest_disp = _entry_order_disposition_from_status(
             client_id=client_id,
             canonical_signal_id=canonical,
@@ -1590,10 +4405,13 @@ def _resolve_shared_setup_disposition(
         )
         if _latest_disp is not None:
             return _latest_disp
+
         log.warning(
             "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP latest entry has "
             "unrecognized status canonical=%s status=%s",
-            client_id, canonical, _latest_order_status,
+            client_id,
+            canonical,
+            _latest_order_status,
         )
         return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
 
@@ -1607,11 +4425,52 @@ def _resolve_shared_setup_disposition(
         return _DispositionResult(_DISPOSITION_NEW)
 
     if _has_current_session_proof:
-        # Had current-session opportunity evidence but it wasn't classified above
-        # (e.g. unrecognised status) — do not guess; fail closed.
+        # PR #404 Blocker 1: classify the exact current-session watcher-attempt
+        # scope. The required ordering is:
+        #   exact active order (Step 7)
+        #   → exact RETRYABLE scope + exact same terminal prior order (Step 7b)
+        #   → ordinary terminal-history suppression (here).
+        # Terminal history is NOT globally ignored.
+        if _attempt_scope_state == WATCH_ATTEMPT_STATE_ARMED:
+            return _DispositionResult(_DISPOSITION_ALREADY_ARMED)
+
+        if _attempt_scope_state in {
+            WATCH_ATTEMPT_STATE_EXHAUSTED,
+            WATCH_ATTEMPT_STATE_ERROR,
+        }:
+            return _DispositionResult(_DISPOSITION_ALREADY_TERMINAL)
+
+        if _attempt_scope_state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
+            return _DispositionResult(
+                _DISPOSITION_AMBIGUOUS_OWNERSHIP
+            )
+
+        if _attempt_scope_state == WATCH_ATTEMPT_STATE_RETRYABLE:
+            if _attempt_scope_order_id:
+                # An exact terminal order would already have returned NEW in
+                # Step 7b. Reaching this point means terminal proof is missing.
+                return _DispositionResult(
+                    _DISPOSITION_AMBIGUOUS_OWNERSHIP
+                )
+
+            # Only the pristine RETRYABLE/count=0 seed may delegate its first
+            # acquisition without a bound prior order.
+            if (
+                _attempt_scope_count == 0
+                and not _attempt_scope_token
+            ):
+                return _DispositionResult(_DISPOSITION_NEW)
+
+            return _DispositionResult(
+                _DISPOSITION_AMBIGUOUS_OWNERSHIP
+            )
+
         log.warning(
-            "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP canonical=%s session=%s",
-            client_id, canonical, _session_key,
+            "[%s] reeval disposition=AMBIGUOUS_OWNERSHIP "
+            "unclassified current-session opportunity canonical=%s session=%s",
+            client_id,
+            canonical,
+            _session_key,
         )
         return _DispositionResult(_DISPOSITION_AMBIGUOUS_OWNERSHIP)
 
@@ -1660,12 +4519,16 @@ def _record_watch_arm_failure_proof(
     cleanup_success: Optional[bool] = None,
     cleanup_failed: bool = False,
     original_reason: Optional[str] = None,
+    retryable_exception: bool = False,
 ) -> None:
     try:
         from ap.opportunity_ledger import (
+            CREATED as _OL_CREATED,
+            STAGE_WATCHER_ARM as _OL_STAGE_WATCHER_ARM,
             create_opportunities,
             mark_internal_error,
             mark_watcher_invalidated,
+            update_opportunity,
         )
         canonical_signal_id = _resolve_canonical_signal_id(signal_id, signal)
         _payload = dict(signal or {})
@@ -1692,7 +4555,30 @@ def _record_watch_arm_failure_proof(
             _extra_meta["overnight_watch_arm_cleanup_failed"] = True
         if original_reason is not None:
             _extra_meta["original_reason"] = str(original_reason)
-        if is_exception:
+        if is_exception and retryable_exception:
+            # A RETRYABLE watcher exception has already been recorded on
+            # the durable attempt scope. Writing INTERNAL_ERROR / any other
+            # terminal opportunity status here would poison the disposition
+            # resolver on the next run (ALREADY_TERMINAL) and permanently
+            # block the retry the attempt scope explicitly authorized.
+            # Merge diagnostic metadata via update_opportunity(..., CREATED, ...)
+            # so the monotonic status rule preserves any higher nonterminal
+            # current status while still surfacing the exception context.
+            update_opportunity(
+                signal_id,
+                client_id,
+                _OL_CREATED,
+                canonical_signal_id=canonical_signal_id,
+                miss_stage=_OL_STAGE_WATCHER_ARM,
+                miss_reason=reason,
+                order_local_id=str(local_order_id or ""),
+                extra_meta={
+                    **_extra_meta,
+                    "overnight_watch_arm_retryable_exception": True,
+                    "retryable": True,
+                },
+            )
+        elif is_exception:
             mark_internal_error(
                 signal_id,
                 client_id,
@@ -2016,6 +4902,50 @@ def run_overnight_reeval(
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
         ticker = signal.get("ticker") or signal.get("symbol", "?")
+        _execution_mode = _run_execution_mode
+        _early_canonical = _resolve_canonical_signal_id(signal_id, signal)
+
+        # PR #404 final placement correction: already-admitted/materialized
+        # watcher recovery must run before age/timeframe, prior-level, snapshot,
+        # validation, Master Control, selector, or authorization admission gates.
+        # The helper is recovery-only and refuses to claim a new/empty scope.
+        _early_recovery = _recover_materialized_watch_before_admission(
+            order_state_machine=order_state_machine,
+            entry_watcher=entry_watcher,
+            signal_id=signal_id,
+            canonical_signal_id=_early_canonical,
+            client_id=client_id,
+            execution_mode=_execution_mode,
+            session_key=session_key,
+            signal_payload=signal,
+            ticker=ticker,
+            job_id=job_id,
+            job_source=job_source,
+        )
+        if _early_recovery.handled:
+            if _early_recovery.outcome == "ARMED":
+                _mark_job_watching_armed(
+                    job_id, client_id,
+                    f"early_recovery:{_early_recovery.local_order_id}",
+                )
+                result["armed"] += 1
+                if _early_recovery.reason == "early_materialized_recovery_armed":
+                    result["fresh_armed"] += 1
+            elif _early_recovery.outcome == "ALREADY_RESOLVED":
+                result["skipped"] = result.get("skipped", 0) + 1
+                result["already_resolved"] += 1
+            elif _early_recovery.outcome == "RETRYABLE":
+                _mark_job_watching_reason(
+                    job_id, client_id, _early_recovery.reason,
+                )
+                result["skipped"] = result.get("skipped", 0) + 1
+                result["retryable_deferred"] += 1
+            else:
+                _mark_job_error(job_id, client_id, _early_recovery.reason)
+                result["errors"] += 1
+                result["terminal_errors"] += 1
+            continue
+
         side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
         if side not in {"CALL", "PUT"}:
             log.warning(
@@ -2031,7 +4961,6 @@ def run_overnight_reeval(
             continue
         signal["side"] = side
         signal["direction"] = side
-        _execution_mode = _run_execution_mode
         _paper_rescue_only = _paper_overnight_rescue_only_signal(
             signal,
             job_source=job_source,
@@ -2800,6 +5729,33 @@ def run_overnight_reeval(
             # Use a fresh REEVAL: signal_id so master_control dedup doesn't block it.
             # The original signal was already deduped when it first arrived — overnight
             # reeval is a legitimate second evaluation of the same setup.
+            _recovery_skip_mc = False
+            _recovery_canonical = _resolve_canonical_signal_id(signal_id, signal)
+            _recovery_probe = _read_attempt_scope_unlocked(
+                _recovery_canonical, client_id, _execution_mode, session_key,
+            )
+            if _recovery_probe is not None:
+                (_rp_state, _rp_count, _rp_token, _rp_order_id) = _recovery_probe
+                if _rp_state in {
+                    WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                    WATCH_ATTEMPT_STATE_RETRYABLE,
+                    WATCH_ATTEMPT_STATE_ARMED,
+                }:
+                    if _rp_order_id:
+                        _rp_lookup, _rp_row = _query_exact_entry_order_by_local_id(
+                            _rp_order_id, client_id, _execution_mode,
+                            _recovery_canonical,
+                        )
+                    else:
+                        _rp_lookup, _rp_row = _query_active_entry_order(
+                            client_id, _execution_mode, _recovery_canonical,
+                        )
+                    _rp_status = str((_rp_row or {}).get("status") or "").upper()
+                    _recovery_skip_mc = (
+                        _rp_lookup == _LS_FOUND
+                        and _rp_status in _ACTIVE_ENTRY_OWN_STATUSES
+                    )
+
             try:
                 import uuid as _uuid2
                 reeval_signal = {**signal, "signal_id": f"REEVAL:{signal_id}:{_uuid2.uuid4().hex[:6]}"}
@@ -2812,9 +5768,28 @@ def run_overnight_reeval(
                     mc_seen = getattr(master_control, "_seen_signals", {})
                     mc_seen.pop(orig_key, None)
                     mc_seen.pop(setup_key, None)
-                except Exception:
-                    pass
-                decision = master_control.evaluate(reeval_signal, client_id=client_id)
+                except Exception as contract_exc:
+                    log.warning(
+                        "[%s] overnight_reeval: failed to normalize deferred contract "
+                        "symbol signal=%s client=%s err=%s",
+                        ticker, signal_id, client_id, contract_exc,
+                    )
+                if _recovery_skip_mc:
+                    import types as _types_recovery
+                    decision = _types_recovery.SimpleNamespace(
+                        ok=True,
+                        plan=_hydrate_plan_from_signal(
+                            signal,
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                        ),
+                        reason="durable_watch_recovery_preflight",
+                        score=float(signal.get("score") or 0),
+                    )
+                else:
+                    decision = master_control.evaluate(
+                        reeval_signal, client_id=client_id,
+                    )
                 if not decision.ok:
                     # Classify the rejection: intel/second-score vs hard safety.
                     # When OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false, morning
@@ -2896,6 +5871,186 @@ def run_overnight_reeval(
                                 score=float(signal.get("score") or 0),
                             )
                         # Fall through to Step 5 (contract selection / arm)
+                    elif "pending_entry_exists" in _r and not _is_hard_safety_block:
+                        # PR #404: classify ownership before terminal rejection.
+                        # P0-3: pass candidate signal so the classifier can
+                        # scope by exact side + canonical identity.
+                        _pe_outcome = _classify_pending_entry_for_overnight(
+                            ticker, client_id, _execution_mode,
+                            entry_watcher=entry_watcher,
+                            candidate_signal=signal,
+                        )
+                        # Test stubs and older callers may return a plain
+                        # PENDING_OWNER_* string. Wrap so .disposition /
+                        # .stale_orders / .failure_reason are always present.
+                        if isinstance(_pe_outcome, str):
+                            _pe_outcome = _PendingEntryOutcome(_pe_outcome, (), "")
+                        _pe_class = _pe_outcome.disposition
+                        if _pe_class == "PENDING_OWNER_ACTIVE":
+                            log.info(
+                                "[%s] pending_entry_owner_active %s — "
+                                "genuine same-client/mode block maintained",
+                                ticker, signal_id,
+                            )
+                            if _paper_rescue_only:
+                                _mark_job_rejected(
+                                    job_id, client_id,
+                                    _paper_rescue_queue_reason("risk_blocked", str(decision.reason or "")),
+                                )
+                            else:
+                                _mark_job_rejected(job_id, client_id, f"mc_blocked:{decision.reason}")
+                            result["rejected"] += 1
+                            result["terminal_rejected"] += 1
+                            continue
+                        elif _pe_class in {"PENDING_OWNER_DB_ERROR", "PENDING_OWNER_CONFLICT"}:
+                            log.critical(
+                                "[%s] pending_entry_ownership_unknown %s — "
+                                "class=%s reason=%s fail closed as retryable_deferred",
+                                ticker, signal_id, _pe_class,
+                                _pe_outcome.failure_reason,
+                            )
+                            # P1: durably stamp the exact ownership-unknown
+                            # class + reason on the queue row so operators can
+                            # distinguish DB error from conflict and diagnose
+                            # repeated silent deferrals.
+                            _mark_job_watching_reason(
+                                job_id, client_id,
+                                f"pending_entry_owner_unknown:{_pe_class}:"
+                                f"{_pe_outcome.failure_reason or 'unspecified'}",
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        elif _pe_class in {
+                            "PENDING_OWNER_STALE",
+                            "PENDING_OWNER_MISSING",
+                            "PENDING_OWNER_CROSS_CLIENT",
+                            "PENDING_OWNER_CROSS_MODE",
+                            "PENDING_OWNER_TERMINAL",
+                        }:
+                            # False suppression released. Two required steps
+                            # before proceeding, in order:
+                            #   1. P0-2: durably terminalize every stale row
+                            #      the classifier saw. A stale row must not
+                            #      outlive the run that released the candidate.
+                            #   2. P0-1: re-invoke master_control.evaluate() so
+                            #      score / 0DTE / priority / context / tier /
+                            #      intelligence gates all run on the released
+                            #      candidate. The prior fall-through skipped
+                            #      those gates entirely.
+                            _pe_label = _pe_class.lower().replace("pending_owner_", "owner_")
+                            log.info(
+                                "[%s] pending_entry_%s %s — false suppression "
+                                "released; terminalizing %d stale row(s) and "
+                                "re-invoking Master Control",
+                                ticker, _pe_label, signal_id,
+                                len(_pe_outcome.stale_orders),
+                            )
+
+                            _cleanup_ok, _cleanup_failure = (
+                                _terminalize_stale_pending_orders(
+                                    order_state_machine=order_state_machine,
+                                    stale_orders=_pe_outcome.stale_orders,
+                                    reason=(
+                                        f"overnight_reeval_stale_release:{_pe_class}"
+                                    ),
+                                )
+                            )
+                            if not _cleanup_ok:
+                                log.critical(
+                                    "[%s] pending_entry_stale_cleanup_failed %s — "
+                                    "class=%s reason=%s; refusing to release "
+                                    "and marking retryable_deferred",
+                                    ticker, signal_id, _pe_class, _cleanup_failure,
+                                )
+                                _mark_job_watching_reason(
+                                    job_id, client_id,
+                                    f"pending_entry_stale_cleanup_failed:{_cleanup_failure}",
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
+                            # P0-1: re-invoke Master Control end-to-end.
+                            # pending_entry_exists is no longer true after the
+                            # cleanup, so the remaining gates (score / 0DTE /
+                            # priority / context / tier / intelligence) can now
+                            # run. Any non-pending-entry rejection is honored.
+                            try:
+                                decision = master_control.evaluate(
+                                    reeval_signal, client_id=client_id,
+                                )
+                            except Exception as _mc_exc:
+                                log.error(
+                                    "[%s] pending_entry_stale_release_reevaluate "
+                                    "failed signal=%s err=%s",
+                                    ticker, signal_id, _mc_exc,
+                                )
+                                _mark_job_watching_reason(
+                                    job_id, client_id,
+                                    "pending_entry_reevaluate_exception:"
+                                    f"{type(_mc_exc).__name__}",
+                                )
+                                result["skipped"] = result.get("skipped", 0) + 1
+                                result["retryable_deferred"] += 1
+                                continue
+
+                            if not getattr(decision, "ok", False):
+                                _rr = str(getattr(decision, "reason", "") or "")
+                                # If pending_entry_exists still fires after
+                                # cleanup, something else is holding a row —
+                                # fail closed and never bypass the gate a
+                                # second time.
+                                if "pending_entry_exists" in _rr.lower():
+                                    log.critical(
+                                        "[%s] pending_entry_still_present_after_"
+                                        "cleanup %s reason=%s — fail closed",
+                                        ticker, signal_id, _rr,
+                                    )
+                                    _mark_job_watching_reason(
+                                        job_id, client_id,
+                                        "pending_entry_still_present_after_cleanup",
+                                    )
+                                    result["skipped"] = result.get("skipped", 0) + 1
+                                    result["retryable_deferred"] += 1
+                                    continue
+                                log.info(
+                                    "[%s] pending_entry_release_reevaluate "
+                                    "rejected %s reason=%s — honoring downstream "
+                                    "gate",
+                                    ticker, signal_id, _rr,
+                                )
+                                if _paper_rescue_only:
+                                    _mark_job_rejected(
+                                        job_id, client_id,
+                                        _paper_rescue_queue_reason(
+                                            "mc_reevaluate_blocked", _rr,
+                                        ),
+                                    )
+                                else:
+                                    _mark_job_rejected(
+                                        job_id, client_id,
+                                        f"mc_blocked_after_stale_release:{_rr}",
+                                    )
+                                result["rejected"] += 1
+                                result["terminal_rejected"] += 1
+                                continue
+
+                            # Re-evaluation succeeded end-to-end. Fall through
+                            # to Step 5 with the fresh decision.
+                        else:
+                            log.critical(
+                                "[%s] pending_entry_ownership_unknown %s — "
+                                "unexpected class=%s fail closed as retryable_deferred",
+                                ticker, signal_id, _pe_class,
+                            )
+                            _mark_job_watching_reason(
+                                job_id, client_id,
+                                f"pending_entry_owner_unknown:unexpected:{_pe_class}",
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
                     else:
                         # Hard safety block OR recheck enabled — reject as before
                         log.info(
@@ -3117,6 +6272,538 @@ def run_overnight_reeval(
                     result["terminal_errors"] += 1
                     continue
 
+            _canonical_for_attempt = _resolve_canonical_signal_id(signal_id, signal)
+            # PR #404 Blocker 1: shared ap_signals rows must take the SAME durable
+            # cross-process attempt owner as trade_queue rows. Previously only
+            # trade_queue claimed and ap_signals received a fake ACQUIRED with no
+            # token, so its retry state could never persist — a first watcher
+            # False could permanently suppress a legitimate shared signal. Both
+            # sources now claim through the atomic PostgreSQL CAS.
+            _claimed_watch_attempt = job_source in ("trade_queue", "ap_signals")
+            _watch_attempt = _WatchAttemptClaim(WATCH_ATTEMPT_ACQUIRED)
+            if _claimed_watch_attempt:
+                _watch_attempt = _claim_watch_arm_attempt(
+                    order_state_machine=order_state_machine,
+                    signal_id=signal_id,
+                    client_id=client_id,
+                    canonical_signal_id=_canonical_for_attempt,
+                    signal_payload=signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
+                )
+                if _watch_attempt.disposition == WATCH_ATTEMPT_ALREADY_ARMED:
+                    log.info(
+                        "[%s] overnight_watch_attempt_already_armed signal=%s canonical=%s "
+                        "count=%s local_order_id=%s",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, _watch_attempt.local_order_id,
+                    )
+                    _mark_job_watching_armed(job_id, client_id, f"DEFERRED:{ticker}")
+                    result["armed"] += 1
+                    continue
+                if _watch_attempt.disposition == WATCH_ATTEMPT_EXHAUSTED:
+                    _exhausted_reason = "overnight_watch_arm_retry_exhausted"
+                    log.critical(
+                        "[%s] overnight_watch_attempt_exhausted signal=%s canonical=%s "
+                        "count=%s max=%s",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS,
+                    )
+                    _mark_job_error(job_id, client_id, _exhausted_reason)
+                    result["errors"] += 1
+                    result["terminal_errors"] += 1
+                    continue
+                if _watch_attempt.disposition == WATCH_ATTEMPT_ALREADY_IN_PROGRESS:
+                    _reason = "overnight_watch_arm_attempt_in_progress"
+                    log.warning(
+                        "[%s] overnight_watch_attempt_in_progress signal=%s canonical=%s "
+                        "count=%s local_order_id=%s reason=%s",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, _watch_attempt.local_order_id,
+                        _watch_attempt.reason,
+                    )
+                    _mark_job_watching_reason(job_id, client_id, _reason)
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
+                if _watch_attempt.disposition == WATCH_ATTEMPT_REATTACH_REQUIRED:
+                    # The claim function found an expired IN_PROGRESS scope with
+                    # an exact active PENDING_TRIGGER ENTRY in orders. It already
+                    # (a) rotated the token,
+                    # (b) bound the discovered local_order_id, and (c) refreshed
+                    # the claim lease — all under the row lock.
+                    #
+                    # We must reattach the existing watcher to that order without
+                    # creating a new order, without running master_control /
+                    # selector / broker, and without cancelling the valid ENTRY.
+                    # On exception the order is intentionally preserved; we
+                    # complete as RETRYABLE / EXHAUSTED with no cleanup required.
+                    _reattach_oid = str(_watch_attempt.local_order_id or "").strip()
+                    log.info(
+                        "[%s] overnight_reeval: REATTACH_REQUIRED signal=%s "
+                        "canonical=%s count=%s existing_order=%s — "
+                        "reusing existing order, no new order or broker submit",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, _reattach_oid,
+                    )
+
+                    def _rr_complete_and_classify(*, state, reason, caller):
+                        completion_ok = _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=state,
+                            local_order_id=_reattach_oid,
+                            reason=reason,
+                            ticker=ticker,
+                            caller=caller,
+                        )
+                        if not completion_ok:
+                            completion_reason = (
+                                "overnight_watch_arm_attempt_completion_failed:"
+                                f"{caller}"
+                            )
+                            _mark_job_error(job_id, client_id, completion_reason)
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            return False
+                        if state == WATCH_ATTEMPT_STATE_RETRYABLE:
+                            _mark_job_watching_reason(job_id, client_id, reason)
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                        elif state == WATCH_ATTEMPT_STATE_EXHAUSTED:
+                            _mark_job_error(
+                                job_id, client_id,
+                                "overnight_watch_arm_retry_exhausted",
+                            )
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                        elif state == WATCH_ATTEMPT_STATE_ERROR:
+                            _mark_job_error(job_id, client_id, reason)
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                        return True
+
+                    if not _reattach_oid:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED missing "
+                            "local_order_id signal=%s — failing closed retryable",
+                            ticker, signal_id,
+                        )
+                        _rr_complete_and_classify(
+                            state=WATCH_ATTEMPT_STATE_ERROR,
+                            reason="reattach_required_missing_local_order_id",
+                            caller="reattach_required_missing_local_order_id",
+                        )
+                        continue
+
+                    # Look up the full order row for plan construction.
+                    _rr_status, _rr_row = _query_exact_entry_order_by_local_id(
+                        _reattach_oid, client_id, _execution_mode,
+                        _canonical_for_attempt,
+                    )
+                    if _rr_status != _LS_FOUND or not _rr_row:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED order "
+                            "lookup failed local_order_id=%s status=%s — "
+                            "failing closed retryable",
+                            ticker, _reattach_oid, _rr_status,
+                        )
+                        _rr_next = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _rr_complete_and_classify(
+                            state=_rr_next,
+                            reason=f"reattach_required_order_lookup:{_rr_status}",
+                            caller="reattach_required_order_lookup",
+                        )
+                        continue
+                    _rr_order_status = str(_rr_row.get("status") or "").upper()
+                    # Already-owned (in-flight / filled): treat as resolved.
+                    if _rr_order_status in _ALREADY_OWNED_STATUSES:
+                        log.info(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED order "
+                            "already in-flight/filled local_order_id=%s "
+                            "status=%s — classifying already_resolved",
+                            ticker, _reattach_oid, _rr_order_status,
+                        )
+                        _rr_armed_ok = _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=WATCH_ATTEMPT_STATE_ARMED,
+                            local_order_id=_reattach_oid,
+                            reason="reattach_required_already_owned",
+                            ticker=ticker,
+                            caller="reattach_required_already_owned",
+                        )
+                        if not _rr_armed_ok:
+                            _mark_job_error(
+                                job_id, client_id,
+                                "overnight_watch_arm_attempt_completion_failed:"
+                                "reattach_required_already_owned",
+                            )
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            continue
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["already_resolved"] += 1
+                        continue
+                    # Terminal: the order is gone; something already cleaned it.
+                    if _rr_order_status in _TERMINAL_ENTRY_STATUSES:
+                        log.warning(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED order "
+                            "terminal local_order_id=%s status=%s — "
+                            "completing attempt RETRYABLE for next reeval",
+                            ticker, _reattach_oid, _rr_order_status,
+                        )
+                        _rr_next_state = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _rr_complete_and_classify(
+                            state=_rr_next_state,
+                            reason=f"reattach_required_order_terminal:{_rr_order_status}",
+                            caller="reattach_required_terminal",
+                        )
+                        continue
+
+                    if _rr_order_status != "PENDING_TRIGGER":
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED refuses "
+                            "non-PENDING_TRIGGER order local_order_id=%s status=%s",
+                            ticker, _reattach_oid, _rr_order_status or "blank",
+                        )
+                        _rr_complete_and_classify(
+                            state=WATCH_ATTEMPT_STATE_ERROR,
+                            reason=(
+                                "reattach_required_non_pending_trigger:"
+                                f"{_rr_order_status or 'blank'}"
+                            ),
+                            caller="reattach_required_non_pending_trigger",
+                        )
+                        continue
+
+                    # Build a minimal reattach plan from the existing order row.
+                    _rr_ord_meta = _rr_row.get("meta") or {}
+                    if isinstance(_rr_ord_meta, str):
+                        try:
+                            import json as _rr_json
+                            _rr_ord_meta = _rr_json.loads(_rr_ord_meta)
+                        except Exception:
+                            _rr_ord_meta = {}
+                    if not isinstance(_rr_ord_meta, dict):
+                        _rr_ord_meta = {}
+
+                    _rr_trigger_raw = (
+                        _rr_row.get("trigger_price")
+                        or signal.get("entry_trigger")
+                    )
+                    try:
+                        _rr_trigger = float(_rr_trigger_raw) if _rr_trigger_raw is not None else None
+                    except (TypeError, ValueError):
+                        _rr_trigger = None
+                    if not _rr_trigger or _rr_trigger <= 0:
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED cannot "
+                            "resolve trigger price local_order_id=%s — "
+                            "failing closed retryable",
+                            ticker, _reattach_oid,
+                        )
+                        _rr_next = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _rr_complete_and_classify(
+                            state=_rr_next,
+                            reason="reattach_required_invalid_trigger",
+                            caller="reattach_required_invalid_trigger",
+                        )
+                        continue
+
+                    def _rr_price(order_key, signal_key):
+                        v = _rr_row.get(order_key)
+                        if v is None:
+                            v = signal.get(signal_key)
+                        try:
+                            return float(v) if v is not None else None
+                        except (TypeError, ValueError):
+                            return None
+
+                    _rr_side      = str(_rr_row.get("direction") or side).upper()
+                    _rr_sig_id    = str(_rr_row.get("signal_id") or signal_id)
+                    _rr_canonical = str(
+                        _rr_row.get("canonical_signal_id") or _canonical_for_attempt
+                    )
+                    _rr_metadata = {
+                        **_rr_ord_meta,
+                        "overnight":                        True,
+                        "reattach_watcher":                 True,
+                        "reattach_required_recovery":       True,
+                        "contract_deferred":                True,
+                        "contract_selection_deferred_to":   "breach_time",
+                        "client_id":                        client_id,
+                        "execution_mode":                   _execution_mode,
+                        "overnight_reeval_session_key":     session_key,
+                        "signal_id":                        _rr_sig_id,
+                        "canonical_signal_id":              _rr_canonical,
+                        "late_attachment_policy_eligible":  True,
+                    }
+                    try:
+                        _rr_score = float(
+                            _rr_row.get("score") or signal.get("score") or 0
+                        )
+                        _rr_contracts = int(_rr_row.get("qty") or 1)
+                        _rr_limit_price = float(
+                            _rr_row.get("limit_price") or 0.01
+                        )
+                    except (TypeError, ValueError, OverflowError):
+                        log.error(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED invalid "
+                            "plan numerics local_order_id=%s",
+                            ticker, _reattach_oid,
+                        )
+                        _rr_next = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _rr_complete_and_classify(
+                            state=_rr_next,
+                            reason="reattach_required_invalid_plan_numerics",
+                            caller="reattach_required_invalid_plan_numerics",
+                        )
+                        continue
+                    import types as _rr_types
+                    _rr_plan = _rr_types.SimpleNamespace(
+                        ticker            = str(_rr_row.get("symbol") or ticker),
+                        side              = _rr_side,
+                        direction         = _rr_side,
+                        score             = _rr_score,
+                        timeframe         = str(_rr_row.get("timeframe") or signal.get("timeframe") or "1d"),
+                        entry_trigger     = _rr_trigger,
+                        trigger_price     = _rr_trigger,
+                        stop_underlying   = _rr_price("stop_underlying", "stop_price"),
+                        target_underlying = _rr_price("target_underlying", "target_price"),
+                        trigger_type      = "breach",
+                        prior_day_high    = signal.get("prior_day_high"),
+                        prior_day_low     = signal.get("prior_day_low"),
+                        pattern           = _rr_row.get("pattern") or signal.get("pattern"),
+                        tier              = _rr_row.get("tier") or signal.get("tier"),
+                        contract_symbol   = str(_rr_row.get("contract") or f"DEFERRED:{ticker}"),
+                        contracts         = _rr_contracts,
+                        limit_price       = _rr_limit_price,
+                        plan_id           = str(_rr_row.get("plan_id") or ""),
+                        signal_id         = _rr_sig_id,
+                        canonical_signal_id = _rr_canonical,
+                        client_id         = client_id,
+                        execution_mode    = _execution_mode,
+                        late_attachment_policy_eligible = True,
+                        metadata          = _rr_metadata,
+                    )
+
+                    # Idempotent guard: if the watcher already owns this exact
+                    # local_order_id, skip watch() and go directly to proof.
+                    _rr_already_owned = False
+                    try:
+                        _rr_has_fn = getattr(entry_watcher, "has_order", None)
+                        if callable(_rr_has_fn):
+                            _rr_already_owned = bool(_rr_has_fn(_reattach_oid))
+                    except Exception as _rr_has_exc:
+                        log.warning(
+                            "[%s] REATTACH_REQUIRED has_order() check failed %s: %s "
+                            "— proceeding with watch() (safe)",
+                            ticker, _reattach_oid, _rr_has_exc,
+                        )
+
+                    if not _rr_already_owned:
+                        try:
+                            _rr_armed = entry_watcher.watch(
+                                _rr_plan, _reattach_oid,
+                                recovery_rearm=True,
+                                no_cancel_on_reject=True,
+                            )
+                        except Exception as _rr_exc:
+                            # Exception path: the existing PENDING_TRIGGER order
+                            # is untouched — do NOT clean it up.  Complete as
+                            # RETRYABLE / EXHAUSTED so the next run can retry.
+                            log.error(
+                                "[%s] overnight_reeval: REATTACH_REQUIRED "
+                                "watch() exception signal=%s "
+                                "local_order_id=%s: %s",
+                                ticker, signal_id, _reattach_oid, _rr_exc,
+                            )
+                            _rr_next = (
+                                WATCH_ATTEMPT_STATE_EXHAUSTED
+                                if _watch_attempt.attempt_count
+                                >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                                else WATCH_ATTEMPT_STATE_RETRYABLE
+                            )
+                            _rr_complete_and_classify(
+                                state=_rr_next,
+                                reason=f"reattach_required_watch_exception:{type(_rr_exc).__name__}",
+                                caller="reattach_required_watch_exception",
+                            )
+                            continue
+                    else:
+                        _rr_armed = True
+
+                    if not _rr_armed:
+                        # watch() returned False: order is still valid, retry.
+                        log.warning(
+                            "[%s] overnight_reeval: REATTACH_REQUIRED watch() "
+                            "False signal=%s local_order_id=%s "
+                            "— order preserved; classifying retryable",
+                            ticker, signal_id, _reattach_oid,
+                        )
+                        _rr_next = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _rr_complete_and_classify(
+                            state=_rr_next,
+                            reason="reattach_required_watch_false",
+                            caller="reattach_required_watch_false",
+                        )
+                        continue
+
+                    # Watcher armed: persist durable proof then complete.
+                    _rr_proof_ok = _persist_watcher_armed_proof(
+                        client_id=client_id,
+                        execution_mode=_execution_mode,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_id=signal_id,
+                        signal_payload=signal,
+                        local_order_id=_reattach_oid,
+                        session_key=session_key,
+                        extra_meta={
+                            "source_table": "trade_queue",
+                            "source_job_id": str(job_id),
+                            "ticker": ticker,
+                            "side": side,
+                            "contract_deferred": True,
+                            "contract_selection_deferred_to": "breach_time",
+                            "reattach_watcher": True,
+                            "reattach_required_recovery": True,
+                            "armed_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    )
+                    if not _rr_proof_ok:
+                        log.critical(
+                            "OVERNIGHT_REEVAL_REATTACH_REQUIRED_PROOF_FAILED | "
+                            "client=%s mode=%s canonical=%s local_order_id=%s "
+                            "session=%s | watcher reattached but proof NOT "
+                            "persisted — next retry will reattach again (idempotent)",
+                            client_id, _execution_mode, _canonical_for_attempt,
+                            _reattach_oid, session_key,
+                        )
+                        _rr_next = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count
+                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _rr_complete_and_classify(
+                            state=_rr_next,
+                            reason="reattach_required_watcher_proof_failed",
+                            caller="reattach_required_watcher_proof_failed",
+                        )
+                        continue
+
+                    _rr_armed_completion_ok = _complete_watch_arm_attempt_checked(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_payload=signal,
+                        execution_mode=_execution_mode,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
+                        state=WATCH_ATTEMPT_STATE_ARMED,
+                        local_order_id=_reattach_oid,
+                        reason="reattach_required_watcher_armed",
+                        ticker=ticker,
+                        caller="reattach_required_watcher_armed",
+                    )
+                    if not _rr_armed_completion_ok:
+                        _mark_job_error(
+                            job_id, client_id,
+                            "overnight_watch_arm_attempt_completion_failed:"
+                            "reattach_required_armed",
+                        )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
+                        continue
+
+                    log.info(
+                        "[%s] ✅ REATTACH_REQUIRED ARMED — "
+                        "local_order_id=%s canonical=%s",
+                        ticker, _reattach_oid, _canonical_for_attempt,
+                    )
+                    _mark_job_watching_armed(
+                        job_id, client_id, f"reattach_required:{_reattach_oid}"
+                    )
+                    result["armed"] += 1
+                    result["fresh_armed"] += 1
+                    continue
+
+                if (
+                    _watch_attempt.disposition == WATCH_ATTEMPT_CONFLICT
+                    and str(_watch_attempt.reason or "") == "attempt_state_error"
+                ):
+                    # Durable attempt state is ERROR — a terminal ownership
+                    # failure the resolver treats as non-replaceable. This
+                    # run is already-resolved, never retryable.
+                    log.info(
+                        "[%s] overnight_watch_attempt_already_terminal signal=%s "
+                        "canonical=%s state=ERROR count=%s local_order_id=%s",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.attempt_count, _watch_attempt.local_order_id,
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["already_resolved"] += 1
+                    continue
+                if _watch_attempt.disposition != WATCH_ATTEMPT_ACQUIRED:
+                    _reason = f"overnight_watch_arm_attempt_unavailable:{_watch_attempt.disposition}:{_watch_attempt.reason}"
+                    log.critical(
+                        "[%s] overnight_watch_attempt_unavailable signal=%s canonical=%s "
+                        "disposition=%s reason=%s",
+                        ticker, signal_id, _canonical_for_attempt,
+                        _watch_attempt.disposition, _watch_attempt.reason,
+                    )
+                    _mark_job_watching_reason(job_id, client_id, _reason)
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
+                if _recovery_skip_mc:
+                    # The advisory preflight saw an existing active owner, but
+                    # the locked claim no longer agrees. Never turn that race
+                    # into a replacement order that bypassed Master Control.
+                    _mark_job_watching_reason(
+                        job_id, client_id,
+                        "overnight_watch_recovery_preflight_changed",
+                    )
+                    result["skipped"] = result.get("skipped", 0) + 1
+                    result["retryable_deferred"] += 1
+                    continue
+
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
             # Do NOT pass local_order_id: static IDs cause OSM conflicts on retry.
             # For deferred contracts: ensure contract_symbol is NOT set to the
@@ -3158,7 +6845,27 @@ def run_overnight_reeval(
                 )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
-                if _paper_rescue_only:
+                _create_completion_ok = _complete_watch_arm_attempt_checked(
+                    signal_id=signal_id,
+                    client_id=client_id,
+                    canonical_signal_id=_canonical_for_attempt,
+                    signal_payload=signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
+                    state=WATCH_ATTEMPT_STATE_ERROR,
+                    local_order_id="",
+                    reason=f"create_entry_order:{type(osm_exc).__name__}",
+                    ticker=ticker,
+                    caller="create_entry_order_exception",
+                )
+                if not _create_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        "create_entry_order_exception",
+                    )
+                elif _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
@@ -3173,12 +6880,89 @@ def run_overnight_reeval(
 
             if not local_order_id:
                 log.error("[%s] overnight_reeval: OSM returned no local_order_id for %s", ticker, signal_id)
-                if _paper_rescue_only:
+                _missing_oid_completion_ok = _complete_watch_arm_attempt_checked(
+                    signal_id=signal_id,
+                    client_id=client_id,
+                    canonical_signal_id=_canonical_for_attempt,
+                    signal_payload=signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
+                    state=WATCH_ATTEMPT_STATE_ERROR,
+                    local_order_id="",
+                    reason="missing_local_order_id",
+                    ticker=ticker,
+                    caller="missing_local_order_id",
+                )
+                if not _missing_oid_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        "missing_local_order_id",
+                    )
+                elif _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
                         "order_materialization_failed:missing_local_order_id",
                     )
+                result["errors"] += 1
+                result["terminal_errors"] += 1
+                continue
+
+            if _claimed_watch_attempt and not _bind_watch_arm_attempt_order(
+                signal_id=signal_id,
+                client_id=client_id,
+                canonical_signal_id=_canonical_for_attempt,
+                signal_payload=signal,
+                execution_mode=_execution_mode,
+                session_key=session_key,
+                attempt=_watch_attempt,
+                local_order_id=str(local_order_id),
+            ):
+                _bind_reason = "overnight_watch_arm_attempt_bind_failed"
+                _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
+                    order_state_machine=order_state_machine,
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    ticker=ticker,
+                    side=side,
+                    local_order_id=str(local_order_id),
+                    contract=f"DEFERRED:{ticker}",
+                    contract_deferred=contract_deferred,
+                    entry_trigger=entry_trigger,
+                    reason=_bind_reason,
+                    done_event="OVERNIGHT_WATCH_ARM_ATTEMPT_BIND_FAILED_CLEANUP_DONE",
+                )
+                _bind_completion_ok = _complete_watch_arm_attempt_checked(
+                    signal_id=signal_id,
+                    client_id=client_id,
+                    canonical_signal_id=_canonical_for_attempt,
+                    signal_payload=signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
+                    state=WATCH_ATTEMPT_STATE_ERROR,
+                    local_order_id=str(local_order_id),
+                    reason=_bind_reason,
+                    ticker=ticker,
+                    caller="bind_failure",
+                )
+                # A failed local-order bind is a terminal ownership failure —
+                # the durable attempt is written as ERROR and the resolver
+                # treats ERROR as non-replaceable. Reporting this run as
+                # retryable would contradict the durable state and let the
+                # runner appear to make progress while the next run refuses.
+                if not _cleanup_success:
+                    _mark_job_error(job_id, client_id, f"{_bind_reason}:cleanup_failed:{_cleanup_method}")
+                elif not _bind_completion_ok:
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        "overnight_watch_arm_bind_cleanup_completion_failed",
+                    )
+                else:
+                    _mark_job_error(job_id, client_id, _bind_reason)
                 result["errors"] += 1
                 result["terminal_errors"] += 1
                 continue
@@ -3208,7 +6992,27 @@ def run_overnight_reeval(
                         ticker,
                         local_order_id,
                     )
-                    if _paper_rescue_only:
+                    _pending_false_completion_ok = _complete_watch_arm_attempt_checked(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_payload=signal,
+                        execution_mode=_execution_mode,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
+                        state=WATCH_ATTEMPT_STATE_ERROR,
+                        local_order_id=str(local_order_id),
+                        reason="pending_trigger_transition_false",
+                        ticker=ticker,
+                        caller="pending_trigger_false",
+                    )
+                    if not _pending_false_completion_ok:
+                        _mark_job_error(
+                            job_id, client_id,
+                            "overnight_watch_arm_attempt_completion_failed:"
+                            "pending_trigger_false",
+                        )
+                    elif _paper_rescue_only:
                         _mark_job_error(
                             job_id,
                             client_id,
@@ -3224,7 +7028,27 @@ def run_overnight_reeval(
                     local_order_id,
                     _pt_exc,
                 )
-                if _paper_rescue_only:
+                _pending_exc_completion_ok = _complete_watch_arm_attempt_checked(
+                    signal_id=signal_id,
+                    client_id=client_id,
+                    canonical_signal_id=_canonical_for_attempt,
+                    signal_payload=signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
+                    state=WATCH_ATTEMPT_STATE_ERROR,
+                    local_order_id=str(local_order_id),
+                    reason=f"pending_trigger_transition:{type(_pt_exc).__name__}",
+                    ticker=ticker,
+                    caller="pending_trigger_exception",
+                )
+                if not _pending_exc_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        "pending_trigger_exception",
+                    )
+                elif _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
@@ -3319,6 +7143,34 @@ def run_overnight_reeval(
                             result["retryable_deferred"] += 1
                             continue
 
+                    _armed_completion_ok = _complete_watch_arm_attempt_checked(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_payload=signal,
+                        execution_mode=_execution_mode,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
+                        state=WATCH_ATTEMPT_STATE_ARMED,
+                        local_order_id=str(local_order_id),
+                        reason="watcher_armed",
+                        ticker=ticker,
+                        caller="watcher_armed",
+                    )
+
+                    if not _armed_completion_ok:
+                        _completion_reason = (
+                            "overnight_watch_arm_attempt_completion_failed:ARMED"
+                        )
+                        _mark_job_error(
+                            job_id,
+                            client_id,
+                            _completion_reason,
+                        )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
+                        continue
+
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
                     log.info(
                         "[%s] ✅ ARMED — contract=%s entry_trigger=%.4f contract_deferred=%s",
@@ -3345,15 +7197,203 @@ def run_overnight_reeval(
                     result["armed"] += 1
                     result["fresh_armed"] += 1
                 else:
+                    # PR #404: classify before any terminal decision.
+                    # Generic False is NEVER automatic terminal rejection.
                     _reject_reason = str(
                         getattr(entry_watcher, "_last_reject_reason", None)
                         or "watch_returned_false"
                     )
+                    # dedup_block requires ownership verification, not direct ALREADY_WATCHING.
+                    _already_watching = False
+                    if _reject_reason == "dedup_block":
+                        _owner_generation = (
+                            getattr(decision.plan, "trigger_generation", None)
+                            or (_plan_meta.get("trigger_generation") if isinstance(_plan_meta, dict) else None)
+                            or signal.get("trigger_generation")
+                        )
+                        _owner_token = (
+                            getattr(decision.plan, "watcher_token", None)
+                            or (_plan_meta.get("watcher_token") if isinstance(_plan_meta, dict) else None)
+                            or signal.get("watcher_token")
+                        )
+                        _owner_result = _resolve_existing_watcher_ownership(
+                            entry_watcher=entry_watcher,
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            execution_mode=_execution_mode,
+                            ticker=ticker,
+                            side=side,
+                            generation=_owner_generation,
+                            watcher_token=_owner_token,
+                            local_order_id=local_order_id,
+                        )
+                        if _owner_result == WATCH_OWNER_EXACT:
+                            _already_watching = True
+                        elif _owner_result == WATCH_OWNER_CONFLICT:
+                            log.warning(
+                                "[%s] overnight_watch_ownership_conflict signal=%s "
+                                "— preserving existing owner, cleaning new duplicate order",
+                                ticker, signal_id,
+                            )
+                            _conflict_cleanup_success, _conflict_cleanup_method = _cleanup_overnight_watch_arm_failure(
+                                order_state_machine=order_state_machine,
+                                client_id=client_id,
+                                signal_id=signal_id,
+                                ticker=ticker,
+                                side=side,
+                                local_order_id=str(local_order_id),
+                                contract=_arm_label,
+                                contract_deferred=contract_deferred,
+                                entry_trigger=entry_trigger,
+                                reason="overnight_watch_ownership_conflict",
+                                done_event="OVERNIGHT_WATCH_OWNERSHIP_CONFLICT_CLEANUP_DONE",
+                            )
+                            _owner_conflict_completion_ok = (
+                                _complete_watch_arm_attempt_checked(
+                                    signal_id=signal_id,
+                                    client_id=client_id,
+                                    canonical_signal_id=_canonical_for_attempt,
+                                    signal_payload=signal,
+                                    execution_mode=_execution_mode,
+                                    session_key=session_key,
+                                    attempt=_watch_attempt,
+                                    state=(
+                                        WATCH_ATTEMPT_STATE_ERROR
+                                        if not _conflict_cleanup_success
+                                        else WATCH_ATTEMPT_STATE_RETRYABLE
+                                    ),
+                                    local_order_id=str(local_order_id),
+                                    reason=(
+                                        "overnight_watch_ownership_conflict:"
+                                        f"{_conflict_cleanup_method}"
+                                    ),
+                                    ticker=ticker,
+                                    caller="watcher_owner_conflict",
+                                )
+                            )
+                            if not _owner_conflict_completion_ok:
+                                _mark_job_error(
+                                    job_id, client_id,
+                                    "overnight_watch_arm_attempt_completion_failed:"
+                                    "watcher_owner_conflict",
+                                )
+                                result["errors"] += 1
+                                result["terminal_errors"] += 1
+                                continue
+                            if not _conflict_cleanup_success:
+                                _mark_job_error(job_id, client_id, "overnight_watch_ownership_conflict_cleanup_failed")
+                                result["errors"] += 1
+                                result["terminal_errors"] += 1
+                                continue
+                            _mark_job_watching_reason(
+                                job_id, client_id, "overnight_watch_ownership_conflict"
+                            )
+                            result["skipped"] = result.get("skipped", 0) + 1
+                            result["retryable_deferred"] += 1
+                            continue
+                        else:
+                            # WATCH_OWNER_MISSING or WATCH_OWNER_LOOKUP_ERROR:
+                            # dedup fired but ownership unverifiable → retryable
+                            log.warning(
+                                "[%s] overnight_watch_owner_unverified signal=%s "
+                                "owner_result=%s", ticker, signal_id, _owner_result,
+                            )
+                            # _already_watching stays False → RETRYABLE_NOT_ARMED below
+
+                    # overnight NEW arm: terminal stale/stop checks bypassed (pre-market).
+                    _arm_outcome = _classify_watch_arm_outcome(
+                        watch_result=False,
+                        already_watching=_already_watching,
+                        terminal_conflict=False,
+                        exception=None,
+                    )
+
+                    if _arm_outcome.disposition == ALREADY_WATCHING:
+                        # Watcher already owns this signal_id; the new OSM order
+                        # was canceled by the watcher's dedup path. Idempotent success.
+                        _dup_cleanup_success, _dup_cleanup_method = _cleanup_overnight_watch_arm_failure(
+                            order_state_machine=order_state_machine,
+                            client_id=client_id,
+                            signal_id=signal_id,
+                            ticker=ticker,
+                            side=side,
+                            local_order_id=str(local_order_id),
+                            contract=_arm_label,
+                            contract_deferred=contract_deferred,
+                            entry_trigger=entry_trigger,
+                            reason="overnight_watch_already_watching_duplicate_cleanup",
+                            done_event="OVERNIGHT_WATCH_ALREADY_WATCHING_DUPLICATE_CLEANUP_DONE",
+                        )
+                        if not _dup_cleanup_success:
+                            _dup_error_completion_ok = _complete_watch_arm_attempt_checked(
+                                signal_id=signal_id,
+                                client_id=client_id,
+                                canonical_signal_id=_canonical_for_attempt,
+                                signal_payload=signal,
+                                execution_mode=_execution_mode,
+                                session_key=session_key,
+                                attempt=_watch_attempt,
+                                state=WATCH_ATTEMPT_STATE_ERROR,
+                                local_order_id=str(local_order_id),
+                                reason="already_watching_duplicate_cleanup_failed",
+                                ticker=ticker,
+                                caller="already_watching_cleanup_failed",
+                            )
+                            _mark_job_error(
+                                job_id,
+                                client_id,
+                                (
+                                    "already_watching_duplicate_cleanup_failed"
+                                    if _dup_error_completion_ok
+                                    else "overnight_watch_arm_attempt_completion_failed:"
+                                    "already_watching_cleanup_failed"
+                                ),
+                            )
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            continue
+                        _already_owner_completion_ok = (
+                            _complete_watch_arm_attempt_checked(
+                                signal_id=signal_id,
+                                client_id=client_id,
+                                canonical_signal_id=_canonical_for_attempt,
+                                signal_payload=signal,
+                                execution_mode=_execution_mode,
+                                session_key=session_key,
+                                attempt=_watch_attempt,
+                                state=WATCH_ATTEMPT_STATE_ARMED,
+                                local_order_id=str(local_order_id),
+                                reason="already_watching_exact_owner",
+                                ticker=ticker,
+                                caller="already_watching_exact_owner",
+                            )
+                        )
+
+                        if not _already_owner_completion_ok:
+                            _mark_job_error(
+                                job_id,
+                                client_id,
+                                "overnight_watch_arm_attempt_completion_failed:"
+                                "already_watching_exact_owner",
+                            )
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            continue
+
+                        log.info(
+                            "[%s] overnight_watch_already_watching %s reason=%s "
+                            "— idempotent success; original watcher ownership preserved",
+                            ticker, signal_id, _reject_reason,
+                        )
+                        _mark_job_watching_armed(job_id, client_id, _arm_label)
+                        result["armed"] += 1
+                        continue
+
                     _full_error = f"overnight_watch_arm_failed:{_reject_reason}"
                     log.error(
                         "[%s] overnight_reeval: entry_watcher.watch() returned False "
-                        "| contract=%s reason=%s",
-                        ticker, _arm_label, _reject_reason,
+                        "| contract=%s reason=%s disposition=%s",
+                        ticker, _arm_label, _reject_reason, _arm_outcome.disposition,
                     )
                     _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                         order_state_machine=order_state_machine,
@@ -3370,6 +7410,20 @@ def run_overnight_reeval(
                     )
                     if not _cleanup_success:
                         _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
+                        _cleanup_error_completion_ok = _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=WATCH_ATTEMPT_STATE_ERROR,
+                            local_order_id=str(local_order_id),
+                            reason=_cleanup_failed_reason,
+                            ticker=ticker,
+                            caller="watch_cleanup_failed",
+                        )
                         log.critical(
                             "[%s] OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED | "
                             "watch arm failed but local ENTRY cleanup failed "
@@ -3396,31 +7450,127 @@ def run_overnight_reeval(
                             cleanup_failed=True,
                             original_reason=_full_error,
                         )
-                        _mark_job_error(job_id, client_id, _cleanup_failed_reason)
+                        _mark_job_error(
+                            job_id,
+                            client_id,
+                            (
+                                _cleanup_failed_reason
+                                if _cleanup_error_completion_ok
+                                else "overnight_watch_arm_attempt_completion_failed:"
+                                "watch_cleanup_failed"
+                            ),
+                        )
                         result["errors"] += 1
                         result["terminal_errors"] += 1
                         continue
-                    _record_watch_arm_failure_proof(
-                        signal_id=signal_id,
-                        client_id=client_id,
-                        signal=signal,
-                        reason=_full_error,
-                        local_order_id=str(local_order_id),
-                        job_id=job_id,
-                        is_exception=False,
-                        session_key=session_key,
-                    )
-                    _mark_job_rejected(job_id, client_id, _full_error)
-                    if _lifecycle_ok:
-                        try:
-                            _sig_rejected(signal_id, ticker, _LO.WATCHER,
-                                          "entry_watcher.watch() returned False",
-                                          _RC.EXECUTION, "WATCHER_ARM_FAILED", _RS.WARNING,
-                                          contract=_arm_label)
-                        except Exception:
-                            pass
-                    result["rejected"] += 1
-                    result["terminal_rejected"] += 1
+
+                    if _arm_outcome.disposition == TERMINAL_FAILURE:
+                        _record_watch_arm_failure_proof(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            signal=signal,
+                            reason=_full_error,
+                            local_order_id=str(local_order_id),
+                            job_id=job_id,
+                            is_exception=False,
+                            session_key=session_key,
+                        )
+                        _mark_job_rejected(job_id, client_id, _full_error)
+                        if _lifecycle_ok:
+                            try:
+                                _sig_rejected(signal_id, ticker, _LO.WATCHER,
+                                              "entry_watcher.watch() returned False",
+                                              _RC.EXECUTION, "WATCHER_ARM_FAILED", _RS.WARNING,
+                                              contract=_arm_label)
+                            except Exception:
+                                pass
+                        result["rejected"] += 1
+                        result["terminal_rejected"] += 1
+                    else:
+                        # RETRYABLE_NOT_ARMED: no permanent proof, no terminal reject.
+                        # Durably preserve WATCHING state for next reeval pickup.
+                        _terminal_result, _terminal_reason = _local_order_terminal_state(
+                            order_state_machine, str(local_order_id)
+                        )
+                        if _terminal_result != WATCH_ATTEMPT_ACQUIRED:
+                            _unproven_completion_ok = _complete_watch_arm_attempt_checked(
+                                signal_id=signal_id,
+                                client_id=client_id,
+                                canonical_signal_id=_canonical_for_attempt,
+                                signal_payload=signal,
+                                execution_mode=_execution_mode,
+                                session_key=session_key,
+                                attempt=_watch_attempt,
+                                state=WATCH_ATTEMPT_STATE_ERROR,
+                                local_order_id=str(local_order_id),
+                                reason=f"cleanup_terminal_unproven:{_terminal_reason}",
+                                ticker=ticker,
+                                caller="cleanup_terminal_unproven",
+                            )
+                            _mark_job_error(
+                                job_id,
+                                client_id,
+                                (
+                                    f"overnight_watch_arm_cleanup_unproven:{_terminal_reason}"
+                                    if _unproven_completion_ok
+                                    else "overnight_watch_arm_attempt_completion_failed:"
+                                    "cleanup_terminal_unproven"
+                                ),
+                            )
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            continue
+                        _next_state = (
+                            WATCH_ATTEMPT_STATE_EXHAUSTED
+                            if _watch_attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                            else WATCH_ATTEMPT_STATE_RETRYABLE
+                        )
+                        _retry_completion_ok = (
+                            _complete_watch_arm_attempt_checked(
+                                signal_id=signal_id,
+                                client_id=client_id,
+                                canonical_signal_id=_canonical_for_attempt,
+                                signal_payload=signal,
+                                execution_mode=_execution_mode,
+                                session_key=session_key,
+                                attempt=_watch_attempt,
+                                state=_next_state,
+                                local_order_id=str(local_order_id),
+                                reason=_full_error,
+                                ticker=ticker,
+                                caller="watch_retry_completion",
+                            )
+                        )
+
+                        if not _retry_completion_ok:
+                            _completion_reason = (
+                                "overnight_watch_arm_attempt_completion_failed:"
+                                f"{_next_state}"
+                            )
+                            _mark_job_error(
+                                job_id,
+                                client_id,
+                                _completion_reason,
+                            )
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            continue
+
+                        if _next_state == WATCH_ATTEMPT_STATE_EXHAUSTED:
+                            _mark_job_error(job_id, client_id, "overnight_watch_arm_retry_exhausted")
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
+                            continue
+                        log.critical(
+                            "[%s] overnight_watch_arm_unknown signal=%s reason=%s "
+                            "disp=%s — fail closed as retryable_deferred (not terminal)",
+                            ticker, signal_id, _reject_reason, _arm_outcome.disposition,
+                        )
+                        _mark_job_watching_reason(
+                            job_id, client_id, "overnight_watch_arm_retryable"
+                        )
+                        result["skipped"] = result.get("skipped", 0) + 1
+                        result["retryable_deferred"] += 1
             except Exception as ew_exc:
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
@@ -3438,6 +7588,20 @@ def run_overnight_reeval(
                 )
                 if not _cleanup_success:
                     _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
+                    _exception_cleanup_completion_ok = _complete_watch_arm_attempt_checked(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        canonical_signal_id=_canonical_for_attempt,
+                        signal_payload=signal,
+                        execution_mode=_execution_mode,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
+                        state=WATCH_ATTEMPT_STATE_ERROR,
+                        local_order_id=str(local_order_id),
+                        reason=_cleanup_failed_reason,
+                        ticker=ticker,
+                        caller="watch_exception_cleanup_failed",
+                    )
                     log.critical(
                         "[%s] OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED | "
                         "entry_watcher.watch exception and local ENTRY cleanup failed "
@@ -3464,10 +7628,107 @@ def run_overnight_reeval(
                         cleanup_failed=True,
                         original_reason=_full_error,
                     )
-                    _mark_job_error(job_id, client_id, _cleanup_failed_reason)
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        (
+                            _cleanup_failed_reason
+                            if _exception_cleanup_completion_ok
+                            else "overnight_watch_arm_attempt_completion_failed:"
+                            "watch_exception_cleanup_failed"
+                        ),
+                    )
                     result["errors"] += 1
                     result["terminal_errors"] += 1
                     continue
+                # PR #404 final amendment: cleanup succeeded on a watcher
+                # exception. The classifier maps this to RETRYABLE_NOT_ARMED;
+                # persisting ERROR would permanently block retries and
+                # contradict the classifier. Complete as RETRYABLE (or
+                # EXHAUSTED at max_attempts) ONLY after the exact local
+                # ENTRY is proven terminal for the expected identity.
+                _terminal_result, _terminal_reason = _local_order_terminal_state(
+                    order_state_machine,
+                    str(local_order_id),
+                    expected_client_id=client_id,
+                    expected_execution_mode=_execution_mode,
+                    expected_canonical_signal_id=_canonical_for_attempt,
+                )
+                if _terminal_result != WATCH_ATTEMPT_ACQUIRED:
+                    # Terminal proof missing / active / mismatched / DB error
+                    # — fail closed as ERROR (do NOT claim retryability).
+                    _exception_unproven_completion_ok = (
+                        _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=WATCH_ATTEMPT_STATE_ERROR,
+                            local_order_id=str(local_order_id),
+                            reason=(
+                                "watch_exception_cleanup_terminal_unproven:"
+                                f"{_terminal_reason}"
+                            ),
+                            ticker=ticker,
+                            caller="watch_exception_cleanup_terminal_unproven",
+                        )
+                    )
+                    _record_watch_arm_failure_proof(
+                        signal_id=signal_id,
+                        client_id=client_id,
+                        signal=signal,
+                        reason=_full_error,
+                        local_order_id=str(local_order_id),
+                        job_id=job_id,
+                        is_exception=True,
+                        session_key=session_key,
+                    )
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        (
+                            "overnight_watch_arm_exception_terminal_unproven:"
+                            f"{_terminal_reason}"
+                            if _exception_unproven_completion_ok
+                            else "overnight_watch_arm_attempt_completion_failed:"
+                            "watch_exception_cleanup_terminal_unproven"
+                        ),
+                    )
+                    log.error(
+                        "[%s] overnight_reeval: watcher exception cleanup terminal-"
+                        "unproven err=%s terminal_reason=%s",
+                        ticker, ew_exc, _terminal_reason,
+                    )
+                    result["errors"] += 1
+                    result["terminal_errors"] += 1
+                    continue
+
+                _next_state = (
+                    WATCH_ATTEMPT_STATE_EXHAUSTED
+                    if _watch_attempt.attempt_count
+                    >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                    else WATCH_ATTEMPT_STATE_RETRYABLE
+                )
+                _exception_completion_ok = _complete_watch_arm_attempt_checked(
+                    signal_id=signal_id,
+                    client_id=client_id,
+                    canonical_signal_id=_canonical_for_attempt,
+                    signal_payload=signal,
+                    execution_mode=_execution_mode,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
+                    state=_next_state,
+                    local_order_id=str(local_order_id),
+                    reason=_full_error,
+                    ticker=ticker,
+                    caller="watch_exception_retry_completion",
+                )
+                # Failure proof is written on every exception path so operator
+                # visibility of the exception itself is never lost, whether
+                # the classification winds up RETRYABLE, EXHAUSTED, or ERROR.
                 _record_watch_arm_failure_proof(
                     signal_id=signal_id,
                     client_id=client_id,
@@ -3477,11 +7738,45 @@ def run_overnight_reeval(
                     job_id=job_id,
                     is_exception=True,
                     session_key=session_key,
+                    retryable_exception=(
+                        _exception_completion_ok
+                        and _next_state == WATCH_ATTEMPT_STATE_RETRYABLE
+                    ),
                 )
-                _mark_job_error(job_id, client_id, _full_error)
-                log.error("[%s] overnight_reeval: entry_watcher.watch failed: %s", ticker, ew_exc)
-                result["errors"] += 1
-                result["terminal_errors"] += 1
+                log.error(
+                    "[%s] overnight_reeval: entry_watcher.watch failed: %s "
+                    "(cleanup ok, next_state=%s, completion_ok=%s)",
+                    ticker, ew_exc, _next_state, _exception_completion_ok,
+                )
+
+                if not _exception_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        f"{_next_state}:watch_exception",
+                    )
+                    result["errors"] += 1
+                    result["terminal_errors"] += 1
+                    continue
+
+                if _next_state == WATCH_ATTEMPT_STATE_EXHAUSTED:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_retry_exhausted",
+                    )
+                    result["errors"] += 1
+                    result["terminal_errors"] += 1
+                    continue
+
+                # RETRYABLE: durably deferred, NOT terminal. Do not call
+                # _mark_job_error. The classifier's RETRYABLE_NOT_ARMED
+                # contract is now honored by the runtime as well.
+                _mark_job_watching_reason(
+                    job_id, client_id,
+                    "overnight_watch_arm_retryable_exception",
+                )
+                result["skipped"] = result.get("skipped", 0) + 1
+                result["retryable_deferred"] += 1
 
         except Exception as outer_exc:
             log.error("[%s] overnight_reeval: unexpected error for %s: %s", ticker, signal_id, outer_exc, exc_info=True)

@@ -169,6 +169,19 @@ def _install_base_stubs(monkeypatch):
     cs_mod.build_canonical_signal_id = lambda sid, sig=None: _canonical(str(sid or ""))
     monkeypatch.setitem(sys.modules, "ap_canonical_signal", cs_mod)
 
+    # PR #404 Blocker 1: shared ap_signals rows now take the durable atomic
+    # watcher-arm claim (Postgres CAS). These tests exercise the shared-setup
+    # disposition and the post-claim arm/proof path, not the claim's DB
+    # internals (covered by test_p0_overnight_watch_attempt_atomicity.py and
+    # test_p0_overnight_watcher_cleanup.py). Stub the claim/bind/complete so the
+    # end-to-end arm-lifecycle assertions do not depend on a live Postgres.
+    monkeypatch.setattr(
+        ov, "_claim_watch_arm_attempt",
+        lambda **kw: ov._WatchAttemptClaim(ov.WATCH_ATTEMPT_ACQUIRED, "tok-stub", 1),
+    )
+    monkeypatch.setattr(ov, "_bind_watch_arm_attempt_order", lambda **kw: True)
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt", lambda **kw: True)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST 1: Successful shared arm is idempotent across two attempts

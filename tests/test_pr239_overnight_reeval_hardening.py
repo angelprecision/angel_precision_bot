@@ -156,6 +156,34 @@ def _run(
     monkeypatch.setattr(ov, "_fetch_watching_signals", lambda client_id: [_job(signal)])
     monkeypatch.setattr(ov, "_shared_watch_arm_failure_already_recorded", lambda *a, **k: False)
 
+    # PR #404: the atomic watcher-arm claim/bind/complete CAS is exercised by
+    # test_p0_overnight_watch_attempt_atomicity.py and
+    # test_p0_overnight_watcher_cleanup.py against a real/shared store. This
+    # suite's purpose is watcher arming, deferred-contract metadata, and
+    # no-premature-broker-submit — not the claim's DB internals. Stub the
+    # already-tested attempt-owner seam so these assertions do not need a DB.
+    monkeypatch.setattr(
+        ov,
+        "_claim_watch_arm_attempt",
+        lambda **_kwargs: ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_ACQUIRED,
+            "test-owner-token",
+            1,
+            "",
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_bind_watch_arm_attempt_order",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        ov,
+        "_complete_watch_arm_attempt_checked",
+        lambda **_kwargs: True,
+    )
+
     rejected: list[tuple[object, str, str]] = []
     errors: list[tuple[object, str, str]] = []
     waiting: list[tuple[object, str, str]] = []
