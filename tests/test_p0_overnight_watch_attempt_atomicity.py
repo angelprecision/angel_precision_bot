@@ -530,6 +530,103 @@ def test_complete_refuses_stolen_owner(_orders_table):
     assert overnight._attempt_state(scope) == S_IN_PROGRESS
 
 
+def test_rotated_restart_owner_fences_stale_process_callback(_orders_table):
+    """Only the current cross-process token may enter a trigger callback."""
+    order_id = "callback-fence-order-1"
+    _insert_order(local_order_id=order_id, status="PENDING_TRIGGER")
+    _seed(mode="live", state=S_ARMED, count=1, token="token-a", order_id=order_id)
+    owner_a = overnight._WatchAttemptClaim(ALREADY_ARMED, "token-a", 1, order_id)
+    owner_b = overnight._reacquire_armed_watch_attempt_for_restart(
+        signal_id=SIGNAL_ID,
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=owner_a,
+    )
+    assert owner_b.disposition == overnight.WATCH_ATTEMPT_REATTACH_REQUIRED
+    assert owner_b.token != owner_a.token
+
+    stale_ok = overnight._claim_watch_callback_owner(
+        signal_id=SIGNAL_ID,
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=owner_a,
+        local_order_id=order_id,
+        reason="stale_pod_trigger",
+    )
+    current_ok = overnight._claim_watch_callback_owner(
+        signal_id=SIGNAL_ID,
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_payload={"signal_id": SIGNAL_ID},
+        execution_mode="live",
+        session_key=SESSION,
+        attempt=owner_b,
+        local_order_id=order_id,
+        reason="current_pod_trigger",
+    )
+
+    assert stale_ok is False
+    assert current_ok is True
+    scope = _read_scope(mode="live")
+    assert scope["state"] == S_IN_PROGRESS
+    assert scope["token"] == owner_b.token
+    assert scope["local_order_id"] == order_id
+
+
+def test_stale_cleanup_owner_cannot_expire_current_owner_order(_orders_table):
+    order_id = "cleanup-fence-order-1"
+    _insert_order(local_order_id=order_id, status="PENDING_TRIGGER")
+    _seed(
+        mode="live", state=S_IN_PROGRESS, count=1,
+        token="token-b", order_id=order_id,
+    )
+    stale_a = overnight._WatchAttemptClaim(ACQUIRED, "token-a", 1, "")
+    osm = MagicMock()
+
+    ok, _method = overnight._cleanup_overnight_watch_arm_failure(
+        order_state_machine=osm,
+        signal_payload={"signal_id": SIGNAL_ID},
+        session_key=SESSION,
+        attempt=stale_a,
+        client_id=CLIENT,
+        signal_id=SIGNAL_ID,
+        execution_mode="live",
+        canonical_signal_id=CANON,
+        ticker="SPY",
+        side="CALL",
+        local_order_id=order_id,
+        contract="DEFERRED:SPY",
+        contract_deferred=True,
+        entry_trigger=450.0,
+        reason="stale_owner_cleanup",
+        done_event="TEST_STALE_OWNER_CLEANUP",
+    )
+
+    assert ok is False
+    osm.get_order.assert_not_called()
+    osm.expire_stale_pending_entry_cas.assert_not_called()
+    assert _order_status(order_id) == "PENDING_TRIGGER"
+
+
+def test_unbound_retryable_resume_preserves_attempt_count_at_cap():
+    _seed(mode="live", state=S_RETRYABLE, count=3, token="released-token")
+
+    claim = _claim(mode="live", max_attempts=3)
+
+    assert claim.disposition == ACQUIRED
+    assert claim.attempt_count == 3
+    scope = _read_scope(mode="live")
+    assert scope["state"] == S_IN_PROGRESS
+    assert scope["count"] == 3
+    assert scope["local_order_id"] == ""
+
+
 def test_db_exception_is_db_error_and_blocks(monkeypatch):
     """A locked-query failure surfaces as WATCH_ATTEMPT_DB_ERROR with no
     acquisition — fail closed (spec Test L)."""

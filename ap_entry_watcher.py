@@ -1330,6 +1330,90 @@ class APEntryWatcher:
                     return True
         return False
 
+    def _claim_durable_overnight_callback_owner(
+        self, watched: "WatchedSignal", *, reason: str
+    ) -> bool:
+        """Claim exact durable ownership before a watcher callback mutates state.
+
+        Ordinary/intraday watchers do not carry the PR #410 fence and retain
+        their existing behavior.  A fenced overnight watcher fails closed when
+        any identity component is missing or when another process rotated the
+        durable attempt token during restart recovery.
+        """
+        signal = getattr(watched, "signal", {}) or {}
+        if not signal.get("overnight_watch_attempt_fenced"):
+            return True
+        token = str(signal.get("overnight_watch_attempt_token") or "").strip()
+        session_key = str(
+            signal.get("overnight_watch_attempt_session_key") or ""
+        ).strip()
+        canonical = str(
+            signal.get("overnight_watch_attempt_canonical_signal_id")
+            or signal.get("canonical_signal_id")
+            or ""
+        ).strip()
+        local_order_id = str(signal.get("local_order_id") or "").strip()
+        client_id = str(signal.get("client_id") or "").strip()
+        execution_mode = str(signal.get("execution_mode") or "").strip().lower()
+        try:
+            attempt_count = int(
+                signal.get("overnight_watch_attempt_count") or 0
+            )
+        except (TypeError, ValueError):
+            attempt_count = 0
+        if not all((token, session_key, canonical, local_order_id, client_id)) \
+                or execution_mode not in {"live", "paper"} or attempt_count < 1:
+            log.critical(
+                "WATCHER_DURABLE_CALLBACK_FENCE_MALFORMED ticker=%s order=%s "
+                "reason=%s",
+                getattr(watched, "ticker", "?"), local_order_id or "?", reason,
+            )
+            return False
+        try:
+            import ap_overnight_reeval as _overnight
+            attempt = _overnight._WatchAttemptClaim(
+                _overnight.WATCH_ATTEMPT_ACQUIRED,
+                token=token,
+                attempt_count=attempt_count,
+                local_order_id=local_order_id,
+                reason=reason,
+            )
+            return bool(_overnight._claim_watch_callback_owner(
+                signal_id=str(signal.get("signal_id") or ""),
+                client_id=client_id,
+                canonical_signal_id=canonical,
+                signal_payload=signal,
+                execution_mode=execution_mode,
+                session_key=session_key,
+                attempt=attempt,
+                local_order_id=local_order_id,
+                reason=reason,
+            ))
+        except Exception as exc:
+            log.critical(
+                "WATCHER_DURABLE_CALLBACK_FENCE_ERROR ticker=%s order=%s "
+                "reason=%s error=%s",
+                getattr(watched, "ticker", "?"), local_order_id, reason, exc,
+            )
+            return False
+
+    def _drop_stale_durable_watcher(self, watched: "WatchedSignal", *, reason: str) -> None:
+        """Remove only the process-local stale watcher; never mutate its order."""
+        with self._lock:
+            wid = id(watched)
+            self._pending = [item for item in self._pending if id(item) != wid]
+        try:
+            watched._release_dedup_key()
+        except Exception:
+            pass
+        log.critical(
+            "WATCHER_DURABLE_OWNERSHIP_LOST ticker=%s order=%s reason=%s "
+            "removed_local_watcher=true order_untouched=true",
+            getattr(watched, "ticker", "?"),
+            str((getattr(watched, "signal", {}) or {}).get("local_order_id") or "?"),
+            reason,
+        )
+
     def prove_materialization_retry_owner(
         self,
         local_order_id: Optional[str],
@@ -3071,6 +3155,31 @@ class APEntryWatcher:
                 or self.mode
             ).lower(),
             "watcher_token": self.owner_token,
+            "overnight_watch_attempt_fenced": bool(
+                (getattr(plan, "metadata", None) or {}).get(
+                    "overnight_watch_attempt_fenced"
+                )
+            ),
+            "overnight_watch_attempt_token": str(
+                (getattr(plan, "metadata", None) or {}).get(
+                    "overnight_watch_attempt_token"
+                ) or ""
+            ),
+            "overnight_watch_attempt_count": (
+                (getattr(plan, "metadata", None) or {}).get(
+                    "overnight_watch_attempt_count"
+                )
+            ),
+            "overnight_watch_attempt_session_key": str(
+                (getattr(plan, "metadata", None) or {}).get(
+                    "overnight_watch_attempt_session_key"
+                ) or ""
+            ),
+            "overnight_watch_attempt_canonical_signal_id": str(
+                (getattr(plan, "metadata", None) or {}).get(
+                    "overnight_watch_attempt_canonical_signal_id"
+                ) or ""
+            ),
             "trigger_generation": int(
                 (getattr(plan, "metadata", None) or {}).get(
                     "materialization_generation", 1
@@ -4889,6 +4998,13 @@ class APEntryWatcher:
             _sig_id = str(w.signal.get("signal_id", ""))
             _ticker = str(w.ticker or "")
             if action == "trigger":
+                if not self._claim_durable_overnight_callback_owner(
+                    w, reason="trigger_callback_claimed"
+                ):
+                    self._drop_stale_durable_watcher(
+                        w, reason="trigger_attempt_ownership_lost"
+                    )
+                    continue
                 # Signal breached — record TRIGGER_READY before firing callback.
                 _trigger_audit = self._build_watcher_audit_payload(
                     w,
@@ -5308,6 +5424,24 @@ class APEntryWatcher:
           → RETRY_OWNED / REARMED: retain in _pending (no removal)
           → FAILED: _enter_ownership_quarantine (retained, not active)
         """
+        if not self._claim_durable_overnight_callback_owner(
+            w, reason="terminal_callback_claimed"
+        ):
+            self._drop_stale_durable_watcher(
+                w, reason="terminal_attempt_ownership_lost"
+            )
+            from ap.pending_trigger_classifier import (
+                WatcherCompletionResult as _FenceWCR,
+                WatcherCompletionOutcome as _FenceWCO,
+            )
+            return _FenceWCR(
+                outcome=_FenceWCO.FAILED,
+                reason_code="durable_watcher_attempt_ownership_lost",
+                local_order_id=str(
+                    (getattr(w, "signal", {}) or {}).get("local_order_id") or ""
+                ) or None,
+            )
+
         # Persist pending audit before callback so cleanup can read the row.
         if pre_computed_audit:
             try:
@@ -5768,6 +5902,13 @@ class APEntryWatcher:
 
         for w in quarantined:
             _local_oid = str(w.signal.get("local_order_id") or "").strip()
+            if not self._claim_durable_overnight_callback_owner(
+                w, reason="quarantine_retry_callback_claimed"
+            ):
+                self._drop_stale_durable_watcher(
+                    w, reason="quarantine_retry_attempt_ownership_lost"
+                )
+                continue
             _deadline = w.cleanup_retry_deadline
             _deadline_expired = (_deadline is not None and now > _deadline)
 

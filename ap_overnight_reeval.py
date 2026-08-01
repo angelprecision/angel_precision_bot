@@ -1184,6 +1184,9 @@ def _log_overnight_watch_cleanup(
 def _cleanup_overnight_watch_arm_failure(
     *,
     order_state_machine,
+    signal_payload: dict,
+    session_key: str,
+    attempt: _WatchAttemptClaim,
     client_id: str,
     signal_id: str,
     execution_mode: str,
@@ -1213,11 +1216,70 @@ def _cleanup_overnight_watch_arm_failure(
         reason=reason,
     )
 
-    cleanup_method = "none"
+    cleanup_method = "ownership_fenced_expire_stale_pending_entry_cas"
     cleanup_success = False
 
+    # Destructive cleanup is authorized only by the exact durable attempt owner.
+    # Refreshing the same IN_PROGRESS owner under the PostgreSQL row lock also
+    # renews its lease.  A stale worker whose token/count/order was rotated by a
+    # recovery worker therefore cannot touch the order, while a worker that wins
+    # this CAS cannot be reclaimed between this proof and the order CAS below.
+    expected_bound_order = str(attempt.local_order_id or "").strip()
+    cleanup_order_id = str(local_order_id or "").strip()
+
+    def _cleanup_owner_predicate(state, count, token, order_id):
+        return (
+            state == WATCH_ATTEMPT_STATE_IN_PROGRESS
+            and token == attempt.token
+            and count == attempt.attempt_count
+            # The immutable claim object remains unbound after a successful
+            # _bind_watch_arm_attempt_order() CAS. Accept either its original
+            # blank value or this exact cleanup order; the token/count fence is
+            # what rejects a rotated owner. The write below durably binds the
+            # exact order before any destructive order CAS.
+            and order_id in {expected_bound_order, cleanup_order_id}
+        )
+
+    ownership_proven = bool(
+        attempt.disposition in {
+            WATCH_ATTEMPT_ACQUIRED,
+            WATCH_ATTEMPT_REATTACH_REQUIRED,
+        }
+        and attempt.token
+        and _pg_cas_write_attempt(
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            predicate=_cleanup_owner_predicate,
+            new_state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+            new_count=attempt.attempt_count,
+            new_token=attempt.token,
+            new_local_order_id=cleanup_order_id,
+            reason="watch_arm_cleanup_owner_proven",
+        )
+    )
+    if not ownership_proven:
+        _log_overnight_watch_cleanup(
+            done_event,
+            level="error",
+            client_id=client_id,
+            signal_id=signal_id,
+            ticker=ticker,
+            side=side,
+            local_order_id=local_order_id,
+            contract=contract,
+            contract_deferred=contract_deferred,
+            entry_trigger=entry_trigger,
+            cleanup_method=cleanup_method,
+            cleanup_success=False,
+            reason=f"{reason}:attempt_ownership_lost",
+        )
+        return False, cleanup_method
+
     if local_order_id:
-        cleanup_method = "expire_stale_pending_entry_cas"
         if (
             hasattr(order_state_machine, "get_order")
             and hasattr(order_state_machine, "expire_stale_pending_entry_cas")
@@ -1271,6 +1333,84 @@ def _cleanup_overnight_watch_arm_failure(
         reason=reason,
     )
     return cleanup_success, cleanup_method
+
+
+def _claim_watch_callback_owner(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    attempt: _WatchAttemptClaim,
+    local_order_id: str,
+    reason: str,
+) -> bool:
+    """Fence a watcher callback against cross-process restart takeover.
+
+    ARMED is converted to the same owner's leased IN_PROGRESS state under the
+    authoritative PostgreSQL row lock.  If a restart worker already rotated the
+    token, this CAS fails and the stale process must not submit, invalidate, or
+    terminalize the order.  Repeated callbacks by the same owner are idempotent
+    and renew the lease; crash recovery remains bounded by the existing lease.
+    """
+    local_order_id = str(local_order_id or "").strip()
+    if not (
+        attempt.token
+        and attempt.attempt_count >= 1
+        and local_order_id
+        and session_key
+        and canonical_signal_id
+    ):
+        return False
+
+    def _predicate(state, count, token, order_id):
+        return (
+            state in {WATCH_ATTEMPT_STATE_ARMED, WATCH_ATTEMPT_STATE_IN_PROGRESS}
+            and count == attempt.attempt_count
+            and token == attempt.token
+            and order_id == local_order_id
+        )
+
+    return _pg_cas_write_attempt(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+        predicate=_predicate,
+        new_state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        new_count=attempt.attempt_count,
+        new_token=attempt.token,
+        new_local_order_id=local_order_id,
+        reason=str(reason or "watcher_callback_owner_claimed"),
+        required_order_status="PENDING_TRIGGER",
+    )
+
+
+def _stamp_watch_attempt_fence(
+    plan,
+    *,
+    attempt: _WatchAttemptClaim,
+    canonical_signal_id: str,
+    session_key: str,
+) -> None:
+    """Carry immutable durable-attempt identity into the process watcher."""
+    meta = getattr(plan, "metadata", None) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.update({
+        "overnight_watch_attempt_token": str(attempt.token or ""),
+        "overnight_watch_attempt_count": int(attempt.attempt_count or 0),
+        "overnight_watch_attempt_session_key": str(session_key or ""),
+        "overnight_watch_attempt_canonical_signal_id": str(
+            canonical_signal_id or ""
+        ),
+        "overnight_watch_attempt_fenced": True,
+    })
+    setattr(plan, "metadata", meta)
 
 
 def _resolve_canonical_signal_id(signal_id: str, signal: dict) -> str:
@@ -2742,7 +2882,12 @@ def _atomic_claim_watch_arm_attempt(
                         "attempt_prior_order_changed",
                     )
 
-                if count >= max_attempts:
+                unbound_retry_resume = (
+                    state == WATCH_ATTEMPT_STATE_RETRYABLE
+                    and not prior_order_id
+                    and count >= 1
+                )
+                if count >= max_attempts and not unbound_retry_resume:
                     exhausted_meta = _attempt_meta_patch(
                         existing_meta=meta,
                         execution_mode=mode,
@@ -2765,7 +2910,11 @@ def _atomic_claim_watch_arm_attempt(
                     )
 
                 token = uuid.uuid4().hex
-                next_count = count + 1
+                # An unbound RETRYABLE claim did not materialize an order and
+                # therefore did not consume another bounded arm attempt. Rotate
+                # its token while preserving the count, matching expired-unbound
+                # lease recovery. Bound/terminal attempts still advance normally.
+                next_count = count if unbound_retry_resume else count + 1
                 next_meta = _attempt_meta_patch(
                     existing_meta=meta,
                     execution_mode=mode,
@@ -3480,9 +3629,11 @@ def _recover_materialized_watch_before_admission(
             True, "ALREADY_RESOLVED", attempt.reason, attempt.local_order_id,
         )
     if attempt.disposition == WATCH_ATTEMPT_ACQUIRED:
-        # The advisory recovery probe and locked claim disagreed. Close the
-        # accidentally acquired unbound owner and fail closed; never let this
-        # race become a new order that bypassed admission validation.
+        # The advisory recovery probe and locked claim disagreed. Release the
+        # accidentally acquired unbound owner to RETRYABLE, then return to the
+        # ordinary admission path.  The caller will run Master Control before it
+        # may claim/create anything; this race must not permanently poison the
+        # canonical opportunity as ERROR.
         completion_ok = _complete_watch_arm_attempt_checked(
             signal_id=signal_id,
             client_id=client_id,
@@ -3491,19 +3642,16 @@ def _recover_materialized_watch_before_admission(
             execution_mode=execution_mode,
             session_key=session_key,
             attempt=attempt,
-            state=WATCH_ATTEMPT_STATE_ERROR,
+            state=WATCH_ATTEMPT_STATE_RETRYABLE,
             local_order_id="",
             reason="early_recovery_preflight_changed",
             ticker=ticker,
             caller="early_recovery_preflight_changed",
         )
+        if completion_ok:
+            return _EarlyWatchRecoveryResult(False)
         return _EarlyWatchRecoveryResult(
-            True,
-            "ERROR",
-            (
-                "early_recovery_preflight_changed"
-                if completion_ok else "early_recovery_completion_failed"
-            ),
+            True, "ERROR", "early_recovery_completion_failed",
         )
     if attempt.disposition != WATCH_ATTEMPT_REATTACH_REQUIRED:
         outcome = (
@@ -3708,6 +3856,12 @@ def _recover_materialized_watch_before_admission(
 
     if not watcher_armed:
         try:
+            _stamp_watch_attempt_fence(
+                plan,
+                attempt=attempt,
+                canonical_signal_id=canonical_signal_id,
+                session_key=session_key,
+            )
             watcher_armed = bool(entry_watcher.watch(
                 plan,
                 local_order_id,
@@ -6005,33 +6159,11 @@ def run_overnight_reeval(
             # Use a fresh REEVAL: signal_id so master_control dedup doesn't block it.
             # The original signal was already deduped when it first arrived — overnight
             # reeval is a legitimate second evaluation of the same setup.
-            _recovery_skip_mc = False
-            _recovery_canonical = _resolve_canonical_signal_id(signal_id, signal)
-            _recovery_probe = _read_attempt_scope_unlocked(
-                _recovery_canonical, client_id, _execution_mode, session_key,
-            )
-            if _recovery_probe is not None:
-                (_rp_state, _rp_count, _rp_token, _rp_order_id) = _recovery_probe
-                if _rp_state in {
-                    WATCH_ATTEMPT_STATE_IN_PROGRESS,
-                    WATCH_ATTEMPT_STATE_RETRYABLE,
-                    WATCH_ATTEMPT_STATE_ARMED,
-                }:
-                    if _rp_order_id:
-                        _rp_lookup, _rp_row = _query_exact_entry_order_by_local_id(
-                            _rp_order_id, client_id, _execution_mode,
-                            _recovery_canonical,
-                        )
-                    else:
-                        _rp_lookup, _rp_row = _query_active_entry_order(
-                            client_id, _execution_mode, _recovery_canonical,
-                        )
-                    _rp_status = str((_rp_row or {}).get("status") or "").upper()
-                    _recovery_skip_mc = (
-                        _rp_lookup == _LS_FOUND
-                        and _rp_status in _ACTIVE_ENTRY_OWN_STATUSES
-                    )
-
+            # Materialized recovery is handled authoritatively by
+            # _recover_materialized_watch_before_admission().  Never bypass
+            # Master Control from a later advisory read: if that read changes
+            # before the locked claim, an ACQUIRED result must restart ordinary
+            # admission instead of creating from a hydrated recovery plan.
             try:
                 import uuid as _uuid2
                 reeval_signal = {**signal, "signal_id": f"REEVAL:{signal_id}:{_uuid2.uuid4().hex[:6]}"}
@@ -6050,22 +6182,9 @@ def run_overnight_reeval(
                         "symbol signal=%s client=%s err=%s",
                         ticker, signal_id, client_id, contract_exc,
                     )
-                if _recovery_skip_mc:
-                    import types as _types_recovery
-                    decision = _types_recovery.SimpleNamespace(
-                        ok=True,
-                        plan=_hydrate_plan_from_signal(
-                            signal,
-                            client_id=client_id,
-                            execution_mode=_execution_mode,
-                        ),
-                        reason="durable_watch_recovery_preflight",
-                        score=float(signal.get("score") or 0),
-                    )
-                else:
-                    decision = master_control.evaluate(
-                        reeval_signal, client_id=client_id,
-                    )
+                decision = master_control.evaluate(
+                    reeval_signal, client_id=client_id,
+                )
                 if not decision.ok:
                     # Classify the rejection: intel/second-score vs hard safety.
                     # When OVERNIGHT_REEVAL_SCORE_RECHECK_ENABLED=false, morning
@@ -6910,6 +7029,12 @@ def run_overnight_reeval(
 
                     if not _rr_already_owned:
                         try:
+                            _stamp_watch_attempt_fence(
+                                _rr_plan,
+                                attempt=_watch_attempt,
+                                canonical_signal_id=_canonical_for_attempt,
+                                session_key=session_key,
+                            )
                             _rr_armed = entry_watcher.watch(
                                 _rr_plan, _reattach_oid,
                                 recovery_rearm=True,
@@ -7063,41 +7188,6 @@ def run_overnight_reeval(
                     result["skipped"] = result.get("skipped", 0) + 1
                     result["retryable_deferred"] += 1
                     continue
-                if _recovery_skip_mc:
-                    # The advisory preflight saw an existing active owner, but
-                    # the locked claim no longer agrees. Never turn that race
-                    # into a replacement order that bypassed Master Control.
-                    # The locked claim returned ACQUIRED, so close that exact
-                    # owner before leaving; otherwise this retryable-looking
-                    # exit strands a fresh IN_PROGRESS lease.
-                    _preflight_completion_ok = _complete_watch_arm_attempt_checked(
-                        signal_id=signal_id,
-                        client_id=client_id,
-                        canonical_signal_id=_canonical_for_attempt,
-                        signal_payload=signal,
-                        execution_mode=_execution_mode,
-                        session_key=session_key,
-                        attempt=_watch_attempt,
-                        state=WATCH_ATTEMPT_STATE_ERROR,
-                        local_order_id="",
-                        reason="overnight_watch_recovery_preflight_changed",
-                        ticker=ticker,
-                        caller="recovery_preflight_changed_after_acquire",
-                    )
-                    _mark_job_error(
-                        job_id,
-                        client_id,
-                        (
-                            "overnight_watch_recovery_preflight_changed"
-                            if _preflight_completion_ok
-                            else "overnight_watch_arm_attempt_completion_failed:"
-                            "recovery_preflight_changed_after_acquire"
-                        ),
-                    )
-                    result["errors"] += 1
-                    result["terminal_errors"] += 1
-                    continue
-
             # Step 6: Create OSM entry order — let OSM generate a fresh UUID.
             # Do NOT pass local_order_id: static IDs cause OSM conflicts on retry.
             # For deferred contracts: ensure contract_symbol is NOT set to the
@@ -7217,6 +7307,9 @@ def run_overnight_reeval(
                 _bind_reason = "overnight_watch_arm_attempt_bind_failed"
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                     order_state_machine=order_state_machine,
+                    signal_payload=signal,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
                     client_id=client_id,
                     signal_id=signal_id,
                     execution_mode=_execution_mode,
@@ -7358,6 +7451,12 @@ def run_overnight_reeval(
             _contract_sym = str(getattr(decision.plan, "contract_symbol", "") or "")
             _arm_label    = _contract_sym if _contract_sym else "DEFERRED_AT_BREACH"
             try:
+                _stamp_watch_attempt_fence(
+                    decision.plan,
+                    attempt=_watch_attempt,
+                    canonical_signal_id=_canonical_for_attempt,
+                    session_key=session_key,
+                )
                 armed = entry_watcher.watch(decision.plan, local_order_id)
                 if armed:
                     try:
@@ -7539,6 +7638,9 @@ def run_overnight_reeval(
                             )
                             _conflict_cleanup_success, _conflict_cleanup_method = _cleanup_overnight_watch_arm_failure(
                                 order_state_machine=order_state_machine,
+                                signal_payload=signal,
+                                session_key=session_key,
+                                attempt=_watch_attempt,
                                 client_id=client_id,
                                 signal_id=signal_id,
                                 execution_mode=_execution_mode,
@@ -7617,6 +7719,9 @@ def run_overnight_reeval(
                         # was canceled by the watcher's dedup path. Idempotent success.
                         _dup_cleanup_success, _dup_cleanup_method = _cleanup_overnight_watch_arm_failure(
                             order_state_machine=order_state_machine,
+                            signal_payload=signal,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
                             client_id=client_id,
                             signal_id=signal_id,
                             execution_mode=_execution_mode,
@@ -7703,6 +7808,9 @@ def run_overnight_reeval(
                     )
                     _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                         order_state_machine=order_state_machine,
+                        signal_payload=signal,
+                        session_key=session_key,
+                        attempt=_watch_attempt,
                         client_id=client_id,
                         signal_id=signal_id,
                         execution_mode=_execution_mode,
@@ -7887,6 +7995,9 @@ def run_overnight_reeval(
                 _full_error = f"overnight_watch_arm_failed:exception:{ew_exc}"
                 _cleanup_success, _cleanup_method = _cleanup_overnight_watch_arm_failure(
                     order_state_machine=order_state_machine,
+                    signal_payload=signal,
+                    session_key=session_key,
+                    attempt=_watch_attempt,
                     client_id=client_id,
                     signal_id=signal_id,
                     execution_mode=_execution_mode,

@@ -2366,7 +2366,7 @@ def test_direct_cas_refuses_durable_recovery_scheduler_owner(monkeypatch):
     ],
 )
 def test_watch_failure_cleanup_passes_and_enforces_full_identity(
-    row_mode, row_canonical, expected_reason,
+    monkeypatch, row_mode, row_canonical, expected_reason,
 ):
     """A same-client row with the wrong mode/canonical must survive cleanup."""
     import ap_overnight_reeval as ov
@@ -2392,9 +2392,15 @@ def test_watch_failure_cleanup_passes_and_enforces_full_identity(
         return result
 
     osm.expire_stale_pending_entry_cas = _cas_spy
+    monkeypatch.setattr(ov, "_pg_cas_write_attempt", lambda **_kw: True)
 
     ok, method = ov._cleanup_overnight_watch_arm_failure(
         order_state_machine=osm,
+        signal_payload={"ticker": "AAPL"},
+        session_key="2026-06-12",
+        attempt=ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_ACQUIRED, "token-1", 1, ""
+        ),
         client_id="client-1",
         signal_id="sig-001",
         execution_mode="live",
@@ -2410,7 +2416,7 @@ def test_watch_failure_cleanup_passes_and_enforces_full_identity(
     )
 
     assert ok is False
-    assert method == "expire_stale_pending_entry_cas"
+    assert method == "ownership_fenced_expire_stale_pending_entry_cas"
     assert captured["expected_execution_mode"] == "live"
     assert captured["expected_canonical_signal_id"] == "CANON-001"
     assert captured["result"] == (False, expected_reason)
@@ -3908,7 +3914,9 @@ def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_pr
         "overnight_watch_arm_failed_cleanup_failed:overnight_watch_arm_failed:armed_false"
     )
     assert proof["metadata"]["overnight_watch_arm_cleanup_failed"] is True
-    assert proof["metadata"]["cleanup_method"] == "expire_stale_pending_entry_cas"
+    assert proof["metadata"]["cleanup_method"] == (
+        "ownership_fenced_expire_stale_pending_entry_cas"
+    )
     assert proof["metadata"]["cleanup_success"] is False
     assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:armed_false"
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED" in caplog.text
@@ -3916,7 +3924,7 @@ def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_pr
     assert "overnight_watch_arm_failed_cleanup_failed" in caplog.text
 
 
-def test_watch_cleanup_never_bypasses_guard_refusal_with_generic_transition():
+def test_watch_cleanup_never_bypasses_guard_refusal_with_generic_transition(monkeypatch):
     import ap_overnight_reeval as ov
 
     osm = _FakeOrderStateMachine(cleanup_succeeds=True)
@@ -3929,9 +3937,15 @@ def test_watch_cleanup_never_bypasses_guard_refusal_with_generic_transition():
             "recovery_submit_owner": "recovery_scheduler:client-1",
         },
     }
+    monkeypatch.setattr(ov, "_pg_cas_write_attempt", lambda **_kw: True)
 
     ok, method = ov._cleanup_overnight_watch_arm_failure(
         order_state_machine=osm,
+        signal_payload={"ticker": "AAPL"},
+        session_key="2026-06-12",
+        attempt=ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_ACQUIRED, "token-1", 1, ""
+        ),
         client_id="client-1",
         signal_id="sig-001",
         execution_mode="paper",
@@ -3947,7 +3961,7 @@ def test_watch_cleanup_never_bypasses_guard_refusal_with_generic_transition():
     )
 
     assert ok is False
-    assert method == "expire_stale_pending_entry_cas"
+    assert method == "ownership_fenced_expire_stale_pending_entry_cas"
     assert osm.transition_calls == []
     assert osm.orders["recovery-owned-1"]["status"] == "PENDING_TRIGGER"
 
@@ -4235,15 +4249,14 @@ def test_retryable_cleanup_completion_failure_is_terminal_error_not_fake_retry(m
 
 
 @pytest.mark.parametrize("completion_ok", [True, False])
-def test_late_recovery_preflight_race_completes_acquired_owner(
+def test_late_recovery_advisory_cannot_bypass_master_control(
     monkeypatch, completion_ok,
 ):
-    """An advisory recovery hit followed by a locked ACQUIRED claim is terminal.
+    """A later advisory recovery hit cannot install a hydrated MC bypass.
 
-    Master Control was intentionally bypassed, so this race cannot create an
-    order. The exact acquired owner must be completed before the caller exits;
-    a lost completion CAS must remain a terminal error, never fake retryable
-    progress.
+    The synthetic claim below is not present in the fake ledger, so its bind
+    fails after creation.  The safety assertion is that normal Master Control
+    ran before that creation; selector and broker submission remain untouched.
     """
     import ap_overnight_reeval as ov
 
@@ -4299,20 +4312,105 @@ def test_late_recovery_preflight_race_completes_acquired_owner(
     assert result["retryable_deferred"] == 0
     assert result["errors"] == 1
     assert result["terminal_errors"] == 1
-    assert osm.create_calls == 0
+    assert osm.create_calls == 1
     watcher.watch.assert_not_called()
-    controls["master_control"].evaluate.assert_not_called()
+    controls["master_control"].evaluate.assert_called_once()
     controls["contract_selector"].select.assert_not_called()
     controls["broker"].submit_order.assert_not_called()
     complete.assert_called_once()
     assert complete.call_args.kwargs["state"] == ov.WATCH_ATTEMPT_STATE_ERROR
-    expected_reason = (
-        "overnight_watch_recovery_preflight_changed"
-        if completion_ok
-        else "overnight_watch_arm_attempt_completion_failed:"
-        "recovery_preflight_changed_after_acquire"
+    assert any(
+        "overnight_watch_arm_attempt_bind_failed" in reason
+        or "bind_cleanup_completion_failed" in reason
+        for _, _, reason in error_calls
     )
-    assert any(reason == expected_reason for _, _, reason in error_calls)
+
+
+def test_early_recovery_preflight_race_releases_to_normal_admission(monkeypatch):
+    """An advisory/locked disagreement is retriable, never permanent ERROR."""
+    import ap_overnight_reeval as ov
+
+    monkeypatch.setattr(
+        ov, "_read_attempt_scope_unlocked",
+        lambda *_args: (ov.WATCH_ATTEMPT_STATE_RETRYABLE, 1, "old", "old-order"),
+    )
+    monkeypatch.setattr(
+        ov, "_query_exact_entry_order_by_local_id",
+        lambda *_args: (
+            ov._LS_FOUND,
+            {"local_order_id": "old-order", "status": "PENDING_TRIGGER"},
+        ),
+    )
+    monkeypatch.setattr(
+        ov, "_claim_watch_arm_attempt",
+        lambda **_kw: ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_ACQUIRED, "new-token", 2, "", "race_reacquired"
+        ),
+    )
+    complete = MagicMock(return_value=True)
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", complete)
+
+    recovered = ov._recover_materialized_watch_before_admission(
+        order_state_machine=MagicMock(),
+        entry_watcher=MagicMock(),
+        signal_id="sig-001",
+        canonical_signal_id="CANON-001",
+        client_id="client-1",
+        execution_mode="paper",
+        session_key="2026-06-12",
+        signal_payload={"ticker": "AAPL", "side": "CALL"},
+        ticker="AAPL",
+        job_id="job-1",
+        job_source="trade_queue",
+    )
+
+    assert recovered.handled is False
+    complete.assert_called_once()
+    assert complete.call_args.kwargs["state"] == ov.WATCH_ATTEMPT_STATE_RETRYABLE
+    assert complete.call_args.kwargs["local_order_id"] == ""
+
+
+def test_cleanup_refuses_order_when_exact_attempt_owner_is_lost(monkeypatch):
+    import ap_overnight_reeval as ov
+
+    osm = _FakeOrderStateMachine()
+    osm.orders["order-owned-by-b"] = {
+        "local_order_id": "order-owned-by-b",
+        "client_id": "client-1",
+        "canonical_signal_id": "CANON-001",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "execution_mode": "paper",
+        "updated_ts": "v1",
+        "meta": {},
+    }
+    monkeypatch.setattr(ov, "_pg_cas_write_attempt", lambda **_kw: False)
+
+    ok, method = ov._cleanup_overnight_watch_arm_failure(
+        order_state_machine=osm,
+        signal_payload={"ticker": "AAPL"},
+        session_key="2026-06-12",
+        attempt=ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_ACQUIRED, "stale-token-a", 1, ""
+        ),
+        client_id="client-1",
+        signal_id="sig-001",
+        execution_mode="paper",
+        canonical_signal_id="CANON-001",
+        ticker="AAPL",
+        side="CALL",
+        local_order_id="order-owned-by-b",
+        contract="DEFERRED:AAPL",
+        contract_deferred=True,
+        entry_trigger=101.0,
+        reason="bind_failed_after_owner_rotation",
+        done_event="TEST_STALE_OWNER_CLEANUP_REFUSED",
+    )
+
+    assert ok is False
+    assert method == "ownership_fenced_expire_stale_pending_entry_cas"
+    assert osm.expire_calls == []
+    assert osm.orders["order-owned-by-b"]["status"] == "PENDING_TRIGGER"
 
 
 def test_watch_false_terminal_proof_rejects_cross_scope_order(monkeypatch):
@@ -4587,7 +4685,9 @@ def test_overnight_watch_exception_cleanup_failure_marks_cleanup_failed_error_an
         "overnight_watch_arm_failed:exception:watcher boom"
     )
     assert proof["metadata"]["overnight_watch_arm_cleanup_failed"] is True
-    assert proof["metadata"]["cleanup_method"] == "expire_stale_pending_entry_cas"
+    assert proof["metadata"]["cleanup_method"] == (
+        "ownership_fenced_expire_stale_pending_entry_cas"
+    )
     assert proof["metadata"]["cleanup_success"] is False
     assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED" in caplog.text
