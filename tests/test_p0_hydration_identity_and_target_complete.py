@@ -28,6 +28,7 @@ def test_hydrate_plan_from_signal_carries_signal_id_and_canonical():
         {
             "signal_id":         "sig-abc",
             "canonical_signal_id": "canon-abc",
+            "plan_id":           "plan-abc",
             "ticker":            "AAPL",
             "side":              "CALL",
             "entry_trigger":     101.0,
@@ -39,6 +40,7 @@ def test_hydrate_plan_from_signal_carries_signal_id_and_canonical():
     )
     assert plan.signal_id == "sig-abc"
     assert plan.canonical_signal_id == "canon-abc"
+    assert plan.plan_id == "plan-abc"
     assert plan.client_id == "jose@example.com"
     assert plan.execution_mode == "paper"
     assert plan.stop_underlying == 99.0
@@ -46,6 +48,7 @@ def test_hydrate_plan_from_signal_carries_signal_id_and_canonical():
     # Metadata carries them too.
     assert plan.metadata["signal_id"] == "sig-abc"
     assert plan.metadata["canonical_signal_id"] == "canon-abc"
+    assert plan.metadata["plan_id"] == "plan-abc"
     assert plan.metadata["client_id"] == "jose@example.com"
     assert plan.metadata["execution_mode"] == "paper"
 
@@ -66,6 +69,7 @@ def test_hydrate_plan_from_signal_derives_canonical_when_missing():
         execution_mode="live",
     )
     assert plan.canonical_signal_id  # non-empty
+    assert plan.plan_id == plan.canonical_signal_id
     assert plan.stop_underlying == 502.0
     assert plan.target_underlying == 490.0
 
@@ -80,6 +84,7 @@ def test_hydrate_plan_from_signal_missing_fields_do_not_raise():
         execution_mode="paper",
     )
     assert plan.signal_id == "s1"
+    assert plan.plan_id
     assert plan.stop_underlying is None
     assert plan.target_underlying is None
 

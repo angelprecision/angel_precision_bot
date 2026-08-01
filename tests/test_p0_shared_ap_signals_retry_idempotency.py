@@ -574,11 +574,11 @@ def test_9b_filled_as_already_owned(monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST 10: Watcher success proof write failure stays retryable
+# TEST 10: Watcher success proof write failure is never fake retryable progress
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_10_watcher_armed_but_proof_write_fails(monkeypatch):
-    """If watch() succeeds but WATCHER_ARMED write fails → retryable_deferred, not armed."""
+    """A live watcher plus missing secondary proof is an operator-visible error."""
     _install_base_stubs(monkeypatch)
 
     # Resolver returns NEW (no prior record).
@@ -636,9 +636,9 @@ def test_10_watcher_armed_but_proof_write_fails(monkeypatch):
     assert result["armed"] == 0, (
         f"armed should be 0 when proof write fails; got {result['armed']}"
     )
-    assert result["retryable_deferred"] >= 1, (
-        "row must be retryable_deferred when proof write fails"
-    )
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

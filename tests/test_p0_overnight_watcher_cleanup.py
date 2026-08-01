@@ -51,6 +51,7 @@ class _FakeOrderStateMachine:
             "status": initial_status,
             "execution_mode": execution_mode,
             "created_ts": self._created_seq,
+            "updated_ts": str(self._created_seq),
             "contract": getattr(plan, "contract_symbol", None),
             "meta": kwargs.get("meta") or {},
         }
@@ -86,6 +87,7 @@ class _FakeOrderStateMachine:
         """Atomic stale-expiration CAS shim. Mirrors OSM: row-version fence on
         (status, updated_ts) plus the pending-entry ownership guard. Returns
         (ok, failure_reason)."""
+        self.expire_calls.append((local_order_id, reason))
         row = self.orders.get(local_order_id)
         if not row:
             return False, "order_not_found"
@@ -2913,7 +2915,7 @@ def test_runtime_reattach_exception_retries_same_order(monkeypatch):
     assert osm.orders["prior-1"]["status"] == "PENDING_TRIGGER"
 
 
-def test_runtime_reattach_proof_failure_completes_retryable(monkeypatch):
+def test_runtime_reattach_proof_failure_completes_armed_and_errors(monkeypatch):
     import ap_overnight_reeval as ov
 
     ledger = _FakeOpportunityLedger()
@@ -2930,11 +2932,88 @@ def test_runtime_reattach_proof_failure_completes_retryable(monkeypatch):
     )
 
     scope = _attempt_scope(ledger)
-    assert scope["state"] == "RETRYABLE"
+    assert scope["state"] == "ARMED"
     assert scope["count"] == 2
     assert scope["local_order_id"] == "prior-1"
-    assert result["retryable_deferred"] == 1
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
     assert osm.create_calls == 0
+
+
+def test_runtime_reattach_proof_uses_actual_ap_signals_source(monkeypatch):
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    _seed_expired_runtime_reattach(ledger)
+    _seed_runtime_pending_order(osm)
+    watcher = MagicMock()
+    watcher.has_order.return_value = False
+    watcher.watch.return_value = True
+    captured = []
+
+    monkeypatch.setattr(
+        ov,
+        "_recover_materialized_watch_before_admission",
+        lambda **kw: ov._EarlyWatchRecoveryResult(False),
+    )
+
+    def _capture_proof(**kwargs):
+        captured.append(kwargs)
+        return True
+
+    monkeypatch.setattr(ov, "_persist_watcher_armed_proof", _capture_proof)
+    result, osm, *_ = _run_reeval(
+        monkeypatch,
+        watcher,
+        source="ap_signals",
+        ledger=ledger,
+        osm=osm,
+    )
+
+    assert result["armed"] == 1
+    assert captured[-1]["extra_meta"]["source_table"] == "ap_signals"
+    assert osm.create_calls == 0
+
+
+def test_durable_armed_restart_reacquires_and_reattaches_same_order_same_count(monkeypatch):
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    watcher1 = MagicMock()
+    watcher1.watch.return_value = True
+
+    result1, osm, *_ = _run_reeval(
+        monkeypatch, watcher1, ledger=ledger, osm=osm,
+    )
+    scope1 = _attempt_scope(ledger)
+    assert result1["armed"] == 1
+    assert scope1["state"] == "ARMED"
+    assert scope1["count"] == 1
+    assert scope1["local_order_id"] == "local-ord-1"
+
+    # Fresh process: durable ARMED survives, the in-memory registry does not.
+    watcher2 = MagicMock()
+    watcher2.has_order.return_value = False
+    watcher2.watch.return_value = True
+    result2, osm, *_ = _run_reeval(
+        monkeypatch, watcher2, ledger=ledger, osm=osm,
+    )
+
+    scope2 = _attempt_scope(ledger)
+    assert result2["armed"] == 1
+    assert scope2["state"] == "ARMED"
+    assert scope2["count"] == 1
+    assert scope2["local_order_id"] == "local-ord-1"
+    assert osm.create_calls == 1
+    assert watcher2.has_order.call_count == 2
+    assert all(call.args == ("local-ord-1",) for call in watcher2.has_order.call_args_list)
+    watcher2.watch.assert_called_once()
+    assert watcher2.watch.call_args.args[1] == "local-ord-1"
+    assert watcher2.watch.call_args.kwargs == {
+        "recovery_rearm": True,
+        "no_cancel_on_reject": True,
+    }
 
 
 def test_runtime_reattach_completion_cas_failure_recovers_after_lease(monkeypatch):
@@ -3255,14 +3334,13 @@ def test_watcher_exception_terminal_proof_failure_remains_error(monkeypatch):
     ledger = _FakeOpportunityLedger()
 
     class _CleanupYesButNotTerminalOSM(_FakeOrderStateMachine):
-        def expire_pending_entry(self, local_order_id, *, reason=""):
+        def expire_stale_pending_entry_cas(
+            self, local_order_id, *, expected_status, expected_updated_ts, reason="",
+        ):
             # Say success but do NOT change status. Readback still shows
             # PENDING_TRIGGER, so terminal proof fails.
             self.expire_calls.append((local_order_id, reason))
-            return True
-        def cancel_pending_entry(self, local_order_id, *, reason=""):
-            self.cancel_calls.append((local_order_id, reason))
-            return True
+            return True, ""
 
     osm = _CleanupYesButNotTerminalOSM()
     entry_watcher = MagicMock()
@@ -3656,28 +3734,54 @@ def test_overnight_watch_false_cleanup_failure_marks_cleanup_failed_error_and_pr
     assert osm.expire_calls == [
         ("local-ord-1", "overnight_watch_arm_failed:armed_false")
     ]
-    assert osm.cancel_calls == [
-        ("local-ord-1", "overnight_watch_arm_failed:armed_false")
-    ]
-    assert osm.transition_calls == [
-        (
-            "local-ord-1",
-            "EXPIRED",
-            {"last_error": "overnight_watch_arm_failed:armed_false"},
-        )
-    ]
+    assert osm.cancel_calls == []
+    assert osm.transition_calls == []
     proof = ledger.rows[("CANON-001", "client-1")]
     assert proof["opportunity_status"] == "INTERNAL_ERROR"
     assert proof["miss_reason"] == (
         "overnight_watch_arm_failed_cleanup_failed:overnight_watch_arm_failed:armed_false"
     )
     assert proof["metadata"]["overnight_watch_arm_cleanup_failed"] is True
-    assert proof["metadata"]["cleanup_method"] == "transition:EXPIRED"
+    assert proof["metadata"]["cleanup_method"] == "expire_stale_pending_entry_cas"
     assert proof["metadata"]["cleanup_success"] is False
     assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:armed_false"
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED" in caplog.text
     assert "cleanup_success=False" in caplog.text
     assert "overnight_watch_arm_failed_cleanup_failed" in caplog.text
+
+
+def test_watch_cleanup_never_bypasses_guard_refusal_with_generic_transition():
+    import ap_overnight_reeval as ov
+
+    osm = _FakeOrderStateMachine(cleanup_succeeds=True)
+    osm.orders["recovery-owned-1"] = {
+        "local_order_id": "recovery-owned-1",
+        "status": "PENDING_TRIGGER",
+        "updated_ts": "1",
+        "meta": {
+            "recovery_ownership": "recovery_scheduler",
+            "recovery_submit_owner": "recovery_scheduler:client-1",
+        },
+    }
+
+    ok, method = ov._cleanup_overnight_watch_arm_failure(
+        order_state_machine=osm,
+        client_id="client-1",
+        signal_id="sig-001",
+        ticker="AAPL",
+        side="CALL",
+        local_order_id="recovery-owned-1",
+        contract="AAPL260619C00100000",
+        contract_deferred=False,
+        entry_trigger=101.0,
+        reason="watch_failed",
+        done_event="TEST_CLEANUP_DONE",
+    )
+
+    assert ok is False
+    assert method == "expire_stale_pending_entry_cas"
+    assert osm.transition_calls == []
+    assert osm.orders["recovery-owned-1"]["status"] == "PENDING_TRIGGER"
 
 
 _ACTIVE_ENTRY_STATUSES = {
@@ -3790,6 +3894,36 @@ def test_watcher_true_but_armed_completion_failure_is_not_reported_armed(monkeyp
     assert any(reason.endswith(":ARMED") for _, _, reason in error_calls)
     assert osm.create_calls == 1
     assert osm.orders["local-ord-1"]["status"] == "PENDING_TRIGGER"
+    entry_watcher.watch.assert_called_once()
+    assert controls["broker"].submit_order.call_count == 0
+
+
+def test_ap_signals_proof_failure_completes_attempt_armed_and_reports_error(monkeypatch):
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    entry_watcher = MagicMock()
+    entry_watcher.watch.return_value = True
+    monkeypatch.setattr(ov, "_persist_watcher_armed_proof", lambda **kw: False)
+
+    result, osm, _, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="ap_signals",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    scope = _attempt_scope(ledger)
+    assert scope["state"] == "ARMED"
+    assert scope["local_order_id"] == "local-ord-1"
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert error_calls[-1][2] == "overnight_watcher_armed_proof_persistence_failed"
     entry_watcher.watch.assert_called_once()
     assert controls["broker"].submit_order.call_count == 0
 
@@ -4285,7 +4419,7 @@ def test_overnight_watch_exception_cleanup_failure_marks_cleanup_failed_error_an
         "overnight_watch_arm_failed:exception:watcher boom"
     )
     assert proof["metadata"]["overnight_watch_arm_cleanup_failed"] is True
-    assert proof["metadata"]["cleanup_method"] == "transition:EXPIRED"
+    assert proof["metadata"]["cleanup_method"] == "expire_stale_pending_entry_cas"
     assert proof["metadata"]["cleanup_success"] is False
     assert proof["metadata"]["original_reason"] == "overnight_watch_arm_failed:exception:watcher boom"
     assert "OVERNIGHT_WATCH_ARM_FAILED_CLEANUP_FAILED" in caplog.text

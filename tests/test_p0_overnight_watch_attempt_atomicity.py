@@ -1747,12 +1747,19 @@ def test_real_postgres_runtime_reattaches_once_then_observes_armed(
     )
 
     assert result2["armed"] == 1
-    watcher2.watch.assert_not_called()
+    watcher2.has_order.assert_called_once_with(_REATTACH_OID)
+    watcher2.watch.assert_called_once()
+    assert watcher2.watch.call_args.args[1] == _REATTACH_OID
+    assert watcher2.watch.call_args.kwargs == {
+        "recovery_rearm": True,
+        "no_cancel_on_reject": True,
+    }
     master_control.evaluate.assert_not_called()
     selector.select.assert_not_called()
     osm.create_entry_order.assert_not_called()
     broker.submit_order.assert_not_called()
-    assert len(proof_calls) == 1
+    assert len(proof_calls) == 2
+    assert _read_scope_reattach(mode="live")["count"] == 2
     assert _count_orders() == 1
 
 

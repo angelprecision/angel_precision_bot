@@ -887,6 +887,7 @@ def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
         or _resolve_canonical_signal_id(_sid, signal)
         or ""
     ).strip()
+    _plan_id = str(signal.get("plan_id") or _canon or _sid).strip()
     _mode = str(execution_mode or "").strip().lower() or None
     return _types.SimpleNamespace(
         ticker              = signal.get("ticker") or signal.get("symbol"),
@@ -907,6 +908,7 @@ def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
         # Identity + risk fields the watcher reads from the plan.
         signal_id           = _sid,
         canonical_signal_id = _canon,
+        plan_id             = _plan_id,
         client_id           = client_id,
         execution_mode      = _mode,
         stop_underlying     = _stop,
@@ -917,6 +919,7 @@ def _hydrate_plan_from_signal(signal, *, client_id=None, execution_mode=None):
             "second_score_mode":     "observe_only",
             "signal_id":             _sid,
             "canonical_signal_id":   _canon,
+            "plan_id":               _plan_id,
             "client_id":             client_id,
             "execution_mode":        _mode,
             "stop_underlying":       _stop,
@@ -1202,57 +1205,39 @@ def _cleanup_overnight_watch_arm_failure(
     cleanup_success = False
 
     if local_order_id:
-        if hasattr(order_state_machine, "expire_pending_entry"):
-            cleanup_method = "expire_pending_entry"
+        cleanup_method = "expire_stale_pending_entry_cas"
+        if (
+            hasattr(order_state_machine, "get_order")
+            and hasattr(order_state_machine, "expire_stale_pending_entry_cas")
+        ):
             try:
-                cleanup_success = bool(
-                    order_state_machine.expire_pending_entry(
+                observed = order_state_machine.get_order(local_order_id)
+                observed = dict(observed) if isinstance(observed, dict) else {}
+                observed_status = str(observed.get("status") or "").strip().upper()
+                observed_updated_ts = observed.get("updated_ts")
+                if not observed or not observed_status or observed_updated_ts is None:
+                    cleanup_success = False
+                else:
+                    cleanup_result = order_state_machine.expire_stale_pending_entry_cas(
                         local_order_id,
+                        expected_status=observed_status,
+                        expected_updated_ts=observed_updated_ts,
                         reason=reason,
                     )
-                )
+                    cleanup_success = bool(
+                        cleanup_result[0]
+                        if isinstance(cleanup_result, tuple)
+                        else cleanup_result
+                    )
             except Exception as exp_exc:
                 log.error(
-                    "[%s] overnight_reeval: expire_pending_entry cleanup failed "
+                    "[%s] overnight_reeval: fenced pending-entry cleanup failed "
                     "| local_order_id=%s reason=%s error=%s",
                     ticker, local_order_id, reason, exp_exc,
                 )
                 cleanup_success = False
-
-        if not cleanup_success and hasattr(order_state_machine, "cancel_pending_entry"):
-            cleanup_method = "cancel_pending_entry"
-            try:
-                cleanup_success = bool(
-                    order_state_machine.cancel_pending_entry(
-                        local_order_id,
-                        reason=reason,
-                    )
-                )
-            except Exception as cancel_exc:
-                log.error(
-                    "[%s] overnight_reeval: cancel_pending_entry cleanup failed "
-                    "| local_order_id=%s reason=%s error=%s",
-                    ticker, local_order_id, reason, cancel_exc,
-                )
-                cleanup_success = False
-
-        if not cleanup_success and hasattr(order_state_machine, "transition"):
-            cleanup_method = "transition:EXPIRED"
-            try:
-                cleanup_success = bool(
-                    order_state_machine.transition(
-                        local_order_id,
-                        "EXPIRED",
-                        last_error=reason,
-                    )
-                )
-            except Exception as trans_exc:
-                log.error(
-                    "[%s] overnight_reeval: transition(EXPIRED) cleanup failed "
-                    "| local_order_id=%s reason=%s error=%s",
-                    ticker, local_order_id, reason, trans_exc,
-                )
-                cleanup_success = False
+        # No weaker fallback is permitted. A refusal or row-version loss means
+        # ownership changed or became ambiguous and the order must be preserved.
     else:
         cleanup_method = "missing_local_order_id"
 
@@ -3004,6 +2989,77 @@ def _bind_watch_arm_attempt_order(
     )
 
 
+def _reacquire_armed_watch_attempt_for_restart(
+    *,
+    signal_id: str,
+    client_id: str,
+    canonical_signal_id: str,
+    signal_payload: dict,
+    execution_mode: str,
+    session_key: str,
+    attempt: _WatchAttemptClaim,
+) -> _WatchAttemptClaim:
+    """Atomically reopen one durable ARMED owner for process-local reattachment.
+
+    The exact PENDING_TRIGGER order is revalidated under the same transaction as
+    the ARMED -> IN_PROGRESS CAS. The attempt count is deliberately unchanged:
+    losing an in-memory watcher during restart is not a new arm failure.
+    """
+    if (
+        attempt.disposition != WATCH_ATTEMPT_ALREADY_ARMED
+        or not attempt.token
+        or not attempt.local_order_id
+    ):
+        return _WatchAttemptClaim(
+            WATCH_ATTEMPT_CONFLICT,
+            attempt.token,
+            attempt.attempt_count,
+            attempt.local_order_id,
+            "armed_restart_reacquire_invalid_owner",
+        )
+
+    new_token = uuid.uuid4().hex
+
+    def _predicate(state, count, token, order_id):
+        return (
+            state == WATCH_ATTEMPT_STATE_ARMED
+            and count == attempt.attempt_count
+            and token == attempt.token
+            and order_id == attempt.local_order_id
+        )
+
+    ok = _pg_cas_write_attempt(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+        predicate=_predicate,
+        new_state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        new_count=attempt.attempt_count,
+        new_token=new_token,
+        new_local_order_id=attempt.local_order_id,
+        reason="armed_restart_watcher_reattach_claimed",
+        required_order_status="PENDING_TRIGGER",
+    )
+    if not ok:
+        return _WatchAttemptClaim(
+            WATCH_ATTEMPT_CONFLICT,
+            attempt.token,
+            attempt.attempt_count,
+            attempt.local_order_id,
+            "armed_restart_reacquire_cas_failed",
+        )
+    return _WatchAttemptClaim(
+        WATCH_ATTEMPT_REATTACH_REQUIRED,
+        new_token,
+        attempt.attempt_count,
+        attempt.local_order_id,
+        "armed_restart_watcher_reattach_claimed",
+    )
+
+
 _ALLOWED_WATCH_ATTEMPT_COMPLETION_STATES = frozenset({
     WATCH_ATTEMPT_STATE_RETRYABLE,
     WATCH_ATTEMPT_STATE_ARMED,
@@ -3196,12 +3252,23 @@ def _recover_materialized_watch_before_admission(
             str(durable_order_id or ""),
         )
     if lookup_status != _LS_FOUND or not order_row:
+        if state == WATCH_ATTEMPT_STATE_ARMED:
+            return _EarlyWatchRecoveryResult(
+                True, "ERROR", "early_recovery_armed_order_missing",
+                str(durable_order_id or ""),
+            )
         # No active materialized owner: this is not the recovery-only seam.
         # Normal admission/replacement logic remains authoritative.
         return _EarlyWatchRecoveryResult(False)
 
     observed_status = str(order_row.get("status") or "").strip().upper()
     if observed_status not in _ACTIVE_ENTRY_OWN_STATUSES:
+        if state == WATCH_ATTEMPT_STATE_ARMED:
+            return _EarlyWatchRecoveryResult(
+                True, "ALREADY_RESOLVED",
+                f"early_recovery_armed_order_terminal:{observed_status or 'blank'}",
+                str(durable_order_id or ""),
+            )
         # A bound terminal order normally returns to the validated replacement
         # path. At the cap, however, the durable claim must be exhausted here,
         # before Master Control or any other new-admission work can run.
@@ -3227,10 +3294,54 @@ def _recover_materialized_watch_before_admission(
     )
 
     if attempt.disposition == WATCH_ATTEMPT_ALREADY_ARMED:
-        return _EarlyWatchRecoveryResult(
-            True, "ARMED", attempt.reason or "early_recovery_already_armed",
-            attempt.local_order_id,
+        # Durable ARMED proves the database transition, not the current
+        # process's in-memory watcher registry. Broker-owned orders no longer
+        # need a trigger watcher, but an active PENDING_TRIGGER order must be
+        # verified locally after every restart and reattached when absent.
+        if observed_status in _ALREADY_OWNED_STATUSES:
+            return _EarlyWatchRecoveryResult(
+                True, "ARMED",
+                attempt.reason or "early_recovery_already_armed_broker_owned",
+                attempt.local_order_id,
+            )
+        if observed_status != "PENDING_TRIGGER":
+            return _EarlyWatchRecoveryResult(
+                True, "ERROR",
+                f"early_recovery_already_armed_non_pending:{observed_status or 'blank'}",
+                attempt.local_order_id,
+            )
+        try:
+            has_order = getattr(entry_watcher, "has_order", None)
+            registry_armed = (
+                bool(has_order(attempt.local_order_id))
+                if callable(has_order) else False
+            )
+        except Exception as exc:
+            return _EarlyWatchRecoveryResult(
+                True, "ERROR",
+                f"early_recovery_watcher_registry_error:{type(exc).__name__}",
+                attempt.local_order_id,
+            )
+        if registry_armed:
+            return _EarlyWatchRecoveryResult(
+                True, "ARMED", attempt.reason or "early_recovery_already_armed",
+                attempt.local_order_id,
+            )
+        attempt = _reacquire_armed_watch_attempt_for_restart(
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            attempt=attempt,
         )
+        if attempt.disposition != WATCH_ATTEMPT_REATTACH_REQUIRED:
+            return _EarlyWatchRecoveryResult(
+                True, "ERROR",
+                attempt.reason or "early_recovery_armed_reacquire_failed",
+                attempt.local_order_id,
+            )
     if (
         attempt.disposition == WATCH_ATTEMPT_CONFLICT
         and str(attempt.reason or "") == "attempt_state_error"
@@ -3528,16 +3639,20 @@ def _recover_materialized_watch_before_admission(
     except Exception:
         proof_ok = False
     if not proof_ok:
-        next_state = (
-            WATCH_ATTEMPT_STATE_EXHAUSTED
-            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
-            else WATCH_ATTEMPT_STATE_RETRYABLE
+        # watch() succeeded. Preserve that truth by completing the exact owner
+        # ARMED; never downgrade an active watcher to RETRYABLE/EXHAUSTED merely
+        # because the secondary opportunity proof failed.
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ARMED,
+            "early_recovery_watcher_armed_proof_failed",
         )
-        completion_ok = _complete(next_state, "early_recovery_proof_failed")
         return _EarlyWatchRecoveryResult(
             True,
-            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
-            "early_recovery_proof_failed",
+            "ERROR",
+            (
+                "early_recovery_watcher_armed_proof_failed"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
             local_order_id,
         )
 
@@ -5450,8 +5565,12 @@ def run_overnight_reeval(
                             client_id, _execution_mode, _canonical_for_proof,
                             _existing_oid, session_key,
                         )
-                        result["skipped"] = result.get("skipped", 0) + 1
-                        result["retryable_deferred"] += 1
+                        _mark_job_error(
+                            job_id, client_id,
+                            "reattach_watcher_armed_proof_persistence_failed",
+                        )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
                         continue
 
                     log.info(
@@ -6718,7 +6837,7 @@ def run_overnight_reeval(
                         local_order_id=_reattach_oid,
                         session_key=session_key,
                         extra_meta={
-                            "source_table": "trade_queue",
+                            "source_table": job_source,
                             "source_job_id": str(job_id),
                             "ticker": ticker,
                             "side": side,
@@ -6729,28 +6848,6 @@ def run_overnight_reeval(
                             "armed_at": datetime.now(timezone.utc).isoformat(),
                         },
                     )
-                    if not _rr_proof_ok:
-                        log.critical(
-                            "OVERNIGHT_REEVAL_REATTACH_REQUIRED_PROOF_FAILED | "
-                            "client=%s mode=%s canonical=%s local_order_id=%s "
-                            "session=%s | watcher reattached but proof NOT "
-                            "persisted — next retry will reattach again (idempotent)",
-                            client_id, _execution_mode, _canonical_for_attempt,
-                            _reattach_oid, session_key,
-                        )
-                        _rr_next = (
-                            WATCH_ATTEMPT_STATE_EXHAUSTED
-                            if _watch_attempt.attempt_count
-                            >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
-                            else WATCH_ATTEMPT_STATE_RETRYABLE
-                        )
-                        _rr_complete_and_classify(
-                            state=_rr_next,
-                            reason="reattach_required_watcher_proof_failed",
-                            caller="reattach_required_watcher_proof_failed",
-                        )
-                        continue
-
                     _rr_armed_completion_ok = _complete_watch_arm_attempt_checked(
                         signal_id=signal_id,
                         client_id=client_id,
@@ -6770,6 +6867,23 @@ def run_overnight_reeval(
                             job_id, client_id,
                             "overnight_watch_arm_attempt_completion_failed:"
                             "reattach_required_armed",
+                        )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
+                        continue
+
+                    if not _rr_proof_ok:
+                        log.critical(
+                            "OVERNIGHT_REEVAL_REATTACH_REQUIRED_PROOF_FAILED | "
+                            "client=%s mode=%s canonical=%s local_order_id=%s "
+                            "session=%s | watcher active and attempt durably "
+                            "ARMED; secondary proof missing",
+                            client_id, _execution_mode, _canonical_for_attempt,
+                            _reattach_oid, session_key,
+                        )
+                        _mark_job_error(
+                            job_id, client_id,
+                            "reattach_required_watcher_armed_proof_persistence_failed",
                         )
                         result["errors"] += 1
                         result["terminal_errors"] += 1
@@ -7175,20 +7289,6 @@ def run_overnight_reeval(
                             },
                         )
 
-                        if not _arm_proof_ok:
-                            log.critical(
-                                "OVERNIGHT_REEVAL_ARM_PROOF_WRITE_FAILED | "
-                                "client=%s mode=%s canonical=%s local_order_id=%s session=%s | "
-                                "watcher armed in-memory but WATCHER_ARMED NOT persisted — "
-                                "classifying as retryable_deferred; next retry will find "
-                                "PENDING_TRIGGER order via active-order fence (REATTACH path)",
-                                client_id, _execution_mode, _canonical_for_arm,
-                                local_order_id, session_key,
-                            )
-                            result["skipped"] = result.get("skipped", 0) + 1
-                            result["retryable_deferred"] += 1
-                            continue
-
                     _armed_completion_ok = _complete_watch_arm_attempt_checked(
                         signal_id=signal_id,
                         client_id=client_id,
@@ -7213,6 +7313,26 @@ def run_overnight_reeval(
                             client_id,
                             _completion_reason,
                         )
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
+                        continue
+
+                    if not _arm_proof_ok:
+                        # The watcher is active and the exact attempt is now
+                        # durably ARMED. Surface the missing secondary proof as
+                        # an operator-visible error, never as retryable progress
+                        # that leaves an active watcher behind an IN_PROGRESS
+                        # owner.
+                        _proof_reason = "overnight_watcher_armed_proof_persistence_failed"
+                        log.critical(
+                            "OVERNIGHT_REEVAL_ARM_PROOF_WRITE_FAILED | "
+                            "client=%s mode=%s canonical=%s local_order_id=%s "
+                            "session=%s | watcher active and attempt durably ARMED; "
+                            "secondary WATCHER_ARMED proof missing",
+                            client_id, _execution_mode, _canonical_for_attempt,
+                            local_order_id, session_key,
+                        )
+                        _mark_job_error(job_id, client_id, _proof_reason)
                         result["errors"] += 1
                         result["terminal_errors"] += 1
                         continue
