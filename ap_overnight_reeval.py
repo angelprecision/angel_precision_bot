@@ -3274,9 +3274,17 @@ def _recover_materialized_watch_before_admission(
         )
 
     if not local_order_id:
-        _complete(WATCH_ATTEMPT_STATE_ERROR, "early_recovery_missing_local_order_id")
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ERROR,
+            "early_recovery_missing_local_order_id",
+        )
         return _EarlyWatchRecoveryResult(
-            True, "ERROR", "early_recovery_missing_local_order_id",
+            True,
+            "ERROR",
+            (
+                "early_recovery_missing_local_order_id"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
         )
 
     # Claim-time FOR UPDATE is authoritative; this caller read constructs the
@@ -7151,13 +7159,13 @@ def run_overnight_reeval(
                         _completion_reason = (
                             "overnight_watch_arm_attempt_completion_failed:ARMED"
                         )
-                        _mark_job_watching_reason(
+                        _mark_job_error(
                             job_id,
                             client_id,
                             _completion_reason,
                         )
-                        result["skipped"] = result.get("skipped", 0) + 1
-                        result["retryable_deferred"] += 1
+                        result["errors"] += 1
+                        result["terminal_errors"] += 1
                         continue
 
                     _mark_job_watching_armed(job_id, client_id, _arm_label)
@@ -7359,14 +7367,14 @@ def run_overnight_reeval(
                         )
 
                         if not _already_owner_completion_ok:
-                            _mark_job_watching_reason(
+                            _mark_job_error(
                                 job_id,
                                 client_id,
                                 "overnight_watch_arm_attempt_completion_failed:"
                                 "already_watching_exact_owner",
                             )
-                            result["skipped"] = result.get("skipped", 0) + 1
-                            result["retryable_deferred"] += 1
+                            result["errors"] += 1
+                            result["terminal_errors"] += 1
                             continue
 
                         log.info(

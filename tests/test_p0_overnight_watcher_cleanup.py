@@ -1045,6 +1045,55 @@ def test_owner_conflict_completion_cas_failure_is_terminal_not_fake_retry(monkey
     controls["broker"].submit_order.assert_not_called()
 
 
+def test_exact_already_watching_completion_cas_failure_is_terminal(monkeypatch):
+    """An exact in-memory owner is not durable success when ARMED CAS loses."""
+    import ap_overnight_reeval as ov
+
+    existing = types.SimpleNamespace(
+        signal_id="sig-001",
+        ticker="AAPL",
+        side="CALL",
+        signal={
+            "signal_id": "sig-001",
+            "client_id": "client-1",
+            "execution_mode": "paper",
+            "ticker": "AAPL",
+            "side": "CALL",
+            "local_order_id": "local-ord-1",
+        },
+    )
+    entry_watcher = types.SimpleNamespace(
+        _pending=[existing],
+        _dedup_set={"sig-001"},
+        _lock=None,
+        _last_reject_reason="dedup_block",
+    )
+    entry_watcher.watch = MagicMock(return_value=False)
+    monkeypatch.setattr(
+        ov, "_complete_watch_arm_attempt_checked", lambda **_kw: False,
+    )
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        return_controls=True,
+    )
+
+    assert result["armed"] == 0
+    assert result["retryable_deferred"] == 0
+    assert result["skipped"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert rejected_calls == []
+    assert any(
+        reason.endswith("already_watching_exact_owner")
+        for _, _, reason in error_calls
+    )
+    entry_watcher.watch.assert_called_once()
+    controls["broker"].submit_order.assert_not_called()
+
+
 def _pending_entry_decision(reason="pending_entry_exists"):
     return types.SimpleNamespace(
         ok=False,
@@ -3712,9 +3761,9 @@ def test_shared_setup_does_not_create_repeated_local_orders_after_watch_arm_fail
 
 def test_watcher_true_but_armed_completion_failure_is_not_reported_armed(monkeypatch):
     # watch() succeeds but the durable ARMED completion CAS fails. The signal
-    # must NOT be reported armed; it is retryable_deferred and the live
-    # PENDING_TRIGGER order + in-memory watcher are preserved (never cleaned up,
-    # never a second order, never a broker submit).
+    # must be a terminal job error, never armed or retryable progress. The live
+    # PENDING_TRIGGER order + in-memory watcher remain preserved (never cleaned
+    # up, never a second order, never a broker submit).
     import ap_overnight_reeval as ov
 
     ledger = _FakeOpportunityLedger()
@@ -3724,7 +3773,7 @@ def test_watcher_true_but_armed_completion_failure_is_not_reported_armed(monkeyp
 
     monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
 
-    result, osm, _, _, controls = _run_reeval(
+    result, osm, _, error_calls, controls = _run_reeval(
         monkeypatch,
         entry_watcher,
         source="trade_queue",
@@ -3734,8 +3783,11 @@ def test_watcher_true_but_armed_completion_failure_is_not_reported_armed(monkeyp
     )
 
     assert result["armed"] == 0
-    assert result["retryable_deferred"] == 1
-    assert result["skipped"] == 1
+    assert result["retryable_deferred"] == 0
+    assert result["skipped"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert any(reason.endswith(":ARMED") for _, _, reason in error_calls)
     assert osm.create_calls == 1
     assert osm.orders["local-ord-1"]["status"] == "PENDING_TRIGGER"
     entry_watcher.watch.assert_called_once()
@@ -3786,8 +3838,8 @@ def test_ap_signals_watcher_armed_completion_fail_then_restart_no_duplicate_entr
     # ap_signals path:
     #   1) watcher.watch() → True
     #   2) WATCHER_ARMED durable ledger write succeeds
-    #   3) attempt ARMED completion CAS fails → retryable_deferred (PENDING_TRIGGER
-    #      order preserved, in-memory watcher preserved)
+    #   3) attempt ARMED completion CAS fails → terminal job error
+    #      (PENDING_TRIGGER order preserved, in-memory watcher preserved)
     #   4) Simulate a process restart: clear the in-memory watcher registry.
     #   5) Next reevaluation MUST reattach (or fail closed) via the active-order
     #      fence and MUST NOT create a second ENTRY or submit to the broker.
@@ -3819,7 +3871,9 @@ def test_ap_signals_watcher_armed_completion_fail_then_restart_no_duplicate_entr
     )
 
     assert result1["armed"] == 0
-    assert result1["retryable_deferred"] == 1
+    assert result1["retryable_deferred"] == 0
+    assert result1["errors"] == 1
+    assert result1["terminal_errors"] == 1
     assert osm.create_calls == 1
     assert osm.orders["local-ord-1"]["status"] == "PENDING_TRIGGER"
     entry_watcher.watch.assert_called_once()
@@ -3878,8 +3932,59 @@ def test_retryable_cleanup_completion_failure_is_terminal_error_not_fake_retry(m
     assert controls["broker"].submit_order.call_count == 0
 
 
+def test_early_recovery_missing_order_id_surfaces_completion_cas_failure(monkeypatch):
+    """The recovery wrapper must not conceal a lost ERROR completion CAS."""
+    import ap_overnight_reeval as ov
+
+    monkeypatch.setattr(
+        ov,
+        "_read_attempt_scope_unlocked",
+        lambda *_args: (ov.WATCH_ATTEMPT_STATE_IN_PROGRESS, 1, "token-1", ""),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_query_active_entry_order",
+        lambda *_args: (
+            ov._LS_FOUND,
+            {"status": "PENDING_TRIGGER", "local_order_id": "discovered-1"},
+        ),
+    )
+    monkeypatch.setattr(
+        ov,
+        "_claim_watch_arm_attempt",
+        lambda **_kw: ov._WatchAttemptClaim(
+            ov.WATCH_ATTEMPT_REATTACH_REQUIRED,
+            token="token-2",
+            attempt_count=2,
+            local_order_id="",
+            reason="test_missing_bound_order_id",
+        ),
+    )
+    complete = MagicMock(return_value=False)
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", complete)
+
+    recovered = ov._recover_materialized_watch_before_admission(
+        order_state_machine=MagicMock(),
+        entry_watcher=MagicMock(),
+        signal_id="sig-001",
+        canonical_signal_id="CANON-001",
+        client_id="client-1",
+        execution_mode="paper",
+        session_key="2026-06-12",
+        signal_payload={"ticker": "AAPL", "side": "CALL"},
+        ticker="AAPL",
+        job_id="job-1",
+        job_source="trade_queue",
+    )
+
+    assert recovered.handled is True
+    assert recovered.outcome == "ERROR"
+    assert recovered.reason == "early_recovery_completion_failed"
+    complete.assert_called_once()
+
+
 def test_every_completion_cas_result_is_consumed_by_its_runtime_caller():
-    """No production caller may discard the checked completion Boolean."""
+    """No direct or local-wrapper completion Boolean may be discarded."""
     import ast
     import inspect
     import ap_overnight_reeval as ov
@@ -3889,15 +3994,16 @@ def test_every_completion_cas_result_is_consumed_by_its_runtime_caller():
     with open(source_path, encoding="utf-8") as source_file:
         tree = ast.parse(source_file.read(), source_path)
 
+    completion_call_names = {
+        "_complete_watch_arm_attempt_checked",
+        "_complete",
+    }
     discarded = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
             continue
         func = node.value.func
-        if (
-            isinstance(func, ast.Name)
-            and func.id == "_complete_watch_arm_attempt_checked"
-        ):
+        if isinstance(func, ast.Name) and func.id in completion_call_names:
             discarded.append(node.lineno)
 
     assert discarded == [], f"completion CAS result discarded at lines {discarded}"
