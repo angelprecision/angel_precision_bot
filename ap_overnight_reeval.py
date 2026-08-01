@@ -488,6 +488,12 @@ def _terminalize_stale_pending_orders(
         # legitimate ownership signal and MUST fail the cleanup.
         expected_status = str((_row or {}).get("status") or "").strip().upper()
         expected_updated_ts = (_row or {}).get("updated_ts")
+        expected_execution_mode = str(
+            (_row or {}).get("execution_mode") or ""
+        ).strip().lower()
+        expected_canonical_signal_id = str(
+            (_row or {}).get("canonical_signal_id") or ""
+        ).strip()
         if not expected_status:
             return False, f"stale_row_missing_status:{oid}"
         if expected_updated_ts is None or (
@@ -496,6 +502,8 @@ def _terminalize_stale_pending_orders(
             # Without a row-version fence the CAS can't detect a concurrent
             # writer. Refuse rather than falling back to a weaker write.
             return False, f"stale_row_missing_updated_ts:{oid}"
+        if not expected_execution_mode or not expected_canonical_signal_id:
+            return False, f"stale_row_missing_identity:{oid}"
 
         terminalized = False
         failure_detail = ""
@@ -505,6 +513,8 @@ def _terminalize_stale_pending_orders(
                     oid,
                     expected_status=expected_status,
                     expected_updated_ts=expected_updated_ts,
+                    expected_execution_mode=expected_execution_mode,
+                    expected_canonical_signal_id=expected_canonical_signal_id,
                     reason=reason,
                 )
                 terminalized = bool(ok)
@@ -1176,6 +1186,8 @@ def _cleanup_overnight_watch_arm_failure(
     order_state_machine,
     client_id: str,
     signal_id: str,
+    execution_mode: str,
+    canonical_signal_id: str,
     ticker: str,
     side: str,
     local_order_id: str,
@@ -1222,6 +1234,8 @@ def _cleanup_overnight_watch_arm_failure(
                         local_order_id,
                         expected_status=observed_status,
                         expected_updated_ts=observed_updated_ts,
+                        expected_execution_mode=execution_mode,
+                        expected_canonical_signal_id=canonical_signal_id,
                         reason=reason,
                     )
                     cleanup_success = bool(
@@ -3195,6 +3209,100 @@ def _complete_watch_arm_attempt_checked(
     return ok
 
 
+def _quarantine_armed_missing_order(
+    *,
+    signal_id: str,
+    canonical_signal_id: str,
+    client_id: str,
+    execution_mode: str,
+    session_key: str,
+    signal_payload: dict,
+    job_id,
+    job_source: str,
+    attempt: _WatchAttemptClaim,
+    local_order_id: str,
+) -> tuple[bool, str]:
+    """Durably converge an ARMED owner whose materialized order disappeared.
+
+    ``_complete_watch_arm_attempt`` intentionally forbids transitions out of a
+    terminal/durable ARMED state. Recovery of a missing materialized row is a
+    distinct repair operation: the exact ARMED token/count/order owner is
+    compare-and-swapped to ERROR, then a client-scoped watcher-arm failure
+    proof is recorded. The two writes are deliberately ordered so an operator
+    never sees a terminal ledger marker while the attempt still claims ARMED.
+    """
+    local_order_id = str(local_order_id or "").strip()
+    mode = str(execution_mode or "").strip().lower()
+    canonical = str(canonical_signal_id or "").strip()
+    if (
+        attempt.disposition != WATCH_ATTEMPT_ALREADY_ARMED
+        or not attempt.token
+        or attempt.attempt_count < 1
+        or not local_order_id
+        or not mode
+        or not canonical
+        or not session_key
+    ):
+        return False, "armed_missing_order_quarantine_invalid_owner"
+
+    terminal_reason = "overnight_watch_arm_failed:early_recovery_armed_order_missing"
+    durable_reason = f"{terminal_reason}:quarantined"
+
+    def _predicate(state, count, token, order_id):
+        return (
+            state == WATCH_ATTEMPT_STATE_ARMED
+            and count == attempt.attempt_count
+            and token == attempt.token
+            and order_id == local_order_id
+        )
+
+    repaired = _pg_cas_write_attempt(
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical,
+        signal_payload=signal_payload,
+        execution_mode=mode,
+        session_key=session_key,
+        predicate=_predicate,
+        new_state=WATCH_ATTEMPT_STATE_ERROR,
+        new_count=attempt.attempt_count,
+        new_token=attempt.token,
+        new_local_order_id=local_order_id,
+        reason=durable_reason,
+    )
+    if not repaired:
+        return False, "armed_missing_order_quarantine_cas_failed"
+
+    proof_ok = _record_watch_arm_failure_proof(
+        signal_id=signal_id,
+        client_id=client_id,
+        signal=signal_payload,
+        reason=terminal_reason,
+        local_order_id=local_order_id,
+        job_id=job_id,
+        is_exception=True,
+        session_key=session_key,
+        cleanup_method="armed_missing_order_quarantine",
+        cleanup_success=True,
+        original_reason="early_recovery_armed_order_missing",
+    )
+    if not proof_ok:
+        log.critical(
+            "[%s] overnight_reeval: ARMED missing-order quarantine durable scope "
+            "repaired but per-client failure proof was not confirmed "
+            "canonical=%s mode=%s session=%s local_order_id=%s source=%s",
+            client_id,
+            canonical,
+            mode,
+            session_key,
+            local_order_id,
+            job_source,
+        )
+        return False, "armed_missing_order_quarantine_proof_failed"
+
+    return True, "early_recovery_armed_order_missing_quarantined"
+
+
 class _EarlyWatchRecoveryResult(NamedTuple):
     handled: bool
     outcome: str = ""
@@ -3229,7 +3337,7 @@ def _recover_materialized_watch_before_admission(
     if probe is None:
         return _EarlyWatchRecoveryResult(False)
 
-    state, attempt_count, _token, durable_order_id = probe
+    state, attempt_count, token, durable_order_id = probe
     if state not in {
         WATCH_ATTEMPT_STATE_IN_PROGRESS,
         WATCH_ATTEMPT_STATE_RETRYABLE,
@@ -3253,8 +3361,30 @@ def _recover_materialized_watch_before_admission(
         )
     if lookup_status != _LS_FOUND or not order_row:
         if state == WATCH_ATTEMPT_STATE_ARMED:
+            quarantine_ok, quarantine_reason = _quarantine_armed_missing_order(
+                signal_id=signal_id,
+                canonical_signal_id=canonical_signal_id,
+                client_id=client_id,
+                execution_mode=execution_mode,
+                session_key=session_key,
+                signal_payload=signal_payload,
+                job_id=job_id,
+                job_source=job_source,
+                attempt=_WatchAttemptClaim(
+                    WATCH_ATTEMPT_ALREADY_ARMED,
+                    token=token,
+                    attempt_count=attempt_count,
+                    local_order_id=str(durable_order_id or ""),
+                    reason="early_recovery_already_armed",
+                ),
+                local_order_id=str(durable_order_id or ""),
+            )
             return _EarlyWatchRecoveryResult(
-                True, "ERROR", "early_recovery_armed_order_missing",
+                True,
+                "ERROR",
+                quarantine_reason if quarantine_ok else (
+                    "early_recovery_armed_order_missing:" + quarantine_reason
+                ),
                 str(durable_order_id or ""),
             )
         # No active materialized owner: this is not the recovery-only seam.
@@ -4658,7 +4788,7 @@ def _record_watch_arm_failure_proof(
     cleanup_failed: bool = False,
     original_reason: Optional[str] = None,
     retryable_exception: bool = False,
-) -> None:
+) -> bool:
     try:
         from ap.opportunity_ledger import (
             CREATED as _OL_CREATED,
@@ -4702,7 +4832,7 @@ def _record_watch_arm_failure_proof(
             # Merge diagnostic metadata via update_opportunity(..., CREATED, ...)
             # so the monotonic status rule preserves any higher nonterminal
             # current status while still surfacing the exception context.
-            update_opportunity(
+            _proof_result = update_opportunity(
                 signal_id,
                 client_id,
                 _OL_CREATED,
@@ -4716,8 +4846,9 @@ def _record_watch_arm_failure_proof(
                     "retryable": True,
                 },
             )
+            return _proof_result is not False
         elif is_exception:
-            mark_internal_error(
+            _proof_result = mark_internal_error(
                 signal_id,
                 client_id,
                 reason,
@@ -4725,8 +4856,9 @@ def _record_watch_arm_failure_proof(
                 order_local_id=str(local_order_id or ""),
                 extra_meta=_extra_meta,
             )
+            return _proof_result is not False
         else:
-            mark_watcher_invalidated(
+            _proof_result = mark_watcher_invalidated(
                 signal_id,
                 client_id,
                 reason,
@@ -4734,6 +4866,7 @@ def _record_watch_arm_failure_proof(
                 order_local_id=str(local_order_id or ""),
                 extra_meta=_extra_meta,
             )
+            return _proof_result is not False
     except Exception as exc:
         log.warning(
             "[%s] overnight_reeval: failed to persist watch-arm failure proof "
@@ -4743,6 +4876,7 @@ def _record_watch_arm_failure_proof(
             local_order_id,
             exc,
         )
+        return False
 
 
 def _classify_overnight_reeval_result(result: dict) -> dict:
@@ -7085,6 +7219,8 @@ def run_overnight_reeval(
                     order_state_machine=order_state_machine,
                     client_id=client_id,
                     signal_id=signal_id,
+                    execution_mode=_execution_mode,
+                    canonical_signal_id=_canonical_for_attempt,
                     ticker=ticker,
                     side=side,
                     local_order_id=str(local_order_id),
@@ -7405,6 +7541,8 @@ def run_overnight_reeval(
                                 order_state_machine=order_state_machine,
                                 client_id=client_id,
                                 signal_id=signal_id,
+                                execution_mode=_execution_mode,
+                                canonical_signal_id=_canonical_for_attempt,
                                 ticker=ticker,
                                 side=side,
                                 local_order_id=str(local_order_id),
@@ -7481,6 +7619,8 @@ def run_overnight_reeval(
                             order_state_machine=order_state_machine,
                             client_id=client_id,
                             signal_id=signal_id,
+                            execution_mode=_execution_mode,
+                            canonical_signal_id=_canonical_for_attempt,
                             ticker=ticker,
                             side=side,
                             local_order_id=str(local_order_id),
@@ -7565,6 +7705,8 @@ def run_overnight_reeval(
                         order_state_machine=order_state_machine,
                         client_id=client_id,
                         signal_id=signal_id,
+                        execution_mode=_execution_mode,
+                        canonical_signal_id=_canonical_for_attempt,
                         ticker=ticker,
                         side=side,
                         local_order_id=str(local_order_id),
@@ -7747,6 +7889,8 @@ def run_overnight_reeval(
                     order_state_machine=order_state_machine,
                     client_id=client_id,
                     signal_id=signal_id,
+                    execution_mode=_execution_mode,
+                    canonical_signal_id=_canonical_for_attempt,
                     ticker=ticker,
                     side=side,
                     local_order_id=str(local_order_id),

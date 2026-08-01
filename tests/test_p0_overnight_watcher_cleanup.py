@@ -82,15 +82,28 @@ class _FakeOrderStateMachine:
         return True
 
     def expire_stale_pending_entry_cas(
-        self, local_order_id: str, *, expected_status, expected_updated_ts, reason: str,
+        self,
+        local_order_id: str,
+        *,
+        expected_status,
+        expected_updated_ts,
+        expected_execution_mode,
+        expected_canonical_signal_id,
+        reason: str,
     ):
-        """Atomic stale-expiration CAS shim. Mirrors OSM: row-version fence on
-        (status, updated_ts) plus the pending-entry ownership guard. Returns
-        (ok, failure_reason)."""
+        """Atomic stale-expiration CAS shim with full identity fencing."""
         self.expire_calls.append((local_order_id, reason))
         row = self.orders.get(local_order_id)
         if not row:
             return False, "order_not_found"
+        expected_mode = str(expected_execution_mode or "").strip().lower()
+        expected_canonical = str(expected_canonical_signal_id or "").strip()
+        if not expected_mode or not expected_canonical:
+            return False, "missing_expected_identity"
+        if str(row.get("execution_mode") or "").strip().lower() != expected_mode:
+            return False, "execution_mode_mismatch"
+        if str(row.get("canonical_signal_id") or "").strip() != expected_canonical:
+            return False, "canonical_signal_id_mismatch"
         cur_status = str(row.get("status") or "").upper()
         if cur_status not in ("CREATED", "PENDING_TRIGGER"):
             return False, f"not_pending:{cur_status}"
@@ -2335,12 +2348,75 @@ def test_direct_cas_refuses_durable_recovery_scheduler_owner(monkeypatch):
         "prior-recov-1",
         expected_status="PENDING_TRIGGER",
         expected_updated_ts="v1",
+        expected_execution_mode="paper",
+        expected_canonical_signal_id="CANON-001",
         reason="test_cleanup",
     )
     assert ok is False
     assert reason == "broker_or_recovery_owner_active"
     # Row untouched.
     assert osm.orders["prior-recov-1"]["status"] == "PENDING_TRIGGER"
+
+
+@pytest.mark.parametrize(
+    ("row_mode", "row_canonical", "expected_reason"),
+    [
+        ("paper", "CANON-001", "execution_mode_mismatch"),
+        ("live", "OTHER-CANON", "canonical_signal_id_mismatch"),
+    ],
+)
+def test_watch_failure_cleanup_passes_and_enforces_full_identity(
+    row_mode, row_canonical, expected_reason,
+):
+    """A same-client row with the wrong mode/canonical must survive cleanup."""
+    import ap_overnight_reeval as ov
+
+    osm = _FakeOrderStateMachine()
+    osm.orders["identity-mismatch-1"] = {
+        "local_order_id": "identity-mismatch-1",
+        "client_id": "client-1",
+        "canonical_signal_id": row_canonical,
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "execution_mode": row_mode,
+        "updated_ts": "v1",
+        "meta": {},
+    }
+    captured = {}
+    original_cas = osm.expire_stale_pending_entry_cas
+
+    def _cas_spy(local_order_id, **kwargs):
+        result = original_cas(local_order_id, **kwargs)
+        captured.update(kwargs)
+        captured["result"] = result
+        return result
+
+    osm.expire_stale_pending_entry_cas = _cas_spy
+
+    ok, method = ov._cleanup_overnight_watch_arm_failure(
+        order_state_machine=osm,
+        client_id="client-1",
+        signal_id="sig-001",
+        execution_mode="live",
+        canonical_signal_id="CANON-001",
+        ticker="AAPL",
+        side="CALL",
+        local_order_id="identity-mismatch-1",
+        contract="DEFERRED:AAPL",
+        contract_deferred=False,
+        entry_trigger=101.0,
+        reason="watch_failed",
+        done_event="TEST_IDENTITY_FENCED_CLEANUP_DONE",
+    )
+
+    assert ok is False
+    assert method == "expire_stale_pending_entry_cas"
+    assert captured["expected_execution_mode"] == "live"
+    assert captured["expected_canonical_signal_id"] == "CANON-001"
+    assert captured["result"] == (False, expected_reason)
+    assert osm.orders["identity-mismatch-1"]["status"] == "PENDING_TRIGGER"
+    assert osm.transition_calls == []
+    assert osm.cancel_calls == []
 
 
 @pytest.mark.parametrize(("marker_patch", "expected_reason"), [
@@ -3016,6 +3092,89 @@ def test_durable_armed_restart_reacquires_and_reattaches_same_order_same_count(m
     }
 
 
+def test_armed_restart_missing_order_is_durably_quarantined_for_shared_signal(monkeypatch):
+    """A missing ARMED order converges to ERROR and stops shared-row repeats."""
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    meta = ov._attempt_meta_patch(
+        existing_meta={},
+        execution_mode="paper",
+        session_key="2026-06-12",
+        state=ov.WATCH_ATTEMPT_STATE_ARMED,
+        attempt_count=1,
+        token="armed-missing-token",
+        local_order_id="missing-armed-order-1",
+        reason="watcher_armed",
+    )
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": ledger.WATCHER_ARMED,
+        "miss_stage": None,
+        "miss_reason": None,
+        "order_local_id": "missing-armed-order-1",
+        "metadata": meta,
+    }
+
+    watcher1 = MagicMock()
+    result1, osm, _, error_calls1, controls1 = _run_reeval(
+        monkeypatch,
+        watcher1,
+        source="ap_signals",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    scope1 = _attempt_scope(ledger)
+    proof = ledger.rows[("CANON-001", "client-1")]
+    assert scope1["state"] == ov.WATCH_ATTEMPT_STATE_ERROR
+    assert scope1["local_order_id"] == "missing-armed-order-1"
+    assert scope1["last_reason"] == (
+        "overnight_watch_arm_failed:early_recovery_armed_order_missing:quarantined"
+    )
+    assert proof["opportunity_status"] == "INTERNAL_ERROR"
+    assert proof["miss_reason"] == (
+        "overnight_watch_arm_failed:early_recovery_armed_order_missing"
+    )
+    assert proof["metadata"]["cleanup_method"] == "armed_missing_order_quarantine"
+    assert proof["metadata"]["cleanup_success"] is True
+    assert result1["errors"] == 1
+    assert result1["terminal_errors"] == 1
+    assert result1["retryable_deferred"] == 0
+    assert error_calls1[-1][0] == "sup:sig-001"
+    assert osm.create_calls == 0
+    watcher1.watch.assert_not_called()
+    controls1["master_control"].evaluate.assert_not_called()
+    controls1["contract_selector"].select.assert_not_called()
+    controls1["broker"].submit_order.assert_not_called()
+
+    # The shared ap_signals row remains WATCHING, but the exact client/mode/
+    # session scope is now terminal. A second run must stop at disposition and
+    # cannot repeat early recovery, create, select, watch, or submit work.
+    watcher2 = MagicMock()
+    result2, osm, _, _, controls2 = _run_reeval(
+        monkeypatch,
+        watcher2,
+        source="ap_signals",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+    assert _attempt_scope(ledger)["state"] == ov.WATCH_ATTEMPT_STATE_ERROR
+    assert result2["already_resolved"] == 1
+    assert result2["errors"] == 0
+    assert result2["terminal_errors"] == 0
+    assert osm.create_calls == 0
+    watcher2.watch.assert_not_called()
+    controls2["master_control"].evaluate.assert_not_called()
+    controls2["contract_selector"].select.assert_not_called()
+    controls2["broker"].submit_order.assert_not_called()
+
+
 def test_runtime_reattach_completion_cas_failure_recovers_after_lease(monkeypatch):
     import ap_overnight_reeval as ov
 
@@ -3335,7 +3494,14 @@ def test_watcher_exception_terminal_proof_failure_remains_error(monkeypatch):
 
     class _CleanupYesButNotTerminalOSM(_FakeOrderStateMachine):
         def expire_stale_pending_entry_cas(
-            self, local_order_id, *, expected_status, expected_updated_ts, reason="",
+            self,
+            local_order_id,
+            *,
+            expected_status,
+            expected_updated_ts,
+            expected_execution_mode,
+            expected_canonical_signal_id,
+            reason="",
         ):
             # Say success but do NOT change status. Readback still shows
             # PENDING_TRIGGER, so terminal proof fails.
@@ -3768,6 +3934,8 @@ def test_watch_cleanup_never_bypasses_guard_refusal_with_generic_transition():
         order_state_machine=osm,
         client_id="client-1",
         signal_id="sig-001",
+        execution_mode="paper",
+        canonical_signal_id="CANON-001",
         ticker="AAPL",
         side="CALL",
         local_order_id="recovery-owned-1",

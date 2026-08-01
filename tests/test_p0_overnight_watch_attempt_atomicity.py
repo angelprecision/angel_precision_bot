@@ -1015,9 +1015,26 @@ def _orders_table():
                 tier                text,
                 pattern             text,
                 meta                jsonb,
-                created_ts          timestamptz NOT NULL DEFAULT now()
+                created_ts          timestamptz NOT NULL DEFAULT now(),
+                updated_ts          timestamptz NOT NULL DEFAULT now(),
+                last_error          text,
+                broker_order_id     text,
+                submitted_ts       timestamptz
             )
             """
+        )
+        cur.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS updated_ts "
+            "timestamptz NOT NULL DEFAULT now()"
+        )
+        cur.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS last_error text"
+        )
+        cur.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS broker_order_id text"
+        )
+        cur.execute(
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS submitted_ts timestamptz"
         )
         cur.execute("TRUNCATE orders")
     setup.close()
@@ -1111,6 +1128,85 @@ def test_bind_requires_exact_pending_entry_under_same_lock(
     scope = _read_scope(mode="live")
     assert overnight._attempt_state(scope) == S_IN_PROGRESS
     assert str(scope.get("local_order_id") or "") == ""
+
+
+@pytest.mark.parametrize(
+    ("stored_mode", "stored_canonical", "expected_reason"),
+    [
+        ("paper", CANON, "execution_mode_mismatch"),
+        ("live", "OTHER-CANON", "canonical_signal_id_mismatch"),
+    ],
+)
+def test_stale_cleanup_cas_rejects_same_client_wrong_identity(
+    _orders_table,
+    monkeypatch,
+    stored_mode,
+    stored_canonical,
+    expected_reason,
+):
+    """The real expiration UPDATE cannot cross mode or canonical ownership."""
+    _insert_order(
+        local_order_id="ord-cleanup-identity-fence",
+        status="PENDING_TRIGGER",
+        client_id=CLIENT,
+        execution_mode=stored_mode,
+        canonical_signal_id=stored_canonical,
+        signal_id=SIGNAL_ID,
+    )
+
+    # APOrderStateMachine binds ap.db.conn at module import time; point that
+    # production module at the same independent real-Postgres transaction
+    # factory used by the overnight helpers before invoking the CAS.
+    from ap import order_state_machine as osm_module
+    monkeypatch.setattr(osm_module, "conn", _independent_conn)
+    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn, *a, **kw: fn())
+    osm = osm_module.APOrderStateMachine(CLIENT)
+
+    with _independent_conn() as c:
+        c.execute(
+            "SELECT status, updated_ts FROM orders WHERE local_order_id = %s",
+            ("ord-cleanup-identity-fence",),
+        )
+        observed = c.fetchone()
+    assert observed
+
+    ok, reason = osm.expire_stale_pending_entry_cas(
+        "ord-cleanup-identity-fence",
+        expected_status="PENDING_TRIGGER",
+        expected_updated_ts=observed["updated_ts"],
+        expected_execution_mode="live",
+        expected_canonical_signal_id=CANON,
+        reason="test_cleanup_identity_fence",
+    )
+
+    assert ok is False
+    assert reason == expected_reason
+    assert _order_status("ord-cleanup-identity-fence") == "PENDING_TRIGGER"
+
+    # Defense in depth: even if a buggy/future caller read back the expected
+    # identity in Python, the real SQL UPDATE must still refuse the actual
+    # wrong-identity row.
+    monkeypatch.setattr(
+        osm,
+        "_get_order",
+        lambda _local_order_id: {
+            **dict(observed),
+            "kind": "ENTRY",
+            "execution_mode": "live",
+            "canonical_signal_id": CANON,
+        },
+    )
+    sql_ok, sql_reason = osm.expire_stale_pending_entry_cas(
+        "ord-cleanup-identity-fence",
+        expected_status="PENDING_TRIGGER",
+        expected_updated_ts=observed["updated_ts"],
+        expected_execution_mode="live",
+        expected_canonical_signal_id=CANON,
+        reason="test_cleanup_identity_sql_fence",
+    )
+    assert sql_ok is False
+    assert sql_reason == "cas_lost_row_version_changed"
+    assert _order_status("ord-cleanup-identity-fence") == "PENDING_TRIGGER"
 
 
 def test_bind_accepts_exact_pending_entry_and_persists_identity(_orders_table):

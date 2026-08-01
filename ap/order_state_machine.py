@@ -1146,9 +1146,11 @@ class APOrderStateMachine:
         *,
         expected_status: str,
         expected_updated_ts,
+        expected_execution_mode: str,
+        expected_canonical_signal_id: str,
         reason: str,
     ) -> tuple[bool, str]:
-        """Atomic stale-pending-entry expiration with row-version fencing.
+        """Atomic stale-pending-entry expiration with identity/version fencing.
 
         A CAS variant of expire_pending_entry() intended for the overnight-reeval
         stale-release path. Preserves the ownership guard (broker/recovery
@@ -1156,6 +1158,7 @@ class APOrderStateMachine:
 
           - the exact status the classifier observed
           - the exact updated_ts (row version) the classifier observed
+          - the exact execution mode and canonical signal identity
 
         If another actor mutated the row between the classifier read and this
         write (a broker submit intent landed, a recovery owner claimed it, or
@@ -1171,6 +1174,10 @@ class APOrderStateMachine:
             return False, "missing_local_order_id"
         if not expected_status:
             return False, "missing_expected_status"
+        expected_mode = str(expected_execution_mode or "").strip().lower()
+        expected_canonical = str(expected_canonical_signal_id or "").strip()
+        if not expected_mode or not expected_canonical:
+            return False, "missing_expected_identity"
 
         current = self._get_order(local_order_id)
         if not current:
@@ -1178,12 +1185,18 @@ class APOrderStateMachine:
         current = dict(current)
         kind = str(current.get("kind") or "").upper()
         status = str(current.get("status") or "").upper()
+        current_mode = str(current.get("execution_mode") or "").strip().lower()
+        current_canonical = str(current.get("canonical_signal_id") or "").strip()
         if kind != "ENTRY":
             log.critical(
                 "[%s] expire_stale_pending_entry_cas blocked -- wrong kind %s | %s",
                 self.client_id, kind, local_order_id,
             )
             return False, f"wrong_kind:{kind}"
+        if current_mode != expected_mode:
+            return False, "execution_mode_mismatch"
+        if current_canonical != expected_canonical:
+            return False, "canonical_signal_id_mismatch"
         if status == OrderStatus.EXPIRED:
             return True, "already_expired"
         if status not in (OrderStatus.CREATED, OrderStatus.PENDING_TRIGGER):
@@ -1229,6 +1242,8 @@ class APOrderStateMachine:
                     "WHERE local_order_id = %s "
                     "AND client_id = %s "
                     "AND kind = 'ENTRY' "
+                    "AND LOWER(BTRIM(COALESCE(execution_mode, ''))) = %s "
+                    "AND canonical_signal_id = %s "
                     "AND status = %s "
                     "AND updated_ts = %s "
                     "AND NOT ("
@@ -1240,6 +1255,8 @@ class APOrderStateMachine:
                         reason,
                         local_order_id,
                         self.client_id,
+                        expected_mode,
+                        expected_canonical,
                         expected_status,
                         expected_updated_ts,
                     ),
