@@ -127,6 +127,9 @@ class _FakeOrderStateMachine:
             _dr_active, _dr_reason = is_durable_recovery_owner_active(
                 _meta,
                 expected_client_id=str(row.get("client_id") or "").strip(),
+                expected_execution_mode=str(
+                    row.get("execution_mode") or ""
+                ).strip(),
             )
             if _dr_active or _dr_reason in LEASE_REASONS_FORCE_CONFLICT:
                 return False, "broker_or_recovery_owner_active"
@@ -991,6 +994,55 @@ def test_dedup_block_stale_order_owner_is_retryable_not_already_armed(monkeypatc
     ]
     assert "overnight_watch_ownership_conflict" in caplog.text
     assert "overnight_watch_already_watching" not in caplog.text
+
+
+def test_owner_conflict_completion_cas_failure_is_terminal_not_fake_retry(monkeypatch):
+    """A cleaned duplicate is not safely retryable unless RETRYABLE persisted."""
+    import ap_overnight_reeval as ov
+
+    existing = types.SimpleNamespace(
+        signal_id="sig-001",
+        ticker="AAPL",
+        side="CALL",
+        signal={
+            "signal_id": "sig-001",
+            "client_id": "client-1",
+            "execution_mode": "paper",
+            "ticker": "AAPL",
+            "side": "CALL",
+            "local_order_id": "local-stale-owner",
+        },
+    )
+    entry_watcher = types.SimpleNamespace(
+        _pending=[existing],
+        _dedup_set={"sig-001"},
+        _lock=None,
+        _last_reject_reason="dedup_block",
+    )
+    entry_watcher.watch = MagicMock(return_value=False)
+    monkeypatch.setattr(
+        ov, "_complete_watch_arm_attempt_checked", lambda **_kw: False,
+    )
+
+    result, osm, rejected_calls, error_calls, controls = _run_reeval(
+        monkeypatch,
+        entry_watcher,
+        source="trade_queue",
+        return_controls=True,
+    )
+
+    assert result["retryable_deferred"] == 0
+    assert result["errors"] == 1
+    assert result["terminal_errors"] == 1
+    assert rejected_calls == []
+    assert any(
+        reason.endswith("watcher_owner_conflict")
+        for _, _, reason in error_calls
+    )
+    assert osm.expire_calls == [
+        ("local-ord-1", "overnight_watch_ownership_conflict")
+    ]
+    controls["broker"].submit_order.assert_not_called()
 
 
 def _pending_entry_decision(reason="pending_entry_exists"):
@@ -2061,7 +2113,7 @@ def test_expired_proof_retry_deadline_is_not_permanent_ownership(monkeypatch):
 
 def _durable_recovery_meta(*, client_id="client-1", owner_suffix=None,
                             reason="restart_pending_entry_deferred",
-                            recovery_mode="restart"):
+                            recovery_mode="PAPER"):
     """Exact producer shape from ap_recovery._retain_recovery_ownership()."""
     from datetime import datetime, timezone as _tz
     owner = f"recovery_scheduler:{client_id}" if owner_suffix is None else owner_suffix
@@ -2079,7 +2131,9 @@ def test_durable_recovery_scheduler_predicate_recognizes_exact_producer_shape():
 
     # Full producer shape → owned.
     ok, reason = is_durable_recovery_owner_active(
-        _durable_recovery_meta(), expected_client_id="client-1",
+        _durable_recovery_meta(),
+        expected_client_id="client-1",
+        expected_execution_mode="paper",
     )
     assert ok is True, reason
     assert reason == "durable_recovery_scheduler_active"
@@ -2103,7 +2157,9 @@ def test_durable_recovery_scheduler_predicate_recognizes_exact_producer_shape():
 def test_overnight_lease_helper_honors_durable_recovery_scheduler_ownership():
     import ap_overnight_reeval as ov
     owned, reason = ov._pending_owner_lease_active(
-        _durable_recovery_meta(), expected_client_id="client-1",
+        _durable_recovery_meta(),
+        expected_client_id="client-1",
+        expected_execution_mode="paper",
     )
     assert owned is True
     assert reason == "durable_recovery_scheduler_active"
@@ -2259,6 +2315,14 @@ def test_direct_cas_refuses_durable_recovery_scheduler_owner(monkeypatch):
         {"recovery_retention_mode": None},
         "durable_recovery_retention_mode_missing",
     ),
+    (
+        {"recovery_retention_mode": "restart"},
+        "durable_recovery_retention_mode_invalid",
+    ),
+    (
+        {"recovery_retention_mode": "LIVE"},
+        "durable_recovery_retention_mode_mismatch",
+    ),
 ])
 def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(
     monkeypatch, marker_patch, expected_reason,
@@ -2280,7 +2344,9 @@ def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(
     _meta.update(marker_patch)
     # Predicate: recognized ownership kind, malformed canonical marker.
     ok, reason = is_durable_recovery_owner_active(
-        _meta, expected_client_id="client-1",
+        _meta,
+        expected_client_id="client-1",
+        expected_execution_mode="paper",
     )
     assert ok is False
     assert reason == expected_reason
@@ -2288,7 +2354,9 @@ def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(
 
     # Overnight lease helper surfaces the reason.
     owned, over_reason = ov._pending_owner_lease_active(
-        _meta, expected_client_id="client-1",
+        _meta,
+        expected_client_id="client-1",
+        expected_execution_mode="paper",
     )
     assert owned is False
     assert over_reason == expected_reason
@@ -3808,6 +3876,31 @@ def test_retryable_cleanup_completion_failure_is_terminal_error_not_fake_retry(m
     assert result["errors"] == 1
     assert result["terminal_errors"] == 1
     assert controls["broker"].submit_order.call_count == 0
+
+
+def test_every_completion_cas_result_is_consumed_by_its_runtime_caller():
+    """No production caller may discard the checked completion Boolean."""
+    import ast
+    import inspect
+    import ap_overnight_reeval as ov
+
+    source_path = inspect.getsourcefile(ov)
+    assert source_path
+    with open(source_path, encoding="utf-8") as source_file:
+        tree = ast.parse(source_file.read(), source_path)
+
+    discarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+            continue
+        func = node.value.func
+        if (
+            isinstance(func, ast.Name)
+            and func.id == "_complete_watch_arm_attempt_checked"
+        ):
+            discarded.append(node.lineno)
+
+    assert discarded == [], f"completion CAS result discarded at lines {discarded}"
 
 
 def test_shared_setup_previous_session_failure_does_not_block_retry(monkeypatch):

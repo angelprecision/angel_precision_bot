@@ -277,6 +277,9 @@ LEASE_REASONS_FORCE_CONFLICT = frozenset({
     "durable_recovery_retained_at_missing_or_unparseable",
     "durable_recovery_retention_reason_missing",
     "durable_recovery_retention_mode_missing",
+    "durable_recovery_retention_mode_invalid",
+    "durable_recovery_expected_mode_missing_or_invalid",
+    "durable_recovery_retention_mode_mismatch",
 })
 
 
@@ -367,7 +370,10 @@ def is_proof_retry_owner_active(
 
 
 def is_durable_recovery_owner_active(
-    meta: dict, *, expected_client_id: Optional[str] = None,
+    meta: dict,
+    *,
+    expected_client_id: Optional[str] = None,
+    expected_execution_mode: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Shared durable-recovery ownership predicate.
 
@@ -425,8 +431,18 @@ def is_durable_recovery_owner_active(
         return False, "durable_recovery_retained_at_missing_or_unparseable"
     if not str(meta.get("recovery_retention_reason") or "").strip():
         return False, "durable_recovery_retention_reason_missing"
-    if not str(meta.get("recovery_retention_mode") or "").strip():
+    retention_mode = str(meta.get("recovery_retention_mode") or "").strip().upper()
+    if not retention_mode:
         return False, "durable_recovery_retention_mode_missing"
+    if retention_mode not in {"PAPER", "LIVE"}:
+        return False, "durable_recovery_retention_mode_invalid"
+
+    if expected_execution_mode is not None:
+        expected_mode = str(expected_execution_mode or "").strip().upper()
+        if expected_mode not in {"PAPER", "LIVE"}:
+            return False, "durable_recovery_expected_mode_missing_or_invalid"
+        if retention_mode != expected_mode:
+            return False, "durable_recovery_retention_mode_mismatch"
 
     return True, "durable_recovery_scheduler_active"
 
@@ -1291,6 +1307,9 @@ class APOrderStateMachine:
         _dr_active, _dr_reason = is_durable_recovery_owner_active(
             meta,
             expected_client_id=str(order.get("client_id") or "").strip(),
+            expected_execution_mode=str(
+                order.get("execution_mode") or ""
+            ).strip(),
         )
         if _dr_active or _dr_reason in LEASE_REASONS_FORCE_CONFLICT:
             return True

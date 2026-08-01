@@ -1,10 +1,12 @@
 # P0 Queue Liveness and Watch Ownership
 
-> **DRAFT IMPLEMENTATION CONTRACT ONLY. DO NOT MERGE OR DEPLOY.**
+> **DRAFT IMPLEMENTATION — UNMERGED AND UNDEPLOYED.**
 >
-> Base: `main` at `3315a633a6061563ecd92a9c15b1615051b90176`
+> Base: committed GitHub `main` at `715d26ede22c6078c22cf5796836789332b5dfe5`
 >
-> This branch preserves the July 28, 2026 LIVE trade-flow incident and the smallest safe implementation contract. It does not claim the production fix is complete.
+> This document records the implemented PR #404 contract. The PR body is the
+> authoritative source for the exact head SHA and exact-head CI run. Merge and
+> deployment remain separate operator decisions.
 
 ## Incident
 
@@ -31,12 +33,13 @@ The system therefore did not rank all available opportunities and select the bes
 
 ## Scope
 
-Expected implementation scope is limited to the existing overnight handoff / watcher ownership seam:
+Implementation scope is limited to the existing overnight handoff / watcher
+ownership seam and its durable state authority:
 
 1. `ap_overnight_reeval.py`
-2. the exact watcher implementation called by that path, only if required
-3. `ap/order_monitor.py` or the existing canonical pending-entry ownership helper, only if required
-4. one focused regression test file
+2. `ap/order_monitor.py` pending-entry ownership classification
+3. `ap/order_state_machine.py` stale-cleanup CAS and shared ownership predicates
+4. the P0 workflow plus focused overnight/watcher ownership regressions
 
 Do not touch:
 
@@ -165,4 +168,8 @@ Before this PR can become mergeable, the final PR description must contain:
 
 ## Current status
 
-Preserved as a draft contract. Production implementation and exact-head tests are still required.
+The production implementation and production-shaped regressions are present on
+PR #404. The PR remains Draft, unmerged, and undeployed until the latest
+amendment passes exact-head CI and receives a fresh whole-PR review. This change
+repairs the overnight queue/watcher ownership seam; it does not by itself prove
+scanner-to-broker trade flow, deployment state, or production profitability.

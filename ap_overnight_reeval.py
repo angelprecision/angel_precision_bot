@@ -351,7 +351,10 @@ def _parse_iso_ts(raw) -> Optional[datetime]:
 
 
 def _pending_owner_lease_active(
-    meta: dict, *, expected_client_id: Optional[str] = None,
+    meta: dict,
+    *,
+    expected_client_id: Optional[str] = None,
+    expected_execution_mode: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Return (owned, reason). A row is 'owned' only when the ownership
     evidence is real AND (for time-bounded fields) still fresh. Reason is
@@ -385,7 +388,9 @@ def _pending_owner_lease_active(
             return False, _proof_reason
         # Durable recovery_scheduler retention — separate canonical contract.
         _dr_active, _dr_reason = is_durable_recovery_owner_active(
-            meta, expected_client_id=expected_client_id,
+            meta,
+            expected_client_id=expected_client_id,
+            expected_execution_mode=expected_execution_mode,
         )
         if _dr_active:
             return True, _dr_reason
@@ -697,7 +702,8 @@ def _classify_pending_entry_for_overnight(
         row = dict(_raw) if not isinstance(_raw, dict) else _raw
         row_client_id = str(row.get("client_id") or "").strip()
         row_client = row_client_id.lower()
-        row_mode   = str(row.get("execution_mode") or "").strip().lower()
+        row_execution_mode = str(row.get("execution_mode") or "").strip()
+        row_mode = row_execution_mode.lower()
 
         # Missing existing row identity → ambiguous, never release. (The SQL
         # filter already restricts to same client/mode; belt-and-suspenders.)
@@ -770,7 +776,9 @@ def _classify_pending_entry_for_overnight(
                 )
                 continue
             _recovery_owned, _owner_reason = _pending_owner_lease_active(
-                _meta, expected_client_id=row_client_id,
+                _meta,
+                expected_client_id=row_client_id,
+                expected_execution_mode=row_execution_mode,
             )
         except Exception as _mexc:
             log.error(
@@ -6826,7 +6834,7 @@ def run_overnight_reeval(
                 )
             except Exception as osm_exc:
                 log.error("[%s] overnight_reeval: OSM create_entry_order failed: %s", ticker, osm_exc)
-                _complete_watch_arm_attempt_checked(
+                _create_completion_ok = _complete_watch_arm_attempt_checked(
                     signal_id=signal_id,
                     client_id=client_id,
                     canonical_signal_id=_canonical_for_attempt,
@@ -6840,7 +6848,13 @@ def run_overnight_reeval(
                     ticker=ticker,
                     caller="create_entry_order_exception",
                 )
-                if _paper_rescue_only:
+                if not _create_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        "create_entry_order_exception",
+                    )
+                elif _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
@@ -6855,7 +6869,7 @@ def run_overnight_reeval(
 
             if not local_order_id:
                 log.error("[%s] overnight_reeval: OSM returned no local_order_id for %s", ticker, signal_id)
-                _complete_watch_arm_attempt_checked(
+                _missing_oid_completion_ok = _complete_watch_arm_attempt_checked(
                     signal_id=signal_id,
                     client_id=client_id,
                     canonical_signal_id=_canonical_for_attempt,
@@ -6869,7 +6883,13 @@ def run_overnight_reeval(
                     ticker=ticker,
                     caller="missing_local_order_id",
                 )
-                if _paper_rescue_only:
+                if not _missing_oid_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        "missing_local_order_id",
+                    )
+                elif _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
@@ -6961,7 +6981,7 @@ def run_overnight_reeval(
                         ticker,
                         local_order_id,
                     )
-                    _complete_watch_arm_attempt_checked(
+                    _pending_false_completion_ok = _complete_watch_arm_attempt_checked(
                         signal_id=signal_id,
                         client_id=client_id,
                         canonical_signal_id=_canonical_for_attempt,
@@ -6975,7 +6995,13 @@ def run_overnight_reeval(
                         ticker=ticker,
                         caller="pending_trigger_false",
                     )
-                    if _paper_rescue_only:
+                    if not _pending_false_completion_ok:
+                        _mark_job_error(
+                            job_id, client_id,
+                            "overnight_watch_arm_attempt_completion_failed:"
+                            "pending_trigger_false",
+                        )
+                    elif _paper_rescue_only:
                         _mark_job_error(
                             job_id,
                             client_id,
@@ -6991,7 +7017,7 @@ def run_overnight_reeval(
                     local_order_id,
                     _pt_exc,
                 )
-                _complete_watch_arm_attempt_checked(
+                _pending_exc_completion_ok = _complete_watch_arm_attempt_checked(
                     signal_id=signal_id,
                     client_id=client_id,
                     canonical_signal_id=_canonical_for_attempt,
@@ -7005,7 +7031,13 @@ def run_overnight_reeval(
                     ticker=ticker,
                     caller="pending_trigger_exception",
                 )
-                if _paper_rescue_only:
+                if not _pending_exc_completion_ok:
+                    _mark_job_error(
+                        job_id, client_id,
+                        "overnight_watch_arm_attempt_completion_failed:"
+                        "pending_trigger_exception",
+                    )
+                elif _paper_rescue_only:
                     _mark_job_error(
                         job_id,
                         client_id,
@@ -7205,24 +7237,38 @@ def run_overnight_reeval(
                                 reason="overnight_watch_ownership_conflict",
                                 done_event="OVERNIGHT_WATCH_OWNERSHIP_CONFLICT_CLEANUP_DONE",
                             )
-                            _complete_watch_arm_attempt_checked(
-                                signal_id=signal_id,
-                                client_id=client_id,
-                                canonical_signal_id=_canonical_for_attempt,
-                                signal_payload=signal,
-                                execution_mode=_execution_mode,
-                                session_key=session_key,
-                                attempt=_watch_attempt,
-                                state=(
-                                    WATCH_ATTEMPT_STATE_ERROR
-                                    if not _conflict_cleanup_success
-                                    else WATCH_ATTEMPT_STATE_RETRYABLE
-                                ),
-                                local_order_id=str(local_order_id),
-                                reason=f"overnight_watch_ownership_conflict:{_conflict_cleanup_method}",
-                                ticker=ticker,
-                                caller="watcher_owner_conflict",
+                            _owner_conflict_completion_ok = (
+                                _complete_watch_arm_attempt_checked(
+                                    signal_id=signal_id,
+                                    client_id=client_id,
+                                    canonical_signal_id=_canonical_for_attempt,
+                                    signal_payload=signal,
+                                    execution_mode=_execution_mode,
+                                    session_key=session_key,
+                                    attempt=_watch_attempt,
+                                    state=(
+                                        WATCH_ATTEMPT_STATE_ERROR
+                                        if not _conflict_cleanup_success
+                                        else WATCH_ATTEMPT_STATE_RETRYABLE
+                                    ),
+                                    local_order_id=str(local_order_id),
+                                    reason=(
+                                        "overnight_watch_ownership_conflict:"
+                                        f"{_conflict_cleanup_method}"
+                                    ),
+                                    ticker=ticker,
+                                    caller="watcher_owner_conflict",
+                                )
                             )
+                            if not _owner_conflict_completion_ok:
+                                _mark_job_error(
+                                    job_id, client_id,
+                                    "overnight_watch_arm_attempt_completion_failed:"
+                                    "watcher_owner_conflict",
+                                )
+                                result["errors"] += 1
+                                result["terminal_errors"] += 1
+                                continue
                             if not _conflict_cleanup_success:
                                 _mark_job_error(job_id, client_id, "overnight_watch_ownership_conflict_cleanup_failed")
                                 result["errors"] += 1
@@ -7268,7 +7314,7 @@ def run_overnight_reeval(
                             done_event="OVERNIGHT_WATCH_ALREADY_WATCHING_DUPLICATE_CLEANUP_DONE",
                         )
                         if not _dup_cleanup_success:
-                            _complete_watch_arm_attempt_checked(
+                            _dup_error_completion_ok = _complete_watch_arm_attempt_checked(
                                 signal_id=signal_id,
                                 client_id=client_id,
                                 canonical_signal_id=_canonical_for_attempt,
@@ -7282,7 +7328,16 @@ def run_overnight_reeval(
                                 ticker=ticker,
                                 caller="already_watching_cleanup_failed",
                             )
-                            _mark_job_error(job_id, client_id, "already_watching_duplicate_cleanup_failed")
+                            _mark_job_error(
+                                job_id,
+                                client_id,
+                                (
+                                    "already_watching_duplicate_cleanup_failed"
+                                    if _dup_error_completion_ok
+                                    else "overnight_watch_arm_attempt_completion_failed:"
+                                    "already_watching_cleanup_failed"
+                                ),
+                            )
                             result["errors"] += 1
                             result["terminal_errors"] += 1
                             continue
@@ -7344,7 +7399,7 @@ def run_overnight_reeval(
                     )
                     if not _cleanup_success:
                         _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
-                        _complete_watch_arm_attempt_checked(
+                        _cleanup_error_completion_ok = _complete_watch_arm_attempt_checked(
                             signal_id=signal_id,
                             client_id=client_id,
                             canonical_signal_id=_canonical_for_attempt,
@@ -7384,7 +7439,16 @@ def run_overnight_reeval(
                             cleanup_failed=True,
                             original_reason=_full_error,
                         )
-                        _mark_job_error(job_id, client_id, _cleanup_failed_reason)
+                        _mark_job_error(
+                            job_id,
+                            client_id,
+                            (
+                                _cleanup_failed_reason
+                                if _cleanup_error_completion_ok
+                                else "overnight_watch_arm_attempt_completion_failed:"
+                                "watch_cleanup_failed"
+                            ),
+                        )
                         result["errors"] += 1
                         result["terminal_errors"] += 1
                         continue
@@ -7418,7 +7482,7 @@ def run_overnight_reeval(
                             order_state_machine, str(local_order_id)
                         )
                         if _terminal_result != WATCH_ATTEMPT_ACQUIRED:
-                            _complete_watch_arm_attempt_checked(
+                            _unproven_completion_ok = _complete_watch_arm_attempt_checked(
                                 signal_id=signal_id,
                                 client_id=client_id,
                                 canonical_signal_id=_canonical_for_attempt,
@@ -7432,7 +7496,16 @@ def run_overnight_reeval(
                                 ticker=ticker,
                                 caller="cleanup_terminal_unproven",
                             )
-                            _mark_job_error(job_id, client_id, f"overnight_watch_arm_cleanup_unproven:{_terminal_reason}")
+                            _mark_job_error(
+                                job_id,
+                                client_id,
+                                (
+                                    f"overnight_watch_arm_cleanup_unproven:{_terminal_reason}"
+                                    if _unproven_completion_ok
+                                    else "overnight_watch_arm_attempt_completion_failed:"
+                                    "cleanup_terminal_unproven"
+                                ),
+                            )
                             result["errors"] += 1
                             result["terminal_errors"] += 1
                             continue
@@ -7504,7 +7577,7 @@ def run_overnight_reeval(
                 )
                 if not _cleanup_success:
                     _cleanup_failed_reason = _watch_arm_cleanup_failed_reason(_full_error)
-                    _complete_watch_arm_attempt_checked(
+                    _exception_cleanup_completion_ok = _complete_watch_arm_attempt_checked(
                         signal_id=signal_id,
                         client_id=client_id,
                         canonical_signal_id=_canonical_for_attempt,
@@ -7544,7 +7617,16 @@ def run_overnight_reeval(
                         cleanup_failed=True,
                         original_reason=_full_error,
                     )
-                    _mark_job_error(job_id, client_id, _cleanup_failed_reason)
+                    _mark_job_error(
+                        job_id,
+                        client_id,
+                        (
+                            _cleanup_failed_reason
+                            if _exception_cleanup_completion_ok
+                            else "overnight_watch_arm_attempt_completion_failed:"
+                            "watch_exception_cleanup_failed"
+                        ),
+                    )
                     result["errors"] += 1
                     result["terminal_errors"] += 1
                     continue
@@ -7564,19 +7646,24 @@ def run_overnight_reeval(
                 if _terminal_result != WATCH_ATTEMPT_ACQUIRED:
                     # Terminal proof missing / active / mismatched / DB error
                     # — fail closed as ERROR (do NOT claim retryability).
-                    _complete_watch_arm_attempt_checked(
-                        signal_id=signal_id,
-                        client_id=client_id,
-                        canonical_signal_id=_canonical_for_attempt,
-                        signal_payload=signal,
-                        execution_mode=_execution_mode,
-                        session_key=session_key,
-                        attempt=_watch_attempt,
-                        state=WATCH_ATTEMPT_STATE_ERROR,
-                        local_order_id=str(local_order_id),
-                        reason=f"watch_exception_cleanup_terminal_unproven:{_terminal_reason}",
-                        ticker=ticker,
-                        caller="watch_exception_cleanup_terminal_unproven",
+                    _exception_unproven_completion_ok = (
+                        _complete_watch_arm_attempt_checked(
+                            signal_id=signal_id,
+                            client_id=client_id,
+                            canonical_signal_id=_canonical_for_attempt,
+                            signal_payload=signal,
+                            execution_mode=_execution_mode,
+                            session_key=session_key,
+                            attempt=_watch_attempt,
+                            state=WATCH_ATTEMPT_STATE_ERROR,
+                            local_order_id=str(local_order_id),
+                            reason=(
+                                "watch_exception_cleanup_terminal_unproven:"
+                                f"{_terminal_reason}"
+                            ),
+                            ticker=ticker,
+                            caller="watch_exception_cleanup_terminal_unproven",
+                        )
                     )
                     _record_watch_arm_failure_proof(
                         signal_id=signal_id,
@@ -7589,8 +7676,15 @@ def run_overnight_reeval(
                         session_key=session_key,
                     )
                     _mark_job_error(
-                        job_id, client_id,
-                        f"overnight_watch_arm_exception_terminal_unproven:{_terminal_reason}",
+                        job_id,
+                        client_id,
+                        (
+                            "overnight_watch_arm_exception_terminal_unproven:"
+                            f"{_terminal_reason}"
+                            if _exception_unproven_completion_ok
+                            else "overnight_watch_arm_attempt_completion_failed:"
+                            "watch_exception_cleanup_terminal_unproven"
+                        ),
                     )
                     log.error(
                         "[%s] overnight_reeval: watcher exception cleanup terminal-"
