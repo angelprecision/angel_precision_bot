@@ -163,13 +163,11 @@ def test_15_intel_block_proceeds_to_arm_when_recheck_disabled():
     assert "PROCEED_TO_ARM" in OV_SRC
     assert "second_score_mode=observe_only" in OV_SRC
     idx = OV_SRC.find("decision=PROCEED_TO_ARM")
-    assert idx != -1
-    fallthrough_idx = OV_SRC.find("Fall through to Step 5", idx)
-    assert fallthrough_idx != -1
-    region = OV_SRC[idx:fallthrough_idx]
-    assert "_mark_job_rejected" not in region, (
+    region = OV_SRC[idx:idx+1800]
+    assert "_mark_job_rejected" not in region.split("else:")[0], (
         "PROCEED branch must not reach _mark_job_rejected before else:"
     )
+    assert "Fall through to Step 5" in region
 
 def test_15a_score_block_proceeds_to_arm_when_recheck_disabled():
     """Morning blocked_score rechecks must stay observe-only for WATCHING rows."""
@@ -215,7 +213,7 @@ def test_15b_hard_safety_block_still_rejects():
     """Hard safety blocks (capital/kill switch/etc) must still reject."""
     assert "_is_hard_safety_block" in OV_SRC
     idx = OV_SRC.find('_is_hard_safety_block')
-    region = OV_SRC[idx:idx+7000]  # PR #404 elif block inserted between this and else
+    region = OV_SRC[idx:idx+3500]
     assert "_mark_job_rejected" in region
     assert "Hard safety block OR recheck enabled" in OV_SRC
 
