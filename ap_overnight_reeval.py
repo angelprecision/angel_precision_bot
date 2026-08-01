@@ -3183,7 +3183,10 @@ def _recover_materialized_watch_before_admission(
         # path. At the cap, however, the durable claim must be exhausted here,
         # before Master Control or any other new-admission work can run.
         if not (
-            state == WATCH_ATTEMPT_STATE_IN_PROGRESS
+            state in {
+                WATCH_ATTEMPT_STATE_IN_PROGRESS,
+                WATCH_ATTEMPT_STATE_RETRYABLE,
+            }
             and bool(durable_order_id)
             and observed_status in _TERMINAL_ENTRY_STATUSES
             and attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS

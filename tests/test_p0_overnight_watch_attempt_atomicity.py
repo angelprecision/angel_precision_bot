@@ -199,7 +199,7 @@ def _wire_db(monkeypatch):
 # ── seed / read helpers (direct Postgres) ─────────────────────────────────────
 
 def _seed(*, mode, session=SESSION, state, count, token="", order_id="",
-          client=CLIENT, canonical=CANON):
+          client=CLIENT, canonical=CANON, signal_id=SIGNAL_ID):
     meta = overnight._attempt_meta_patch(
         existing_meta={},
         execution_mode=mode,
@@ -220,7 +220,7 @@ def _seed(*, mode, session=SESSION, state, count, token="", order_id="",
             " order_local_id, metadata) VALUES (%s,%s,%s,%s,%s,%s::jsonb) "
             "ON CONFLICT (canonical_signal_id, client_id) DO UPDATE SET "
             "metadata = EXCLUDED.metadata",
-            (SIGNAL_ID, canonical, client, "CREATED", order_id or None, json.dumps(meta)),
+            (signal_id, canonical, client, "CREATED", order_id or None, json.dumps(meta)),
         )
     setup.close()
 
@@ -1821,3 +1821,98 @@ def test_real_postgres_runtime_recovery_precedes_new_admission_market_gates(
     assert overnight._attempt_state(scope) == S_ARMED
     assert scope["count"] == 2
     assert scope["local_order_id"] == _REATTACH_OID
+
+
+def test_real_postgres_retryable_bound_terminal_at_cap_exhausts_before_admission(
+    monkeypatch, _orders_table,
+):
+    """A capped RETRYABLE terminal owner is exhausted before new-admission work."""
+    signal = {
+        "signal_id": _REATTACH_SIG,
+        "canonical_signal_id": _REATTACH_CANON,
+        "ticker": "SPY",
+        "symbol": "SPY",
+        "side": "CALL",
+        "direction": "CALL",
+        "timeframe": "1d",
+        "score": 80.0,
+        "entry_trigger": 450.0,
+        "created_at": "2026-07-29T20:00:00+00:00",
+    }
+    job = {
+        "id": "job-retryable-bound-terminal-at-cap",
+        "signal_id": _REATTACH_SIG,
+        "payload": signal,
+        "_source": "trade_queue",
+    }
+    _insert_order(local_order_id=_REATTACH_OID, status="EXPIRED")
+    _seed(
+        mode="live",
+        state=S_RETRYABLE,
+        count=3,
+        token="retryable-token-003",
+        order_id=_REATTACH_OID,
+        client=_REATTACH_CLIENT,
+        canonical=_REATTACH_CANON,
+        signal_id=_REATTACH_SIG,
+    )
+
+    monkeypatch.setattr(
+        overnight,
+        "_et_now",
+        lambda: datetime(2026, 7, 29, 9, 15, tzinfo=ZoneInfo("America/New_York")),
+    )
+    monkeypatch.setattr(
+        overnight,
+        "_fetch_watching_signals_with_status",
+        lambda client_id: overnight._FetchWatchingSignalsResult(
+            [job], "SUCCESS", "SUCCESS", None, None,
+        ),
+    )
+    monkeypatch.setattr(overnight, "_mark_job_rejected", lambda *a, **kw: None)
+    monkeypatch.setattr(overnight, "_mark_job_error", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        overnight, "_mark_job_watching_reason", lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        overnight, "_mark_job_watching_armed", lambda *a, **kw: None,
+    )
+
+    auth = types.ModuleType("ap.authorization")
+    auth.execution_mode_for_broker = lambda broker: "LIVE"
+    auth.is_live_broker = lambda broker: False
+    auth.broker_live_mode_known = lambda broker: True
+    auth.check_live_authorization = lambda client_id: None
+    auth.authorization_gate_enforced = lambda: False
+    auth.LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
+    monkeypatch.setitem(sys.modules, "ap.authorization", auth)
+
+    broker = MagicMock()
+    master_control = MagicMock()
+    selector = MagicMock()
+    osm = MagicMock()
+    watcher = MagicMock()
+
+    result = overnight.run_overnight_reeval(
+        client_id=_REATTACH_CLIENT,
+        broker=broker,
+        master_control=master_control,
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher,
+        force=True,
+    )
+
+    scope = _read_scope_reattach(mode="live")
+    assert overnight._attempt_state(scope) == S_EXHAUSTED
+    assert scope["count"] == 3
+    assert scope["local_order_id"] == _REATTACH_OID
+    assert _order_status(_REATTACH_OID) == "EXPIRED"
+    assert result["terminal_errors"] == 1
+    assert result["retryable_deferred"] == 0
+    broker.get_prior_day_levels.assert_not_called()
+    master_control.evaluate.assert_not_called()
+    selector.select.assert_not_called()
+    osm.create_entry_order.assert_not_called()
+    broker.submit_order.assert_not_called()
+    watcher.watch.assert_not_called()
