@@ -271,6 +271,12 @@ LEASE_REASONS_FORCE_CONFLICT = frozenset({
     # Durable recovery_scheduler retention with blank owner — recognized
     # canonical ownership kind but malformed identity; must fail closed.
     "durable_recovery_owner_missing",
+    "durable_recovery_owner_malformed",
+    "durable_recovery_expected_client_missing",
+    "durable_recovery_owner_client_mismatch",
+    "durable_recovery_retained_at_missing_or_unparseable",
+    "durable_recovery_retention_reason_missing",
+    "durable_recovery_retention_mode_missing",
 })
 
 
@@ -360,7 +366,9 @@ def is_proof_retry_owner_active(
     return True, "proof_retry_active"
 
 
-def is_durable_recovery_owner_active(meta: dict) -> tuple[bool, str]:
+def is_durable_recovery_owner_active(
+    meta: dict, *, expected_client_id: Optional[str] = None,
+) -> tuple[bool, str]:
     """Shared durable-recovery ownership predicate.
 
     ap_recovery persists a canonical durable retention marker so a future
@@ -378,10 +386,10 @@ def is_durable_recovery_owner_active(meta: dict) -> tuple[bool, str]:
     a canonical release marker. Generic admission cleanup MUST NOT
     terminalize a row bearing this marker.
 
-    Returns (owned, reason). A recognized ownership kind with a BLANK owner
-    is a malformed canonical state that must fail closed as CONFLICT; the
-    caller detects that reason via LEASE_REASONS_FORCE_CONFLICT rather than
-    falling through to stale classification. Both layers (overnight
+    Returns (owned, reason). Any recognized ownership kind whose remaining
+    canonical fields are missing or malformed must fail closed as CONFLICT;
+    the caller detects that reason via LEASE_REASONS_FORCE_CONFLICT rather
+    than falling through to stale classification. Both layers (overnight
     liveness helper AND OSM pending-entry cleanup guard) consult this same
     function so there is one source of truth for this evidence.
     """
@@ -397,6 +405,28 @@ def is_durable_recovery_owner_active(meta: dict) -> tuple[bool, str]:
         # Recognized canonical kind, malformed identity → fail closed as
         # conflict via LEASE_REASONS_FORCE_CONFLICT.
         return False, "durable_recovery_owner_missing"
+
+    owner_prefix, separator, owner_client_id = owner.partition(":")
+    if (
+        separator != ":"
+        or owner_prefix != "recovery_scheduler"
+        or not owner_client_id.strip()
+    ):
+        return False, "durable_recovery_owner_malformed"
+
+    if expected_client_id is not None:
+        expected_client = str(expected_client_id or "").strip()
+        if not expected_client:
+            return False, "durable_recovery_expected_client_missing"
+        if owner != f"recovery_scheduler:{expected_client}":
+            return False, "durable_recovery_owner_client_mismatch"
+
+    if _parse_iso_ts_for_proof_retry(meta.get("recovery_retained_at")) is None:
+        return False, "durable_recovery_retained_at_missing_or_unparseable"
+    if not str(meta.get("recovery_retention_reason") or "").strip():
+        return False, "durable_recovery_retention_reason_missing"
+    if not str(meta.get("recovery_retention_mode") or "").strip():
+        return False, "durable_recovery_retention_mode_missing"
 
     return True, "durable_recovery_scheduler_active"
 
@@ -1173,11 +1203,10 @@ class APOrderStateMachine:
                 # SQL defense-in-depth: even if a future classifier or a
                 # bug in the Python-side guard incorrectly authorized this
                 # CAS, the UPDATE itself refuses when the row carries the
-                # canonical durable recovery_scheduler retention marker
-                # with a nonblank owner. This invariant is enforced at
-                # the database exactly as it is enforced in Python, so
-                # any single-point failure upstream cannot terminalize a
-                # rightful recovery-owned row.
+                # recognized durable recovery_scheduler retention kind.
+                # Even a malformed marker is preserved for its designated
+                # recovery/operator path to diagnose; generic cleanup must
+                # never turn malformed ownership into duplicate exposure.
                 c.execute(
                     "UPDATE orders "
                     "SET status = %s, updated_ts = NOW(), last_error = %s "
@@ -1188,10 +1217,7 @@ class APOrderStateMachine:
                     "AND updated_ts = %s "
                     "AND NOT ("
                     "  LOWER(BTRIM(COALESCE(meta->>'recovery_ownership', ''))) "
-                    "    = 'recovery_scheduler' "
-                    "  AND NULLIF("
-                    "    BTRIM(COALESCE(meta->>'recovery_owner', '')), ''"
-                    "  ) IS NOT NULL"
+                    "    = 'recovery_scheduler'"
                     ")",
                     (
                         OrderStatus.EXPIRED,
@@ -1262,8 +1288,11 @@ class APOrderStateMachine:
         # ownership contract. ap_recovery writes it precisely so a future
         # recovery pass can resume the exact row; generic cleanup MUST
         # refuse. Same shared predicate as the overnight liveness helper.
-        _dr_active, _ = is_durable_recovery_owner_active(meta)
-        if _dr_active:
+        _dr_active, _dr_reason = is_durable_recovery_owner_active(
+            meta,
+            expected_client_id=str(order.get("client_id") or "").strip(),
+        )
+        if _dr_active or _dr_reason in LEASE_REASONS_FORCE_CONFLICT:
             return True
         return False
 

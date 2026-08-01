@@ -120,18 +120,22 @@ class _FakeOrderStateMachine:
             from ap.order_state_machine import (
                 is_proof_retry_owner_active,
                 is_durable_recovery_owner_active,
+                LEASE_REASONS_FORCE_CONFLICT,
             )
             if is_proof_retry_owner_active(_meta)[0]:
                 return False, "broker_or_recovery_owner_active"
-            if is_durable_recovery_owner_active(_meta)[0]:
+            _dr_active, _dr_reason = is_durable_recovery_owner_active(
+                _meta,
+                expected_client_id=str(row.get("client_id") or "").strip(),
+            )
+            if _dr_active or _dr_reason in LEASE_REASONS_FORCE_CONFLICT:
                 return False, "broker_or_recovery_owner_active"
             # SQL-side defense-in-depth mirror: even if the Python guard
             # above ever regresses, the UPDATE itself rejects when the
-            # canonical durable retention marker is present with a
-            # nonblank owner. Model that here.
+            # recognized durable retention kind is present. Even malformed
+            # markers remain protected for diagnosis. Model that here.
             _ro_kind = str(_meta.get("recovery_ownership") or "").strip().lower()
-            _ro_owner = str(_meta.get("recovery_owner") or "").strip()
-            if _ro_kind == "recovery_scheduler" and _ro_owner:
+            if _ro_kind == "recovery_scheduler":
                 return False, "cas_sql_defense_recovery_scheduler_owner"
         if not self.cleanup_succeeds:
             return False, "cleanup_stub_disabled"
@@ -2074,7 +2078,9 @@ def test_durable_recovery_scheduler_predicate_recognizes_exact_producer_shape():
     from ap.order_state_machine import is_durable_recovery_owner_active
 
     # Full producer shape → owned.
-    ok, reason = is_durable_recovery_owner_active(_durable_recovery_meta())
+    ok, reason = is_durable_recovery_owner_active(
+        _durable_recovery_meta(), expected_client_id="client-1",
+    )
     assert ok is True, reason
     assert reason == "durable_recovery_scheduler_active"
 
@@ -2096,7 +2102,9 @@ def test_durable_recovery_scheduler_predicate_recognizes_exact_producer_shape():
 
 def test_overnight_lease_helper_honors_durable_recovery_scheduler_ownership():
     import ap_overnight_reeval as ov
-    owned, reason = ov._pending_owner_lease_active(_durable_recovery_meta())
+    owned, reason = ov._pending_owner_lease_active(
+        _durable_recovery_meta(), expected_client_id="client-1",
+    )
     assert owned is True
     assert reason == "durable_recovery_scheduler_active"
 
@@ -2228,11 +2236,39 @@ def test_direct_cas_refuses_durable_recovery_scheduler_owner(monkeypatch):
     assert osm.orders["prior-recov-1"]["status"] == "PENDING_TRIGGER"
 
 
-def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(monkeypatch):
-    """Blank recovery_owner on an otherwise canonical recovery_ownership
-    row is a malformed durable-recovery state. The overnight helper must
-    surface the malformed reason; the classifier must escalate it to
-    CONFLICT (not stale) via LEASE_REASONS_FORCE_CONFLICT."""
+@pytest.mark.parametrize(("marker_patch", "expected_reason"), [
+    ({"recovery_owner": ""}, "durable_recovery_owner_missing"),
+    ({"recovery_owner": "worker:client-1"}, "durable_recovery_owner_malformed"),
+    (
+        {"recovery_owner": "recovery_scheduler:client-2"},
+        "durable_recovery_owner_client_mismatch",
+    ),
+    (
+        {"recovery_retained_at": None},
+        "durable_recovery_retained_at_missing_or_unparseable",
+    ),
+    (
+        {"recovery_retained_at": "not-a-timestamp"},
+        "durable_recovery_retained_at_missing_or_unparseable",
+    ),
+    (
+        {"recovery_retention_reason": None},
+        "durable_recovery_retention_reason_missing",
+    ),
+    (
+        {"recovery_retention_mode": None},
+        "durable_recovery_retention_mode_missing",
+    ),
+])
+def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(
+    monkeypatch, marker_patch, expected_reason,
+):
+    """Every malformed canonical recovery marker is surfaced as conflict.
+
+    This covers malformed and cross-client owners plus missing retention
+    timestamp/reason/mode. None may silently count as an active owner or
+    fall through to destructive stale cleanup.
+    """
     import types as _types
     import ap_overnight_reeval as ov
     from ap.order_state_machine import (
@@ -2240,17 +2276,22 @@ def test_malformed_recovery_scheduler_owner_fails_closed_as_conflict(monkeypatch
         LEASE_REASONS_FORCE_CONFLICT,
     )
 
-    _meta = _durable_recovery_meta(owner_suffix="")
-    # Predicate: recognized shape, malformed identity.
-    ok, reason = is_durable_recovery_owner_active(_meta)
+    _meta = _durable_recovery_meta()
+    _meta.update(marker_patch)
+    # Predicate: recognized ownership kind, malformed canonical marker.
+    ok, reason = is_durable_recovery_owner_active(
+        _meta, expected_client_id="client-1",
+    )
     assert ok is False
-    assert reason == "durable_recovery_owner_missing"
+    assert reason == expected_reason
     assert reason in LEASE_REASONS_FORCE_CONFLICT
 
     # Overnight lease helper surfaces the reason.
-    owned, over_reason = ov._pending_owner_lease_active(_meta)
+    owned, over_reason = ov._pending_owner_lease_active(
+        _meta, expected_client_id="client-1",
+    )
     assert owned is False
-    assert over_reason == "durable_recovery_owner_missing"
+    assert over_reason == expected_reason
 
     # End-to-end: classifier escalates to PENDING_OWNER_CONFLICT (never stale).
     _rows = [{

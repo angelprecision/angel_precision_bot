@@ -350,7 +350,9 @@ def _parse_iso_ts(raw) -> Optional[datetime]:
         return None
 
 
-def _pending_owner_lease_active(meta: dict) -> tuple[bool, str]:
+def _pending_owner_lease_active(
+    meta: dict, *, expected_client_id: Optional[str] = None,
+) -> tuple[bool, str]:
     """Return (owned, reason). A row is 'owned' only when the ownership
     evidence is real AND (for time-bounded fields) still fresh. Reason is
     the fact that produced the True/False decision for diagnostics."""
@@ -382,10 +384,12 @@ def _pending_owner_lease_active(meta: dict) -> tuple[bool, str]:
             # to CONFLICT (not stale).
             return False, _proof_reason
         # Durable recovery_scheduler retention — separate canonical contract.
-        _dr_active, _dr_reason = is_durable_recovery_owner_active(meta)
+        _dr_active, _dr_reason = is_durable_recovery_owner_active(
+            meta, expected_client_id=expected_client_id,
+        )
         if _dr_active:
             return True, _dr_reason
-        if _dr_reason == "durable_recovery_owner_missing":
+        if _dr_reason in LEASE_REASONS_FORCE_CONFLICT:
             return False, _dr_reason
     except Exception as _pr_exc:
         log.warning(
@@ -691,7 +695,8 @@ def _classify_pending_entry_for_overnight(
 
     for _raw in rows:
         row = dict(_raw) if not isinstance(_raw, dict) else _raw
-        row_client = str(row.get("client_id")      or "").strip().lower()
+        row_client_id = str(row.get("client_id") or "").strip()
+        row_client = row_client_id.lower()
         row_mode   = str(row.get("execution_mode") or "").strip().lower()
 
         # Missing existing row identity → ambiguous, never release. (The SQL
@@ -764,7 +769,9 @@ def _classify_pending_entry_for_overnight(
                     or f"meta_unexpected_type:{type(_meta_raw).__name__}"
                 )
                 continue
-            _recovery_owned, _owner_reason = _pending_owner_lease_active(_meta)
+            _recovery_owned, _owner_reason = _pending_owner_lease_active(
+                _meta, expected_client_id=row_client_id,
+            )
         except Exception as _mexc:
             log.error(
                 "[%s] _classify_pending_entry_for_overnight: metadata parse "
