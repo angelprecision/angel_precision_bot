@@ -21,9 +21,6 @@ Disposition rules:
 """
 from __future__ import annotations
 
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 import pytest
 
 import ap_overnight_reeval as ov
@@ -40,16 +37,6 @@ NONTERMINAL_STATUSES = [
     "PARTIALLY_FILLED",
     "FILLED",
 ]
-
-
-@pytest.fixture(autouse=True)
-def _fixed_reeval_clock(monkeypatch):
-    """Keep fixed July 27 inventory fresh regardless of the CI wall clock."""
-    monkeypatch.setattr(
-        ov,
-        "_et_now",
-        lambda: datetime(2026, 7, 28, 9, 35, tzinfo=ZoneInfo("America/New_York")),
-    )
 
 
 def test_full_nonterminal_family_present_in_active_status_set():
