@@ -948,6 +948,8 @@ def test_exact_armed_completion_replay_is_idempotent():
 # a second order or submit to the broker.
 # ══════════════════════════════════════════════════════════════════════════════
 
+from datetime import datetime, timezone, timedelta  # noqa: E402 — appended block
+
 REATTACH_REQUIRED = overnight.WATCH_ATTEMPT_REATTACH_REQUIRED
 
 # ── helpers scoped to the reattach suite ─────────────────────────────────────
@@ -1151,11 +1153,15 @@ def _read_scope_reattach(*, mode: str = "live"):
 
 def test_reattach_required_disposition_on_expired_claim_with_pending_trigger_entry(
     _orders_table,
-    monkeypatch,
 ):
     """
     Primary regression: expired IN_PROGRESS + blank order_id + PENDING_TRIGGER
     ENTRY must yield WATCH_ATTEMPT_REATTACH_REQUIRED — NEVER ALREADY_IN_PROGRESS.
+
+    No mocks.  _read_attempt_scope_probe_full and _query_active_entry_order both
+    go through ap.db.conn, which the autouse _wire_db fixture already routes to
+    the real Postgres instance.  The seeded metadata (expired claim_lease_until)
+    and the real orders row are read via those real DB paths.
 
     Preconditions
     -------------
@@ -1165,48 +1171,16 @@ def test_reattach_required_disposition_on_expired_claim_with_pending_trigger_ent
     Post-conditions (all must hold)
     --------------------------------
     1. Claim returns WATCH_ATTEMPT_REATTACH_REQUIRED.
-    2. The returned local_order_id is the discovered order (durable bind).
+    2. The returned local_order_id equals the discovered order (durable bind).
     3. Durable scope state remains IN_PROGRESS (attempt not yet complete).
     4. Durable scope local_order_id is now bound to the existing order.
-    5. Durable scope token rotated (≠ original expired token).
-    6. Durable scope lease refreshed (claim_lease_until > now).
+    5. Durable scope token is rotated (≠ original expired token).
+    6. Durable scope lease is refreshed (claim_lease_until > now).
     7. No second orders row was created.
-    8. No ALREADY_IN_PROGRESS was returned (liveness proof).
+    8. ALREADY_IN_PROGRESS was NOT returned (liveness proof).
     """
     _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
     _seed_expired_in_progress(mode="live", count=1, order_id="")
-
-    # Wire _query_active_entry_order to return the real PENDING_TRIGGER row
-    # from the real orders table (direct Postgres query).
-    def _real_active_entry_query(client_id, execution_mode, canonical_sig_id):
-        conn = psycopg2.connect(_RAW_URL)
-        conn.autocommit = True
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(
-            "SELECT * FROM orders "
-            "WHERE client_id = %s AND kind = 'ENTRY' "
-            "AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s "
-            "AND canonical_signal_id = %s "
-            "AND status IN ('PENDING_TRIGGER','CREATED') "
-            "ORDER BY created_ts DESC LIMIT 1",
-            (client_id, execution_mode.lower(), canonical_sig_id),
-        )
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        if row:
-            return overnight._LS_FOUND, dict(row)
-        return overnight._LS_NOT_FOUND, None
-
-    monkeypatch.setattr(
-        overnight, "_query_active_entry_order", _real_active_entry_query
-    )
-    # Also patch the probe used for the pre-lock lease check so that the
-    # expired lease is visible without the Supabase client path.
-    monkeypatch.setattr(
-        overnight, "_read_attempt_scope_probe_full",
-        lambda *a, **kw: None,   # returns None → falls through to direct DB
-    )
 
     claim = _claim_reattach(mode="live")
 
@@ -1224,7 +1198,7 @@ def test_reattach_required_disposition_on_expired_claim_with_pending_trigger_ent
         f"local_order_id must be {_REATTACH_OID!r}, got {claim.local_order_id!r}"
     )
 
-    # 3–6. Durable scope assertions
+    # 3–6. Durable scope assertions (read back from real Postgres)
     scope = _read_scope_reattach(mode="live")
     assert overnight._attempt_state(scope) == "IN_PROGRESS"  # 3
     assert str(scope.get("local_order_id") or "").strip() == _REATTACH_OID  # 4
@@ -1249,31 +1223,20 @@ def test_reattach_required_disposition_on_expired_claim_with_pending_trigger_ent
     )
 
 
-def test_reattach_required_attempt_can_be_completed_as_armed(_orders_table, monkeypatch):
+def test_reattach_required_attempt_can_be_completed_as_armed(_orders_table):
     """
     After a REATTACH_REQUIRED claim the caller completes the attempt as ARMED
     (simulating a successful watch() call).  Proves the token/count returned by
     the claim function satisfies _complete_watch_arm_attempt's CAS predicate.
+    No mocks — real Postgres for all DB paths.
     """
     _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
     _seed_expired_in_progress(mode="live", count=1, order_id="")
 
-    def _fake_active(client_id, execution_mode, canonical_sig_id):
-        return overnight._LS_FOUND, {
-            "local_order_id": _REATTACH_OID,
-            "status": "PENDING_TRIGGER",
-            "client_id": client_id,
-            "execution_mode": execution_mode,
-            "canonical_signal_id": canonical_sig_id,
-            "kind": "ENTRY",
-        }
-
-    monkeypatch.setattr(overnight, "_query_active_entry_order", _fake_active)
-    monkeypatch.setattr(overnight, "_read_attempt_scope_probe_full",
-                        lambda *a, **kw: None)
-
     claim = _claim_reattach(mode="live")
-    assert claim.disposition == REATTACH_REQUIRED
+    assert claim.disposition == REATTACH_REQUIRED, (
+        f"Prerequisite: claim must be REATTACH_REQUIRED, got {claim.disposition!r}"
+    )
     assert claim.local_order_id == _REATTACH_OID
 
     # Simulate caller completing as ARMED after successful watch().
@@ -1300,29 +1263,20 @@ def test_reattach_required_attempt_can_be_completed_as_armed(_orders_table, monk
     assert scope.get("token") == claim.token
 
 
-def test_reattach_required_no_second_order_created(_orders_table, monkeypatch):
+def test_reattach_required_no_second_order_created(_orders_table):
     """
     Prove the REATTACH_REQUIRED path never creates a second order.
     After claim, attempt is completed as ARMED (via test helper, not real watcher).
     The orders table must still contain exactly one row.
+    No mocks — real Postgres for all DB paths.
     """
     _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
     _seed_expired_in_progress(mode="live", count=1, order_id="")
 
-    monkeypatch.setattr(overnight, "_query_active_entry_order",
-        lambda cid, mode, canon: (overnight._LS_FOUND, {
-            "local_order_id": _REATTACH_OID,
-            "status": "PENDING_TRIGGER",
-            "client_id": cid,
-            "execution_mode": mode,
-            "canonical_signal_id": canon,
-            "kind": "ENTRY",
-        }))
-    monkeypatch.setattr(overnight, "_read_attempt_scope_probe_full",
-                        lambda *a, **kw: None)
-
     claim = _claim_reattach(mode="live")
-    assert claim.disposition == REATTACH_REQUIRED
+    assert claim.disposition == REATTACH_REQUIRED, (
+        f"Prerequisite: claim must be REATTACH_REQUIRED, got {claim.disposition!r}"
+    )
 
     overnight._complete_watch_arm_attempt(
         signal_id=_REATTACH_SIG,
@@ -1342,33 +1296,17 @@ def test_reattach_required_no_second_order_created(_orders_table, monkeypatch):
     )
 
 
-def test_reattach_required_no_retryable_deferred_loop_after_arm(
-    _orders_table, monkeypatch,
-):
+def test_reattach_required_no_retryable_deferred_loop_after_arm(_orders_table):
     """
     Prove the indefinite retryable_deferred loop is closed.
+    No mocks — real Postgres for all DB paths.
 
-    Precondition: the same expired-claim + PENDING_TRIGGER scenario is presented
-    on two consecutive claim calls (simulating two scheduler runs).
-
-    Run 1: claim returns REATTACH_REQUIRED → caller completes as ARMED.
-    Run 2: claim returns WATCH_ATTEMPT_ALREADY_ARMED (durable scope is ARMED).
-           NOT ALREADY_IN_PROGRESS and NOT REATTACH_REQUIRED → the loop is gone.
+    Run 1: expired lease + PENDING_TRIGGER → REATTACH_REQUIRED → complete ARMED.
+    Run 2: scope is now ARMED → claim returns WATCH_ATTEMPT_ALREADY_ARMED.
+           Neither ALREADY_IN_PROGRESS nor REATTACH_REQUIRED → the loop is gone.
     """
     _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
     _seed_expired_in_progress(mode="live", count=1, order_id="")
-
-    def _fake_active(cid, mode, canon):
-        return overnight._LS_FOUND, {
-            "local_order_id": _REATTACH_OID,
-            "status": "PENDING_TRIGGER",
-            "client_id": cid, "execution_mode": mode,
-            "canonical_signal_id": canon, "kind": "ENTRY",
-        }
-
-    monkeypatch.setattr(overnight, "_query_active_entry_order", _fake_active)
-    monkeypatch.setattr(overnight, "_read_attempt_scope_probe_full",
-                        lambda *a, **kw: None)
 
     # Run 1: claim + arm
     claim1 = _claim_reattach(mode="live")
@@ -1389,7 +1327,7 @@ def test_reattach_required_no_retryable_deferred_loop_after_arm(
     )
     assert armed is True, "Run 1 completion must succeed"
 
-    # Run 2: the scope is now ARMED — claim must surface that immediately
+    # Run 2: scope is ARMED — claim must short-circuit immediately
     claim2 = _claim_reattach(mode="live")
     assert claim2.disposition == overnight.WATCH_ATTEMPT_ALREADY_ARMED, (
         f"Run 2 must yield ALREADY_ARMED (durable ARMED scope), "
@@ -1404,28 +1342,18 @@ def test_reattach_required_no_retryable_deferred_loop_after_arm(
     )
 
 
-def test_reattach_required_already_owned_status_stays_in_progress(
-    _orders_table, monkeypatch,
-):
+def test_reattach_required_already_owned_status_stays_in_progress(_orders_table):
     """
-    An already-owned in-flight order (SUBMITTED/ACCEPTED/OPEN) must NOT produce
-    REATTACH_REQUIRED — those orders are broker-owned and must not be reattached.
-    The claim must return ALREADY_IN_PROGRESS, not REATTACH_REQUIRED.
+    An already-owned in-flight order (SUBMITTED/ACCEPTED/OPEN/PARTIALLY_FILLED/
+    FILLED) must NOT produce REATTACH_REQUIRED — those orders are broker-owned
+    and must never be reattached. The claim must return ALREADY_IN_PROGRESS.
+    No mocks — the orders table is seeded with each status directly; the real
+    _query_active_entry_order reads it back.
     """
     for status in ("SUBMITTED", "ACCEPTED", "OPEN", "PARTIALLY_FILLED", "FILLED"):
-        # Reset scope for each sub-case
+        # Reset scope for each sub-case (ON CONFLICT DO UPDATE in both helpers)
         _seed_expired_in_progress(mode="live", count=1, order_id="")
         _insert_order(local_order_id=_REATTACH_OID, status=status)
-
-        monkeypatch.setattr(overnight, "_query_active_entry_order",
-            lambda cid, mode, canon, _st=status: (overnight._LS_FOUND, {
-                "local_order_id": _REATTACH_OID,
-                "status": _st,
-                "client_id": cid, "execution_mode": mode,
-                "canonical_signal_id": canon, "kind": "ENTRY",
-            }))
-        monkeypatch.setattr(overnight, "_read_attempt_scope_probe_full",
-                            lambda *a, **kw: None)
 
         claim = _claim_reattach(mode="live")
         assert claim.disposition == IN_PROGRESS, (
