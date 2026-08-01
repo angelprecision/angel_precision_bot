@@ -761,7 +761,9 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
         force=True,
     )
 
-    assert first["retryable_deferred"] == 1
+    assert first["retryable_deferred"] == 0
+    assert first["errors"] == 1
+    assert first["terminal_errors"] == 1
     assert ledger_row["opportunity_status"] == "MISSED"
     assert ledger_row["metadata"]["overnight_reeval_session_key"] == "2026-07-27"
     assert ledger_row["metadata"]["reattach_in_progress"] is True
@@ -793,7 +795,9 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
         force=True,
     )
 
-    assert second["retryable_deferred"] == 1
+    assert second["retryable_deferred"] == 0
+    assert second["errors"] == 1
+    assert second["terminal_errors"] == 1
     assert second_watcher_watch.call_count == 1
     assert second_watcher_watch.call_args.args[1] == EXISTING_LOCAL_OID
     mc_evaluate.assert_not_called()

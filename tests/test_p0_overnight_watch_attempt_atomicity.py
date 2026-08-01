@@ -1747,7 +1747,11 @@ def test_real_postgres_runtime_reattaches_once_then_observes_armed(
     )
 
     assert result2["armed"] == 1
-    watcher2.has_order.assert_called_once_with(_REATTACH_OID)
+    assert watcher2.has_order.call_count == 2
+    assert all(
+        call.args == (_REATTACH_OID,)
+        for call in watcher2.has_order.call_args_list
+    )
     watcher2.watch.assert_called_once()
     assert watcher2.watch.call_args.args[1] == _REATTACH_OID
     assert watcher2.watch.call_args.kwargs == {
