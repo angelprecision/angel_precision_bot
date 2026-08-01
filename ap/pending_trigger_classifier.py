@@ -323,6 +323,7 @@ def classify_late_attachment(
     stop=None,
     target_complete: bool = False,
     decisive_drift_exceeded: bool = False,
+    trigger_previously_breached: bool = False,
 ) -> LateAttachmentDecision:
     """Classify a late-attachment observation.
 
@@ -341,6 +342,10 @@ def classify_late_attachment(
     Non-terminal lifecycle outputs:
       LATE_ATTACHMENT_WITHIN_CONTINUATION           (inside continuation zone)
       MISSED_LATE_WATCHER_ATTACHMENT_WAITING_RESET  (past zone, structurally valid, awaiting reset)
+
+    ``trigger_previously_breached`` is durable lifecycle evidence supplied by
+    the watcher.  The scanner stop is dormant until that evidence exists or
+    the current canonical trigger quote itself proves the first breach.
     """
     normalized_side = str(side or "").strip().upper()
     if normalized_side not in ("CALL", "PUT"):
@@ -384,14 +389,40 @@ def classify_late_attachment(
 
     canonical_quote = quote_result.value
 
+    # A stop is not an entry-trigger substitute.  Before the first
+    # entry-direction breach, the opposite-side stop geometry is dormant; a
+    # wide spread must not terminalize a still-eligible setup.  Once a durable
+    # breach is known, keep the stop active even if the current quote has
+    # subsequently reset.  The current canonical quote also activates the stop
+    # for this lifecycle when it proves the first breach.
+    _current_trigger_breached = (
+        (normalized_side == "CALL" and canonical_quote >= trigger)
+        or (normalized_side == "PUT" and canonical_quote <= trigger)
+    )
+    _stop_active = (trigger_previously_breached is True) or _current_trigger_breached
+    if not _stop_active:
+        return LateAttachmentDecision(
+            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+            allowed_continuation=allowed,
+            quote=canonical_quote,
+            quote_source=quote_result.source,
+            detail=(
+                "call_below_trigger_stop_dormant"
+                if normalized_side == "CALL"
+                else "put_above_trigger_stop_dormant"
+            ),
+        )
+
     _stop_state = _evaluate_stop(normalized_side, stop, bid=bid, ask=ask)
     if _stop_state == _STOP_BROKEN:
+        _stop_source = "bid" if normalized_side == "CALL" else "ask"
+        _stop_value = _safe_decimal(bid if normalized_side == "CALL" else ask)
         return LateAttachmentDecision(
             classification=STOP_ALREADY_BROKEN_TERMINAL,
             allowed_continuation=allowed,
             quote=canonical_quote,
             quote_source=quote_result.source,
-            detail=f"stop_broken_at_{quote_result.source}={canonical_quote}",
+            detail=f"stop_broken_at_{_stop_source}={_stop_value}",
         )
     if _stop_state == _STOP_UNKNOWN:
         # Valid stop exists but the STOP-SIDE quote is missing (CALL: bid=0;

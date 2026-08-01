@@ -195,14 +195,14 @@ def test_case8_missing_canonical_quote_is_retryable_no_terminalization():
 def test_case9_call_stop_broken_is_terminal():
     # CALL stop broken when bid <= stop. Trigger side (ask) is irrelevant.
     d = _decide(side="CALL", trigger_price=200, bid=194.90, ask=195.10,
-                stop=195.00)
+                stop=195.00, trigger_previously_breached=True)
     assert d.classification == ptc.STOP_ALREADY_BROKEN_TERMINAL
 
 
 def test_case9b_put_stop_broken_is_terminal():
     # PUT stop broken when ask >= stop. Trigger side (bid) is irrelevant.
     d = _decide(side="PUT", trigger_price=200, bid=204.90, ask=205.10,
-                stop=205.00)
+                stop=205.00, trigger_previously_breached=True)
     assert d.classification == ptc.STOP_ALREADY_BROKEN_TERMINAL
 
 
@@ -216,7 +216,7 @@ def test_call_stop_broken_when_bid_at_or_below_stop_even_if_ask_above():
     Must terminalize on bid-side break — the trigger-side ask must not
     rescue the setup from a real stop break."""
     d = _decide(side="CALL", trigger_price=200, bid=194.90, ask=195.10,
-                stop=195.00)
+                stop=195.00, trigger_previously_breached=True)
     assert d.classification == ptc.STOP_ALREADY_BROKEN_TERMINAL
 
 
@@ -232,7 +232,7 @@ def test_put_stop_broken_when_ask_at_or_above_stop_even_if_bid_below():
     """PUT stop=205, ask=205.10 (broken), bid=204.90 (not broken by bid).
     Must terminalize on ask-side break."""
     d = _decide(side="PUT", trigger_price=200, bid=204.90, ask=205.10,
-                stop=205.00)
+                stop=205.00, trigger_previously_breached=True)
     assert d.classification == ptc.STOP_ALREADY_BROKEN_TERMINAL
 
 

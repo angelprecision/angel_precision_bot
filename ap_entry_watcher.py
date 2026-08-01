@@ -74,6 +74,22 @@ log = logging.getLogger("ap.entry_watcher")
 # Module-level ET zoneinfo: declared BEFORE any helper that uses it.
 ET = ZoneInfo("America/New_York")
 
+
+def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
+    """Parse durable first-breach evidence without treating bad data as proof."""
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        value = datetime.fromisoformat(text)
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+    except (TypeError, ValueError):
+        return None
+
 # FUNNEL FIX (2026-05-20, hardened 2026-05-21) + PR-C / BUG-EW-1:
 # Pre-open helper for the stop-touch invalidation guard. Returns True from
 # midnight ET through 9:30 ET (pre-market) AND through the 5-min open-protect
@@ -382,7 +398,18 @@ class WatchedSignal:
         # when the confirmed poll fires after MOMENTUM_POLLS_REQUIRED breaches).
         # Used by ap.live_submit_gates.check_trigger_age_gate to enforce
         # ENTRY_TRIGGER_MAX_AGE_SEC (default 120s).
-        self.trigger_crossed_at: Optional[datetime] = None
+        _trigger_crossed_raw = signal.get("trigger_crossed_at")
+        if _trigger_crossed_raw is None:
+            _signal_meta = signal.get("metadata") or {}
+            if isinstance(_signal_meta, dict):
+                _trigger_crossed_raw = _signal_meta.get("trigger_crossed_at")
+        # Existing order metadata is the durable lifecycle evidence used to
+        # keep the scanner stop active after a restart/reattachment.  Invalid
+        # values are not proof and therefore leave the stop dormant until a
+        # fresh canonical breach is observed.
+        self.trigger_crossed_at: Optional[datetime] = _parse_trigger_crossed_at(
+            _trigger_crossed_raw
+        )
         self.first_breach_bid: float = 0.0
         self.first_breach_ask: float = 0.0
         self.trigger_price: Optional[float] = None
@@ -651,6 +678,9 @@ class WatchedSignal:
                     stop=self.stop_level,
                     target_complete=_tgt_complete,
                     decisive_drift_exceeded=_decisive_drift,
+                    trigger_previously_breached=(
+                        getattr(self, "trigger_crossed_at", None) is not None
+                    ),
                 )
                 self.late_attachment_last_quote = (
                     float(_late_dec.quote) if _late_dec.quote is not None else None
@@ -866,8 +896,16 @@ class WatchedSignal:
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
             )
+            # PR #407: scanner-stop protection is dormant before the
+            # entry-direction breach. A current CALL breach counts as the
+            # first activation so same-poll trigger/stop collision protection
+            # remains fail-closed even without a prior timestamp.
             if (
                 self.stop_level
+                and (
+                    getattr(self, "trigger_crossed_at", None) is not None
+                    or ask >= self.entry_trigger
+                )
                 and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -987,8 +1025,14 @@ class WatchedSignal:
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
             )
+            # PR #407: symmetric PUT rule; the bid trigger breach activates
+            # the stop for this poll, while a pre-trigger ask touch is inert.
             if (
                 self.stop_level
+                and (
+                    getattr(self, "trigger_crossed_at", None) is not None
+                    or bid <= self.entry_trigger
+                )
                 and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -3048,6 +3092,7 @@ class APEntryWatcher:
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
+        _plan_metadata = getattr(plan, "metadata", None) or {}
 
         signal_dict = {
             "signal_id": getattr(plan, "signal_id", str(uuid.uuid4())),
@@ -3058,6 +3103,14 @@ class APEntryWatcher:
             "entry_price": getattr(plan, "trigger_price", None),
             "stop_price": getattr(plan, "stop_underlying", None),
             "target_price": getattr(plan, "target_underlying", None),
+            # Preserve existing durable first-breach evidence for the
+            # classifier and the reconstructed WatchedSignal.  No new truth
+            # source is introduced; this is only the order/plan metadata that
+            # already survives watcher recovery.
+            "trigger_crossed_at": (
+                getattr(plan, "trigger_crossed_at", None)
+                or (_plan_metadata.get("trigger_crossed_at") if isinstance(_plan_metadata, dict) else None)
+            ),
             "plan_id": getattr(plan, "plan_id", ""),
             "local_order_id": local_order_id,
             "client_id": str(
@@ -3790,6 +3843,10 @@ class APEntryWatcher:
                     stop=stop,
                     target_complete=_arm_tgt_complete,
                     decisive_drift_exceeded=_arm_decisive_drift,
+                    trigger_previously_breached=(
+                        _parse_trigger_crossed_at(signal_dict.get("trigger_crossed_at"))
+                        is not None
+                    ),
                 )
                 _late_cls = _late_decision.classification
 
@@ -4415,6 +4472,9 @@ class APEntryWatcher:
                         stop=w.stop_level,
                         target_complete=_bug_d_target_complete,
                         decisive_drift_exceeded=_open_decisive_drift,
+                        trigger_previously_breached=(
+                            getattr(w, "trigger_crossed_at", None) is not None
+                        ),
                     )
                     _open_cls = _open_decision.classification
 
