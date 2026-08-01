@@ -2595,36 +2595,68 @@ def _atomic_claim_watch_arm_attempt(
                         )
                     if prior_order_id:
                         # Case A: exact prior order was proven terminal
-                        # pre-lock. Reclaim keeping count unchanged.
+                        # pre-lock. The bound order consumed this attempt, so
+                        # replacement must consume the next bounded attempt.
+                        # Only an expired *unbound* claim below keeps count.
+                        if count >= max_attempts:
+                            _exhausted_meta = _attempt_meta_patch(
+                                existing_meta=meta,
+                                execution_mode=mode,
+                                session_key=session,
+                                state=WATCH_ATTEMPT_STATE_EXHAUSTED,
+                                attempt_count=count,
+                                token=prior_token,
+                                local_order_id=prior_order_id,
+                                reason="expired_bound_terminal_attempt_exhausted",
+                            )
+                            if not _write_locked_attempt_meta(
+                                c, row["id"], _exhausted_meta, mode, session,
+                                WATCH_ATTEMPT_STATE_EXHAUSTED, count, prior_token,
+                                prior_order_id,
+                            ):
+                                return _WatchAttemptClaim(
+                                    WATCH_ATTEMPT_DB_ERROR,
+                                    reason="expired_bound_terminal_exhausted_write_failed",
+                                )
+                            return _WatchAttemptClaim(
+                                WATCH_ATTEMPT_EXHAUSTED,
+                                prior_token,
+                                count,
+                                prior_order_id,
+                                "expired_bound_terminal_attempt_exhausted",
+                            )
+
+                        _next_count = count + 1
                         _new_token = uuid.uuid4().hex
                         _reclaim_meta = _attempt_meta_patch(
                             existing_meta=meta,
                             execution_mode=mode,
                             session_key=session,
                             state=WATCH_ATTEMPT_STATE_IN_PROGRESS,
-                            attempt_count=count,
+                            attempt_count=_next_count,
                             token=_new_token,
                             local_order_id="",
-                            reason="expired_in_progress_claim_reacquired",
+                            reason="expired_bound_terminal_attempt_advanced",
                         )
                         if not _write_locked_attempt_meta(
                             c, row["id"], _reclaim_meta, mode, session,
-                            WATCH_ATTEMPT_STATE_IN_PROGRESS, count, _new_token, "",
+                            WATCH_ATTEMPT_STATE_IN_PROGRESS, _next_count,
+                            _new_token, "",
                         ):
                             return _WatchAttemptClaim(
                                 WATCH_ATTEMPT_DB_ERROR,
                                 reason="expired_in_progress_reacquire_write_failed",
                             )
                         log.info(
-                            "OVERNIGHT_WATCH_ATTEMPT_EXPIRED_CLAIM_REACQUIRED "
+                            "OVERNIGHT_WATCH_ATTEMPT_EXPIRED_BOUND_TERMINAL_ADVANCED "
                             "client=%s mode=%s canonical=%s session=%s count=%s "
                             "token_prefix=%s prior_order=%s",
                             client_id, mode, canonical_signal_id, session,
-                            count, _new_token[:8], prior_order_id,
+                            _next_count, _new_token[:8], prior_order_id,
                         )
                         return _WatchAttemptClaim(
-                            WATCH_ATTEMPT_ACQUIRED, _new_token, count, "",
-                            "expired_in_progress_claim_reacquired",
+                            WATCH_ATTEMPT_ACQUIRED, _new_token, _next_count, "",
+                            "expired_bound_terminal_attempt_advanced",
                         )
                     _new_token = uuid.uuid4().hex
                     _reclaim_meta = _attempt_meta_patch(
@@ -3103,7 +3135,7 @@ def _recover_materialized_watch_before_admission(
     if probe is None:
         return _EarlyWatchRecoveryResult(False)
 
-    state, _count, _token, durable_order_id = probe
+    state, attempt_count, _token, durable_order_id = probe
     if state not in {
         WATCH_ATTEMPT_STATE_IN_PROGRESS,
         WATCH_ATTEMPT_STATE_RETRYABLE,
@@ -3132,7 +3164,16 @@ def _recover_materialized_watch_before_admission(
 
     observed_status = str(order_row.get("status") or "").strip().upper()
     if observed_status not in _ACTIVE_ENTRY_OWN_STATUSES:
-        return _EarlyWatchRecoveryResult(False)
+        # A bound terminal order normally returns to the validated replacement
+        # path. At the cap, however, the durable claim must be exhausted here,
+        # before Master Control or any other new-admission work can run.
+        if not (
+            state == WATCH_ATTEMPT_STATE_IN_PROGRESS
+            and bool(durable_order_id)
+            and observed_status in _TERMINAL_ENTRY_STATUSES
+            and attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+        ):
+            return _EarlyWatchRecoveryResult(False)
 
     attempt = _claim_watch_arm_attempt(
         order_state_machine=order_state_machine,

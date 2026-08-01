@@ -1471,6 +1471,52 @@ def test_expired_bound_completion_failure_recovers_same_order(_orders_table):
     assert _count_orders() == 1
 
 
+def test_expired_bound_terminal_order_advances_to_next_attempt(_orders_table):
+    _insert_order(local_order_id=_REATTACH_OID, status="EXPIRED")
+    _seed_expired_in_progress(
+        mode="live", count=1, order_id=_REATTACH_OID,
+    )
+    osm = _FakeOSM(
+        {_REATTACH_OID: {"status": "EXPIRED"}},
+        client_id=_REATTACH_CLIENT,
+        canonical_signal_id=_REATTACH_CANON,
+    )
+
+    recovered = _claim_reattach(mode="live", osm=osm)
+
+    assert recovered.disposition == ACQUIRED, recovered
+    assert recovered.attempt_count == 2
+    assert recovered.local_order_id == ""
+    scope = _read_scope_reattach(mode="live")
+    assert overnight._attempt_state(scope) == S_IN_PROGRESS
+    assert scope["count"] == 2
+    assert scope["local_order_id"] == ""
+    assert _count_orders() == 1
+
+
+def test_expired_bound_terminal_order_at_cap_persists_exhausted(_orders_table):
+    _insert_order(local_order_id=_REATTACH_OID, status="EXPIRED")
+    _seed_expired_in_progress(
+        mode="live", count=3, order_id=_REATTACH_OID,
+    )
+    osm = _FakeOSM(
+        {_REATTACH_OID: {"status": "EXPIRED"}},
+        client_id=_REATTACH_CLIENT,
+        canonical_signal_id=_REATTACH_CANON,
+    )
+
+    recovered = _claim_reattach(mode="live", osm=osm)
+
+    assert recovered.disposition == EXHAUSTED, recovered
+    assert recovered.attempt_count == 3
+    assert recovered.local_order_id == _REATTACH_OID
+    scope = _read_scope_reattach(mode="live")
+    assert overnight._attempt_state(scope) == S_EXHAUSTED
+    assert scope["count"] == 3
+    assert scope["local_order_id"] == _REATTACH_OID
+    assert _count_orders() == 1
+
+
 def test_real_postgres_runtime_reattaches_once_then_observes_armed(
     monkeypatch, _orders_table,
 ):

@@ -2848,7 +2848,8 @@ def test_runtime_created_order_never_reaches_watcher(monkeypatch):
 
 def test_expired_claim_recovery_with_terminal_prior_order_reacquires(monkeypatch):
     # Stranded IN_PROGRESS + bound prior order that is TERMINAL for the exact
-    # identity → reclaim allowed, count unchanged, run continues to arm.
+    # identity → the bound order consumed attempt 1, so replacement advances
+    # to attempt 2 before the run continues to arm.
     import ap_overnight_reeval as ov
     from datetime import datetime, timedelta, timezone
 
@@ -2890,8 +2891,103 @@ def test_expired_claim_recovery_with_terminal_prior_order_reacquires(monkeypatch
     assert result["armed"] == 1
     scope = _attempt_scope(ledger)
     assert scope["state"] == "ARMED"
-    assert scope["count"] == 1  # crash recovery did NOT burn a retry
+    assert scope["count"] == 2
     assert scope["token"] != "tok-DEAD"
+
+
+def test_bound_terminal_crash_at_cap_exhausts_before_any_new_admission(monkeypatch):
+    """The real cleanup/completion-failure crash window cannot create Order 4."""
+    import ap_overnight_reeval as ov
+
+    ledger = _FakeOpportunityLedger()
+    osm = _FakeOrderStateMachine()
+    retryable_meta = ov._attempt_meta_patch(
+        existing_meta={},
+        execution_mode="paper",
+        session_key="2026-06-12",
+        state=ov.WATCH_ATTEMPT_STATE_RETRYABLE,
+        attempt_count=2,
+        token="attempt-2-token",
+        local_order_id="prior-2",
+        reason="watcher_exception_retryable",
+    )
+    ledger.rows[("CANON-001", "client-1")] = {
+        "signal_id": "sig-001",
+        "canonical_signal_id": "CANON-001",
+        "client_id": "client-1",
+        "opportunity_status": "CREATED",
+        "metadata": retryable_meta,
+    }
+    osm.orders["prior-2"] = {
+        "local_order_id": "prior-2",
+        "client_id": "client-1",
+        "canonical_signal_id": "CANON-001",
+        "signal_id": "sig-001",
+        "kind": "ENTRY",
+        "status": "EXPIRED",
+        "execution_mode": "paper",
+        "symbol": "AAPL",
+        "direction": "CALL",
+        "trigger_price": 101.0,
+        "meta": {},
+    }
+
+    # Attempt 3 creates and binds one order. The watcher throws, cleanup
+    # terminalizes it, but the completion CAS is lost (simulated crash seam).
+    watcher3 = MagicMock()
+    watcher3.watch.side_effect = RuntimeError("watcher crashed at attempt 3")
+    real_complete = ov._complete_watch_arm_attempt_checked
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", lambda **kw: False)
+    result3, osm, _, _, controls3 = _run_reeval(
+        monkeypatch,
+        watcher3,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    stranded = _attempt_scope(ledger)
+    assert stranded["state"] == "IN_PROGRESS"
+    assert stranded["count"] == 3
+    bound_order_id = stranded["local_order_id"]
+    assert bound_order_id
+    assert osm.orders[bound_order_id]["status"] in {"EXPIRED", "CANCELED"}
+    assert result3["terminal_errors"] == 1
+    assert controls3["broker"].submit_order.call_count == 0
+    created_at_crash = osm.create_calls
+
+    # Lease expiry exposes the stranded bound-terminal claim to recovery.
+    stranded["claim_lease_until"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=1)
+    ).isoformat()
+    ledger.rows[("CANON-001", "client-1")]["metadata"][
+        "overnight_watch_arm_attempt_scopes"
+    ]["paper:2026-06-12"] = stranded
+    monkeypatch.setattr(ov, "_complete_watch_arm_attempt_checked", real_complete)
+
+    watcher4 = MagicMock()
+    result4, osm, _, error_calls4, controls4 = _run_reeval(
+        monkeypatch,
+        watcher4,
+        source="trade_queue",
+        ledger=ledger,
+        osm=osm,
+        return_controls=True,
+    )
+
+    exhausted = _attempt_scope(ledger)
+    assert exhausted["state"] == "EXHAUSTED"
+    assert exhausted["count"] == 3
+    assert exhausted["local_order_id"] == bound_order_id
+    assert osm.create_calls == created_at_crash
+    watcher4.watch.assert_not_called()
+    controls4["master_control"].evaluate.assert_not_called()
+    controls4["contract_selector"].select.assert_not_called()
+    controls4["broker"].submit_order.assert_not_called()
+    controls4["broker"].place_order.assert_not_called()
+    assert result4["terminal_errors"] == 1
+    assert any("expired_bound_terminal_attempt_exhausted" in c[2] for c in error_calls4)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
