@@ -1891,6 +1891,14 @@ def test_real_postgres_retryable_bound_terminal_at_cap_exhausts_before_admission
     master_control = MagicMock()
     selector = MagicMock()
     osm = MagicMock()
+    osm.get_order.return_value = {
+        "local_order_id": _REATTACH_OID,
+        "client_id": _REATTACH_CLIENT,
+        "execution_mode": "live",
+        "canonical_signal_id": _REATTACH_CANON,
+        "kind": "ENTRY",
+        "status": "EXPIRED",
+    }
     watcher = MagicMock()
 
     result = overnight.run_overnight_reeval(
