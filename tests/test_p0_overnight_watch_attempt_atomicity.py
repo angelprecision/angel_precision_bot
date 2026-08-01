@@ -112,6 +112,10 @@ def _independent_conn():
         def fetchall(self):
             return [dict(r) for r in (cursor.fetchall() or [])]
 
+        @property
+        def rowcount(self):
+            return cursor.rowcount
+
     try:
         yield _Wrap()
         connection.commit()
