@@ -3069,6 +3069,402 @@ def _complete_watch_arm_attempt_checked(
     return ok
 
 
+class _EarlyWatchRecoveryResult(NamedTuple):
+    handled: bool
+    outcome: str = ""
+    reason: str = ""
+    local_order_id: str = ""
+
+
+def _recover_materialized_watch_before_admission(
+    *,
+    order_state_machine,
+    entry_watcher,
+    signal_id: str,
+    canonical_signal_id: str,
+    client_id: str,
+    execution_mode: str,
+    session_key: str,
+    signal_payload: dict,
+    ticker: str,
+    job_id,
+    job_source: str,
+) -> _EarlyWatchRecoveryResult:
+    """Recover already-admitted durable work before new-admission validation.
+
+    This seam is deliberately recovery-only. It does not claim an empty or
+    otherwise new attempt scope. A claim is made only after the durable scope
+    says recovery is in progress/retryable/armed *and* an exact active ENTRY is
+    visible for the same client, mode, and canonical signal.
+    """
+    probe = _read_attempt_scope_unlocked(
+        canonical_signal_id, client_id, execution_mode, session_key,
+    )
+    if probe is None:
+        return _EarlyWatchRecoveryResult(False)
+
+    state, _count, _token, durable_order_id = probe
+    if state not in {
+        WATCH_ATTEMPT_STATE_IN_PROGRESS,
+        WATCH_ATTEMPT_STATE_RETRYABLE,
+        WATCH_ATTEMPT_STATE_ARMED,
+    }:
+        return _EarlyWatchRecoveryResult(False)
+
+    if durable_order_id:
+        lookup_status, order_row = _query_exact_entry_order_by_local_id(
+            durable_order_id, client_id, execution_mode, canonical_signal_id,
+        )
+    else:
+        lookup_status, order_row = _query_active_entry_order(
+            client_id, execution_mode, canonical_signal_id,
+        )
+
+    if lookup_status == _LS_LOOKUP_FAILED:
+        return _EarlyWatchRecoveryResult(
+            True, "ERROR", "early_recovery_order_lookup_failed",
+            str(durable_order_id or ""),
+        )
+    if lookup_status != _LS_FOUND or not order_row:
+        # No active materialized owner: this is not the recovery-only seam.
+        # Normal admission/replacement logic remains authoritative.
+        return _EarlyWatchRecoveryResult(False)
+
+    observed_status = str(order_row.get("status") or "").strip().upper()
+    if observed_status not in _ACTIVE_ENTRY_OWN_STATUSES:
+        return _EarlyWatchRecoveryResult(False)
+
+    attempt = _claim_watch_arm_attempt(
+        order_state_machine=order_state_machine,
+        signal_id=signal_id,
+        client_id=client_id,
+        canonical_signal_id=canonical_signal_id,
+        signal_payload=signal_payload,
+        execution_mode=execution_mode,
+        session_key=session_key,
+    )
+
+    if attempt.disposition == WATCH_ATTEMPT_ALREADY_ARMED:
+        return _EarlyWatchRecoveryResult(
+            True, "ARMED", attempt.reason or "early_recovery_already_armed",
+            attempt.local_order_id,
+        )
+    if (
+        attempt.disposition == WATCH_ATTEMPT_CONFLICT
+        and str(attempt.reason or "") == "attempt_state_error"
+    ):
+        return _EarlyWatchRecoveryResult(
+            True, "ALREADY_RESOLVED", attempt.reason, attempt.local_order_id,
+        )
+    if attempt.disposition == WATCH_ATTEMPT_ACQUIRED:
+        # The advisory recovery probe and locked claim disagreed. Close the
+        # accidentally acquired unbound owner and fail closed; never let this
+        # race become a new order that bypassed admission validation.
+        completion_ok = _complete_watch_arm_attempt_checked(
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            attempt=attempt,
+            state=WATCH_ATTEMPT_STATE_ERROR,
+            local_order_id="",
+            reason="early_recovery_preflight_changed",
+            ticker=ticker,
+            caller="early_recovery_preflight_changed",
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR",
+            (
+                "early_recovery_preflight_changed"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
+        )
+    if attempt.disposition != WATCH_ATTEMPT_REATTACH_REQUIRED:
+        outcome = (
+            "ERROR"
+            if attempt.disposition in {
+                WATCH_ATTEMPT_DB_ERROR,
+                WATCH_ATTEMPT_CONFLICT,
+                WATCH_ATTEMPT_EXHAUSTED,
+            }
+            else "RETRYABLE"
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            outcome,
+            f"early_recovery_claim:{attempt.disposition}:{attempt.reason}",
+            attempt.local_order_id,
+        )
+
+    local_order_id = str(attempt.local_order_id or "").strip()
+
+    def _complete(state_value: str, reason: str) -> bool:
+        return _complete_watch_arm_attempt_checked(
+            signal_id=signal_id,
+            client_id=client_id,
+            canonical_signal_id=canonical_signal_id,
+            signal_payload=signal_payload,
+            execution_mode=execution_mode,
+            session_key=session_key,
+            attempt=attempt,
+            state=state_value,
+            local_order_id=local_order_id,
+            reason=reason,
+            ticker=ticker,
+            caller="early_materialized_recovery",
+        )
+
+    if not local_order_id:
+        _complete(WATCH_ATTEMPT_STATE_ERROR, "early_recovery_missing_local_order_id")
+        return _EarlyWatchRecoveryResult(
+            True, "ERROR", "early_recovery_missing_local_order_id",
+        )
+
+    # Claim-time FOR UPDATE is authoritative; this caller read constructs the
+    # watcher plan and catches any post-claim status transition before watch().
+    exact_status, exact_order = _query_exact_entry_order_by_local_id(
+        local_order_id, client_id, execution_mode, canonical_signal_id,
+    )
+    if exact_status != _LS_FOUND or not exact_order:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_exact_order_lookup_failed")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok else (
+                "ERROR" if next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE"
+            ),
+            "early_recovery_exact_order_lookup_failed",
+            local_order_id,
+        )
+
+    exact_order_status = str(exact_order.get("status") or "").strip().upper()
+    if exact_order_status in _ALREADY_OWNED_STATUSES:
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ARMED, "early_recovery_broker_owned",
+        )
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ARMED" if completion_ok else "ERROR",
+            "early_recovery_broker_owned",
+            local_order_id,
+        )
+    if exact_order_status != "PENDING_TRIGGER":
+        completion_ok = _complete(
+            WATCH_ATTEMPT_STATE_ERROR,
+            f"early_recovery_non_pending_trigger:{exact_order_status or 'blank'}",
+        )
+        return _EarlyWatchRecoveryResult(
+            True, "ERROR",
+            (
+                f"early_recovery_non_pending_trigger:{exact_order_status or 'blank'}"
+                if completion_ok else "early_recovery_completion_failed"
+            ),
+            local_order_id,
+        )
+
+    order_meta = exact_order.get("meta") or {}
+    if isinstance(order_meta, str):
+        try:
+            import json as _early_json
+            order_meta = _early_json.loads(order_meta)
+        except Exception:
+            order_meta = {}
+    if not isinstance(order_meta, dict):
+        order_meta = {}
+
+    def _number(order_key, signal_key, default=None):
+        raw = exact_order.get(order_key)
+        if raw is None:
+            raw = signal_payload.get(signal_key)
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    trigger = _number("trigger_price", "entry_trigger")
+    if not trigger or trigger <= 0:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_invalid_trigger")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_invalid_trigger",
+            local_order_id,
+        )
+
+    try:
+        contracts = int(exact_order.get("qty") or 1)
+    except (TypeError, ValueError, OverflowError):
+        contracts = 0
+    if contracts < 1:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_invalid_contracts")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_invalid_contracts",
+            local_order_id,
+        )
+
+    import types as _early_types
+    side = str(
+        exact_order.get("direction")
+        or signal_payload.get("side")
+        or signal_payload.get("direction")
+        or ""
+    ).strip().upper()
+    plan = _early_types.SimpleNamespace(
+        ticker=str(exact_order.get("symbol") or ticker),
+        side=side,
+        direction=side,
+        score=_number("score", "score", 0.0),
+        timeframe=str(exact_order.get("timeframe") or signal_payload.get("timeframe") or "1d"),
+        entry_trigger=trigger,
+        trigger_price=trigger,
+        stop_underlying=_number("stop_underlying", "stop_price"),
+        target_underlying=_number("target_underlying", "target_price"),
+        trigger_type="breach",
+        prior_day_high=signal_payload.get("prior_day_high"),
+        prior_day_low=signal_payload.get("prior_day_low"),
+        pattern=exact_order.get("pattern") or signal_payload.get("pattern"),
+        tier=exact_order.get("tier") or signal_payload.get("tier"),
+        contract_symbol=str(exact_order.get("contract") or f"DEFERRED:{ticker}"),
+        contracts=contracts,
+        limit_price=_number("limit_price", "limit_price", 0.01),
+        plan_id=str(exact_order.get("plan_id") or ""),
+        signal_id=str(exact_order.get("signal_id") or signal_id),
+        canonical_signal_id=canonical_signal_id,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        late_attachment_policy_eligible=True,
+        metadata={
+            **order_meta,
+            "overnight": True,
+            "reattach_watcher": True,
+            "reattach_required_recovery": True,
+            "contract_deferred": True,
+            "contract_selection_deferred_to": "breach_time",
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "overnight_reeval_session_key": session_key,
+            "canonical_signal_id": canonical_signal_id,
+            "late_attachment_policy_eligible": True,
+        },
+    )
+
+    try:
+        has_order = getattr(entry_watcher, "has_order", None)
+        watcher_armed = bool(has_order(local_order_id)) if callable(has_order) else False
+    except Exception:
+        watcher_armed = False
+
+    if not watcher_armed:
+        try:
+            watcher_armed = bool(entry_watcher.watch(
+                plan,
+                local_order_id,
+                recovery_rearm=True,
+                no_cancel_on_reject=True,
+            ))
+        except Exception as exc:
+            next_state = (
+                WATCH_ATTEMPT_STATE_EXHAUSTED
+                if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+                else WATCH_ATTEMPT_STATE_RETRYABLE
+            )
+            completion_ok = _complete(
+                next_state,
+                f"early_recovery_watch_exception:{type(exc).__name__}",
+            )
+            return _EarlyWatchRecoveryResult(
+                True,
+                "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+                f"early_recovery_watch_exception:{type(exc).__name__}",
+                local_order_id,
+            )
+
+    if not watcher_armed:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_watch_false")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_watch_false",
+            local_order_id,
+        )
+
+    try:
+        proof_ok = _persist_watcher_armed_proof(
+            client_id=client_id,
+            execution_mode=execution_mode,
+            canonical_signal_id=canonical_signal_id,
+            signal_id=signal_id,
+            signal_payload=signal_payload,
+            local_order_id=local_order_id,
+            session_key=session_key,
+            extra_meta={
+                "source_table": job_source,
+                "source_job_id": str(job_id),
+                "ticker": ticker,
+                "side": side,
+                "contract_deferred": True,
+                "contract_selection_deferred_to": "breach_time",
+                "reattach_watcher": True,
+                "early_materialized_recovery": True,
+                "armed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception:
+        proof_ok = False
+    if not proof_ok:
+        next_state = (
+            WATCH_ATTEMPT_STATE_EXHAUSTED
+            if attempt.attempt_count >= OVERNIGHT_WATCH_ARM_MAX_ATTEMPTS
+            else WATCH_ATTEMPT_STATE_RETRYABLE
+        )
+        completion_ok = _complete(next_state, "early_recovery_proof_failed")
+        return _EarlyWatchRecoveryResult(
+            True,
+            "ERROR" if not completion_ok or next_state == WATCH_ATTEMPT_STATE_EXHAUSTED else "RETRYABLE",
+            "early_recovery_proof_failed",
+            local_order_id,
+        )
+
+    completion_ok = _complete(
+        WATCH_ATTEMPT_STATE_ARMED, "early_materialized_recovery_armed",
+    )
+    return _EarlyWatchRecoveryResult(
+        True,
+        "ARMED" if completion_ok else "ERROR",
+        (
+            "early_materialized_recovery_armed"
+            if completion_ok else "early_recovery_completion_failed"
+        ),
+        local_order_id,
+    )
+
+
 def _entry_order_disposition_from_status(
     *,
     client_id: str,
@@ -4439,6 +4835,50 @@ def run_overnight_reeval(
         signal_id = job.get("signal_id") or signal.get("signal_id", "")
         job_source = job.get("_source") or ("ap_signals" if str(job_id).startswith("sup:") else "trade_queue")
         ticker = signal.get("ticker") or signal.get("symbol", "?")
+        _execution_mode = _run_execution_mode
+        _early_canonical = _resolve_canonical_signal_id(signal_id, signal)
+
+        # PR #404 final placement correction: already-admitted/materialized
+        # watcher recovery must run before age/timeframe, prior-level, snapshot,
+        # validation, Master Control, selector, or authorization admission gates.
+        # The helper is recovery-only and refuses to claim a new/empty scope.
+        _early_recovery = _recover_materialized_watch_before_admission(
+            order_state_machine=order_state_machine,
+            entry_watcher=entry_watcher,
+            signal_id=signal_id,
+            canonical_signal_id=_early_canonical,
+            client_id=client_id,
+            execution_mode=_execution_mode,
+            session_key=session_key,
+            signal_payload=signal,
+            ticker=ticker,
+            job_id=job_id,
+            job_source=job_source,
+        )
+        if _early_recovery.handled:
+            if _early_recovery.outcome == "ARMED":
+                _mark_job_watching_armed(
+                    job_id, client_id,
+                    f"early_recovery:{_early_recovery.local_order_id}",
+                )
+                result["armed"] += 1
+                if _early_recovery.reason == "early_materialized_recovery_armed":
+                    result["fresh_armed"] += 1
+            elif _early_recovery.outcome == "ALREADY_RESOLVED":
+                result["skipped"] = result.get("skipped", 0) + 1
+                result["already_resolved"] += 1
+            elif _early_recovery.outcome == "RETRYABLE":
+                _mark_job_watching_reason(
+                    job_id, client_id, _early_recovery.reason,
+                )
+                result["skipped"] = result.get("skipped", 0) + 1
+                result["retryable_deferred"] += 1
+            else:
+                _mark_job_error(job_id, client_id, _early_recovery.reason)
+                result["errors"] += 1
+                result["terminal_errors"] += 1
+            continue
+
         side = _normalize_overnight_side(signal.get("side") or signal.get("direction"))
         if side not in {"CALL", "PUT"}:
             log.warning(
@@ -4454,7 +4894,6 @@ def run_overnight_reeval(
             continue
         signal["side"] = side
         signal["direction"] = side
-        _execution_mode = _run_execution_mode
         _paper_rescue_only = _paper_overnight_rescue_only_signal(
             signal,
             job_source=job_source,

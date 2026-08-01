@@ -1619,3 +1619,159 @@ def test_real_postgres_runtime_reattaches_once_then_observes_armed(
     broker.submit_order.assert_not_called()
     assert len(proof_calls) == 1
     assert _count_orders() == 1
+
+
+@pytest.mark.parametrize(
+    "blocked_gate",
+    ["snapshot_exception", "validator_true_invalidation", "missing_prior_level"],
+)
+def test_real_postgres_runtime_recovery_precedes_new_admission_market_gates(
+    monkeypatch, _orders_table, blocked_gate,
+):
+    """Materialized recovery cannot be intercepted by new-admission data gates."""
+    signal = {
+        "signal_id": _REATTACH_SIG,
+        "canonical_signal_id": _REATTACH_CANON,
+        "ticker": "SPY",
+        "symbol": "SPY",
+        "side": "CALL",
+        "direction": "CALL",
+        "timeframe": "1d",
+        "score": 80.0,
+        "entry_trigger": 450.0,
+        "created_at": "2026-07-29T20:00:00+00:00",
+    }
+    job = {
+        "id": f"job-early-recovery-{blocked_gate}",
+        "signal_id": _REATTACH_SIG,
+        "payload": signal,
+        "_source": "trade_queue",
+    }
+    _insert_order(local_order_id=_REATTACH_OID, status="PENDING_TRIGGER")
+    _seed_expired_in_progress(mode="live", count=1, order_id="")
+
+    snapshot = MagicMock()
+    validator_call = MagicMock()
+    if blocked_gate == "snapshot_exception":
+        snapshot.side_effect = RuntimeError("snapshot temporarily unavailable")
+        validator_call.return_value = types.SimpleNamespace(
+            valid=True, reason_code="", reason_text="",
+        )
+    elif blocked_gate == "validator_true_invalidation":
+        snapshot.return_value = {"last": 449.0}
+        validator_call.return_value = types.SimpleNamespace(
+            valid=False,
+            reason_code="TRUE_INVALIDATION",
+            reason_text="current structure invalidated",
+        )
+    else:
+        snapshot.return_value = {"last": 449.0}
+        validator_call.return_value = types.SimpleNamespace(
+            valid=True, reason_code="", reason_text="",
+        )
+
+    validator = types.ModuleType("ap.overnight_daily_validator")
+    validator.fetch_market_snapshot = snapshot
+    validator.validate_overnight_daily_signal = validator_call
+    validator.InvalidationReason = object
+    monkeypatch.setitem(sys.modules, "ap.overnight_daily_validator", validator)
+
+    auth = types.ModuleType("ap.authorization")
+    auth.execution_mode_for_broker = lambda broker: "LIVE"
+    auth.is_live_broker = lambda broker: False
+    auth.broker_live_mode_known = lambda broker: True
+    auth.check_live_authorization = lambda client_id: None
+    auth.authorization_gate_enforced = lambda: False
+    auth.LIVE_AUTHORIZATION_GATE_UNAVAILABLE = "LIVE_AUTHORIZATION_GATE_UNAVAILABLE"
+    monkeypatch.setitem(sys.modules, "ap.authorization", auth)
+
+    monkeypatch.setattr(
+        overnight,
+        "_et_now",
+        lambda: datetime(2026, 7, 29, 9, 15, tzinfo=ZoneInfo("America/New_York")),
+    )
+    monkeypatch.setattr(
+        overnight,
+        "_fetch_watching_signals_with_status",
+        lambda client_id: overnight._FetchWatchingSignalsResult(
+            [job], "SUCCESS", "SUCCESS", None, None,
+        ),
+    )
+    rejected = MagicMock()
+    monkeypatch.setattr(overnight, "_mark_job_rejected", rejected)
+    monkeypatch.setattr(overnight, "_mark_job_error", lambda *a, **kw: None)
+    monkeypatch.setattr(overnight, "_mark_job_watching_reason", lambda *a, **kw: None)
+    monkeypatch.setattr(overnight, "_mark_job_watching_armed", lambda *a, **kw: None)
+
+    def _persist_real_proof(**kwargs):
+        proof_meta = {
+            "execution_mode": "live",
+            "overnight_reeval_session_key": SESSION,
+            "local_order_id": _REATTACH_OID,
+        }
+        connection = psycopg2.connect(_RAW_URL)
+        connection.autocommit = True
+        with connection.cursor() as cur:
+            cur.execute(
+                "UPDATE client_signal_opportunities "
+                "SET opportunity_status = 'WATCHER_ARMED', order_local_id = %s, "
+                "metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb "
+                "WHERE canonical_signal_id = %s AND client_id = %s",
+                (
+                    _REATTACH_OID, json.dumps(proof_meta),
+                    _REATTACH_CANON, _REATTACH_CLIENT,
+                ),
+            )
+            updated = cur.rowcount
+        connection.close()
+        return updated == 1
+
+    monkeypatch.setattr(
+        overnight, "_persist_watcher_armed_proof", _persist_real_proof,
+    )
+
+    broker = MagicMock()
+    if blocked_gate == "missing_prior_level":
+        broker.get_prior_day_levels.return_value = {
+            "prior_day_high": None,
+            "prior_day_low": 445.0,
+        }
+    else:
+        broker.get_prior_day_levels.return_value = {
+            "prior_day_high": 451.0,
+            "prior_day_low": 445.0,
+        }
+    master_control = MagicMock()
+    selector = MagicMock()
+    osm = MagicMock()
+    watcher = MagicMock()
+    watcher.has_order.return_value = False
+    watcher.watch.return_value = True
+
+    result = overnight.run_overnight_reeval(
+        client_id=_REATTACH_CLIENT,
+        broker=broker,
+        master_control=master_control,
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher,
+        force=True,
+    )
+
+    assert result["armed"] == 1
+    assert result["terminal_rejected"] == 0
+    rejected.assert_not_called()
+    broker.get_prior_day_levels.assert_not_called()
+    snapshot.assert_not_called()
+    validator_call.assert_not_called()
+    master_control.evaluate.assert_not_called()
+    selector.select.assert_not_called()
+    osm.create_entry_order.assert_not_called()
+    broker.submit_order.assert_not_called()
+    watcher.watch.assert_called_once()
+    assert watcher.watch.call_args.args[1] == _REATTACH_OID
+    assert _count_orders() == 1
+    scope = _read_scope_reattach(mode="live")
+    assert overnight._attempt_state(scope) == S_ARMED
+    assert scope["count"] == 2
+    assert scope["local_order_id"] == _REATTACH_OID
