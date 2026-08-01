@@ -390,10 +390,16 @@ def test_exhausted_does_not_acquire():
 def test_active_prior_order_reclaims_same_order_with_increment(_orders_table):
     """RETRYABLE + exact PENDING_TRIGGER reclaims the same bounded attempt."""
     _seed(mode="live", state=S_RETRYABLE, count=1, token="tok-1", order_id="prior-1")
-    _insert_order(local_order_id="prior-1", status="PENDING_TRIGGER")
+    _insert_order(
+        local_order_id="prior-1",
+        status="PENDING_TRIGGER",
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_id=SIGNAL_ID,
+    )
     osm = _FakeOSM({"prior-1": {"status": "PENDING_TRIGGER"}})
     claim = _claim(mode="live", osm=osm)
-    assert claim.disposition == REATTACH_REQUIRED
+    assert claim.disposition == REATTACH_REQUIRED, claim
     assert claim.local_order_id == "prior-1"
     scope = _read_scope(mode="live")
     assert overnight._attempt_count(scope) == 2
@@ -1390,8 +1396,13 @@ def test_retryable_bound_pending_trigger_reclaims_and_exhausts(_orders_table):
         canonical=_REATTACH_CANON,
     )
 
-    claim2 = _claim_reattach(mode="live")
-    assert claim2.disposition == REATTACH_REQUIRED
+    osm = _FakeOSM(
+        {_REATTACH_OID: {"status": "PENDING_TRIGGER"}},
+        client_id=_REATTACH_CLIENT,
+        canonical_signal_id=_REATTACH_CANON,
+    )
+    claim2 = _claim_reattach(mode="live", osm=osm)
+    assert claim2.disposition == REATTACH_REQUIRED, claim2
     assert claim2.attempt_count == 2
     assert claim2.local_order_id == _REATTACH_OID
     assert overnight._complete_watch_arm_attempt(
@@ -1407,8 +1418,8 @@ def test_retryable_bound_pending_trigger_reclaims_and_exhausts(_orders_table):
         reason="watch_false",
     ) is True
 
-    claim3 = _claim_reattach(mode="live")
-    assert claim3.disposition == REATTACH_REQUIRED
+    claim3 = _claim_reattach(mode="live", osm=osm)
+    assert claim3.disposition == REATTACH_REQUIRED, claim3
     assert claim3.attempt_count == 3
     assert overnight._complete_watch_arm_attempt(
         signal_id=_REATTACH_SIG,
@@ -1447,9 +1458,14 @@ def test_expired_bound_completion_failure_recovers_same_order(_orders_table):
         mode="live", count=2, order_id=_REATTACH_OID,
     )
 
-    recovered = _claim_reattach(mode="live")
+    osm = _FakeOSM(
+        {_REATTACH_OID: {"status": "PENDING_TRIGGER"}},
+        client_id=_REATTACH_CLIENT,
+        canonical_signal_id=_REATTACH_CANON,
+    )
+    recovered = _claim_reattach(mode="live", osm=osm)
 
-    assert recovered.disposition == REATTACH_REQUIRED
+    assert recovered.disposition == REATTACH_REQUIRED, recovered
     assert recovered.attempt_count == 3
     assert recovered.local_order_id == _REATTACH_OID
     assert _count_orders() == 1
