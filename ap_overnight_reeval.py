@@ -1875,15 +1875,19 @@ def _parse_attempt_scope_strict(
                     local_order_id,
                     "retryable_zero_count_has_owner_data",
                 )
-        elif not token or not local_order_id:
+        elif not token:
             return (
                 False,
                 state,
                 count,
                 token,
                 local_order_id,
-                "retryable_attempt_missing_token_or_order",
+                "retryable_attempt_missing_token",
             )
+        # A released retryable owner deliberately has no local_order_id.  This
+        # is the durable hand-off state used when recovery preflight changes
+        # before an order is bound; the next claimant rotates the token without
+        # consuming another bounded attempt.
 
     elif state == WATCH_ATTEMPT_STATE_IN_PROGRESS:
         if count < 1 or not token:

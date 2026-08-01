@@ -377,10 +377,8 @@ def test_two_processes_single_winner_final_allowed_attempt():
 def test_exhausted_does_not_acquire():
     """count == max → EXHAUSTED, no acquisition, count unchanged.
 
-    A RETRYABLE seed with count > 0 must carry both a token and a bound prior
-    order (strict scope contract); otherwise the strict parser rejects it as a
-    malformed scope, which is a separate assertion covered by
-    test_malformed_or_unknown_attempt_scope_never_acquires.
+    A bound terminal order has consumed the capped attempt, so no new attempt
+    may be admitted.
     """
     _seed(mode="live", state=S_RETRYABLE, count=3, token="tok-x", order_id="prior-x")
     osm = _FakeOSM({"prior-x": {"status": "EXPIRED"}})
@@ -533,7 +531,13 @@ def test_complete_refuses_stolen_owner(_orders_table):
 def test_rotated_restart_owner_fences_stale_process_callback(_orders_table):
     """Only the current cross-process token may enter a trigger callback."""
     order_id = "callback-fence-order-1"
-    _insert_order(local_order_id=order_id, status="PENDING_TRIGGER")
+    _insert_order(
+        local_order_id=order_id,
+        status="PENDING_TRIGGER",
+        client_id=CLIENT,
+        canonical_signal_id=CANON,
+        signal_id=SIGNAL_ID,
+    )
     _seed(mode="live", state=S_ARMED, count=1, token="token-a", order_id=order_id)
     owner_a = overnight._WatchAttemptClaim(ALREADY_ARMED, "token-a", 1, order_id)
     owner_b = overnight._reacquire_armed_watch_attempt_for_restart(
@@ -685,6 +689,7 @@ def test_bounded_lifecycle_three_attempts_then_exhausted():
         {"state": "UNKNOWN", "count": 1, "token": "tok", "local_order_id": "ord"},
         {"state": "RETRYABLE", "count": "not-an-int", "token": "tok", "local_order_id": "ord"},
         {"state": "RETRYABLE", "count": -1, "token": "tok", "local_order_id": "ord"},
+        {"state": "RETRYABLE", "count": 1, "token": "", "local_order_id": ""},
         {"state": "", "count": 1, "token": "", "local_order_id": ""},
         {"state": "", "count": 0, "token": "tok", "local_order_id": ""},
     ],
