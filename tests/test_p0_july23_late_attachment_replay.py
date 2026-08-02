@@ -108,6 +108,12 @@ def _classify_row(row: dict) -> str:
         stop=row.get("stop"),
         target_complete=bool(row.get("target_complete")),
         decisive_drift_exceeded=_decisive_drift_exceeded(row),
+        # PR #407: late-attachment fixture rows come from production
+        # snapshots where the watcher has already confirmed breach at
+        # classification time.  Under the new invariant, stop evaluation
+        # requires durable breach evidence — passing True reproduces the
+        # production binding for accurate replay.
+        trigger_previously_breached=True,
     ).classification
 
 
