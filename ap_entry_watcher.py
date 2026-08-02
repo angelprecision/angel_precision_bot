@@ -5506,9 +5506,24 @@ class APEntryWatcher:
         if cb_exc is not None:
             return _failed("callback_raised", str(cb_exc))
 
-        if not isinstance(cb_result, _WCR):
-            _t = type(cb_result).__name__ if cb_result is not None else "NoneType"
-            return _failed("callback_result_not_watcher_completion_result", f"got {_t}")
+        # Guard against module-reload class-identity mismatch: in combined
+        # test runs, ap.pending_trigger_classifier may be loaded into two
+        # different module instances, making isinstance() fail even when the
+        # object is a genuine WatcherCompletionResult.  Check by type name
+        # AND required structural attributes so the contract is enforced
+        # regardless of which module instance created the object.
+        _cb_type_name = type(cb_result).__name__ if cb_result is not None else "NoneType"
+        _is_wcr = (
+            isinstance(cb_result, _WCR)
+            or (
+                _cb_type_name == "WatcherCompletionResult"
+                and hasattr(cb_result, "outcome")
+                and hasattr(cb_result, "reason_code")
+                and hasattr(cb_result, "local_order_id")
+            )
+        )
+        if not _is_wcr:
+            return _failed("callback_result_not_watcher_completion_result", f"got {_cb_type_name}")
 
         _valid = {_WCO.TERMINALIZED, _WCO.RETRY_OWNED, _WCO.REARMED, _WCO.FAILED}
         if cb_result.outcome not in _valid:
