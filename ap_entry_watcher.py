@@ -76,19 +76,34 @@ ET = ZoneInfo("America/New_York")
 
 
 def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
-    """Parse durable first-breach evidence without treating bad data as proof."""
-    if raw is None or str(raw).strip() == "":
+    """Parse durable first-breach evidence without treating bad data as proof.
+
+    PR #407 tightening: naive datetimes and ISO strings without timezone
+    information are rejected. Silent coercion to UTC would fabricate
+    confirmed-breach evidence out of ambiguous input, which is exactly what
+    the pre-breach stop-activation invariant forbids. Returns None for any
+    input the caller must treat as absence-of-proof.
+    """
+    if raw is None:
+        return None
+    # datetime instances: accept iff tz-aware.
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo is not None else None
+    # Anything else must be a non-empty ISO-8601 string with tz info.
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
         return None
     try:
-        text = str(raw).strip()
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         value = datetime.fromisoformat(text)
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value
     except (TypeError, ValueError):
         return None
+    if value.tzinfo is None:
+        return None
+    return value
 
 # FUNNEL FIX (2026-05-20, hardened 2026-05-21) + PR-C / BUG-EW-1:
 # Pre-open helper for the stop-touch invalidation guard. Returns True from
@@ -410,6 +425,10 @@ class WatchedSignal:
         self.trigger_crossed_at: Optional[datetime] = _parse_trigger_crossed_at(
             _trigger_crossed_raw
         )
+        # PR #407: pending (unconfirmed) first-breach timestamp. Populated on
+        # the first breach poll of a streak, promoted into trigger_crossed_at
+        # only after MOMENTUM_POLLS_REQUIRED breaches confirm. Never persisted.
+        self._pending_first_breach_at: Optional[datetime] = None
         self.first_breach_bid: float = 0.0
         self.first_breach_ask: float = 0.0
         self.trigger_price: Optional[float] = None
@@ -853,16 +872,13 @@ class WatchedSignal:
             if ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
-                    # ── P0 (PR #305) trigger-age gate:
-                    # Stamp the first-breach moment so the LIVE pre-submit
-                    # trigger-age gate can enforce ENTRY_TRIGGER_MAX_AGE_SEC.
-                    # This is the "trigger crossed" moment, distinct from
-                    # triggered_at (which is when the confirmed poll fires
-                    # after MOMENTUM_POLLS_REQUIRED breaches).
-                    if getattr(self, "trigger_crossed_at", None) is None:
-                        self.trigger_crossed_at = now
-                        self.first_breach_bid = bid
-                        self.first_breach_ask = ask
+                    # PR #407: durable trigger_crossed_at proof is issued ONLY
+                    # after MOMENTUM_POLLS_REQUIRED breaches confirm. Until
+                    # then, retain the first-breach poll timestamp in a private
+                    # pending slot and record the observed first-breach quote.
+                    self._pending_first_breach_at = now
+                    self.first_breach_bid = bid
+                    self.first_breach_ask = ask
                     log.debug(
                         "[%s] CALL breach candidate — ask=$%.2f >= trigger=$%.2f",
                         self.ticker,
@@ -871,6 +887,13 @@ class WatchedSignal:
                     )
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
+                    # PR #407: confirmation promotes the pending first-breach
+                    # timestamp into the durable trigger_crossed_at proof.
+                    # trigger_crossed_at MUST be the first-breach poll time,
+                    # not the confirmation-poll time — see LIVE trigger-age
+                    # gate (ENTRY_TRIGGER_MAX_AGE_SEC) semantics.
+                    self.trigger_crossed_at = self._pending_first_breach_at
+                    self._pending_first_breach_at = None
                     self.state = WatchState.TRIGGERED
                     self.triggered_at = now
                     self.trigger_price = ask
@@ -896,16 +919,14 @@ class WatchedSignal:
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
             )
-            # PR #407: scanner-stop protection is dormant before the
-            # entry-direction breach. A current CALL breach counts as the
-            # first activation so same-poll trigger/stop collision protection
-            # remains fail-closed even without a prior timestamp.
+            # PR #407: scanner-stop protection is dormant until a CONFIRMED
+            # entry-direction breach exists (trigger_crossed_at is set only
+            # after MOMENTUM_POLLS_REQUIRED breaches). Same-poll trigger/stop
+            # collision remains fail-closed because the confirmation branch
+            # above assigns trigger_crossed_at within this same check() call.
             if (
                 self.stop_level
-                and (
-                    getattr(self, "trigger_crossed_at", None) is not None
-                    or ask >= self.entry_trigger
-                )
+                and getattr(self, "trigger_crossed_at", None) is not None
                 and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -992,11 +1013,10 @@ class WatchedSignal:
             if bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
-                    # ── P0 (PR #305) trigger-age gate — see CALL branch above.
-                    if getattr(self, "trigger_crossed_at", None) is None:
-                        self.trigger_crossed_at = now
-                        self.first_breach_bid = bid
-                        self.first_breach_ask = ask
+                    # PR #407: see CALL branch — pending until confirmed.
+                    self._pending_first_breach_at = now
+                    self.first_breach_bid = bid
+                    self.first_breach_ask = ask
                     log.debug(
                         "[%s] PUT breach candidate — bid=$%.2f <= trigger=$%.2f",
                         self.ticker,
@@ -1005,6 +1025,9 @@ class WatchedSignal:
                     )
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
+                    # PR #407: confirmation promotes pending timestamp.
+                    self.trigger_crossed_at = self._pending_first_breach_at
+                    self._pending_first_breach_at = None
                     self.state = WatchState.TRIGGERED
                     self.triggered_at = now
                     self.trigger_price = bid
@@ -1025,14 +1048,12 @@ class WatchedSignal:
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
             )
-            # PR #407: symmetric PUT rule; the bid trigger breach activates
-            # the stop for this poll, while a pre-trigger ask touch is inert.
+            # PR #407: PUT scanner stop is dormant until confirmed breach.
+            # Symmetric to CALL; a pre-trigger ask touch is inert. Same-poll
+            # collision fail-closed via confirmation-branch assignment above.
             if (
                 self.stop_level
-                and (
-                    getattr(self, "trigger_crossed_at", None) is not None
-                    or bid <= self.entry_trigger
-                )
+                and getattr(self, "trigger_crossed_at", None) is not None
                 and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):

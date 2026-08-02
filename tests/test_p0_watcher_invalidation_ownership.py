@@ -599,7 +599,12 @@ class TestTriggerStopCollision:
         watched._watcher_ref = w
 
         # Advance breach count to MOMENTUM_POLLS_REQUIRED - 1.
+        # PR #407: production invariant — a positive breach_count implies a
+        # streak already started, so _pending_first_breach_at is populated.
+        # Seed it alongside the breach_count shortcut so the confirmation
+        # branch promotes a real timestamp into trigger_crossed_at.
         watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        watched._pending_first_breach_at = datetime.now(timezone.utc)
 
         # Poll where CALL confirms trigger (ask >= trigger) AND bid <= stop.
         # ask=451 >= trigger=450 → TRIGGERED on this poll.
@@ -633,6 +638,8 @@ class TestTriggerStopCollision:
         watched.entry_trigger = trigger
         watched.stop_level = stop
         watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        # PR #407: see CALL collision test above — seed pending timestamp.
+        watched._pending_first_breach_at = datetime.now(timezone.utc)
 
         state = watched.check(bid=449.0, ask=454.0)
 
@@ -996,10 +1003,28 @@ class TestProductionPathRegressions:
 
     def test_call_stop_dedup_held_until_verified_cleanup(self):
         """Normal CALL stop invalidation: dedup must remain held until
-        _dispatch_completion verifies TERMINALIZED from the callback."""
+        _dispatch_completion verifies TERMINALIZED from the callback.
+
+        PR #407: under the pre-breach stop-activation invariant, the scanner
+        stop is dormant until a CONFIRMED breach exists (durable
+        trigger_crossed_at). To exercise the stop-invalidation dispatch path
+        this test needs the watcher to hold durable prior-breach evidence.
+        We supply it through the SAME production hydration entry point
+        WatchedSignal.__init__ uses (signal["trigger_crossed_at"]), not via
+        direct attribute assignment.
+        """
         osm = _MockOSM()
-        w, watched, sig = _arm_watcher(mode="paper", osm=osm)
+        w, _prehydration_watched, sig = _arm_watcher(mode="paper", osm=osm)
+        # Rehydrate the watched signal with durable prior-confirmed-breach
+        # evidence via the production hydration path. The parsed value must
+        # flow through _parse_trigger_crossed_at() exactly like a restart.
+        sig["trigger_crossed_at"] = datetime.now(timezone.utc).isoformat()
+        watched = WatchedSignal(sig, overnight=False)
         watched._watcher_ref = w
+        # Replace the arm_watcher-constructed instance so all subsequent
+        # dispatch machinery references the hydrated watcher.
+        w._pending.remove(_prehydration_watched)
+        w._pending.append(watched)
 
         def _on_inv(ws: WatchedSignal) -> WatcherCompletionResult:
             oid = str((ws.signal or {}).get("local_order_id") or "")
@@ -1029,9 +1054,19 @@ class TestProductionPathRegressions:
         assert sig["signal_id"] not in w._dedup_set
 
     def test_put_stop_dedup_held_until_verified_cleanup(self):
+        # PR #407: symmetric to CALL sibling above — hydrate durable
+        # prior-confirmed-breach evidence via the production hydration path
+        # (WatchedSignal.__init__ reads trigger_crossed_at from the signal).
+        # Direct attribute assignment is not permitted.
         osm = _MockOSM()
-        w, watched, sig = _arm_watcher(mode="paper", osm=osm, signal_kwargs={"side": "PUT"})
+        w, _prehydration_watched, sig = _arm_watcher(
+            mode="paper", osm=osm, signal_kwargs={"side": "PUT"}
+        )
+        sig["trigger_crossed_at"] = datetime.now(timezone.utc).isoformat()
+        watched = WatchedSignal(sig, overnight=False)
         watched._watcher_ref = w
+        w._pending.remove(_prehydration_watched)
+        w._pending.append(watched)
 
         def _on_inv(ws: WatchedSignal) -> WatcherCompletionResult:
             oid = str((ws.signal or {}).get("local_order_id") or "")
@@ -1060,7 +1095,10 @@ class TestProductionPathRegressions:
         watched._watcher_ref = w
         watched.entry_trigger = 450.0
         watched.stop_level = 447.0
+        # PR #407: pre-set breach_count implies streak already began;
+        # seed the pending first-breach timestamp to match production.
         watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        watched._pending_first_breach_at = datetime.now(timezone.utc)
 
         state = watched.check(bid=446.0, ask=451.0)
         assert state == WatchState.INVALIDATED
@@ -1073,7 +1111,9 @@ class TestProductionPathRegressions:
         watched._watcher_ref = w
         watched.entry_trigger = 450.0
         watched.stop_level = 453.0
+        # PR #407: see CALL sibling above.
         watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
+        watched._pending_first_breach_at = datetime.now(timezone.utc)
 
         state = watched.check(bid=449.0, ask=454.0)
         assert state == WatchState.INVALIDATED
