@@ -246,11 +246,17 @@ def test_call_stop_missing_stop_side_quote_returns_truth_retry_with_quote_none()
     """Missing bid (stop side for CALL) must NOT claim a stop break AND
     must NOT let the classifier continue into WITHIN/WAITING/pre-trigger.
     Return TRIGGER_TRUTH_UNAVAILABLE_RETRY with quote=None so the watcher
-    seeds/preserves AWAITING_FIRST_TRUTH."""
+    seeds/preserves AWAITING_FIRST_TRUTH.
+
+    PR #407: this AWAITING_FIRST_TRUTH gate applies only when the stop is
+    active — i.e., durable trigger_previously_breached evidence exists.
+    Under the new invariant, pre-confirmation the stop is dormant and the
+    missing-stop-side quote is irrelevant to safety.
+    """
     # Ask is inside continuation zone (would otherwise be WITHIN); the
     # missing stop-side bid must override into retry.
     d = _decide(side="CALL", trigger_price=200, bid=0, ask=200.10,
-                stop=195.00)
+                stop=195.00, trigger_previously_breached=True)
     assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
     assert d.quote is None, (
         "Missing stop-side quote must yield quote=None so the watcher "
@@ -260,8 +266,9 @@ def test_call_stop_missing_stop_side_quote_returns_truth_retry_with_quote_none()
 
 
 def test_put_stop_missing_stop_side_quote_returns_truth_retry_with_quote_none():
+    # PR #407: see CALL sibling above.
     d = _decide(side="PUT", trigger_price=200, bid=199.90, ask=0,
-                stop=205.00)
+                stop=205.00, trigger_previously_breached=True)
     assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
     assert d.quote is None
 
@@ -275,9 +282,12 @@ def test_missing_stop_side_quote_with_no_stop_configured_does_not_retry():
 
 def test_call_stop_missing_stop_side_quote_when_would_have_been_waiting_reset():
     """A CALL past the continuation zone with missing bid must also seed
-    retry (not silently transition to WAITING_RESET without stop truth)."""
+    retry (not silently transition to WAITING_RESET without stop truth).
+
+    PR #407: applies only when the stop is active (durable breach evidence).
+    """
     d = _decide(side="CALL", trigger_price=200, bid=0, ask=200.50,
-                stop=195.00)
+                stop=195.00, trigger_previously_breached=True)
     assert d.classification == ptc.TRIGGER_TRUTH_UNAVAILABLE_RETRY
     assert d.quote is None
 

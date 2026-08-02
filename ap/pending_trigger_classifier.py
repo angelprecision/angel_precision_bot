@@ -389,55 +389,49 @@ def classify_late_attachment(
 
     canonical_quote = quote_result.value
 
-    # A stop is not an entry-trigger substitute.  Before the first
-    # entry-direction breach, the opposite-side stop geometry is dormant; a
-    # wide spread must not terminalize a still-eligible setup.  Once a durable
-    # breach is known, keep the stop active even if the current quote has
-    # subsequently reset.  The current canonical quote also activates the stop
-    # for this lifecycle when it proves the first breach.
-    _current_trigger_breached = (
-        (normalized_side == "CALL" and canonical_quote >= trigger)
-        or (normalized_side == "PUT" and canonical_quote <= trigger)
-    )
-    _stop_active = (trigger_previously_breached is True) or _current_trigger_breached
-    if not _stop_active:
-        return LateAttachmentDecision(
-            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
-            allowed_continuation=allowed,
-            quote=canonical_quote,
-            quote_source=quote_result.source,
-            detail=(
-                "call_below_trigger_stop_dormant"
-                if normalized_side == "CALL"
-                else "put_above_trigger_stop_dormant"
-            ),
-        )
-
-    _stop_state = _evaluate_stop(normalized_side, stop, bid=bid, ask=ask)
-    if _stop_state == _STOP_BROKEN:
-        _stop_source = "bid" if normalized_side == "CALL" else "ask"
-        _stop_value = _safe_decimal(bid if normalized_side == "CALL" else ask)
-        return LateAttachmentDecision(
-            classification=STOP_ALREADY_BROKEN_TERMINAL,
-            allowed_continuation=allowed,
-            quote=canonical_quote,
-            quote_source=quote_result.source,
-            detail=f"stop_broken_at_{_stop_source}={_stop_value}",
-        )
-    if _stop_state == _STOP_UNKNOWN:
-        # Valid stop exists but the STOP-SIDE quote is missing (CALL: bid=0;
-        # PUT: ask=0). We cannot prove the stop is safe, so we must NOT let
-        # the classifier continue into WITHIN_CONTINUATION / WAITING_RESET
-        # / pre-trigger. Return the retry shape with quote=None so the
-        # watcher seeds/preserves AWAITING_FIRST_TRUTH and blocks the
-        # ordinary breach path until both sides have truth.
-        return LateAttachmentDecision(
-            classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
-            allowed_continuation=allowed,
-            quote=None,
-            quote_source=quote_result.source,
-            detail=f"stop_side_quote_unavailable_{normalized_side}",
-        )
+    # A stop is not an entry-trigger substitute.  Before a CONFIRMED durable
+    # breach, the opposite-side stop geometry is dormant; a wide spread must
+    # not terminalize a still-eligible setup.  Once durable breach evidence
+    # is known (trigger_previously_breached=True), keep the stop active even
+    # if the current quote has subsequently reset.
+    #
+    # PR #407 correction: a single current trigger-side quote is NOT
+    # activation.  The watcher only issues durable trigger_crossed_at after
+    # MOMENTUM_POLLS_REQUIRED breaches confirm; the classifier must honor
+    # that same invariant.  Only the STOP EVALUATION block is gated; other
+    # classifications (WITHIN_CONTINUATION, WAITING_RESET, pre-trigger
+    # ordinary-breach) still flow.
+    _stop_active = trigger_previously_breached is True
+    if _stop_active:
+        _stop_state = _evaluate_stop(normalized_side, stop, bid=bid, ask=ask)
+        if _stop_state == _STOP_BROKEN:
+            _stop_source = "bid" if normalized_side == "CALL" else "ask"
+            _stop_value = _safe_decimal(bid if normalized_side == "CALL" else ask)
+            return LateAttachmentDecision(
+                classification=STOP_ALREADY_BROKEN_TERMINAL,
+                allowed_continuation=allowed,
+                quote=canonical_quote,
+                quote_source=quote_result.source,
+                detail=f"stop_broken_at_{_stop_source}={_stop_value}",
+            )
+        if _stop_state == _STOP_UNKNOWN:
+            # Valid stop exists but the STOP-SIDE quote is missing (CALL:
+            # bid=0; PUT: ask=0). We cannot prove the stop is safe, so we
+            # must NOT let the classifier continue into WITHIN_CONTINUATION
+            # / WAITING_RESET / pre-trigger. Return the retry shape with
+            # quote=None so the watcher seeds/preserves AWAITING_FIRST_TRUTH
+            # and blocks the ordinary breach path until both sides have
+            # truth.
+            return LateAttachmentDecision(
+                classification=TRIGGER_TRUTH_UNAVAILABLE_RETRY,
+                allowed_continuation=allowed,
+                quote=None,
+                quote_source=quote_result.source,
+                detail=f"stop_side_quote_unavailable_{normalized_side}",
+            )
+    # Dormant stop path: fall through to WITHIN / WAITING / pre-trigger
+    # classification below.  The watcher's own check() owns breach counting
+    # and only issues durable trigger_crossed_at after confirmation.
 
     if decisive_drift_exceeded:
         return LateAttachmentDecision(

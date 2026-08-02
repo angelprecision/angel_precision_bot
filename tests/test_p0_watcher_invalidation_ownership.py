@@ -599,12 +599,14 @@ class TestTriggerStopCollision:
         watched._watcher_ref = w
 
         # Advance breach count to MOMENTUM_POLLS_REQUIRED - 1.
-        # PR #407: production invariant — a positive breach_count implies a
-        # streak already started, so _pending_first_breach_at is populated.
-        # Seed it alongside the breach_count shortcut so the confirmation
-        # branch promotes a real timestamp into trigger_crossed_at.
-        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
-        watched._pending_first_breach_at = datetime.now(timezone.utc)
+        # PR #407: feed a real qualifying breach poll through the public
+        # check() path so the streak is established the same way it is in
+        # production — no private-attribute injection.
+        assert watched.MOMENTUM_POLLS_REQUIRED == 2, (
+            "This test presumes MOMENTUM_POLLS_REQUIRED == 2."
+        )
+        prior_state = watched.check(bid=449.50, ask=450.10)
+        assert prior_state == WatchState.PENDING
 
         # Poll where CALL confirms trigger (ask >= trigger) AND bid <= stop.
         # ask=451 >= trigger=450 → TRIGGERED on this poll.
@@ -637,9 +639,13 @@ class TestTriggerStopCollision:
         stop = 453.0
         watched.entry_trigger = trigger
         watched.stop_level = stop
-        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
-        # PR #407: see CALL collision test above — seed pending timestamp.
-        watched._pending_first_breach_at = datetime.now(timezone.utc)
+        # PR #407: feed a real qualifying PUT breach poll instead of
+        # injecting private state.  bid crosses trigger downward; ask stays
+        # comfortably below the buffered stop threshold so this poll does
+        # not itself trip the stop.
+        assert watched.MOMENTUM_POLLS_REQUIRED == 2
+        prior_state = watched.check(bid=449.50, ask=450.00)
+        assert prior_state == WatchState.PENDING
 
         state = watched.check(bid=449.0, ask=454.0)
 
@@ -1095,10 +1101,10 @@ class TestProductionPathRegressions:
         watched._watcher_ref = w
         watched.entry_trigger = 450.0
         watched.stop_level = 447.0
-        # PR #407: pre-set breach_count implies streak already began;
-        # seed the pending first-breach timestamp to match production.
-        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
-        watched._pending_first_breach_at = datetime.now(timezone.utc)
+        # PR #407: prior qualifying breach via public check() path.
+        assert watched.MOMENTUM_POLLS_REQUIRED == 2
+        prior_state = watched.check(bid=449.50, ask=450.10)
+        assert prior_state == WatchState.PENDING
 
         state = watched.check(bid=446.0, ask=451.0)
         assert state == WatchState.INVALIDATED
@@ -1111,9 +1117,10 @@ class TestProductionPathRegressions:
         watched._watcher_ref = w
         watched.entry_trigger = 450.0
         watched.stop_level = 453.0
-        # PR #407: see CALL sibling above.
-        watched.breach_count = watched.MOMENTUM_POLLS_REQUIRED - 1
-        watched._pending_first_breach_at = datetime.now(timezone.utc)
+        # PR #407: prior qualifying PUT breach via public check() path.
+        assert watched.MOMENTUM_POLLS_REQUIRED == 2
+        prior_state = watched.check(bid=449.50, ask=450.00)
+        assert prior_state == WatchState.PENDING
 
         state = watched.check(bid=449.0, ask=454.0)
         assert state == WatchState.INVALIDATED

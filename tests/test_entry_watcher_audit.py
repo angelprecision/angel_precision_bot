@@ -527,14 +527,28 @@ class TestPrecedenceTriggerVsStop:
         This is the safer-by-design behavior the user asked to preserve:
         if the underlying is whip-sawing both directions in a single
         poll, do NOT fire the entry.
+
+        PR #407: exercised through real breach polls so the streak is
+        established via the public production path (watched.check),
+        not by manipulating private internals.
         """
         sig = _make_signal(side="CALL", entry_price=500.00, stop_price=498.00)
         ws = WatchedSignal(sig, overnight=False)
-        # Need MOMENTUM_POLLS_REQUIRED prior breach so this tick would
-        # trigger if not for the stop.
-        ws.breach_count = ws.MOMENTUM_POLLS_REQUIRED - 1  # one more = TRIGGERED
+        assert ws.MOMENTUM_POLLS_REQUIRED == 2, (
+            "This test presumes MOMENTUM_POLLS_REQUIRED == 2 so a single "
+            "prior qualifying poll leaves the confirmation for the "
+            "collision tick."
+        )
 
-        # Same-tick: ask=500.10 (above trigger), bid=497.50 (below stop)
+        # Prior qualifying breach: ask crosses trigger, bid strictly
+        # above scanner stop (no collision on this poll).  Leaves
+        # breach_count=1 and populates _pending_first_breach_at
+        # through the same code path production runs on.
+        prior_state = ws.check(bid=499.50, ask=500.10)
+        assert prior_state == WatchState.PENDING
+
+        # Same-tick: ask=500.10 (above trigger), bid=497.50 (below stop).
+        # This poll confirms the trigger AND breaks the scanner stop.
         state = ws.check(bid=497.50, ask=500.10)
 
         assert state == WatchState.INVALIDATED, (
@@ -548,12 +562,18 @@ class TestPrecedenceTriggerVsStop:
         PUT stop-break threshold is ask >= stop_level * (1 + WRONG_DIR_BUFFER_PCT)
         = stop * 1.001. With stop=502 the threshold is 502.502, so ask must
         be >= 502.502 to register the stop break. Use ask=503.00 to clear it.
+
+        PR #407: exercised through real breach polls (see CALL sibling above).
         """
         sig = _make_signal(side="PUT", entry_price=500.00, stop_price=502.00)
         ws = WatchedSignal(sig, overnight=False)
-        ws.breach_count = ws.MOMENTUM_POLLS_REQUIRED - 1
+        assert ws.MOMENTUM_POLLS_REQUIRED == 2
 
-        # PUT: bid<=trigger triggers, ask>=stop*1.001 invalidates.
+        # Prior qualifying PUT breach: bid crosses trigger downward, ask
+        # strictly below scanner stop threshold (no collision this poll).
+        prior_state = ws.check(bid=499.50, ask=500.00)
+        assert prior_state == WatchState.PENDING
+
         # Same-tick: bid=499.50 (below trigger=500) → would TRIGGER,
         #             ask=503.00 (above 502*1.001=502.502) → INVALIDATES.
         # Last-write wins → INVALIDATED.

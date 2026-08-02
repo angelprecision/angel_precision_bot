@@ -285,66 +285,136 @@ class TestPreBreachStopActivationPut:
             )
 
     def test_restart_hydration_reactivates_stop_via_ask(self):
-        """Step 6 (parts 7-11): after a JSONB round-trip and reconstruction
-        through the production hydration entry point (WatchedSignal.__init__
-        reading trigger_crossed_at from the signal), the scanner stop is
-        ACTIVE.  A post-restart quote whose ASK breaks the PUT stop must
-        invalidate -- with no selector call, no broker submit, no broker
-        cancel of a nonexistent broker order, and no duplicate local order.
+        """Step 6 (parts 7-11): end-to-end restart proof.
 
-        Note on geometry: WRONG_DIR_BUFFER_PCT (0.001) requires
+        This test does NOT fabricate the persisted metadata.  It drives a
+        real dispatch through _poll_active_signals so the production path
+        emits update_order_meta(local_order_id, patch); captures the exact
+        patch; JSON-round-trips the dict to simulate the Supabase JSONB
+        boundary; then reconstructs a second watcher via the production
+        hydration entry point (WatchedSignal.__init__).  A post-restart
+        quote whose ASK breaks the PUT stop must invalidate the second
+        watcher with no selector, broker submit, or broker cancel side
+        effects.
+
+        Geometry note: WRONG_DIR_BUFFER_PCT (0.001) requires
         ask >= stop_level * 1.001 to fire.  For stop=62.49, threshold is
-        62.5525; test feeds ask=62.60 which comfortably clears the buffer
-        while preserving the spec's "post-restart quote above trigger,
-        breaks PUT stop via ASK" invariant.
+        62.5525; test feeds ask=62.60 which clears the buffer while
+        preserving the spec's "post-restart quote above trigger, breaks
+        PUT stop via ASK" invariant.
         """
-        # Round-trip the persisted meta through JSONB serialization to
-        # simulate the Supabase boundary.
-        captured_meta = {
-            "trigger_crossed_at": datetime.now(timezone.utc).isoformat(),
-            "trigger_confirmed_at": datetime.now(timezone.utc).isoformat(),
-            "first_breach_bid": 61.85,
-            "first_breach_ask": 61.95,
-        }
-        round_tripped_meta = json.loads(json.dumps(captured_meta))
+        # -- Step A: drive the first watcher through a real confirmation
+        #    dispatch so update_order_meta captures the production metadata.
+        first_osm = _MockOSM()
+        broker = MagicMock()
+        selector = MagicMock()
+        w1 = APEntryWatcher(broker, order_state_machine=first_osm, mode="PAPER")
 
-        # Reconstruct through the production hydration entry point:
-        # WatchedSignal.__init__ pulls trigger_crossed_at from either the
-        # top-level signal dict or signal["metadata"], then routes it
-        # through _parse_trigger_crossed_at().
-        sig = _bac_put_signal(
+        first_local_oid = str(uuid.uuid4())
+        first_sig = _bac_put_signal(local_order_id=first_local_oid)
+        first_watched = WatchedSignal(first_sig, overnight=False)
+        first_watched.entry_trigger = BAC_PUT_TRIGGER
+        first_watched.stop_level = BAC_PUT_STOP
+        first_watched._watcher_ref = w1
+        w1._pending.append(first_watched)
+        w1._dedup_set.add(first_sig["signal_id"])
+
+        # on_trigger records that dispatch reached it (i.e., production path
+        # ran end-to-end); it does not call selector or broker.
+        on_trigger_calls: list[str] = []
+        def _on_trigger(ws: WatchedSignal):
+            on_trigger_calls.append(ws.signal_id)
+            return None
+        w1.on_trigger = _on_trigger
+
+        # First qualifying breach — bid below trigger; ask well above the
+        # buffered stop so no collision.  Leaves the watcher PENDING with
+        # breach_count == 1 through the public check() path.
+        with patch.object(w1, "_fetch_quotes", return_value={
+            "BAC": {"bid": 61.85, "ask": 61.95}
+        }):
+            w1._poll_active_signals(open_protect_active=False)
+        assert first_watched.state == WatchState.PENDING
+        assert first_watched.breach_count == 1
+        assert first_watched.trigger_crossed_at is None
+
+        # Confirming poll — bid still below trigger, ask still below the
+        # buffered stop.  Promotes _pending_first_breach_at into
+        # trigger_crossed_at and drives update_order_meta.
+        with patch.object(w1, "_fetch_quotes", return_value={
+            "BAC": {"bid": 61.80, "ask": 61.90}
+        }):
+            w1._poll_active_signals(open_protect_active=False)
+
+        # -- Step B: extract the exact meta patch persisted before on_trigger.
+        ts_writes = [
+            patch for (oid, patch) in first_osm.meta_writes
+            if oid == first_local_oid and "trigger_crossed_at" in patch
+        ]
+        assert ts_writes, (
+            "Production dispatch did not persist trigger metadata "
+            "before on_trigger."
+        )
+        captured_meta = ts_writes[0]
+        for required_key in (
+            "trigger_crossed_at",
+            "trigger_confirmed_at",
+            "first_breach_bid",
+            "first_breach_ask",
+        ):
+            assert required_key in captured_meta, (
+                f"Captured meta missing production key: {required_key}"
+            )
+
+        # -- Step C: JSONB round-trip simulates the Supabase boundary on
+        #    the captured production metadata (not fabricated data).
+        round_tripped_meta = json.loads(json.dumps(captured_meta))
+        assert round_tripped_meta == captured_meta
+
+        # -- Step D: reconstruct a second watcher through the production
+        #    hydration entry point (WatchedSignal.__init__).  The signal
+        #    carries the round-tripped trigger_crossed_at exactly as a
+        #    restart-recovery module would read it from orders.meta.
+        second_sig = _bac_put_signal(
             trigger_crossed_at=round_tripped_meta["trigger_crossed_at"]
         )
-        second_watcher = WatchedSignal(sig, overnight=False)
+        second_watcher = WatchedSignal(second_sig, overnight=False)
         second_watcher.entry_trigger = BAC_PUT_TRIGGER
         second_watcher.stop_level = BAC_PUT_STOP
 
-        # Hydration must produce a tz-aware datetime.
         assert isinstance(second_watcher.trigger_crossed_at, datetime)
         assert second_watcher.trigger_crossed_at.tzinfo is not None
 
-        broker = MagicMock()
-        selector = MagicMock()
-        on_trigger_calls: list[str] = []
-
-        # WatchedSignal.check() does not call selector or broker directly;
-        # those are on the APEntryWatcher dispatch loop.  We verify no
-        # side-effect from the check() invalidation itself, and that
-        # neither MagicMock was touched.
+        # -- Step E: post-restart quote breaks the PUT stop via ASK.
         state = second_watcher.check(bid=62.60, ask=62.60)
 
         assert state == WatchState.INVALIDATED, (
             "Post-restart quote whose ask breaks the PUT stop must "
-            "invalidate given hydrated trigger_crossed_at."
+            "invalidate given hydrated (round-tripped) trigger_crossed_at."
         )
+        # No selector work, no broker submit, no broker cancel.  The
+        # second watcher never had a broker order; check() cannot reach
+        # the dispatch loop's broker code from a standalone WatchedSignal.
         assert selector.mock_calls == [], (
             "Selector must not be called during stop invalidation."
         )
-        assert broker.mock_calls == [], (
-            "Broker must not be called (no submit, no cancel) during "
-            "pre-broker-order invalidation."
-        )
-        assert on_trigger_calls == []
+        # The dispatch path may read broker attributes for gating (e.g.
+        # broker.live_access_token during LIVE-mode checks); those reads
+        # are not the invariant under test.  What must NOT happen is any
+        # submit or cancel call originating from the invalidation path.
+        forbidden_broker_methods = {
+            "submit_order",
+            "submit_option_order",
+            "cancel_order",
+            "cancel_option_order",
+        }
+        for call_ in broker.mock_calls:
+            called_name = str(call_).split("(", 1)[0]
+            for forbidden in forbidden_broker_methods:
+                assert forbidden not in called_name, (
+                    f"Broker.{forbidden} must not be called during "
+                    f"pre-broker-order invalidation; observed {call_}"
+                )
 
     def test_prebreach_ask_touch_leaves_stop_dormant(self):
         """Explicit dormancy check: with NO prior trigger evidence and
@@ -364,6 +434,174 @@ class TestPreBreachStopActivationPut:
         )
         assert watched.trigger_crossed_at is None
         assert watched._pending_first_breach_at is None
+
+    def test_prebreach_original_defect_geometry_stays_pending(self):
+        """Original defect proof at the exact spec geometry:
+        BAC PUT, trigger=61.90, stop=62.49, quote bid=62.45/ask=62.49.
+
+        Before PR #407, a single trigger-side or stop-side poll could
+        activate scanner-stop invalidation with no confirmed breach on
+        record.  With PR #407 the invariant is: no confirmed breach ->
+        stop is dormant.  This test drives the exact spec quote through
+        the public check() path and asserts the setup remains PENDING.
+        The WRONG_DIR_BUFFER_PCT (0.001) is intentionally untouched;
+        the value of this test is the defect proof at the exact numbers.
+        """
+        sig = _bac_put_signal()
+        watched = WatchedSignal(sig, overnight=False)
+        watched.entry_trigger = BAC_PUT_TRIGGER   # 61.90
+        watched.stop_level = BAC_PUT_STOP         # 62.49
+
+        # The exact BAC quote from the original spec.  No breach (bid
+        # above trigger); no confirmed evidence.  Stop MUST be dormant.
+        state = watched.check(bid=62.45, ask=62.49)
+
+        assert state == WatchState.PENDING, (
+            "Original defect: pre-confirmed BAC PUT at bid=62.45/ask=62.49 "
+            f"must remain PENDING; got {state}."
+        )
+        assert watched.trigger_crossed_at is None
+        assert watched._pending_first_breach_at is None
+        assert watched.breach_count == 0
+
+
+# ===========================================================================
+# Class 1b -- Lifecycle identity binding through existing recovery path
+# ===========================================================================
+#
+# The binding specification requires trigger evidence to remain bound to the
+# canonical signal ID, client ID, normalized execution mode, and local order
+# ID.  No new architecture is introduced here: the existing production
+# recovery module (ap.pending_trigger_restart_recovery.PendingTriggerRestartRecovery)
+# already enforces this fence and returns UNRESOLVED with a specific reason
+# code for each mismatched case.  The tests below prove that a persisted row
+# carrying valid trigger_crossed_at metadata cannot be routed into a watcher
+# by the recovery path unless every identity field belongs to the same
+# lifecycle.
+
+class TestLifecycleIdentityBinding:
+    """Cross-client, cross-mode, and missing-identity rows carrying valid
+    durable trigger evidence must be rejected by the production recovery
+    entry point before any watcher can hydrate."""
+
+    def _row_with_valid_trigger_evidence(
+        self,
+        *,
+        client_id: str,
+        execution_mode: str,
+        local_order_id=None,
+    ) -> dict:
+        """A row shaped like the durable Supabase pending_trigger record,
+        with all four post-confirmation meta keys populated.  A watcher
+        hydrated from this row's meta would treat the trigger as
+        confirmed — which is exactly why the recovery entry point must
+        reject mismatched lifecycles BEFORE hydration.
+
+        local_order_id=None auto-generates; pass "" explicitly to test
+        the missing-oid rejection path (do NOT collapse with `or`).
+        """
+        oid = str(uuid.uuid4()) if local_order_id is None else local_order_id
+        return {
+            "local_order_id": oid,
+            "signal_id": str(uuid.uuid4()),
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "ticker": "BAC",
+            "side": "PUT",
+            "entry_price": BAC_PUT_TRIGGER,
+            "stop_price": BAC_PUT_STOP,
+            "meta": {
+                "trigger_crossed_at":   datetime.now(timezone.utc).isoformat(),
+                "trigger_confirmed_at": datetime.now(timezone.utc).isoformat(),
+                "first_breach_bid":     61.85,
+                "first_breach_ask":     61.95,
+            },
+        }
+
+    def test_cross_client_row_rejected_before_hydration(self):
+        """Row belongs to another client — recovery MUST fail with
+        identity:client_id_mismatch and never construct a watcher."""
+        from ap.pending_trigger_restart_recovery import (
+            PendingTriggerRestartRecovery,
+        )
+        recovery = PendingTriggerRestartRecovery(
+            client_id="owner@example.com",
+            execution_mode="paper",
+            osm=_MockOSM(),
+        )
+        row = self._row_with_valid_trigger_evidence(
+            client_id="other@example.com",
+            execution_mode="paper",
+        )
+        outcome = recovery.recover_one_row(row)
+
+        # Recovery does not resolve; failure reason names the mismatch.
+        failure_reason = recovery._row_failure_reasons.get(
+            row["local_order_id"], ""
+        )
+        assert failure_reason == "identity:client_id_mismatch", (
+            f"Cross-client row must fail with client_id_mismatch; "
+            f"got {failure_reason!r}, outcome={outcome!r}."
+        )
+
+    def test_cross_mode_row_rejected_before_hydration(self):
+        """Row execution_mode does not match the recovery owner's mode
+        — MUST fail with identity:execution_mode_mismatch."""
+        from ap.pending_trigger_restart_recovery import (
+            PendingTriggerRestartRecovery,
+        )
+        recovery = PendingTriggerRestartRecovery(
+            client_id="owner@example.com",
+            execution_mode="live",     # owner is LIVE
+            osm=_MockOSM(),
+        )
+        row = self._row_with_valid_trigger_evidence(
+            client_id="owner@example.com",
+            execution_mode="paper",    # durable row is PAPER
+        )
+        outcome = recovery.recover_one_row(row)
+
+        failure_reason = recovery._row_failure_reasons.get(
+            row["local_order_id"], ""
+        )
+        assert failure_reason == "identity:execution_mode_mismatch", (
+            f"Cross-mode row must fail with execution_mode_mismatch; "
+            f"got {failure_reason!r}, outcome={outcome!r}."
+        )
+
+    def test_row_missing_local_order_id_rejected(self, caplog):
+        """A row without a durable local_order_id cannot bind to a
+        lifecycle at all — durable trigger evidence must never be reused
+        without an owner."""
+        import logging
+        from ap.pending_trigger_restart_recovery import (
+            PendingTriggerRestartRecovery,
+        )
+        recovery = PendingTriggerRestartRecovery(
+            client_id="owner@example.com",
+            execution_mode="paper",
+            osm=_MockOSM(),
+        )
+        row = self._row_with_valid_trigger_evidence(
+            client_id="owner@example.com",
+            execution_mode="paper",
+            local_order_id="",   # explicitly missing (helper honors "")
+        )
+        with caplog.at_level(logging.CRITICAL, logger="ap.pending_trigger_restart_recovery"):
+            outcome = recovery.recover_one_row(row)
+
+        # Recovery does not resolve.  The rejection reason is emitted as a
+        # CRITICAL identity-failure log marker (empty local_oid is not
+        # storable in _row_failure_reasons keyed by local_oid).
+        assert outcome != "RESOLVED", (
+            f"Row without local_order_id must not resolve; got {outcome!r}."
+        )
+        assert any(
+            "RESTART_RECOVERY_MISSING_LOCAL_ORDER_ID" in rec.message
+            for rec in caplog.records
+        ), (
+            "Missing local_order_id must emit the identity-failure marker."
+        )
 
 
 # ===========================================================================
