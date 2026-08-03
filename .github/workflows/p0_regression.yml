@@ -85,6 +85,7 @@ jobs:
             tests/test_readiness_contract.py \
             tests/test_funnel_fixes.py \
             tests/test_p0_regression_suite.py \
+            tests/test_p0_prebreach_stop_activation.py \
             tests/test_p0_entry_metadata_guard.py \
             tests/test_p0_trade_flow_contracts.py \
             tests/test_p0_fresh_sync_live_submit_quote.py \

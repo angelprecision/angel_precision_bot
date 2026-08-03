@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from ap.logger import get_logger
@@ -1282,33 +1283,111 @@ def _emit_summary(summary: dict) -> None:
 
 # ── Plan builder ──────────────────────────────────────────────────────────────
 
-def _build_plan(row: dict, plan_builder_fn=None) -> Optional[dict]:
+class _RecoveryPlan(SimpleNamespace):
+    """Attribute-first restart plan with a read-only legacy ``get`` shim.
+
+    ``APEntryWatcher.watch()`` consumes recovery plans through attributes.
+    The shim keeps older recovery observers that only read ``plan.get`` from
+    breaking without turning the plan back into a plain dict.
+    """
+
+    def get(self, name: str, default=None):
+        return getattr(self, name, default)
+
+
+def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
     if plan_builder_fn is not None:
         try:
             return plan_builder_fn(row)
         except Exception:
             return None
     try:
-        return {
-            "signal_id":      row.get("signal_id") or "",
-            "plan_id":        row.get("plan_id") or "",
-            "local_order_id": row.get("local_order_id") or "",
-            "client_id":      row.get("client_id") or "",
-            "client_email":   row.get("client_id") or row.get("client_email") or "",
-            "execution_mode": row.get("execution_mode") or "",
-            "ticker":         row.get("ticker") or row.get("symbol") or "",
-            "side":           row.get("direction") or row.get("side") or "",
-            "entry_price":    float(row.get("entry_price") or row.get("trigger_price") or 0),
-            "trigger_price":  float(_canonical_underlying_trigger(row) or row.get("trigger_price") or 0),
-            "stop_price":     float(row.get("stop_price") or row.get("stop_underlying") or 0),
-            "target_price":   float(row.get("target_price") or row.get("target_underlying") or 0),
-            "score":          float(row.get("score") or 0),
-            "tier":           row.get("tier") or "",
-            "timeframe":      row.get("timeframe") or "",
-            "contracts":      int(row.get("contracts") or 0),
-            "contract":       row.get("contract") or "",
-            "limit_price":    float(row.get("limit_price") or 0),
-        }
+        meta = _extract_meta(row)
+        signal_id = str(row.get("signal_id") or meta.get("signal_id") or "")
+        canonical_signal_id = str(
+            row.get("canonical_signal_id")
+            or meta.get("canonical_signal_id")
+            or ""
+        )
+        local_order_id = str(row.get("local_order_id") or "")
+        client_id = str(row.get("client_id") or meta.get("client_id") or "")
+        execution_mode = str(
+            row.get("execution_mode") or meta.get("execution_mode") or ""
+        ).strip().lower()
+        ticker = str(
+            row.get("ticker")
+            or row.get("symbol")
+            or meta.get("ticker")
+            or meta.get("symbol")
+            or ""
+        ).upper()
+        side = str(row.get("direction") or row.get("side") or meta.get("side") or "").strip().upper()
+        trigger = float(
+            _canonical_underlying_trigger(row)
+            or row.get("trigger_price")
+            or row.get("entry_price")
+            or meta.get("trigger_price")
+            or meta.get("entry_trigger")
+            or meta.get("signal_entry_price")
+            or 0
+        )
+        stop = float(
+            row.get("stop_price")
+            or row.get("stop_underlying")
+            or meta.get("stop_price")
+            or meta.get("stop_underlying")
+            or 0
+        )
+        target = float(
+            row.get("target_price")
+            or row.get("target_underlying")
+            or meta.get("target_price")
+            or meta.get("target_underlying")
+            or 0
+        )
+        generation = meta.get("materialization_generation")
+        try:
+            generation = int(generation) if generation is not None else None
+        except (TypeError, ValueError):
+            generation = None
+        return _RecoveryPlan(
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
+            plan_id=str(row.get("plan_id") or meta.get("plan_id") or ""),
+            ticker=ticker,
+            side=side,
+            direction=side,
+            entry_trigger=trigger,
+            trigger_price=trigger,
+            stop_underlying=stop,
+            stop_price=stop,
+            target_underlying=target,
+            target_price=target,
+            client_id=client_id,
+            client_email=client_id or str(row.get("client_email") or ""),
+            execution_mode=execution_mode,
+            local_order_id=local_order_id,
+            materialization_generation=generation,
+            trigger_crossed_at=(
+                row.get("trigger_crossed_at")
+                or meta.get("trigger_crossed_at")
+            ),
+            metadata=dict(meta),
+            score=float(row.get("score") or meta.get("score") or 0),
+            tier=row.get("tier") or meta.get("tier") or "",
+            timeframe=row.get("timeframe") or meta.get("timeframe") or "",
+            contracts=int(row.get("contracts") or row.get("qty") or meta.get("selected_qty") or 0),
+            quantity=int(row.get("quantity") or row.get("qty") or meta.get("selected_qty") or 0),
+            contract_symbol=str(
+                row.get("contract_symbol")
+                or row.get("contract")
+                or meta.get("contract_symbol")
+                or meta.get("selected_contract")
+                or ""
+            ),
+            contract=str(row.get("contract") or meta.get("selected_contract") or ""),
+            limit_price=float(row.get("limit_price") or meta.get("selected_limit") or 0),
+        )
     except Exception:
         return None
 

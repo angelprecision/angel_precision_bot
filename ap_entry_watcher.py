@@ -105,6 +105,82 @@ def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
         return None
     return value
 
+
+def _coerce_materialization_generation(raw) -> Optional[int]:
+    try:
+        if raw is None or raw == "":
+            return None
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_trigger_crossed_at_provenance(
+    signal: dict,
+    local_order_id: Optional[str],
+) -> dict:
+    """Build identity metadata for a newly confirmed trigger timestamp."""
+    metadata = signal.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    generation = signal.get("materialization_generation")
+    if generation is None:
+        generation = metadata.get("materialization_generation")
+    return {
+        "canonical_signal_id": str(
+            signal.get("canonical_signal_id")
+            or metadata.get("canonical_signal_id")
+            or ""
+        ).strip(),
+        "client_id": str(
+            signal.get("client_id")
+            or signal.get("client_email")
+            or ""
+        ).strip().lower(),
+        "execution_mode": str(signal.get("execution_mode") or "").strip().lower(),
+        "local_order_id": str(
+            local_order_id or signal.get("local_order_id") or ""
+        ).strip(),
+        "materialization_generation": _coerce_materialization_generation(generation),
+    }
+
+
+def _trigger_crossed_at_provenance_matches(
+    provenance,
+    signal: dict,
+    local_order_id: Optional[str],
+) -> bool:
+    """Return True only for complete, exact lifecycle provenance."""
+    if not isinstance(provenance, dict):
+        return False
+    expected = _build_trigger_crossed_at_provenance(signal, local_order_id)
+    actual = {
+        "canonical_signal_id": str(provenance.get("canonical_signal_id") or "").strip(),
+        "client_id": str(provenance.get("client_id") or "").strip().lower(),
+        "execution_mode": str(provenance.get("execution_mode") or "").strip().lower(),
+        "local_order_id": str(provenance.get("local_order_id") or "").strip(),
+        "materialization_generation": _coerce_materialization_generation(
+            provenance.get("materialization_generation")
+        ),
+    }
+    if (
+        not expected["canonical_signal_id"]
+        or not expected["client_id"]
+        or not expected["execution_mode"]
+        or not expected["local_order_id"]
+        or expected["materialization_generation"] is None
+    ):
+        return False
+    if (
+        not actual["canonical_signal_id"]
+        or not actual["client_id"]
+        or not actual["execution_mode"]
+        or not actual["local_order_id"]
+        or actual["materialization_generation"] is None
+    ):
+        return False
+    return actual == expected
+
 # FUNNEL FIX (2026-05-20, hardened 2026-05-21) + PR-C / BUG-EW-1:
 # Pre-open helper for the stop-touch invalidation guard. Returns True from
 # midnight ET through 9:30 ET (pre-market) AND through the 5-min open-protect
@@ -892,7 +968,11 @@ class WatchedSignal:
                     # trigger_crossed_at MUST be the first-breach poll time,
                     # not the confirmation-poll time — see LIVE trigger-age
                     # gate (ENTRY_TRIGGER_MAX_AGE_SEC) semantics.
-                    self.trigger_crossed_at = self._pending_first_breach_at
+                    if self.trigger_crossed_at is None:
+                        confirmed_at = self._pending_first_breach_at
+                        if confirmed_at is None:
+                            confirmed_at = now
+                        self.trigger_crossed_at = confirmed_at
                     self._pending_first_breach_at = None
                     self.state = WatchState.TRIGGERED
                     self.triggered_at = now
@@ -1026,7 +1106,11 @@ class WatchedSignal:
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
                     # PR #407: confirmation promotes pending timestamp.
-                    self.trigger_crossed_at = self._pending_first_breach_at
+                    if self.trigger_crossed_at is None:
+                        confirmed_at = self._pending_first_breach_at
+                        if confirmed_at is None:
+                            confirmed_at = now
+                        self.trigger_crossed_at = confirmed_at
                     self._pending_first_breach_at = None
                     self.state = WatchState.TRIGGERED
                     self.triggered_at = now
@@ -3114,14 +3198,33 @@ class APEntryWatcher:
         _materialization_resume = bool(materialization_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
         _plan_metadata = getattr(plan, "metadata", None) or {}
+        if not isinstance(_plan_metadata, dict):
+            _plan_metadata = {}
+        _plan_signal_id = str(getattr(plan, "signal_id", "") or "").strip()
+        _plan_canonical_signal_id = str(
+            getattr(plan, "canonical_signal_id", "")
+            or _plan_metadata.get("canonical_signal_id")
+            or ""
+        ).strip()
+        _plan_materialization_generation = getattr(
+            plan, "materialization_generation", None
+        )
+        if _plan_materialization_generation is None:
+            _plan_materialization_generation = _plan_metadata.get(
+                "materialization_generation"
+            )
 
         signal_dict = {
-            "signal_id": getattr(plan, "signal_id", str(uuid.uuid4())),
+            "signal_id": _plan_signal_id or str(uuid.uuid4()),
+            "canonical_signal_id": _plan_canonical_signal_id,
             "ticker": getattr(plan, "ticker", ""),
             "side": getattr(plan, "side", "CALL"),
             "score": getattr(plan, "score", 65.0),
             "grade": getattr(plan, "tier", "B"),
             "entry_price": getattr(plan, "trigger_price", None),
+            "entry_trigger": getattr(
+                plan, "entry_trigger", getattr(plan, "trigger_price", None)
+            ),
             "stop_price": getattr(plan, "stop_underlying", None),
             "target_price": getattr(plan, "target_underlying", None),
             # Preserve existing durable first-breach evidence for the
@@ -3134,31 +3237,31 @@ class APEntryWatcher:
             ),
             "plan_id": getattr(plan, "plan_id", ""),
             "local_order_id": local_order_id,
+            "metadata": dict(_plan_metadata),
+            "materialization_generation": _plan_materialization_generation,
             "client_id": str(
                 getattr(plan, "client_id", "")
-                or (getattr(plan, "metadata", None) or {}).get("client_id")
+                or _plan_metadata.get("client_id")
                 or ""
             ),
             "execution_mode": str(
                 getattr(plan, "execution_mode", "")
-                or (getattr(plan, "metadata", None) or {}).get("execution_mode")
+                or _plan_metadata.get("execution_mode")
                 or self.mode
             ).lower(),
             "watcher_token": self.owner_token,
             "trigger_generation": int(
-                (getattr(plan, "metadata", None) or {}).get(
-                    "materialization_generation", 1
-                ) or 1
+                _plan_materialization_generation or 1
             ),
             "deferred_retry_not_before": (
-                (getattr(plan, "metadata", None) or {}).get("next_retry_at")
-                or (getattr(plan, "metadata", None) or {}).get("materialization_next_retry_at")
+                _plan_metadata.get("next_retry_at")
+                or _plan_metadata.get("materialization_next_retry_at")
             ),
             # PR #182: carry trade_queue.id through to breach time so
             # write_deferred_breach_last_error() can find the queue row.
             # Populated by queue.py _dispatch() onto plan.metadata before watch() is called.
-            "queue_id": (getattr(plan, "metadata", None) or {}).get("queue_id"),
-            "trade_queue_id": (getattr(plan, "metadata", None) or {}).get("trade_queue_id"),
+            "queue_id": _plan_metadata.get("queue_id"),
+            "trade_queue_id": _plan_metadata.get("trade_queue_id"),
             # PR #388 late-attachment policy provenance flag. True ONLY for
             # plans built by the PR#388 seams (run_overnight_reeval new
             # watchers, REATTACH_WATCHER reconstructed plans, and the open-
@@ -3167,9 +3270,7 @@ class APEntryWatcher:
             # arms keep committed-main's strict anti-chase invariant.
             "late_attachment_policy_eligible": bool(
                 getattr(plan, "late_attachment_policy_eligible", False)
-                or (getattr(plan, "metadata", None) or {}).get(
-                    "late_attachment_policy_eligible", False
-                )
+                or _plan_metadata.get("late_attachment_policy_eligible", False)
             ),
             "contract_symbol": getattr(plan, "contract_symbol", ""),
             "pattern": getattr(plan, "pattern", ""),
@@ -3178,7 +3279,7 @@ class APEntryWatcher:
             "timeframe": getattr(plan, "timeframe", "1d"),
             "strategy_type": getattr(plan, "strategy_type", ""),
             "contract_deferred": bool(
-                (getattr(plan, "metadata", None) or {}).get("contract_deferred")
+                _plan_metadata.get("contract_deferred")
                 or str(getattr(plan, "contract_symbol", "") or "").upper().startswith("DEFERRED:")
             ),
             "trigger": {
@@ -3187,6 +3288,26 @@ class APEntryWatcher:
                 "pt1": getattr(plan, "target_underlying", None),
             },
         }
+
+        if _recovery_rearm or _materialization_resume:
+            _raw_trigger_crossed_at = signal_dict.get("trigger_crossed_at")
+            _provenance = _plan_metadata.get("trigger_crossed_at_provenance")
+            if not _trigger_crossed_at_provenance_matches(
+                _provenance, signal_dict, local_order_id
+            ):
+                if _raw_trigger_crossed_at is not None:
+                    log.warning(
+                        "[%s] recovery trigger evidence rejected — incomplete_or_mismatched_provenance "
+                        "local_order_id=%s",
+                        signal_dict.get("ticker") or "?",
+                        local_order_id or "?",
+                    )
+                signal_dict["trigger_crossed_at"] = None
+                # WatchedSignal.__init__ also checks signal.metadata for the
+                # durable timestamp.  Clear that copied recovery payload too;
+                # otherwise a rejected top-level value would be rehydrated
+                # from the same stale metadata a few lines later.
+                signal_dict["metadata"]["trigger_crossed_at"] = None
 
         now_et = datetime.now(ET)
         post_session = (
@@ -5033,6 +5154,11 @@ class APEntryWatcher:
                                 _ts_patch["trigger_crossed_at"] = (
                                     _tc_at.isoformat() if hasattr(_tc_at, "isoformat")
                                     else str(_tc_at)
+                                )
+                                _ts_patch["trigger_crossed_at_provenance"] = (
+                                    _build_trigger_crossed_at_provenance(
+                                        _sig_for_ts, _ts_pre_local_oid
+                                    )
                                 )
                             if _tc_bid:
                                 _ts_patch["first_breach_bid"]  = _tc_bid

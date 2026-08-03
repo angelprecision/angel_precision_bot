@@ -29,11 +29,19 @@ import json
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ap_entry_watcher import APEntryWatcher, WatchedSignal, WatchState
+from ap_entry_watcher import (
+    APEntryWatcher,
+    WatchedSignal,
+    WatchState,
+    _trigger_crossed_at_provenance_matches,
+)
+from ap.pending_trigger_restart_recovery import _build_plan
+from ap_recovery import APStartupRecovery
 
 
 # -- Local minimal mock OSM --------------------------------------------------
@@ -109,13 +117,19 @@ def _bac_put_signal(local_order_id: Optional[str] = None,
         "tier": "A",
         "queue_status": "QUEUED",
     }
+    sig["canonical_signal_id"] = sig["signal_id"]
+    sig["materialization_generation"] = 1
+    sig["metadata"] = {
+        "canonical_signal_id": sig["canonical_signal_id"],
+        "materialization_generation": 1,
+    }
     if trigger_crossed_at is not None:
         sig["trigger_crossed_at"] = trigger_crossed_at
     return sig
 
 
 def _spy_call_signal(local_order_id: Optional[str] = None) -> dict:
-    return {
+    sig = {
         "signal_id": str(uuid.uuid4()),
         "local_order_id": local_order_id or str(uuid.uuid4()),
         "client_id": "client@test.com",
@@ -134,6 +148,13 @@ def _spy_call_signal(local_order_id: Optional[str] = None) -> dict:
         "tier": "A",
         "queue_status": "QUEUED",
     }
+    sig["canonical_signal_id"] = sig["signal_id"]
+    sig["materialization_generation"] = 1
+    sig["metadata"] = {
+        "canonical_signal_id": sig["canonical_signal_id"],
+        "materialization_generation": 1,
+    }
+    return sig
 
 
 # ===========================================================================
@@ -254,15 +275,17 @@ class TestPreBreachStopActivationPut:
         }):
             w._poll_active_signals(open_protect_active=False)
 
-        # meta_write occurred, and it occurred BEFORE on_trigger (if
-        # on_trigger fired at all this pass).
+        # This is a real confirmation dispatch, so the callback must be
+        # reached exactly once after the timestamp write.
         assert "meta_write" in events, (
             "Dispatch path did not call update_order_meta before on_trigger."
         )
-        if "on_trigger" in events:
-            assert events.index("meta_write") < events.index("on_trigger"), (
-                "update_order_meta MUST be persisted before on_trigger."
-            )
+        assert events.count("on_trigger") == 1, (
+            "A confirmed watcher must invoke on_trigger exactly once in this poll."
+        )
+        assert events.index("meta_write") < events.index("on_trigger"), (
+            "update_order_meta MUST be persisted before on_trigger."
+        )
 
         # Capture the exact meta patch and assert the four required keys.
         assert osm.meta_writes, "No meta writes recorded."
@@ -279,10 +302,18 @@ class TestPreBreachStopActivationPut:
             "trigger_confirmed_at",
             "first_breach_bid",
             "first_breach_ask",
+            "trigger_crossed_at_provenance",
         ):
             assert required_key in first_ts_patch, (
                 f"meta patch missing required key: {required_key}"
             )
+        assert first_ts_patch["trigger_crossed_at_provenance"] == {
+            "canonical_signal_id": sig["canonical_signal_id"],
+            "client_id": "client@test.com",
+            "execution_mode": "paper",
+            "local_order_id": sig["local_order_id"],
+            "materialization_generation": 1,
+        }
 
     def test_restart_hydration_reactivates_stop_via_ask(self):
         """Step 6 (parts 7-11): end-to-end restart proof.
@@ -416,6 +447,7 @@ class TestPreBreachStopActivationPut:
                     f"pre-broker-order invalidation; observed {call_}"
                 )
 
+
     def test_prebreach_ask_touch_leaves_stop_dormant(self):
         """Explicit dormancy check: with NO prior trigger evidence and
         NO breach in this poll, an ask above the PUT stop must NOT
@@ -464,6 +496,335 @@ class TestPreBreachStopActivationPut:
         assert watched._pending_first_breach_at is None
         assert watched.breach_count == 0
 
+
+@pytest.mark.parametrize(
+    ("side", "signal_factory", "safe_quote", "broken_quote"),
+    [
+        (
+            "CALL",
+            _spy_call_signal,
+            {"SPY": {"bid": 449.0, "ask": 451.0}},
+            {"SPY": {"bid": 446.0, "ask": 451.0}},
+        ),
+        (
+            "PUT",
+            _bac_put_signal,
+            {"BAC": {"bid": 61.80, "ask": 61.90}},
+            {"BAC": {"bid": 61.80, "ask": 62.60}},
+        ),
+    ],
+)
+@pytest.mark.parametrize("retry_path", ["callback_exception", "keep_watcher"])
+def test_confirmed_evidence_survives_real_poll_retry_and_active_stop(
+    side, signal_factory, safe_quote, broken_quote, retry_path
+):
+    """A real poll confirmation must survive both existing retry branches.
+
+    The second poll invokes the callback and returns the watcher to PENDING
+    while retaining breach_count.  The next qualifying poll is deliberately
+    a broken active scanner stop: it must terminalize the watcher without
+    erasing the original confirmed timestamp or invoking on_trigger again.
+    """
+    osm = _MockOSM()
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    signal = signal_factory()
+    watched = WatchedSignal(signal, overnight=False)
+    if side == "CALL":
+        watched.entry_trigger = 450.0
+        watched.stop_level = 447.0
+    else:
+        watched.entry_trigger = BAC_PUT_TRIGGER
+        watched.stop_level = BAC_PUT_STOP
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(signal["signal_id"])
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+
+    callback_calls: list[str] = []
+
+    def _on_trigger(_watched):
+        callback_calls.append(side)
+        if retry_path == "callback_exception":
+            raise RuntimeError("simulated transient callback failure")
+        return {"disposition": "KEEP_WATCHER", "retry_after_seconds": 1}
+
+    watcher.on_trigger = _on_trigger
+    quote_sequence = [safe_quote, safe_quote, broken_quote]
+
+    def _fetch_quotes(_tickers):
+        return quote_sequence.pop(0)
+
+    watcher._fetch_quotes = _fetch_quotes
+
+    # First breach: real _poll_active_signals -> real WatchedSignal.check().
+    watcher._poll_active_signals(open_protect_active=False)
+    assert watched.breach_count == 1
+    assert watched._pending_first_breach_at is not None
+    assert watched.trigger_crossed_at is None
+
+    # Confirmation: callback retry/KEEP_WATCHER resets only state, not the
+    # already confirmed evidence or the momentum count.
+    watcher._poll_active_signals(open_protect_active=False)
+    original_confirmed_at = watched.trigger_crossed_at
+    preserved_breach_count = watched.breach_count
+    assert original_confirmed_at is not None
+    assert watched._pending_first_breach_at is None
+    assert watched.state == WatchState.PENDING
+    assert preserved_breach_count >= watched.MOMENTUM_POLLS_REQUIRED
+    assert len(callback_calls) == 1
+
+    # Make the retry due immediately; this models the scheduler's next due
+    # poll without waiting for the wall-clock retry interval.
+    watched.deferred_retry_not_before = None
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.INVALIDATED, (
+        f"{side} active scanner stop must terminalize after confirmation"
+    )
+    assert watched.trigger_crossed_at == original_confirmed_at, (
+        f"{side} retry must not erase or replace confirmed trigger evidence"
+    )
+    assert watched.trigger_crossed_at is not None
+    assert len(callback_calls) == 1, (
+        "A stop terminalization after a callback retry must not invoke "
+        "on_trigger a second time."
+    )
+
+
+def test_deferred_timestamp_persistence_retry_preserves_stop_evidence():
+    """The separate retryable-deferred persistence branch is covered too."""
+    osm = _MockOSM()
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="LIVE")
+    signal = _bac_put_signal()
+    signal["contract_symbol"] = "DEFERRED:BAC240101P00062000"
+    signal["contract_deferred"] = True
+    watched = WatchedSignal(signal, overnight=False)
+    watched.entry_trigger = BAC_PUT_TRIGGER
+    watched.stop_level = BAC_PUT_STOP
+    watched._watcher_ref = watcher
+    watcher._pending.append(watched)
+    watcher._dedup_set.add(signal["signal_id"])
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+    watcher._is_live_runtime = lambda: True
+
+    def _failed_meta_write(oid, patch):
+        osm.meta_writes.append((oid, dict(patch)))
+        return False
+
+    osm.update_order_meta = _failed_meta_write  # type: ignore[assignment]
+    callback_calls: list[str] = []
+    watcher.on_trigger = lambda _watched: callback_calls.append("called")
+    quote_sequence = [
+        {"BAC": {"bid": 61.85, "ask": 61.95}},
+        {"BAC": {"bid": 61.80, "ask": 61.90}},
+        {"BAC": {"bid": 61.80, "ask": 62.60}},
+    ]
+    watcher._fetch_quotes = lambda _tickers: quote_sequence.pop(0)
+
+    watcher._poll_active_signals(open_protect_active=False)
+    assert watched._pending_first_breach_at is not None
+    assert watched.trigger_crossed_at is None
+
+    watcher._poll_active_signals(open_protect_active=False)
+    original_confirmed_at = watched.trigger_crossed_at
+    preserved_breach_count = watched.breach_count
+    assert original_confirmed_at is not None
+    assert watched.state == WatchState.PENDING
+    assert watched.deferred_retry_not_before is not None
+    assert preserved_breach_count >= watched.MOMENTUM_POLLS_REQUIRED
+    assert callback_calls == [], (
+        "Deferred timestamp persistence failure must not enter callback work."
+    )
+
+    watched.deferred_retry_not_before = None
+    watcher._poll_active_signals(open_protect_active=False)
+
+    assert watched.state == WatchState.INVALIDATED
+    assert watched.trigger_crossed_at == original_confirmed_at
+    assert watched.trigger_crossed_at is not None
+    assert callback_calls == []
+
+
+def _restart_row_with_confirmed_evidence() -> dict:
+    local_order_id = "lo-restart-407"
+    canonical_signal_id = "canonical-restart-407"
+    crossed_at = "2026-08-03T16:00:00+00:00"
+    provenance = {
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": "client@test.com",
+        "execution_mode": "paper",
+        "local_order_id": local_order_id,
+        "materialization_generation": 7,
+    }
+    return {
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "local_order_id": local_order_id,
+        "signal_id": "signal-restart-407",
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": "client@test.com",
+        "execution_mode": "paper",
+        "symbol": "BAC",
+        "side": "PUT",
+        "trigger_price": BAC_PUT_TRIGGER,
+        "stop_underlying": BAC_PUT_STOP,
+        "target_underlying": 60.50,
+        "contract": "BAC240101P00062000",
+        "qty": 1,
+        "limit_price": 1.20,
+        "meta": {
+            "signal_id": "signal-restart-407",
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": "client@test.com",
+            "execution_mode": "paper",
+            "ticker": "BAC",
+            "side": "PUT",
+            "signal_entry_price": BAC_PUT_TRIGGER,
+            "stop_underlying": BAC_PUT_STOP,
+            "target_underlying": 60.50,
+            "selected_contract": "BAC240101P00062000",
+            "selected_qty": 1,
+            "selected_limit": 1.20,
+            "materialization_generation": 7,
+            "trigger_crossed_at": crossed_at,
+            "trigger_crossed_at_provenance": provenance,
+        },
+    }
+
+
+def test_restart_plan_json_roundtrip_reaches_watcher_with_active_stop():
+    """Production recovery builders must pass an attribute plan into watch()."""
+    persisted_row = _restart_row_with_confirmed_evidence()
+    row_after_json = json.loads(json.dumps(persisted_row))
+
+    # Exercise both generic and startup recovery builders.  The generic
+    # builder is the formerly-dict-shaped path; startup recovery is the
+    # ap_recovery -> PendingTriggerRestartRecovery -> watch() path.
+    generic_plan = _build_plan(row_after_json)
+    assert isinstance(generic_plan, SimpleNamespace)
+    assert generic_plan.signal_id == "signal-restart-407"
+    assert generic_plan.canonical_signal_id == "canonical-restart-407"
+    assert generic_plan.entry_trigger == BAC_PUT_TRIGGER
+    assert generic_plan.stop_underlying == BAC_PUT_STOP
+    assert generic_plan.target_underlying == 60.50
+    assert generic_plan.materialization_generation == 7
+    assert generic_plan.trigger_crossed_at == "2026-08-03T16:00:00+00:00"
+    assert isinstance(generic_plan.metadata, dict)
+
+    startup_recovery = APStartupRecovery.__new__(APStartupRecovery)
+    startup_recovery.client_id = "client@test.com"
+    production_plan = startup_recovery._build_recovery_plan_from_order(
+        row_after_json
+    )
+    assert isinstance(production_plan, SimpleNamespace)
+
+    osm = _MockOSM()
+    osm._row_status[persisted_row["local_order_id"]] = "PENDING_TRIGGER"
+    osm._row_meta[persisted_row["local_order_id"]] = dict(
+        row_after_json["meta"]
+    )
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+
+    # Keep the test independent of wall-clock market/session state while
+    # using the real recovery classifier and real add_signal/watch path.
+    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+         patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
+         patch.object(watcher, "_get_quote", return_value={"bid": 62.45, "ask": 62.49}):
+        assert watcher.watch(
+            production_plan,
+            persisted_row["local_order_id"],
+            recovery_rearm=True,
+        ) is True
+
+    assert len(watcher._pending) == 1
+    armed = watcher._pending[0]
+    assert armed.signal["ticker"] == "BAC"
+    assert armed.signal["side"] == "PUT"
+    assert armed.entry_trigger == BAC_PUT_TRIGGER
+    assert armed.stop_level == BAC_PUT_STOP
+    assert armed.signal["client_id"] == "client@test.com"
+    assert armed.signal["execution_mode"] == "paper"
+    assert armed.signal["local_order_id"] == "lo-restart-407"
+    assert armed.signal["canonical_signal_id"] == "canonical-restart-407"
+    assert armed.signal["materialization_generation"] == 7
+    assert armed.trigger_crossed_at == datetime.fromisoformat(
+        "2026-08-03T16:00:00+00:00"
+    )
+
+    # The recovered confirmed evidence must make the scanner stop live.
+    assert armed.check(bid=62.60, ask=62.60) == WatchState.INVALIDATED
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        pytest.param("client_id", "other@test.com", id="wrong-client"),
+        pytest.param("execution_mode", "live", id="wrong-mode"),
+        pytest.param("local_order_id", "stale-order", id="wrong-order"),
+        pytest.param("materialization_generation", 6, id="stale-generation"),
+    ],
+)
+def test_recovery_trigger_evidence_rejects_mismatched_lifecycle_identity(
+    field, bad_value
+):
+    row = json.loads(json.dumps(_restart_row_with_confirmed_evidence()))
+    row["meta"]["trigger_crossed_at_provenance"][field] = bad_value
+    signal = {
+        "signal_id": row["signal_id"],
+        "canonical_signal_id": row["canonical_signal_id"],
+        "client_id": row["client_id"],
+        "execution_mode": row["execution_mode"],
+        "local_order_id": row["local_order_id"],
+        "materialization_generation": row["meta"]["materialization_generation"],
+    }
+    provenance = dict(row["meta"]["trigger_crossed_at_provenance"])
+
+    assert not _trigger_crossed_at_provenance_matches(
+        provenance, signal, row["local_order_id"]
+    ), f"mismatched {field} must fail closed"
+
+    startup_recovery = APStartupRecovery.__new__(APStartupRecovery)
+    startup_recovery.client_id = "client@test.com"
+    production_plan = startup_recovery._build_recovery_plan_from_order(row)
+    assert isinstance(production_plan, SimpleNamespace)
+    osm = _MockOSM()
+    osm._row_status[row["local_order_id"]] = "PENDING_TRIGGER"
+    osm._row_meta[row["local_order_id"]] = dict(row["meta"])
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+         patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
+         patch.object(watcher, "_get_quote", return_value={"bid": 62.45, "ask": 62.49}):
+        assert watcher.watch(
+            production_plan, row["local_order_id"], recovery_rearm=True
+        ) is True
+    armed = watcher._pending[0]
+    assert armed.trigger_crossed_at is None, (
+        f"recovery must clear trigger evidence for mismatched {field}"
+    )
+    assert armed.check(bid=62.60, ask=62.60) == WatchState.PENDING, (
+        f"mismatched {field} must not activate the scanner stop"
+    )
+
+
+def test_recovery_trigger_evidence_rejects_incomplete_provenance():
+    row = _restart_row_with_confirmed_evidence()
+    signal = {
+        "signal_id": row["signal_id"],
+        "canonical_signal_id": row["canonical_signal_id"],
+        "client_id": row["client_id"],
+        "execution_mode": row["execution_mode"],
+        "local_order_id": row["local_order_id"],
+        "materialization_generation": row["meta"]["materialization_generation"],
+    }
+    for missing_field in ("canonical_signal_id", "materialization_generation"):
+        incomplete = dict(row["meta"]["trigger_crossed_at_provenance"])
+        incomplete.pop(missing_field)
+        assert not _trigger_crossed_at_provenance_matches(
+            incomplete, signal, row["local_order_id"]
+        ), f"missing {missing_field} must fail closed"
 
 # ===========================================================================
 # Class 1b -- Lifecycle identity binding through existing recovery path
@@ -569,11 +930,11 @@ class TestLifecycleIdentityBinding:
             f"got {failure_reason!r}, outcome={outcome!r}."
         )
 
-    def test_row_missing_local_order_id_rejected(self, caplog):
+    def test_row_missing_local_order_id_rejected(self):
         """A row without a durable local_order_id cannot bind to a
         lifecycle at all — durable trigger evidence must never be reused
         without an owner."""
-        import logging
+        import ap.pending_trigger_restart_recovery as restart_recovery
         from ap.pending_trigger_restart_recovery import (
             PendingTriggerRestartRecovery,
         )
@@ -587,7 +948,7 @@ class TestLifecycleIdentityBinding:
             execution_mode="paper",
             local_order_id="",   # explicitly missing (helper honors "")
         )
-        with caplog.at_level(logging.CRITICAL, logger="ap.pending_trigger_restart_recovery"):
+        with patch.object(restart_recovery.log, "critical") as critical:
             outcome = recovery.recover_one_row(row)
 
         # Recovery does not resolve.  The rejection reason is emitted as a
@@ -596,9 +957,9 @@ class TestLifecycleIdentityBinding:
         assert outcome != "RESOLVED", (
             f"Row without local_order_id must not resolve; got {outcome!r}."
         )
-        assert any(
-            "RESTART_RECOVERY_MISSING_LOCAL_ORDER_ID" in rec.message
-            for rec in caplog.records
+        assert critical.called
+        assert "RESTART_RECOVERY_MISSING_LOCAL_ORDER_ID" in str(
+            critical.call_args
         ), (
             "Missing local_order_id must emit the identity-failure marker."
         )
@@ -689,11 +1050,13 @@ class TestPreBreachStopActivationCall:
             _ = watched.check(bid=449.0, ask=451.0)
         assert watched.state == WatchState.TRIGGERED
 
-        # Reset state to simulate downstream watcher continuing after the
-        # confirmed trigger (durable trigger_crossed_at retained).
+        # Reset only state to simulate downstream watcher continuing after
+        # the confirmed trigger.  Preserve breach_count exactly as the real
+        # callback retry/KEEP_WATCHER paths do.
         watched.state = WatchState.PENDING
-        watched.breach_count = 0
+        preserved_breach_count = watched.breach_count
         watched._trigger_stop_collision = False
+        assert preserved_breach_count >= watched.MOMENTUM_POLLS_REQUIRED
 
         # Now feed a quote where bid breaks stop with buffer clearance.
         # stop=447 * 0.999 = 446.553; bid=446 clears.
