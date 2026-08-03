@@ -131,6 +131,13 @@ def _reattach_plan(*, local_order_id="local-existing-1", confirmed=False):
         meta["trigger_crossed_at"] = (
             datetime.now(timezone.utc) - timedelta(minutes=10)
         ).isoformat()
+        meta["trigger_crossed_at_provenance"] = {
+            "canonical_signal_id": "sig-reattach-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "local_order_id": local_order_id,
+            "materialization_generation": 1,
+        }
     return SimpleNamespace(
         signal_id="sig-reattach-1",
         canonical_signal_id="sig-reattach-1",
@@ -238,7 +245,9 @@ def test_reattach_with_proven_terminal_truth_terminalizes_existing_order_once(
     )
 
     result = w.watch(
-        _reattach_plan(confirmed=True),   # real rearmed recovery has trigger_crossed_at
+        _reattach_plan(
+            local_order_id="local-existing-terminal", confirmed=True
+        ),   # real rearmed recovery has trigger_crossed_at + provenance
         local_order_id="local-existing-terminal",
         recovery_rearm=True,
         no_cancel_on_reject=True,

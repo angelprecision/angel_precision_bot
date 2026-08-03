@@ -73,7 +73,7 @@ def _row(
     trigger_crossed_offset_seconds: int = -120,
 ) -> dict:
     now = datetime.now(timezone.utc)
-    return {
+    row = {
         "local_order_id": LOCAL_ORDER_ID,
         "client_id": client_id,
         "execution_mode": execution_mode,
@@ -121,6 +121,37 @@ def _row(
             },
         },
     }
+    _bind_trigger_evidence(row)
+    return row
+
+
+def _bind_trigger_evidence(row: dict) -> dict:
+    """Give deferred fixtures the durable identity now required by recovery."""
+    meta = row.setdefault("meta", {})
+    canonical = str(
+        row.get("canonical_signal_id")
+        or meta.get("canonical_signal_id")
+        or row.get("signal_id")
+        or ""
+    )
+    client_id = str(row.get("client_id") or meta.get("client_id") or "")
+    execution_mode = str(
+        row.get("execution_mode") or meta.get("execution_mode") or ""
+    ).strip().lower()
+    meta.update(
+        {
+            "canonical_signal_id": canonical,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": canonical,
+                "client_id": client_id,
+                "execution_mode": execution_mode,
+                "local_order_id": str(row.get("local_order_id") or ""),
+            },
+        }
+    )
+    return row
 
 
 def _core(*, execution_mode: str = "paper"):
@@ -1058,7 +1089,16 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
             "materialization_in_flight": True,
             "materialization_owner": owner,
             "materialization_generation": generation,
+            "canonical_signal_id": signal_id,
+            "client_id": client_id,
+            "execution_mode": "live",
             "trigger_crossed_at": (now - timedelta(seconds=10)).isoformat(),
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": signal_id,
+                "client_id": client_id,
+                "execution_mode": "live",
+                "local_order_id": local_order_id,
+            },
             "trigger_price": 61.0,
         }
         with _pg_conn() as c:
@@ -1122,6 +1162,12 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
         assert meta["materialization_status"] == "RETRY_PENDING"
         assert meta["retry_owner"] == owner
         assert meta["materialization_generation"] == generation
+        assert meta["trigger_crossed_at_provenance"] == {
+            "canonical_signal_id": signal_id,
+            "client_id": client_id,
+            "execution_mode": "live",
+            "local_order_id": local_order_id,
+        }
         assert row["client_id"] == client_id
         assert row["execution_mode"] == "live"
         assert row["signal_id"] == signal_id
@@ -1200,6 +1246,7 @@ def _budget_row(client_id: str, execution_mode: str,
     )
     row["local_order_id"] = local_order_id
     row["signal_id"] = signal_id
+    _bind_trigger_evidence(row)
     row["symbol"] = "BAC"
     row["direction"] = "PUT"
     row["meta"]["materialization_selector_failure"] = {
@@ -2155,10 +2202,12 @@ def test_final_malformed_generation_quarantines_first_row_and_second_due_retry_r
 
     bad = _row()
     bad["local_order_id"] = "oid-bad-counter"
+    _bind_trigger_evidence(bad)
     bad["meta"]["materialization_generation"] = "not-an-int"
 
     good = _row()
     good["local_order_id"] = "oid-good-counter"
+    _bind_trigger_evidence(good)
 
     resume_calls = []
     mock_core = MagicMock()
@@ -2211,8 +2260,10 @@ def test_final_malformed_retry_attempt_during_cas_miss_is_row_local():
 
     first = _row()
     first["local_order_id"] = "oid-cas-malformed"
+    _bind_trigger_evidence(first)
     second = _row()
     second["local_order_id"] = "oid-after-cas-malformed"
+    _bind_trigger_evidence(second)
 
     resume_calls = []
     mock_core = MagicMock()
@@ -2244,6 +2295,7 @@ def test_final_malformed_retry_attempt_during_cas_miss_is_row_local():
             if oid == "oid-cas-malformed":
                 row = _row()
                 row["local_order_id"] = oid
+                _bind_trigger_evidence(row)
                 row["meta"]["retry_attempt"] = "bad-attempt"
                 return row
             return second

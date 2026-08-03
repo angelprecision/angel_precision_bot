@@ -36,11 +36,16 @@ import pytest
 
 from ap_entry_watcher import (
     APEntryWatcher,
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     WatchedSignal,
     WatchState,
+    recovery_trigger_evidence_identity_is_proven,
     _trigger_crossed_at_provenance_matches,
 )
-from ap.pending_trigger_restart_recovery import _build_plan
+from ap.pending_trigger_restart_recovery import (
+    PendingTriggerRestartRecovery,
+    _build_plan,
+)
 from ap_recovery import APStartupRecovery
 
 
@@ -55,6 +60,8 @@ class _MockOSM:
         self._row_meta: dict[str, dict] = {}
         self.meta_writes: list[tuple[str, dict]] = []
         self.cancel_calls: list[tuple[str, str]] = []
+        self.expire_calls: list[tuple[str, str]] = []
+        self.transition_calls: list[tuple[str, str]] = []
 
     def _ensure(self, oid: str) -> None:
         if oid not in self._row_status:
@@ -85,6 +92,11 @@ class _MockOSM:
         return True
 
     def expire_pending_entry(self, local_order_id: str, *, reason: str = "") -> bool:
+        self.expire_calls.append((local_order_id, reason))
+        return True
+
+    def transition(self, local_order_id: str, status: str, **_kwargs) -> bool:
+        self.transition_calls.append((local_order_id, status))
         return True
 
     def terminalize_deferred_breach(self, *a, **kw) -> bool:
@@ -118,10 +130,10 @@ def _bac_put_signal(local_order_id: Optional[str] = None,
         "queue_status": "QUEUED",
     }
     sig["canonical_signal_id"] = sig["signal_id"]
-    sig["materialization_generation"] = 1
     sig["metadata"] = {
         "canonical_signal_id": sig["canonical_signal_id"],
-        "materialization_generation": 1,
+        "client_id": sig["client_id"],
+        "execution_mode": sig["execution_mode"],
     }
     if trigger_crossed_at is not None:
         sig["trigger_crossed_at"] = trigger_crossed_at
@@ -149,10 +161,10 @@ def _spy_call_signal(local_order_id: Optional[str] = None) -> dict:
         "queue_status": "QUEUED",
     }
     sig["canonical_signal_id"] = sig["signal_id"]
-    sig["materialization_generation"] = 1
     sig["metadata"] = {
         "canonical_signal_id": sig["canonical_signal_id"],
-        "materialization_generation": 1,
+        "client_id": sig["client_id"],
+        "execution_mode": sig["execution_mode"],
     }
     return sig
 
@@ -312,8 +324,10 @@ class TestPreBreachStopActivationPut:
             "client_id": "client@test.com",
             "execution_mode": "paper",
             "local_order_id": sig["local_order_id"],
-            "materialization_generation": 1,
         }
+        assert "materialization_generation" not in first_ts_patch[
+            "trigger_crossed_at_provenance"
+        ], "ordinary queue evidence must not invent a generation"
 
     def test_restart_hydration_reactivates_stop_via_ask(self):
         """Step 6 (parts 7-11): end-to-end restart proof.
@@ -526,7 +540,7 @@ def test_confirmed_evidence_survives_real_poll_retry_and_active_stop(
     erasing the original confirmed timestamp or invoking on_trigger again.
     """
     osm = _MockOSM()
-    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="LIVE")
     signal = signal_factory()
     watched = WatchedSignal(signal, overnight=False)
     if side == "CALL":
@@ -573,31 +587,60 @@ def test_confirmed_evidence_survives_real_poll_retry_and_active_stop(
     assert preserved_breach_count >= watched.MOMENTUM_POLLS_REQUIRED
     assert len(callback_calls) == 1
 
+    # Simulate process restart from the exact orders.meta JSON boundary.  The
+    # callback exception and KEEP_WATCHER paths both leave a durable timestamp;
+    # the newly hydrated watcher must retain active-stop authority.
+    persisted_signal = dict(signal)
+    persisted_signal["metadata"] = json.loads(
+        json.dumps(osm._row_meta[signal["local_order_id"]])
+    )
+    restarted = WatchedSignal(persisted_signal, overnight=False)
+    if side == "CALL":
+        restarted.entry_trigger = 450.0
+        restarted.stop_level = 447.0
+    else:
+        restarted.entry_trigger = BAC_PUT_TRIGGER
+        restarted.stop_level = BAC_PUT_STOP
+    restarted._watcher_ref = watcher
+    watcher._pending = [restarted]
+    watcher._dedup_set = {signal["signal_id"]}
+
     # Make the retry due immediately; this models the scheduler's next due
     # poll without waiting for the wall-clock retry interval.
-    watched.deferred_retry_not_before = None
+    restarted.deferred_retry_not_before = None
     watcher._poll_active_signals(open_protect_active=False)
 
-    assert watched.state == WatchState.INVALIDATED, (
+    assert restarted.state == WatchState.INVALIDATED, (
         f"{side} active scanner stop must terminalize after confirmation"
     )
-    assert watched.trigger_crossed_at == original_confirmed_at, (
+    assert restarted.trigger_crossed_at == original_confirmed_at, (
         f"{side} retry must not erase or replace confirmed trigger evidence"
     )
-    assert watched.trigger_crossed_at is not None
+    assert restarted.trigger_crossed_at is not None
     assert len(callback_calls) == 1, (
         "A stop terminalization after a callback retry must not invoke "
         "on_trigger a second time."
     )
 
 
-def test_deferred_timestamp_persistence_retry_preserves_stop_evidence():
-    """The separate retryable-deferred persistence branch is covered too."""
+@pytest.mark.parametrize("deferred", [False, True], ids=["ordinary-live", "deferred-live"])
+def test_live_timestamp_persistence_retry_requires_durable_write_before_callback(
+    deferred,
+):
+    """Every LIVE watcher must persist trigger evidence before callback work.
+
+    The ordinary queue path is intentionally included alongside the deferred
+    path: the persistence fence is a LIVE safety invariant, not a deferred-only
+    special case.  A later successful write permits exactly one KEEP_WATCHER
+    callback, after which a broken active stop terminalizes without a second
+    callback.
+    """
     osm = _MockOSM()
     watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="LIVE")
     signal = _bac_put_signal()
-    signal["contract_symbol"] = "DEFERRED:BAC240101P00062000"
-    signal["contract_deferred"] = True
+    if deferred:
+        signal["contract_symbol"] = "DEFERRED:BAC240101P00062000"
+        signal["contract_deferred"] = True
     watched = WatchedSignal(signal, overnight=False)
     watched.entry_trigger = BAC_PUT_TRIGGER
     watched.stop_level = BAC_PUT_STOP
@@ -607,15 +650,28 @@ def test_deferred_timestamp_persistence_retry_preserves_stop_evidence():
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
     watcher._is_live_runtime = lambda: True
 
-    def _failed_meta_write(oid, patch):
-        osm.meta_writes.append((oid, dict(patch)))
-        return False
+    persist_attempts: list[dict] = []
+    fail_persistence = True
 
-    osm.update_order_meta = _failed_meta_write  # type: ignore[assignment]
+    def _meta_write(oid, patch):
+        nonlocal fail_persistence
+        osm.meta_writes.append((oid, dict(patch)))
+        persist_attempts.append(dict(patch))
+        if fail_persistence:
+            return False
+        return True
+
+    osm.update_order_meta = _meta_write  # type: ignore[assignment]
     callback_calls: list[str] = []
-    watcher.on_trigger = lambda _watched: callback_calls.append("called")
+
+    def _on_trigger(_watched):
+        callback_calls.append("called")
+        return {"disposition": "KEEP_WATCHER", "retry_after_seconds": 1}
+
+    watcher.on_trigger = _on_trigger
     quote_sequence = [
         {"BAC": {"bid": 61.85, "ask": 61.95}},
+        {"BAC": {"bid": 61.80, "ask": 61.90}},
         {"BAC": {"bid": 61.80, "ask": 61.90}},
         {"BAC": {"bid": 61.80, "ask": 62.60}},
     ]
@@ -633,16 +689,31 @@ def test_deferred_timestamp_persistence_retry_preserves_stop_evidence():
     assert watched.deferred_retry_not_before is not None
     assert preserved_breach_count >= watched.MOMENTUM_POLLS_REQUIRED
     assert callback_calls == [], (
-        "Deferred timestamp persistence failure must not enter callback work."
+        "LIVE timestamp persistence failure must not enter callback work."
     )
 
+    # The next due poll gets a successful durable write.  Callback work may
+    # begin only after that write and must run once.
+    fail_persistence = False
     watched.deferred_retry_not_before = None
+    watcher._poll_active_signals(open_protect_active=False)
+    assert len(callback_calls) == 1
+    assert watched.state == WatchState.PENDING
+    assert watched.trigger_crossed_at == original_confirmed_at
+    assert len(persist_attempts) >= 2
+
+    # A later qualifying poll with a broken active stop must terminalize and
+    # must not invoke the callback a second time.
+    watched.deferred_retry_not_before = None
+    watcher._fetch_quotes = lambda _tickers: {
+        "BAC": {"bid": 61.80, "ask": 62.60}
+    }
     watcher._poll_active_signals(open_protect_active=False)
 
     assert watched.state == WatchState.INVALIDATED
     assert watched.trigger_crossed_at == original_confirmed_at
     assert watched.trigger_crossed_at is not None
-    assert callback_calls == []
+    assert callback_calls == ["called"]
 
 
 def _restart_row_with_confirmed_evidence() -> dict:
@@ -654,7 +725,6 @@ def _restart_row_with_confirmed_evidence() -> dict:
         "client_id": "client@test.com",
         "execution_mode": "paper",
         "local_order_id": local_order_id,
-        "materialization_generation": 7,
     }
     return {
         "status": "PENDING_TRIGGER",
@@ -760,10 +830,10 @@ def test_restart_plan_json_roundtrip_reaches_watcher_with_active_stop():
 @pytest.mark.parametrize(
     ("field", "bad_value"),
     [
+        pytest.param("canonical_signal_id", "stale-canonical", id="wrong-canonical"),
         pytest.param("client_id", "other@test.com", id="wrong-client"),
         pytest.param("execution_mode", "live", id="wrong-mode"),
         pytest.param("local_order_id", "stale-order", id="wrong-order"),
-        pytest.param("materialization_generation", 6, id="stale-generation"),
     ],
 )
 def test_recovery_trigger_evidence_rejects_mismatched_lifecycle_identity(
@@ -777,7 +847,6 @@ def test_recovery_trigger_evidence_rejects_mismatched_lifecycle_identity(
         "client_id": row["client_id"],
         "execution_mode": row["execution_mode"],
         "local_order_id": row["local_order_id"],
-        "materialization_generation": row["meta"]["materialization_generation"],
     }
     provenance = dict(row["meta"]["trigger_crossed_at_provenance"])
 
@@ -799,32 +868,215 @@ def test_recovery_trigger_evidence_rejects_mismatched_lifecycle_identity(
          patch.object(watcher, "_get_quote", return_value={"bid": 62.45, "ask": 62.49}):
         assert watcher.watch(
             production_plan, row["local_order_id"], recovery_rearm=True
-        ) is True
-    armed = watcher._pending[0]
-    assert armed.trigger_crossed_at is None, (
-        f"recovery must clear trigger evidence for mismatched {field}"
-    )
-    assert armed.check(bid=62.60, ask=62.60) == WatchState.PENDING, (
-        f"mismatched {field} must not activate the scanner stop"
-    )
+        ) is False
+    assert watcher._last_reject_reason == RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+    assert watcher._pending == [], f"mismatched {field} must not register a watcher"
+    assert osm.meta_writes == [], f"mismatched {field} must not write order metadata"
+    assert osm.cancel_calls == [], f"mismatched {field} must not cancel the order"
+    assert osm.expire_calls == [], f"mismatched {field} must not expire the order"
+    assert osm.transition_calls == [], f"mismatched {field} must not transition the order"
 
 
 def test_recovery_trigger_evidence_rejects_incomplete_provenance():
-    row = _restart_row_with_confirmed_evidence()
-    signal = {
-        "signal_id": row["signal_id"],
-        "canonical_signal_id": row["canonical_signal_id"],
-        "client_id": row["client_id"],
-        "execution_mode": row["execution_mode"],
-        "local_order_id": row["local_order_id"],
-        "materialization_generation": row["meta"]["materialization_generation"],
-    }
-    for missing_field in ("canonical_signal_id", "materialization_generation"):
+    for missing_field in (
+        "canonical_signal_id", "client_id", "execution_mode", "local_order_id"
+    ):
+        row = _restart_row_with_confirmed_evidence()
         incomplete = dict(row["meta"]["trigger_crossed_at_provenance"])
         incomplete.pop(missing_field)
-        assert not _trigger_crossed_at_provenance_matches(
-            incomplete, signal, row["local_order_id"]
-        ), f"missing {missing_field} must fail closed"
+        row["meta"]["trigger_crossed_at_provenance"] = incomplete
+        startup_recovery = APStartupRecovery.__new__(APStartupRecovery)
+        startup_recovery.client_id = "client@test.com"
+        production_plan = startup_recovery._build_recovery_plan_from_order(row)
+        osm = _MockOSM()
+        osm._row_status[row["local_order_id"]] = "PENDING_TRIGGER"
+        osm._row_meta[row["local_order_id"]] = dict(row["meta"])
+        watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+        with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+             patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
+             patch.object(watcher, "_get_quote", return_value={"bid": 62.45, "ask": 62.49}):
+            assert watcher.watch(
+                production_plan, row["local_order_id"], recovery_rearm=True
+            ) is False
+        assert watcher._last_reject_reason == RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+        assert watcher._pending == []
+        assert osm.meta_writes == []
+        assert osm.cancel_calls == []
+
+
+def test_ordinary_queue_evidence_identity_does_not_require_generation():
+    """Ordinary queue plans have no durable materialization generation.
+
+    This is the production contract audit result: generation remains available
+    to deferred materialization CAS, but it is not fabricated or required for
+    ordinary confirmed-trigger evidence.
+    """
+    signal = _spy_call_signal(local_order_id="lo-ordinary-queue-407")
+    assert "materialization_generation" not in signal
+    provenance = {
+        "canonical_signal_id": signal["canonical_signal_id"],
+        "client_id": signal["client_id"],
+        "execution_mode": signal["execution_mode"],
+        "local_order_id": signal["local_order_id"],
+    }
+    signal["trigger_crossed_at"] = "2026-08-03T16:00:00+00:00"
+    signal["metadata"]["trigger_crossed_at_provenance"] = provenance
+    assert recovery_trigger_evidence_identity_is_proven(
+        signal, signal["local_order_id"]
+    )
+    persisted_row = {
+        "local_order_id": signal["local_order_id"],
+        "meta": {
+            "canonical_signal_id": signal["canonical_signal_id"],
+            "client_id": signal["client_id"],
+            "execution_mode": signal["execution_mode"],
+            "trigger_crossed_at": signal["trigger_crossed_at"],
+            "trigger_crossed_at_provenance": provenance,
+        },
+    }
+    assert recovery_trigger_evidence_identity_is_proven(
+        persisted_row, signal["local_order_id"]
+    )
+
+
+def test_ordinary_queue_dispatch_passes_real_plan_without_generation(monkeypatch):
+    """The real queue arm seam does not inject a fake generation.
+
+    This uses the production ``ApprovedExecutionPlan`` and production
+    ``ap.queue._dispatch`` call chain, capturing the exact plan handed to
+    ``entry_watcher.watch``.  Deferred materialization generation remains a
+    separate lifecycle field and is absent here by contract.
+    """
+    import os
+
+    os.environ.setdefault("DATABASE_URL", "postgresql://test:test@127.0.0.1:5432/test")
+    import ap.queue as queue
+    import ap.authorization as authorization
+    from ap_master_control import ApprovedExecutionPlan
+
+    plan = ApprovedExecutionPlan(
+        plan_id="plan-ordinary-407",
+        signal_id="signal-ordinary-407",
+        client_id="client@test.com",
+        ticker="SPY",
+        side="CALL",
+        direction="CALL",
+        pattern="3-2U",
+        timeframe="1h",
+        contracts=1,
+        max_position_usd=150.0,
+        tier="A",
+        score=80.0,
+        intel_score=80.0,
+        confidence_bucket="standard_pool",
+        trigger_type="breach",
+        trigger_price=450.0,
+        stop_underlying=447.0,
+        target_underlying=455.0,
+        contract_symbol="SPY240101C00450000",
+        limit_price=1.50,
+        mode="PAPER",
+        metadata={
+            "canonical_signal_id": "canonical-ordinary-407",
+            "client_id": "client@test.com",
+            "execution_mode": "paper",
+        },
+    )
+
+    class _QueueMC:
+        mode = "PAPER"
+        _equity_cache_ts = 10**12
+
+        def evaluate(self, _payload, client_id=None):
+            return SimpleNamespace(ok=True, stage="approved", reason="", plan=plan)
+
+        def revalidate_exposure(self, _plan, client_id=None):
+            return SimpleNamespace(ok=True, reason="")
+
+    selector = MagicMock()
+    selector.select.return_value = SimpleNamespace(
+        contract_symbol=plan.contract_symbol,
+        mid=plan.limit_price,
+        candidate_audit=None,
+    )
+    osm = MagicMock()
+    osm.create_entry_order.return_value = "lo-ordinary-queue-407"
+    osm.mark_entry_pending_trigger.return_value = True
+    watcher = MagicMock()
+    watcher.watch.return_value = True
+
+    monkeypatch.setattr(queue, "_mark_job", MagicMock())
+    monkeypatch.setattr(queue, "_log_signal_to_db", MagicMock(return_value=True))
+    monkeypatch.setattr(queue, "trace_gate", MagicMock())
+    monkeypatch.setattr(
+        authorization, "execution_mode_for_broker", lambda _broker: "paper"
+    )
+    monkeypatch.setattr(
+        queue,
+        "_now_et",
+        lambda: datetime(2026, 8, 3, 10, 0, tzinfo=timezone.utc),
+    )
+    monkeypatch.setattr(queue, "_is_regular_session_et", lambda _now: True)
+
+    queue._dispatch(
+        40701,
+        "client@test.com",
+        "signal-ordinary-407",
+        {
+            "signal_id": "signal-ordinary-407",
+            "ticker": "SPY",
+            "side": "CALL",
+            "score": 80.0,
+            "timeframe": "1h",
+            "execution_mode": "paper",
+        },
+        master_control=_QueueMC(),
+        contract_selector=selector,
+        order_state_machine=osm,
+        entry_watcher=watcher,
+        broker=MagicMock(),
+    )
+
+    osm.create_entry_order.assert_called_once()
+    watcher.watch.assert_called_once()
+    passed_plan = watcher.watch.call_args.kwargs["plan"]
+    assert passed_plan is plan
+    assert not hasattr(passed_plan, "materialization_generation")
+    assert "materialization_generation" not in passed_plan.metadata
+
+
+def test_restart_recovery_identity_refusal_has_no_side_effects():
+    """Production restart recovery refuses stale evidence before any action."""
+    row = json.loads(json.dumps(_restart_row_with_confirmed_evidence()))
+    row["meta"]["trigger_crossed_at_provenance"]["canonical_signal_id"] = (
+        "stale-canonical"
+    )
+    osm = _MockOSM()
+    osm._row_status[row["local_order_id"]] = "PENDING_TRIGGER"
+    osm._row_meta[row["local_order_id"]] = dict(row["meta"])
+    watcher = MagicMock()
+    quote_check = MagicMock(return_value=False)
+    recovery = PendingTriggerRestartRecovery(
+        client_id="client@test.com",
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=MagicMock(),
+        quote_check_fn=quote_check,
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == "UNRESOLVED"
+    assert recovery._row_failure_reasons[row["local_order_id"]] == (
+        RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+    )
+    quote_check.assert_not_called()
+    watcher.watch.assert_not_called()
+    assert osm.meta_writes == []
+    assert osm.cancel_calls == []
+    assert osm.expire_calls == []
+    assert osm.transition_calls == []
 
 # ===========================================================================
 # Class 1b -- Lifecycle identity binding through existing recovery path

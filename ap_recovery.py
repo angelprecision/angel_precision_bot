@@ -36,6 +36,10 @@ import types
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
 from ap.pending_trigger_restart_recovery import _RecoveryPlan
 
 log = logging.getLogger("ap.recovery")
@@ -1875,6 +1879,26 @@ class APStartupRecovery:
             meta = self._coerce_order_meta(order.get("meta"))
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
+
+            # Do this before stale/terminal classification, quote work, or any
+            # recovery ownership mutation.  A confirmed timestamp with missing
+            # or mismatched lifecycle provenance is not permission to erase the
+            # evidence and continue as pre-breach.
+            _evidence_row = dict(order)
+            _evidence_row["meta"] = meta
+            if not recovery_trigger_evidence_identity_is_proven(
+                _evidence_row, local_order_id
+            ):
+                log.critical(
+                    "[%s] %s local_order_id=%s — preserving order unchanged",
+                    self.client_id,
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                    local_order_id,
+                )
+                result.setdefault("errors", []).append(
+                    f"{RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN}:{local_order_id}"
+                )
+                continue
 
             created_raw = order.get("created_ts")
             try:

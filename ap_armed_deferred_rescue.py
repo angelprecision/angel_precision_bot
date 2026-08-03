@@ -26,6 +26,11 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
+
 log = logging.getLogger("ap.armed_deferred_rescue")
 
 _MIN_SCORE_FOR_REPAIR = float(os.getenv("ARMED_DEFERRED_RESCUE_MIN_SCORE", "60"))
@@ -352,6 +357,22 @@ def _repair_row(
     if plan is None:
         result["action"] = "skipped"
         result["skip_reason"] = "plan_reconstruction_failed"
+        return result
+
+    # This repair path creates the missing order before arming it.  Refuse an
+    # already-confirmed row before that create when its durable evidence cannot
+    # be bound to this lifecycle; otherwise rescue could manufacture a second
+    # ENTRY while silently discarding the stale trigger proof.
+    if not recovery_trigger_evidence_identity_is_proven(plan):
+        result["action"] = "skipped"
+        result["skip_reason"] = RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+        log.critical(
+            "armed_deferred_rescue: %s signal_id=%s queue_id=%s — "
+            "no order, watcher, or queue mutation",
+            RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+            signal_id,
+            queue_id,
+        )
         return result
 
     if dry_run:

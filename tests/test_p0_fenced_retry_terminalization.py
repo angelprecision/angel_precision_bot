@@ -37,6 +37,41 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def _bind_trigger_evidence(row: dict) -> dict:
+    """Bind confirmed-trigger fixtures to the lifecycle identity contract."""
+    meta = row.setdefault("meta", {})
+    canonical_signal_id = str(
+        row.get("canonical_signal_id")
+        or meta.get("canonical_signal_id")
+        or row.get("signal_id")
+        or ""
+    ).strip()
+    client_id = str(
+        row.get("client_id")
+        or meta.get("client_id")
+        or ""
+    ).strip()
+    execution_mode = str(
+        row.get("execution_mode")
+        or meta.get("execution_mode")
+        or ""
+    ).strip().lower()
+    meta.update(
+        {
+            "canonical_signal_id": canonical_signal_id,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": canonical_signal_id,
+                "client_id": client_id,
+                "execution_mode": execution_mode,
+                "local_order_id": str(row.get("local_order_id") or "").strip(),
+            },
+        }
+    )
+    return row
+
+
 # ── OSM CAS harness ───────────────────────────────────────────────────────────
 
 class _FakeConn:
@@ -736,7 +771,7 @@ def test_fa1_fenced_terminal_unavailable_no_broad_fallback():
             broad_calls[0] += 1
             return True
         def get_order(self, oid):
-            return {
+            return _bind_trigger_evidence({
                 "local_order_id": LOCAL_ORDER_ID, "client_id": CLIENT_ID,
                 "execution_mode": "paper", "signal_id": SIGNAL_ID,
                 "status": "PENDING_TRIGGER", "broker_order_id": None,
@@ -751,7 +786,7 @@ def test_fa1_fenced_terminal_unavailable_no_broad_fallback():
                     "trigger_crossed_at": _iso(_now() - timedelta(minutes=2)),
                     "trigger_price": 130.0,
                 },
-            }
+            })
         def update_order_meta(self, *a, **kw): return True
         def get_orders_for_position(self, *a, **kw): return []
 
@@ -843,6 +878,7 @@ def test_fa2_due_retry_missing_direction_reaches_resume():
             "trigger_price": 130.0,
         },
     }
+    _bind_trigger_evidence(row_no_dir)
 
     resume_calls = [0]
 
@@ -936,6 +972,7 @@ def test_fa3_future_retry_invalid_plan_retains_ownership():
             # No side/direction in meta either
         },
     }
+    _bind_trigger_evidence(row_future)
 
     retain_patches = []
 
@@ -1023,7 +1060,7 @@ def test_fix1_incomplete_outcome_returns_invalid_fenced_outcome():
             cas_calls[0] += 1
             return True
         def get_order(self, oid):
-            return {
+            return _bind_trigger_evidence({
                 "local_order_id": LOCAL_ORDER_ID, "client_id": CLIENT_ID,
                 "execution_mode": "paper", "signal_id": SIGNAL_ID,
                 "status": "PENDING_TRIGGER", "broker_order_id": None, "submitted_ts": None,
@@ -1038,7 +1075,7 @@ def test_fix1_incomplete_outcome_returns_invalid_fenced_outcome():
                     "trigger_crossed_at": _iso(_now() - timedelta(minutes=2)),
                     "trigger_price": 130.0,
                 },
-            }
+            })
         def update_order_meta(self, *a, **kw): return True
         def get_orders_for_position(self, *a, **kw): return []
 

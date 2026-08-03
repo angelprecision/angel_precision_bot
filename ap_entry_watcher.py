@@ -74,6 +74,13 @@ log = logging.getLogger("ap.entry_watcher")
 # Module-level ET zoneinfo: declared BEFORE any helper that uses it.
 ET = ZoneInfo("America/New_York")
 
+# Stable recovery refusal reason.  Recovery callers use this exact marker to
+# leave the durable order untouched when confirmed-trigger provenance cannot be
+# bound to the lifecycle being restored.
+RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN = (
+    "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN"
+)
+
 
 def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
     """Parse durable first-breach evidence without treating bad data as proof.
@@ -119,29 +126,38 @@ def _build_trigger_crossed_at_provenance(
     signal: dict,
     local_order_id: Optional[str],
 ) -> dict:
-    """Build identity metadata for a newly confirmed trigger timestamp."""
+    """Build the durable identity for a newly confirmed trigger timestamp.
+
+    ``materialization_generation`` is deliberately not part of this contract.
+    The ordinary queue path owns no durable generation; deferred materialization
+    owns one for its retry CAS separately.  Mixing the two contracts would make
+    ordinary queue-created watchers either fabricate a generation or fail
+    recovery for a lifecycle that never had one.
+    """
     metadata = signal.get("metadata") or {}
     if not isinstance(metadata, dict):
         metadata = {}
-    generation = signal.get("materialization_generation")
-    if generation is None:
-        generation = metadata.get("materialization_generation")
     return {
         "canonical_signal_id": str(
             signal.get("canonical_signal_id")
             or metadata.get("canonical_signal_id")
+            or signal.get("signal_id")
+            or metadata.get("signal_id")
             or ""
         ).strip(),
         "client_id": str(
             signal.get("client_id")
             or signal.get("client_email")
+            or metadata.get("client_id")
+            or metadata.get("client_email")
             or ""
         ).strip().lower(),
-        "execution_mode": str(signal.get("execution_mode") or "").strip().lower(),
+        "execution_mode": str(
+            signal.get("execution_mode") or metadata.get("execution_mode") or ""
+        ).strip().lower(),
         "local_order_id": str(
             local_order_id or signal.get("local_order_id") or ""
         ).strip(),
-        "materialization_generation": _coerce_materialization_generation(generation),
     }
 
 
@@ -159,16 +175,12 @@ def _trigger_crossed_at_provenance_matches(
         "client_id": str(provenance.get("client_id") or "").strip().lower(),
         "execution_mode": str(provenance.get("execution_mode") or "").strip().lower(),
         "local_order_id": str(provenance.get("local_order_id") or "").strip(),
-        "materialization_generation": _coerce_materialization_generation(
-            provenance.get("materialization_generation")
-        ),
     }
     if (
         not expected["canonical_signal_id"]
         or not expected["client_id"]
         or not expected["execution_mode"]
         or not expected["local_order_id"]
-        or expected["materialization_generation"] is None
     ):
         return False
     if (
@@ -176,10 +188,94 @@ def _trigger_crossed_at_provenance_matches(
         or not actual["client_id"]
         or not actual["execution_mode"]
         or not actual["local_order_id"]
-        or actual["materialization_generation"] is None
     ):
         return False
     return actual == expected
+
+
+def recovery_trigger_evidence_identity_is_proven(
+    signal_or_row,
+    local_order_id: Optional[str] = None,
+) -> bool:
+    """Return whether durable confirmed-trigger evidence is safe to reuse.
+
+    A lifecycle with no durable ``trigger_crossed_at`` has no confirmed
+    evidence to validate and remains eligible for an ordinary pre-breach
+    rearm.  Once a timestamp is present, the timestamp itself must be valid
+    and its four-field identity must match exactly.  This helper is shared by
+    recovery callers so they can refuse before quote, selector, watcher, or
+    order-side effects occur.
+    """
+    if isinstance(signal_or_row, dict):
+        signal = dict(signal_or_row)
+        metadata = signal.get("metadata") or signal.get("meta") or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        signal["metadata"] = metadata
+        # Persisted orders commonly keep canonical identity in JSONB metadata
+        # while client/mode remain columns. Hydrate the same production
+        # identity shape used by plan objects before comparing provenance.
+        signal["canonical_signal_id"] = (
+            signal.get("canonical_signal_id")
+            or metadata.get("canonical_signal_id")
+        )
+        signal["client_id"] = (
+            signal.get("client_id")
+            or metadata.get("client_id")
+            or metadata.get("client_email")
+        )
+        signal["execution_mode"] = (
+            signal.get("execution_mode")
+            or metadata.get("execution_mode")
+        )
+        raw_crossed_at = signal.get("trigger_crossed_at")
+        if raw_crossed_at is None:
+            raw_crossed_at = metadata.get("trigger_crossed_at")
+        provenance = metadata.get("trigger_crossed_at_provenance")
+        resolved_local_order_id = (
+            local_order_id
+            or signal.get("local_order_id")
+        )
+    else:
+        metadata = getattr(signal_or_row, "metadata", None) or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        signal = {
+            "signal_id": getattr(signal_or_row, "signal_id", ""),
+            "canonical_signal_id": (
+                getattr(signal_or_row, "canonical_signal_id", "")
+                or metadata.get("canonical_signal_id")
+            ),
+            "client_id": (
+                getattr(signal_or_row, "client_id", "")
+                or metadata.get("client_id")
+                or metadata.get("client_email")
+            ),
+            "execution_mode": (
+                getattr(signal_or_row, "execution_mode", "")
+                or metadata.get("execution_mode")
+            ),
+            "local_order_id": getattr(signal_or_row, "local_order_id", ""),
+            "metadata": metadata,
+        }
+        raw_crossed_at = getattr(signal_or_row, "trigger_crossed_at", None)
+        if raw_crossed_at is None:
+            raw_crossed_at = metadata.get("trigger_crossed_at")
+        provenance = metadata.get("trigger_crossed_at_provenance")
+        resolved_local_order_id = local_order_id or signal.get("local_order_id")
+
+    if raw_crossed_at is None:
+        return True
+    if _parse_trigger_crossed_at(raw_crossed_at) is None:
+        return False
+    return _trigger_crossed_at_provenance_matches(
+        provenance, signal, resolved_local_order_id
+    )
 
 # FUNNEL FIX (2026-05-20, hardened 2026-05-21) + PR-C / BUG-EW-1:
 # Pre-open helper for the stop-touch invalidation guard. Returns True from
@@ -1249,6 +1345,7 @@ class APEntryWatcher:
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
         self._dedup_set: set[str] = set()
+        self._last_reject_reason: Optional[str] = None
 
     @staticmethod
     def _is_deferred_signal(signal: dict) -> bool:
@@ -3290,24 +3387,20 @@ class APEntryWatcher:
         }
 
         if _recovery_rearm or _materialization_resume:
-            _raw_trigger_crossed_at = signal_dict.get("trigger_crossed_at")
-            _provenance = _plan_metadata.get("trigger_crossed_at_provenance")
-            if not _trigger_crossed_at_provenance_matches(
-                _provenance, signal_dict, local_order_id
+            if not recovery_trigger_evidence_identity_is_proven(
+                signal_dict, local_order_id
             ):
-                if _raw_trigger_crossed_at is not None:
-                    log.warning(
-                        "[%s] recovery trigger evidence rejected — incomplete_or_mismatched_provenance "
-                        "local_order_id=%s",
-                        signal_dict.get("ticker") or "?",
-                        local_order_id or "?",
-                    )
-                signal_dict["trigger_crossed_at"] = None
-                # WatchedSignal.__init__ also checks signal.metadata for the
-                # durable timestamp.  Clear that copied recovery payload too;
-                # otherwise a rejected top-level value would be rehydrated
-                # from the same stale metadata a few lines later.
-                signal_dict["metadata"]["trigger_crossed_at"] = None
+                self._last_reject_reason = (
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+                )
+                log.critical(
+                    "[%s] %s local_order_id=%s — refusing recovery rearm; "
+                    "durable order and trigger evidence remain unchanged",
+                    signal_dict.get("ticker") or "?",
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                    local_order_id or "?",
+                )
+                return False
 
         now_et = datetime.now(ET)
         post_session = (
@@ -5189,8 +5282,8 @@ class APEntryWatcher:
                             log.critical(
                                 "[%s] WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED — "
                                 "LIVE mode, trigger timestamps could not be written "
-                                "to orders.meta before on_trigger. Submit gate will "
-                                "rely on in-memory WatchedSignal fallback. "
+                                "to orders.meta before on_trigger; callback is "
+                                "skipped and persistence will be retried. "
                                 "local_order_id=%s error=%s",
                                 w.ticker, _ts_pre_local_oid or "?", _pre_ts_exc,
                             )
@@ -5202,7 +5295,6 @@ class APEntryWatcher:
 
                     if (
                         self._is_live_runtime()
-                        and self._is_deferred_signal(getattr(w, "signal", {}) or {})
                         and not _ts_pre_write_ok
                     ):
                         # Database truth is unavailable.  Keep the watcher as the

@@ -29,6 +29,10 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from ap.logger import get_logger
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
@@ -236,6 +240,24 @@ class PendingTriggerRestartRecovery:
             self._mark_failure(local_oid, "identity:execution_mode_mismatch")
             self._log_identity_failure(
                 "RESTART_RECOVERY_EXECUTION_MODE_MISMATCH",
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # Confirmed-trigger evidence is a durable lifecycle fact, not a quote
+        # hint.  Refuse this exact row before quote checks, selector work,
+        # watcher admission, or any terminal/cleanup action when the evidence
+        # cannot be bound to the persisted identity.  A row with no timestamp
+        # remains an ordinary pre-breach rearm candidate.
+        if not recovery_trigger_evidence_identity_is_proven(row, local_oid):
+            self._mark_failure(
+                local_oid, RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+            )
+            self._log_identity_failure(
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
                 local_oid=local_oid,
                 signal_id=signal_id,
                 durable_client=row_client,
@@ -538,6 +560,18 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.UNRESOLVED
 
         if not armed:
+            if getattr(watcher, "_last_reject_reason", None) == (
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+            ):
+                self._mark_failure(
+                    local_oid, RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+                )
+                log.critical(
+                    "RESTART_RECOVERY_%s local=%s — row left unchanged",
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                    local_oid,
+                )
+                return _RowOutcome.UNRESOLVED
             log.warning(
                 "RESTART_RECOVERY_WATCH_RETURNED_FALSE local=%s — terminalizing",
                 local_oid,

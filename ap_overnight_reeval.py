@@ -40,6 +40,10 @@ from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ap_signal_store import canonical_client_email, canonical_signal_id, upsert_ap_signal_row_with_fallback
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
 
 log = logging.getLogger("ap.overnight_reeval")
 
@@ -2258,9 +2262,34 @@ def run_overnight_reeval(
                         canonical_signal_id = _reattach_canonical,
                         client_id         = _reattach_client,
                         execution_mode    = _reattach_mode,
+                        local_order_id    = _existing_oid,
+                        materialization_generation = _reattach_metadata.get(
+                            "materialization_generation"
+                        ),
+                        trigger_crossed_at = _reattach_metadata.get(
+                            "trigger_crossed_at"
+                        ),
                         late_attachment_policy_eligible = True,
                         metadata          = _reattach_metadata,
                     )
+
+                    # Refuse stale/incomplete confirmed-trigger evidence before
+                    # the REATTACH ownership fence.  The existing ENTRY row and
+                    # queue/opportunity state must remain byte-for-byte
+                    # untouched until lifecycle identity is proven.
+                    if not recovery_trigger_evidence_identity_is_proven(
+                        _reattach_plan, _existing_oid
+                    ):
+                        log.critical(
+                            "[%s] %s signal=%s local_order_id=%s — "
+                            "refusing reattach; existing order unchanged",
+                            ticker,
+                            RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                            signal_id,
+                            _existing_oid,
+                        )
+                        result["unresolved"] += 1
+                        continue
 
                     # P0-3 precheck: if the existing watcher already owns
                     # this exact local_order_id, do NOT call watch() again.
