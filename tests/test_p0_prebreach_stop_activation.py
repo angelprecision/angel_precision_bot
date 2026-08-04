@@ -904,6 +904,79 @@ def test_recovery_trigger_evidence_rejects_incomplete_provenance():
         assert osm.cancel_calls == []
 
 
+def test_legacy_confirmed_row_is_blocked_until_rollout_backfill():
+    """Pre-#407 rows stay fail-closed until the data migration binds them."""
+    row = json.loads(json.dumps(_restart_row_with_confirmed_evidence()))
+    row["meta"].pop("trigger_crossed_at_provenance")
+
+    assert not recovery_trigger_evidence_identity_is_proven(
+        row, row["local_order_id"]
+    )
+
+    osm = _MockOSM()
+    watcher = MagicMock()
+    quote_check = MagicMock(return_value=False)
+    recovery = PendingTriggerRestartRecovery(
+        client_id="client@test.com",
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=MagicMock(),
+        quote_check_fn=quote_check,
+    )
+
+    outcome = recovery.recover_one_row(row)
+    assert outcome == "UNRESOLVED"
+    assert recovery._row_failure_reasons[row["local_order_id"]] == (
+        RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+    )
+    quote_check.assert_not_called()
+    watcher.watch.assert_not_called()
+    assert osm.meta_writes == []
+    assert osm.cancel_calls == []
+    assert osm.expire_calls == []
+    assert osm.transition_calls == []
+
+    # This is the exact four-field value produced by the rollout migration
+    # when the durable row identity is complete and internally consistent.
+    row["meta"]["trigger_crossed_at_provenance"] = {
+        "canonical_signal_id": row["canonical_signal_id"],
+        "client_id": row["client_id"],
+        "execution_mode": row["execution_mode"],
+        "local_order_id": row["local_order_id"],
+    }
+    assert recovery_trigger_evidence_identity_is_proven(
+        row, row["local_order_id"]
+    )
+
+
+def test_trigger_provenance_rollout_migration_is_bounded_and_generation_free():
+    """The migration is the explicit pre-deploy repair, not a new runtime path."""
+    from pathlib import Path
+
+    migration = Path(__file__).resolve().parents[1] / (
+        "migrations/20260804_trigger_crossed_at_provenance_backfill.sql"
+    )
+    sql = migration.read_text(encoding="utf-8")
+    normalized = " ".join(sql.lower().split())
+
+    assert "update orders as o" in normalized
+    assert "o.meta ? 'trigger_crossed_at'" in normalized
+    assert "not (o.meta ? 'trigger_crossed_at_provenance')" in normalized
+    for field in (
+        "canonical_signal_id",
+        "client_id",
+        "execution_mode",
+        "local_order_id",
+    ):
+        assert field in normalized
+    assert "does not add a column" in normalized
+    assert "delete from orders" not in normalized
+    update_body = normalized.split("update orders as o", 1)[1].split(";", 1)[0]
+    assert "broker" not in update_body
+    assert "materialization_generation" not in update_body
+
+
 def test_ordinary_queue_evidence_identity_does_not_require_generation():
     """Ordinary queue plans have no durable materialization generation.
 
