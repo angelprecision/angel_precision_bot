@@ -235,7 +235,10 @@ def _build_audit_plan(order: dict):
         ).strip().lower(),
         local_order_id=str(order.get("local_order_id") or ""),
         materialization_generation=meta.get("materialization_generation"),
-        trigger_crossed_at=meta.get("trigger_crossed_at"),
+        trigger_crossed_at=(
+            order.get("trigger_crossed_at")
+            or meta.get("trigger_crossed_at")
+        ),
         plan_id=str(order.get("plan_id") or meta.get("plan_id") or ""),
         ticker=ticker,
         side=direction,

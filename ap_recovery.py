@@ -1441,7 +1441,10 @@ class APStartupRecovery:
             ).strip().lower(),
             local_order_id=local_order_id,
             materialization_generation=materialization_generation,
-            trigger_crossed_at=meta.get("trigger_crossed_at"),
+            trigger_crossed_at=(
+                order.get("trigger_crossed_at")
+                or meta.get("trigger_crossed_at")
+            ),
             contracts=int(order.get("qty") or meta.get("selected_qty") or 0),
             quantity=int(order.get("qty") or meta.get("selected_qty") or 0),
             limit_price=float(

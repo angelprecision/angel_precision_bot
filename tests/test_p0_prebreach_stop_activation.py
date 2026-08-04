@@ -1045,6 +1045,132 @@ def test_ordinary_queue_dispatch_passes_real_plan_without_generation(monkeypatch
     assert "materialization_generation" not in passed_plan.metadata
 
 
+def test_queue_and_rescue_plans_share_canonical_id_authority_without_generation():
+    """Real queue/rescue plan shapes normalize REEVAL IDs at watcher ingress."""
+    from ap_canonical_signal import build_canonical_signal_id
+    from ap_armed_deferred_rescue import _plan_from_payload
+    from ap_master_control import ApprovedExecutionPlan
+
+    raw_queue_id = "REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9:f4dc44"
+    raw_rescue_id = "REEVAL:8d9338d0-5dde-4b7b-81ea-208039999b72:a1b2c3"
+    expected_queue_id = build_canonical_signal_id(raw_queue_id)
+    expected_rescue_id = build_canonical_signal_id(raw_rescue_id)
+
+    queue_plan = ApprovedExecutionPlan(
+        plan_id="plan-ordinary-canonical-407",
+        signal_id=raw_queue_id,
+        client_id="client@test.com",
+        ticker="SPY",
+        side="CALL",
+        direction="CALL",
+        pattern="3-2U",
+        timeframe="1h",
+        contracts=1,
+        max_position_usd=150.0,
+        tier="A",
+        score=80.0,
+        intel_score=80.0,
+        confidence_bucket="standard_pool",
+        trigger_type="breach",
+        trigger_price=450.0,
+        stop_underlying=447.0,
+        target_underlying=455.0,
+        contract_symbol="SPY240101C00450000",
+        limit_price=1.50,
+        mode="PAPER",
+        metadata={
+            "client_id": "client@test.com",
+            "execution_mode": "paper",
+        },
+    )
+    rescue_plan = _plan_from_payload(
+        {
+            "signal_id": raw_rescue_id,
+            "ticker": "QQQ",
+            "side": "PUT",
+            "trigger": {"entry": 450.0, "stop": 453.0, "pt1": 440.0},
+            "metadata": {
+                "client_id": "client@test.com",
+                "execution_mode": "paper",
+            },
+        },
+        signal_id=raw_rescue_id,
+        client_id="client@test.com",
+        execution_mode="paper",
+        queue_id=40702,
+    )
+    assert rescue_plan is not None
+    assert not hasattr(queue_plan, "materialization_generation")
+    assert not hasattr(rescue_plan, "materialization_generation")
+
+    osm = _MockOSM()
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+         patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
+         patch.object(watcher, "_get_quote", return_value={"bid": 450.0, "ask": 450.0}):
+        assert watcher.watch(queue_plan, "lo-queue-canonical-407") is True
+        assert watcher.watch(rescue_plan, "lo-rescue-canonical-407") is True
+
+    assert watcher._pending[-2].signal["canonical_signal_id"] == expected_queue_id
+    assert watcher._pending[-1].signal["canonical_signal_id"] == expected_rescue_id
+
+
+def test_startup_and_morning_builders_preserve_top_level_trigger_timestamp():
+    """Both production restart builders retain legacy top-level evidence."""
+    from ap_morning_handoff_audit import _build_audit_plan
+
+    row = _restart_row_with_confirmed_evidence()
+    crossed_at = row["meta"].pop("trigger_crossed_at")
+    row["trigger_crossed_at"] = crossed_at
+
+    startup_recovery = APStartupRecovery.__new__(APStartupRecovery)
+    startup_recovery.client_id = "client@test.com"
+    startup_plan = startup_recovery._build_recovery_plan_from_order(row)
+    audit_plan = _build_audit_plan(row)
+
+    assert startup_plan.trigger_crossed_at == crossed_at
+    assert audit_plan.trigger_crossed_at == crossed_at
+
+
+@pytest.mark.parametrize("bad_metadata", [
+    "not-json",
+    "[1, 2]",
+    ["malformed"],
+    7,
+])
+def test_restart_recovery_rejects_malformed_metadata_without_side_effects(
+    bad_metadata,
+):
+    """Malformed metadata cannot be reinterpreted as a pre-breach row."""
+    row = _restart_row_with_confirmed_evidence()
+    row["meta"] = bad_metadata
+    osm = _MockOSM()
+    watcher = MagicMock()
+    quote_check = MagicMock(return_value=False)
+    recovery = PendingTriggerRestartRecovery(
+        client_id="client@test.com",
+        execution_mode="paper",
+        osm=osm,
+        entry_watcher=watcher,
+        broker=MagicMock(),
+        quote_check_fn=quote_check,
+    )
+
+    outcome = recovery.recover_one_row(row)
+
+    assert outcome == "UNRESOLVED"
+    assert recovery._row_failure_reasons[row["local_order_id"]] == (
+        RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+    )
+    quote_check.assert_not_called()
+    watcher.watch.assert_not_called()
+    assert osm.meta_writes == []
+    assert osm.cancel_calls == []
+    assert osm.expire_calls == []
+    assert osm.transition_calls == []
+
+
 def test_restart_recovery_identity_refusal_has_no_side_effects():
     """Production restart recovery refuses stale evidence before any action."""
     row = json.loads(json.dumps(_restart_row_with_confirmed_evidence()))

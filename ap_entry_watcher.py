@@ -35,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from ap_canonical_signal import build_canonical_signal_id
+
 # ── Lifecycle + health wiring (defensive — watcher runs standalone if missing) ──
 try:
     from ap_lifecycle import (
@@ -137,14 +139,21 @@ def _build_trigger_crossed_at_provenance(
     metadata = signal.get("metadata") or {}
     if not isinstance(metadata, dict):
         metadata = {}
+    raw_signal_id = str(
+        signal.get("signal_id") or metadata.get("signal_id") or ""
+    ).strip()
+    canonical_signal_id = str(
+        signal.get("canonical_signal_id")
+        or metadata.get("canonical_signal_id")
+        or ""
+    ).strip()
+    if not canonical_signal_id:
+        # Ordinary queue and deferred-rescue plans do not carry a separate
+        # canonical field.  Use the same authority as OSM instead of storing
+        # a REEVAL:<uuid>:<suffix> as durable lifecycle evidence.
+        canonical_signal_id = build_canonical_signal_id(raw_signal_id)
     return {
-        "canonical_signal_id": str(
-            signal.get("canonical_signal_id")
-            or metadata.get("canonical_signal_id")
-            or signal.get("signal_id")
-            or metadata.get("signal_id")
-            or ""
-        ).strip(),
+        "canonical_signal_id": canonical_signal_id,
         "client_id": str(
             signal.get("client_id")
             or signal.get("client_email")
@@ -206,16 +215,42 @@ def recovery_trigger_evidence_identity_is_proven(
     recovery callers so they can refuse before quote, selector, watcher, or
     order-side effects occur.
     """
+    def _coerce_metadata(raw_metadata):
+        if raw_metadata is None:
+            return {}, True
+        if isinstance(raw_metadata, dict):
+            return dict(raw_metadata), True
+        if isinstance(raw_metadata, str):
+            if not raw_metadata.strip():
+                return {}, True
+            try:
+                parsed = json.loads(raw_metadata)
+            except Exception:
+                return {}, False
+            return (dict(parsed), True) if isinstance(parsed, dict) else ({}, False)
+        return {}, False
+
+    def _metadata_source(primary, fallback):
+        if primary is None:
+            return fallback
+        if isinstance(primary, str) and not primary.strip():
+            return fallback
+        if isinstance(primary, (dict, list, tuple, set)) and not primary:
+            return fallback
+        return primary
+
     if isinstance(signal_or_row, dict):
         signal = dict(signal_or_row)
-        metadata = signal.get("metadata") or signal.get("meta") or {}
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except Exception:
-                metadata = {}
-        if not isinstance(metadata, dict):
-            metadata = {}
+        raw_metadata = _metadata_source(
+            signal.get("metadata"), signal.get("meta")
+        )
+        metadata, metadata_is_valid = _coerce_metadata(raw_metadata)
+        if not metadata_is_valid:
+            log.critical(
+                "%s | malformed recovery metadata; refusing rearm",
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+            )
+            return False
         signal["metadata"] = metadata
         # Persisted orders commonly keep canonical identity in JSONB metadata
         # while client/mode remain columns. Hydrate the same production
@@ -242,9 +277,17 @@ def recovery_trigger_evidence_identity_is_proven(
             or signal.get("local_order_id")
         )
     else:
-        metadata = getattr(signal_or_row, "metadata", None) or {}
-        if not isinstance(metadata, dict):
-            metadata = {}
+        raw_metadata = _metadata_source(
+            getattr(signal_or_row, "metadata", None),
+            getattr(signal_or_row, "meta", None),
+        )
+        metadata, metadata_is_valid = _coerce_metadata(raw_metadata)
+        if not metadata_is_valid:
+            log.critical(
+                "%s | malformed recovery metadata; refusing rearm",
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+            )
+            return False
         signal = {
             "signal_id": getattr(signal_or_row, "signal_id", ""),
             "canonical_signal_id": (
@@ -3303,6 +3346,10 @@ class APEntryWatcher:
             or _plan_metadata.get("canonical_signal_id")
             or ""
         ).strip()
+        if not _plan_canonical_signal_id:
+            _plan_canonical_signal_id = build_canonical_signal_id(
+                _plan_signal_id, _plan_metadata
+            )
         _plan_materialization_generation = getattr(
             plan, "materialization_generation", None
         )
