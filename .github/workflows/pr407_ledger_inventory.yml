@@ -1,0 +1,33 @@
+name: PR407 Ledger Inventory
+
+on:
+  push:
+    branches:
+      - ops/pr407-ledger-inventory-20260804
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Emit exact base migration inventory
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          rows = []
+          for path in sorted(Path('migrations').glob('*.sql'), key=lambda p: p.name):
+              text = path.read_text(encoding='utf-8')
+              rows.append({
+                  'filename': path.name,
+                  'checksum': hashlib.sha256(text.encode('utf-8')).hexdigest(),
+              })
+          print('PR407_LEDGER_INVENTORY=' + json.dumps(rows, separators=(',', ':')))
+          print('PR407_LEDGER_COUNT=' + str(len(rows)))
+          PY
