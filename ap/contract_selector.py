@@ -72,6 +72,7 @@ from ap.contract_playbook import (
 from ap.contract_quote_revalidator import (
     revalidate_with_direct_quote  as _revalidate_direct,
     should_revalidate             as _should_revalidate,
+    correct_recovered_cursor_disposition as _correct_recovered_cursor_disposition,
     DEFAULT_REVALIDATE_TOP_N,
 )
 
@@ -3270,6 +3271,28 @@ class APContractSelectionEngine:
                         # spread too wide at direct prices) — reject with the
                         # real reason from the re-run, not the chain reason.
                         result = _result2
+                        # Audit blocker 4 fix: _revalidate_direct already
+                        # durably persisted DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/
+                        # transient=False to the selector recovery cursor at
+                        # the transport-recovery stage, before this quality
+                        # re-check ran. Now that the re-check has actually
+                        # rejected the candidate, correct that record so the
+                        # cursor never remains classified as a successful
+                        # recovered candidate for a symbol that failed
+                        # quality -- persist the real final reason instead.
+                        # Any persistence failure here propagates naturally
+                        # (SelectorRecoveryCursorPersistFailed /
+                        # SelectorRecoveryOwnershipLost) to the same
+                        # existing catch sites that already handle every
+                        # other cursor write in this selector call.
+                        _correct_recovered_cursor_disposition(
+                            request_context,
+                            str(opt.get("symbol") or ""),
+                            final_reason=str(_result2),
+                            provider_timestamp=(
+                                _rv.get("audit", {}).get("provider_timestamp")
+                            ),
+                        )
                         # P0 PR #302 Fix 2: stamp quality re-failure audit so
                         # operators can distinguish "zero bid/ask" from "real
                         # bid/ask but spread/OI/volume gate re-fired".
@@ -3743,6 +3766,23 @@ class APContractSelectionEngine:
             context: Optional[dict] = None,
             tradeability_diag: Optional[dict] = None,
         ) -> None:
+            # Audit blocker 4 fix (continued): any candidate reaching this
+            # rejection choke point that was earlier patched via direct-
+            # quote transport recovery (opt["_direct_quote_used"] is True,
+            # set at the patch site in contract_quote_revalidator.py) may
+            # already have a premature DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/
+            # transient=False record in the durable cursor from that
+            # transport-recovery stage -- correct it here with the real
+            # final rejection reason, covering every later-stage check
+            # (affordability, delta, moneyness, premium) in one place
+            # rather than duplicating the correction at each call site.
+            if opt.get("_direct_quote_used"):
+                _correct_recovered_cursor_disposition(
+                    request_context,
+                    str(opt.get("symbol") or ""),
+                    final_reason=str(reason_code or "UNKNOWN_FAIL_CLOSED"),
+                    provider_timestamp=opt.get("_direct_quote_fetched_at"),
+                )
             candidate_row = _build_candidate_row(
                 opt,
                 rank_score=score,

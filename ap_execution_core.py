@@ -509,6 +509,32 @@ def _positive_int_env_config(name: str, default: int) -> int:
     return value
 
 
+def _resolve_deferred_materialization_ceiling() -> int:
+    """Canonical retry-ceiling resolver, shared identically with
+    ap/pending_trigger_restart_recovery.py's restart-recovery exhaustion
+    check and ap/deferred_materializer.py's bucket config -- replaces this
+    module's own independent MAX_BREACH_SELECTOR_RETRIES-only read so all
+    three consumers resolve to the exact same value under every
+    environment configuration. Falls back to the conservative pre-#401
+    value (3) on an explicit env-var conflict, matching the other two
+    consumers' fallback exactly, rather than crashing the selector loop
+    over a configuration error."""
+    from ap.selector_retry_policy import (
+        DeferredMaterializationConfigConflict,
+        resolve_deferred_materialization_max_attempts,
+    )
+    try:
+        return resolve_deferred_materialization_max_attempts()
+    except DeferredMaterializationConfigConflict as exc:
+        log.critical(
+            "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT error=%s "
+            "-- falling back to conservative default 3. Fix the "
+            "conflicting environment variables.",
+            exc,
+        )
+        return 3
+
+
 def _resolve_selector_attempt_number(
     *,
     retry_attempt,
@@ -2542,7 +2568,9 @@ class APExecutionCore:
             )
 
         # ── Amendment 1 (rev 2): configured env is the hard ceiling ──────────
-        # Policy: MAX_BREACH_SELECTOR_RETRIES is the sole authoritative bound.
+        # Policy: the canonical resolver (_resolve_deferred_materialization_ceiling,
+        # shared with restart recovery and the deferred materializer) is the
+        # sole authoritative bound.
         # Durable retry_max_attempts is read only to detect stale rows and is
         # NEVER allowed to raise max_attempts above configured_max.
         #
@@ -2561,9 +2589,7 @@ class APExecutionCore:
         #   malformed durable → 5   (safe default)
         #   negative durable  → 5   (clamped to zero, then env wins)
         try:
-            _configured_max = _positive_int_env_config(
-                "MAX_BREACH_SELECTOR_RETRIES", 5
-            )
+            _configured_max = _resolve_deferred_materialization_ceiling()
         except (TypeError, ValueError):
             _configured_max = 5
         try:
@@ -4262,6 +4288,7 @@ class APExecutionCore:
                     _new_selector_request_context,
                 )
                 from ap.selector_retry_policy import (
+                    SelectorRecoveryCursorPersistFailed,
                     SelectorRecoveryOwnershipLost,
                     load_selector_recovery_cursor,
                     record_selector_recovery_attempt,
@@ -4579,17 +4606,33 @@ class APExecutionCore:
                         _cursor_pending_updates += 1
                         try:
                             _flush_selector_cursor(force=True)
-                        except SelectorRecoveryOwnershipLost as _cursor_lost:
+                        except (
+                            SelectorRecoveryOwnershipLost,
+                            SelectorRecoveryCursorPersistFailed,
+                        ) as _cursor_lost:
+                            _is_ownership_loss = isinstance(
+                                _cursor_lost, SelectorRecoveryOwnershipLost
+                            )
                             log.critical(
-                                "[%s] SELECTOR_RECOVERY_OWNERSHIP_LOST order=%s "
-                                "stage=market_truth error=%s",
+                                "[%s] %s order=%s stage=market_truth error=%s",
                                 ticker,
+                                "SELECTOR_RECOVERY_OWNERSHIP_LOST"
+                                if _is_ownership_loss
+                                else "SELECTOR_RECOVERY_CURSOR_PERSIST_FAILED",
                                 queue_local_order_id,
                                 _cursor_lost,
                             )
                             return {
-                                "disposition": "MATERIALIZATION_OWNERSHIP_LOST",
-                                "reason_code": "SELECTOR_RECOVERY_OWNERSHIP_LOST",
+                                "disposition": (
+                                    "MATERIALIZATION_OWNERSHIP_LOST"
+                                    if _is_ownership_loss
+                                    else "MATERIALIZATION_CURSOR_PERSIST_FAILED"
+                                ),
+                                "reason_code": (
+                                    "SELECTOR_RECOVERY_OWNERSHIP_LOST"
+                                    if _is_ownership_loss
+                                    else "SELECTOR_RECOVERY_CURSOR_PERSIST_FAILED"
+                                ),
                             }
                     if (
                         _truth_authority
@@ -4646,8 +4689,8 @@ class APExecutionCore:
                         _truth_authority
                         == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
                     ):
-                        _max_attempts_truth = _positive_int_env_config(
-                            "MAX_BREACH_SELECTOR_RETRIES", 5
+                        _max_attempts_truth = (
+                            _resolve_deferred_materialization_ceiling()
                         )
                         if _selector_attempt_number >= _max_attempts_truth:
                             _terminalize_deferred_breach_failure(
@@ -4760,17 +4803,33 @@ class APExecutionCore:
                         request_context=_selector_request_context,
                     )
                     _flush_selector_cursor(force=True)
-                except SelectorRecoveryOwnershipLost as _cursor_lost:
+                except (
+                    SelectorRecoveryOwnershipLost,
+                    SelectorRecoveryCursorPersistFailed,
+                ) as _cursor_lost:
+                    _is_ownership_loss = isinstance(
+                        _cursor_lost, SelectorRecoveryOwnershipLost
+                    )
                     log.critical(
-                        "[%s] SELECTOR_RECOVERY_OWNERSHIP_LOST order=%s "
-                        "stage=selector error=%s",
+                        "[%s] %s order=%s stage=selector error=%s",
                         ticker,
+                        "SELECTOR_RECOVERY_OWNERSHIP_LOST"
+                        if _is_ownership_loss
+                        else "SELECTOR_RECOVERY_CURSOR_PERSIST_FAILED",
                         queue_local_order_id,
                         _cursor_lost,
                     )
                     return {
-                        "disposition": "MATERIALIZATION_OWNERSHIP_LOST",
-                        "reason_code": "SELECTOR_RECOVERY_OWNERSHIP_LOST",
+                        "disposition": (
+                            "MATERIALIZATION_OWNERSHIP_LOST"
+                            if _is_ownership_loss
+                            else "MATERIALIZATION_CURSOR_PERSIST_FAILED"
+                        ),
+                        "reason_code": (
+                            "SELECTOR_RECOVERY_OWNERSHIP_LOST"
+                            if _is_ownership_loss
+                            else "SELECTOR_RECOVERY_CURSOR_PERSIST_FAILED"
+                        ),
                     }
                 (
                     _sel_result_valid,
@@ -5173,9 +5232,7 @@ class APExecutionCore:
                     # an emergency kill switch (set to "0" to disable without
                     # a code deploy).
                     _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
-                    _MAX_RETRIES_A = _positive_int_env_config(
-                        "MAX_BREACH_SELECTOR_RETRIES", 5
-                    )
+                    _MAX_RETRIES_A = _resolve_deferred_materialization_ceiling()
                     _RETRY_DELAY_A = _positive_int_env_config(
                         "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
                     )

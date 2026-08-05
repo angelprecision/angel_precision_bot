@@ -324,18 +324,64 @@ def _ctx_persist_attempt(
             provider_timestamp=provider_timestamp,
         )
     except Exception as exc:
-        from ap.selector_retry_policy import SelectorRecoveryOwnershipLost
+        from ap.selector_retry_policy import (
+            SelectorRecoveryCursorPersistFailed,
+            SelectorRecoveryOwnershipLost,
+        )
         if isinstance(exc, SelectorRecoveryOwnershipLost):
             raise
-        # Cursor serialization/persistence may never bypass selector safety or
-        # block terminal cleanup.  The caller keeps the in-memory duplicate
-        # fence even when the durable write is temporarily unavailable.
+        # Audit follow-up fix: previously logged and continued, letting
+        # the selector keep spending provider-call/broker-adjacent budget
+        # on later candidates with no durable record of this candidate's
+        # outcome -- violating the durable restart contract exactly like
+        # batching did (already fixed separately), just via write-failure
+        # rather than write-delay. Any non-ownership persistence failure
+        # (DB exception, serialization error, timeout, or anything else)
+        # now stops selector work immediately with a stable typed failure
+        # rather than continuing on process-memory-only progress.
         log.warning(
             "selector recovery cursor persist failed contract=%s reason=%s err=%s",
             occ_symbol,
             result_reason,
             exc,
         )
+        raise SelectorRecoveryCursorPersistFailed(
+            f"cursor persist failed for {occ_symbol}: {exc}"
+        ) from exc
+
+
+def correct_recovered_cursor_disposition(
+    request_context,
+    occ_symbol: str,
+    *,
+    final_reason: str,
+    provider_timestamp=None,
+) -> None:
+    """Audit blocker 4 fix: correct a durable cursor record that was
+    written prematurely as DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/transient=False
+    at the transport-recovery stage, before the caller's own subsequent
+    spread/OI/volume (_quality_filter) and delta/premium/affordability
+    checks completed. This function's own docstring at the original write
+    site says outright: "Caller will re-run the spread/premium/
+    affordability/liquidity checks against this patched opt" -- meaning the
+    original write is known-provisional at the moment it happens.
+
+    Call this once the caller's full quality re-run has actually rejected
+    the candidate, with the real final reason code (e.g. "SPREAD_TOO_WIDE",
+    "OI_TOO_LOW"), so the durable cursor never remains classified as a
+    successful recovered candidate once it's known not to be one. Uses the
+    same fail-closed persistence path (_ctx_persist_attempt) as the
+    original write -- a failure to persist the correction raises
+    SelectorRecoveryCursorPersistFailed exactly like any other cursor
+    write, rather than silently leaving the incorrect record in place.
+    """
+    _ctx_persist_attempt(
+        request_context,
+        occ_symbol,
+        result_reason=str(final_reason or "UNKNOWN_FAIL_CLOSED"),
+        transient=False,
+        provider_timestamp=provider_timestamp,
+    )
 
 
 def _ctx_note_unattempted_symbol(request_context, occ_symbol: str) -> None:

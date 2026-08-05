@@ -61,6 +61,7 @@ Unknown reasons fail closed — they are NOT retryable by default.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -661,6 +662,91 @@ _CURSOR_MAX_EXPIRATIONS = 10
 
 class SelectorRecoveryOwnershipLost(RuntimeError):
     """The exact order-owner CAS no longer authorizes selector continuation."""
+
+
+class SelectorRecoveryCursorPersistFailed(RuntimeError):
+    """Durable cursor persistence for a deferred-breach retry attempt failed
+    after a completed provider call or structural skip -- a genuine write
+    failure (DB exception, serialization error, timeout, or any other
+    non-ownership error), distinct from SelectorRecoveryOwnershipLost
+    (identity/generation CAS miss, where ownership itself is proven lost).
+    Callers must stop further selector/provider work immediately rather
+    than continuing with process-memory-only progress: continuing would
+    let the process spend more request-budget capacity on candidates whose
+    prior-attempt outcomes have no durable record, exactly the crash-loss/
+    capacity-laundering risk the durable restart contract exists to
+    prevent.
+    """
+
+
+class DeferredMaterializationConfigConflict(RuntimeError):
+    """MAX_BREACH_SELECTOR_RETRIES and DEFERRED_MATERIALIZATION_MAX_ATTEMPTS
+    were both explicitly set in the environment to different values -- or
+    either was set to a malformed/non-positive value. There is no correct
+    silent choice between two explicitly-conflicting operator instructions
+    for the same conceptual retry ceiling."""
+
+
+_DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT = 5
+
+
+def resolve_deferred_materialization_max_attempts() -> int:
+    """Single canonical resolver for the deferred-materialization retry
+    ceiling. Every consumer of this ceiling -- ap_execution_core.py's
+    selector retry loop, ap/pending_trigger_restart_recovery.py's restart-
+    recovery exhaustion check, and ap/deferred_materializer.py's bucket
+    config -- must call this function rather than reading either env var
+    independently, so all three resolve to the exact same value under
+    every environment configuration, not merely under matching hardcoded
+    defaults (which is all the prior fix guaranteed).
+
+    Precedence:
+      - neither var set: both default to 5.
+      - exactly one set: that value is used.
+      - both set and equal: that value is used.
+      - both set and unequal: raises DeferredMaterializationConfigConflict.
+      - either set to a malformed or non-positive value: raises
+        DeferredMaterializationConfigConflict.
+
+    Raises rather than silently picking a value on conflict -- callers
+    decide how to fail safe in their own context (this module has no
+    opinion on selector/restart/materializer-specific fallback behavior).
+    """
+    _raw_breach = os.getenv("MAX_BREACH_SELECTOR_RETRIES")
+    _raw_deferred = os.getenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS")
+
+    def _parse(raw, name):
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise DeferredMaterializationConfigConflict(
+                f"{name}={raw!r} is not a valid integer"
+            )
+        if value <= 0:
+            raise DeferredMaterializationConfigConflict(
+                f"{name}={raw!r} must be a positive integer"
+            )
+        return value
+
+    breach_value = _parse(_raw_breach, "MAX_BREACH_SELECTOR_RETRIES")
+    deferred_value = _parse(_raw_deferred, "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS")
+
+    if breach_value is not None and deferred_value is not None:
+        if breach_value != deferred_value:
+            raise DeferredMaterializationConfigConflict(
+                f"MAX_BREACH_SELECTOR_RETRIES={breach_value} conflicts with "
+                f"DEFERRED_MATERIALIZATION_MAX_ATTEMPTS={deferred_value} -- "
+                "both env vars govern the same conceptual retry ceiling and "
+                "must agree, or only one of them should be set"
+            )
+        return breach_value
+    if breach_value is not None:
+        return breach_value
+    if deferred_value is not None:
+        return deferred_value
+    return _DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT
 
 
 def _utc_iso(now=None) -> str:

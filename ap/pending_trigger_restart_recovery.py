@@ -37,8 +37,29 @@ from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
 )
+from ap.selector_retry_policy import (
+    DeferredMaterializationConfigConflict,
+    resolve_deferred_materialization_max_attempts,
+)
 
 log = get_logger("ap.pending_trigger_restart_recovery")
+
+
+def _resolve_max_attempts() -> int:
+    """Canonical retry-ceiling resolver, shared with ap_execution_core.py's
+    selector loop and ap/deferred_materializer.py's bucket config. Falls
+    back to the conservative pre-#401 value (3) on an explicit env-var
+    conflict rather than crashing restart recovery entirely."""
+    try:
+        return resolve_deferred_materialization_max_attempts()
+    except DeferredMaterializationConfigConflict as exc:
+        log.critical(
+            "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT error=%s "
+            "-- falling back to conservative default 3. Fix the "
+            "conflicting environment variables.",
+            exc,
+        )
+        return 3
 
 
 # ── Per-row outcome constants (Blocker 2) ─────────────────────────────────────
@@ -720,7 +741,7 @@ class PendingTriggerRestartRecovery:
                  (none of these exist in stamp_retry_pending).
         """
         _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
-        _max   = _env_int(_MAT_MAX_ATTEMPTS_ENV, 5)
+        _max   = _resolve_max_attempts()
         _now   = datetime.now(timezone.utc)
 
         _meta     = _extract_meta(row)
@@ -949,7 +970,7 @@ class PendingTriggerRestartRecovery:
         except (TypeError, ValueError):
             return None
 
-        _max = _env_int(_MAT_MAX_ATTEMPTS_ENV, 5)
+        _max = _resolve_max_attempts()
         if mat_status != "RETRY_PENDING":
             return None
         if broker_ready is not False:

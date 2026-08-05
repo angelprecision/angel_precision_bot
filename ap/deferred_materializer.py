@@ -74,7 +74,22 @@ FAILED_TERMINAL     = "FAILED_TERMINAL"
 from ap.selector_retry_policy import (  # noqa: E402
     RETRYABLE_MATERIALIZATION_REASONS,
     RETRYABLE_BREACH_SELECTOR_REASONS as _RETRYABLE_BREACH_SELECTOR_REASONS_DM,  # noqa: F401
+    DeferredMaterializationConfigConflict,
+    resolve_deferred_materialization_max_attempts,
 )
+
+
+def _resolve_max_attempts() -> int:
+    try:
+        return resolve_deferred_materialization_max_attempts()
+    except DeferredMaterializationConfigConflict as exc:
+        log.critical(
+            "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT error=%s "
+            "-- falling back to conservative default 3. Fix the "
+            "conflicting environment variables.",
+            exc,
+        )
+        return 3
 
 # ── Config helpers (hot-read from env; no restart needed for tuning) ──────────
 
@@ -101,17 +116,18 @@ def _cfg() -> dict:
 
     return {
         "enabled":           _bool("DEFERRED_MATERIALIZATION_BUCKET_ENABLED", True),
-        # Audit blocker 2 fix: this default must match ap_execution_core.py's
-        # MAX_BREACH_SELECTOR_RETRIES (5) and
-        # ap/pending_trigger_restart_recovery.py's own
-        # DEFERRED_MATERIALIZATION_MAX_ATTEMPTS fallback (also bumped to 5).
-        # All three read the same conceptual retry ceiling for a deferred
-        # materialization row; leaving this one at the pre-#401 default of 3
-        # meant the row could be considered exhausted here while restart
-        # recovery and the selector loop both still considered it retryable
-        # -- liveness drift / premature terminalization / stranded retry
-        # ownership depending on which consumer touched the row first.
-        "max_attempts":      _int("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", 5),
+        # Audit follow-up fix: matching hardcoded defaults across three
+        # consumers is not a unified authority -- an operator setting only
+        # one of MAX_BREACH_SELECTOR_RETRIES /
+        # DEFERRED_MATERIALIZATION_MAX_ATTEMPTS could still cause this
+        # consumer to disagree with the other two. Now calls the single
+        # canonical resolver shared by ap_execution_core.py and
+        # ap/pending_trigger_restart_recovery.py. On an explicit conflict
+        # between the two env vars, falls back to the conservative
+        # pre-#401 value (3) rather than crashing config load -- a
+        # misconfigured environment variable must not halt materialization
+        # entirely, but it must be loud.
+        "max_attempts":      _resolve_max_attempts(),
         "retry_base_s":      _int("DEFERRED_MATERIALIZATION_RETRY_BASE_SECONDS", 15),
         "retry_max_s":       _int("DEFERRED_MATERIALIZATION_RETRY_MAX_SECONDS", 90),
         "lock_ttl_s":        _int("DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", 120),

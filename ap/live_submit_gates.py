@@ -164,6 +164,8 @@ def validate_retry_market_quote_authority(
         parsed.scheme.lower() != "https"
         or parsed.hostname != "api.tradier.com"
         or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
     ):
         return {
             "valid": False,
