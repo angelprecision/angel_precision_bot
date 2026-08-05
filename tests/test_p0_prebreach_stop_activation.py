@@ -977,6 +977,190 @@ def test_trigger_provenance_rollout_migration_is_bounded_and_generation_free():
     assert "materialization_generation" not in update_body
 
 
+def test_trigger_provenance_rollout_migration_executes_against_postgres_rows():
+    """Execute the shipped backfill against production-shaped JSONB rows."""
+    import os
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    dsn = next(
+        (
+            os.getenv(name)
+            for name in (
+                "DATABASE_URL",
+                "DATABASE_URI",
+                "POSTGRES_URL",
+                "SUPABASE_DB_URL",
+            )
+            if os.getenv(name)
+        ),
+        None,
+    )
+    if not dsn:
+        pytest.skip("no PostgreSQL DSN configured for migration integration test")
+
+    try:
+        connection = psycopg2.connect(dsn)
+    except psycopg2.OperationalError as exc:
+        if os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true":
+            raise
+        pytest.skip(f"PostgreSQL unavailable for migration integration test: {exc}")
+
+    from pathlib import Path
+
+    migration = Path(__file__).resolve().parents[1] / (
+        "migrations/20260804_trigger_crossed_at_provenance_backfill.sql"
+    )
+    sql = migration.read_text(encoding="utf-8")
+    crossed_at = "2026-08-03T16:00:00+00:00"
+    reeval_signal = (
+        "REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9:f4dc44"
+    )
+
+    rows = [
+        (
+            "lo-eligible-407",
+            "client@test.com",
+            "paper",
+            "signal-eligible-407",
+            "signal-eligible-407",
+            "ENTRY",
+            {
+                "trigger_crossed_at": crossed_at,
+                "canonical_signal_id": "signal-eligible-407",
+            },
+        ),
+        (
+            "lo-reeval-407",
+            "client@test.com",
+            "paper",
+            reeval_signal,
+            "REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9",
+            "ENTRY",
+            {"trigger_crossed_at": crossed_at},
+        ),
+        (
+            "lo-conflicting-canonical-407",
+            "client@test.com",
+            "paper",
+            "signal-conflicting-canonical-407",
+            "stale-canonical-407",
+            "ENTRY",
+            {"trigger_crossed_at": crossed_at},
+        ),
+        (
+            "lo-conflicting-client-407",
+            "client@test.com",
+            "paper",
+            "signal-conflicting-client-407",
+            "signal-conflicting-client-407",
+            "ENTRY",
+            {
+                "trigger_crossed_at": crossed_at,
+                "client_id": "other@test.com",
+            },
+        ),
+        (
+            "lo-existing-provenance-407",
+            "client@test.com",
+            "paper",
+            "signal-existing-407",
+            "signal-existing-407",
+            "ENTRY",
+            {
+                "trigger_crossed_at": crossed_at,
+                "trigger_crossed_at_provenance": {
+                    "canonical_signal_id": "preserve-existing-407",
+                    "client_id": "client@test.com",
+                    "execution_mode": "paper",
+                    "local_order_id": "lo-existing-provenance-407",
+                },
+            },
+        ),
+        (
+            "lo-incomplete-mode-407",
+            "client@test.com",
+            "",
+            "signal-incomplete-mode-407",
+            "signal-incomplete-mode-407",
+            "ENTRY",
+            {"trigger_crossed_at": crossed_at},
+        ),
+    ]
+
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    CREATE TEMP TABLE orders (
+                        local_order_id TEXT PRIMARY KEY,
+                        client_id TEXT,
+                        execution_mode TEXT,
+                        signal_id TEXT,
+                        canonical_signal_id TEXT,
+                        kind TEXT,
+                        meta JSONB
+                    )
+                    """
+                )
+                for row in rows:
+                    cursor.execute(
+                        """
+                        INSERT INTO orders (
+                            local_order_id, client_id, execution_mode,
+                            signal_id, canonical_signal_id, kind, meta
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                        """,
+                        (*row[:6], json.dumps(row[6])),
+                    )
+
+                cursor.execute(sql)
+                cursor.execute(
+                    "SELECT local_order_id, meta::text FROM orders "
+                    "ORDER BY local_order_id"
+                )
+                first_pass = {
+                    local_order_id: json.loads(meta_text)
+                    for local_order_id, meta_text in cursor.fetchall()
+                }
+
+                assert first_pass["lo-eligible-407"][
+                    "trigger_crossed_at_provenance"
+                ] == {
+                    "canonical_signal_id": "signal-eligible-407",
+                    "client_id": "client@test.com",
+                    "execution_mode": "paper",
+                    "local_order_id": "lo-eligible-407",
+                }
+                assert first_pass["lo-reeval-407"][
+                    "trigger_crossed_at_provenance"
+                ]["canonical_signal_id"] == (
+                    "REEVAL:603bce5b-352e-44e0-b00b-6baa826ca2c9"
+                )
+                for refused_id in (
+                    "lo-conflicting-canonical-407",
+                    "lo-conflicting-client-407",
+                    "lo-incomplete-mode-407",
+                ):
+                    assert "trigger_crossed_at_provenance" not in first_pass[refused_id]
+                assert first_pass["lo-existing-provenance-407"][
+                    "trigger_crossed_at_provenance"
+                ] == rows[4][6]["trigger_crossed_at_provenance"]
+
+                cursor.execute(sql)
+                cursor.execute(
+                    "SELECT local_order_id, meta::text FROM orders "
+                    "ORDER BY local_order_id"
+                )
+                second_pass = {
+                    local_order_id: json.loads(meta_text)
+                    for local_order_id, meta_text in cursor.fetchall()
+                }
+                assert second_pass == first_pass, "backfill must be idempotent"
+    finally:
+        connection.close()
+
+
 def test_ordinary_queue_evidence_identity_does_not_require_generation():
     """Ordinary queue plans have no durable materialization generation.
 

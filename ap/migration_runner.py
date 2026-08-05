@@ -20,7 +20,9 @@ Design (deliberately conservative for a hand-migrated history):
       runner refuses to proceed (fail loudly — history must be immutable).
     * Startup auto-apply is OFF by default. ``ENABLE_MIGRATION_RUNNER=1``
       enables ``run_pending_on_startup()``; until then this module is a
-      CLI/operator tool: ``python -m ap.migration_runner status|baseline|apply``.
+      CLI/operator tool. A one-file rollout can use ``dry-run --only FILE`` /
+      ``apply --only FILE`` only after an existing ledger proves the base
+      migration set was adopted.
     * Migration files executed by this runner must not contain top-level
       transaction-control statements. The runner owns the transaction and
       atomically records the migration ledger entry before commit. Historical
@@ -63,6 +65,14 @@ class MigrationChecksumDrift(RuntimeError):
 
 class MigrationTransactionControlError(RuntimeError):
     """Pending migration files contain top-level transaction-control SQL."""
+
+
+class MigrationLedgerRequired(RuntimeError):
+    """A targeted migration was requested before history was baselined."""
+
+
+class MigrationTargetError(RuntimeError):
+    """A targeted migration cannot be proven to be the only safe pending file."""
 
 
 class BaselineAttestationError(RuntimeError):
@@ -264,6 +274,49 @@ def _recorded() -> dict[str, dict[str, Any]]:
     return run_with_retry(_read)
 
 
+def _ledger_exists() -> bool:
+    """Read ledger existence without creating it."""
+    from ap.db import conn, run_with_retry
+
+    def _read() -> bool:
+        with conn() as c:
+            row = c.execute(
+                "SELECT to_regclass('schema_migrations') AS ledger_name"
+            ).fetchone()
+        if not row:
+            return False
+        if isinstance(row, dict):
+            return bool(row.get("ledger_name"))
+        try:
+            return bool(row[0])
+        except (IndexError, TypeError, KeyError):
+            return False
+
+    return bool(run_with_retry(_read))
+
+
+def _require_existing_ledger() -> None:
+    if not _ledger_exists():
+        raise MigrationLedgerRequired(
+            "Targeted migration refused: schema_migrations does not exist. "
+            "Baseline the deployed/base migration set first; this command "
+            "will not create a ledger or replay historical migrations."
+        )
+
+
+def _validate_migration_target(raw_target: str) -> str:
+    target = str(raw_target or "").strip()
+    if (
+        not target
+        or Path(target).name != target
+        or Path(target).suffix.lower() != ".sql"
+    ):
+        raise MigrationTargetError(
+            f"Invalid migration target {raw_target!r}; pass one filename ending in .sql"
+        )
+    return target
+
+
 def _record(filename: str, checksum: str, *, baselined: bool) -> None:
     from ap.db import conn, run_with_retry
     bot_mode = os.getenv("BOT_MODE", os.getenv("MODE", "PAPER")).strip().upper()
@@ -279,9 +332,19 @@ def _record(filename: str, checksum: str, *, baselined: bool) -> None:
     run_with_retry(_write)
 
 
-def status(directory: Path | None = None) -> dict[str, Any]:
-    """Report pending / recorded / drifted files without changing anything."""
-    _ensure_ledger()
+def status(
+    directory: Path | None = None,
+    *,
+    ensure_ledger: bool = True,
+) -> dict[str, Any]:
+    """Report pending / recorded / drifted files.
+
+    The historical default creates the ledger for compatibility. Targeted
+    apply/dry-run uses ``ensure_ledger=False`` after explicitly proving that
+    the ledger already exists.
+    """
+    if ensure_ledger:
+        _ensure_ledger()
     recorded = _recorded()
     files = _migration_files(directory)
     pending, applied, drifted = [], [], []
@@ -355,7 +418,12 @@ def baseline(directory: Path | None = None, *, force: bool = False) -> dict[str,
     return {"baselined": marked}
 
 
-def run_pending(*, apply: bool = False, directory: Path | None = None) -> dict[str, Any]:
+def run_pending(
+    *,
+    apply: bool = False,
+    directory: Path | None = None,
+    only: str | None = None,
+) -> dict[str, Any]:
     """Apply unrecorded migrations in deterministic order.
 
     ``apply=False`` (default) is a dry run: reports what WOULD run.
@@ -363,7 +431,29 @@ def run_pending(*, apply: bool = False, directory: Path | None = None) -> dict[s
     Each file executes in its own transaction via ``ap.db.conn()`` and is
     recorded only after successful commit. Stops at the first failure.
     """
-    report = status(directory)
+    if only is None:
+        report = status(directory)
+    else:
+        target = _validate_migration_target(only)
+        _require_existing_ledger()
+        directory = directory or MIGRATIONS_DIR
+        available = {path.name for path in _migration_files(directory)}
+        if target not in available:
+            raise MigrationTargetError(
+                f"Targeted migration is not present in {directory}: {target}"
+            )
+        report = status(directory, ensure_ledger=False)
+        if target not in report["pending"]:
+            raise MigrationTargetError(
+                f"Targeted migration is not pending: {target}"
+            )
+        other_pending = [name for name in report["pending"] if name != target]
+        if other_pending:
+            raise MigrationTargetError(
+                "Targeted migration refused because other files are pending: "
+                f"{other_pending}. Baseline the deployed/base set and retry."
+            )
+        report["pending"] = [target]
     if report["drifted"]:
         raise MigrationChecksumDrift(
             f"Recorded migration files changed on disk: {report['drifted']}. "
@@ -446,11 +536,28 @@ def _main(argv: list[str]) -> int:
         force = "--force" in argv[2:]
         print(baseline(force=force))
     elif cmd == "apply":
-        print(run_pending(apply=True))
+        only = None
+        if "--only" in argv[2:]:
+            index = argv.index("--only")
+            if index + 1 >= len(argv):
+                print("usage: python -m ap.migration_runner apply [--only FILE]")
+                return 2
+            only = argv[index + 1]
+        print(run_pending(apply=True, only=only))
     elif cmd == "dry-run":
-        print(run_pending(apply=False))
+        only = None
+        if "--only" in argv[2:]:
+            index = argv.index("--only")
+            if index + 1 >= len(argv):
+                print("usage: python -m ap.migration_runner dry-run [--only FILE]")
+                return 2
+            only = argv[index + 1]
+        print(run_pending(apply=False, only=only))
     else:
-        print("usage: python -m ap.migration_runner [status|baseline [--force]|dry-run|apply]")
+        print(
+            "usage: python -m ap.migration_runner "
+            "[status|baseline [--force]|dry-run [--only FILE]|apply [--only FILE]]"
+        )
         return 2
     return 0
 

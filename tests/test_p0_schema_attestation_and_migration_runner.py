@@ -47,6 +47,8 @@ class FakeCursorConn:
     def execute(self, sql, params=()):
         self.h.executed.append((sql.strip(), tuple(params) if params else ()))
         self.h.last_sql = sql
+        if "CREATE TABLE IF NOT EXISTS schema_migrations" in sql:
+            self.h.ledger_exists = True
         if self.h.raise_on and self.h.raise_on in sql:
             raise RuntimeError(f"forced failure on: {self.h.raise_on}")
         return self
@@ -69,10 +71,15 @@ class FakeDB:
         self.raise_on = None
         self.information_schema_rows = []
         self.schema_migrations_rows = []
+        self.ledger_exists = False
 
     def next_rows(self, sql):
         if "information_schema.columns" in sql:
             return list(self.information_schema_rows)
+        if "to_regclass('schema_migrations')" in sql:
+            return [{
+                "ledger_name": "schema_migrations"
+            }] if self.ledger_exists else []
         if "FROM schema_migrations" in sql:
             return list(self.schema_migrations_rows)
         return []
@@ -194,6 +201,11 @@ def test_production_declaration_covers_claims_table():
     assert "generation_key" in sa.REQUIRED_SCHEMA["exit_decision_generation_claims"]
     assert "proof_trades" in sa.REQUIRED_SCHEMA
     assert "performance_taxonomy" in sa.REQUIRED_SCHEMA["proof_trades"]
+
+
+def test_production_declaration_covers_trigger_provenance_source_column():
+    """The rollout SQL reads canonical_signal_id from the durable orders row."""
+    assert "canonical_signal_id" in sa.REQUIRED_SCHEMA["orders"]
 
 
 def test_lifecycle_manifest_records_healthy_schema_as_installed(monkeypatch):
@@ -375,6 +387,67 @@ def test_checksum_drift_refuses_to_apply(fake_db, mig_dir):
     }]
     with pytest.raises(mr.MigrationChecksumDrift, match="old_style"):
         mr.run_pending(apply=True, directory=mig_dir)
+
+
+def test_targeted_migration_refuses_without_existing_ledger(fake_db, mig_dir):
+    """A targeted rollout must not create a ledger or replay history."""
+    with pytest.raises(mr.MigrationLedgerRequired, match="does not exist"):
+        mr.run_pending(
+            apply=True,
+            directory=mig_dir,
+            only="20260717_new_style.sql",
+        )
+
+    assert fake_db.ledger_exists is False
+    assert [sql for sql, _ in fake_db.executed if sql in {
+        "SELECT 1;", "SELECT 2;", "SELECT 3;"
+    }] == []
+
+
+def test_targeted_migration_refuses_when_another_file_is_pending(fake_db, mig_dir):
+    """The operator must prove the base set was recorded before targeting one file."""
+    fake_db.ledger_exists = True
+    with pytest.raises(mr.MigrationTargetError, match="other files are pending"):
+        mr.run_pending(
+            apply=True,
+            directory=mig_dir,
+            only="20260717_new_style.sql",
+        )
+
+    assert [sql for sql, _ in fake_db.executed if sql in {
+        "SELECT 1;", "SELECT 2;", "SELECT 3;"
+    }] == []
+    assert _ledger_inserts(fake_db) == []
+
+
+def test_targeted_migration_applies_only_named_pending_file(fake_db, mig_dir):
+    """A proven single pending target executes and records only that file."""
+    fake_db.ledger_exists = True
+    old_path = mig_dir / "2026_05_17_old_style.sql"
+    fake_db.schema_migrations_rows = [{
+        "filename": old_path.name,
+        "checksum": mr._sha256(old_path.read_text()),
+        "applied_at": None,
+        "baselined": True,
+    }, {
+        "filename": "no_date_last.sql",
+        "checksum": mr._sha256((mig_dir / "no_date_last.sql").read_text()),
+        "applied_at": None,
+        "baselined": True,
+    }]
+
+    result = mr.run_pending(
+        apply=True,
+        directory=mig_dir,
+        only="20260717_new_style.sql",
+    )
+
+    assert result["applied"] == ["20260717_new_style.sql"]
+    bodies = [sql for sql, _ in fake_db.executed if sql in {
+        "SELECT 1;", "SELECT 2;", "SELECT 3;"
+    }]
+    assert bodies == ["SELECT 2;"]
+    assert len(_ledger_inserts(fake_db)) == 1
 
 
 def test_startup_hook_disabled_by_default(fake_db, mig_dir, monkeypatch):

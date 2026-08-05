@@ -81,6 +81,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
         "local_order_id", "broker_order_id", "client_id", "position_id",
         "kind", "status", "meta", "created_ts", "direction", "contract",
         "qty", "filled_qty", "fill_price", "signal_id", "execution_mode",
+        "canonical_signal_id",
     }),
     # PR #152 — morning handoff DB-level idempotency.
     "handoff_run_locks": frozenset({
