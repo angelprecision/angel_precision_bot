@@ -1134,9 +1134,19 @@ class WatchedSignal:
             # transiently without representing a real thesis break.
             # The validated overnight revalidation at 9:30 ET (which runs the
             # full structural daily validator) will catch genuine breaks.
+            #
+            # HOTFIX (2026-08-05): this protection is for PRE-breach signals
+            # only. Once trigger_crossed_at is confirmed (PR #407), the stop
+            # must stay live for the remainder of the lifecycle, including
+            # through the overnight/pre-market window — that is the explicit
+            # invariant PR #407 established ("the stop becomes active for the
+            # remainder of the same durable lifecycle"). Without this
+            # exclusion, a confirmed-breach position's stop went dormant every
+            # night from close until 9:35 ET regardless of confirmed evidence.
             _pre_open_skip = (
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
+                and getattr(self, "trigger_crossed_at", None) is None
             )
             # PR #407: scanner-stop protection is dormant until a CONFIRMED
             # entry-direction breach exists (trigger_crossed_at is set only
@@ -1267,9 +1277,11 @@ class WatchedSignal:
                 self.breach_count = 0
 
             # FUNNEL FIX (2026-05-20): same pre-open guard for PUT setups.
+            # HOTFIX (2026-08-05): see CALL branch — dormant only pre-breach.
             _pre_open_skip = (
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
+                and getattr(self, "trigger_crossed_at", None) is None
             )
             # PR #407: PUT scanner stop is dormant until confirmed breach.
             # Symmetric to CALL; a pre-trigger ask touch is inert. Same-poll

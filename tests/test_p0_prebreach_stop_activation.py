@@ -1700,3 +1700,70 @@ class TestPreBreachStopActivationCall:
         assert state == WatchState.INVALIDATED, (
             "Confirmed CALL: bid <= stop*(1-buffer) must invalidate."
         )
+
+
+def test_confirmed_call_stop_stays_active_through_preopen_window():
+    """HOTFIX regression: a confirmed-breach CALL stop must not go dormant
+    overnight/pre-market. The pre-open skip exists to protect PRE-breach
+    signals from wide-spread false stops; once trigger_crossed_at is
+    confirmed, PR #407's own invariant ("stop stays active for the
+    remainder of the lifecycle") must hold regardless of session, or a
+    live position sits unprotected every night until 9:35 ET.
+    """
+    sig = _spy_call_signal()
+    sig["overnight"] = True
+    watched = WatchedSignal(sig, overnight=True)
+    watched.entry_trigger = 450.0
+    watched.stop_level = 447.0
+
+    for _ in range(watched.MOMENTUM_POLLS_REQUIRED):
+        _ = watched.check(bid=449.0, ask=451.0)
+    assert watched.state == WatchState.TRIGGERED
+    assert watched.trigger_crossed_at is not None
+
+    watched.state = WatchState.PENDING
+    watched._trigger_stop_collision = False
+
+    # Simulate the overnight/pre-market window (e.g. 2 AM ET), where the
+    # pre-open skip would otherwise suppress this exact stop touch.
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = watched.check(bid=446.0, ask=449.0)
+
+    assert state == WatchState.INVALIDATED, (
+        "Confirmed CALL stop must fire even during the pre-market window."
+    )
+
+
+def test_confirmed_put_stop_stays_active_through_preopen_window():
+    """HOTFIX regression: PUT mirror of the CALL case above."""
+    persisted_row = _restart_row_with_confirmed_evidence()
+    row_after_json = json.loads(json.dumps(persisted_row))
+    startup_recovery = APStartupRecovery.__new__(APStartupRecovery)
+    startup_recovery.client_id = "client@test.com"
+    production_plan = startup_recovery._build_recovery_plan_from_order(
+        row_after_json
+    )
+    osm = _MockOSM()
+    osm._row_status[persisted_row["local_order_id"]] = "PENDING_TRIGGER"
+    osm._row_meta[persisted_row["local_order_id"]] = dict(row_after_json["meta"])
+    watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+
+    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+         patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
+         patch.object(watcher, "_get_quote", return_value={"bid": 62.45, "ask": 62.49}):
+        assert watcher.watch(
+            production_plan, persisted_row["local_order_id"], recovery_rearm=True
+        ) is True
+
+    armed = watcher._pending[0]
+    assert armed.trigger_crossed_at is not None
+
+    # Simulate the overnight/pre-market window explicitly rather than
+    # depending on the wall clock at test-run time.
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = armed.check(bid=62.60, ask=62.60)
+
+    assert state == WatchState.INVALIDATED, (
+        "Confirmed PUT stop must fire even during the pre-market window."
+    )
