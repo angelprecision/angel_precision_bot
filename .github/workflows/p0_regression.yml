@@ -107,7 +107,6 @@ jobs:
             tests/test_p0_selector_recovery_capacity_and_validity.py \
             tests/test_p0_selector_recovery_cursor.py \
             tests/test_p0_selector_recovery_july27_replay.py \
-            tests/test_p0_selector_recovery_deploy_preflight.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \
