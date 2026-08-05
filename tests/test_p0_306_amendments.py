@@ -432,8 +432,19 @@ class TestAmendment7AuditWriteFailureNotSwallowed:
         All must use named exception and emit a log.
         """
         src = open("ap_execution_core.py").read()
-        # Find the gate section (between live_submit_gates import and submit call)
-        gate_start = src.find("from ap.live_submit_gates import")
+        # Find the gate section (between the live_submit_gates identity/
+        # market-validity/trigger-age import and the submit call). Anchor on
+        # "derive_submit_execution_mode" rather than the bare
+        # "from ap.live_submit_gates import" prefix: other, unrelated local
+        # imports of the same module can legitimately exist earlier in the
+        # file for narrower purposes (e.g. a deferred-retry chart-truth
+        # revalidation importing only MarketTruthAuthority /
+        # check_market_validity_gate / classify_market_truth /
+        # validate_retry_market_quote_authority). A prefix-only match would
+        # find whichever import happens to come first and could silently
+        # widen this scan to cover thousands of unrelated, pre-existing
+        # lines the amendment was never scoped to check.
+        gate_start = src.find("derive_submit_execution_mode")
         gate_end   = src.find("submit_res = self.order_state_machine.submit_existing_entry(", gate_start)
         gate_section = src[gate_start:gate_end] if gate_start >= 0 and gate_end >= 0 else ""
 
