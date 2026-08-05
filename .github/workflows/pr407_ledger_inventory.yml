@@ -1,9 +1,9 @@
 name: PR407 Ledger Inventory
 
 on:
-  push:
+  pull_request:
     branches:
-      - ops/pr407-ledger-inventory-20260804
+      - main
 
 permissions:
   contents: read
