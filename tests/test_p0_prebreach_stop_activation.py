@@ -34,8 +34,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import ap_entry_watcher as aew_module
 from ap_entry_watcher import (
     APEntryWatcher,
+    ET,
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     WatchedSignal,
     WatchState,
@@ -1363,9 +1365,26 @@ def test_queue_and_rescue_plans_share_canonical_id_authority_without_generation(
     osm = _MockOSM()
     watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
-    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+    # Fixed pre-market ET time (2 AM), matching this test's already-explicit
+    # intent (via the two session-method patches below) that real-world
+    # session/session-boundary state must not gate this test — it exists to
+    # prove canonical-ID normalization, not arm-time trigger-through checks.
+    # Without this, add_signal()'s own inline `datetime.now(ET)` read (a
+    # separate mechanism from the two patched methods) makes this test
+    # wall-clock-dependent: it silently passes before 9:30 ET and fails
+    # after, since the CALL/PUT arm-time already-through-trigger check
+    # (PR #304 "Bug C") only activates during real regular session and the
+    # queue_plan (CALL, trigger=450) and rescue_plan (PUT, trigger=450)
+    # share one quote that cannot simultaneously satisfy both sides'
+    # not-yet-through conditions once that check is live.
+    _fixed_pre_market_et = datetime(2026, 8, 5, 2, 0, 0, tzinfo=ET)
+    with patch.object(aew_module._base, "datetime") as mock_dt, \
+         patch.object(watcher, "_is_regular_session_now", return_value=False), \
          patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
          patch.object(watcher, "_get_quote", return_value={"bid": 450.0, "ask": 450.0}):
+        mock_dt.now.return_value = _fixed_pre_market_et
+        mock_dt.fromisoformat.side_effect = datetime.fromisoformat
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
         assert watcher.watch(queue_plan, "lo-queue-canonical-407") is True
         assert watcher.watch(rescue_plan, "lo-rescue-canonical-407") is True
 
@@ -1700,3 +1719,417 @@ class TestPreBreachStopActivationCall:
         assert state == WatchState.INVALIDATED, (
             "Confirmed CALL: bid <= stop*(1-buffer) must invalidate."
         )
+
+
+def test_confirmed_call_stop_stays_active_through_preopen_window():
+    """HOTFIX regression: a confirmed-breach CALL pending-entry watcher must
+    not go dormant overnight/pre-market. The pre-open skip exists to protect
+    setups that have NOT yet triggered from wide-spread false stops; once
+    trigger_crossed_at is confirmed, PR #407's own invariant ("stop stays
+    active for the remainder of the pending-entry lifecycle") must hold
+    regardless of session, or a confirmed-breach setup remains eligible for
+    later recovery, retry, contract selection, or materialization when it
+    should already be invalidated.
+
+    The "zero callback on invalidation" property is already proven for both
+    sides by test_confirmed_evidence_survives_real_poll_retry_and_active_stop
+    via the real _poll_active_signals path; this test is scoped specifically
+    to the pre-market-window interaction, using a MagicMock broker to prove
+    check() itself never reaches broker submit/cancel.
+    """
+    broker = MagicMock()
+    osm = _MockOSM()
+    watcher = APEntryWatcher(broker, order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+    sig = _spy_call_signal()
+    sig["overnight"] = True
+    watched = WatchedSignal(sig, overnight=True)
+    watched.entry_trigger = 450.0
+    watched.stop_level = 447.0
+    watched._watcher_ref = watcher
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=False):
+        for _ in range(watched.MOMENTUM_POLLS_REQUIRED):
+            _ = watched.check(bid=449.0, ask=451.0)
+    assert watched.state == WatchState.TRIGGERED
+    assert watched.trigger_crossed_at is not None
+    original_confirmed_at = watched.trigger_crossed_at
+
+    # Simulate downstream watcher continuing after the confirmed trigger,
+    # then entering the overnight/pre-market window with BID breaking stop.
+    watched.state = WatchState.PENDING
+    watched._trigger_stop_collision = False
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = watched.check(bid=446.0, ask=449.0)
+
+    assert state == WatchState.INVALIDATED, (
+        "Confirmed CALL stop must fire even during the pre-market window."
+    )
+    assert watched.trigger_crossed_at == original_confirmed_at, (
+        "Invalidation must not erase or replace confirmed trigger evidence."
+    )
+    assert watched._pending_audit is not None
+    assert watched._pending_audit.get("reason_code") == "stop_bid_below_call_stop", (
+        "CALL invalidation must be authorized by BID breaking the CALL stop."
+    )
+    forbidden_broker_methods = {
+        "submit_order", "submit_option_order",
+        "cancel_order", "cancel_option_order",
+    }
+    for call_ in broker.mock_calls:
+        called_name = str(call_).split("(", 1)[0]
+        for forbidden in forbidden_broker_methods:
+            assert forbidden not in called_name, (
+                f"Broker.{forbidden} must not be called during "
+                f"pre-broker-order invalidation; observed {call_}"
+            )
+
+
+def test_confirmed_put_stop_stays_active_through_preopen_window():
+    """HOTFIX regression: PUT mirror of the CALL case above, exercised
+    through the actual production restart-recovery path (APStartupRecovery
+    -> PendingTriggerRestartRecovery-shaped plan -> watch(recovery_rearm)),
+    asserting the real #407 identity and lifecycle fields, not just state.
+    """
+    persisted_row = _restart_row_with_confirmed_evidence()
+    row_after_json = json.loads(json.dumps(persisted_row))
+    startup_recovery = APStartupRecovery.__new__(APStartupRecovery)
+    startup_recovery.client_id = "client@test.com"
+    production_plan = startup_recovery._build_recovery_plan_from_order(
+        row_after_json
+    )
+    osm = _MockOSM()
+    osm._row_status[persisted_row["local_order_id"]] = "PENDING_TRIGGER"
+    osm._row_meta[persisted_row["local_order_id"]] = dict(row_after_json["meta"])
+    broker = MagicMock()
+    watcher = APEntryWatcher(broker, order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+
+    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+         patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
+         patch.object(watcher, "_get_quote", return_value={"bid": 62.45, "ask": 62.49}):
+        assert watcher.watch(
+            production_plan, persisted_row["local_order_id"], recovery_rearm=True
+        ) is True
+
+    armed = watcher._pending[0]
+    # #407 identity/lifecycle fields — the actual production contract, not
+    # just "some watcher exists".
+    assert armed.signal["canonical_signal_id"] == "canonical-restart-407"
+    assert armed.signal["client_id"] == "client@test.com"
+    assert armed.signal["execution_mode"] == "paper"
+    assert armed.signal["local_order_id"] == "lo-restart-407"
+    assert armed.trigger_crossed_at == datetime.fromisoformat(
+        "2026-08-03T16:00:00+00:00"
+    )
+
+    # Simulate the overnight/pre-market window explicitly rather than
+    # depending on the wall clock at test-run time.
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = armed.check(bid=62.60, ask=62.60)
+
+    assert state == WatchState.INVALIDATED, (
+        "Confirmed PUT stop must fire even during the pre-market window."
+    )
+    assert armed._pending_audit is not None
+    assert armed._pending_audit.get("reason_code") == "stop_ask_above_put_stop", (
+        "PUT invalidation must be authorized by ASK breaking the PUT stop."
+    )
+    forbidden_broker_methods = {
+        "submit_order", "submit_option_order",
+        "cancel_order", "cancel_option_order",
+    }
+    for call_ in broker.mock_calls:
+        called_name = str(call_).split("(", 1)[0]
+        for forbidden in forbidden_broker_methods:
+            assert forbidden not in called_name, (
+                f"Broker.{forbidden} must not be called during "
+                f"pre-broker-order invalidation; observed {call_}"
+            )
+
+
+def test_prebreach_overnight_call_stop_touch_during_premarket_remains_ignored():
+    """Preservation: the pre-2026-08-05 behavior must still hold for a
+    setup that has NOT triggered yet — pre-market spread protection is
+    still active pre-breach, exactly as FUNNEL FIX (2026-05-20) intended.
+    """
+    sig = _spy_call_signal()
+    sig["overnight"] = True
+    watched = WatchedSignal(sig, overnight=True)
+    watched.entry_trigger = 450.0
+    watched.stop_level = 447.0
+    assert watched.trigger_crossed_at is None
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = watched.check(bid=446.0, ask=449.0)
+
+    assert state == WatchState.PENDING, (
+        "Pre-breach overnight CALL stop touch during pre-market must "
+        "still be ignored — this is the original FUNNEL FIX behavior "
+        "and must not regress."
+    )
+    assert watched.trigger_crossed_at is None
+
+
+def test_prebreach_overnight_put_stop_touch_during_premarket_remains_ignored():
+    """Preservation: PUT mirror of the CALL case above."""
+    sig = {
+        "signal_id": str(uuid.uuid4()),
+        "local_order_id": str(uuid.uuid4()),
+        "client_id": "client@test.com",
+        "client_email": "client@test.com",
+        "execution_mode": "paper",
+        "timeframe": "1d",
+        "ticker": "BAC",
+        "side": "PUT",
+        "entry_price": BAC_PUT_TRIGGER,
+        "stop_price": BAC_PUT_STOP,
+        "target_price": 60.50,
+        "contract_symbol": "BAC240101P00062000",
+        "contracts": 1,
+        "limit_price": 1.20,
+        "score": 0.8,
+        "tier": "A",
+        "queue_status": "QUEUED",
+    }
+    sig["canonical_signal_id"] = sig["signal_id"]
+    sig["metadata"] = {
+        "canonical_signal_id": sig["canonical_signal_id"],
+        "client_id": sig["client_id"],
+        "execution_mode": sig["execution_mode"],
+    }
+    watched = WatchedSignal(sig, overnight=True)
+    watched.entry_trigger = BAC_PUT_TRIGGER
+    watched.stop_level = BAC_PUT_STOP
+    assert watched.trigger_crossed_at is None
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = watched.check(bid=62.45, ask=62.60)
+
+    assert state == WatchState.PENDING, (
+        "Pre-breach overnight PUT stop touch during pre-market must "
+        "still be ignored — must not regress."
+    )
+    assert watched.trigger_crossed_at is None
+
+
+def test_ordinary_nonovernight_preopen_behavior_unchanged():
+    """Preservation: a non-overnight, non-daily setup never engages
+    _pre_open_skip in the first place (self.overnight is False and the
+    signal is not daily), so this fix must not change its behavior at all,
+    regardless of confirmation state or wall-clock session.
+    """
+    sig = _spy_call_signal()
+    watched = WatchedSignal(sig, overnight=False)
+    watched.entry_trigger = 450.0
+    watched.stop_level = 447.0
+
+    for _ in range(watched.MOMENTUM_POLLS_REQUIRED):
+        _ = watched.check(bid=449.0, ask=451.0)
+    assert watched.state == WatchState.TRIGGERED
+    watched.state = WatchState.PENDING
+    watched._trigger_stop_collision = False
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        state = watched.check(bid=446.0, ask=449.0)
+
+    assert state == WatchState.INVALIDATED, (
+        "Non-overnight setups were never gated by _pre_open_skip and must "
+        "invalidate identically before and after this fix."
+    )
+
+
+def test_call_invalidation_preserves_independent_put_on_same_ticker():
+    """Opposite-side preservation: a confirmed CALL breaking its CALL stop
+    must invalidate ONLY the CALL watcher. The independent PUT setup on the
+    same underlying (distinct signal_id/local_order_id by construction --
+    see app.py's _discord_signal_id(symbol, "CALL"/"PUT", ...)) must remain
+    untouched: not deleted, not terminalized, not consumed, still eligible
+    to activate later on its own PUT trigger confirmation.
+    """
+    broker = MagicMock()
+    osm = _MockOSM()
+    watcher = APEntryWatcher(broker, order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+
+    call_sig = _spy_call_signal()
+    put_sig = _spy_call_signal()  # fresh signal_id/local_order_id
+    put_sig["side"] = "PUT"
+    put_sig["entry_price"] = 445.0
+    put_sig["stop_price"] = 448.0
+    put_sig["target_price"] = 440.0
+    put_sig["canonical_signal_id"] = put_sig["signal_id"]
+    put_sig["metadata"] = {
+        "canonical_signal_id": put_sig["canonical_signal_id"],
+        "client_id": put_sig["client_id"],
+        "execution_mode": put_sig["execution_mode"],
+    }
+    assert call_sig["signal_id"] != put_sig["signal_id"]
+    assert call_sig["local_order_id"] != put_sig["local_order_id"]
+
+    call_watched = WatchedSignal(call_sig, overnight=True)
+    call_watched.entry_trigger = 450.0
+    call_watched.stop_level = 447.0
+    call_watched._watcher_ref = watcher
+
+    put_watched = WatchedSignal(put_sig, overnight=True)
+    put_watched.entry_trigger = 445.0
+    put_watched.stop_level = 448.0
+    put_watched._watcher_ref = watcher
+
+    watcher._pending = [call_watched, put_watched]
+    watcher._dedup_set = {call_sig["signal_id"], put_sig["signal_id"]}
+
+    # Confirm the CALL breach (regular hours), independent of PUT entirely.
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=False):
+        for _ in range(call_watched.MOMENTUM_POLLS_REQUIRED):
+            _ = call_watched.check(bid=449.0, ask=451.0)
+    assert call_watched.state == WatchState.TRIGGERED
+    assert call_watched.trigger_crossed_at is not None
+    call_watched.state = WatchState.PENDING
+    call_watched._trigger_stop_collision = False
+
+    # PUT has NEVER been touched — still pristine, pre-breach.
+    assert put_watched.state == WatchState.PENDING
+    assert put_watched.trigger_crossed_at is None
+
+    # CALL stop breaks during pre-market (the exact #414 scenario).
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        call_state = call_watched.check(bid=446.0, ask=449.0)
+    assert call_state == WatchState.INVALIDATED
+    assert call_watched._pending_audit.get("reason_code") == "stop_bid_below_call_stop"
+
+    # PUT must be completely unaffected by the CALL invalidation: same
+    # object identity, same signal_id, still PENDING, still un-triggered,
+    # still present in the watcher's own bookkeeping.
+    assert put_watched.state == WatchState.PENDING, (
+        "CALL invalidation must not alter the independent PUT setup's state."
+    )
+    assert put_watched.trigger_crossed_at is None, (
+        "CALL invalidation must not fabricate PUT trigger evidence."
+    )
+    assert put_watched in watcher._pending, (
+        "The independent PUT watcher must not be removed/deleted/consumed "
+        "as a side effect of the CALL invalidating."
+    )
+    assert put_sig["signal_id"] in watcher._dedup_set, (
+        "The PUT's dedup entry must not be cleared by the CALL invalidating."
+    )
+
+    # PUT can still activate normally afterward, on its OWN trigger only —
+    # the CALL's stop break does not auto-activate the opposite side.
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=False):
+        for _ in range(put_watched.MOMENTUM_POLLS_REQUIRED):
+            put_state = put_watched.check(bid=444.0, ask=446.0)
+    assert put_state == WatchState.TRIGGERED, (
+        "The independent PUT must still be able to confirm its own trigger "
+        "after the CALL side invalidated."
+    )
+    assert put_watched.trigger_crossed_at is not None
+
+    forbidden_broker_methods = {
+        "submit_order", "submit_option_order",
+        "cancel_order", "cancel_option_order",
+    }
+    for call_ in broker.mock_calls:
+        called_name = str(call_).split("(", 1)[0]
+        for forbidden in forbidden_broker_methods:
+            assert forbidden not in called_name, (
+                f"Broker.{forbidden} must not be called by either the CALL "
+                f"invalidation or the PUT confirmation; observed {call_}"
+            )
+    assert osm.cancel_calls == [] and osm.expire_calls == [], (
+        "Neither the CALL invalidation nor the PUT confirmation reaching "
+        "trigger state should cancel or expire any order — trigger "
+        "confirmation alone is not a broker submission or order mutation."
+    )
+
+
+def test_put_invalidation_preserves_independent_call_on_same_ticker():
+    """Opposite-side preservation, mirrored: a confirmed PUT breaking its
+    PUT stop must invalidate ONLY the PUT watcher; the independent CALL
+    setup remains eligible and activates only on its own trigger.
+    """
+    broker = MagicMock()
+    osm = _MockOSM()
+    watcher = APEntryWatcher(broker, order_state_machine=osm, mode="PAPER")
+    watcher._persist_watcher_audit = lambda *args, **kwargs: None
+
+    put_sig = _spy_call_signal()
+    put_sig["side"] = "PUT"
+    put_sig["entry_price"] = 445.0
+    put_sig["stop_price"] = 448.0
+    put_sig["target_price"] = 440.0
+    put_sig["canonical_signal_id"] = put_sig["signal_id"]
+    put_sig["metadata"] = {
+        "canonical_signal_id": put_sig["canonical_signal_id"],
+        "client_id": put_sig["client_id"],
+        "execution_mode": put_sig["execution_mode"],
+    }
+    call_sig = _spy_call_signal()
+    assert call_sig["signal_id"] != put_sig["signal_id"]
+    assert call_sig["local_order_id"] != put_sig["local_order_id"]
+
+    put_watched = WatchedSignal(put_sig, overnight=True)
+    put_watched.entry_trigger = 445.0
+    put_watched.stop_level = 448.0
+    put_watched._watcher_ref = watcher
+
+    call_watched = WatchedSignal(call_sig, overnight=True)
+    call_watched.entry_trigger = 450.0
+    call_watched.stop_level = 447.0
+    call_watched._watcher_ref = watcher
+
+    watcher._pending = [put_watched, call_watched]
+    watcher._dedup_set = {put_sig["signal_id"], call_sig["signal_id"]}
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=False):
+        for _ in range(put_watched.MOMENTUM_POLLS_REQUIRED):
+            _ = put_watched.check(bid=444.0, ask=446.0)
+    assert put_watched.state == WatchState.TRIGGERED
+    assert put_watched.trigger_crossed_at is not None
+    put_watched.state = WatchState.PENDING
+    put_watched._trigger_stop_collision = False
+
+    assert call_watched.state == WatchState.PENDING
+    assert call_watched.trigger_crossed_at is None
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=True):
+        put_state = put_watched.check(bid=447.0, ask=449.0)
+    assert put_state == WatchState.INVALIDATED
+    assert put_watched._pending_audit.get("reason_code") == "stop_ask_above_put_stop"
+
+    assert call_watched.state == WatchState.PENDING, (
+        "PUT invalidation must not alter the independent CALL setup's state."
+    )
+    assert call_watched.trigger_crossed_at is None, (
+        "PUT invalidation must not fabricate CALL trigger evidence."
+    )
+    assert call_watched in watcher._pending
+    assert call_sig["signal_id"] in watcher._dedup_set
+
+    with patch("ap_entry_watcher._is_pre_market_now", return_value=False):
+        for _ in range(call_watched.MOMENTUM_POLLS_REQUIRED):
+            call_state = call_watched.check(bid=449.0, ask=451.0)
+    assert call_state == WatchState.TRIGGERED, (
+        "The independent CALL must still be able to confirm its own "
+        "trigger after the PUT side invalidated."
+    )
+    assert call_watched.trigger_crossed_at is not None
+
+    forbidden_broker_methods = {
+        "submit_order", "submit_option_order",
+        "cancel_order", "cancel_option_order",
+    }
+    for call_ in broker.mock_calls:
+        called_name = str(call_).split("(", 1)[0]
+        for forbidden in forbidden_broker_methods:
+            assert forbidden not in called_name, (
+                f"Broker.{forbidden} must not be called by either the PUT "
+                f"invalidation or the CALL confirmation; observed {call_}"
+            )
+    assert osm.cancel_calls == [] and osm.expire_calls == [], (
+        "Neither the PUT invalidation nor the CALL confirmation reaching "
+        "trigger state should cancel or expire any order."
+    )
