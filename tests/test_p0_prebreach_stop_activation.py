@@ -34,8 +34,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import ap_entry_watcher as aew_module
 from ap_entry_watcher import (
     APEntryWatcher,
+    ET,
     RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
     WatchedSignal,
     WatchState,
@@ -1363,9 +1365,26 @@ def test_queue_and_rescue_plans_share_canonical_id_authority_without_generation(
     osm = _MockOSM()
     watcher = APEntryWatcher(MagicMock(), order_state_machine=osm, mode="PAPER")
     watcher._persist_watcher_audit = lambda *args, **kwargs: None
-    with patch.object(watcher, "_is_regular_session_now", return_value=False), \
+    # Fixed pre-market ET time (2 AM), matching this test's already-explicit
+    # intent (via the two session-method patches below) that real-world
+    # session/session-boundary state must not gate this test — it exists to
+    # prove canonical-ID normalization, not arm-time trigger-through checks.
+    # Without this, add_signal()'s own inline `datetime.now(ET)` read (a
+    # separate mechanism from the two patched methods) makes this test
+    # wall-clock-dependent: it silently passes before 9:30 ET and fails
+    # after, since the CALL/PUT arm-time already-through-trigger check
+    # (PR #304 "Bug C") only activates during real regular session and the
+    # queue_plan (CALL, trigger=450) and rescue_plan (PUT, trigger=450)
+    # share one quote that cannot simultaneously satisfy both sides'
+    # not-yet-through conditions once that check is live.
+    _fixed_pre_market_et = datetime(2026, 8, 5, 2, 0, 0, tzinfo=ET)
+    with patch.object(aew_module._base, "datetime") as mock_dt, \
+         patch.object(watcher, "_is_regular_session_now", return_value=False), \
          patch.object(watcher, "_is_past_entry_cutoff_now", return_value=False), \
          patch.object(watcher, "_get_quote", return_value={"bid": 450.0, "ask": 450.0}):
+        mock_dt.now.return_value = _fixed_pre_market_et
+        mock_dt.fromisoformat.side_effect = datetime.fromisoformat
+        mock_dt.side_effect = lambda *a, **k: datetime(*a, **k)
         assert watcher.watch(queue_plan, "lo-queue-canonical-407") is True
         assert watcher.watch(rescue_plan, "lo-rescue-canonical-407") is True
 
