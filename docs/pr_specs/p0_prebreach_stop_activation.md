@@ -105,6 +105,21 @@ Cross-client, cross-mode, or stale-generation evidence must not activate the sto
 
 The change is active behavior, but it is limited to pending-entry classification before broker submission.
 
+### LIVE trigger-evidence persistence fence
+
+For every LIVE watcher, ordinary queue-created and deferred signals alike, the
+confirmed trigger evidence must be persisted to the existing `orders.meta`
+record before `on_trigger` is allowed to run. The pre-callback write carries
+the confirmed `trigger_crossed_at`, its lifecycle provenance, the first-breach
+quote evidence when available, and `trigger_confirmed_at`.
+
+If that write is unavailable, returns false, or raises, the watcher remains the
+active owner in `PENDING`, schedules its bounded persistence retry, and skips
+`on_trigger`, selector work, contract selection, and broker work for that poll.
+The next callback attempt is permitted only after persistence succeeds, while
+the existing callback-exception and `KEEP_WATCHER` disposition contract remains
+unchanged. PAPER keeps its existing non-critical persistence behavior.
+
 It must not:
 
 - bypass trigger confirmation
@@ -175,6 +190,7 @@ Repeated classifier/watcher evaluations must not:
 - Restart does not forget stop activation.
 - PUT diagnostics report the same ask used for control.
 - PAPER and LIVE share the same geometry classification; later differences may only come from explicit mode/account policies.
+- Every LIVE confirmed trigger persists durable evidence before callback work for both ordinary and deferred signals; persistence failure does not enter selector or broker work.
 - Focused tests pass.
 - Adjacent watcher/recovery tests pass.
 - Exact-head P0 CI passes.
