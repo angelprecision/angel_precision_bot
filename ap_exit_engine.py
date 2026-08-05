@@ -1367,6 +1367,18 @@ class ManagedPosition:
     _proof_finalized:   bool                   = False
     proof_logged:       bool                   = False
 
+    # PR-C (baseline repair): protective-monitoring ghost field. Previously
+    # assigned dynamically in _apply_retry_intent_to_position() and read
+    # defensively elsewhere via getattr(pos, "protective_monitoring_state", "")
+    # -- that "" default at the read sites is the codebase's own established
+    # convention for "no protective-monitoring state yet", since none of the
+    # five PROTECTIVE_STATE_* constants represents an unset/normal state.
+    # Declared here, following the same PR-B rationale (survives
+    # dataclasses.replace() / asdict() roundtrips; a freshly constructed or
+    # hydrated position no longer raises AttributeError before any
+    # protective-monitoring code path has run).
+    protective_monitoring_state: str = ""
+
     # Exit coordination
     exit_in_flight:       bool  = False
     pending_exit_reason:  str   = ""

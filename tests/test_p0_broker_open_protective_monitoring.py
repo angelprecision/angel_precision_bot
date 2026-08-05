@@ -32,6 +32,49 @@ from ap_exit_engine import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_stale_exit_decision_generation_claim():
+    """Baseline repair.
+
+    This file's tests all use the fixed identity (client_id=jason@example.com,
+    position_id=pos-protective-1) via _pos() below, and assume
+    APExitEngine._submit_exit_decision is the raw, unwrapped implementation.
+
+    ap.exit_decision_idempotency_guard.install_exit_decision_idempotency_guard()
+    is a real, process-wide, one-time monkey-patch (it checks a module-level
+    "already installed" flag and no-ops on repeat calls) that replaces
+    _submit_exit_decision with a version backed by a real Postgres table,
+    exit_decision_generation_claims, keyed on
+    (client_id, position_id, remaining_qty, exit_generation). Once any test
+    anywhere in the same pytest process calls install_trade_lifecycle_guards()
+    (several other P0 test files do), that patch cannot be reverted for the
+    rest of the process -- there is no corresponding uninstall.
+
+    If a real claim row for this file's fixed test identity is ever left
+    behind (by this file's own tests, if the guard happens to be active, or
+    by any accidental key collision), every subsequent test using the same
+    identity would find a pre-existing claim and be incorrectly treated as a
+    duplicate submission -- exactly the AttributeError/AssertionError
+    previously observed only when this file ran after certain other tests in
+    the full suite, never in isolation. Clearing this file's own key before
+    every test makes it deterministic regardless of guard-install state or
+    what ran earlier in the same process -- a test-only change; it does not
+    touch production submit/cancel/precedence behavior.
+    """
+    try:
+        with ap_db.conn() as c:
+            c.execute(
+                "DELETE FROM exit_decision_generation_claims "
+                "WHERE client_id = %s AND position_id = %s",
+                ("jason@example.com", "pos-protective-1"),
+            )
+    except Exception:
+        # Table may not exist under a mock DATABASE_URL / when the guard was
+        # never installed in this process -- both are fine; nothing to clear.
+        pass
+    yield
+
+
 def _pos(**overrides) -> ManagedPosition:
     data = dict(
         ticker="SPY",
@@ -771,3 +814,95 @@ def test_normal_stop_evaluates_before_hard_emergency_threshold_with_valid_quote(
     assert decision.should_act is True
     assert decision.reason_code != "HARD_STOP"
     assert "DEEP_LOSS_STOP" in decision.reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Baseline repair regressions: protective_monitoring_state initialization
+# and cross-test claim isolation.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_freshly_constructed_position_has_protective_monitoring_state_field():
+    """A bare ManagedPosition(), constructed with only the required
+    positional/keyword fields and nothing touching protective monitoring,
+    must not raise AttributeError on this field -- it must exist with the
+    codebase's own established "unset" default."""
+    pos = ManagedPosition(
+        ticker="SPY",
+        option_symbol="SPY260717C00500000",
+        side="CALL",
+        quantity=1,
+        entry_price=1.00,
+        underlying_entry=500.0,
+        underlying_target=510.0,
+        underlying_stop=495.0,
+    )
+    assert hasattr(pos, "protective_monitoring_state")
+    assert pos.protective_monitoring_state == "", (
+        "the default must match the codebase's own existing convention -- "
+        "every defensive read site uses getattr(pos, "
+        "'protective_monitoring_state', ''), and none of the five "
+        "PROTECTIVE_STATE_* constants represents an unset/normal state"
+    )
+
+
+def test_hydration_construction_path_has_the_field_via_dataclass_default():
+    """Mirrors ap_exit_engine.APExitEngine.seed_from_db's exact construction
+    shape: ManagedPosition(...) with only the fields that function passes
+    explicitly, proving the restart/hydration path also gets the field via
+    the dataclass default -- not via any hydration-specific code that could
+    itself be skipped or fail."""
+    mp = ManagedPosition(
+        ticker="SPY",
+        option_symbol="SPY260717C00500000",
+        side="CALL",
+        quantity=1,
+        entry_price=1.10,
+        underlying_entry=500.0,
+        underlying_target=0.0,
+        underlying_stop=0.0,
+        position_id="pos-hydrated-1",
+        client_id="jason@example.com",
+        signal_id="sig-hydrated-1",
+        execution_mode="live",
+    )
+    assert hasattr(mp, "protective_monitoring_state")
+    assert mp.protective_monitoring_state == ""
+
+
+def test_eod_forced_risk_and_take_profit_paths_do_not_double_submit(monkeypatch):
+    """Explicit no-duplicate-action proof for the actual fix: with the claim
+    table properly isolated (via the autouse fixture), both previously-
+    failing scenarios must invoke on_exit at most once, never twice, and the
+    take-profit path must never invoke it at all on a stale quote."""
+    engine = _engine(monkeypatch, broker_qty=1)
+    pos = _pos(last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90))
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    submitted = []
+    engine.on_exit = lambda p, d: submitted.append(d.reason_code) or {
+        "accepted": True, "local_order_id": "L-baseline-1", "broker_order_id": "B-baseline-1",
+    }
+    monkeypatch.setattr(exit_engine_mod, "_is_option_quote_stale", lambda pos, now_utc: (True, 90.0, "stale_option_quote"))
+
+    result = engine._submit_exit_decision(pos, _decision("EOD_FORCE_CLOSE", "EOD FORCE CLOSE"))
+
+    assert result is True
+    assert submitted.count("EOD_FORCE_CLOSE") == 1, "exactly one submission, never a duplicate"
+
+    # Take-profit on the same stale-quote condition must not submit at all.
+    pos2 = _pos(
+        position_id="pos-protective-2",
+        last_option_quote_update_ts=datetime.now(timezone.utc) - timedelta(seconds=90),
+    )
+    engine._positions = [pos2]
+    engine._positions_by_id = {pos2.position_id: pos2}
+    tp_submitted = []
+    engine.on_exit = lambda p, d: tp_submitted.append(d.reason_code)
+    _patch_db(monkeypatch)
+
+    tp_result = engine._submit_exit_decision(pos2, _decision("IMMEDIATE_TP", "IMMEDIATE TP -- +20%"))
+
+    assert tp_result is False
+    assert tp_submitted == [], "take-profit must never submit on a stale quote"
+    assert pos2.protective_monitoring_state == PROTECTIVE_STATE_DEGRADED
