@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 import os
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -386,7 +387,35 @@ class TestAlreadyThroughTrigger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestStuckTriggerReady:
-    def test_stuck_trigger_ready_terminalized_no_broker_submit(self):
+    def test_owned_watcher_legacy_evidence_uses_read_only_ownership_path(self):
+        """A healthy owner must not be hidden by a non-atomic legacy proof gap."""
+        r = _row(meta={"trigger_crossed_at": "2026-01-01T09:30:00+00:00"})
+        watcher = _MockWatcher()
+        watcher._pending = [SimpleNamespace(
+            signal={
+                "local_order_id": r["local_order_id"],
+                "signal_id": r["signal_id"],
+                "client_id": r["client_id"],
+                "execution_mode": r["execution_mode"],
+            },
+            state="PENDING",
+            _ownership_quarantine=False,
+        )]
+        watcher._dedup_set = {r["signal_id"]}
+        watcher.watch = MagicMock()
+
+        rec, osm = _make_recovery(r, watcher=watcher, quote_result=False)
+        outcome = rec.recover_one_row(r)
+
+        assert outcome == _RowOutcome.WATCHER_OWNED
+        watcher.watch.assert_not_called()
+        assert rec._row_failure_reasons == {}
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+        rec.broker.submit_order.assert_not_called()
+        rec.broker.cancel_order.assert_not_called()
+
+    def test_stuck_trigger_ready_with_unproven_evidence_is_left_unchanged(self):
         r = _row(meta={"watcher_audit": {"reason_code": "trigger_ready"},
                        "trigger_crossed_at": "2026-01-01T09:30:00+00:00"})
         broker = MagicMock()
@@ -394,10 +423,17 @@ class TestStuckTriggerReady:
         rec, osm = _make_recovery(r, watcher=_MockWatcher())
         summary = rec.recover_all([r])
 
-        assert summary["terminalized"] == 1
+        # The timestamp is present but its lifecycle provenance is absent.
+        # Recovery must not terminalize, clear, or reclassify the exact order.
+        assert summary["terminalized"] == 0
         assert summary["watchers_rearmed"] == 0
+        assert summary["unresolved_cleanup_failures"] == 1
         broker.submit_order.assert_not_called()
-        assert "restart_stuck_trigger_ready" in osm.cancel_calls[0][1]
+        assert osm.cancel_calls == []
+        assert osm.meta_writes == []
+        assert rec._row_failure_reasons[r["local_order_id"]] == (
+            "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

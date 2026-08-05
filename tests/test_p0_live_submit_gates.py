@@ -417,8 +417,12 @@ class TestGateIntegration:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestTriggerCrossedAtStamping:
-    """WatchedSignal.check must stamp trigger_crossed_at on FIRST breach, not
-    on confirmed trigger — the age gate needs the earliest evidence."""
+    """PR #407: WatchedSignal.check stamps trigger_crossed_at ONLY after
+    MOMENTUM_POLLS_REQUIRED breaches confirm. The stamped VALUE is the
+    FIRST breach poll timestamp (so the trigger-age gate still gets the
+    earliest evidence). Before confirmation, _pending_first_breach_at
+    holds the first-breach time; on confirmation it is promoted into
+    trigger_crossed_at and cleared."""
 
     def _make_watched(self, side="CALL", trigger=100.0):
         import ap_entry_watcher as ew
@@ -432,24 +436,37 @@ class TestTriggerCrossedAtStamping:
         }, overnight=False)
         return w
 
-    def test_call_stamps_trigger_crossed_at_on_first_breach(self):
+    def test_call_stamps_trigger_crossed_at_on_confirmation(self):
         w = self._make_watched(side="CALL", trigger=100.0)
         assert w.trigger_crossed_at is None
-        # First breach: ask crosses trigger
+        # First breach: state stays PENDING, trigger_crossed_at NOT set,
+        # but _pending_first_breach_at records the first-breach time.
         w.check(bid=99.5, ask=100.5)
-        assert w.trigger_crossed_at is not None
-        first_stamp = w.trigger_crossed_at
-        # Second breach — must NOT overwrite (age uses FIRST breach)
-        w.check(bid=99.7, ask=100.7)
-        assert w.trigger_crossed_at == first_stamp, (
-            "trigger_crossed_at must not be overwritten by subsequent breaches"
+        assert w.trigger_crossed_at is None, (
+            "PR #407: trigger_crossed_at is not stamped until confirmation."
         )
+        pending_ts = w._pending_first_breach_at
+        assert pending_ts is not None
+        # Confirming breach — trigger_crossed_at now set to the FIRST
+        # breach poll timestamp (not this poll's).
+        w.check(bid=99.7, ask=100.7)
+        assert w.trigger_crossed_at == pending_ts, (
+            "trigger_crossed_at must be the FIRST breach poll timestamp, "
+            "not the confirmation poll's."
+        )
+        assert w._pending_first_breach_at is None
 
-    def test_put_stamps_trigger_crossed_at_on_first_breach(self):
+    def test_put_stamps_trigger_crossed_at_on_confirmation(self):
         w = self._make_watched(side="PUT", trigger=100.0)
         assert w.trigger_crossed_at is None
-        w.check(bid=99.5, ask=100.5)   # bid <= trigger for PUT
-        assert w.trigger_crossed_at is not None
+        # First breach (bid <= trigger for PUT): PENDING, not yet stamped.
+        w.check(bid=99.5, ask=100.5)
+        assert w.trigger_crossed_at is None
+        pending_ts = w._pending_first_breach_at
+        assert pending_ts is not None
+        # Confirmation.
+        w.check(bid=99.7, ask=100.7)
+        assert w.trigger_crossed_at == pending_ts
 
     def test_first_breach_bid_and_ask_stamped(self):
         w = self._make_watched(side="CALL", trigger=100.0)

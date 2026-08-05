@@ -85,6 +85,7 @@ jobs:
             tests/test_readiness_contract.py \
             tests/test_funnel_fixes.py \
             tests/test_p0_regression_suite.py \
+            tests/test_p0_prebreach_stop_activation.py \
             tests/test_p0_entry_metadata_guard.py \
             tests/test_p0_trade_flow_contracts.py \
             tests/test_p0_fresh_sync_live_submit_quote.py \
@@ -156,6 +157,8 @@ jobs:
             tests/test_p0_position_execution_mode_schema.py \
             tests/test_p0_live_startup_preflight.py \
             tests/test_p0_live_one_contract_runner_precedence.py \
+            tests/test_p0_live_submit_gates.py \
+            tests/test_p0_live_submit_gates_amended.py \
             tests/test_p0_touched_profit_bid_confirmation.py \
             tests/test_p0_position_quote_monitor_binding_health.py \
             tests/test_p0_live_position_direct_quote_recovery.py \

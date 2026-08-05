@@ -127,8 +127,9 @@ class TestExecutionModeDerivation:
 
 class TestTriggerTimestampPersistence:
 
-    def test_watcher_stamps_trigger_crossed_at_on_first_breach(self):
-        """WatchedSignal.check stamps trigger_crossed_at at breach_count==0."""
+    def test_watcher_stamps_trigger_crossed_at_on_confirmation(self):
+        """PR #407: trigger_crossed_at is stamped ONLY after
+        MOMENTUM_POLLS_REQUIRED breaches confirm."""
         import ap_entry_watcher as ew
         w = ew.WatchedSignal(
             {"signal_id": "S1", "ticker": "GS", "side": "CALL",
@@ -136,21 +137,31 @@ class TestTriggerTimestampPersistence:
             overnight=False,
         )
         assert w.trigger_crossed_at is None
-        w.check(bid=99.5, ask=100.5)  # first breach
-        assert w.trigger_crossed_at is not None, "trigger_crossed_at must be stamped on first breach"
+        w.check(bid=99.5, ask=100.5)   # first breach — PENDING, not stamped
+        assert w.trigger_crossed_at is None
+        assert w._pending_first_breach_at is not None
+        w.check(bid=99.7, ask=100.7)   # confirming breach — stamped
+        assert w.trigger_crossed_at is not None, (
+            "trigger_crossed_at must be stamped after confirmation."
+        )
 
-    def test_trigger_crossed_at_not_overwritten_on_second_breach(self):
-        """Subsequent breach polls must not overwrite first_breach timestamp."""
+    def test_trigger_crossed_at_equals_first_breach_timestamp(self):
+        """PR #407: the stamped value MUST be the FIRST breach poll's
+        timestamp (LIVE trigger-age gate relies on the earliest evidence),
+        not the confirmation poll's."""
         import ap_entry_watcher as ew
         w = ew.WatchedSignal(
             {"signal_id": "S1", "ticker": "GS", "side": "CALL",
              "entry_price": 100.0, "score": 65.0, "grade": "B"},
             overnight=False,
         )
-        w.check(bid=99.5, ask=100.5)
-        first = w.trigger_crossed_at
-        w.check(bid=99.8, ask=100.8)
-        assert w.trigger_crossed_at == first, "trigger_crossed_at must not be overwritten"
+        w.check(bid=99.5, ask=100.5)   # first breach
+        pending_ts = w._pending_first_breach_at
+        assert pending_ts is not None
+        w.check(bid=99.8, ask=100.8)   # confirmation
+        assert w.trigger_crossed_at == pending_ts, (
+            "trigger_crossed_at must equal the FIRST breach poll timestamp."
+        )
 
     def test_trigger_age_gate_blocks_when_missing(self):
         """LIVE blocks when trigger_crossed_at is None."""
@@ -202,7 +213,11 @@ class TestTriggerTimestampPersistence:
              "entry_price": 100.0, "score": 65.0, "grade": "B"},
             overnight=False,
         )
-        w.check(bid=99.5, ask=100.5)
+        # PR #407: trigger_crossed_at is only populated after confirmation;
+        # feed two qualifying polls so the watcher has durable evidence.
+        w.check(bid=99.5, ask=100.5)   # first breach
+        w.check(bid=99.7, ask=100.7)   # confirmation
+        assert w.trigger_crossed_at is not None
         crossed, _ = resolve_trigger_timestamps(order_meta={}, watched_signal=w)
         assert crossed == w.trigger_crossed_at.isoformat()
 

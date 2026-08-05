@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -36,6 +37,11 @@ import pytest
 
 import ap_overnight_reeval as ov
 
+# Dynamic signal date — keeps signal age below OVERNIGHT_SIGNAL_MAX_AGE_DAYS (4).
+_SIG_DATE = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+_SIG_TS   = (datetime.now(timezone.utc) - timedelta(days=1)).strftime(
+    "%Y-%m-%dT20:00:00+00:00"
+)
 
 EXISTING_LOCAL_OID = "local-existing-pending-1"
 
@@ -81,11 +87,11 @@ def _shared_row():
             "target_price":  520.0,
             "score":         85.0,
             "tier":          "A",
-            "created_at":    "2026-07-27T20:00:00+00:00",
+            "created_at":    _SIG_TS,
             "prior_day_high": 502.0,
             "prior_day_low":  498.0,
         },
-        "created_ts": "2026-07-27T20:00:00+00:00",
+        "created_ts": _SIG_TS,
         "_source":    "ap_signals",
     }
 
@@ -126,7 +132,7 @@ def _terminal_marker_row(*, reason="reattach_post_watch_terminal:CANCELED"):
         "order_local_id": EXISTING_LOCAL_OID,
         "metadata": {
             "execution_mode": "paper",
-            "overnight_reeval_session_key": "2026-07-27",
+            "overnight_reeval_session_key": _SIG_DATE,
             "local_order_id": EXISTING_LOCAL_OID,
             "reattach_terminal_suppression": True,
         },
@@ -143,7 +149,7 @@ def _reattach_in_progress_row():
         "order_local_id": EXISTING_LOCAL_OID,
         "metadata": {
             "execution_mode": "paper",
-            "overnight_reeval_session_key": "2026-07-27",
+            "overnight_reeval_session_key": _SIG_DATE,
             "local_order_id": EXISTING_LOCAL_OID,
             "reattach_in_progress": True,
         },
@@ -160,7 +166,7 @@ def _prior_terminal_row_with_current_reattach_metadata():
         "order_local_id": EXISTING_LOCAL_OID,
         "metadata": {
             "execution_mode": "paper",
-            "overnight_reeval_session_key": "2026-07-27",
+            "overnight_reeval_session_key": _SIG_DATE,
             "local_order_id": EXISTING_LOCAL_OID,
             "reattach_in_progress": True,
         },
@@ -205,7 +211,7 @@ def test_ambiguity_marker_storage_failure_returns_false(monkeypatch):
         signal_id="sig-reattach-integration",
         signal_payload=_shared_row()["payload"],
         local_order_id=EXISTING_LOCAL_OID,
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
         post_status=ov._LS_LOOKUP_FAILED,
         post_row_status="",
     )
@@ -244,7 +250,7 @@ def test_ambiguity_marker_success_requires_readback_verification(monkeypatch):
         signal_id="sig-reattach-integration",
         signal_payload=_shared_row()["payload"],
         local_order_id=EXISTING_LOCAL_OID,
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
         post_status=ov._LS_NOT_FOUND,
         post_row_status="",
     )
@@ -255,7 +261,7 @@ def test_ambiguity_marker_success_requires_readback_verification(monkeypatch):
     assert args[2] == "reattach_post_watch_ambiguous_terminal_or_missing"
     assert kwargs["order_local_id"] == EXISTING_LOCAL_OID
     assert kwargs["extra_meta"]["execution_mode"] == "paper"
-    assert kwargs["extra_meta"]["overnight_reeval_session_key"] == "2026-07-27"
+    assert kwargs["extra_meta"]["overnight_reeval_session_key"] == _SIG_DATE
 
 
 def test_terminal_marker_readback_suppresses_new_disposition(monkeypatch):
@@ -290,7 +296,7 @@ def test_terminal_marker_readback_suppresses_new_disposition(monkeypatch):
         "jose@example.com",
         _shared_row()["payload"],
         "paper",
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
     )
 
     assert disp.disposition == ov._DISPOSITION_ALREADY_TERMINAL
@@ -298,7 +304,7 @@ def test_terminal_marker_readback_suppresses_new_disposition(monkeypatch):
 
 def test_second_full_reeval_terminal_marker_creates_zero_replacement_orders(monkeypatch):
     _install_reeval_sub_module_stubs(monkeypatch)
-    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: "2026-07-27")
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: _SIG_DATE)
     _install_opportunity_ledger_stub(
         monkeypatch,
         create_opportunities=MagicMock(return_value=1),
@@ -408,7 +414,7 @@ def test_latest_no_status_terminal_order_suppresses_new_disposition(monkeypatch)
         "jose@example.com",
         _shared_row()["payload"],
         "paper",
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
     )
 
     assert disp.disposition == ov._DISPOSITION_ALREADY_TERMINAL
@@ -441,7 +447,7 @@ def test_reattach_in_progress_terminal_opportunity_does_not_outrank_active_order
         "jose@example.com",
         _shared_row()["payload"],
         "paper",
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
     )
 
     assert disp.disposition == ov._DISPOSITION_REATTACH_WATCHER
@@ -450,7 +456,7 @@ def test_reattach_in_progress_terminal_opportunity_does_not_outrank_active_order
 
 def test_pre_watch_fence_failure_never_calls_watcher_or_replaces_order(monkeypatch):
     _install_reeval_sub_module_stubs(monkeypatch)
-    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: "2026-07-27")
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: _SIG_DATE)
     monkeypatch.setattr(
         ov, "_fetch_watching_signals_with_status_impl",
         lambda _c: ov._FetchWatchingSignalsResult(
@@ -520,7 +526,7 @@ def test_pre_watch_fence_failure_never_calls_watcher_or_replaces_order(monkeypat
 
 def test_post_watch_marker_failure_then_second_reeval_cannot_return_new(monkeypatch):
     _install_reeval_sub_module_stubs(monkeypatch)
-    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: "2026-07-27")
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: _SIG_DATE)
     monkeypatch.setattr(
         ov, "_fetch_watching_signals_with_status_impl",
         lambda _c: ov._FetchWatchingSignalsResult(
@@ -632,7 +638,7 @@ def test_post_watch_marker_failure_then_second_reeval_cannot_return_new(monkeypa
 
 def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order(monkeypatch):
     _install_reeval_sub_module_stubs(monkeypatch)
-    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: "2026-07-27")
+    monkeypatch.setattr(ov, "_overnight_reeval_session_key", lambda *_a, **_kw: _SIG_DATE)
     monkeypatch.setattr(
         ov, "_fetch_watching_signals_with_status_impl",
         lambda _c: ov._FetchWatchingSignalsResult(
@@ -657,7 +663,7 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
         "order_local_id": "",
         "metadata": {
             "execution_mode": "paper",
-            "overnight_reeval_session_key": "2026-07-26",
+            "overnight_reeval_session_key": (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d"),
         },
     }
 
@@ -751,7 +757,7 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
 
     assert first["retryable_deferred"] == 1
     assert ledger_row["opportunity_status"] == "MISSED"
-    assert ledger_row["metadata"]["overnight_reeval_session_key"] == "2026-07-27"
+    assert ledger_row["metadata"]["overnight_reeval_session_key"] == _SIG_DATE
     assert ledger_row["metadata"]["reattach_in_progress"] is True
     assert watcher_watch.call_count == 1
     assert watcher_watch.call_args.args[1] == EXISTING_LOCAL_OID
@@ -761,7 +767,7 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
         "jose@example.com",
         _shared_row()["payload"],
         "paper",
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
     )
     assert restarted_disp.disposition == ov._DISPOSITION_REATTACH_WATCHER
     assert restarted_disp.existing_local_order_id == EXISTING_LOCAL_OID
@@ -793,7 +799,13 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
     broker.replace_order.assert_not_called()
 
 
-def _run_one_attempt(monkeypatch, *, mock_ledger):
+def _run_one_attempt(
+    monkeypatch,
+    *,
+    mock_ledger,
+    watcher_already_owns=False,
+    legacy_confirmed=False,
+):
     """Drive the real run_overnight_reeval loop for a single attempt.
     Uses spies on master_control, contract_selector, OSM create/broker to
     prove the fence assertions."""
@@ -822,13 +834,19 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
     )
     # Active-order query: return the same PENDING_TRIGGER row on every call
     # (both attempt 1 and attempt 2).
+    _active_row = _pending_trigger_order_row()
+    if legacy_confirmed:
+        _active_row["meta"] = {
+            "trigger_crossed_at": "2026-08-03T16:00:00+00:00",
+        }
     monkeypatch.setattr(
         ov, "_query_active_entry_order",
-        lambda *_a, **_kw: (ov._LS_FOUND, _pending_trigger_order_row()),
+        lambda *_a, **_kw: (ov._LS_FOUND, dict(_active_row)),
     )
+    _pre_watch_fence = MagicMock(return_value=True)
     monkeypatch.setattr(
         ov, "_persist_reattach_in_progress_fence",
-        MagicMock(return_value=True),
+        _pre_watch_fence,
     )
     monkeypatch.setattr(ov, "_persist_watcher_armed_proof", mock_ledger)
 
@@ -864,7 +882,7 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
         # caller invokes watch() which we stub to True. In production the
         # real watcher runs; here we only need to prove NO cancel / create
         # calls originate from the reeval outer flow.
-        has_order=lambda _oid: False,
+        has_order=lambda _oid: watcher_already_owns,
         watch=MagicMock(return_value=True),
     )
 
@@ -888,7 +906,33 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
         selector_select=selector_select,
         broker=broker,
         entry_watcher=entry_watcher,
+        pre_watch_fence=_pre_watch_fence,
     )
+
+
+def test_owned_reattach_legacy_evidence_retries_proof_without_rearm(monkeypatch):
+    """An existing owner may retry its durable proof, but never watch twice."""
+    proof_write = MagicMock(return_value=True)
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        watcher_already_owns=True,
+        legacy_confirmed=True,
+    )
+
+    assert state.result["armed"] == 1
+    assert state.result["unresolved"] == 0
+    assert state.result["retryable_deferred"] == 0
+    state.entry_watcher.watch.assert_not_called()
+    state.pre_watch_fence.assert_not_called()
+    proof_write.assert_called_once()
+    state.mc_evaluate.assert_not_called()
+    state.selector_select.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
 
 
 def test_two_attempts_reuse_same_local_order_id_and_never_create_or_broker(monkeypatch):

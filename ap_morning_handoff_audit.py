@@ -54,6 +54,11 @@ import types
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
+
 log = logging.getLogger("ap.morning_handoff_audit")
 
 # ── Architectural safety proof constant ───────────────────────────────────────
@@ -221,6 +226,19 @@ def _build_audit_plan(order: dict):
 
     plan = types.SimpleNamespace(
         signal_id=str(order.get("signal_id") or meta.get("signal_id") or order.get("local_order_id") or ""),
+        canonical_signal_id=str(
+            order.get("canonical_signal_id") or meta.get("canonical_signal_id") or ""
+        ),
+        client_id=str(order.get("client_id") or meta.get("client_id") or ""),
+        execution_mode=str(
+            order.get("execution_mode") or meta.get("execution_mode") or ""
+        ).strip().lower(),
+        local_order_id=str(order.get("local_order_id") or ""),
+        materialization_generation=meta.get("materialization_generation"),
+        trigger_crossed_at=(
+            order.get("trigger_crossed_at")
+            or meta.get("trigger_crossed_at")
+        ),
         plan_id=str(order.get("plan_id") or meta.get("plan_id") or ""),
         ticker=ticker,
         side=direction,
@@ -492,6 +510,21 @@ def _audit_row(
             "MORNING_HANDOFF_ROW client=%s order_id=%s symbol=%s "
             "classification=%s action=skip_plan_build_failed",
             client_id, local_id, symbol, BROKEN_NEEDS_CODE,
+        )
+        return row_result
+
+    # A confirmed timestamp with unproven lifecycle identity is not a reason
+    # to clear evidence and continue as pre-breach.  Refuse before the watcher
+    # or the audit metadata writer can touch the order.
+    if not recovery_trigger_evidence_identity_is_proven(plan, local_id):
+        rearm_reason = RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+        row_result["classification"] = BLOCKED_RISK
+        row_result["action"] = "rearm_refused_identity_unproven"
+        row_result["rearm_succeeded"] = False
+        row_result["rearm_reason"] = rearm_reason
+        log.critical(
+            "MORNING_HANDOFF_ROW %s client=%s order_id=%s — row unchanged",
+            rearm_reason, client_id, local_id,
         )
         return row_result
 

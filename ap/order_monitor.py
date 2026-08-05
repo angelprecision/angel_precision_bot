@@ -638,7 +638,18 @@ class APOrderMonitor:
                         )
                         continue
 
-                    # Re-arm not attempted, or attempted and failed.
+                    # Re-arm not attempted, or attempted and failed. A
+                    # confirmed-trigger row with unproven lifecycle identity
+                    # is not a stale CREATED order. Leave the exact row alone;
+                    # no metadata attempt marker or cleanup is safe here.
+                    if _rearm_reason == "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN":
+                        log.critical(
+                            "[%s] RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN "
+                            "local=%s — preserving lost-handoff order unchanged",
+                            self.client_id, local_id,
+                        )
+                        continue
+
                     # Now we honestly declare LOST_HANDOFF and cancel.
                     _enriched_reason = (
                         f"LOST_HANDOFF_90S: CREATED for {age_secs:.0f}s > {TIMEOUT_CREATED}s — "
@@ -1611,6 +1622,26 @@ class APOrderMonitor:
             return (False, False, "plan_rebuild_failed")
 
         try:
+            from ap_entry_watcher import recovery_trigger_evidence_identity_is_proven
+
+            if not recovery_trigger_evidence_identity_is_proven(plan, local_order_id):
+                return (
+                    True,
+                    False,
+                    "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN",
+                )
+        except Exception as exc:
+            log.critical(
+                "[%s] LOST_HANDOFF_EVIDENCE_IDENTITY_CHECK_FAILED | local=%s error=%s",
+                self.client_id, local_order_id, exc,
+            )
+            return (
+                True,
+                False,
+                "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN",
+            )
+
+        try:
             armed = bool(watcher.watch(plan, local_order_id))
         except Exception as exc:
             log.error(
@@ -2096,7 +2127,17 @@ class APOrderMonitor:
             )
 
             plan = _types.SimpleNamespace(
-                client_id=self.client_id,
+                client_id=str(
+                    order.get("client_id")
+                    or meta.get("client_id")
+                    or self.client_id
+                    or ""
+                ),
+                canonical_signal_id=str(
+                    order.get("canonical_signal_id")
+                    or meta.get("canonical_signal_id")
+                    or ""
+                ),
                 signal_id=str(
                     order.get("signal_id")
                     or meta.get("signal_id")
@@ -2126,9 +2167,15 @@ class APOrderMonitor:
                 execution_mode=str(
                     order.get("execution_mode")
                     or meta.get("execution_mode")
-                    or self.client_mode
+                    or getattr(self, "client_mode", "")
                     or ""
                 ).lower(),
+                local_order_id=str(order.get("local_order_id") or ""),
+                materialization_generation=meta.get("materialization_generation"),
+                trigger_crossed_at=(
+                    order.get("trigger_crossed_at")
+                    or meta.get("trigger_crossed_at")
+                ),
                 metadata=dict(meta) if isinstance(meta, dict) else {},
             )
             # Preserve deferred-contract behavior — see PR #140.

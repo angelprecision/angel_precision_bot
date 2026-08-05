@@ -25,9 +25,14 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from ap.logger import get_logger
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
 from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
@@ -242,6 +247,34 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
+        def _reject_unproven_trigger_evidence() -> str:
+            self._mark_failure(
+                local_oid, RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+            )
+            self._log_identity_failure(
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                local_oid=local_oid,
+                signal_id=signal_id,
+                durable_client=row_client,
+                durable_mode=row_mode,
+            )
+            return _RowOutcome.UNRESOLVED
+
+        # Confirmed-trigger evidence is a durable lifecycle fact, not a quote
+        # hint.  First probe the registry so an already-owned watcher can take
+        # its read-only proof path.  This matters for the legacy/crash window
+        # where the watcher is healthy but the timestamp and its provenance
+        # were not persisted atomically.  No rearm or cleanup is permitted on
+        # that path; the exact watcher/order ownership proof is the authority.
+        watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
+        _evidence_proven = recovery_trigger_evidence_identity_is_proven(row, local_oid)
+
+        # For an unowned row, keep the fail-closed fence before quote checks,
+        # selector work, watcher admission, or any terminal/cleanup action.
+        # A row with no timestamp remains an ordinary pre-breach candidate.
+        if watcher_owned is not True and not _evidence_proven:
+            return _reject_unproven_trigger_evidence()
+
         # Live quote check.
         live_quote_abt: Optional[bool] = None
         _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
@@ -252,9 +285,6 @@ class PendingTriggerRestartRecovery:
                 live_quote_abt = self.quote_check_fn(self.broker, _symbol, _side, _trigger)
             except Exception as _qe:
                 log.debug("RESTART_RECOVERY quote check failed local=%s: %s", local_oid, _qe)
-
-        # Registry ownership check.
-        watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
 
         # Classification.
         cls = classify_pending_trigger_row(
@@ -270,20 +300,30 @@ class PendingTriggerRestartRecovery:
         )
 
         # Action table.
+        if cls == PTC.WAITING_VALID and watcher_owned is True:
+            # Already owned — verify proof then count.  This is deliberately
+            # before the evidence gate below: it performs no rearm, callback,
+            # selector, broker, or cleanup action and preserves the exact row.
+            proof = self._verify_registry_ownership(local_oid, row)
+            if proof and proof.get("dedup_held"):
+                return _RowOutcome.WATCHER_OWNED
+            # Proof failed despite watcher reporting owned — treat as orphan.
+            log.warning(
+                "RESTART_RECOVERY watcher_owned=True but proof failed local=%s — "
+                "treating as orphan", local_oid,
+            )
+
+        # Every path that would classify, terminalize, retry, or rearm an
+        # order with confirmed-trigger evidence still requires durable
+        # lifecycle identity.  Only the proven already-owned fast path above
+        # is allowed to return before this fence.
+        if not _evidence_proven:
+            return _reject_unproven_trigger_evidence()
+
         if cls == PTC.NOT_PENDING_TRIGGER:
             return _RowOutcome.SKIPPED
 
         elif cls == PTC.WAITING_VALID:
-            if watcher_owned is True:
-                # Already owned — verify proof then count.
-                proof = self._verify_registry_ownership(local_oid, row)
-                if proof and proof.get("dedup_held"):
-                    return _RowOutcome.WATCHER_OWNED
-                # Proof failed despite watcher reporting owned — treat as orphan.
-                log.warning(
-                    "RESTART_RECOVERY watcher_owned=True but proof failed local=%s — "
-                    "treating as orphan", local_oid,
-                )
             # Not owned or proof failed: quote check then rearm.
             if live_quote_abt is True:
                 return self._terminalize_with_reason(
@@ -537,6 +577,18 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.UNRESOLVED
 
         if not armed:
+            if getattr(watcher, "_last_reject_reason", None) == (
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+            ):
+                self._mark_failure(
+                    local_oid, RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+                )
+                log.critical(
+                    "RESTART_RECOVERY_%s local=%s — row left unchanged",
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                    local_oid,
+                )
+                return _RowOutcome.UNRESOLVED
             log.warning(
                 "RESTART_RECOVERY_WATCH_RETURNED_FALSE local=%s — terminalizing",
                 local_oid,
@@ -1282,33 +1334,111 @@ def _emit_summary(summary: dict) -> None:
 
 # ── Plan builder ──────────────────────────────────────────────────────────────
 
-def _build_plan(row: dict, plan_builder_fn=None) -> Optional[dict]:
+class _RecoveryPlan(SimpleNamespace):
+    """Attribute-first restart plan with a read-only legacy ``get`` shim.
+
+    ``APEntryWatcher.watch()`` consumes recovery plans through attributes.
+    The shim keeps older recovery observers that only read ``plan.get`` from
+    breaking without turning the plan back into a plain dict.
+    """
+
+    def get(self, name: str, default=None):
+        return getattr(self, name, default)
+
+
+def _build_plan(row: dict, plan_builder_fn=None) -> Optional[Any]:
     if plan_builder_fn is not None:
         try:
             return plan_builder_fn(row)
         except Exception:
             return None
     try:
-        return {
-            "signal_id":      row.get("signal_id") or "",
-            "plan_id":        row.get("plan_id") or "",
-            "local_order_id": row.get("local_order_id") or "",
-            "client_id":      row.get("client_id") or "",
-            "client_email":   row.get("client_id") or row.get("client_email") or "",
-            "execution_mode": row.get("execution_mode") or "",
-            "ticker":         row.get("ticker") or row.get("symbol") or "",
-            "side":           row.get("direction") or row.get("side") or "",
-            "entry_price":    float(row.get("entry_price") or row.get("trigger_price") or 0),
-            "trigger_price":  float(_canonical_underlying_trigger(row) or row.get("trigger_price") or 0),
-            "stop_price":     float(row.get("stop_price") or row.get("stop_underlying") or 0),
-            "target_price":   float(row.get("target_price") or row.get("target_underlying") or 0),
-            "score":          float(row.get("score") or 0),
-            "tier":           row.get("tier") or "",
-            "timeframe":      row.get("timeframe") or "",
-            "contracts":      int(row.get("contracts") or 0),
-            "contract":       row.get("contract") or "",
-            "limit_price":    float(row.get("limit_price") or 0),
-        }
+        meta = _extract_meta(row)
+        signal_id = str(row.get("signal_id") or meta.get("signal_id") or "")
+        canonical_signal_id = str(
+            row.get("canonical_signal_id")
+            or meta.get("canonical_signal_id")
+            or ""
+        )
+        local_order_id = str(row.get("local_order_id") or "")
+        client_id = str(row.get("client_id") or meta.get("client_id") or "")
+        execution_mode = str(
+            row.get("execution_mode") or meta.get("execution_mode") or ""
+        ).strip().lower()
+        ticker = str(
+            row.get("ticker")
+            or row.get("symbol")
+            or meta.get("ticker")
+            or meta.get("symbol")
+            or ""
+        ).upper()
+        side = str(row.get("direction") or row.get("side") or meta.get("side") or "").strip().upper()
+        trigger = float(
+            _canonical_underlying_trigger(row)
+            or row.get("trigger_price")
+            or row.get("entry_price")
+            or meta.get("trigger_price")
+            or meta.get("entry_trigger")
+            or meta.get("signal_entry_price")
+            or 0
+        )
+        stop = float(
+            row.get("stop_price")
+            or row.get("stop_underlying")
+            or meta.get("stop_price")
+            or meta.get("stop_underlying")
+            or 0
+        )
+        target = float(
+            row.get("target_price")
+            or row.get("target_underlying")
+            or meta.get("target_price")
+            or meta.get("target_underlying")
+            or 0
+        )
+        generation = meta.get("materialization_generation")
+        try:
+            generation = int(generation) if generation is not None else None
+        except (TypeError, ValueError):
+            generation = None
+        return _RecoveryPlan(
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
+            plan_id=str(row.get("plan_id") or meta.get("plan_id") or ""),
+            ticker=ticker,
+            side=side,
+            direction=side,
+            entry_trigger=trigger,
+            trigger_price=trigger,
+            stop_underlying=stop,
+            stop_price=stop,
+            target_underlying=target,
+            target_price=target,
+            client_id=client_id,
+            client_email=client_id or str(row.get("client_email") or ""),
+            execution_mode=execution_mode,
+            local_order_id=local_order_id,
+            materialization_generation=generation,
+            trigger_crossed_at=(
+                row.get("trigger_crossed_at")
+                or meta.get("trigger_crossed_at")
+            ),
+            metadata=dict(meta),
+            score=float(row.get("score") or meta.get("score") or 0),
+            tier=row.get("tier") or meta.get("tier") or "",
+            timeframe=row.get("timeframe") or meta.get("timeframe") or "",
+            contracts=int(row.get("contracts") or row.get("qty") or meta.get("selected_qty") or 0),
+            quantity=int(row.get("quantity") or row.get("qty") or meta.get("selected_qty") or 0),
+            contract_symbol=str(
+                row.get("contract_symbol")
+                or row.get("contract")
+                or meta.get("contract_symbol")
+                or meta.get("selected_contract")
+                or ""
+            ),
+            contract=str(row.get("contract") or meta.get("selected_contract") or ""),
+            limit_price=float(row.get("limit_price") or meta.get("selected_limit") or 0),
+        )
     except Exception:
         return None
 

@@ -196,6 +196,30 @@ def test_eligible_arm_within_continuation_seeds_late_state(monkeypatch):
     assert invalidate_calls == []
 
 
+def test_eligible_put_pretrigger_stop_touch_keeps_arm_flow_open(monkeypatch):
+    """A PUT stop-side ask touch before the bid trigger must not reject the arm."""
+    invalidate_calls = []
+
+    def _on_inv(w_shim):
+        invalidate_calls.append(w_shim._pending_audit)
+
+    w = _make_min_watcher(on_invalidate=_on_inv)
+    monkeypatch.setattr(w, "_get_quote", lambda _t: {"bid": 62.45, "ask": 62.49})
+    monkeypatch.setattr(w, "_persist_watcher_audit", lambda *_a, **_kw: None)
+    monkeypatch.setattr(w, "_is_live_runtime", lambda: False)
+    _force_regular_session(monkeypatch)
+
+    captured = {}
+    monkeypatch.setattr(w, "add_signal", lambda sig: captured.update(sig) or True)
+
+    plan = _eligible_plan(side="PUT", trigger=61.90, stop=62.49, target=30.0)
+    result = w.watch(plan, local_order_id="local-bac-pretrigger-1")
+
+    assert result is True
+    assert captured.get("_late_attachment_seed") is None
+    assert invalidate_calls == []
+
+
 def test_ordinary_put_arm_slightly_below_trigger_rejected(monkeypatch):
     """PUT symmetric: ordinary direct arm with bid slightly below trigger
     must be rejected (committed-main strict behavior)."""

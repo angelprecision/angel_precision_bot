@@ -21,9 +21,18 @@ Disposition rules:
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 import ap_overnight_reeval as ov
+
+# Dynamic signal date — keeps signal age below OVERNIGHT_SIGNAL_MAX_AGE_DAYS (4)
+# regardless of when the test runs.
+_SIG_DATE = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+_SIG_TS   = (datetime.now(timezone.utc) - timedelta(days=1)).strftime(
+    "%Y-%m-%dT20:00:00+00:00"
+)
 
 
 NONTERMINAL_STATUSES = [
@@ -84,7 +93,7 @@ def test_disposition_never_returns_new_for_any_nonterminal_status(monkeypatch, s
         client_id="jose@example.com",
         signal={"signal_id": "canon-sig-1"},
         execution_mode="paper",
-        session_key="2026-07-27",
+        session_key=_SIG_DATE,
     )
 
     # Never NEW (would trigger create_entry_order).
@@ -164,9 +173,9 @@ def test_end_to_end_created_row_never_reaches_master_control_or_create_entry_ord
             "target_price":  520.0,
             "score":         85.0,
             "tier":          "A",
-            "created_at":    "2026-07-27T20:00:00+00:00",
+            "created_at":    _SIG_TS,
         },
-        "created_ts": "2026-07-27T20:00:00+00:00",
+        "created_ts": _SIG_TS,
         "_source":    "ap_signals",
     }
     monkeypatch.setattr(

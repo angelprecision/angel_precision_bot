@@ -35,6 +35,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from ap_canonical_signal import build_canonical_signal_id
+
 # ── Lifecycle + health wiring (defensive — watcher runs standalone if missing) ──
 try:
     from ap_lifecycle import (
@@ -73,6 +75,250 @@ log = logging.getLogger("ap.entry_watcher")
 
 # Module-level ET zoneinfo: declared BEFORE any helper that uses it.
 ET = ZoneInfo("America/New_York")
+
+# Stable recovery refusal reason.  Recovery callers use this exact marker to
+# leave the durable order untouched when confirmed-trigger provenance cannot be
+# bound to the lifecycle being restored.
+RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN = (
+    "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN"
+)
+
+
+def _parse_trigger_crossed_at(raw) -> Optional[datetime]:
+    """Parse durable first-breach evidence without treating bad data as proof.
+
+    PR #407 tightening: naive datetimes and ISO strings without timezone
+    information are rejected. Silent coercion to UTC would fabricate
+    confirmed-breach evidence out of ambiguous input, which is exactly what
+    the pre-breach stop-activation invariant forbids. Returns None for any
+    input the caller must treat as absence-of-proof.
+    """
+    if raw is None:
+        return None
+    # datetime instances: accept iff tz-aware.
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo is not None else None
+    # Anything else must be a non-empty ISO-8601 string with tz info.
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        value = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if value.tzinfo is None:
+        return None
+    return value
+
+
+def _coerce_materialization_generation(raw) -> Optional[int]:
+    try:
+        if raw is None or raw == "":
+            return None
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_trigger_crossed_at_provenance(
+    signal: dict,
+    local_order_id: Optional[str],
+) -> dict:
+    """Build the durable identity for a newly confirmed trigger timestamp.
+
+    ``materialization_generation`` is deliberately not part of this contract.
+    The ordinary queue path owns no durable generation; deferred materialization
+    owns one for its retry CAS separately.  Mixing the two contracts would make
+    ordinary queue-created watchers either fabricate a generation or fail
+    recovery for a lifecycle that never had one.
+    """
+    metadata = signal.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    raw_signal_id = str(
+        signal.get("signal_id") or metadata.get("signal_id") or ""
+    ).strip()
+    canonical_signal_id = str(
+        signal.get("canonical_signal_id")
+        or metadata.get("canonical_signal_id")
+        or ""
+    ).strip()
+    if not canonical_signal_id:
+        # Ordinary queue and deferred-rescue plans do not carry a separate
+        # canonical field.  Use the same authority as OSM instead of storing
+        # a REEVAL:<uuid>:<suffix> as durable lifecycle evidence.
+        canonical_signal_id = build_canonical_signal_id(raw_signal_id)
+    return {
+        "canonical_signal_id": canonical_signal_id,
+        "client_id": str(
+            signal.get("client_id")
+            or signal.get("client_email")
+            or metadata.get("client_id")
+            or metadata.get("client_email")
+            or ""
+        ).strip().lower(),
+        "execution_mode": str(
+            signal.get("execution_mode") or metadata.get("execution_mode") or ""
+        ).strip().lower(),
+        "local_order_id": str(
+            local_order_id or signal.get("local_order_id") or ""
+        ).strip(),
+    }
+
+
+def _trigger_crossed_at_provenance_matches(
+    provenance,
+    signal: dict,
+    local_order_id: Optional[str],
+) -> bool:
+    """Return True only for complete, exact lifecycle provenance."""
+    if not isinstance(provenance, dict):
+        return False
+    expected = _build_trigger_crossed_at_provenance(signal, local_order_id)
+    actual = {
+        "canonical_signal_id": str(provenance.get("canonical_signal_id") or "").strip(),
+        "client_id": str(provenance.get("client_id") or "").strip().lower(),
+        "execution_mode": str(provenance.get("execution_mode") or "").strip().lower(),
+        "local_order_id": str(provenance.get("local_order_id") or "").strip(),
+    }
+    if (
+        not expected["canonical_signal_id"]
+        or not expected["client_id"]
+        or not expected["execution_mode"]
+        or not expected["local_order_id"]
+    ):
+        return False
+    if (
+        not actual["canonical_signal_id"]
+        or not actual["client_id"]
+        or not actual["execution_mode"]
+        or not actual["local_order_id"]
+    ):
+        return False
+    return actual == expected
+
+
+def recovery_trigger_evidence_identity_is_proven(
+    signal_or_row,
+    local_order_id: Optional[str] = None,
+) -> bool:
+    """Return whether durable confirmed-trigger evidence is safe to reuse.
+
+    A lifecycle with no durable ``trigger_crossed_at`` has no confirmed
+    evidence to validate and remains eligible for an ordinary pre-breach
+    rearm.  Once a timestamp is present, the timestamp itself must be valid
+    and its four-field identity must match exactly.  This helper is shared by
+    recovery callers so they can refuse before quote, selector, watcher, or
+    order-side effects occur.
+    """
+    def _coerce_metadata(raw_metadata):
+        if raw_metadata is None:
+            return {}, True
+        if isinstance(raw_metadata, dict):
+            return dict(raw_metadata), True
+        if isinstance(raw_metadata, str):
+            if not raw_metadata.strip():
+                return {}, True
+            try:
+                parsed = json.loads(raw_metadata)
+            except Exception:
+                return {}, False
+            return (dict(parsed), True) if isinstance(parsed, dict) else ({}, False)
+        return {}, False
+
+    def _metadata_source(primary, fallback):
+        if primary is None:
+            return fallback
+        if isinstance(primary, str) and not primary.strip():
+            return fallback
+        if isinstance(primary, (dict, list, tuple, set)) and not primary:
+            return fallback
+        return primary
+
+    if isinstance(signal_or_row, dict):
+        signal = dict(signal_or_row)
+        raw_metadata = _metadata_source(
+            signal.get("metadata"), signal.get("meta")
+        )
+        metadata, metadata_is_valid = _coerce_metadata(raw_metadata)
+        if not metadata_is_valid:
+            log.critical(
+                "%s | malformed recovery metadata; refusing rearm",
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+            )
+            return False
+        signal["metadata"] = metadata
+        # Persisted orders commonly keep canonical identity in JSONB metadata
+        # while client/mode remain columns. Hydrate the same production
+        # identity shape used by plan objects before comparing provenance.
+        signal["canonical_signal_id"] = (
+            signal.get("canonical_signal_id")
+            or metadata.get("canonical_signal_id")
+        )
+        signal["client_id"] = (
+            signal.get("client_id")
+            or metadata.get("client_id")
+            or metadata.get("client_email")
+        )
+        signal["execution_mode"] = (
+            signal.get("execution_mode")
+            or metadata.get("execution_mode")
+        )
+        raw_crossed_at = signal.get("trigger_crossed_at")
+        if raw_crossed_at is None:
+            raw_crossed_at = metadata.get("trigger_crossed_at")
+        provenance = metadata.get("trigger_crossed_at_provenance")
+        resolved_local_order_id = (
+            local_order_id
+            or signal.get("local_order_id")
+        )
+    else:
+        raw_metadata = _metadata_source(
+            getattr(signal_or_row, "metadata", None),
+            getattr(signal_or_row, "meta", None),
+        )
+        metadata, metadata_is_valid = _coerce_metadata(raw_metadata)
+        if not metadata_is_valid:
+            log.critical(
+                "%s | malformed recovery metadata; refusing rearm",
+                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+            )
+            return False
+        signal = {
+            "signal_id": getattr(signal_or_row, "signal_id", ""),
+            "canonical_signal_id": (
+                getattr(signal_or_row, "canonical_signal_id", "")
+                or metadata.get("canonical_signal_id")
+            ),
+            "client_id": (
+                getattr(signal_or_row, "client_id", "")
+                or metadata.get("client_id")
+                or metadata.get("client_email")
+            ),
+            "execution_mode": (
+                getattr(signal_or_row, "execution_mode", "")
+                or metadata.get("execution_mode")
+            ),
+            "local_order_id": getattr(signal_or_row, "local_order_id", ""),
+            "metadata": metadata,
+        }
+        raw_crossed_at = getattr(signal_or_row, "trigger_crossed_at", None)
+        if raw_crossed_at is None:
+            raw_crossed_at = metadata.get("trigger_crossed_at")
+        provenance = metadata.get("trigger_crossed_at_provenance")
+        resolved_local_order_id = local_order_id or signal.get("local_order_id")
+
+    if raw_crossed_at is None:
+        return True
+    if _parse_trigger_crossed_at(raw_crossed_at) is None:
+        return False
+    return _trigger_crossed_at_provenance_matches(
+        provenance, signal, resolved_local_order_id
+    )
 
 # FUNNEL FIX (2026-05-20, hardened 2026-05-21) + PR-C / BUG-EW-1:
 # Pre-open helper for the stop-touch invalidation guard. Returns True from
@@ -382,7 +628,22 @@ class WatchedSignal:
         # when the confirmed poll fires after MOMENTUM_POLLS_REQUIRED breaches).
         # Used by ap.live_submit_gates.check_trigger_age_gate to enforce
         # ENTRY_TRIGGER_MAX_AGE_SEC (default 120s).
-        self.trigger_crossed_at: Optional[datetime] = None
+        _trigger_crossed_raw = signal.get("trigger_crossed_at")
+        if _trigger_crossed_raw is None:
+            _signal_meta = signal.get("metadata") or {}
+            if isinstance(_signal_meta, dict):
+                _trigger_crossed_raw = _signal_meta.get("trigger_crossed_at")
+        # Existing order metadata is the durable lifecycle evidence used to
+        # keep the scanner stop active after a restart/reattachment.  Invalid
+        # values are not proof and therefore leave the stop dormant until a
+        # fresh canonical breach is observed.
+        self.trigger_crossed_at: Optional[datetime] = _parse_trigger_crossed_at(
+            _trigger_crossed_raw
+        )
+        # PR #407: pending (unconfirmed) first-breach timestamp. Populated on
+        # the first breach poll of a streak, promoted into trigger_crossed_at
+        # only after MOMENTUM_POLLS_REQUIRED breaches confirm. Never persisted.
+        self._pending_first_breach_at: Optional[datetime] = None
         self.first_breach_bid: float = 0.0
         self.first_breach_ask: float = 0.0
         self.trigger_price: Optional[float] = None
@@ -651,6 +912,9 @@ class WatchedSignal:
                     stop=self.stop_level,
                     target_complete=_tgt_complete,
                     decisive_drift_exceeded=_decisive_drift,
+                    trigger_previously_breached=(
+                        getattr(self, "trigger_crossed_at", None) is not None
+                    ),
                 )
                 self.late_attachment_last_quote = (
                     float(_late_dec.quote) if _late_dec.quote is not None else None
@@ -823,16 +1087,13 @@ class WatchedSignal:
             if ask >= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = ask
-                    # ── P0 (PR #305) trigger-age gate:
-                    # Stamp the first-breach moment so the LIVE pre-submit
-                    # trigger-age gate can enforce ENTRY_TRIGGER_MAX_AGE_SEC.
-                    # This is the "trigger crossed" moment, distinct from
-                    # triggered_at (which is when the confirmed poll fires
-                    # after MOMENTUM_POLLS_REQUIRED breaches).
-                    if getattr(self, "trigger_crossed_at", None) is None:
-                        self.trigger_crossed_at = now
-                        self.first_breach_bid = bid
-                        self.first_breach_ask = ask
+                    # PR #407: durable trigger_crossed_at proof is issued ONLY
+                    # after MOMENTUM_POLLS_REQUIRED breaches confirm. Until
+                    # then, retain the first-breach poll timestamp in a private
+                    # pending slot and record the observed first-breach quote.
+                    self._pending_first_breach_at = now
+                    self.first_breach_bid = bid
+                    self.first_breach_ask = ask
                     log.debug(
                         "[%s] CALL breach candidate — ask=$%.2f >= trigger=$%.2f",
                         self.ticker,
@@ -841,6 +1102,17 @@ class WatchedSignal:
                     )
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
+                    # PR #407: confirmation promotes the pending first-breach
+                    # timestamp into the durable trigger_crossed_at proof.
+                    # trigger_crossed_at MUST be the first-breach poll time,
+                    # not the confirmation-poll time — see LIVE trigger-age
+                    # gate (ENTRY_TRIGGER_MAX_AGE_SEC) semantics.
+                    if self.trigger_crossed_at is None:
+                        confirmed_at = self._pending_first_breach_at
+                        if confirmed_at is None:
+                            confirmed_at = now
+                        self.trigger_crossed_at = confirmed_at
+                    self._pending_first_breach_at = None
                     self.state = WatchState.TRIGGERED
                     self.triggered_at = now
                     self.trigger_price = ask
@@ -866,8 +1138,14 @@ class WatchedSignal:
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
             )
+            # PR #407: scanner-stop protection is dormant until a CONFIRMED
+            # entry-direction breach exists (trigger_crossed_at is set only
+            # after MOMENTUM_POLLS_REQUIRED breaches). Same-poll trigger/stop
+            # collision remains fail-closed because the confirmation branch
+            # above assigns trigger_crossed_at within this same check() call.
             if (
                 self.stop_level
+                and getattr(self, "trigger_crossed_at", None) is not None
                 and bid <= self.stop_level * (1 - WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -954,11 +1232,10 @@ class WatchedSignal:
             if bid <= self.entry_trigger:
                 if self.breach_count == 0:
                     self.breach_price = bid
-                    # ── P0 (PR #305) trigger-age gate — see CALL branch above.
-                    if getattr(self, "trigger_crossed_at", None) is None:
-                        self.trigger_crossed_at = now
-                        self.first_breach_bid = bid
-                        self.first_breach_ask = ask
+                    # PR #407: see CALL branch — pending until confirmed.
+                    self._pending_first_breach_at = now
+                    self.first_breach_bid = bid
+                    self.first_breach_ask = ask
                     log.debug(
                         "[%s] PUT breach candidate — bid=$%.2f <= trigger=$%.2f",
                         self.ticker,
@@ -967,6 +1244,13 @@ class WatchedSignal:
                     )
                 self.breach_count += 1
                 if self.breach_count >= self.MOMENTUM_POLLS_REQUIRED:
+                    # PR #407: confirmation promotes pending timestamp.
+                    if self.trigger_crossed_at is None:
+                        confirmed_at = self._pending_first_breach_at
+                        if confirmed_at is None:
+                            confirmed_at = now
+                        self.trigger_crossed_at = confirmed_at
+                    self._pending_first_breach_at = None
                     self.state = WatchState.TRIGGERED
                     self.triggered_at = now
                     self.trigger_price = bid
@@ -987,8 +1271,12 @@ class WatchedSignal:
                 (self.overnight or _safe_is_daily_signal(self))
                 and _is_pre_market_now()
             )
+            # PR #407: PUT scanner stop is dormant until confirmed breach.
+            # Symmetric to CALL; a pre-trigger ask touch is inert. Same-poll
+            # collision fail-closed via confirmation-branch assignment above.
             if (
                 self.stop_level
+                and getattr(self, "trigger_crossed_at", None) is not None
                 and ask >= self.stop_level * (1 + WRONG_DIR_BUFFER_PCT)
                 and not _pre_open_skip
             ):
@@ -1100,6 +1388,7 @@ class APEntryWatcher:
         # Real watcher-level duplicate barrier. Cleanup alone is not enough;
         # the key must be initialized and enforced before a signal is armed.
         self._dedup_set: set[str] = set()
+        self._last_reject_reason: Optional[str] = None
 
     @staticmethod
     def _is_deferred_signal(signal: dict) -> bool:
@@ -3048,43 +3337,75 @@ class APEntryWatcher:
         _recovery_rearm    = bool(recovery_rearm)
         _materialization_resume = bool(materialization_resume)
         _no_cancel_on_reject = bool(no_cancel_on_reject or recovery_rearm)
+        _plan_metadata = getattr(plan, "metadata", None) or {}
+        if not isinstance(_plan_metadata, dict):
+            _plan_metadata = {}
+        _plan_signal_id = str(getattr(plan, "signal_id", "") or "").strip()
+        _plan_canonical_signal_id = str(
+            getattr(plan, "canonical_signal_id", "")
+            or _plan_metadata.get("canonical_signal_id")
+            or ""
+        ).strip()
+        if not _plan_canonical_signal_id:
+            _plan_canonical_signal_id = build_canonical_signal_id(
+                _plan_signal_id, _plan_metadata
+            )
+        _plan_materialization_generation = getattr(
+            plan, "materialization_generation", None
+        )
+        if _plan_materialization_generation is None:
+            _plan_materialization_generation = _plan_metadata.get(
+                "materialization_generation"
+            )
 
         signal_dict = {
-            "signal_id": getattr(plan, "signal_id", str(uuid.uuid4())),
+            "signal_id": _plan_signal_id or str(uuid.uuid4()),
+            "canonical_signal_id": _plan_canonical_signal_id,
             "ticker": getattr(plan, "ticker", ""),
             "side": getattr(plan, "side", "CALL"),
             "score": getattr(plan, "score", 65.0),
             "grade": getattr(plan, "tier", "B"),
             "entry_price": getattr(plan, "trigger_price", None),
+            "entry_trigger": getattr(
+                plan, "entry_trigger", getattr(plan, "trigger_price", None)
+            ),
             "stop_price": getattr(plan, "stop_underlying", None),
             "target_price": getattr(plan, "target_underlying", None),
+            # Preserve existing durable first-breach evidence for the
+            # classifier and the reconstructed WatchedSignal.  No new truth
+            # source is introduced; this is only the order/plan metadata that
+            # already survives watcher recovery.
+            "trigger_crossed_at": (
+                getattr(plan, "trigger_crossed_at", None)
+                or (_plan_metadata.get("trigger_crossed_at") if isinstance(_plan_metadata, dict) else None)
+            ),
             "plan_id": getattr(plan, "plan_id", ""),
             "local_order_id": local_order_id,
+            "metadata": dict(_plan_metadata),
+            "materialization_generation": _plan_materialization_generation,
             "client_id": str(
                 getattr(plan, "client_id", "")
-                or (getattr(plan, "metadata", None) or {}).get("client_id")
+                or _plan_metadata.get("client_id")
                 or ""
             ),
             "execution_mode": str(
                 getattr(plan, "execution_mode", "")
-                or (getattr(plan, "metadata", None) or {}).get("execution_mode")
+                or _plan_metadata.get("execution_mode")
                 or self.mode
             ).lower(),
             "watcher_token": self.owner_token,
             "trigger_generation": int(
-                (getattr(plan, "metadata", None) or {}).get(
-                    "materialization_generation", 1
-                ) or 1
+                _plan_materialization_generation or 1
             ),
             "deferred_retry_not_before": (
-                (getattr(plan, "metadata", None) or {}).get("next_retry_at")
-                or (getattr(plan, "metadata", None) or {}).get("materialization_next_retry_at")
+                _plan_metadata.get("next_retry_at")
+                or _plan_metadata.get("materialization_next_retry_at")
             ),
             # PR #182: carry trade_queue.id through to breach time so
             # write_deferred_breach_last_error() can find the queue row.
             # Populated by queue.py _dispatch() onto plan.metadata before watch() is called.
-            "queue_id": (getattr(plan, "metadata", None) or {}).get("queue_id"),
-            "trade_queue_id": (getattr(plan, "metadata", None) or {}).get("trade_queue_id"),
+            "queue_id": _plan_metadata.get("queue_id"),
+            "trade_queue_id": _plan_metadata.get("trade_queue_id"),
             # PR #388 late-attachment policy provenance flag. True ONLY for
             # plans built by the PR#388 seams (run_overnight_reeval new
             # watchers, REATTACH_WATCHER reconstructed plans, and the open-
@@ -3093,9 +3414,7 @@ class APEntryWatcher:
             # arms keep committed-main's strict anti-chase invariant.
             "late_attachment_policy_eligible": bool(
                 getattr(plan, "late_attachment_policy_eligible", False)
-                or (getattr(plan, "metadata", None) or {}).get(
-                    "late_attachment_policy_eligible", False
-                )
+                or _plan_metadata.get("late_attachment_policy_eligible", False)
             ),
             "contract_symbol": getattr(plan, "contract_symbol", ""),
             "pattern": getattr(plan, "pattern", ""),
@@ -3104,7 +3423,7 @@ class APEntryWatcher:
             "timeframe": getattr(plan, "timeframe", "1d"),
             "strategy_type": getattr(plan, "strategy_type", ""),
             "contract_deferred": bool(
-                (getattr(plan, "metadata", None) or {}).get("contract_deferred")
+                _plan_metadata.get("contract_deferred")
                 or str(getattr(plan, "contract_symbol", "") or "").upper().startswith("DEFERRED:")
             ),
             "trigger": {
@@ -3113,6 +3432,22 @@ class APEntryWatcher:
                 "pt1": getattr(plan, "target_underlying", None),
             },
         }
+
+        if _recovery_rearm or _materialization_resume:
+            if not recovery_trigger_evidence_identity_is_proven(
+                signal_dict, local_order_id
+            ):
+                self._last_reject_reason = (
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
+                )
+                log.critical(
+                    "[%s] %s local_order_id=%s — refusing recovery rearm; "
+                    "durable order and trigger evidence remain unchanged",
+                    signal_dict.get("ticker") or "?",
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                    local_order_id or "?",
+                )
+                return False
 
         now_et = datetime.now(ET)
         post_session = (
@@ -3790,6 +4125,10 @@ class APEntryWatcher:
                     stop=stop,
                     target_complete=_arm_tgt_complete,
                     decisive_drift_exceeded=_arm_decisive_drift,
+                    trigger_previously_breached=(
+                        _parse_trigger_crossed_at(signal_dict.get("trigger_crossed_at"))
+                        is not None
+                    ),
                 )
                 _late_cls = _late_decision.classification
 
@@ -4415,6 +4754,9 @@ class APEntryWatcher:
                         stop=w.stop_level,
                         target_complete=_bug_d_target_complete,
                         decisive_drift_exceeded=_open_decisive_drift,
+                        trigger_previously_breached=(
+                            getattr(w, "trigger_crossed_at", None) is not None
+                        ),
                     )
                     _open_cls = _open_decision.classification
 
@@ -4953,6 +5295,11 @@ class APEntryWatcher:
                                     _tc_at.isoformat() if hasattr(_tc_at, "isoformat")
                                     else str(_tc_at)
                                 )
+                                _ts_patch["trigger_crossed_at_provenance"] = (
+                                    _build_trigger_crossed_at_provenance(
+                                        _sig_for_ts, _ts_pre_local_oid
+                                    )
+                                )
                             if _tc_bid:
                                 _ts_patch["first_breach_bid"]  = _tc_bid
                             if _tc_ask:
@@ -4982,8 +5329,8 @@ class APEntryWatcher:
                             log.critical(
                                 "[%s] WATCHER_TRIGGER_TIMESTAMP_PERSIST_FAILED — "
                                 "LIVE mode, trigger timestamps could not be written "
-                                "to orders.meta before on_trigger. Submit gate will "
-                                "rely on in-memory WatchedSignal fallback. "
+                                "to orders.meta before on_trigger; callback is "
+                                "skipped and persistence will be retried. "
                                 "local_order_id=%s error=%s",
                                 w.ticker, _ts_pre_local_oid or "?", _pre_ts_exc,
                             )
@@ -4995,7 +5342,6 @@ class APEntryWatcher:
 
                     if (
                         self._is_live_runtime()
-                        and self._is_deferred_signal(getattr(w, "signal", {}) or {})
                         and not _ts_pre_write_ok
                     ):
                         # Database truth is unavailable.  Keep the watcher as the
@@ -5425,9 +5771,24 @@ class APEntryWatcher:
         if cb_exc is not None:
             return _failed("callback_raised", str(cb_exc))
 
-        if not isinstance(cb_result, _WCR):
-            _t = type(cb_result).__name__ if cb_result is not None else "NoneType"
-            return _failed("callback_result_not_watcher_completion_result", f"got {_t}")
+        # Guard against module-reload class-identity mismatch: in combined
+        # test runs, ap.pending_trigger_classifier may be loaded into two
+        # different module instances, making isinstance() fail even when the
+        # object is a genuine WatcherCompletionResult.  Check by type name
+        # AND required structural attributes so the contract is enforced
+        # regardless of which module instance created the object.
+        _cb_type_name = type(cb_result).__name__ if cb_result is not None else "NoneType"
+        _is_wcr = (
+            isinstance(cb_result, _WCR)
+            or (
+                _cb_type_name == "WatcherCompletionResult"
+                and hasattr(cb_result, "outcome")
+                and hasattr(cb_result, "reason_code")
+                and hasattr(cb_result, "local_order_id")
+            )
+        )
+        if not _is_wcr:
+            return _failed("callback_result_not_watcher_completion_result", f"got {_cb_type_name}")
 
         _valid = {_WCO.TERMINALIZED, _WCO.RETRY_OWNED, _WCO.REARMED, _WCO.FAILED}
         if cb_result.outcome not in _valid:

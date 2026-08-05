@@ -115,13 +115,16 @@ def _row(
             bid = trigger * (1.0 - offset)
             ask = bid + 0.02
     elif bucket == "stop_broken":
-        # Stop-side quote crossed the stop level. For CALL: bid <= stop.
+        # Stop-side quote crossed the stop level after the entry-direction
+        # breach. For CALL: bid <= stop and ask >= trigger. For PUT: ask >=
+        # stop and bid <= trigger. The explicit trigger-side breach matters:
+        # scanner-stop geometry is dormant while a setup is still pre-trigger.
         if side == "CALL":
             bid = stop - 0.10
-            ask = stop + 0.05   # ask above stop; only bid-side check catches it
+            ask = trigger + 0.05
         else:
             ask = stop + 0.10
-            bid = stop - 0.05
+            bid = trigger - 0.05
     elif bucket == "pre_trigger":
         # Quote on the ordinary pre-trigger side of the canonical lane.
         offset = 0.10 + (row_index % 3) * 0.05

@@ -40,6 +40,10 @@ from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from ap_signal_store import canonical_client_email, canonical_signal_id, upsert_ap_signal_row_with_fallback
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
 
 log = logging.getLogger("ap.overnight_reeval")
 
@@ -2258,6 +2262,13 @@ def run_overnight_reeval(
                         canonical_signal_id = _reattach_canonical,
                         client_id         = _reattach_client,
                         execution_mode    = _reattach_mode,
+                        local_order_id    = _existing_oid,
+                        materialization_generation = _reattach_metadata.get(
+                            "materialization_generation"
+                        ),
+                        trigger_crossed_at = _reattach_metadata.get(
+                            "trigger_crossed_at"
+                        ),
                         late_attachment_policy_eligible = True,
                         metadata          = _reattach_metadata,
                     )
@@ -2289,6 +2300,25 @@ def run_overnight_reeval(
                         )
                         _reattach_armed = True
                     else:
+                        # Refuse stale/incomplete confirmed-trigger evidence
+                        # before the mutating REATTACH ownership fence.  An
+                        # already-owned watcher took the read-only durable
+                        # proof path above; this gate remains mandatory for
+                        # every path that would fence or call watch().
+                        if not recovery_trigger_evidence_identity_is_proven(
+                            _reattach_plan, _existing_oid
+                        ):
+                            log.critical(
+                                "[%s] %s signal=%s local_order_id=%s — "
+                                "refusing reattach; existing order unchanged",
+                                ticker,
+                                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                                signal_id,
+                                _existing_oid,
+                            )
+                            result["unresolved"] += 1
+                            continue
+
                         _pre_watch_fenced = _persist_reattach_in_progress_fence(
                             client_id=client_id,
                             execution_mode=_reattach_mode,

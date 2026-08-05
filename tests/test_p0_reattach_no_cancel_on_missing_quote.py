@@ -18,7 +18,7 @@ _terminalize_recovery_rearm_candidate call.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
@@ -26,6 +26,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import ap_entry_watcher as ew
+
+# Dynamic signal date — keeps signal age below OVERNIGHT_SIGNAL_MAX_AGE_DAYS (4).
+_SIG_DATE = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+_SIG_TS   = (datetime.now(timezone.utc) - timedelta(days=1)).strftime(
+    "%Y-%m-%dT20:00:00+00:00"
+)
 
 
 def _force_regular_live_session(monkeypatch, watcher=None):
@@ -101,7 +107,37 @@ def _make_watcher_for_reattach(monkeypatch, *, quote_bid=0, quote_ask=0):
     return w, cancel_spy, add_spy
 
 
-def _reattach_plan(*, local_order_id="local-existing-1"):
+def _reattach_plan(*, local_order_id="local-existing-1", confirmed=False):
+    """Build a SimpleNamespace plan for reattach tests.
+
+    confirmed=True adds durable trigger_crossed_at evidence to the plan
+    metadata.  PR #407 requires this for the scanner stop to be active;
+    a real rearmed recovery restores it from the persisted order meta.
+    Use confirmed=True for terminal-truth test cases (stop/target already
+    broken) and the default False for pre-breach or quote-unavailable cases.
+    """
+    meta = {
+        "reattach_watcher":                 True,
+        "overnight":                        True,
+        "contract_deferred":                True,
+        "materialization_generation":       1,
+        "late_attachment_policy_eligible":  True,
+        "execution_mode":                   "live",
+        "client_id":                        "jason@example.com",
+    }
+    if confirmed:
+        # Durable first-breach evidence — always present in a real rearmed
+        # recovery row that reached PENDING_TRIGGER after confirmation.
+        meta["trigger_crossed_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=10)
+        ).isoformat()
+        meta["trigger_crossed_at_provenance"] = {
+            "canonical_signal_id": "sig-reattach-1",
+            "client_id": "jason@example.com",
+            "execution_mode": "live",
+            "local_order_id": local_order_id,
+            "materialization_generation": 1,
+        }
     return SimpleNamespace(
         signal_id="sig-reattach-1",
         canonical_signal_id="sig-reattach-1",
@@ -116,7 +152,7 @@ def _reattach_plan(*, local_order_id="local-existing-1"):
         stop_underlying=490.0,
         target_underlying=520.0,
         pattern="2-1-2",
-        contract_symbol=f"DEFERRED:SPY",
+        contract_symbol="DEFERRED:SPY",
         contracts=2,
         limit_price=0.01,
         plan_id="plan-reattach-1",
@@ -124,16 +160,8 @@ def _reattach_plan(*, local_order_id="local-existing-1"):
         execution_mode="live",
         prior_day_high=502.0,
         prior_day_low=498.0,
-        late_attachment_policy_eligible=True,   # PR#388 seam
-        metadata={
-            "reattach_watcher":                 True,
-            "overnight":                        True,
-            "contract_deferred":                True,
-            "materialization_generation":       1,
-            "late_attachment_policy_eligible":  True,
-            "execution_mode":                   "live",
-            "client_id":                        "jason@example.com",
-        },
+        late_attachment_policy_eligible=True,
+        metadata=meta,
     )
 
 
@@ -217,7 +245,9 @@ def test_reattach_with_proven_terminal_truth_terminalizes_existing_order_once(
     )
 
     result = w.watch(
-        _reattach_plan(),
+        _reattach_plan(
+            local_order_id="local-existing-terminal", confirmed=True
+        ),   # real rearmed recovery has trigger_crossed_at + provenance
         local_order_id="local-existing-terminal",
         recovery_rearm=True,
         no_cancel_on_reject=True,

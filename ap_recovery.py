@@ -36,6 +36,12 @@ import types
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from ap_entry_watcher import (
+    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+    recovery_trigger_evidence_identity_is_proven,
+)
+from ap.pending_trigger_restart_recovery import _RecoveryPlan
+
 log = logging.getLogger("ap.recovery")
 
 # How far back to look for signals to re-seed dedup state
@@ -1385,17 +1391,36 @@ class APStartupRecovery:
         metadata = dict(meta)
         metadata["recovery_side_source"] = side_source
 
-        return types.SimpleNamespace(
-            signal_id=str(
-                order.get("signal_id")
-                or meta.get("signal_id")
-                or order.get("local_order_id")
-                or ""
-            ),
+        local_order_id = str(order.get("local_order_id") or "")
+        signal_id = str(
+            order.get("signal_id")
+            or meta.get("signal_id")
+            or local_order_id
+            or ""
+        )
+        canonical_signal_id = str(
+            order.get("canonical_signal_id")
+            or meta.get("canonical_signal_id")
+            or ""
+        )
+        materialization_generation = meta.get("materialization_generation")
+        try:
+            materialization_generation = (
+                int(materialization_generation)
+                if materialization_generation is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            materialization_generation = None
+
+        return _RecoveryPlan(
+            signal_id=signal_id,
+            canonical_signal_id=canonical_signal_id,
             plan_id=str(order.get("plan_id") or meta.get("plan_id") or ""),
             ticker=ticker,
             side=direction,
             direction=direction,
+            entry_trigger=float(trigger or 0) if trigger is not None else None,
             score=float(order.get("score") or meta.get("score") or 65.0),
             tier=str(order.get("tier") or meta.get("tier") or "B"),
             trigger_price=float(trigger or 0) if trigger is not None else None,
@@ -1414,7 +1439,14 @@ class APStartupRecovery:
                 or meta.get("execution_mode")
                 or ""
             ).strip().lower(),
+            local_order_id=local_order_id,
+            materialization_generation=materialization_generation,
+            trigger_crossed_at=(
+                order.get("trigger_crossed_at")
+                or meta.get("trigger_crossed_at")
+            ),
             contracts=int(order.get("qty") or meta.get("selected_qty") or 0),
+            quantity=int(order.get("qty") or meta.get("selected_qty") or 0),
             limit_price=float(
                 order.get("limit_price") or meta.get("selected_limit") or 0
             ),
@@ -1850,6 +1882,26 @@ class APStartupRecovery:
             meta = self._coerce_order_meta(order.get("meta"))
             lifecycle = str(meta.get("lifecycle_state") or "").upper()
             materialization_status = str(meta.get("materialization_status") or "").upper()
+
+            # Do this before stale/terminal classification, quote work, or any
+            # recovery ownership mutation.  A confirmed timestamp with missing
+            # or mismatched lifecycle provenance is not permission to erase the
+            # evidence and continue as pre-breach.
+            _evidence_row = dict(order)
+            _evidence_row["meta"] = meta
+            if not recovery_trigger_evidence_identity_is_proven(
+                _evidence_row, local_order_id
+            ):
+                log.critical(
+                    "[%s] %s local_order_id=%s — preserving order unchanged",
+                    self.client_id,
+                    RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                    local_order_id,
+                )
+                result.setdefault("errors", []).append(
+                    f"{RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN}:{local_order_id}"
+                )
+                continue
 
             created_raw = order.get("created_ts")
             try:
@@ -2795,7 +2847,7 @@ class APStartupRecovery:
                     _row_dict = dict(order)
 
                     def _plan_builder(_r):
-                        _p = self._build_recovery_plan_from_order(order)
+                        _p = self._build_recovery_plan_from_order(_r)
                         if _p is None:
                             log.warning(
                                 "[%s] RECOVERY: cannot rearm local_order_id=%s — invalid_or_missing_side",
@@ -2815,26 +2867,9 @@ class APStartupRecovery:
                                 _p.metadata["contract_deferred"] = True
                             except Exception:
                                 pass
-                        # Convert plan object to dict for the recovery engine.
-                        return {
-                            "signal_id":      getattr(_p, "signal_id", "") or "",
-                            "plan_id":        getattr(_p, "plan_id", "") or "",
-                            "local_order_id": getattr(_p, "local_order_id", local_order_id) or local_order_id,
-                            "client_id":      getattr(_p, "client_id", self.client_id) or self.client_id,
-                            "client_email":   getattr(_p, "client_id", self.client_id) or self.client_id,
-                            "execution_mode": self._execution_mode() or "",
-                            "ticker":         getattr(_p, "ticker", "") or "",
-                            "side":           getattr(_p, "side", "") or "",
-                            "entry_price":    float(getattr(_p, "trigger_price", 0) or 0),
-                            "trigger_price":  float(getattr(_p, "trigger_price", 0) or 0),
-                            "stop_price":     float(getattr(_p, "stop_price", 0) or 0),
-                            "target_price":   float(getattr(_p, "target_price", 0) or 0),
-                            "score":          float(getattr(_p, "score", 0) or 0),
-                            "tier":           getattr(_p, "tier", "") or "",
-                            "timeframe":      getattr(_p, "timeframe", "") or "",
-                            "contracts":      int(getattr(_p, "quantity", 0) or 0),
-                            "contract":       getattr(_p, "contract_symbol", "") or "",
-                        }
+                        # The recovery engine and APEntryWatcher.watch() share
+                        # the established attribute-based plan contract.
+                        return _p
 
                     _ptr = _PTR(
                         client_id=self.client_id,

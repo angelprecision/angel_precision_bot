@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -196,6 +197,82 @@ def test_attempt_rearm_watch_returns_false():
     assert attempted is True
     assert succeeded is False
     assert reason == "stop_above_mid"
+
+
+def test_attempt_rearm_refuses_unproven_confirmed_evidence_without_watching():
+    """A stale confirmed timestamp must not enter lost-handoff rearm."""
+    monitor, watcher = _make_monitor()
+    monitor.client_mode = "LIVE"
+    order = {
+        "local_order_id": "abc",
+        "client_id": "jason_test@example.com",
+        "symbol": "SPY",
+        "direction": "CALL",
+        "trigger_price": 500.0,
+        "contract": "SPY_X",
+        "meta": {
+            "canonical_signal_id": "canonical-current",
+            "client_id": "jason_test@example.com",
+            "execution_mode": "live",
+            "trigger_crossed_at": "2026-08-03T16:00:00+00:00",
+            "trigger_crossed_at_provenance": {
+                "canonical_signal_id": "canonical-stale",
+                "client_id": "jason_test@example.com",
+                "execution_mode": "live",
+                "local_order_id": "abc",
+            },
+        },
+    }
+
+    attempted, succeeded, reason = monitor._attempt_lost_handoff_rearm(
+        order, "abc", "SPY_X"
+    )
+
+    assert (attempted, succeeded) == (True, False)
+    assert reason == "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN"
+    watcher.watch.assert_not_called()
+
+
+def test_lost_handoff_identity_refusal_skips_cleanup_and_attempt_marker():
+    """The order-monitor caller must preserve the exact CREATED row too."""
+    monitor, _watcher = _make_monitor()
+    monitor.client_mode = "LIVE"
+    monitor.osm = MagicMock()
+    monitor._get_active_entry_orders = MagicMock(
+        return_value=[
+            {
+                "status": "CREATED",
+                "local_order_id": "abc",
+                "signal_id": "sig-1",
+                "plan_id": "plan-1",
+                "symbol": "SPY",
+                "contract": "SPY_X",
+                "broker_order_id": None,
+                "submitted_ts": None,
+                "created_ts": "2026-08-03T15:55:00+00:00",
+                "meta": {},
+            }
+        ]
+    )
+    monitor._parse_ts = lambda _raw: datetime.now(timezone.utc) - timedelta(seconds=200)
+    monitor._emit_order_event = MagicMock()
+    monitor._pending_trigger_watcher_owner_state = MagicMock(
+        return_value=(False, True, None)
+    )
+    monitor._attempt_lost_handoff_rearm = MagicMock(
+        return_value=(True, False, "RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN")
+    )
+    monitor._record_lost_handoff_rearm = MagicMock()
+    monitor._handle_stale_entry = MagicMock()
+
+    monitor._check_entry_orders()
+
+    monitor._attempt_lost_handoff_rearm.assert_called_once()
+    monitor._record_lost_handoff_rearm.assert_not_called()
+    monitor._handle_stale_entry.assert_not_called()
+    monitor.osm.expire_pending_entry.assert_not_called()
+    monitor.osm.cancel_pending_entry.assert_not_called()
+    monitor.osm.transition.assert_not_called()
 
 
 def test_attempt_rearm_watch_raises():
