@@ -247,12 +247,7 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
-        # Confirmed-trigger evidence is a durable lifecycle fact, not a quote
-        # hint.  Refuse this exact row before quote checks, selector work,
-        # watcher admission, or any terminal/cleanup action when the evidence
-        # cannot be bound to the persisted identity.  A row with no timestamp
-        # remains an ordinary pre-breach rearm candidate.
-        if not recovery_trigger_evidence_identity_is_proven(row, local_oid):
+        def _reject_unproven_trigger_evidence() -> str:
             self._mark_failure(
                 local_oid, RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN
             )
@@ -265,6 +260,21 @@ class PendingTriggerRestartRecovery:
             )
             return _RowOutcome.UNRESOLVED
 
+        # Confirmed-trigger evidence is a durable lifecycle fact, not a quote
+        # hint.  First probe the registry so an already-owned watcher can take
+        # its read-only proof path.  This matters for the legacy/crash window
+        # where the watcher is healthy but the timestamp and its provenance
+        # were not persisted atomically.  No rearm or cleanup is permitted on
+        # that path; the exact watcher/order ownership proof is the authority.
+        watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
+        _evidence_proven = recovery_trigger_evidence_identity_is_proven(row, local_oid)
+
+        # For an unowned row, keep the fail-closed fence before quote checks,
+        # selector work, watcher admission, or any terminal/cleanup action.
+        # A row with no timestamp remains an ordinary pre-breach candidate.
+        if watcher_owned is not True and not _evidence_proven:
+            return _reject_unproven_trigger_evidence()
+
         # Live quote check.
         live_quote_abt: Optional[bool] = None
         _side    = str(row.get("direction") or row.get("side") or "").strip().upper()
@@ -275,9 +285,6 @@ class PendingTriggerRestartRecovery:
                 live_quote_abt = self.quote_check_fn(self.broker, _symbol, _side, _trigger)
             except Exception as _qe:
                 log.debug("RESTART_RECOVERY quote check failed local=%s: %s", local_oid, _qe)
-
-        # Registry ownership check.
-        watcher_owned: Optional[bool] = self._check_watcher_owns(local_oid, row)
 
         # Classification.
         cls = classify_pending_trigger_row(
@@ -293,20 +300,30 @@ class PendingTriggerRestartRecovery:
         )
 
         # Action table.
+        if cls == PTC.WAITING_VALID and watcher_owned is True:
+            # Already owned — verify proof then count.  This is deliberately
+            # before the evidence gate below: it performs no rearm, callback,
+            # selector, broker, or cleanup action and preserves the exact row.
+            proof = self._verify_registry_ownership(local_oid, row)
+            if proof and proof.get("dedup_held"):
+                return _RowOutcome.WATCHER_OWNED
+            # Proof failed despite watcher reporting owned — treat as orphan.
+            log.warning(
+                "RESTART_RECOVERY watcher_owned=True but proof failed local=%s — "
+                "treating as orphan", local_oid,
+            )
+
+        # Every path that would classify, terminalize, retry, or rearm an
+        # order with confirmed-trigger evidence still requires durable
+        # lifecycle identity.  Only the proven already-owned fast path above
+        # is allowed to return before this fence.
+        if not _evidence_proven:
+            return _reject_unproven_trigger_evidence()
+
         if cls == PTC.NOT_PENDING_TRIGGER:
             return _RowOutcome.SKIPPED
 
         elif cls == PTC.WAITING_VALID:
-            if watcher_owned is True:
-                # Already owned — verify proof then count.
-                proof = self._verify_registry_ownership(local_oid, row)
-                if proof and proof.get("dedup_held"):
-                    return _RowOutcome.WATCHER_OWNED
-                # Proof failed despite watcher reporting owned — treat as orphan.
-                log.warning(
-                    "RESTART_RECOVERY watcher_owned=True but proof failed local=%s — "
-                    "treating as orphan", local_oid,
-                )
             # Not owned or proof failed: quote check then rearm.
             if live_quote_abt is True:
                 return self._terminalize_with_reason(

@@ -799,7 +799,13 @@ def test_prior_terminal_opportunity_monotonic_guard_does_not_strand_active_order
     broker.replace_order.assert_not_called()
 
 
-def _run_one_attempt(monkeypatch, *, mock_ledger):
+def _run_one_attempt(
+    monkeypatch,
+    *,
+    mock_ledger,
+    watcher_already_owns=False,
+    legacy_confirmed=False,
+):
     """Drive the real run_overnight_reeval loop for a single attempt.
     Uses spies on master_control, contract_selector, OSM create/broker to
     prove the fence assertions."""
@@ -828,13 +834,19 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
     )
     # Active-order query: return the same PENDING_TRIGGER row on every call
     # (both attempt 1 and attempt 2).
+    _active_row = _pending_trigger_order_row()
+    if legacy_confirmed:
+        _active_row["meta"] = {
+            "trigger_crossed_at": "2026-08-03T16:00:00+00:00",
+        }
     monkeypatch.setattr(
         ov, "_query_active_entry_order",
-        lambda *_a, **_kw: (ov._LS_FOUND, _pending_trigger_order_row()),
+        lambda *_a, **_kw: (ov._LS_FOUND, dict(_active_row)),
     )
+    _pre_watch_fence = MagicMock(return_value=True)
     monkeypatch.setattr(
         ov, "_persist_reattach_in_progress_fence",
-        MagicMock(return_value=True),
+        _pre_watch_fence,
     )
     monkeypatch.setattr(ov, "_persist_watcher_armed_proof", mock_ledger)
 
@@ -870,7 +882,7 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
         # caller invokes watch() which we stub to True. In production the
         # real watcher runs; here we only need to prove NO cancel / create
         # calls originate from the reeval outer flow.
-        has_order=lambda _oid: False,
+        has_order=lambda _oid: watcher_already_owns,
         watch=MagicMock(return_value=True),
     )
 
@@ -894,7 +906,33 @@ def _run_one_attempt(monkeypatch, *, mock_ledger):
         selector_select=selector_select,
         broker=broker,
         entry_watcher=entry_watcher,
+        pre_watch_fence=_pre_watch_fence,
     )
+
+
+def test_owned_reattach_legacy_evidence_retries_proof_without_rearm(monkeypatch):
+    """An existing owner may retry its durable proof, but never watch twice."""
+    proof_write = MagicMock(return_value=True)
+    state = _run_one_attempt(
+        monkeypatch,
+        mock_ledger=proof_write,
+        watcher_already_owns=True,
+        legacy_confirmed=True,
+    )
+
+    assert state.result["armed"] == 1
+    assert state.result["unresolved"] == 0
+    assert state.result["retryable_deferred"] == 0
+    state.entry_watcher.watch.assert_not_called()
+    state.pre_watch_fence.assert_not_called()
+    proof_write.assert_called_once()
+    state.mc_evaluate.assert_not_called()
+    state.selector_select.assert_not_called()
+    state.osm_create.assert_not_called()
+    state.broker.submit_order.assert_not_called()
+    state.broker.place_order.assert_not_called()
+    state.broker.cancel_order.assert_not_called()
+    state.broker.replace_order.assert_not_called()
 
 
 def test_two_attempts_reuse_same_local_order_id_and_never_create_or_broker(monkeypatch):

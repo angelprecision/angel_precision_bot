@@ -2273,24 +2273,6 @@ def run_overnight_reeval(
                         metadata          = _reattach_metadata,
                     )
 
-                    # Refuse stale/incomplete confirmed-trigger evidence before
-                    # the REATTACH ownership fence.  The existing ENTRY row and
-                    # queue/opportunity state must remain byte-for-byte
-                    # untouched until lifecycle identity is proven.
-                    if not recovery_trigger_evidence_identity_is_proven(
-                        _reattach_plan, _existing_oid
-                    ):
-                        log.critical(
-                            "[%s] %s signal=%s local_order_id=%s — "
-                            "refusing reattach; existing order unchanged",
-                            ticker,
-                            RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
-                            signal_id,
-                            _existing_oid,
-                        )
-                        result["unresolved"] += 1
-                        continue
-
                     # P0-3 precheck: if the existing watcher already owns
                     # this exact local_order_id, do NOT call watch() again.
                     # A second watch() would hit add_signal() dedup, return
@@ -2318,6 +2300,25 @@ def run_overnight_reeval(
                         )
                         _reattach_armed = True
                     else:
+                        # Refuse stale/incomplete confirmed-trigger evidence
+                        # before the mutating REATTACH ownership fence.  An
+                        # already-owned watcher took the read-only durable
+                        # proof path above; this gate remains mandatory for
+                        # every path that would fence or call watch().
+                        if not recovery_trigger_evidence_identity_is_proven(
+                            _reattach_plan, _existing_oid
+                        ):
+                            log.critical(
+                                "[%s] %s signal=%s local_order_id=%s — "
+                                "refusing reattach; existing order unchanged",
+                                ticker,
+                                RECOVERY_TRIGGER_EVIDENCE_IDENTITY_UNPROVEN,
+                                signal_id,
+                                _existing_oid,
+                            )
+                            result["unresolved"] += 1
+                            continue
+
                         _pre_watch_fenced = _persist_reattach_in_progress_fence(
                             client_id=client_id,
                             execution_mode=_reattach_mode,
