@@ -71,7 +71,9 @@ class FakeDB:
         self.raise_on = None
         self.information_schema_rows = []
         self.schema_migrations_rows = []
-        self.ledger_exists = False
+        # Existing runner tests model a database whose migration ledger has
+        # already been initialized.  No-ledger safety tests opt out explicitly.
+        self.ledger_exists = True
 
     def next_rows(self, sql):
         if "information_schema.columns" in sql:
@@ -389,8 +391,21 @@ def test_checksum_drift_refuses_to_apply(fake_db, mig_dir):
         mr.run_pending(apply=True, directory=mig_dir)
 
 
+def test_unqualified_apply_refuses_without_existing_ledger(fake_db, mig_dir):
+    """The legacy apply command cannot replay history into an unknown DB."""
+    fake_db.ledger_exists = False
+    with pytest.raises(mr.MigrationLedgerRequired, match="does not exist"):
+        mr.run_pending(apply=True, directory=mig_dir)
+
+    assert fake_db.ledger_exists is False
+    assert [sql for sql, _ in fake_db.executed if sql in {
+        "SELECT 1;", "SELECT 2;", "SELECT 3;"
+    }] == []
+
+
 def test_targeted_migration_refuses_without_existing_ledger(fake_db, mig_dir):
     """A targeted rollout must not create a ledger or replay history."""
+    fake_db.ledger_exists = False
     with pytest.raises(mr.MigrationLedgerRequired, match="does not exist"):
         mr.run_pending(
             apply=True,

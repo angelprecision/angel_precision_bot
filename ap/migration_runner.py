@@ -298,7 +298,7 @@ def _ledger_exists() -> bool:
 def _require_existing_ledger() -> None:
     if not _ledger_exists():
         raise MigrationLedgerRequired(
-            "Targeted migration refused: schema_migrations does not exist. "
+            "Migration apply refused: schema_migrations does not exist. "
             "Baseline the deployed/base migration set first; this command "
             "will not create a ledger or replay historical migrations."
         )
@@ -432,6 +432,8 @@ def run_pending(
     recorded only after successful commit. Stops at the first failure.
     """
     if only is None:
+        if apply:
+            _require_existing_ledger()
         report = status(directory)
     else:
         target = _validate_migration_target(only)
