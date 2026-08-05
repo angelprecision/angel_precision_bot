@@ -509,6 +509,79 @@ def _positive_int_env_config(name: str, default: int) -> int:
     return value
 
 
+def _resolve_selector_attempt_number(
+    *,
+    retry_attempt,
+    breach_attempt_count,
+    materialization_attempts,
+    recovery_pre_claimed_attempt,
+) -> tuple[int | None, str | None]:
+    """Resolve the durable selector attempt number from every available
+    counter, requiring agreement rather than taking the first truthy value.
+
+    retry_attempt, breach_attempt_count, and materialization_attempts are
+    the "canonical durable" counters -- schedule_deferred_materialization_retry
+    writes all three to the identical value in one atomic JSONB patch, so
+    any two of them disagreeing means either a malformed/legacy row or
+    genuine corruption, not a benign discrepancy. recovery_pre_claimed_attempt
+    is a different kind of signal: an in-process transactional pre-claim
+    that can legitimately run ahead of what has been durably persisted yet
+    (mid-CAS-transition), so it is only trusted as authoritative when it
+    represents forward progress over the durable value, never a regression.
+
+    Returns (resolved_attempt, None) on success. Returns (None, reason_code)
+    when any field is malformed/negative or the counters disagree in a way
+    that cannot be reconciled as forward progress -- callers MUST fail
+    closed on a non-None reason_code: zero selector calls, zero broker
+    calls, terminalize/hold instead.
+    """
+    _CONFLICT = "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def _parse(raw):
+        """Returns (value_or_None, is_malformed)."""
+        if raw is None or raw == "":
+            return None, False
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None, True
+        if value < 0:
+            return None, True
+        return value, False
+
+    durable_values = {}
+    for name, raw in (
+        ("retry_attempt", retry_attempt),
+        ("breach_attempt_count", breach_attempt_count),
+        ("materialization_attempts", materialization_attempts),
+    ):
+        value, malformed = _parse(raw)
+        if malformed:
+            return None, _CONFLICT
+        if value is not None:
+            durable_values[name] = value
+
+    if len(set(durable_values.values())) > 1:
+        return None, _CONFLICT
+    durable_attempt = next(iter(durable_values.values()), None)
+
+    pre_claimed, pre_claimed_malformed = _parse(recovery_pre_claimed_attempt)
+    if pre_claimed_malformed:
+        return None, _CONFLICT
+
+    if durable_attempt is None and pre_claimed is None:
+        return 1, None
+    if durable_attempt is None:
+        return max(1, pre_claimed), None
+    if pre_claimed is None:
+        return max(1, durable_attempt), None
+    if pre_claimed < durable_attempt:
+        # A pre-claim behind the durably persisted attempt is a regression,
+        # not legitimate forward progress -- unreconcilable.
+        return None, _CONFLICT
+    return max(1, durable_attempt, pre_claimed), None
+
+
 def _selector_cursor_retry_block_reason(
     *,
     cursor_enabled: bool,
@@ -4213,15 +4286,50 @@ class APExecutionCore:
                         _cursor_meta = {}
                 if not isinstance(_cursor_meta, dict):
                     _cursor_meta = {}
-                _selector_attempt_number = max(
-                    1,
-                    int(
-                        _cursor_meta.get("retry_attempt")
-                        or _cursor_meta.get("materialization_attempts")
-                        or (sig.get("_recovery_pre_claimed_attempt") if isinstance(sig, dict) else 0)
-                        or 1
-                    ),
+                _selector_attempt_number, _attempt_conflict_reason = (
+                    _resolve_selector_attempt_number(
+                        retry_attempt=_cursor_meta.get("retry_attempt"),
+                        breach_attempt_count=_cursor_meta.get("breach_attempt_count"),
+                        materialization_attempts=_cursor_meta.get("materialization_attempts"),
+                        recovery_pre_claimed_attempt=(
+                            sig.get("_recovery_pre_claimed_attempt")
+                            if isinstance(sig, dict) else None
+                        ),
+                    )
                 )
+                if _attempt_conflict_reason:
+                    # Zero selector/broker work: the attempt number itself
+                    # cannot be trusted, so nothing gated on it (chart
+                    # revalidation, cursor identity, structural filtering)
+                    # can be trusted either. Terminalize before touching the
+                    # cursor at all.
+                    _terminalize_deferred_breach_failure(
+                        f"SELECTOR_RECOVERY_CURSOR_INVALID:{_attempt_conflict_reason}",
+                        extra_meta={
+                            "selector_recovery_cursor_load_reason": (
+                                _attempt_conflict_reason
+                            ),
+                            "materialization_attempt_counters": {
+                                "retry_attempt": _cursor_meta.get("retry_attempt"),
+                                "breach_attempt_count": _cursor_meta.get("breach_attempt_count"),
+                                "materialization_attempts": _cursor_meta.get("materialization_attempts"),
+                                "_recovery_pre_claimed_attempt": (
+                                    sig.get("_recovery_pre_claimed_attempt")
+                                    if isinstance(sig, dict) else None
+                                ),
+                            },
+                            "selector_calls": 0,
+                            "direct_quote_calls": 0,
+                            "broker_post_count": 0,
+                        },
+                    )
+                    return {
+                        "disposition": "TERMINAL_DURABLE",
+                        "reason_code": (
+                            f"SELECTOR_RECOVERY_CURSOR_INVALID:"
+                            f"{_attempt_conflict_reason}"
+                        ),
+                    }
                 _cursor_candidate = (
                     _cursor_meta.get("selector_recovery_cursor_v1")
                     if _cursor_enabled
@@ -4271,8 +4379,18 @@ class APExecutionCore:
                     nonlocal _cursor_pending_updates
                     if not _cursor_enabled or _cursor_pending_updates <= 0:
                         return True
-                    if not force and _cursor_pending_updates < 5:
-                        return True
+                    # Audit blocker 5 fix: previously deferred until 5
+                    # pending updates accumulated (or a forced flush point),
+                    # meaning a crash after 1-4 completed candidate quote
+                    # attempts lost that progress to process-local memory
+                    # only -- violating the binding contract ("restart must
+                    # preserve progress... process-local memory alone is
+                    # insufficient"). Every update is now persisted
+                    # immediately; `force` is retained as a no-op parameter
+                    # for call-site compatibility rather than removed, since
+                    # its two existing callers (market-truth check, end of
+                    # selector) still explicitly document why they flush at
+                    # those specific points.
                     _persist_cursor = getattr(
                         self.order_state_machine,
                         "persist_selector_recovery_cursor",

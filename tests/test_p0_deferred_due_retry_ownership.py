@@ -2072,11 +2072,17 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
     )
-    # One market-truth checkpoint + two five-candidate batches + one final
-    # two-candidate flush. Without batching this fixture would perform 13
-    # synchronous writes and spend at least 130ms in the simulated DB.
-    assert len(cursor_persist_calls) == 4
-    assert selector_elapsed < 0.12
+    # Audit blocker 5 fix: cursor persistence is no longer batched by 5 --
+    # every completed candidate quote attempt is now flushed immediately,
+    # closing the crash-loss window where 1-4 completed attempts existed
+    # only in process memory. This fixture has one market-truth checkpoint
+    # plus 12 candidates, so all 13 writes now happen synchronously
+    # (previously batched down to 4). The ~10ms simulated per-write latency
+    # means this is slower (~130ms) than the old batched path (~40ms), which
+    # is the correct, deliberate trade of speed for durability the audit
+    # required -- not a regression.
+    assert len(cursor_persist_calls) == 13
+    assert selector_elapsed < 0.25
     assert copyback_calls, "validated retry selection must reach durable copyback"
     assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
     assert float(copyback_calls[-1]["limit_price"]) > 0.01

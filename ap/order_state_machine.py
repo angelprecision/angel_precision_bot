@@ -2772,7 +2772,7 @@ class APOrderStateMachine:
                     WHERE local_order_id = %s
                       AND client_id = %s
                       AND signal_id = %s
-                      AND LOWER(COALESCE(execution_mode, meta->>'execution_mode','')) = %s
+                      AND LOWER(TRIM(COALESCE(NULLIF(execution_mode, ''), meta->>'execution_mode',''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')

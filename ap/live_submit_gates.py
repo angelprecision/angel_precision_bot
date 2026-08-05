@@ -160,28 +160,43 @@ def validate_retry_market_quote_authority(
         or ""
     ).strip()
     parsed = urlparse(base_url)
-    if parsed.scheme.lower() != "https" or parsed.hostname != "api.tradier.com":
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != "api.tradier.com"
+        or parsed.port not in (None, 443)
+    ):
         return {
             "valid": False,
             "reason": "MARKET_QUOTE_UNAPPROVED_TRANSPORT",
             "transport_url": base_url or None,
         }
-    raw_source = str(
-        quote.get("source")
-        or quote.get("quote_source")
-        or quote.get("provider")
-        or ""
-    ).strip().lower()
-    if raw_source and raw_source not in {"tradier", "tradier_live", "api.tradier.com"}:
-        return {
-            "valid": False,
-            "reason": "MARKET_QUOTE_SOURCE_UNPROVEN",
-            "quote_source": raw_source or None,
-        }
+    # Audit blocker 3 fix: collect and validate EVERY explicit source field,
+    # not just the first non-empty one via `or`-chaining. A payload with
+    # {"source": "tradier_live", "provider": "simulator"} previously passed
+    # because only "source" was ever inspected -- "provider" was silently
+    # ignored once "source" was truthy. Every explicit field must now be
+    # individually approved; any one unapproved field rejects the quote
+    # regardless of what the others say.
+    _explicit_sources = {}
+    for _field in ("source", "quote_source", "provider"):
+        _raw = quote.get(_field)
+        if _raw is None:
+            continue
+        _normalized = str(_raw).strip().lower()
+        if _normalized:
+            _explicit_sources[_field] = _normalized
+    for _field, _normalized in _explicit_sources.items():
+        if _normalized not in {"tradier", "tradier_live", "api.tradier.com"}:
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_SOURCE_UNPROVEN",
+                "quote_source": _normalized,
+                "quote_source_field": _field,
+            }
     # Tradier production payloads omit provider metadata. The exact approved
     # HTTPS transport is authoritative for a source-less quote; contradictory
     # explicit metadata remains rejected above.
-    resolved_source = raw_source or "tradier_live"
+    resolved_source = next(iter(_explicit_sources.values()), None) or "tradier_live"
 
     # Validate the timestamp of EVERY price leg downstream market truth may use.
     # The retry market gate reads the bid for PUT trigger truth, the ask for
@@ -228,24 +243,36 @@ def validate_retry_market_quote_authority(
     bid_used = _finite_positive(quote.get("bid"))
     ask_used = _finite_positive(quote.get("ask"))
 
-    # Each required leg is (diagnostic_field, raw_timestamp_source).
+    # Audit blocker 3 fix: an explicitly supplied leg timestamp that is
+    # present but falsy/invalid (e.g. "bid_date": 0) must be treated as
+    # invalid evidence for that leg, not silently treated as absent and
+    # fallen back to the common timestamp. Only a genuinely ABSENT key
+    # (leg timestamp never supplied at all) falls back to the common
+    # timestamp; an explicitly-present-but-unparseable value fails the leg
+    # directly.
+    def _leg_timestamp_raw(field_name: str):
+        """Returns (raw_value, explicitly_supplied). explicitly_supplied is
+        True whenever the key exists in the payload at all, even if its
+        value is falsy (0, "", None-but-present)."""
+        if field_name in quote:
+            return quote.get(field_name), True
+        return common_timestamp_raw, False
+
+    # Each required leg is (diagnostic_field, raw_timestamp_source,
+    # explicitly_supplied).
     required_legs: list = []
     if bid_used:
-        required_legs.append(
-            ("bid", quote.get("bid_date") or common_timestamp_raw)
-        )
+        required_legs.append(("bid", *_leg_timestamp_raw("bid_date")))
     if ask_used:
-        required_legs.append(
-            ("ask", quote.get("ask_date") or common_timestamp_raw)
-        )
+        required_legs.append(("ask", *_leg_timestamp_raw("ask_date")))
     if not required_legs:
         # No positive bid or ask: preserve existing authority behavior by
         # validating the common timestamp. Missing/zero prices remain the
         # responsibility of the downstream market-validity gate.
-        required_legs.append(("common", common_timestamp_raw))
+        required_legs.append(("common", common_timestamp_raw, False))
 
     parsed_legs: list = []
-    for leg_name, raw in required_legs:
+    for leg_name, raw, explicitly_supplied in required_legs:
         observed = _parse_provider_timestamp(raw)
         if observed is None:
             return {

@@ -101,7 +101,17 @@ def _cfg() -> dict:
 
     return {
         "enabled":           _bool("DEFERRED_MATERIALIZATION_BUCKET_ENABLED", True),
-        "max_attempts":      _int("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", 3),
+        # Audit blocker 2 fix: this default must match ap_execution_core.py's
+        # MAX_BREACH_SELECTOR_RETRIES (5) and
+        # ap/pending_trigger_restart_recovery.py's own
+        # DEFERRED_MATERIALIZATION_MAX_ATTEMPTS fallback (also bumped to 5).
+        # All three read the same conceptual retry ceiling for a deferred
+        # materialization row; leaving this one at the pre-#401 default of 3
+        # meant the row could be considered exhausted here while restart
+        # recovery and the selector loop both still considered it retryable
+        # -- liveness drift / premature terminalization / stranded retry
+        # ownership depending on which consumer touched the row first.
+        "max_attempts":      _int("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", 5),
         "retry_base_s":      _int("DEFERRED_MATERIALIZATION_RETRY_BASE_SECONDS", 15),
         "retry_max_s":       _int("DEFERRED_MATERIALIZATION_RETRY_MAX_SECONDS", 90),
         "lock_ttl_s":        _int("DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", 120),

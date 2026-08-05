@@ -593,3 +593,119 @@ class TestPaperRetryMarketDataAuthority:
 def _now_iso() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit additional finding: schedule_deferred_materialization_retry's
+# execution-mode predicate lacked TRIM and could not fall back to
+# meta.execution_mode when the durable column was an empty string (not NULL).
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestScheduleRetryExecutionModeNormalization:
+    LOID = "item11-execmode-1"
+
+    def test_whitespace_padded_column_value_still_matches(self):
+        """A legacy row with ' paper ' (whitespace) in the durable
+        execution_mode column must still CAS-match a normalized 'paper'
+        parameter -- previously this predicate had no TRIM() while every
+        other #401 write did."""
+        _insert_row(
+            local_order_id=self.LOID,
+            owner="watcher:real-owner",
+            generation=1,
+        )
+        with _pg_conn() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE orders SET execution_mode = %s WHERE local_order_id = %s",
+                    (" paper ", self.LOID),
+                )
+            c.commit()
+        osm = _osm()
+        ok = osm.schedule_deferred_materialization_retry(
+            self.LOID, owner="watcher:real-owner", generation=1,
+            reason_code="SELECTOR_NO_QUOTES", attempt=2, max_attempts=5,
+            next_retry_at="2026-08-06T00:00:00+00:00",
+            selector_failure={}, signal_id="sig-item11-1",
+            execution_mode="paper",
+        )
+        assert ok is True, (
+            "whitespace-padded durable execution_mode must still CAS-match"
+        )
+
+    def test_empty_column_falls_back_to_meta_execution_mode(self):
+        """A row with an empty-string (not NULL) execution_mode column must
+        still fall back to meta.execution_mode -- COALESCE(execution_mode,
+        meta->>'execution_mode', '') never falls through when the column is
+        '' rather than NULL, since '' is not NULL. NULLIF(execution_mode,'')
+        fixes this."""
+        _insert_row(
+            local_order_id=self.LOID,
+            owner="watcher:real-owner",
+            generation=1,
+            meta_extra={"execution_mode": "paper"},
+        )
+        with _pg_conn() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "UPDATE orders SET execution_mode = '' WHERE local_order_id = %s",
+                    (self.LOID,),
+                )
+            c.commit()
+        osm = _osm()
+        ok = osm.schedule_deferred_materialization_retry(
+            self.LOID, owner="watcher:real-owner", generation=1,
+            reason_code="SELECTOR_NO_QUOTES", attempt=2, max_attempts=5,
+            next_retry_at="2026-08-06T00:00:00+00:00",
+            selector_failure={}, signal_id="sig-item11-1",
+            execution_mode="paper",
+        )
+        assert ok is True, (
+            "empty-string durable execution_mode column must fall back to "
+            "meta.execution_mode, not permanently block the CAS"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit Blocker 5: cursor batching violated the durable restart contract.
+# Direct proof that a single completed candidate's cursor progress is
+# durably persisted immediately -- not just held in process memory until a
+# 5-update batch threshold -- using a real Postgres round-trip.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCursorFlushIsNoLongerBatched:
+    LOID = "item11-flush-durability-1"
+
+    def test_single_flush_call_persists_immediately_not_batched(self):
+        """Simulates the exact crash scenario the audit describes: one
+        candidate completes, the cursor is flushed once (not five times),
+        and a fresh read of the row from Postgres must already show that
+        one candidate's progress -- proving durability doesn't depend on
+        reaching a batch threshold that a crash could occur before."""
+        _insert_row(
+            local_order_id=self.LOID,
+            owner="watcher:flush-owner",
+            generation=1,
+        )
+        osm = _osm()
+        cursor_after_one_candidate = {
+            "version": 1,
+            "attempted_symbols": {"AAPL240101C00200000": {"reason": "OI_TOO_LOW"}},
+        }
+        ok = osm.persist_selector_recovery_cursor(
+            self.LOID, owner="watcher:flush-owner", generation=1,
+            signal_id="sig-item11-1", execution_mode="paper",
+            cursor=cursor_after_one_candidate,
+        )
+        assert ok is True
+
+        # Simulate a "crash and restart" by opening a completely fresh read
+        # of the row, independent of any in-process state.
+        reloaded = _fetch_row(self.LOID)
+        assert reloaded["meta"]["selector_recovery_cursor_v1"] == (
+            cursor_after_one_candidate
+        ), (
+            "a single candidate's progress must be durably visible "
+            "immediately after one persist call, not lost to a batching "
+            "window that a crash could occur inside"
+        )
