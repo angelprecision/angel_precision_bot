@@ -2200,6 +2200,14 @@ class APOrderStateMachine:
             "materialization_owner": _owner,
             "watcher_token": _owner,
             "current_owner": _owner,
+            # A fresh confirmed breach supersedes any recovery-owned
+            # direction-reversal waiting state.
+            "recovery_ownership": "",
+            "recovery_owner": "",
+            "direction_reversal_rearm_requires_watcher": False,
+            "watcher_generation": _new_generation,
+            "final_market_truth_status": "",
+            "final_market_truth": {},
             "materialization_generation": _new_generation,
             "materialization_claimed_at": _now,
             "materialization_lease_until": str(lease_until or ""),
@@ -2371,15 +2379,37 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         owner: str,
+        watcher_token: str = "",
         generation: int,
         signal_id: str,
         execution_mode: str,
         market_truth_audit: dict,
     ) -> bool:
-        """Return the same deferred ENTRY identity to trigger-watcher ownership."""
+        """Return the same deferred ENTRY to a clean pre-breach state.
+
+        A real in-process watcher may retain its exact watcher token by
+        passing it as ``watcher_token``. A restart/due-retry callback runs
+        against a synthetic (unregistered) watched object and MUST NOT pass
+        one — the recovery takeover token used to win the original CAS
+        (``owner``) is a claim authority only, never a proof of a live,
+        registered APEntryWatcher. Persisting it as ``watcher_token`` is the
+        exact defect this correction closes: it let a synthetic recovery
+        callback masquerade as an attached watcher, after which
+        ``resume_deferred_materialization_retry`` would try (and fail) to
+        reschedule a materialization retry against a row this method had
+        already released from MATERIALIZING.
+
+        When no watcher_token is supplied, the row is left explicitly
+        recovery-owned (``recovery_ownership='recovery_scheduler'``,
+        ``direction_reversal_rearm_requires_watcher=True``) so the existing
+        recovery health loop recognizes it must attach a real watcher on a
+        later pass, rather than silently leaving an orphaned PENDING_TRIGGER
+        row outside every executable retry path.
+        """
         import json as _json_local
 
         _owner = str(owner or "").strip()
+        _watcher_token = str(watcher_token or "").strip()
         _signal = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
         try:
@@ -2388,17 +2418,38 @@ class APOrderStateMachine:
             return False
         if not _owner or not _signal or _mode not in {"live", "paper"}:
             return False
+
+        # In the uninterrupted watcher path, materialization ownership came
+        # from this exact watcher token. Any disagreement is an ownership
+        # conflict — fail closed rather than silently accepting a mismatched
+        # token as authoritative.
+        if _watcher_token and _watcher_token != _owner:
+            return False
+
+        _now = now_utc_iso()
+        _recovery_owned = not bool(_watcher_token)
+        _audit = dict(market_truth_audit or {})
+
         _patch = {
             "lifecycle_state": "",
-            "materialization_status": "REARM_DIRECTION_REVERSAL",
+            # WAITING_FOR_TRIGGER is a durable lifecycle state the existing
+            # recovery scan already understands. REARM_DIRECTION_REVERSAL is
+            # preserved only as a diagnostic (final_market_truth_status /
+            # last_direction_reversal_* below), never as the live
+            # materialization_status a recovery pass must classify.
+            "materialization_status": "WAITING_FOR_TRIGGER",
             "materialization_in_flight": False,
             "materialization_owner": "",
             "materialization_lease_until": "",
-            # The same watcher token that owned the materialization claim keeps
-            # ownership after rearm.  Clearing these fields while returning
-            # KEEP_WATCHER creates a durable/runtime ownership split.
-            "current_owner": _owner,
-            "watcher_token": _owner,
+            "current_owner": _watcher_token or _owner,
+            "watcher_token": _watcher_token,
+            "watcher_generation": _generation if _watcher_token else 0,
+            "watcher_registered_at": _now if _watcher_token else "",
+            "recovery_ownership": (
+                "recovery_scheduler" if _recovery_owned else ""
+            ),
+            "recovery_owner": _owner if _recovery_owned else "",
+            "direction_reversal_rearm_requires_watcher": _recovery_owned,
             "broker_ready": False,
             # Direction reversal starts a fresh selector attempt.  Preserve the
             # monotonic materialization_generation, but clear every active
@@ -2411,15 +2462,34 @@ class APOrderStateMachine:
             "retry_max_attempts": 0,
             "next_retry_at": "",
             "materialization_next_retry_at": "",
+            "deferred_retry_scheduled": False,
+            "deferred_retry_reason_code": "",
+            "deferred_retry_attempt": 0,
+            "deferred_retry_max_attempts": 0,
+            "deferred_retry_delay_seconds": 0,
+            "deferred_retry_scheduled_at": "",
+            "deferred_retry_next_attempt_at": "",
+            "deferred_retry_terminal_reason": "",
             "retry_reason": "",
             "materialization_reason": "",
             "retry_owner": "",
+            "materialization_retry_owner": "",
+            "materialization_retry_attempt": 0,
+            "materialization_retry_max_attempts": 0,
+            "watcher_retry_attempt": 0,
+            "watcher_next_retry_at": "",
             "selector_failure": {},
             "materialization_selector_failure": {},
+            "materialization_outcome": "",
+            "materialization_detail": "",
+            "entry_path": "",
+            # Preserve the decision as diagnostics only.
             "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
-            "final_market_truth": dict(market_truth_audit or {}),
+            "final_market_truth": _audit,
+            "last_direction_reversal_market_truth": _audit,
+            "last_direction_reversal_rearmed_at": _now,
             "selector_recovery_cursor_v1": None,
-            "rearmed_at": now_utc_iso(),
+            "rearmed_at": _now,
         }
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
@@ -2445,13 +2515,61 @@ class APOrderStateMachine:
                                 COALESCE(
                                     meta->'first_trigger_crossed_at_provenance',
                                     meta->'trigger_crossed_at_provenance'
-                                )
+                                ),
+                                'first_trigger_confirmed_at',
+                                COALESCE(
+                                    NULLIF(
+                                        meta->>'first_trigger_confirmed_at',
+                                        ''
+                                    ),
+                                    NULLIF(meta->>'trigger_confirmed_at', ''),
+                                    NULLIF(
+                                        meta->>'last_confirmed_trigger_at',
+                                        ''
+                                    )
+                                ),
+                                'first_trigger_breach_bid',
+                                COALESCE(
+                                    meta->'first_trigger_breach_bid',
+                                    meta->'first_breach_bid'
+                                ),
+                                'first_trigger_breach_ask',
+                                COALESCE(
+                                    meta->'first_trigger_breach_ask',
+                                    meta->'first_breach_ask'
+                                ),
+                                'first_trigger_confirmation_quote',
+                                COALESCE(
+                                    meta->'first_trigger_confirmation_quote',
+                                    meta->'last_trigger_confirmation_quote'
+                                ),
+                                'last_direction_reversal_retry_reason',
+                                COALESCE(
+                                    NULLIF(meta->>'retry_reason', ''),
+                                    NULLIF(
+                                        meta->>'materialization_reason',
+                                        ''
+                                    )
+                                ),
+                                'last_direction_reversal_selector_failure',
+                                COALESCE(
+                                    meta->'materialization_selector_failure',
+                                    meta->'selector_failure'
+                                ),
+                                'last_direction_reversal_materialization_outcome',
+                                NULLIF(meta->>'materialization_outcome', '')
                             ))
                         )
                         - 'selector_recovery_cursor_v1'
                         - 'trigger_crossed_at'
                         - 'trigger_crossed_at_provenance'
-                        - 'triggered_at',
+                        - 'triggered_at'
+                        - 'trigger_confirmed_at'
+                        - 'last_confirmed_trigger_at'
+                        - 'original_trigger_crossed_at'
+                        - 'first_breach_bid'
+                        - 'first_breach_ask'
+                        - 'last_trigger_confirmation_quote',
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s

@@ -622,23 +622,52 @@ def _selector_cursor_retry_block_reason(
     return str(cursor_load_reason) if cursor_load_reason else None
 
 
-def _reset_direction_reversal_runtime_state(watched, approved_plan, signal: dict) -> None:
-    """Reset process-local retry state after a durable direction rearm.
+def _reset_direction_reversal_runtime_state(
+    watched,
+    approved_plan,
+    signal: dict,
+    *,
+    watcher_token: str = "",
+    recovery_owner: str = "",
+    generation: int,
+    market_truth_audit: dict,
+) -> None:
+    """Mirror a successful durable direction-reversal reset in memory.
 
-    The durable OSM transition clears the active selector attempt and archives
-    the prior confirmed breach.  The in-memory watcher and approved plan must
-    mirror that reset before the next poll; otherwise stale attempt counters or
-    trigger evidence can make the next genuine breach look like attempt 2+ with
-    no cursor.
+    Only called after the durable OSM rearm has already returned True — a
+    CAS miss or exception must leave every runtime field the caller passed
+    in untouched, so this function performs no OSM/selector/broker calls of
+    its own and simply mutates the objects it was handed.
+
+    ``watcher_token`` is the exact real watcher token when this reset runs
+    on an uninterrupted, registered APEntryWatcher. It is intentionally left
+    blank for a synthetic restart/due-retry callback so the row stays
+    recovery-owned in memory too — matching the durable state written by
+    ``rearm_deferred_materialization_direction_reversal`` — rather than
+    fabricating watcher ownership that was never actually registered.
     """
     signal = signal if isinstance(signal, dict) else {}
+    watcher_token = str(watcher_token or "").strip()
+    recovery_owner = (
+        str(recovery_owner or "").strip() if not watcher_token else ""
+    )
+
     plan_meta = getattr(approved_plan, "metadata", None)
     if not isinstance(plan_meta, dict):
         plan_meta = {}
         try:
             approved_plan.metadata = plan_meta
-        except Exception:
-            pass
+        except Exception as exc:
+            # This is not an optional diagnostic mirror — if the plan's
+            # metadata dict cannot be attached, the durable reset and the
+            # in-memory plan silently diverge and the next breach can be
+            # evaluated against stale attempt/trigger state. Fail loudly
+            # rather than continuing on a half-reset object.
+            log.critical(
+                "DIRECTION_REVERSAL_PLAN_METADATA_RESET_FAILED err=%s", exc
+            )
+            raise
+
     signal_meta = signal.get("metadata")
     if not isinstance(signal_meta, dict):
         signal_meta = {}
@@ -657,13 +686,71 @@ def _reset_direction_reversal_runtime_state(watched, approved_plan, signal: dict
         or plan_meta.get("trigger_crossed_at_provenance")
         or signal_meta.get("trigger_crossed_at_provenance")
     )
+    prior_confirmed_at = (
+        signal.get("trigger_confirmed_at")
+        or plan_meta.get("trigger_confirmed_at")
+        or signal_meta.get("trigger_confirmed_at")
+        or signal.get("last_confirmed_trigger_at")
+        or plan_meta.get("last_confirmed_trigger_at")
+        or signal_meta.get("last_confirmed_trigger_at")
+    )
+    prior_breach_bid = (
+        signal.get("first_breach_bid")
+        or plan_meta.get("first_breach_bid")
+        or signal_meta.get("first_breach_bid")
+        or getattr(watched, "first_breach_bid", 0)
+    )
+    prior_breach_ask = (
+        signal.get("first_breach_ask")
+        or plan_meta.get("first_breach_ask")
+        or signal_meta.get("first_breach_ask")
+        or getattr(watched, "first_breach_ask", 0)
+    )
+    prior_confirmation_quote = (
+        signal.get("last_trigger_confirmation_quote")
+        or plan_meta.get("last_trigger_confirmation_quote")
+        or signal_meta.get("last_trigger_confirmation_quote")
+    )
+    prior_retry_reason = (
+        signal.get("retry_reason")
+        or plan_meta.get("retry_reason")
+        or signal_meta.get("retry_reason")
+        or signal.get("materialization_reason")
+        or plan_meta.get("materialization_reason")
+        or signal_meta.get("materialization_reason")
+    )
+    prior_selector_failure = (
+        signal.get("materialization_selector_failure")
+        or plan_meta.get("materialization_selector_failure")
+        or signal_meta.get("materialization_selector_failure")
+        or signal.get("selector_failure")
+        or plan_meta.get("selector_failure")
+        or signal_meta.get("selector_failure")
+    )
+    prior_materialization_outcome = (
+        signal.get("materialization_outcome")
+        or plan_meta.get("materialization_outcome")
+        or signal_meta.get("materialization_outcome")
+    )
 
+    recovery_owned = bool(recovery_owner and not watcher_token)
+    _audit = dict(market_truth_audit or {})
+    _now_iso = now_utc_iso()
     reset_patch = {
         "lifecycle_state": "",
-        "materialization_status": "REARM_DIRECTION_REVERSAL",
+        "materialization_status": "WAITING_FOR_TRIGGER",
         "materialization_in_flight": False,
         "materialization_owner": "",
         "materialization_lease_until": "",
+        "current_owner": watcher_token or recovery_owner,
+        "watcher_token": watcher_token,
+        "watcher_generation": (generation if watcher_token else 0),
+        "watcher_registered_at": (_now_iso if watcher_token else ""),
+        "recovery_ownership": (
+            "recovery_scheduler" if recovery_owned else ""
+        ),
+        "recovery_owner": recovery_owner if recovery_owned else "",
+        "direction_reversal_rearm_requires_watcher": recovery_owned,
         "broker_ready": False,
         "retry_attempt": 0,
         "retry_attempt_in_flight": 0,
@@ -672,10 +759,47 @@ def _reset_direction_reversal_runtime_state(watched, approved_plan, signal: dict
         "retry_max_attempts": 0,
         "next_retry_at": "",
         "materialization_next_retry_at": "",
+        "deferred_retry_scheduled": False,
+        "deferred_retry_reason_code": "",
+        "deferred_retry_attempt": 0,
+        "deferred_retry_max_attempts": 0,
+        "deferred_retry_delay_seconds": 0,
+        "deferred_retry_scheduled_at": "",
+        "deferred_retry_next_attempt_at": "",
+        "deferred_retry_terminal_reason": "",
         "retry_reason": "",
         "materialization_reason": "",
         "retry_owner": "",
+        "materialization_retry_owner": "",
+        "materialization_retry_attempt": 0,
+        "materialization_retry_max_attempts": 0,
+        "watcher_retry_attempt": 0,
+        "watcher_next_retry_at": "",
+        "selector_failure": {},
+        "materialization_selector_failure": {},
+        "materialization_outcome": "",
+        "materialization_detail": "",
+        "entry_path": "",
+        "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
+        "final_market_truth": _audit,
+        "last_direction_reversal_market_truth": _audit,
+        "last_direction_reversal_rearmed_at": _now_iso,
+        "rearmed_at": _now_iso,
     }
+
+    active_keys = (
+        "selector_recovery_cursor_v1",
+        "trigger_crossed_at",
+        "trigger_crossed_at_provenance",
+        "triggered_at",
+        "trigger_confirmed_at",
+        "last_confirmed_trigger_at",
+        "original_trigger_crossed_at",
+        "first_breach_bid",
+        "first_breach_ask",
+        "last_trigger_confirmation_quote",
+    )
+
     for target in (plan_meta, signal_meta):
         if prior_crossed_at and not target.get("first_trigger_crossed_at"):
             target["first_trigger_crossed_at"] = prior_crossed_at
@@ -684,22 +808,74 @@ def _reset_direction_reversal_runtime_state(watched, approved_plan, signal: dict
             and prior_provenance
             and not target.get("first_trigger_crossed_at_provenance")
         ):
-            target["first_trigger_crossed_at_provenance"] = dict(prior_provenance)
-        target.update(reset_patch)
-        for key in (
-            "selector_recovery_cursor_v1",
-            "trigger_crossed_at",
-            "trigger_crossed_at_provenance",
-            "triggered_at",
+            target["first_trigger_crossed_at_provenance"] = dict(
+                prior_provenance
+            )
+        if prior_confirmed_at and not target.get("first_trigger_confirmed_at"):
+            target["first_trigger_confirmed_at"] = prior_confirmed_at
+        if prior_breach_bid and not target.get("first_trigger_breach_bid"):
+            target["first_trigger_breach_bid"] = prior_breach_bid
+        if prior_breach_ask and not target.get("first_trigger_breach_ask"):
+            target["first_trigger_breach_ask"] = prior_breach_ask
+        if (
+            isinstance(prior_confirmation_quote, dict)
+            and prior_confirmation_quote
+            and not target.get("first_trigger_confirmation_quote")
         ):
+            target["first_trigger_confirmation_quote"] = dict(
+                prior_confirmation_quote
+            )
+        if (
+            prior_retry_reason
+            and not target.get("last_direction_reversal_retry_reason")
+        ):
+            target["last_direction_reversal_retry_reason"] = str(
+                prior_retry_reason
+            )
+        if (
+            isinstance(prior_selector_failure, dict)
+            and prior_selector_failure
+            and not target.get("last_direction_reversal_selector_failure")
+        ):
+            target["last_direction_reversal_selector_failure"] = dict(
+                prior_selector_failure
+            )
+        if (
+            prior_materialization_outcome
+            and not target.get(
+                "last_direction_reversal_materialization_outcome"
+            )
+        ):
+            target[
+                "last_direction_reversal_materialization_outcome"
+            ] = str(prior_materialization_outcome)
+
+        target.update(reset_patch)
+        for key in active_keys:
             target.pop(key, None)
 
     signal.update(reset_patch)
+    for key in active_keys:
+        signal.pop(key, None)
+
+    # These fields are valid only for the synthetic in-flight recovery claim
+    # that just ended. Leaving them behind makes the next real breach attempt
+    # enter the pre-claim verification path with stale authority.
     for key in (
-        "selector_recovery_cursor_v1",
-        "trigger_crossed_at",
-        "trigger_crossed_at_provenance",
-        "triggered_at",
+        "_recovery_pre_claimed",
+        "_recovery_pre_claimed_owner",
+        "_recovery_pre_claimed_generation",
+        "_recovery_pre_claimed_attempt",
+        "_recovery_pre_claimed_client_id",
+        "_recovery_pre_claimed_mode",
+        "materialization_retry_owner",
+        "materialization_retry_attempt",
+        "ownership_kind",
+        "owner",
+        "fenced",
+        "recovery_submit_fenced",
+        "recovery_submit_owner",
+        "recovery_submit_generation",
     ):
         signal.pop(key, None)
 
@@ -707,11 +883,30 @@ def _reset_direction_reversal_runtime_state(watched, approved_plan, signal: dict
         ("breach_count", 0),
         ("trigger_crossed_at", None),
         ("trigger_crossed_at_provenance", None),
+        ("triggered_at", None),
+        ("_pending_first_breach_at", None),
+        ("first_breach_bid", 0.0),
+        ("first_breach_ask", 0.0),
+        ("trigger_price", None),
+        ("breach_price", 0.0),
+        ("deferred_retry_not_before", None),
+        ("_trigger_attempts", 0),
+        ("_trigger_stop_collision", False),
+        ("_pending_audit", None),
     ):
         try:
             setattr(watched, attr, value)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Optional/compat fields on the watched object: log every
+            # failure rather than swallowing it, but do not abort the reset
+            # over an attribute that may not exist on every WatchedSignal
+            # variant (e.g. the synthetic SimpleNamespace built by
+            # resume_deferred_materialization_retry).
+            log.warning(
+                "DIRECTION_REVERSAL_WATCHER_ATTR_RESET_FAILED attr=%s err=%s",
+                attr,
+                exc,
+            )
 
 
 def _breach_retry_cutoff_hhmm() -> int:
@@ -3009,6 +3204,7 @@ class APExecutionCore:
             ),
         )
 
+        _callback_result = None
         try:
             # Set verified pre-claim markers so _on_entry_trigger's deferred
             # claim block bypasses its second claim and proceeds directly to
@@ -3024,7 +3220,7 @@ class APExecutionCore:
                 "_recovery_pre_claimed_client_id":   row_client,
                 "_recovery_pre_claimed_mode":        row_mode,
             })
-            self._on_entry_trigger(watched)
+            _callback_result = self._on_entry_trigger(watched)
         except Exception as exc:
             log.exception("[%s] resume_deferred_materialization_retry canonical_callback_failed "
                           "local_order_id=%s", ticker or local_order_id, exc)
@@ -3034,6 +3230,33 @@ class APExecutionCore:
                 f"RETRY_CANONICAL_CALLBACK_EXCEPTION:{type(exc).__name__}",
                 {"callback_exception": str(exc)[:200]},
             )
+
+        if (
+            isinstance(_callback_result, dict)
+            and str(
+                _callback_result.get("disposition") or ""
+            ).strip().upper() == "KEEP_WATCHER"
+            and str(
+                _callback_result.get("reason_code") or ""
+            ).strip().upper() == "REARM_DIRECTION_REVERSAL"
+        ):
+            # The OSM already committed the clean pre-breach transition
+            # (lifecycle_state="", materialization_status="WAITING_FOR_TRIGGER").
+            # Do not call schedule_deferred_materialization_retry(): that
+            # method correctly requires MATERIALIZING ownership, which the
+            # rearm just released — calling it here is exactly the false
+            # reschedule this correction closes. This synthetic callback had
+            # no real registered watcher, so the row must stay recovery-owned
+            # until the existing recovery health loop attaches a real
+            # APEntryWatcher on a later pass.
+            return {
+                **_base,
+                "disposition": "KEEP_WATCHER",
+                "reason_code": "REARM_DIRECTION_REVERSAL_RECOVERY_OWNED",
+                "generation": _new_generation,
+                "attempt": _expected_attempt,
+                "watcher_rearm_required": True,
+            }
 
         # ── Re-read to determine outcome ─────────────────────────────
         try:
@@ -4746,11 +4969,23 @@ class APExecutionCore:
                             "rearm_deferred_materialization_direction_reversal",
                             None,
                         )
+                        # _recovery_pre_claimed (verified earlier in this same
+                        # callback invocation against the durable row) is the
+                        # authoritative signal for whether this is a real,
+                        # registered APEntryWatcher or a synthetic restart/
+                        # due-retry callback. A synthetic invocation must
+                        # never have its recovery takeover claim persisted as
+                        # watcher ownership — that is the exact defect this
+                        # correction closes.
+                        _rearm_watcher_token = (
+                            "" if _recovery_pre_claimed else _mat_owner
+                        )
                         _rearmed = bool(
                             callable(_rearm)
                             and _rearm(
                                 str(queue_local_order_id or ""),
                                 owner=_mat_owner,
+                                watcher_token=_rearm_watcher_token,
                                 generation=_mat_generation,
                                 signal_id=str(
                                     getattr(approved_plan, "signal_id", "") or ""
@@ -4761,7 +4996,15 @@ class APExecutionCore:
                         )
                         if _rearmed:
                             _reset_direction_reversal_runtime_state(
-                                watched, approved_plan, sig
+                                watched,
+                                approved_plan,
+                                sig,
+                                watcher_token=_rearm_watcher_token,
+                                recovery_owner=(
+                                    "" if _rearm_watcher_token else _mat_owner
+                                ),
+                                generation=_mat_generation,
+                                market_truth_audit=_truth_result.audit,
                             )
                         return {
                             "disposition": (
@@ -4770,6 +5013,10 @@ class APExecutionCore:
                                 else "MATERIALIZATION_REARM_WRITE_FAILED"
                             ),
                             "reason_code": "REARM_DIRECTION_REVERSAL",
+                            "watcher_rearm_required": bool(
+                                _rearmed and not _rearm_watcher_token
+                            ),
+                            "materialization_generation": _mat_generation,
                         }
                     if (
                         _truth_authority
