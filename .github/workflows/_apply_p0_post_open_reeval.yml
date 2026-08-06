@@ -1,0 +1,473 @@
+name: Apply reserved post-open reevaluation patch
+
+on:
+  push:
+    branches:
+      - fix/p0-reserve-post-open-reeval-attempt
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: intelligence_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intelligence_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/p0-reserve-post-open-reeval-attempt
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply surgical production and regression patch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('client_runner.py')
+          text = path.read_text()
+
+          init_old = '''        self._overnight_reeval_state_date = None
+          self._overnight_reeval_success_date = None
+          self._overnight_reeval_exhausted_date = None
+          self._overnight_reeval_last_attempt_at = None
+          self._overnight_reeval_next_retry_at = None
+          self._overnight_reeval_attempt_count = 0
+          self._overnight_reeval_last_result_class = None
+          self._overnight_reeval_last_retry_reason = None
+          '''
+          init_new = init_old + '''        self._overnight_reeval_premarket_all_deferred = True
+          self._overnight_reeval_post_open_retry_reserved = False
+          self._overnight_reeval_post_open_attempt_performed = False
+          '''
+          assert text.count(init_old) == 1, text.count(init_old)
+          text = text.replace(init_old, init_new, 1)
+
+          reset_old = '''        self._overnight_reeval_state_date = today
+          self._overnight_reeval_success_date = None
+          self._overnight_reeval_exhausted_date = None
+          self._overnight_reeval_last_attempt_at = None
+          self._overnight_reeval_next_retry_at = None
+          self._overnight_reeval_attempt_count = 0
+          self._overnight_reeval_last_result_class = None
+          self._overnight_reeval_last_retry_reason = None
+          '''
+          reset_new = reset_old + '''        self._overnight_reeval_premarket_all_deferred = True
+          self._overnight_reeval_post_open_retry_reserved = False
+          self._overnight_reeval_post_open_attempt_performed = False
+          '''
+          assert text.count(reset_old) == 1, text.count(reset_old)
+          text = text.replace(reset_old, reset_new, 1)
+
+          window_old = '''    def _overnight_reeval_window_end(self, today):
+              return datetime(today.year, today.month, today.day, 9, 45, 0, tzinfo=_ET)
+
+          def _overnight_reeval_in_window(self, now_et) -> bool:
+          '''
+          window_new = '''    def _overnight_reeval_window_end(self, today):
+              return datetime(today.year, today.month, today.day, 9, 45, 0, tzinfo=_ET)
+
+          def _overnight_reeval_reserved_post_open_at(self, today):
+              return datetime(
+                  today.year,
+                  today.month,
+                  today.day,
+                  9,
+                  30,
+                  OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC,
+                  tzinfo=_ET,
+              )
+
+          @staticmethod
+          def _overnight_reeval_is_post_open(now_et) -> bool:
+              return bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30))
+
+          def _overnight_reeval_in_window(self, now_et) -> bool:
+          '''
+          assert text.count(window_old) == 1, text.count(window_old)
+          text = text.replace(window_old, window_new, 1)
+
+          schedule_pattern = re.compile(
+              r'    def _schedule_overnight_reeval_retry\(self, now_et, today, result: dict\) -> tuple\[object \| None, str \| None\]:\n.*?\n    def _persist_overnight_reeval_lock\(',
+              re.S,
+          )
+          schedule_match = schedule_pattern.search(text)
+          assert schedule_match is not None
+          schedule_new = '''    def _schedule_overnight_reeval_retry(self, now_et, today, result: dict) -> tuple[object | None, str | None]:
+              window_end = self._overnight_reeval_window_end(today)
+              reserved_post_open_at = self._overnight_reeval_reserved_post_open_at(today)
+              post_open_attempt = self._overnight_reeval_is_post_open(now_et)
+
+              if self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS:
+                  # Preserve fast premarket retries, but do not let six market-closed
+                  # all-deferred passes consume the only attempt that can observe an
+                  # open option market. The reservation is narrow: every premarket
+                  # attempt must have remained RETRYABLE_ALL_DEFERRED, the current
+                  # attempt must have the same classification, and no post-open
+                  # attempt may already have run.
+                  can_reserve_post_open = (
+                      not post_open_attempt
+                      and bool(self._overnight_reeval_premarket_all_deferred)
+                      and str(result.get("result_class") or "") == "RETRYABLE_ALL_DEFERRED"
+                      and not self._overnight_reeval_post_open_attempt_performed
+                      and now_et < reserved_post_open_at < window_end
+                  )
+                  if can_reserve_post_open:
+                      self._overnight_reeval_post_open_retry_reserved = True
+                      return reserved_post_open_at, None
+                  return None, "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
+
+              # Premarket retries continue on the normal short interval. This keeps
+              # prior-level validation, OSM creation, and watcher arming available
+              # before open when market data is usable.
+              scheduled = now_et + timedelta(seconds=OVERNIGHT_REEVAL_RETRY_SEC)
+              if scheduled >= window_end:
+                  return None, "OVERNIGHT_REEVAL_RETRY_EXHAUSTED"
+              return scheduled, None
+
+          def _persist_overnight_reeval_lock('''
+          text = schedule_pattern.sub(schedule_new, text, count=1)
+
+          run_marker = '    def run_overnight_reeval_attempt(\n'
+          run_start = text.index(run_marker)
+          guard_start_marker = '            if self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS:\n'
+          guard_start = text.index(guard_start_marker, run_start)
+          guard_end_marker = '\n\n        if not self._overnight_reeval_attempt_lock.acquire(blocking=False):'
+          guard_end = text.index(guard_end_marker, guard_start)
+          guard_new = '''            reserved_post_open_due = (
+                  bool(self._overnight_reeval_post_open_retry_reserved)
+                  and not self._overnight_reeval_post_open_attempt_performed
+                  and now_et >= self._overnight_reeval_reserved_post_open_at(today)
+                  and now_et < self._overnight_reeval_window_end(today)
+              )
+              if (
+                  self._overnight_reeval_attempt_count >= OVERNIGHT_REEVAL_MAX_ATTEMPTS
+                  and not reserved_post_open_due
+              ):
+                  self._overnight_reeval_exhausted_date = today
+                  self._overnight_reeval_next_retry_at = None
+                  self._overnight_reeval_last_result_class = "RETRY_EXHAUSTED"
+                  result = self._overnight_reeval_base_result(
+                      result_class="RETRY_EXHAUSTED",
+                      completed=False,
+                      retryable=False,
+                      retry_reason=self._overnight_reeval_last_retry_reason,
+                      now_et=now_et,
+                      source=source,
+                      last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
+                  )
+                  self._persist_overnight_reeval_lock(
+                      result,
+                      today=today,
+                      source=source,
+                      now_et=now_et,
+                      last_error="OVERNIGHT_REEVAL_RETRY_EXHAUSTED",
+                  )
+                  _readiness = self._enforce_preopen_readiness_at_deadline(
+                      now_et=now_et, today=today, source=source,
+                      result_class="RETRY_EXHAUSTED",
+                  )
+                  if _readiness is not None:
+                      result["readiness_result"] = _readiness
+                  return result'''
+          text = text[:guard_start] + guard_new + text[guard_end:]
+
+          attempt_old = '''        try:
+              self._overnight_reeval_attempt_count += 1
+              self._overnight_reeval_last_attempt_at = now_et
+          '''
+          attempt_new = '''        try:
+              _post_open_attempt = self._overnight_reeval_is_post_open(now_et)
+              self._overnight_reeval_attempt_count += 1
+              self._overnight_reeval_last_attempt_at = now_et
+              if _post_open_attempt:
+                  self._overnight_reeval_post_open_attempt_performed = True
+                  self._overnight_reeval_post_open_retry_reserved = False
+          '''
+          assert text.count(attempt_old) == 1, text.count(attempt_old)
+          text = text.replace(attempt_old, attempt_new, 1)
+
+          classify_old = '''            result["attempt_performed"] = True
+
+              if bool(result.get("completed")):
+          '''
+          classify_new = '''            result["attempt_performed"] = True
+
+              if (
+                  not _post_open_attempt
+                  and str(result.get("result_class") or "") != "RETRYABLE_ALL_DEFERRED"
+              ):
+                  self._overnight_reeval_premarket_all_deferred = False
+
+              if bool(result.get("completed")):
+                  self._overnight_reeval_post_open_retry_reserved = False
+          '''
+          assert text.count(classify_old) == 1, text.count(classify_old)
+          text = text.replace(classify_old, classify_new, 1)
+
+          diag_old = '''            result["next_retry_at"] = (
+                  self._overnight_reeval_next_retry_at.isoformat()
+                  if self._overnight_reeval_next_retry_at is not None else None
+              )
+
+              self._persist_overnight_reeval_lock(
+          '''
+          diag_new = '''            result["next_retry_at"] = (
+                  self._overnight_reeval_next_retry_at.isoformat()
+                  if self._overnight_reeval_next_retry_at is not None else None
+              )
+              result["post_open_retry_reserved"] = bool(
+                  self._overnight_reeval_post_open_retry_reserved
+              )
+              result["post_open_attempt_performed"] = bool(
+                  self._overnight_reeval_post_open_attempt_performed
+              )
+              result["premarket_all_deferred"] = bool(
+                  self._overnight_reeval_premarket_all_deferred
+              )
+
+              self._persist_overnight_reeval_lock(
+          '''
+          assert text.count(diag_old) == 1, text.count(diag_old)
+          text = text.replace(diag_old, diag_new, 1)
+
+          base_old = '''            "last_error": last_error,
+              "attempt_performed": False,
+          '''
+          base_new = '''            "last_error": last_error,
+              "attempt_performed": False,
+              "post_open_retry_reserved": bool(self._overnight_reeval_post_open_retry_reserved),
+              "post_open_attempt_performed": bool(self._overnight_reeval_post_open_attempt_performed),
+              "premarket_all_deferred": bool(self._overnight_reeval_premarket_all_deferred),
+          '''
+          assert text.count(base_old) == 1, text.count(base_old)
+          text = text.replace(base_old, base_new, 1)
+
+          lock_old = '''                "post_open_attempt": bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
+              }
+          '''
+          lock_new = '''                "post_open_attempt": bool(now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)),
+                  "post_open_retry_reserved": bool(self._overnight_reeval_post_open_retry_reserved),
+                  "post_open_attempt_performed": bool(self._overnight_reeval_post_open_attempt_performed),
+                  "premarket_all_deferred": bool(self._overnight_reeval_premarket_all_deferred),
+              }
+          '''
+          assert text.count(lock_old) == 1, text.count(lock_old)
+          text = text.replace(lock_old, lock_new, 1)
+
+          path.write_text(text)
+
+          test_path = Path('tests/test_p0_overnight_reeval_retry_liveness.py')
+          tests = test_path.read_text()
+          helper_old = '''    runner._overnight_reeval_attempt_count = 0
+              runner._overnight_reeval_last_result_class = None
+              runner._overnight_reeval_last_retry_reason = None
+          '''
+          helper_new = helper_old + '''    runner._overnight_reeval_premarket_all_deferred = True
+              runner._overnight_reeval_post_open_retry_reserved = False
+              runner._overnight_reeval_post_open_attempt_performed = False
+          '''
+          assert tests.count(helper_old) == 1, tests.count(helper_old)
+          tests = tests.replace(helper_old, helper_new, 1)
+
+          tests += r'''
+
+          def test_six_all_deferred_premarket_attempts_reserve_one_post_open_attempt(monkeypatch):
+              calls = []
+              monkeypatch.setattr(
+                  ov,
+                  "run_overnight_reeval",
+                  lambda **kwargs: calls.append(kwargs) or _result(),
+              )
+              runner = _runner()
+              start = _dt(9)
+
+              result = None
+              for attempt_index in range(cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS):
+                  now = start + cr.timedelta(
+                      seconds=attempt_index * cr.OVERNIGHT_REEVAL_RETRY_SEC
+                  )
+                  result = runner.run_overnight_reeval_attempt(
+                      now_et=now,
+                      source="scheduler",
+                  )
+
+              reserved_at = _dt(
+                  9,
+                  30,
+                  cr.OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC,
+              )
+              assert len(calls) == cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS
+              assert result["result_class"] == "RETRYABLE_ALL_DEFERRED"
+              assert result["retryable"] is True
+              assert result["next_retry_at"] == reserved_at.isoformat()
+              assert result["post_open_retry_reserved"] is True
+              assert runner._overnight_reeval_exhausted_date is None
+
+
+          def test_reserved_post_open_attempt_runs_after_premarket_budget_and_completes(monkeypatch):
+              calls = []
+              outcomes = [
+                  *[_result() for _ in range(cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS)],
+                  _result(
+                      armed=5,
+                      rejected=120,
+                      skipped=0,
+                      stalled=False,
+                      completed=True,
+                      retryable=False,
+                      retry_reason=None,
+                      result_class="COMPLETED_WITH_DECISIONS",
+                  ),
+              ]
+              monkeypatch.setattr(
+                  ov,
+                  "run_overnight_reeval",
+                  lambda **kwargs: calls.append(kwargs) or outcomes.pop(0),
+              )
+              runner = _runner()
+              start = _dt(9)
+              for attempt_index in range(cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS):
+                  runner.run_overnight_reeval_attempt(
+                      now_et=start + cr.timedelta(
+                          seconds=attempt_index * cr.OVERNIGHT_REEVAL_RETRY_SEC
+                      ),
+                      source="scheduler",
+                  )
+
+              result = runner.run_overnight_reeval_attempt(
+                  now_et=_dt(
+                      9,
+                      30,
+                      cr.OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC,
+                  ),
+                  source="scheduler",
+              )
+
+              assert len(calls) == cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS + 1
+              assert result["completed"] is True
+              assert result["post_open_attempt"] is True
+              assert result["post_open_attempt_performed"] is True
+              assert result["post_open_retry_reserved"] is False
+              assert runner._overnight_reeval_success_date == _dt(9).date()
+              assert runner._overnight_reeval_exhausted_date is None
+              assert len(runner.post_calls) == 1
+
+
+          def test_reserved_post_open_attempt_can_exhaust_only_after_it_runs(monkeypatch):
+              calls = []
+              monkeypatch.setattr(
+                  ov,
+                  "run_overnight_reeval",
+                  lambda **kwargs: calls.append(kwargs) or _result(),
+              )
+              runner = _runner()
+              start = _dt(9)
+              for attempt_index in range(cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS):
+                  runner.run_overnight_reeval_attempt(
+                      now_et=start + cr.timedelta(
+                          seconds=attempt_index * cr.OVERNIGHT_REEVAL_RETRY_SEC
+                      ),
+                      source="scheduler",
+                  )
+
+              exhausted = runner.run_overnight_reeval_attempt(
+                  now_et=_dt(
+                      9,
+                      30,
+                      cr.OVERNIGHT_REEVAL_POST_OPEN_RETRY_DELAY_SEC,
+                  ),
+                  source="scheduler",
+              )
+              repeated = runner.run_overnight_reeval_attempt(
+                  now_et=_dt(9, 31),
+                  source="scheduler",
+              )
+
+              assert exhausted["result_class"] == "RETRY_EXHAUSTED"
+              assert exhausted["attempt_performed"] is True
+              assert exhausted["post_open_attempt"] is True
+              assert exhausted["post_open_attempt_performed"] is True
+              assert runner._overnight_reeval_exhausted_date == _dt(9).date()
+              assert repeated["result_class"] == "RETRY_EXHAUSTED"
+              assert repeated["attempt_performed"] is False
+              assert len(calls) == cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS + 1
+
+
+          def test_mixed_premarket_failures_do_not_earn_reserved_post_open_attempt(monkeypatch):
+              calls = []
+              outcomes = [
+                  _result(
+                      errors=1,
+                      terminal_errors=1,
+                      result_class="RETRYABLE_ROW_ERRORS",
+                      retry_reason="row_errors",
+                  ),
+                  *[_result() for _ in range(cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS - 1)],
+              ]
+              monkeypatch.setattr(
+                  ov,
+                  "run_overnight_reeval",
+                  lambda **kwargs: calls.append(kwargs) or outcomes.pop(0),
+              )
+              runner = _runner()
+              start = _dt(9)
+
+              result = None
+              for attempt_index in range(cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS):
+                  result = runner.run_overnight_reeval_attempt(
+                      now_et=start + cr.timedelta(
+                          seconds=attempt_index * cr.OVERNIGHT_REEVAL_RETRY_SEC
+                      ),
+                      source="scheduler",
+                  )
+
+              assert len(calls) == cr.OVERNIGHT_REEVAL_MAX_ATTEMPTS
+              assert result["result_class"] == "RETRY_EXHAUSTED"
+              assert result["post_open_retry_reserved"] is False
+              assert runner._overnight_reeval_exhausted_date == _dt(9).date()
+          '''
+          test_path.write_text(tests)
+          PY
+
+      - name: Install focused test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest requests psycopg2-binary python-dotenv cryptography numpy pandas
+
+      - name: Run focused liveness regressions
+        env:
+          PGSSLMODE: disable
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable
+          INTELLIGENCE_POSTGRES_TEST_URL: postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable
+        run: |
+          python -m pytest tests/test_p0_overnight_reeval_retry_liveness.py tests/test_p0_readiness_deadline_enforcement.py -q --tb=short
+          python -m py_compile client_runner.py tests/test_p0_overnight_reeval_retry_liveness.py
+          git diff --check
+
+      - name: Commit tested patch and remove bootstrap workflow
+        run: |
+          git config user.name "Angel Precision CI"
+          git config user.email "ci@angelprecision.local"
+          rm .github/workflows/_apply_p0_post_open_reeval.yml
+          git add client_runner.py tests/test_p0_overnight_reeval_retry_liveness.py .github/workflows/_apply_p0_post_open_reeval.yml
+          git commit -m "P0: reserve one post-open overnight reevaluation attempt"
+          git push origin HEAD:fix/p0-reserve-post-open-reeval-attempt
