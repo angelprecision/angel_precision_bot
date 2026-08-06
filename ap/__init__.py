@@ -38,7 +38,6 @@ def install_entry_safety_guards() -> None:
         install_entry_metadata_safety_guards,
         install_underlying_confirmation_safety_guard,
         install_deferred_materialization_persistence_guard,
-        install_selector_cursor_safety_guard,
         install_trade_lifecycle_safety_guards,
     )
     for installer in installers:
@@ -52,3 +51,8 @@ def install_entry_safety_guards() -> None:
 
 
 install_entry_safety_guards()
+# PR #401 cursor persistence classification is a deployment invariant, not an
+# optional compatibility guard. If it cannot install, fail startup rather than
+# silently reverting to the implementation that conflates DB failure with an
+# exact-owner CAS miss.
+install_selector_cursor_safety_guard()
