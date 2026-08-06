@@ -64,6 +64,8 @@ def _fetch_candidate_rows() -> list[dict]:
                  OR meta ? 'next_retry_at'
                  OR meta ? 'materialization_next_retry_at'
                  OR meta ? 'recovery_owner'
+                 OR meta ? 'trigger_crossed_at'
+                 OR meta ? 'trigger_crossed_at_provenance'
                   )
             ORDER BY updated_ts ASC
             """
@@ -71,12 +73,21 @@ def _fetch_candidate_rows() -> list[dict]:
     return rows
 
 
-def _parse_timestamp(raw, *, finding: str, findings: list[str]) -> datetime | None:
+def _parse_timestamp(
+    raw,
+    *,
+    finding: str,
+    findings: list[str],
+    require_timezone: bool = False,
+) -> datetime | None:
     if raw in (None, ""):
         return None
     try:
         parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
+            if require_timezone:
+                findings.append(finding)
+                return None
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
     except (TypeError, ValueError):
@@ -289,6 +300,7 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
             trigger_crossed_raw,
             finding="TRIGGER_CROSSED_TIMESTAMP_MALFORMED",
             findings=findings,
+            require_timezone=True,
         )
         if not provenance_present:
             findings.append("TRIGGER_PROVENANCE_MISSING")
