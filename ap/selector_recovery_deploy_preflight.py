@@ -10,16 +10,21 @@ PENDING_TRIGGER/MATERIALIZING ENTRY row and classifies it using the SAME
 production resolver helpers runtime code uses -- not reimplemented logic --
 so preflight classification can never drift from actual runtime behavior:
 
-  - ap_execution_core._resolve_selector_attempt_number  (Blocker 1 fix)
+  - ap_execution_core._resolve_selector_attempt_number  (counter conflict)
+  - ap_execution_core._selector_cursor_retry_block_reason  (Blocker 1 fix:
+    MISSING_CURSOR_ON_RETRY detected even when load_selector_recovery_cursor
+    silently produces a fresh cursor for a missing candidate)
   - ap.selector_retry_policy.resolve_deferred_materialization_max_attempts
-    (Blocker 2 fix)
+    (Blocker 2 fix: config conflict forces exit 2 even with zero rows)
   - ap.selector_retry_policy.load_selector_recovery_cursor
 
 Output is deterministic JSON to stdout. Exit code is 0 if every row
-classifies as safe, 2 if any row is unsafe (counter conflict, malformed/
-missing attempt-2+ cursor, lifecycle/materialization conflict, expired
-lease with no retry schedule, incomplete identity, or incomplete trigger
-provenance), 1 on a genuine tool error (DB unreachable, etc.).
+classifies as safe AND there is no configuration conflict, 2 if any row is
+unsafe (counter conflict, malformed/missing attempt-2+ cursor, lifecycle/
+materialization conflict, expired lease with no retry schedule, incomplete
+identity, incomplete trigger provenance, or invalid/missing generation) OR if
+a configuration conflict is detected, 1 on a genuine tool error (DB
+unreachable, etc.).
 """
 
 from __future__ import annotations
@@ -46,6 +51,10 @@ def _fetch_candidate_rows() -> list[dict]:
     deliberately wide net on any evidence of deferred-materialization
     involvement; _classify_row() does the actual safety determination for
     every row this returns.
+
+    Blocker 4 fix: BTRIM applied to both kind and status outer predicates
+    so rows with leading/trailing whitespace (e.g. kind=' ENTRY ',
+    status=' PENDING_TRIGGER ') are not silently invisible.
     """
     with conn() as c:
         rows = c.execute(
@@ -54,8 +63,8 @@ def _fetch_candidate_rows() -> list[dict]:
                 local_order_id, client_id, execution_mode, signal_id,
                 canonical_signal_id, status, meta, updated_ts
             FROM orders
-            WHERE UPPER(COALESCE(kind, '')) = 'ENTRY'
-              AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
+            WHERE UPPER(BTRIM(COALESCE(kind, ''))) = 'ENTRY'
+              AND UPPER(BTRIM(COALESCE(status, ''))) = 'PENDING_TRIGGER'
               AND (
                     -- Any lifecycle_state at all (case/whitespace drift,
                     -- or a value other than exactly "MATERIALIZING").
@@ -100,6 +109,15 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     findings: list[str] = []
     local_order_id = str(row.get("local_order_id") or "")
 
+    # Extract lifecycle/status up-front -- reused across multiple checks
+    # below so the extraction is not repeated.
+    lifecycle_raw = meta.get("lifecycle_state")
+    materialization_status_raw = meta.get("materialization_status")
+    lifecycle_state = str(lifecycle_raw) if lifecycle_raw is not None else ""
+    materialization_status = (
+        str(materialization_status_raw) if materialization_status_raw is not None else ""
+    )
+
     # 1. Counter conflict -- reuse the exact runtime resolver.
     from ap_execution_core import _resolve_selector_attempt_number
 
@@ -112,20 +130,67 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     if conflict_reason:
         findings.append(f"COUNTER_CONFLICT:{conflict_reason}")
 
-    # 2. Missing/malformed attempt-2+ cursor -- reuse the exact runtime
-    # cursor loader.
-    if resolved_attempt is not None and resolved_attempt > 1:
-        from ap.selector_retry_policy import load_selector_recovery_cursor
-
-        _generation = meta.get("materialization_generation")
-        try:
-            _generation_int = int(_generation) if _generation is not None else None
-        except (TypeError, ValueError):
-            _generation_int = None
+    # 2. Generation completeness -- validated independently of attempt
+    # number (Blocker 3 fix).  Generation is part of the ownership and
+    # cursor identity fence; any row carrying active deferred-
+    # materialization lifecycle or ownership evidence must carry a valid
+    # positive integer generation.  Missing, zero, negative, boolean,
+    # float, or malformed generation is unsafe regardless of what attempt
+    # number the row reports.
+    _generation_raw = meta.get("materialization_generation")
+    _has_ownership_evidence = bool(
+        lifecycle_state.strip()
+        or materialization_status.strip()
+        or meta.get("selector_recovery_cursor_v1") is not None
+        or "materialization_lease_until" in meta
+        or "materialization_owner" in meta
+    )
+    _generation_int: int | None = None
+    if _has_ownership_evidence:
+        if _generation_raw is None:
+            findings.append("GENERATION_MISSING")
+        elif isinstance(_generation_raw, bool):
+            # bool is a subclass of int in Python; must be checked before int.
+            findings.append("GENERATION_MALFORMED")
+        elif isinstance(_generation_raw, float):
+            findings.append("GENERATION_MALFORMED")
+        elif isinstance(_generation_raw, int):
+            if _generation_raw <= 0:
+                findings.append("GENERATION_MALFORMED")
+            else:
+                _generation_int = _generation_raw
+        elif isinstance(_generation_raw, str):
+            # Accept integer-shaped strings (e.g. "1"); reject fractional,
+            # non-numeric, or zero/negative.
+            try:
+                _val = int(_generation_raw.strip())
+                if _val > 0:
+                    _generation_int = _val
+                else:
+                    findings.append("GENERATION_MALFORMED")
+            except (TypeError, ValueError):
+                findings.append("GENERATION_MALFORMED")
+        else:
             findings.append("GENERATION_MALFORMED")
 
-        _cursor, cursor_reason = load_selector_recovery_cursor(
-            meta.get("selector_recovery_cursor_v1"),
+    # 3. Missing/malformed attempt-2+ cursor -- reuse both the exact
+    # runtime cursor loader AND the runtime cursor retry-block helper
+    # (Blocker 1 fix).
+    #
+    # The loader alone is insufficient: load_selector_recovery_cursor()
+    # returns a fresh cursor with no cursor_reason when the candidate is
+    # absent (None/""), so an attempt-2+ row with no durable cursor
+    # previously classified as safe.  _selector_cursor_retry_block_reason()
+    # is the production gate that explicitly returns MISSING_CURSOR_ON_RETRY
+    # when attempt > 1 and cursor_candidate is None/"".  The preflight now
+    # calls both helpers in the same order runtime does.
+    if resolved_attempt is not None and resolved_attempt > 1:
+        from ap.selector_retry_policy import load_selector_recovery_cursor
+        from ap_execution_core import _selector_cursor_retry_block_reason
+
+        _cursor_candidate = meta.get("selector_recovery_cursor_v1")
+        _cursor, cursor_load_reason = load_selector_recovery_cursor(
+            _cursor_candidate,
             local_order_id=local_order_id,
             client_id=str(row.get("client_id") or ""),
             execution_mode=str(row.get("execution_mode") or ""),
@@ -134,19 +199,19 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
             selector_attempt_count=resolved_attempt,
             allow_previous_generation=False,
         )
-        if cursor_reason:
-            findings.append(f"ATTEMPT_2PLUS_CURSOR_INVALID:{cursor_reason}")
+        _cursor_block_reason = _selector_cursor_retry_block_reason(
+            cursor_enabled=True,
+            selector_attempt_number=resolved_attempt,
+            cursor_candidate=_cursor_candidate,
+            cursor_load_reason=cursor_load_reason,
+        )
+        if _cursor_block_reason:
+            findings.append(f"ATTEMPT_2PLUS_CURSOR_INVALID:{_cursor_block_reason}")
 
-    # 3. Lifecycle/materialization-status conflict -- allowlist of known-
+    # 4. Lifecycle/materialization-status conflict -- allowlist of known-
     # valid pairings rather than a denylist of known-bad ones, so any
     # combination this classifier doesn't already recognize is flagged by
     # default rather than silently passing through.
-    lifecycle_raw = meta.get("lifecycle_state")
-    materialization_status_raw = meta.get("materialization_status")
-    lifecycle_state = str(lifecycle_raw) if lifecycle_raw is not None else ""
-    materialization_status = (
-        str(materialization_status_raw) if materialization_status_raw is not None else ""
-    )
     if lifecycle_state and lifecycle_state != lifecycle_state.strip():
         findings.append(f"LIFECYCLE_STATE_WHITESPACE_DRIFT:{lifecycle_state!r}")
     _lifecycle_norm = lifecycle_state.strip().upper()
@@ -168,7 +233,7 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
             f"lifecycle={lifecycle_state}:status={materialization_status}"
         )
 
-    # 4. Expired MATERIALIZING lease with no retry schedule.
+    # 5. Expired MATERIALIZING lease with no retry schedule.
     lease_raw = meta.get("materialization_lease_until")
     lease_expired = False
     if lease_raw:
@@ -183,14 +248,14 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     if lease_expired and not has_retry_schedule:
         findings.append("EXPIRED_LEASE_NO_RETRY_SCHEDULE")
 
-    # 5. Incomplete identity.
+    # 6. Incomplete identity.
     for field in ("client_id",):
         if not str(row.get(field) or "").strip():
             findings.append(f"MISSING_IDENTITY_FIELD:{field}")
     if not str(row.get("execution_mode") or "").strip():
         findings.append("MISSING_IDENTITY_FIELD:execution_mode")
 
-    # 6. Incomplete trigger provenance (only relevant if a breach was
+    # 7. Incomplete trigger provenance (only relevant if a breach was
     # actually confirmed).
     if meta.get("trigger_crossed_at") and not meta.get(
         "trigger_crossed_at_provenance"
@@ -229,11 +294,17 @@ def run_preflight() -> dict:
         DeferredMaterializationConfigConflict,
         resolve_deferred_materialization_max_attempts,
     )
+    # Blocker 2 fix: do not substitute a numeric fallback.  A configuration
+    # conflict is an explicitly unsafe condition -- the deployment gate must
+    # not bless a runtime whose canonical retry authority is contradictory.
+    # resolved_max_attempts=null signals "unknown due to conflict"; the
+    # presence of max_attempts_config_conflict is what drives exit 2 in
+    # main(), independently of unsafe_row_count.
     try:
         max_attempts = resolve_deferred_materialization_max_attempts()
         max_attempts_conflict = None
     except DeferredMaterializationConfigConflict as exc:
-        max_attempts = 3
+        max_attempts = None          # no local fallback -- ever
         max_attempts_conflict = str(exc)
 
     rows = _fetch_candidate_rows()
@@ -258,7 +329,13 @@ def main() -> int:
         print(json.dumps({"tool_error": str(exc)}, indent=2, sort_keys=True))
         return 1
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
-    return 2 if result["unsafe_row_count"] > 0 else 0
+    # Blocker 2 fix: exit 2 on any unsafe row OR any configuration conflict,
+    # even when candidate_row_count == 0.  A deployment gate that reports
+    # success while the canonical retry authority is explicitly contradictory
+    # is not a deployment gate.
+    _has_unsafe_rows = result["unsafe_row_count"] > 0
+    _has_config_conflict = result.get("max_attempts_config_conflict") is not None
+    return 2 if (_has_unsafe_rows or _has_config_conflict) else 0
 
 
 if __name__ == "__main__":
