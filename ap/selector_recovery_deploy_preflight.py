@@ -270,13 +270,20 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
         if field in meta and normalize(meta.get(field)) != expected:
             findings.append(f"IDENTITY_MIRROR_MISMATCH:{field}")
 
-    # 7. Trigger provenance must bind to complete identity once a breach exists.
-    if meta.get("trigger_crossed_at") and not meta.get(
-        "trigger_crossed_at_provenance"
-    ):
-        findings.append("TRIGGER_PROVENANCE_MISSING")
-    elif meta.get("trigger_crossed_at_provenance"):
-        provenance = meta["trigger_crossed_at_provenance"]
+    # 7. Trigger provenance must be complete, timestamp-valid, and bound to
+    # this exact row identity. Presence alone is not proof: stale provenance
+    # copied from another client/order/mode would otherwise pass the gate.
+    trigger_crossed_raw = meta.get("trigger_crossed_at")
+    provenance = meta.get("trigger_crossed_at_provenance")
+    if trigger_crossed_raw:
+        _parse_timestamp(
+            trigger_crossed_raw,
+            finding="TRIGGER_CROSSED_TIMESTAMP_MALFORMED",
+            findings=findings,
+        )
+        if not provenance:
+            findings.append("TRIGGER_PROVENANCE_MISSING")
+    if provenance:
         if not isinstance(provenance, dict) or not all(
             provenance.get(key)
             for key in (
@@ -287,6 +294,30 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
             )
         ):
             findings.append("TRIGGER_PROVENANCE_INCOMPLETE")
+        else:
+            provenance_rules = {
+                "local_order_id": (
+                    local_id_clean,
+                    lambda value: str(value or "").strip(),
+                ),
+                "client_id": (
+                    client_clean.lower(),
+                    lambda value: str(value or "").strip().lower(),
+                ),
+                "execution_mode": (
+                    mode_clean,
+                    lambda value: str(value or "").strip().lower(),
+                ),
+                "canonical_signal_id": (
+                    canonical_clean,
+                    lambda value: str(value or "").strip(),
+                ),
+            }
+            for field, (expected, normalize) in provenance_rules.items():
+                if normalize(provenance.get(field)) != expected:
+                    findings.append(
+                        f"TRIGGER_PROVENANCE_IDENTITY_MISMATCH:{field}"
+                    )
 
     return {
         "local_order_id": local_order_id,
