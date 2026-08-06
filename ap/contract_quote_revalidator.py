@@ -384,6 +384,50 @@ def correct_recovered_cursor_disposition(
     )
 
 
+def _ctx_persist_structural_skip(
+    request_context,
+    occ_symbol: str,
+    *,
+    structural_skip_reason: str,
+) -> None:
+    """Persist a structural-skip event through the same fail-closed
+    contract as _ctx_persist_attempt(). Previously duplicated inline in
+    ap/contract_selector.py's _structural_direct_quote_skip() with its own
+    try/except that only re-raised SelectorRecoveryOwnershipLost and
+    logged-and-continued for every other exception -- including the typed
+    SelectorRecoveryCursorPersistFailed exception this function itself now
+    raises, meaning a structural skip could be recorded only in process
+    memory while the selector kept spending provider-call budget on later
+    candidates. Factored into this one shared function rather than fixed
+    twice in two places that could drift apart again.
+    """
+    if request_context is None:
+        return
+    callback = getattr(request_context, "recovery_cursor_persist", None)
+    if not callable(callback):
+        return
+    try:
+        callback(
+            symbol=str(occ_symbol or ""),
+            structural_skip_reason=str(structural_skip_reason or ""),
+        )
+    except Exception as exc:
+        from ap.selector_retry_policy import (
+            SelectorRecoveryCursorPersistFailed,
+            SelectorRecoveryOwnershipLost,
+        )
+        if isinstance(exc, SelectorRecoveryOwnershipLost):
+            raise
+        log.warning(
+            "selector recovery structural cursor persist failed symbol=%s err=%s",
+            occ_symbol,
+            exc,
+        )
+        raise SelectorRecoveryCursorPersistFailed(
+            f"structural skip persist failed for {occ_symbol}: {exc}"
+        ) from exc
+
+
 def _ctx_note_unattempted_symbol(request_context, occ_symbol: str) -> None:
     if request_context is None:
         return

@@ -236,115 +236,80 @@ class TestSecondAttemptChartGateStillRuns:
 # Blocker 2: retry maximum authority split between incompatible defaults.
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestRetryMaximumAuthorityConsistency:
-    """Proves the three consumers of the deferred-materialization retry
-    ceiling agree with each other, both with the environment unset and
-    under the documented rollback configuration -- closing the gap where
-    ap/deferred_materializer.py defaulted to 3 while
-    ap_execution_core.py's MAX_BREACH_SELECTOR_RETRIES and
-    ap/pending_trigger_restart_recovery.py's DEFERRED_MATERIALIZATION_MAX_ATTEMPTS
-    both defaulted to 5.
+class TestRetryMaximumAuthorityNoLocalFallback:
+    """Round 3 correction: the previous version of this test class
+    verified that all three consumers fell back to a MATCHING local value
+    (3) on conflict. That was itself wrong -- the audit required that NO
+    consumer substitute a local numeric fallback after the canonical
+    resolver raises DeferredMaterializationConfigConflict. These tests
+    verify the corrected contract: each consumer now refuses to act
+    (context-appropriate "no claim" signal) rather than silently
+    proceeding with any number, including a "safe-looking" 3.
     """
 
-    def _resolved_maxima(self, monkeypatch, *, mat_env=None, breach_env=None):
-        if mat_env is None:
-            monkeypatch.delenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", raising=False)
-        else:
-            monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", mat_env)
-        if breach_env is None:
-            monkeypatch.delenv("MAX_BREACH_SELECTOR_RETRIES", raising=False)
-        else:
-            monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", breach_env)
+    def test_canonical_resolver_conflict_is_unchanged(self, monkeypatch):
+        """The resolver itself still raises on conflict -- this is the
+        contract every consumer now respects rather than catching."""
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "3")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        from ap.selector_retry_policy import (
+            DeferredMaterializationConfigConflict,
+            resolve_deferred_materialization_max_attempts,
+        )
+        with pytest.raises(DeferredMaterializationConfigConflict):
+            resolve_deferred_materialization_max_attempts()
 
-        from ap_execution_core import _resolve_deferred_materialization_ceiling
-        from ap.pending_trigger_restart_recovery import _resolve_max_attempts
+    def test_deferred_materializer_cfg_raises_directly_no_fallback(self, monkeypatch):
+        """ap/deferred_materializer.py's _cfg() previously caught the
+        conflict and returned max_attempts=3. It must now raise directly
+        -- no traced caller exists in this module to add per-row handling
+        to, so propagating is the correct, complete fix rather than
+        inventing a fallback."""
+        monkeypatch.setenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", "3")
+        monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+        from ap.selector_retry_policy import DeferredMaterializationConfigConflict
         import ap.deferred_materializer as deferred_materializer_mod
+        with pytest.raises(DeferredMaterializationConfigConflict):
+            deferred_materializer_mod._cfg()
 
-        execution_core_max = _resolve_deferred_materialization_ceiling()
-        restart_recovery_max = _resolve_max_attempts()
-        deferred_materializer_max = deferred_materializer_mod._cfg()["max_attempts"]
-        return execution_core_max, restart_recovery_max, deferred_materializer_max
+    def test_deferred_materializer_cfg_succeeds_when_not_conflicting(self, monkeypatch):
+        monkeypatch.delenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", raising=False)
+        monkeypatch.delenv("MAX_BREACH_SELECTOR_RETRIES", raising=False)
+        import ap.deferred_materializer as deferred_materializer_mod
+        cfg = deferred_materializer_mod._cfg()
+        assert cfg["max_attempts"] == 5
 
-    def test_env_unset_all_three_consumers_agree_at_five(self, monkeypatch):
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch,
-        )
-        assert execution_core == 5
-        assert restart_recovery == 5
-        assert materializer == 5
-        assert execution_core == restart_recovery == materializer
+    def test_no_dead_fallback_wrappers_remain(self):
+        """Structural guard: the three now-removed wrapper functions that
+        used to catch-and-substitute must not have been reintroduced."""
+        import inspect
+        import ap_execution_core as exec_core_mod
+        import ap.pending_trigger_restart_recovery as restart_recovery_mod
+        assert not hasattr(exec_core_mod, "_resolve_deferred_materialization_ceiling")
+        assert not hasattr(restart_recovery_mod, "_resolve_max_attempts")
 
-    def test_documented_rollback_configuration_restores_three_everywhere(
-        self, monkeypatch,
-    ):
-        """The documented rollback sets both env vars back to 3 -- proving
-        that MAX_BREACH_SELECTOR_RETRIES=3 alone is NOT sufficient (it only
-        governs the execution-core selector loop); DEFERRED_MATERIALIZATION_
-        MAX_ATTEMPTS=3 must also be set to roll back restart recovery and
-        the deferred materializer, since those two share that env var name
-        independently of MAX_BREACH_SELECTOR_RETRIES."""
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env="3", breach_env="3",
-        )
-        assert execution_core == 3
-        assert restart_recovery == 3
-        assert materializer == 3
-        assert execution_core == restart_recovery == materializer
+    def test_restart_recovery_call_sites_no_longer_reference_removed_wrapper(self):
+        """Structural guard: both restart-recovery call sites now call the
+        canonical resolver directly and handle
+        DeferredMaterializationConfigConflict inline (UNRESOLVED / None),
+        rather than routing through a wrapper that substituted a number."""
+        import inspect
+        import ap.pending_trigger_restart_recovery as restart_recovery_mod
+        source = inspect.getsource(restart_recovery_mod)
+        assert source.count("resolve_deferred_materialization_max_attempts()") == 2
+        assert "DeferredMaterializationConfigConflict" in source
+        assert "return 3" not in source
 
-    def test_either_env_var_alone_now_rolls_back_all_three_consumers(self, monkeypatch):
-        """Reflects the follow-up unification fix: all three consumers now
-        call the single canonical resolver, so setting EITHER env var alone
-        (with the other unset) rolls back all three identically -- there is
-        no longer a case where one consumer disagrees with the other two
-        just because only one env var was set."""
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env=None, breach_env="3",
-        )
-        assert execution_core == 3
-        assert restart_recovery == 3
-        assert materializer == 3
-
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env="3", breach_env=None,
-        )
-        assert execution_core == 3
-        assert restart_recovery == 3
-        assert materializer == 3
-
-    def test_conflicting_explicit_values_fall_back_safely_on_all_three(
-        self, monkeypatch,
-    ):
-        """When both env vars are explicitly set to different values, the
-        canonical resolver raises DeferredMaterializationConfigConflict;
-        each of the three consumers catches it and falls back to the same
-        conservative value (3) rather than three different silent
-        choices -- still agreeing with each other even in the failure
-        path."""
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env="3", breach_env="5",
-        )
-        assert execution_core == restart_recovery == materializer == 3
-
-    def test_reverse_conflicting_values_also_fall_back_safely(self, monkeypatch):
-        """Mirror of the above with the values swapped -- proves the
-        conflict detection isn't order-dependent on which env var happens
-        to be larger."""
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env="5", breach_env="3",
-        )
-        assert execution_core == restart_recovery == materializer == 3
-
-    def test_both_malformed_falls_back_safely_on_all_three(self, monkeypatch):
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env="not-a-number", breach_env="also-not-a-number",
-        )
-        assert execution_core == restart_recovery == materializer == 3
-
-    def test_one_malformed_one_valid_falls_back_safely(self, monkeypatch):
-        execution_core, restart_recovery, materializer = self._resolved_maxima(
-            monkeypatch, mat_env="garbage", breach_env="5",
-        )
-        assert execution_core == restart_recovery == materializer == 3
+    def test_exec_core_call_sites_no_longer_substitute_a_local_number(self):
+        """Structural guard: none of the three ap_execution_core.py call
+        sites for the retry ceiling may contain a bare numeric fallback
+        after catching the conflict."""
+        import inspect
+        import ap_execution_core as exec_core_mod
+        source = inspect.getsource(exec_core_mod)
+        # 3 real call sites + 1 comment mention of the function name.
+        assert source.count("resolve_deferred_materialization_max_attempts()") == 4
+        assert "MATERIALIZATION_CONFIG_CONFLICT" in source
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -865,3 +830,226 @@ class TestQuoteAuthorityURLNormalizationEdgeCases:
             quote, transport=_FakeTransport("https://evil.api.tradier.com")
         )
         assert result["valid"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Round 3: structural-skip cursor persistence also failed open -- a
+# genuinely separate code path from _ctx_persist_attempt with the same bug.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from ap.contract_quote_revalidator import _ctx_persist_structural_skip
+
+
+class TestStructuralSkipPersistenceFailsClosed:
+    def test_db_exception_on_first_structural_skip_raises_typed_failure(self):
+        def _raising_callback(**kwargs):
+            raise ConnectionError("db unavailable")
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_raising_callback)
+        with pytest.raises(SelectorRecoveryCursorPersistFailed):
+            _ctx_persist_structural_skip(
+                ctx, "AAPL240101C00200000",
+                structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+            )
+
+    def test_serialization_failure_raises_typed_failure(self):
+        def _raising_callback(**kwargs):
+            raise TypeError("not JSON serializable")
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_raising_callback)
+        with pytest.raises(SelectorRecoveryCursorPersistFailed):
+            _ctx_persist_structural_skip(
+                ctx, "AAPL240101C00200000",
+                structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+            )
+
+    def test_timeout_raises_typed_failure(self):
+        def _raising_callback(**kwargs):
+            raise TimeoutError("statement timeout")
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_raising_callback)
+        with pytest.raises(SelectorRecoveryCursorPersistFailed):
+            _ctx_persist_structural_skip(
+                ctx, "AAPL240101C00200000",
+                structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+            )
+
+    def test_generic_exception_raises_typed_failure(self):
+        def _raising_callback(**kwargs):
+            raise RuntimeError("unexpected")
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_raising_callback)
+        with pytest.raises(SelectorRecoveryCursorPersistFailed):
+            _ctx_persist_structural_skip(
+                ctx, "AAPL240101C00200000",
+                structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+            )
+
+    def test_ownership_cas_miss_still_raises_the_original_exception_unchanged(self):
+        def _raising_callback(**kwargs):
+            raise SelectorRecoveryOwnershipLost("owner CAS missed")
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_raising_callback)
+        with pytest.raises(SelectorRecoveryOwnershipLost) as excinfo:
+            _ctx_persist_structural_skip(
+                ctx, "AAPL240101C00200000",
+                structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+            )
+        assert not isinstance(excinfo.value, SelectorRecoveryCursorPersistFailed)
+
+    def test_success_does_not_raise_and_uses_correct_kwarg_shape(self):
+        calls = []
+
+        def _ok_callback(**kwargs):
+            calls.append(kwargs)
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_ok_callback)
+        _ctx_persist_structural_skip(
+            ctx, "AAPL240101C00200000",
+            structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+        )
+        assert len(calls) == 1
+        assert calls[0]["symbol"] == "AAPL240101C00200000"
+        assert calls[0]["structural_skip_reason"] == "OI_TOO_LOW_STRUCTURAL"
+        assert "result_reason" not in calls[0]
+        assert "transient" not in calls[0]
+
+    def test_no_callback_configured_is_a_silent_noop_ordinary_request_shape(self):
+        ctx = SimpleNamespace()
+        _ctx_persist_structural_skip(
+            ctx, "AAPL240101C00200000",
+            structural_skip_reason="OI_TOO_LOW_STRUCTURAL",
+        )  # must not raise
+
+    def test_selector_module_calls_the_shared_function_not_duplicated_logic(self):
+        """Structural guard: confirms contract_selector.py no longer
+        duplicates the try/except inline -- it calls the one shared,
+        already-tested function, so there is only one place this contract
+        can drift."""
+        import inspect
+        import ap.contract_selector as selector_mod
+        source = inspect.getsource(selector_mod)
+        assert "_ctx_persist_structural_skip(" in source
+        assert "structural_skip_reason=reason" in source
+
+
+class TestStrictAttemptCounterParsing:
+    """Round 3: int(raw) accepted booleans (int(True)==1), whole-valued
+    floats (int(2.0)==2), and fractional floats (int(1.5)==1) as if they
+    were genuine attempt counts. Now only real ints or strictly
+    integer-shaped strings are accepted."""
+
+    def test_boolean_true_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=True, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_boolean_false_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=False, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_fractional_float_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=1.5, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_whole_valued_float_is_still_malformed(self):
+        """2.0 has no fractional part but is still a float, not a genuine
+        integral representation -- rejected regardless."""
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=2.0, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_negative_fractional_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=-0.5, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_nan_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=float("nan"), breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_infinity_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=float("inf"), breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_non_integer_string_1_point_0_is_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt="1.0", breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved is None
+        assert reason == "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
+
+    def test_genuine_integer_string_is_accepted(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt="3", breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved == 3
+        assert reason is None
+
+    def test_whitespace_padded_integer_string_is_accepted(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=" 3 ", breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved == 3
+        assert reason is None
+
+    def test_absent_is_distinct_from_explicit_zero(self):
+        absent_resolved, absent_reason = _resolve_selector_attempt_number(
+            retry_attempt=None, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        zero_resolved, zero_reason = _resolve_selector_attempt_number(
+            retry_attempt=0, breach_attempt_count=None,
+            materialization_attempts=None, recovery_pre_claimed_attempt=None,
+        )
+        assert absent_reason is None and zero_reason is None
+        assert absent_resolved == 1, "absent floors to attempt 1"
+        assert zero_resolved == 1, "explicit zero also floors to attempt 1 (0 is not >= first attempt)"
+        # Both resolve to the same final number here, but critically
+        # neither is malformed -- an explicit 0 must not be treated as
+        # equivalent to a missing/invalid field.
+        assert absent_reason == zero_reason == None
+
+    def test_real_integer_zero_is_not_malformed(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=0, breach_attempt_count=0,
+            materialization_attempts=0, recovery_pre_claimed_attempt=None,
+        )
+        assert reason is None, "explicit zero across all three agreeing durable counters is valid, not a conflict"
+        assert resolved == 1
+
+    def test_genuine_integer_type_still_accepted(self):
+        resolved, reason = _resolve_selector_attempt_number(
+            retry_attempt=3, breach_attempt_count=3,
+            materialization_attempts=3, recovery_pre_claimed_attempt=None,
+        )
+        assert resolved == 3
+        assert reason is None

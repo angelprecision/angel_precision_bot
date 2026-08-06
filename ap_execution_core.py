@@ -509,30 +509,7 @@ def _positive_int_env_config(name: str, default: int) -> int:
     return value
 
 
-def _resolve_deferred_materialization_ceiling() -> int:
-    """Canonical retry-ceiling resolver, shared identically with
-    ap/pending_trigger_restart_recovery.py's restart-recovery exhaustion
-    check and ap/deferred_materializer.py's bucket config -- replaces this
-    module's own independent MAX_BREACH_SELECTOR_RETRIES-only read so all
-    three consumers resolve to the exact same value under every
-    environment configuration. Falls back to the conservative pre-#401
-    value (3) on an explicit env-var conflict, matching the other two
-    consumers' fallback exactly, rather than crashing the selector loop
-    over a configuration error."""
-    from ap.selector_retry_policy import (
-        DeferredMaterializationConfigConflict,
-        resolve_deferred_materialization_max_attempts,
-    )
-    try:
-        return resolve_deferred_materialization_max_attempts()
-    except DeferredMaterializationConfigConflict as exc:
-        log.critical(
-            "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT error=%s "
-            "-- falling back to conservative default 3. Fix the "
-            "conflicting environment variables.",
-            exc,
-        )
-        return 3
+
 
 
 def _resolve_selector_attempt_number(
@@ -564,12 +541,34 @@ def _resolve_selector_attempt_number(
     _CONFLICT = "MATERIALIZATION_ATTEMPT_COUNTER_CONFLICT"
 
     def _parse(raw):
-        """Returns (value_or_None, is_malformed)."""
-        if raw is None or raw == "":
+        """Returns (value_or_None, is_malformed). Distinguishes absent
+        (None/empty-string) from an explicit value, including explicit
+        zero. Only genuine integral representations are accepted -- a
+        real int (bool is explicitly excluded, since Python's bool is an
+        int subclass and int(True)==1/int(False)==0 would otherwise
+        silently coerce a boolean into a "valid" attempt count), or a
+        string containing only an optional leading minus and digits.
+        Floats (including whole-valued floats like 2.0, and NaN/infinity,
+        which are float instances), fractional strings ("1.5"), and
+        non-integer-looking strings ("1.0") are all malformed, not
+        silently coerced via a lossy int() cast.
+        """
+        if raw is None:
             return None, False
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
+        if isinstance(raw, bool):
+            return None, True
+        if isinstance(raw, int):
+            value = raw
+        elif isinstance(raw, str):
+            stripped = raw.strip()
+            if stripped == "":
+                return None, False
+            if not re.fullmatch(r"-?\d+", stripped):
+                return None, True
+            value = int(stripped)
+        else:
+            # float (including NaN/inf, which are float instances) or any
+            # other type is malformed -- never silently coerced.
             return None, True
         if value < 0:
             return None, True
@@ -2568,9 +2567,11 @@ class APExecutionCore:
             )
 
         # ── Amendment 1 (rev 2): configured env is the hard ceiling ──────────
-        # Policy: the canonical resolver (_resolve_deferred_materialization_ceiling,
-        # shared with restart recovery and the deferred materializer) is the
-        # sole authoritative bound.
+        # Policy: resolve_deferred_materialization_max_attempts() (the
+        # canonical resolver shared with restart recovery and the
+        # deferred materializer) is the sole authoritative bound. On an
+        # explicit env-var conflict, this call site refuses the retry
+        # claim entirely rather than substituting a local fallback.
         # Durable retry_max_attempts is read only to detect stale rows and is
         # NEVER allowed to raise max_attempts above configured_max.
         #
@@ -2588,10 +2589,20 @@ class APExecutionCore:
         #   durable missing   → 5   (env is sole authority)
         #   malformed durable → 5   (safe default)
         #   negative durable  → 5   (clamped to zero, then env wins)
+        from ap.selector_retry_policy import (
+            DeferredMaterializationConfigConflict,
+            resolve_deferred_materialization_max_attempts,
+        )
         try:
-            _configured_max = _resolve_deferred_materialization_ceiling()
-        except (TypeError, ValueError):
-            _configured_max = 5
+            _configured_max = resolve_deferred_materialization_max_attempts()
+        except DeferredMaterializationConfigConflict as _cfg_conflict:
+            log.critical(
+                "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT "
+                "order=%s error=%s -- refusing retry claim, zero selector/"
+                "broker work.",
+                local_order_id, _cfg_conflict,
+            )
+            return _keep("MATERIALIZATION_CONFIG_CONFLICT")
         try:
             _durable_raw = int(meta.get("retry_max_attempts") or 0)
         except (TypeError, ValueError):
@@ -4689,9 +4700,25 @@ class APExecutionCore:
                         _truth_authority
                         == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
                     ):
-                        _max_attempts_truth = (
-                            _resolve_deferred_materialization_ceiling()
+                        from ap.selector_retry_policy import (
+                            DeferredMaterializationConfigConflict,
+                            resolve_deferred_materialization_max_attempts,
                         )
+                        try:
+                            _max_attempts_truth = (
+                                resolve_deferred_materialization_max_attempts()
+                            )
+                        except DeferredMaterializationConfigConflict as _cfg_conflict:
+                            log.critical(
+                                "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT "
+                                "order=%s error=%s -- refusing retry claim, zero "
+                                "selector/broker work.",
+                                queue_local_order_id, _cfg_conflict,
+                            )
+                            return {
+                                "disposition": "KEEP_WATCHER",
+                                "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
+                            }
                         if _selector_attempt_number >= _max_attempts_truth:
                             _terminalize_deferred_breach_failure(
                                 f"BREACH_RETRY_EXHAUSTED:{_truth_result.reason_code}",
@@ -5232,7 +5259,23 @@ class APExecutionCore:
                     # an emergency kill switch (set to "0" to disable without
                     # a code deploy).
                     _retry_enabled_a    = str(os.getenv("BREACH_SELECTOR_RETRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes")
-                    _MAX_RETRIES_A = _resolve_deferred_materialization_ceiling()
+                    from ap.selector_retry_policy import (
+                        DeferredMaterializationConfigConflict,
+                        resolve_deferred_materialization_max_attempts,
+                    )
+                    try:
+                        _MAX_RETRIES_A = resolve_deferred_materialization_max_attempts()
+                    except DeferredMaterializationConfigConflict as _cfg_conflict:
+                        log.critical(
+                            "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT "
+                            "order=%s error=%s -- refusing retry claim, zero "
+                            "selector/broker work.",
+                            queue_local_order_id, _cfg_conflict,
+                        )
+                        return {
+                            "disposition": "KEEP_WATCHER",
+                            "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
+                        }
                     _RETRY_DELAY_A = _positive_int_env_config(
                         "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
                     )

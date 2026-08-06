@@ -73,6 +73,7 @@ from ap.contract_quote_revalidator import (
     revalidate_with_direct_quote  as _revalidate_direct,
     should_revalidate             as _should_revalidate,
     correct_recovered_cursor_disposition as _correct_recovered_cursor_disposition,
+    _ctx_persist_structural_skip,
     DEFAULT_REVALIDATE_TOP_N,
 )
 
@@ -1282,25 +1283,17 @@ def _structural_direct_quote_skip(
     if request_context is not None:
         request_context.structural_skips.append(diagnostic)
         request_context.structural_skips[:] = request_context.structural_skips[-200:]
-        try:
-            from ap.selector_retry_policy import record_selector_structural_skip
-            request_context.recovery_cursor = record_selector_structural_skip(
-                request_context.recovery_cursor or {},
-                symbol=symbol,
-                skip_reason=reason,
-            )
-            callback = request_context.recovery_cursor_persist
-            if callable(callback):
-                callback(symbol=symbol, structural_skip_reason=reason)
-        except Exception as exc:
-            from ap.selector_retry_policy import SelectorRecoveryOwnershipLost
-            if isinstance(exc, SelectorRecoveryOwnershipLost):
-                raise
-            log.warning(
-                "selector recovery structural cursor persist failed symbol=%s err=%s",
-                symbol,
-                exc,
-            )
+        from ap.selector_retry_policy import record_selector_structural_skip
+        request_context.recovery_cursor = record_selector_structural_skip(
+            request_context.recovery_cursor or {},
+            symbol=symbol,
+            skip_reason=reason,
+        )
+        _ctx_persist_structural_skip(
+            request_context,
+            symbol,
+            structural_skip_reason=reason,
+        )
         _ctx_refresh_diagnostics(request_context)
     return diagnostic
 
