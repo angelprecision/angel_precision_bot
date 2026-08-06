@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/p0-terminal-disposition-truth
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
