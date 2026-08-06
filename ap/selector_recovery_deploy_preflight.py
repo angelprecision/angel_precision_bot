@@ -278,18 +278,22 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     # this exact row identity. Presence alone is not proof: stale provenance
     # copied from another client/order/mode would otherwise pass the gate.
     trigger_crossed_raw = meta.get("trigger_crossed_at")
+    provenance_present = "trigger_crossed_at_provenance" in meta
     provenance = meta.get("trigger_crossed_at_provenance")
-    if provenance and not str(trigger_crossed_raw or "").strip():
+
+    if provenance_present and not str(trigger_crossed_raw or "").strip():
         findings.append("TRIGGER_CROSSED_TIMESTAMP_MISSING")
+
     if trigger_crossed_raw:
         _parse_timestamp(
             trigger_crossed_raw,
             finding="TRIGGER_CROSSED_TIMESTAMP_MALFORMED",
             findings=findings,
         )
-        if not provenance:
+        if not provenance_present:
             findings.append("TRIGGER_PROVENANCE_MISSING")
-    if provenance:
+
+    if provenance_present:
         if not isinstance(provenance, dict) or not all(
             provenance.get(key)
             for key in (
