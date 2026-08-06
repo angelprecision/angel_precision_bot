@@ -672,7 +672,11 @@ def test_8_concurrent_terminal_winner_no_error():
 # Test: TERMINAL_REQUIRED carries exact expected state
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_terminal_required_carries_expected_state():
+def test_terminal_required_carries_expected_state(monkeypatch):
+    # Pin env to 3 so resolved max = max(3, durable=3) = 3; attempt=4 is exhausted.
+    # Amendment 1 changed max=max(env, durable); without pinning, env default of 5
+    # would raise the floor and attempt 4 would no longer be terminal.
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
     """resume_deferred_materialization_retry must include all expected
     fencing fields in the TERMINAL_REQUIRED return dict so recovery
     can call terminalize_deferred_retry_if_unchanged with exact predicates.
@@ -1386,6 +1390,10 @@ def test_final_schedule_retry_clears_stale_watcher_token_and_adoption_stamps_new
             max_attempts=5,
             next_retry_at="2026-07-14T12:00:00+00:00",
             selector_failure={"reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED"},
+            # PR #401 added signal_id and execution_mode to the OSM gate; the
+            # fixture must supply them so the validation does not return False.
+            signal_id=SIGNAL_ID,
+            execution_mode="paper",
         )
 
     assert ok is True

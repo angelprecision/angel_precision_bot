@@ -85,6 +85,8 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+# Compatibility diagnostic only.  The behavioral request cap is owned by
+# SELECTOR_MAX_DIRECT_QUOTE_CALLS in contract_selector.
 DEFAULT_REVALIDATE_TOP_N = _positive_int_env("CONTRACT_REVALIDATE_TOP_N", 5)
 
 # Per-transport/per-symbol cache so a single selector pass doesn't double-fetch.
@@ -207,6 +209,9 @@ def _ctx_update_sink(request_context) -> None:
     sink["elapsed_ms_by_stage"] = dict(getattr(request_context, "elapsed_ms_by_stage", {}) or {})
     counts = sink["provider_call_counts"]
     used = int(counts.get("direct_quote_calls", 0) or 0)
+    # Generic fallback is the ordinary pre-PR #401 default of five. A real
+    # deferred request carries its explicit 40 on the context, so this fallback
+    # never reduces deferred capacity.
     effective = int(
         getattr(
             request_context,
@@ -243,6 +248,10 @@ def _direct_quote_budget_failure(request_context) -> Optional[dict]:
         return None
     started = float(getattr(request_context, "started_at_monotonic", 0.0) or 0.0)
     elapsed_ms = max(0.0, (time.monotonic() - started) * 1000.0) if started else 0.0
+    # Generic fallbacks are the ordinary pre-PR #401 defaults (elapsed 15000ms,
+    # five direct quotes). A real deferred request carries its explicit 25000ms
+    # / 40-call values on the context, so these fallbacks never reduce deferred
+    # capacity.
     elapsed_limit = int(getattr(request_context, "max_total_elapsed_ms", 15000) or 15000)
     counts = getattr(request_context, "provider_call_counts", {}) or {}
     used = int(counts.get("direct_quote_calls", 0) or 0)
@@ -291,6 +300,132 @@ def _ctx_note_attempted_symbol(request_context, occ_symbol: str) -> None:
     if isinstance(attempted, list) and occ_symbol not in attempted:
         attempted.append(occ_symbol)
         _ctx_update_sink(request_context)
+
+
+def _ctx_persist_attempt(
+    request_context,
+    occ_symbol: str,
+    *,
+    result_reason: str,
+    transient: bool,
+    provider_timestamp=None,
+) -> None:
+    """Persist completed quote progress through the existing order-state owner."""
+    if request_context is None:
+        return
+    callback = getattr(request_context, "recovery_cursor_persist", None)
+    if not callable(callback):
+        return
+    try:
+        callback(
+            symbol=str(occ_symbol or ""),
+            result_reason=str(result_reason or ""),
+            transient=bool(transient),
+            provider_timestamp=provider_timestamp,
+        )
+    except Exception as exc:
+        from ap.selector_retry_policy import (
+            SelectorRecoveryCursorPersistFailed,
+            SelectorRecoveryOwnershipLost,
+        )
+        if isinstance(exc, SelectorRecoveryOwnershipLost):
+            raise
+        # Audit follow-up fix: previously logged and continued, letting
+        # the selector keep spending provider-call/broker-adjacent budget
+        # on later candidates with no durable record of this candidate's
+        # outcome -- violating the durable restart contract exactly like
+        # batching did (already fixed separately), just via write-failure
+        # rather than write-delay. Any non-ownership persistence failure
+        # (DB exception, serialization error, timeout, or anything else)
+        # now stops selector work immediately with a stable typed failure
+        # rather than continuing on process-memory-only progress.
+        log.warning(
+            "selector recovery cursor persist failed contract=%s reason=%s err=%s",
+            occ_symbol,
+            result_reason,
+            exc,
+        )
+        raise SelectorRecoveryCursorPersistFailed(
+            f"cursor persist failed for {occ_symbol}: {exc}"
+        ) from exc
+
+
+def correct_recovered_cursor_disposition(
+    request_context,
+    occ_symbol: str,
+    *,
+    final_reason: str,
+    provider_timestamp=None,
+) -> None:
+    """Audit blocker 4 fix: correct a durable cursor record that was
+    written prematurely as DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/transient=False
+    at the transport-recovery stage, before the caller's own subsequent
+    spread/OI/volume (_quality_filter) and delta/premium/affordability
+    checks completed. This function's own docstring at the original write
+    site says outright: "Caller will re-run the spread/premium/
+    affordability/liquidity checks against this patched opt" -- meaning the
+    original write is known-provisional at the moment it happens.
+
+    Call this once the caller's full quality re-run has actually rejected
+    the candidate, with the real final reason code (e.g. "SPREAD_TOO_WIDE",
+    "OI_TOO_LOW"), so the durable cursor never remains classified as a
+    successful recovered candidate once it's known not to be one. Uses the
+    same fail-closed persistence path (_ctx_persist_attempt) as the
+    original write -- a failure to persist the correction raises
+    SelectorRecoveryCursorPersistFailed exactly like any other cursor
+    write, rather than silently leaving the incorrect record in place.
+    """
+    _ctx_persist_attempt(
+        request_context,
+        occ_symbol,
+        result_reason=str(final_reason or "UNKNOWN_FAIL_CLOSED"),
+        transient=False,
+        provider_timestamp=provider_timestamp,
+    )
+
+
+def _ctx_persist_structural_skip(
+    request_context,
+    occ_symbol: str,
+    *,
+    structural_skip_reason: str,
+) -> None:
+    """Persist a structural-skip event through the same fail-closed
+    contract as _ctx_persist_attempt(). Previously duplicated inline in
+    ap/contract_selector.py's _structural_direct_quote_skip() with its own
+    try/except that only re-raised SelectorRecoveryOwnershipLost and
+    logged-and-continued for every other exception -- including the typed
+    SelectorRecoveryCursorPersistFailed exception this function itself now
+    raises, meaning a structural skip could be recorded only in process
+    memory while the selector kept spending provider-call budget on later
+    candidates. Factored into this one shared function rather than fixed
+    twice in two places that could drift apart again.
+    """
+    if request_context is None:
+        return
+    callback = getattr(request_context, "recovery_cursor_persist", None)
+    if not callable(callback):
+        return
+    try:
+        callback(
+            symbol=str(occ_symbol or ""),
+            structural_skip_reason=str(structural_skip_reason or ""),
+        )
+    except Exception as exc:
+        from ap.selector_retry_policy import (
+            SelectorRecoveryCursorPersistFailed,
+            SelectorRecoveryOwnershipLost,
+        )
+        if isinstance(exc, SelectorRecoveryOwnershipLost):
+            raise
+        log.warning(
+            "selector recovery structural cursor persist failed symbol=%s err=%s",
+            occ_symbol,
+            exc,
+        )
+        raise SelectorRecoveryCursorPersistFailed(
+            f"structural skip persist failed for {occ_symbol}: {exc}"
+        ) from exc
 
 
 def _ctx_note_unattempted_symbol(request_context, occ_symbol: str) -> None:
@@ -437,6 +572,11 @@ def _normalize_quote(raw: dict, fetched_at: float, latency_ms: int) -> dict:
         "quote_fetch_latency_ms": latency_ms,
         "quote_fetched_at":       fetched_at,
         "quote_age_semantics":    "fetch_latency_not_exchange_age",
+        "provider_timestamp":     (
+            raw.get("provider_timestamp")
+            or raw.get("quote_timestamp")
+            or raw.get("timestamp")
+        ),
         "_quote_payload_empty":   not bool(raw),
     }
 
@@ -818,9 +958,25 @@ def revalidate_with_direct_quote(
                 "opt_updated":       None,
                 "audit":             audit,
             }
+        _failure_reason = quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE
+        _ctx_persist_attempt(
+            request_context,
+            occ_key,
+            result_reason=_failure_reason,
+            transient=bool(
+                quote_meta.get("retryable")
+                or _failure_reason
+                in {
+                    REASON_DIRECT_QUOTE_UNAVAILABLE,
+                    REASON_DIRECT_QUOTE_FETCH_TIMEOUT,
+                    REASON_DIRECT_QUOTE_RATE_LIMITED,
+                    REASON_MARKET_DATA_THROTTLE_UNAVAILABLE,
+                }
+            ),
+        )
         return {
             "action":            "REJECT_UNAVAILABLE",
-            "reason_code":       quote_meta.get("reason_code") or REASON_DIRECT_QUOTE_UNAVAILABLE,
+            "reason_code":       _failure_reason,
             "direct_quote_used": False,
             "opt_updated":       None,
             "audit":             audit,
@@ -841,6 +997,13 @@ def revalidate_with_direct_quote(
             audit["direct_mid"] = None
 
     if not direct_quote_is_valid(quote):
+        _ctx_persist_attempt(
+            request_context,
+            occ_key,
+            result_reason=REASON_DIRECT_QUOTE_ZERO_BID_ASK,
+            transient=True,
+            provider_timestamp=quote.get("provider_timestamp"),
+        )
         return {
             "action":            "REJECT_DIRECT_ZERO",
             "reason_code":       REASON_DIRECT_QUOTE_ZERO_BID_ASK,
@@ -869,6 +1032,18 @@ def revalidate_with_direct_quote(
     patched["_chain_ask"] = chain_ask
 
     audit["contract_quote_source"] = "direct"
+    # Audit Blocker 2, true two-stage fix: previously persisted
+    # DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/transient=False here, immediately
+    # after a valid transport-level quote and before ANY of the caller's
+    # spread/OI/volume/delta/premium/affordability checks ran -- a crash
+    # in that window left a false "successful recovery" record on
+    # restart, and the later correction (if the checks rejected the
+    # candidate) did not close that window, only shortened the time a
+    # false record could be read as final. No cursor write happens here
+    # at all now. The caller persists the true final disposition exactly
+    # once: at its own rejection point if any check fails, or at the one
+    # place in the whole selection loop where a candidate has passed
+    # every gate and is actually chosen.
     return {
         "action":            "PASS",
         "reason_code":       REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO,

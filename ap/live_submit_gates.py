@@ -70,7 +70,9 @@ import os
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Optional
+from urllib.parse import urlparse
 
 from ap.logger import get_logger
 
@@ -99,6 +101,7 @@ class GateOutcome:
     CURRENT_PRICE_STALE                    = "CURRENT_PRICE_STALE"
     CURRENT_PRICE_MISSING                  = "CURRENT_PRICE_MISSING"
     CURRENT_PRICE_ZERO                     = "CURRENT_PRICE_ZERO"
+    CURRENT_OPTION_SIDE_INVALID            = "CURRENT_OPTION_SIDE_INVALID"
     TARGET_ALREADY_INVALID                 = "TARGET_ALREADY_INVALID"
     REMAINING_OPPORTUNITY_TOO_SMALL        = "REMAINING_OPPORTUNITY_TOO_SMALL"
     CALL_NO_LONGER_ABOVE_TRIGGER           = "CALL_NO_LONGER_ABOVE_TRIGGER"
@@ -130,6 +133,219 @@ class GateResult:
     reason_code: str = GateOutcome.PASS
     detail: str = ""
     audit: dict = field(default_factory=dict)
+
+
+class MarketTruthAuthority(str, Enum):
+    SUBMIT_VALID = "SUBMIT_VALID"
+    REARM_DIRECTION_REVERSAL = "REARM_DIRECTION_REVERSAL"
+    HOLD_MARKET_TRUTH_UNAVAILABLE = "HOLD_MARKET_TRUTH_UNAVAILABLE"
+    TERMINAL_SETUP_COMPLETE = "TERMINAL_SETUP_COMPLETE"
+
+
+def validate_retry_market_quote_authority(
+    quote: object,
+    *,
+    transport: object,
+    now: Optional[datetime] = None,
+    max_age_ms: int = 5000,
+    max_future_skew_ms: int = 1000,
+) -> dict:
+    """Prove an approved LIVE Tradier observation and provider timestamp."""
+    if not isinstance(quote, dict):
+        return {"valid": False, "reason": "MARKET_QUOTE_INVALID_PAYLOAD"}
+    cfg = getattr(transport, "cfg", None)
+    base_url = str(
+        getattr(cfg, "base_url", None)
+        or getattr(transport, "base_url", None)
+        or ""
+    ).strip()
+    parsed = urlparse(base_url)
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.hostname != "api.tradier.com"
+        or parsed.port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return {
+            "valid": False,
+            "reason": "MARKET_QUOTE_UNAPPROVED_TRANSPORT",
+            "transport_url": base_url or None,
+        }
+    # Audit blocker 3 fix: collect and validate EVERY explicit source field,
+    # not just the first non-empty one via `or`-chaining. A payload with
+    # {"source": "tradier_live", "provider": "simulator"} previously passed
+    # because only "source" was ever inspected -- "provider" was silently
+    # ignored once "source" was truthy. Every explicit field must now be
+    # individually approved; any one unapproved field rejects the quote
+    # regardless of what the others say.
+    _explicit_sources = {}
+    for _field in ("source", "quote_source", "provider"):
+        _raw = quote.get(_field)
+        if _raw is None:
+            continue
+        _normalized = str(_raw).strip().lower()
+        if _normalized:
+            _explicit_sources[_field] = _normalized
+    for _field, _normalized in _explicit_sources.items():
+        if _normalized not in {"tradier", "tradier_live", "api.tradier.com"}:
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_SOURCE_UNPROVEN",
+                "quote_source": _normalized,
+                "quote_source_field": _field,
+            }
+    # Tradier production payloads omit provider metadata. The exact approved
+    # HTTPS transport is authoritative for a source-less quote; contradictory
+    # explicit metadata remains rejected above.
+    resolved_source = next(iter(_explicit_sources.values()), None) or "tradier_live"
+
+    # Validate the timestamp of EVERY price leg downstream market truth may use.
+    # The retry market gate reads the bid for PUT trigger truth, the ask for
+    # CALL trigger truth, and bid+ask for midpoint truth. A single-timestamp
+    # "first nonblank wins" selection could accept a stale bid while reading a
+    # fresh ask (or vice versa); the oldest USED leg must control freshness.
+    #
+    # Common/provider-level timestamp candidates. bid_date/ask_date are
+    # leg-specific and are deliberately excluded from this common chain.
+    common_timestamp_raw = (
+        quote.get("provider_timestamp")
+        or quote.get("quote_timestamp")
+        or quote.get("timestamp")
+        or quote.get("trade_date")
+    )
+
+    def _finite_positive(value) -> bool:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(numeric) and numeric > 0.0
+
+    def _parse_provider_timestamp(raw) -> Optional[datetime]:
+        try:
+            if isinstance(raw, datetime):
+                observed = raw
+            elif isinstance(raw, (int, float)):
+                numeric = float(raw)
+                if numeric > 10_000_000_000:
+                    numeric /= 1000.0
+                observed = datetime.fromtimestamp(numeric, tz=timezone.utc)
+            else:
+                observed = datetime.fromisoformat(
+                    str(raw).strip().replace("Z", "+00:00")
+                )
+            if observed.tzinfo is None:
+                # Naive datetime / timezone-less ISO string is not accepted.
+                return None
+            return observed.astimezone(timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    bid_used = _finite_positive(quote.get("bid"))
+    ask_used = _finite_positive(quote.get("ask"))
+
+    # Audit blocker 3 fix: an explicitly supplied leg timestamp that is
+    # present but falsy/invalid (e.g. "bid_date": 0) must be treated as
+    # invalid evidence for that leg, not silently treated as absent and
+    # fallen back to the common timestamp. Only a genuinely ABSENT key
+    # (leg timestamp never supplied at all) falls back to the common
+    # timestamp; an explicitly-present-but-unparseable value fails the leg
+    # directly.
+    def _leg_timestamp_raw(field_name: str):
+        """Returns (raw_value, explicitly_supplied). explicitly_supplied is
+        True whenever the key exists in the payload at all, even if its
+        value is falsy (0, "", None-but-present)."""
+        if field_name in quote:
+            return quote.get(field_name), True
+        return common_timestamp_raw, False
+
+    # Each required leg is (diagnostic_field, raw_timestamp_source,
+    # explicitly_supplied).
+    required_legs: list = []
+    if bid_used:
+        required_legs.append(("bid", *_leg_timestamp_raw("bid_date")))
+    if ask_used:
+        required_legs.append(("ask", *_leg_timestamp_raw("ask_date")))
+    if not required_legs:
+        # No positive bid or ask: preserve existing authority behavior by
+        # validating the common timestamp. Missing/zero prices remain the
+        # responsibility of the downstream market-validity gate.
+        required_legs.append(("common", common_timestamp_raw, False))
+
+    parsed_legs: list = []
+    for leg_name, raw, explicitly_supplied in required_legs:
+        observed = _parse_provider_timestamp(raw)
+        if observed is None:
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_TIMESTAMP_UNPROVEN",
+            }
+        parsed_legs.append((leg_name, observed))
+
+    current = (now or _now_utc()).astimezone(timezone.utc)
+
+    # Age is calculated independently for every required timestamp.
+    aged_legs: list = []
+    for leg_name, observed in parsed_legs:
+        age_ms = (current - observed).total_seconds() * 1000.0
+        if not math.isfinite(age_ms) or age_ms < -float(max_future_skew_ms):
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_TIMESTAMP_FUTURE",
+                "provider_timestamp": observed.isoformat(),
+                "timestamp_field": leg_name,
+            }
+        aged_legs.append((age_ms, leg_name, observed))
+    for age_ms, leg_name, observed in aged_legs:
+        if age_ms > float(max_age_ms):
+            return {
+                "valid": False,
+                "reason": "MARKET_QUOTE_STALE",
+                "provider_timestamp": observed.isoformat(),
+                "quote_age_ms": age_ms,
+                "timestamp_field": leg_name,
+            }
+
+    # The oldest used price leg controls freshness. Do not average or pick the
+    # newest timestamp.
+    oldest_age_ms, oldest_leg, oldest_observed = max(
+        aged_legs, key=lambda item: item[0]
+    )
+    result = {
+        "valid": True,
+        "reason": "MARKET_QUOTE_AUTHORITY_PROVEN",
+        "provider_timestamp": oldest_observed.isoformat(),
+        "quote_age_ms": max(0.0, oldest_age_ms),
+        "quote_source": resolved_source,
+        "transport_url": base_url,
+    }
+    for leg_name, observed in parsed_legs:
+        if leg_name == "bid":
+            result["bid_provider_timestamp"] = observed.isoformat()
+        elif leg_name == "ask":
+            result["ask_provider_timestamp"] = observed.isoformat()
+    return result
+
+
+def classify_market_truth(result: GateResult) -> MarketTruthAuthority:
+    """Map the pure market gate into the deferred-retry authority contract."""
+    reason = str(getattr(result, "reason_code", "") or "")
+    if bool(getattr(result, "passed", False)) and reason == GateOutcome.PASS:
+        return MarketTruthAuthority.SUBMIT_VALID
+    if reason in {
+        GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
+        GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+    }:
+        return MarketTruthAuthority.REARM_DIRECTION_REVERSAL
+    if reason in {
+        GateOutcome.CALL_STOP_ALREADY_BROKEN,
+        GateOutcome.PUT_STOP_ALREADY_BROKEN,
+        GateOutcome.TARGET_ALREADY_INVALID,
+        GateOutcome.REMAINING_OPPORTUNITY_TOO_SMALL,
+    }:
+        return MarketTruthAuthority.TERMINAL_SETUP_COMPLETE
+    return MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -576,6 +792,11 @@ def check_market_validity_gate(
         )
 
     _side = str(side or "").strip().upper()
+    if _side not in {"CALL", "PUT"}:
+        return _fail(
+            GateOutcome.CURRENT_OPTION_SIDE_INVALID,
+            f"option side must be CALL or PUT, got {side!r}",
+        )
     tr = _finite_float(trigger_price)
     tg = _finite_float(target_price)
     st = _finite_float(stop_price)
@@ -593,11 +814,6 @@ def check_market_validity_gate(
     # geometry (which is symmetric on both sides).
     if _side == "CALL":
         _trigger_check = ask if ask and ask > 0 else mid
-        if _trigger_check is not None and _trigger_check < tr:
-            return _fail(
-                GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
-                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
-            )
         if st is not None and st > 0 and mid is not None and mid <= st:
             return _fail(
                 GateOutcome.CALL_STOP_ALREADY_BROKEN,
@@ -608,13 +824,13 @@ def check_market_validity_gate(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"CALL mid={mid:.4f} >= target={tg:.4f} — move complete",
             )
+        if _trigger_check is not None and _trigger_check < tr:
+            return _fail(
+                GateOutcome.CALL_NO_LONGER_ABOVE_TRIGGER,
+                f"ask={ask:.4f} mid={(mid or 0.0):.4f} < trigger={tr:.4f} — breach reversed",
+            )
     elif _side == "PUT":
         _trigger_check = bid if bid and bid > 0 else mid
-        if _trigger_check is not None and _trigger_check > tr:
-            return _fail(
-                GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
-                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
-            )
         if st is not None and st > 0 and mid is not None and mid >= st:
             return _fail(
                 GateOutcome.PUT_STOP_ALREADY_BROKEN,
@@ -625,8 +841,11 @@ def check_market_validity_gate(
                 GateOutcome.TARGET_ALREADY_INVALID,
                 f"PUT mid={mid:.4f} <= target={tg:.4f} — move complete",
             )
-    # Unknown side: pass (identity gate would have blocked this earlier)
-
+        if _trigger_check is not None and _trigger_check > tr:
+            return _fail(
+                GateOutcome.PUT_NO_LONGER_BELOW_TRIGGER,
+                f"bid={bid:.4f} mid={(mid or 0.0):.4f} > trigger={tr:.4f} — breach reversed",
+            )
     # Rule: remaining opportunity
     rem_pct = _remaining_opportunity_pct(_side, mid, tr, tg)
     if rem_pct is not None:

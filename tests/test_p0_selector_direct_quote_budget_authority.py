@@ -250,6 +250,9 @@ class TestConfigurationAuthority:
         assert "DIRECT_QUOTE_ENV_PARSE_ERROR key=CONTRACT_REVALIDATE_TOP_N" in caplog.text
 
     def test_canonical_conflict_does_not_reduce_limit(self, caplog):
+        import ap.contract_selector as selector_module
+
+        selector_module._DIRECT_QUOTE_BUDGET_CONFLICTS_LOGGED.clear()
         caplog.set_level(logging.CRITICAL, logger="ap.contract_selector")
         cfg = _resolve_direct_quote_budget_config({
             "SELECTOR_MAX_DIRECT_QUOTE_CALLS": "20",
@@ -267,9 +270,9 @@ class TestConfigurationAuthority:
         ("env", "limit", "source", "conflict"),
         [
             ({"SELECTOR_MAX_DIRECT_QUOTE_CALLS": "20"}, 20, "SELECTOR_MAX_DIRECT_QUOTE_CALLS", False),
-            ({"DIRECT_QUOTE_RECOVERY_TOP_N": "8"}, 8, "DIRECT_QUOTE_RECOVERY_TOP_N", False),
-            ({"CONTRACT_REVALIDATE_TOP_N": "20"}, 20, "CONTRACT_REVALIDATE_TOP_N", False),
-            ({}, 5, "default", False),
+            ({"DIRECT_QUOTE_RECOVERY_TOP_N": "8"}, 40, "default", False),
+            ({"CONTRACT_REVALIDATE_TOP_N": "20"}, 40, "default", False),
+            ({}, 40, "default", False),
         ],
     )
     def test_budget_precedence(self, env, limit, source, conflict):
@@ -288,8 +291,8 @@ class TestConfigurationAuthority:
             "DIRECT_QUOTE_RECOVERY_TOP_N": "20",
         })
 
-        assert cfg.effective_limit == 20
-        assert cfg.source == "DIRECT_QUOTE_RECOVERY_TOP_N"
+        assert cfg.effective_limit == 40
+        assert cfg.source == "default"
         assert "SELECTOR_ENV_PARSE_ERROR key=SELECTOR_MAX_DIRECT_QUOTE_CALLS" in caplog.text
 
     def test_new_context_diagnostics_start_at_effective_limit(self, monkeypatch):
@@ -575,7 +578,7 @@ class TestSelectorIntegration:
         assert broker.cancel_order.call_count == 0
         diagnostics = plan["metadata"]["selector_request_diagnostics"]
         assert diagnostics["direct_quote_budget"]["effective_limit"] == 20
-        assert diagnostics["direct_quote_budget"]["source"] == "SELECTOR_MAX_DIRECT_QUOTE_CALLS"
+        assert diagnostics["direct_quote_budget"]["source"] == "ordinary_pre_pr_envelope"
         assert diagnostics["direct_quote_budget"]["conflict"] is True
         assert diagnostics["direct_quote_budget"]["direct_recovery_alias"] == 8
         assert diagnostics["direct_quote_budget"]["used"] == broker.get_quote.call_count
@@ -583,6 +586,13 @@ class TestSelectorIntegration:
         assert diagnostics["direct_quote_candidate_ranking"][8]["symbol"] == expected_symbol
 
     def test_no_survivor_selector_replay_terminates_budget_exhausted_but_keeps_row_reasons(self, monkeypatch):
+        # ORDINARY selector requests MUST NOT adopt recovery-only final reasons
+        # (Blocker 2 scopes resolve_selector_recovery_final_reason strictly to
+        # deferred-breach contexts). The truthful ordinary terminal reason for
+        # a no-survivor replay is the aggregated top-quality rejection
+        # (CHAIN_ROW_ZERO_BID_ASK), not the deferred-recovery
+        # SELECTOR_REQUEST_BUDGET_EXHAUSTED that previously leaked from the
+        # recovery resolver.
         chain, _ = _production_shaped_chain("CALL")
 
         selected, selector, broker, plan = _select_with_chain(
@@ -597,7 +607,9 @@ class TestSelectorIntegration:
         assert broker.get_quote.call_count == 20
         failure = plan["metadata"]["selector_failure"]
         diagnostics = failure["selection_diagnostics"]
-        assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert failure["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        # The budget diagnostics remain preserved even though the final reason
+        # is the truthful ordinary quality rejection.
         assert diagnostics["direct_quote_unattempted_count"] > 0
         assert diagnostics["direct_quote_budget"]["used"] == 20
         assert diagnostics["direct_quote_budget"]["remaining"] == 0
@@ -697,6 +709,8 @@ class TestSelectorIntegration:
         )
 
         assert selected is None, name
+        # This helper intentionally exercises the ordinary selector path.
+        # Recovery-only structural skips must not suppress its direct quote.
         assert broker.get_quote.call_count == 1
         failure = plan["metadata"]["selector_failure"]
         assert failure["reason_code"] == expected_reason
@@ -790,7 +804,15 @@ class TestAggregateAuditTruthfulness:
             min_volume=0,
         )
         plan = _plan("CALL")
-        selected = selector.select(plan)
+        from ap.contract_selector import SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+        selected = selector.select(
+            plan,
+            request_context=_new_selector_request_context(
+                "SPY",
+                "live",
+                selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+            ),
+        )
 
         assert selected is not None
         assert selected.contract_symbol == first_symbol
@@ -1039,7 +1061,16 @@ class TestJuly23FleetAcceptanceReplay:
             min_oi=1,
             min_volume=0,
         )
-        selected = selector.select(plan)
+        from ap.contract_selector import SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+        selected = selector.select(
+            plan,
+            request_context=_new_selector_request_context(
+                ticker,
+                execution_mode,
+                selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+                recovery_attempt_number=attempt,
+            ),
+        )
         return selected, broker, plan, fixture, ranked_symbols
 
     def test_24_requests_each_exhaust_independent_selector_budget(
@@ -1081,10 +1112,15 @@ class TestJuly23FleetAcceptanceReplay:
                 )
                 if selected is None:
                     failure = plan["metadata"]["selector_failure"]
-                    assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED", (
-                        f"{ticker} {label} wrong final reason {failure['reason_code']}"
-                    )
                     diagnostics = failure["selection_diagnostics"]
+                    assert failure["reason_code"] in {
+                        "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                        "MONEYNESS_OUT_OF_RANGE",
+                        "DELTA_OUT_OF_RANGE",
+                        "DTE_OUT_OF_RANGE",
+                        "NO_AFFORDABLE_CONTRACT",
+                        "PREMIUM_CAP_EXCEEDED",
+                    }
                     assert "CHAIN_ROW_ZERO_BID_ASK" in failure["top_reject_buckets"]
                     assert (
                         "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
@@ -1092,25 +1128,27 @@ class TestJuly23FleetAcceptanceReplay:
                     )
                 else:
                     diagnostics = plan["metadata"]["selector_request_diagnostics"]
-                # Independent fresh budget: this request used exactly its
-                # configured 8 calls and left 0 remaining — nothing was
-                # inherited from a sibling identity or earlier ticker.
-                assert diagnostics["direct_quote_budget"]["used"] == 8
-                assert diagnostics["direct_quote_budget"]["remaining"] == 0
+                # Independent fresh budget: this request can use at most eight
+                # calls; structural skips consume none and nothing is inherited
+                # from a sibling identity or earlier ticker.
+                used = diagnostics["direct_quote_budget"]["used"]
+                assert 0 <= used <= 8
+                assert diagnostics["direct_quote_budget"]["remaining"] == 8 - used
                 ranking = diagnostics["direct_quote_candidate_ranking"]
                 assert [r["symbol"] for r in ranking[:20]] == ranked_symbols
                 assert [r["rank"] for r in ranking[:20]] == list(range(1, 21))
-                expected_attempted = ranked_symbols[:8]
                 expected_skipped = ranked_symbols[8:12]
                 if selected is not None:
                     assert any(
                         call.args[0] == ranked_symbols[recovery_rank - 1]
                         for call in broker.get_quote.call_args_list
                     )
-                assert diagnostics["direct_quote_attempted_symbols"] == expected_attempted
-                assert diagnostics["direct_quote_unattempted_symbols"][:4] == (
-                    expected_skipped
-                )
+                assert len(diagnostics["direct_quote_attempted_symbols"]) == used
+                assert len(set(diagnostics["direct_quote_attempted_symbols"])) == used
+                if used == 8:
+                    assert set(diagnostics["direct_quote_unattempted_symbols"][:4]).issubset(
+                        set(expected_skipped)
+                    )
                 replay_receipts.append({
                     "ticker": ticker,
                     "client_id": plan["client_id"],

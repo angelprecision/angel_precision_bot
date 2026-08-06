@@ -61,6 +61,8 @@ Unknown reasons fail closed — they are NOT retryable by default.
 
 from __future__ import annotations
 
+import os
+from datetime import datetime, timezone
 from typing import NamedTuple
 
 
@@ -652,3 +654,457 @@ def classify_retry_reason_taxonomy(
         "operational_reason": _code if _operational else None,
         "may_retry_with_fresh_budget": _operational,
     }
+
+
+_CURSOR_MAX_SYMBOLS = 200
+_CURSOR_MAX_EXPIRATIONS = 10
+
+
+class SelectorRecoveryOwnershipLost(RuntimeError):
+    """The exact order-owner CAS no longer authorizes selector continuation."""
+
+
+class SelectorRecoveryCursorPersistFailed(RuntimeError):
+    """Durable cursor persistence for a deferred-breach retry attempt failed
+    after a completed provider call or structural skip -- a genuine write
+    failure (DB exception, serialization error, timeout, or any other
+    non-ownership error), distinct from SelectorRecoveryOwnershipLost
+    (identity/generation CAS miss, where ownership itself is proven lost).
+    Callers must stop further selector/provider work immediately rather
+    than continuing with process-memory-only progress: continuing would
+    let the process spend more request-budget capacity on candidates whose
+    prior-attempt outcomes have no durable record, exactly the crash-loss/
+    capacity-laundering risk the durable restart contract exists to
+    prevent.
+    """
+
+
+class DeferredMaterializationConfigConflict(RuntimeError):
+    """MAX_BREACH_SELECTOR_RETRIES and DEFERRED_MATERIALIZATION_MAX_ATTEMPTS
+    were both explicitly set in the environment to different values -- or
+    either was set to a malformed/non-positive value. There is no correct
+    silent choice between two explicitly-conflicting operator instructions
+    for the same conceptual retry ceiling."""
+
+
+_DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT = 5
+
+
+def resolve_deferred_materialization_max_attempts() -> int:
+    """Single canonical resolver for the deferred-materialization retry
+    ceiling. Every consumer of this ceiling -- ap_execution_core.py's
+    selector retry loop, ap/pending_trigger_restart_recovery.py's restart-
+    recovery exhaustion check, and ap/deferred_materializer.py's bucket
+    config -- must call this function rather than reading either env var
+    independently, so all three resolve to the exact same value under
+    every environment configuration, not merely under matching hardcoded
+    defaults (which is all the prior fix guaranteed).
+
+    Precedence:
+      - neither var set: both default to 5.
+      - exactly one set: that value is used.
+      - both set and equal: that value is used.
+      - both set and unequal: raises DeferredMaterializationConfigConflict.
+      - either set to a malformed or non-positive value: raises
+        DeferredMaterializationConfigConflict.
+
+    Raises rather than silently picking a value on conflict -- callers
+    decide how to fail safe in their own context (this module has no
+    opinion on selector/restart/materializer-specific fallback behavior).
+    """
+    _raw_breach = os.getenv("MAX_BREACH_SELECTOR_RETRIES")
+    _raw_deferred = os.getenv("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS")
+
+    def _parse(raw, name):
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise DeferredMaterializationConfigConflict(
+                f"{name}={raw!r} is not a valid integer"
+            )
+        if value <= 0:
+            raise DeferredMaterializationConfigConflict(
+                f"{name}={raw!r} must be a positive integer"
+            )
+        return value
+
+    breach_value = _parse(_raw_breach, "MAX_BREACH_SELECTOR_RETRIES")
+    deferred_value = _parse(_raw_deferred, "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS")
+
+    if breach_value is not None and deferred_value is not None:
+        if breach_value != deferred_value:
+            raise DeferredMaterializationConfigConflict(
+                f"MAX_BREACH_SELECTOR_RETRIES={breach_value} conflicts with "
+                f"DEFERRED_MATERIALIZATION_MAX_ATTEMPTS={deferred_value} -- "
+                "both env vars govern the same conceptual retry ceiling and "
+                "must agree, or only one of them should be set"
+            )
+        return breach_value
+    if breach_value is not None:
+        return breach_value
+    if deferred_value is not None:
+        return deferred_value
+    return _DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_DEFAULT
+
+
+def _utc_iso(now=None) -> str:
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def new_selector_recovery_cursor(
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    materialization_generation: int,
+    selector_attempt_count: int = 1,
+    now=None,
+) -> dict:
+    """Build the bounded namespaced cursor stored in orders.meta."""
+    return {
+        "version": 1,
+        "local_order_id": str(local_order_id or ""),
+        "client_id": str(client_id or "").strip().lower(),
+        "execution_mode": str(execution_mode or "").strip().lower(),
+        "signal_id": str(signal_id or ""),
+        "materialization_generation": int(materialization_generation or 0),
+        "selector_attempt_count": max(1, int(selector_attempt_count or 1)),
+        "attempted_symbols": {},
+        "structurally_skipped_symbols": {},
+        "expirations_probed": [],
+        "last_ranked_index_by_expiration": {},
+        "last_market_truth_outcome": None,
+        "last_market_truth_checked_at": None,
+        "updated_at": _utc_iso(now),
+    }
+
+
+def load_selector_recovery_cursor(
+    candidate,
+    *,
+    local_order_id: str,
+    client_id: str,
+    execution_mode: str,
+    signal_id: str,
+    materialization_generation: int,
+    selector_attempt_count: int,
+    allow_previous_generation: bool = False,
+    now=None,
+) -> tuple[dict, str | None]:
+    """Validate identity and bound untrusted JSON cursor input.
+
+    A mismatched cursor is never reused.  The sole previous-generation
+    allowance supports the existing atomic claim transition N→N+1: callers may
+    opt in only after proving the canonical row is owned by the exact new
+    generation.
+    """
+    fresh = new_selector_recovery_cursor(
+        local_order_id=local_order_id,
+        client_id=client_id,
+        execution_mode=execution_mode,
+        signal_id=signal_id,
+        materialization_generation=materialization_generation,
+        selector_attempt_count=selector_attempt_count,
+        now=now,
+    )
+    if candidate in (None, ""):
+        return fresh, None
+    if not isinstance(candidate, dict):
+        return fresh, "MALFORMED_CURSOR"
+    expected = {
+        "version": 1,
+        "local_order_id": str(local_order_id or ""),
+        "client_id": str(client_id or "").strip().lower(),
+        "execution_mode": str(execution_mode or "").strip().lower(),
+        "signal_id": str(signal_id or ""),
+    }
+    for key, value in expected.items():
+        actual = candidate.get(key)
+        if key in {"client_id", "execution_mode"}:
+            actual = str(actual or "").strip().lower()
+        if actual != value:
+            return fresh, f"IDENTITY_MISMATCH:{key}"
+    try:
+        actual_generation = int(candidate.get("materialization_generation"))
+        expected_generation = int(materialization_generation)
+    except (TypeError, ValueError):
+        return fresh, "IDENTITY_MISMATCH:materialization_generation"
+    allowed_generations = {expected_generation}
+    if allow_previous_generation and expected_generation > 1:
+        allowed_generations.add(expected_generation - 1)
+    if actual_generation not in allowed_generations:
+        return fresh, "IDENTITY_MISMATCH:materialization_generation"
+
+    cursor = dict(candidate)
+    cursor["materialization_generation"] = expected_generation
+    cursor["selector_attempt_count"] = max(
+        int(cursor.get("selector_attempt_count") or 0),
+        max(1, int(selector_attempt_count or 1)),
+    )
+    attempted = cursor.get("attempted_symbols")
+    skipped = cursor.get("structurally_skipped_symbols")
+    expirations = cursor.get("expirations_probed")
+    ranked = cursor.get("last_ranked_index_by_expiration")
+    cursor["attempted_symbols"] = dict(
+        list((attempted if isinstance(attempted, dict) else {}).items())[-_CURSOR_MAX_SYMBOLS:]
+    )
+    cursor["structurally_skipped_symbols"] = dict(
+        list((skipped if isinstance(skipped, dict) else {}).items())[-_CURSOR_MAX_SYMBOLS:]
+    )
+    cursor["expirations_probed"] = list(
+        dict.fromkeys(expirations if isinstance(expirations, list) else [])
+    )[-_CURSOR_MAX_EXPIRATIONS:]
+    cursor["last_ranked_index_by_expiration"] = dict(
+        list((ranked if isinstance(ranked, dict) else {}).items())[-_CURSOR_MAX_EXPIRATIONS:]
+    )
+    cursor["updated_at"] = _utc_iso(now)
+    return cursor, None
+
+
+def selector_symbol_may_retry(
+    record,
+    *,
+    refresh_seconds: int,
+    now=None,
+) -> bool:
+    if not isinstance(record, dict) or not bool(record.get("transient")):
+        return False
+    raw = record.get("attempted_at")
+    try:
+        attempted_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if attempted_at.tzinfo is None:
+            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    return (current - attempted_at.astimezone(timezone.utc)).total_seconds() >= max(
+        5, min(120, int(refresh_seconds or 20))
+    )
+
+
+def record_selector_recovery_attempt(
+    cursor: dict,
+    *,
+    symbol: str,
+    attempt_number: int,
+    expiration: str | None,
+    result_reason: str,
+    transient: bool,
+    provider_timestamp=None,
+    now=None,
+) -> dict:
+    out = dict(cursor or {})
+    records = dict(out.get("attempted_symbols") or {})
+    key = "".join(str(symbol or "").upper().split())
+    if key:
+        records.pop(key, None)
+        records[key] = {
+            "attempt_number": max(1, int(attempt_number or 1)),
+            "expiration": str(expiration or ""),
+            "result_reason": str(result_reason or ""),
+            "attempted_at": _utc_iso(now),
+            "provider_timestamp": provider_timestamp,
+            "transient": bool(transient),
+        }
+    out["attempted_symbols"] = dict(list(records.items())[-_CURSOR_MAX_SYMBOLS:])
+    if expiration:
+        expirations = list(out.get("expirations_probed") or [])
+        if str(expiration) not in expirations:
+            expirations.append(str(expiration))
+        out["expirations_probed"] = expirations[-_CURSOR_MAX_EXPIRATIONS:]
+        ranked = dict(out.get("last_ranked_index_by_expiration") or {})
+        ranked[str(expiration)] = int(ranked.get(str(expiration), 0) or 0) + 1
+        out["last_ranked_index_by_expiration"] = dict(
+            list(ranked.items())[-_CURSOR_MAX_EXPIRATIONS:]
+        )
+    out["selector_attempt_count"] = max(
+        int(out.get("selector_attempt_count") or 0),
+        max(1, int(attempt_number or 1)),
+    )
+    out["updated_at"] = _utc_iso(now)
+    return out
+
+
+def record_selector_structural_skip(
+    cursor: dict,
+    *,
+    symbol: str,
+    skip_reason: str,
+    now=None,
+) -> dict:
+    out = dict(cursor or {})
+    records = dict(out.get("structurally_skipped_symbols") or {})
+    key = "".join(str(symbol or "").upper().split())
+    if key:
+        records.pop(key, None)
+        records[key] = {
+            "skip_reason": str(skip_reason or ""),
+            "observed_at": _utc_iso(now),
+        }
+    out["structurally_skipped_symbols"] = dict(
+        list(records.items())[-_CURSOR_MAX_SYMBOLS:]
+    )
+    out["updated_at"] = _utc_iso(now)
+    return out
+
+
+def resolve_selector_recovery_final_reason(evidence: dict) -> str:
+    """Resolve the truthful terminal reason without side effects."""
+    data = evidence if isinstance(evidence, dict) else {}
+    market_outcome = str(data.get("market_truth_outcome") or "").upper()
+    market_reason = str(data.get("market_truth_reason") or "").strip()
+    if market_outcome == "TERMINAL_SETUP_COMPLETE":
+        return market_reason or "MARKET_SETUP_INVALIDATED"
+    if market_reason == "MARKET_SETUP_INVALIDATED":
+        return market_reason
+
+    quality = data.get("quality_rejections")
+    quality = quality if isinstance(quality, dict) else {}
+    attempted = data.get("attempted_results")
+    attempted = attempted if isinstance(attempted, dict) else {}
+    skipped = data.get("structural_skip_results")
+    skipped = skipped if isinstance(skipped, dict) else {}
+
+    # This amendment is surgical: it demotes ONLY affordability so that one
+    # unaffordable candidate cannot terminalize a request while retryable
+    # candidates, budget exhaustion, or non-affordability terminal geometry are
+    # the truthful story. Every OTHER precedence relationship (terminal policy,
+    # non-affordability structural geometry, terminal quality, budget, transient
+    # data, retryable quality) is preserved exactly as it was before PR #401's
+    # amendment. Affordability now terminalizes only when the FULL candidate set
+    # is accounted for and every accounted candidate is an affordability reason.
+    #
+    # Affordability reasons are named ONCE here so the terminal-policy and
+    # terminal-quality vetoes below can exclude them. NO_AFFORDABLE_CONTRACT is
+    # classified TERMINAL_POLICY and PREMIUM_CAP_EXCEEDED is TERMINAL_QUALITY;
+    # without this exclusion an affordability reason arriving via
+    # quality_rejections would short-circuit at step 2 or step 4 and bypass the
+    # full-set accounting entirely — the precise defect this amendment closes.
+    no_affordable_reasons = {
+        "NO_AFFORDABLE_CONTRACT",
+        "STRUCTURAL_CLEARLY_UNAFFORDABLE",
+    }
+    premium_cap_reasons = {
+        "PREMIUM_CAP_EXCEEDED",
+        "STRUCTURAL_PREMIUM_CAP_EXCEEDED",
+    }
+    affordability_reasons = no_affordable_reasons | premium_cap_reasons
+
+    # ── Step 2: terminal policy veto (excluding affordability) ───────────────
+    terminal_policy = next(
+        (
+            reason
+            for reason in quality
+            if reason not in affordability_reasons
+            and get_policy(reason).classification == TERMINAL_POLICY
+        ),
+        None,
+    )
+    if terminal_policy:
+        return terminal_policy
+
+    # ── Step 3: non-affordability terminal structural geometry ───────────────
+    # The affordability structural skips are intentionally EXCLUDED here and
+    # resolved by the full-set affordability accounting below. This preserves
+    # the pre-amendment position of DTE/moneyness/delta/policy geometry.
+    structural_values = set(skipped.values())
+    for structural, canonical in (
+        ("STRUCTURAL_DTE_OUT_OF_RANGE", "DTE_OUT_OF_RANGE"),
+        ("STRUCTURAL_MONEYNESS_OUT_OF_RANGE", "MONEYNESS_OUT_OF_RANGE"),
+        ("STRUCTURAL_DELTA_OUT_OF_RANGE", "DELTA_OUT_OF_RANGE"),
+        ("STRUCTURAL_TERMINAL_POLICY_REJECT", "TERMINAL_POLICY_REJECT"),
+    ):
+        if structural in structural_values:
+            return canonical
+
+    # ── Step 4: terminal quality veto (excluding affordability) ──────────────
+    terminal_quality = next(
+        (
+            reason
+            for reason in quality
+            if reason not in affordability_reasons
+            and get_policy(reason).classification == TERMINAL_QUALITY
+        ),
+        None,
+    )
+    if terminal_quality:
+        return terminal_quality
+
+    # ── Step 5: actual request-budget exhaustion with candidates left ────────
+    # A single affordability skip may not outrank actual exhaustion while
+    # another eligible candidate remains unattempted.
+    eligible = list(data.get("eligible_unattempted_symbols") or [])
+    if (
+        bool(data.get("actual_limit_reached"))
+        and bool(data.get("budget_exhausted_stage"))
+        and eligible
+    ):
+        return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+
+    # ── Step 6: retryable attempted-data failure ─────────────────────────────
+    transient_counts: dict[str, int] = {}
+    for record in attempted.values():
+        if isinstance(record, dict):
+            reason = str(record.get("result_reason") or "")
+        else:
+            reason = str(record or "")
+        if reason and get_policy(reason).classification == RETRYABLE_DATA:
+            transient_counts[reason] = transient_counts.get(reason, 0) + 1
+    if transient_counts:
+        return sorted(transient_counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+    # ── Step 7: retryable quality/data failure ───────────────────────────────
+    retryable_quality = [
+        (str(reason), int(count or 0))
+        for reason, count in quality.items()
+        if get_policy(str(reason)).classification == RETRYABLE_DATA
+    ]
+    if retryable_quality:
+        return sorted(retryable_quality, key=lambda item: (-item[1], item[0]))[0][0]
+
+    # ── Step 8: affordability terminal — only when the FULL candidate set is
+    # accounted for and every accounted candidate is an affordability reason.
+    # Do NOT infer the whole set is unaffordable because one candidate is.
+    # (no_affordable_reasons / premium_cap_reasons / affordability_reasons are
+    # declared once near the top of this function.)
+    accounted_reasons: list[str] = []
+    for record in attempted.values():
+        if isinstance(record, dict):
+            accounted_reasons.append(str(record.get("result_reason") or ""))
+        else:
+            accounted_reasons.append(str(record or ""))
+    accounted_reasons.extend(str(value or "") for value in skipped.values())
+    accounted_reasons.extend(str(reason or "") for reason in quality.keys())
+    accounted_reasons = [reason for reason in accounted_reasons if reason]
+
+    # Affordability is the terminal reason ONLY when the entire candidate set is
+    # accounted for and every accounted candidate is an affordability reason:
+    #   * eligible_unattempted_symbols is empty;
+    #   * no retryable attempted-data failure remains (returned at step 6);
+    #   * no retryable quality failure remains (returned at step 7);
+    #   * at least one accounted reason exists;
+    #   * every accounted attempted, structural, and aggregated-quality reason
+    #     is an affordability reason.
+    # There is deliberately NO structural fallback below this block: a partial
+    # affordability set (candidates still eligible, or non-affordability reasons
+    # present) must never terminalize as affordability. It falls through to the
+    # truthful higher-priority reason above or to UNKNOWN.
+    if (
+        not eligible
+        and accounted_reasons
+        and all(reason in affordability_reasons for reason in accounted_reasons)
+    ):
+        if any(reason in no_affordable_reasons for reason in accounted_reasons):
+            return "NO_AFFORDABLE_CONTRACT"
+        return "PREMIUM_CAP_EXCEEDED"
+
+    # ── Step 9: unknown recovery failure ─────────────────────────────────────
+    return "UNKNOWN_SELECTOR_RECOVERY_FAILURE"

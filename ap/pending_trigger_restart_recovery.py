@@ -37,6 +37,10 @@ from ap.pending_trigger_classifier import (
     PendingTriggerClassification as PTC,
     classify_pending_trigger_row,
 )
+from ap.selector_retry_policy import (
+    DeferredMaterializationConfigConflict,
+    resolve_deferred_materialization_max_attempts,
+)
 
 log = get_logger("ap.pending_trigger_restart_recovery")
 
@@ -719,8 +723,16 @@ class PendingTriggerRestartRecovery:
                  materialization_attempt_count, materialization_retry_reason
                  (none of these exist in stamp_retry_pending).
         """
-        _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 20)
-        _max   = _env_int(_MAT_MAX_ATTEMPTS_ENV, 3)
+        _delay = _env_int("BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8)
+        try:
+            _max = resolve_deferred_materialization_max_attempts()
+        except DeferredMaterializationConfigConflict as _cfg_conflict:
+            log.critical(
+                "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT "
+                "local=%s error=%s -- refusing retry claim.",
+                local_oid, _cfg_conflict,
+            )
+            return _RowOutcome.UNRESOLVED
         _now   = datetime.now(timezone.utc)
 
         _meta     = _extract_meta(row)
@@ -949,7 +961,15 @@ class PendingTriggerRestartRecovery:
         except (TypeError, ValueError):
             return None
 
-        _max = _env_int(_MAT_MAX_ATTEMPTS_ENV, 3)
+        try:
+            _max = resolve_deferred_materialization_max_attempts()
+        except DeferredMaterializationConfigConflict as _cfg_conflict:
+            log.critical(
+                "DEFERRED_MATERIALIZATION_MAX_ATTEMPTS_CONFIG_CONFLICT "
+                "local=%s error=%s -- refusing retry claim.",
+                local_oid, _cfg_conflict,
+            )
+            return None
         if mat_status != "RETRY_PENDING":
             return None
         if broker_ready is not False:

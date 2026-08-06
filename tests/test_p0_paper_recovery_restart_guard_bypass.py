@@ -27,7 +27,18 @@ _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
+# Guard: test files that import client_runner (e.g. test_p0_live_startup_preflight)
+# inject ap.queue as a MagicMock into sys.modules at collection time.  If we
+# received the stub, discard it and force the real module.  We check
+# isinstance(queue, types.ModuleType) because MagicMock attributes are
+# themselves callable, making a callable() check ineffective.
 import ap.queue as queue
+if not isinstance(queue, types.ModuleType):
+    sys.modules.pop("ap.queue", None)
+    importlib.invalidate_caches()
+    import ap.queue  # noqa: F811
+    importlib.reload(ap.queue)
+    import ap.queue as queue  # noqa: F811
 
 ET_NAME = "America/New_York"
 from zoneinfo import ZoneInfo

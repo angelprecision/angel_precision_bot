@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 
 # PR #389 amendment: ap.order_state_machine imports ap.db which requires a
 # DATABASE_URL at import time. Test 11d exercises the real OSM seam so the
@@ -541,9 +542,14 @@ def test_7_successful_retry_reports_broker_ready_or_submitted():
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker():
+def test_8_exhausted_retry_returns_terminal_and_does_not_call_broker(monkeypatch):
+    # Pin MAX_BREACH_SELECTOR_RETRIES=3 to match the durable row's max_attempts=3.
+    # Amendment 1 resolves max = max(configured_env, durable); without pinning the
+    # env, the default of 5 would raise the max and attempt 4 would no longer be
+    # exhausted — defeating what this test is specifically verifying.
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "3")
     core = _core()
-    # attempt 4 requested but max_attempts=3
+    # attempt 4 requested but max_attempts=3 (env also 3 → resolved max=3)
     row = _row(retry_attempt=3, max_attempts=3)
     core.order_state_machine.get_order.return_value = row
 
@@ -955,6 +961,8 @@ def test_11d_generic_retry_promotes_data_unavailable_and_rejects_contradiction(
         max_attempts=5,
         next_retry_at=due,
         selector_failure={"provider_status": 504},
+        signal_id="signal-data",
+        execution_mode="live",
     ) is True
     patch = json.loads(sink[-1][1][0])
     assert patch["materialization_outcome"] == "RETRY_LATER_DATA_UNAVAILABLE"
@@ -976,6 +984,8 @@ def test_11d_generic_retry_promotes_data_unavailable_and_rejects_contradiction(
             "materialization_detail": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
             "entry_path": "DEFERRED_BREACH_MATERIALIZATION",
         },
+        signal_id="signal-contradictory",
+        execution_mode="live",
     ) is False
     assert len(sink) == prior_writes
 
@@ -1146,6 +1156,8 @@ def test_11d_real_postgres_round_trip_is_retryable_not_terminal(monkeypatch):
             max_attempts=5,
             next_retry_at=next_retry_at,
             selector_failure=selector_meta,
+            signal_id=signal_id,
+            execution_mode="live",
         ) is True
 
         row = osm.get_order(local_order_id)
@@ -1565,7 +1577,20 @@ def test_11e_startup_loader_overlap_runs_one_real_selector_request(monkeypatch):
             }},
             "max_position_usd": 2000.0,
         }
-        selected = selector.select(plan)
+        from ap.contract_selector import (
+            SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+            _new_selector_request_context,
+        )
+        selected = selector.select(
+            plan,
+            request_context=_new_selector_request_context(
+                "BAC",
+                "live",
+                selector_request_kind=(
+                    SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+                ),
+            ),
+        )
         assert selected is not None
         selector_requests.append(plan["metadata"]["selector_request_diagnostics"])
         with osm.lock:
@@ -1789,6 +1814,19 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
         "materialization_selector_failure": {
             "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
         },
+        "selector_recovery_cursor_v1": {
+            "version": 1,
+            "local_order_id": LOCAL_ORDER_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "signal_id": SIGNAL_ID,
+            "materialization_generation": 1,
+            "selector_attempt_count": 1,
+            "attempted_symbols": {},
+            "structurally_skipped_symbols": {},
+            "expirations_probed": [],
+            "last_ranked_index_by_expiration": {},
+        },
     }
     before_row = {
         "local_order_id": LOCAL_ORDER_ID,
@@ -1852,6 +1890,7 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     claim_call_count = [0]
     copyback_calls = []
     submit_calls = []
+    cursor_persist_calls = []
 
     class _OSM:
         client_id = CLIENT_ID
@@ -1869,6 +1908,14 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
         def update_order_meta(self, oid, patch):
             self.row.setdefault("meta", {}).update(patch)
+            return True
+
+        def persist_selector_recovery_cursor(self, oid, **kw):
+            cursor_persist_calls.append(kw["cursor"])
+            time.sleep(0.01)
+            self.row.setdefault("meta", {})[
+                "selector_recovery_cursor_v1"
+            ] = kw["cursor"]
             return True
 
         def schedule_deferred_materialization_retry(self, oid, **kw):
@@ -1918,8 +1965,26 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
 
     class _FakeSelector:
         select_count = 0
-        def select(self, plan):
+        data_broker = SimpleNamespace(
+            base_url="https://api.tradier.com/v1",
+            cfg=SimpleNamespace(base_url="https://api.tradier.com/v1"),
+            get_quote=lambda _symbol: {
+                "bid": 130.20,
+                "ask": 130.30,
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
+                "source": "tradier_live",
+            }
+        )
+
+        def select(self, plan, **_kwargs):
             _FakeSelector.select_count += 1
+            request_context = _kwargs["request_context"]
+            for index in range(12):
+                request_context.recovery_cursor_persist(
+                    symbol=f"RTX260117C{130000 + index:08d}",
+                    result_reason="DIRECT_QUOTE_ZERO_BID_ASK",
+                    transient=True,
+                )
             return SimpleNamespace(
                 contract_symbol="RTX260117C00130000",
                 limit_price=2.10,
@@ -1988,12 +2053,14 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     core.intelligence_context.is_enabled.return_value = False
 
     owner_label = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:3"
+    started = time.perf_counter()
     result = core.resume_deferred_materialization_retry(
         local_order_id=LOCAL_ORDER_ID,
         expected_generation=1,
         expected_retry_attempt=2,
         owner=owner_label,
     )
+    selector_elapsed = time.perf_counter() - started
 
     # ── Assertions ────────────────────────────────────────────────────
     # CORE INVARIANT: claim must be called exactly once
@@ -2005,6 +2072,17 @@ def test_spec_acceptance_single_claim_seam(monkeypatch, starting_contract):
     assert _FakeSelector.select_count == 1, (
         f"selector.select must be called exactly once; got {_FakeSelector.select_count}"
     )
+    # Audit blocker 5 fix: cursor persistence is no longer batched by 5 --
+    # every completed candidate quote attempt is now flushed immediately,
+    # closing the crash-loss window where 1-4 completed attempts existed
+    # only in process memory. This fixture has one market-truth checkpoint
+    # plus 12 candidates, so all 13 writes now happen synchronously
+    # (previously batched down to 4). The ~10ms simulated per-write latency
+    # means this is slower (~130ms) than the old batched path (~40ms), which
+    # is the correct, deliberate trade of speed for durability the audit
+    # required -- not a regression.
+    assert len(cursor_persist_calls) == 13
+    assert selector_elapsed < 0.25
     assert copyback_calls, "validated retry selection must reach durable copyback"
     assert copyback_calls[-1]["contract"] == "RTX260117C00130000"
     assert float(copyback_calls[-1]["limit_price"]) > 0.01
@@ -2674,3 +2752,480 @@ def test_blocker5_missing_timeframe_fails_before_claim():
     assert result["disposition"] in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
     assert "TIMEFRAME" in result["reason_code"]
     core.order_state_machine.claim_deferred_materialization.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Amendment 1 — durable retry maximum authority
+#
+# PR #401 requires that the resolved max_attempts = max(configured_env, durable).
+# The old code used the durable value first and only fell back to env when
+# durable was absent, so a row stamped retry_max_attempts=3 was forever capped
+# at 3 even when MAX_BREACH_SELECTOR_RETRIES=5.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _core_with_row(row_meta: dict, *, monkeypatch, execution_mode: str = "paper"):
+    """Return (core, osm) with a minimal row whose meta is row_meta."""
+    core = _core(execution_mode=execution_mode)
+    osm = core.order_state_machine
+
+    now = datetime.now(timezone.utc)
+    full_row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": execution_mode,
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-am1",
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "symbol": "SPY",
+        "direction": "CALL",
+        "score": 80.0,
+        "tier": "A",
+        "trigger_price": 550.0,
+        "stop_underlying": 545.0,
+        "target_underlying": 558.0,
+        "pattern": "3-1-2",
+        "timeframe": "1d",
+        "contract": "DEFERRED:SPY",
+        "qty": 1,
+        "limit_price": 0.01,
+        "reserved_cost": 0.0,
+        "meta": row_meta,
+    }
+    osm.get_order.return_value = full_row
+    osm.claim_deferred_materialization.return_value = True
+    osm.schedule_deferred_materialization_retry.return_value = True
+    osm.update_order_meta.return_value = None
+    osm.client_id = CLIENT_ID
+    return core, osm
+
+
+def _base_meta(*, retry_max_attempts=None, retry_attempt: int = 1) -> dict:
+    """Minimal valid retry-wait meta for Amendment 1 tests."""
+    now = datetime.now(timezone.utc)
+    m = {
+        "lifecycle_state": "RETRY_WAIT",
+        "materialization_status": "RETRY_PENDING",
+        "materialization_generation": 1,
+        "watcher_token": "watcher:am1",
+        "retry_attempt": retry_attempt,
+        "next_retry_at": (now - timedelta(seconds=30)).isoformat(),
+        "materialization_next_retry_at": (now - timedelta(seconds=30)).isoformat(),
+        "trigger_crossed_at": (now - timedelta(seconds=90)).isoformat(),
+        "trigger_price": 550.0,
+        "observed_underlying_price": 550.10,
+        "score": 80.0,
+        "tier": "A",
+        "timeframe": "1d",
+        "materialization_selector_failure": {
+            "reason_code": "NO_CHAIN_DATA",
+        },
+    }
+    if retry_max_attempts is not None:
+        m["retry_max_attempts"] = retry_max_attempts
+    return m
+
+
+# ── Test 1: durable=3, env=5 → max_attempts raised to 5 ─────────────────────
+
+def test_am1_durable_3_env_5_raises_to_5(monkeypatch):
+    """Existing row with retry_max_attempts=3 must use env=5 after raise."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=3, retry_attempt=1), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # Must not be exhausted at attempt 2 (old code with durable=3 also allows 2)
+    assert result.get("disposition") not in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"} or \
+        "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
+        f"Attempt 2/5 must not be exhausted: {result}"
+
+    # Confirm schedule_deferred_materialization_retry was called with max_attempts=5
+    calls = osm.schedule_deferred_materialization_retry.call_args_list
+    if calls:
+        _, kwargs = calls[0]
+        assert kwargs.get("max_attempts") == 5, \
+            f"Expected max_attempts=5, got {kwargs.get('max_attempts')}"
+
+
+def test_am1_durable_3_env_5_attempt_4_allowed(monkeypatch):
+    """Attempt 4 must be ALLOWED when env=5 (would have been blocked at durable=3)."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=3, retry_attempt=3), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=4,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:4",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
+        f"Attempt 4 should be allowed when env=5: {result}"
+
+
+def test_am1_durable_3_env_5_attempt_5_allowed(monkeypatch):
+    """Attempt 5 must be ALLOWED when env=5."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=3, retry_attempt=4), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=5,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:5",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
+        f"Attempt 5 should be allowed when env=5: {result}"
+
+
+def test_am1_durable_3_env_5_attempt_6_exhausted(monkeypatch):
+    """Attempt 6 must be BLOCKED when resolved max is 5."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=3, retry_attempt=5), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=6,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""), \
+        f"Attempt 6 must be exhausted at max=5: {result}"
+    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+
+
+# ── Test 2: durable=7/500, env=5 → hard capped at 5 (blocker correction) ────
+#
+# Rev-2 policy (P0 blocker 1): configured_max is the HARD CEILING.
+# A durable value above configured_max is CLAMPED, not honoured.
+# "max(configured, durable)" allowed stale/corrupted metadata (e.g.,
+# retry_max_attempts=500) to silently create an unbounded retry loop.
+
+def test_am1_durable_7_env_5_clamped_to_5(monkeypatch):
+    """Durable max=7 with env=5 must be clamped to 5, not preserved at 7.
+
+    Prevents stale/historically-high durable values from silently overriding
+    the current production policy ceiling.
+    """
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=7, retry_attempt=1), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # Attempt 2 is within the clamped max of 5 — must not be exhausted
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Attempt 2 must not be exhausted (resolved max=5): {result}"
+
+    # Schedule call must persist max_attempts=5, NOT the durable 7
+    calls = osm.schedule_deferred_materialization_retry.call_args_list
+    if calls:
+        _, kwargs = calls[0]
+        assert kwargs.get("max_attempts") == 5,             f"Durable max=7 must be clamped to env=5: got {kwargs.get('max_attempts')}"
+
+
+def test_am1_durable_7_env_5_attempt_6_clamped_exhausted(monkeypatch):
+    """Attempt 6 must be BLOCKED when durable=7, env=5 (clamped to 5)."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=7, retry_attempt=5), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=6,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""),         f"Attempt 6 must be exhausted when durable=7 is clamped to env=5: {result}"
+    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+
+
+def test_am1_durable_500_env_5_clamped(monkeypatch):
+    """Corrupted or stale durable max=500 must be clamped to env=5."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=500, retry_attempt=5), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=6,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:6",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" in result.get("reason_code", ""),         f"Attempt 6 must be exhausted when durable=500 is clamped to env=5: {result}"
+    assert result.get("disposition") in {"TERMINAL_DURABLE", "TERMINAL_REQUIRED"}
+
+
+# ── Test 2b: durable=5, env=5 → 5 (exact match) ──────────────────────────────
+
+def test_am1_durable_5_env_5_exact_match(monkeypatch):
+    """Durable exactly equal to configured max → still resolves to 5."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=5, retry_attempt=4), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=5,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:5",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Attempt 5 must not be exhausted when durable=5 env=5: {result}"
+
+
+def test_am1_negative_durable_uses_env(monkeypatch):
+    """Negative durable retry_max_attempts is treated as 0; env remains sole authority."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    meta = _base_meta(retry_attempt=1)
+    meta["retry_max_attempts"] = -3
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch)
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # Negative durable clamped to 0; env=5 → max_attempts=5 → attempt 2 allowed
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""),         f"Negative durable must fall back to env=5: {result}"
+
+
+# ── Test 3: durable missing, env=5 → env is sole authority ───────────────────
+
+def test_am1_durable_missing_env_5_uses_env(monkeypatch):
+    """When retry_max_attempts is absent from meta, env=5 is the sole authority."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=None, retry_attempt=1), monkeypatch=monkeypatch)
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
+        f"Attempt 2/5 must not be exhausted: {result}"
+
+    calls = osm.schedule_deferred_materialization_retry.call_args_list
+    if calls:
+        _, kwargs = calls[0]
+        assert kwargs.get("max_attempts") == 5, \
+            f"Expected max_attempts=5 from env: {kwargs.get('max_attempts')}"
+
+
+# ── Test 4: malformed durable maximum falls back safely ──────────────────────
+
+@pytest.mark.parametrize("bad_value", ["abc", "", None, [], {}, -1, 0])
+def test_am1_malformed_durable_max_falls_back(monkeypatch, bad_value):
+    """Malformed or non-positive durable max must fall back to env safely."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    meta = _base_meta(retry_attempt=1)
+    meta["retry_max_attempts"] = bad_value
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch)
+
+    # Must not raise
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # Attempt 2 must not be exhausted with env=5
+    assert "RETRY_MAX_ATTEMPTS_EXCEEDED" not in result.get("reason_code", ""), \
+        f"bad durable={bad_value!r}: attempt 2 must not be exhausted: {result}"
+
+
+# ── Test 5: malformed/non-positive env → safe default, no crash ──────────────
+
+@pytest.mark.parametrize("bad_env", ["abc", "0", "-3", ""])
+def test_am1_malformed_env_safe_default(monkeypatch, bad_env):
+    """Malformed env MAX_BREACH_SELECTOR_RETRIES must not crash; uses safe default."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", bad_env)
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=None, retry_attempt=1), monkeypatch=monkeypatch)
+    # Must not raise
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # Should get a valid disposition (not a Python exception)
+    assert "disposition" in result, f"Expected valid disposition for bad env={bad_env!r}: {result}"
+
+
+# ── Test 6: terminal/submitted/filled rows are never reopened ─────────────────
+
+@pytest.mark.parametrize("bad_status,broker_order_id,submitted_ts", [
+    ("FILLED",      "broker-123", "2026-07-28T10:00:00+00:00"),
+    ("CANCELLED",   "broker-124", None),
+    ("EXPIRED",     None,         "2026-07-28T10:00:00+00:00"),
+    ("REJECTED",    "broker-125", "2026-07-28T10:01:00+00:00"),
+])
+def test_am1_terminal_rows_never_reopened(monkeypatch, bad_status, broker_order_id, submitted_ts):
+    """Terminal/submitted rows must never be reopened by a raised max_attempts."""
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "10")  # very high env
+
+    meta = _base_meta(retry_max_attempts=3, retry_attempt=1)
+    core, osm = _core_with_row(meta, monkeypatch=monkeypatch)
+
+    # Override get_order to return a row with broker_order_id or submitted_ts set
+    now = datetime.now(timezone.utc)
+    bad_row = {
+        "local_order_id": LOCAL_ORDER_ID,
+        "client_id": CLIENT_ID,
+        "execution_mode": "paper",
+        "signal_id": SIGNAL_ID,
+        "plan_id": "plan-am1-terminal",
+        "kind": "ENTRY",
+        "status": bad_status,
+        "broker_order_id": broker_order_id,
+        "submitted_ts": submitted_ts,
+        "symbol": "SPY",
+        "direction": "CALL",
+        "score": 80.0,
+        "tier": "A",
+        "trigger_price": 550.0,
+        "stop_underlying": 545.0,
+        "target_underlying": 558.0,
+        "pattern": "3-1-2",
+        "timeframe": "1d",
+        "contract": "DEFERRED:SPY",
+        "qty": 1,
+        "limit_price": 0.01,
+        "reserved_cost": 0.0,
+        "meta": meta,
+    }
+    osm.get_order.return_value = bad_row
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    # claim must NOT have been called
+    osm.claim_deferred_materialization.assert_not_called()
+    # disposition must be a TERMINAL or KEEP (not a successful RETRY progression)
+    assert result.get("disposition") not in {"RETRY_WAIT", "SUBMITTED", "BROKER_READY"}, \
+        f"Terminal row status={bad_status!r} must not be reopened: {result}"
+
+
+# ── Test 7: restart — resolved raised maximum persists across restarts ────────
+
+def test_am1_resolved_max_persists_on_restart(monkeypatch):
+    """The bounded resolved max (configured_max=5) must be persisted so that
+    the next process observes the same ceiling after restart.
+
+    With the hard-ceiling policy, max_attempts = configured_max = 5 regardless
+    of the durable value.  This test verifies the OSM call carries max_attempts=5
+    even when the durable row says retry_max_attempts=3.
+
+    Drive schedule_deferred_materialization_retry by making _on_entry_trigger
+    raise (the exception handler calls _schedule_retry_wait, which calls
+    schedule_deferred_materialization_retry on the OSM — same pattern as
+    test_amend5_callback_exception_schedules_durable_retry).
+    """
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+
+    core, osm = _core_with_row(_base_meta(retry_max_attempts=3, retry_attempt=1), monkeypatch=monkeypatch)
+    # Force the retry-schedule path: callback exception → _schedule_retry_wait
+    core._on_entry_trigger.side_effect = RuntimeError("am1-restart-test-sentinel")
+
+    result = core.resume_deferred_materialization_retry(
+        local_order_id=LOCAL_ORDER_ID,
+        expected_generation=1,
+        expected_retry_attempt=2,
+        owner=f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:2",
+    )
+    assert result.get("disposition") == "RETRY_WAIT", (
+        f"Expected RETRY_WAIT after callback exception: {result}"
+    )
+
+    # The schedule_deferred_materialization_retry call must pass max_attempts=5
+    # (configured ceiling); OSM persists this as retry_max_attempts=5 so the
+    # next process restart observes the same bounded maximum.
+    calls = osm.schedule_deferred_materialization_retry.call_args_list
+    assert calls, "schedule_deferred_materialization_retry must have been called"
+    _, kwargs = calls[0]
+    assert kwargs.get("max_attempts") == 5, (
+        f"Persisted max_attempts must equal configured ceiling (5), "
+        f"got {kwargs.get('max_attempts')!r}"
+    )
+
+
+def test_tradier_production_quote_without_source_passes_retry_authority():
+    from ap.brokers.tradier import TradierBroker, TradierConfig
+    from ap.live_submit_gates import validate_retry_market_quote_authority
+
+    now = datetime.now(timezone.utc)
+    broker = TradierBroker(TradierConfig(
+        base_url="https://api.tradier.com/v1",
+        access_token="test-token",
+        account_id="test-account",
+    ))
+    broker._get = MagicMock(return_value={
+        "quotes": {"quote": {
+            "symbol": "SPY",
+            "bid": 637.10,
+            "ask": 637.12,
+            "trade_date": int(now.timestamp() * 1000),
+        }}
+    })
+
+    quote = broker.get_quote("SPY")
+    result = validate_retry_market_quote_authority(quote, transport=broker, now=now)
+
+    assert "source" not in quote
+    assert "quote_source" not in quote
+    assert "provider" not in quote
+    assert result["valid"] is True
+    assert result["quote_source"] == "tradier_live"
+
+
+def test_retry_authority_rejects_contradictory_source_on_approved_transport():
+    from ap.live_submit_gates import validate_retry_market_quote_authority
+
+    now = datetime.now(timezone.utc)
+    result = validate_retry_market_quote_authority(
+        {"bid": 637.10, "ask": 637.12,
+         "trade_date": int(now.timestamp() * 1000),
+         "source": "other_provider"},
+        transport=SimpleNamespace(
+            base_url="https://api.tradier.com/v1",
+            cfg=SimpleNamespace(base_url="https://api.tradier.com/v1"),
+        ),
+        now=now,
+    )
+
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_SOURCE_UNPROVEN"
+
+
+@pytest.mark.parametrize("base_url", [
+    "http://api.tradier.com/v1",
+    "https://api.tradier.com.evil.example/v1",
+    "https://sandbox.tradier.com/v1",
+])
+def test_source_less_quote_still_requires_approved_tradier_transport(base_url):
+    from ap.live_submit_gates import validate_retry_market_quote_authority
+
+    now = datetime.now(timezone.utc)
+    result = validate_retry_market_quote_authority(
+        {"bid": 637.10, "ask": 637.12,
+         "trade_date": int(now.timestamp() * 1000)},
+        transport=SimpleNamespace(
+            base_url=base_url, cfg=SimpleNamespace(base_url=base_url)),
+        now=now,
+    )
+
+    assert result["valid"] is False
+    assert result["reason"] == "MARKET_QUOTE_UNAPPROVED_TRANSPORT"

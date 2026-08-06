@@ -400,6 +400,17 @@ class TestTriggerLaneMarketValidity:
         )
         assert r.passed is True
 
+    @pytest.mark.parametrize("side", ["", "UNKNOWN", "BUY"])
+    def test_invalid_option_side_blocks_live(self, side):
+        r = check_market_validity_gate(
+            side=side, trigger_price=100.0, stop_price=95.0, target_price=110.0,
+            current_bid=100.8, current_ask=101.0, quote_age_ms=200,
+            execution_mode="live",
+        )
+        assert r.passed is False
+        assert r.reason_code == GateOutcome.CURRENT_OPTION_SIDE_INVALID
+        assert r.audit["side"] == side
+
     def test_valid_call_setup_passes_all_checks(self):
         """Clean CALL: ask above trigger, mid below target, above stop, good opportunity."""
         r = check_market_validity_gate(

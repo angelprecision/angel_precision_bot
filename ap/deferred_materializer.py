@@ -74,12 +74,23 @@ FAILED_TERMINAL     = "FAILED_TERMINAL"
 from ap.selector_retry_policy import (  # noqa: E402
     RETRYABLE_MATERIALIZATION_REASONS,
     RETRYABLE_BREACH_SELECTOR_REASONS as _RETRYABLE_BREACH_SELECTOR_REASONS_DM,  # noqa: F401
+    resolve_deferred_materialization_max_attempts,
 )
+
 
 # ── Config helpers (hot-read from env; no restart needed for tuning) ──────────
 
 def _cfg() -> dict:
-    """Read materializer config from env."""
+    """Read materializer config from env.
+
+    Raises DeferredMaterializationConfigConflict (from
+    resolve_deferred_materialization_max_attempts) if
+    MAX_BREACH_SELECTOR_RETRIES and DEFERRED_MATERIALIZATION_MAX_ATTEMPTS
+    are both explicitly set to conflicting or malformed values. No local
+    fallback is substituted -- per the audit requirement, no consumer of
+    the canonical resolver may convert an invalid configuration into
+    usable runtime policy. Callers must handle the conflict explicitly.
+    """
     def _int(key: str, default: int) -> int:
         try:
             return max(1, int(os.getenv(key, str(default)).strip()))
@@ -101,7 +112,7 @@ def _cfg() -> dict:
 
     return {
         "enabled":           _bool("DEFERRED_MATERIALIZATION_BUCKET_ENABLED", True),
-        "max_attempts":      _int("DEFERRED_MATERIALIZATION_MAX_ATTEMPTS", 3),
+        "max_attempts":      resolve_deferred_materialization_max_attempts(),
         "retry_base_s":      _int("DEFERRED_MATERIALIZATION_RETRY_BASE_SECONDS", 15),
         "retry_max_s":       _int("DEFERRED_MATERIALIZATION_RETRY_MAX_SECONDS", 90),
         "lock_ttl_s":        _int("DEFERRED_MATERIALIZATION_LOCK_TTL_SECONDS", 120),

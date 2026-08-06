@@ -32,12 +32,32 @@ SRC = (_REPO / "client_runner.py").read_text()
 # ─── Mock heavy imports BEFORE importing client_runner (repo pattern,
 #     copied from test_paper_selector_market_data_transport.py) ─────────────
 os.environ.setdefault("DATABASE_URL", "postgresql://stub:stub@localhost/stub")
+
+# Track which keys were injected (vs already present) so we can remove only
+# the ones we installed, preventing sys.modules pollution for test files that
+# run after this one and need the real modules (e.g. ap.queue).
+_STUB_INJECTED: list = []
 for _m in (
     "psycopg2", "psycopg2.extras", "psycopg2.pool", "supabase",
     "cryptography", "cryptography.fernet", "ap.db", "ap.queue",
     "ap.position_sizer", "ap.market_intelligence",
 ):
-    sys.modules.setdefault(_m, MagicMock())
+    if _m not in sys.modules:
+        sys.modules[_m] = MagicMock()
+        _STUB_INJECTED.append(_m)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _remove_startup_preflight_stubs():
+    """Remove module-level MagicMock stubs we injected after all tests in this
+    file complete.  Prevents sys.modules contamination for subsequent test
+    files (e.g. test_p0_paper_recovery_restart_guard_bypass) that import the
+    real ap.queue and rely on real attribute lookup rather than MagicMock
+    auto-creation.
+    """
+    yield
+    for _m in _STUB_INJECTED:
+        sys.modules.pop(_m, None)
 
 
 # ── Load the preflight without full runner init (repo pattern) ──────────────

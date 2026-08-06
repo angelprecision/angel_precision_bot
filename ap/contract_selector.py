@@ -72,6 +72,9 @@ from ap.contract_playbook import (
 from ap.contract_quote_revalidator import (
     revalidate_with_direct_quote  as _revalidate_direct,
     should_revalidate             as _should_revalidate,
+    correct_recovered_cursor_disposition as _correct_recovered_cursor_disposition,
+    _ctx_persist_structural_skip,
+    _ctx_persist_attempt,
     DEFAULT_REVALIDATE_TOP_N,
 )
 
@@ -168,8 +171,13 @@ class SelectorRequestContext:
     started_at_monotonic: float = 0.0
     legacy_fallback_used: bool = False
     execution_mode: str = "unknown"
+    selector_request_kind: str = "ORDINARY"
     max_expiration_calls: int = 2
     max_chain_calls: int = 6
+    # Generic dataclass defaults describe an ORDINARY request with no canonical
+    # capacity env present — the pre-PR #401 default of five direct quotes.
+    # Deferred-recovery contexts receive their explicit computed value in
+    # _new_selector_request_context() and never depend on these defaults.
     max_direct_quote_calls: int = 5
     effective_direct_quote_limit: int = 5
     direct_quote_budget_source: str = "default"
@@ -205,6 +213,16 @@ class SelectorRequestContext:
     playbook_enabled: bool | None = None
     playbook_now_et: datetime | None = None
     playbook_today_et: date | None = None
+    recovery_attempt_number: int = 1
+    recovery_cursor: dict | None = None
+    recovery_cursor_persist: object | None = None
+    structural_skips: list[dict] = field(default_factory=list)
+    affordability_headroom_pct: float = 0.10
+    symbol_refresh_seconds: int = 20
+
+
+SELECTOR_REQUEST_KIND_ORDINARY = "ORDINARY"
+SELECTOR_REQUEST_KIND_DEFERRED_BREACH = "DEFERRED_BREACH_MATERIALIZATION"
 
 TICKER_MAX_PREMIUM_PER_CONTRACT = {
     "NVDA":  1500.0,  "TSLA": 1200.0,  "MSTR": 2000.0,
@@ -588,6 +606,31 @@ def _positive_int_env(name: str, default: int) -> int:
         return default
 
 
+def _bounded_float_env(name: str, default: float, low: float, high: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning(
+            "SELECTOR_ENV_PARSE_ERROR key=%s value=%r expected_type=float default=%s",
+            name,
+            raw,
+            default,
+        )
+        return float(default)
+    if not math.isfinite(value) or value < low or value > high:
+        log.warning(
+            "SELECTOR_ENV_PARSE_ERROR key=%s value=%r expected_range=[%s,%s] default=%s",
+            name,
+            raw,
+            low,
+            high,
+            default,
+        )
+        return float(default)
+    return value
+
+
 _DIRECT_QUOTE_BUDGET_CONFLICTS_LOGGED: set[str] = set()
 
 
@@ -649,14 +692,11 @@ def _resolve_direct_quote_budget_config(env=None) -> DirectQuoteBudgetConfig:
                     effective,
                     source,
                 )
-    elif direct_recovery is not None:
-        effective = direct_recovery
-        source = "DIRECT_QUOTE_RECOVERY_TOP_N"
-    elif contract_revalidate is not None:
-        effective = contract_revalidate
-        source = "CONTRACT_REVALIDATE_TOP_N"
     else:
-        effective = 5
+        # The legacy aliases remain diagnostic-only.  They must never become a
+        # second behavioral budget authority when the canonical value is
+        # absent or malformed.
+        effective = 40
         source = "default"
 
     return DirectQuoteBudgetConfig(
@@ -673,18 +713,69 @@ def _resolve_direct_quote_budget_config(env=None) -> DirectQuoteBudgetConfig:
 def _new_selector_request_context(
     ticker: str,
     execution_mode: str = "unknown",
+    *,
+    selector_request_kind: str = SELECTOR_REQUEST_KIND_ORDINARY,
+    recovery_attempt_number: int = 1,
+    recovery_cursor: dict | None = None,
+    recovery_cursor_persist=None,
 ) -> SelectorRequestContext:
+    request_kind = str(
+        selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY
+    ).strip().upper()
+    deferred_recovery = request_kind == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
     budget_cfg = _resolve_direct_quote_budget_config()
-    return SelectorRequestContext(
+    # PR #401 recovery capacity is explicit deferred-breach behavior.  Ordinary
+    # selection retains the pre-PR production default of FIVE direct quotes when
+    # the canonical env is absent — never the deferred-recovery capacity.
+    #
+    # SELECTOR_MAX_DIRECT_QUOTE_CALLS is the canonical behavioral quote-call
+    # authority (Amendment 5).  For ordinary requests it operates as a CEILING:
+    # the env can raise the ordinary cap up to 20 or lower it (e.g. test probes,
+    # budget-exhaustion tests) but must never raise it above 20.  For
+    # deferred-breach requests the full env value is the budget (Amendment 4:
+    # default 40).
+    #
+    # Examples:
+    #   deferred, no env            → 40
+    #   deferred, canonical env=20  → 20
+    #   deferred, canonical env=40  → 40
+    #   ordinary, no env            → 5   (pre-PR #401 default restored)
+    #   ordinary, canonical env=1   → min(20,  1) =  1
+    #   ordinary, canonical env=20  → min(20, 20) = 20
+    #   ordinary, canonical env=40  → min(20, 40) = 20
+    if deferred_recovery:
+        effective_direct_quote_limit = budget_cfg.effective_limit
+    elif budget_cfg.source == "SELECTOR_MAX_DIRECT_QUOTE_CALLS":
+        # Canonical env explicitly set: apply as a ceiling for ordinary.
+        effective_direct_quote_limit = min(20, budget_cfg.effective_limit)
+    else:
+        # Ordinary default with no canonical env: pre-PR #401 default of five.
+        effective_direct_quote_limit = 5
+    context = SelectorRequestContext(
         ticker=str(ticker or ""),
-        direct_quote_attempts_remaining=budget_cfg.effective_limit,
+        direct_quote_attempts_remaining=effective_direct_quote_limit,
         started_at_monotonic=time.monotonic(),
         execution_mode=str(execution_mode or "unknown").lower(),
-        max_expiration_calls=_positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 2),
-        max_chain_calls=_positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 6),
-        max_direct_quote_calls=budget_cfg.effective_limit,
-        effective_direct_quote_limit=budget_cfg.effective_limit,
-        direct_quote_budget_source=budget_cfg.source,
+        selector_request_kind=request_kind,
+        # Ordinary defaults stay pre-PR #401 (expiration 2, chain 6, elapsed
+        # 15000ms), but the explicit environment overrides remain authoritative
+        # for ordinary requests too — restoring the base-SHA behavior. Deferred
+        # recovery keeps its higher defaults (3 / 8 / 25000ms).
+        max_expiration_calls=(
+            _positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 3)
+            if deferred_recovery
+            else _positive_int_env("SELECTOR_MAX_EXPIRATION_CALLS", 2)
+        ),
+        max_chain_calls=(
+            _positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 8)
+            if deferred_recovery
+            else _positive_int_env("SELECTOR_MAX_CHAIN_CALLS", 6)
+        ),
+        max_direct_quote_calls=effective_direct_quote_limit,
+        effective_direct_quote_limit=effective_direct_quote_limit,
+        direct_quote_budget_source=(
+            budget_cfg.source if deferred_recovery else "ordinary_pre_pr_envelope"
+        ),
         direct_quote_budget_conflict=budget_cfg.conflict,
         direct_quote_budget_conflict_detail=budget_cfg.conflict_detail,
         configured_selector_max_direct_quote_calls=(
@@ -696,8 +787,49 @@ def _new_selector_request_context(
         configured_contract_revalidate_top_n=(
             int(budget_cfg.contract_revalidate_raw) if budget_cfg.contract_revalidate_raw and budget_cfg.contract_revalidate_raw.isdigit() else None
         ),
-        max_total_elapsed_ms=_positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 15000),
+        max_total_elapsed_ms=(
+            _positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 25000)
+            if deferred_recovery
+            else _positive_int_env("SELECTOR_MAX_TOTAL_ELAPSED_MS", 15000)
+        ),
+        recovery_attempt_number=max(1, int(recovery_attempt_number or 1)),
+        recovery_cursor=dict(recovery_cursor or {}) if recovery_cursor else None,
+        recovery_cursor_persist=recovery_cursor_persist,
+        affordability_headroom_pct=_bounded_float_env(
+            "SELECTOR_RECOVERY_AFFORDABILITY_HEADROOM_PCT", 0.10, 0.0, 0.25
+        ),
+        symbol_refresh_seconds=max(
+            5,
+            min(
+                120,
+                _positive_int_env("SELECTOR_RECOVERY_SYMBOL_REFRESH_SECONDS", 20),
+            ),
+        ),
     )
+    if context.recovery_cursor:
+        try:
+            from ap.selector_retry_policy import selector_symbol_may_retry
+            for symbol, record in dict(
+                context.recovery_cursor.get("attempted_symbols") or {}
+            ).items():
+                if not selector_symbol_may_retry(
+                    record,
+                    refresh_seconds=context.symbol_refresh_seconds,
+                ):
+                    context.revalidated_contracts.add(
+                        "".join(str(symbol or "").upper().split())
+                    )
+        except Exception as exc:
+            log.warning("selector recovery cursor seed failed err=%s", exc)
+            # Fail closed on malformed progress: never repeat a symbol merely
+            # because cursor parsing failed.
+            for symbol in dict(
+                (context.recovery_cursor or {}).get("attempted_symbols") or {}
+            ):
+                context.revalidated_contracts.add(
+                    "".join(str(symbol or "").upper().split())
+                )
+    return context
 
 
 def _ctx_elapsed_ms(ctx: SelectorRequestContext | None) -> float:
@@ -820,6 +952,9 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
     if ctx is None:
         return {}
     direct_quote_used = int(ctx.provider_call_counts.get("direct_quote_calls", 0) or 0)
+    # Generic missing-context fallback is the ordinary pre-PR #401 default of
+    # five. A real deferred request carries its explicit 40 on the context, so
+    # this fallback never reduces deferred capacity.
     effective_direct_quote_limit = int(ctx.effective_direct_quote_limit or ctx.max_direct_quote_calls or 5)
     direct_quote_remaining = max(0, effective_direct_quote_limit - direct_quote_used)
     return {
@@ -854,6 +989,9 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "direct_quote_unattempted_count": int(ctx.direct_quote_unattempted_count or 0),
         "direct_quote_unattempted_symbols": list(ctx.direct_quote_unattempted_symbols[:25]),
         "direct_quote_candidate_ranking": list(ctx.direct_quote_candidate_ranking[:25]),
+        "selector_request_kind": str(ctx.selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY),
+        "recovery_attempt_number": int(ctx.recovery_attempt_number or 1),
+        "structural_skips": list(ctx.structural_skips[:200]),
         "limits": {
             "max_expiration_calls": int(ctx.max_expiration_calls),
             "max_chain_calls": int(ctx.max_chain_calls),
@@ -1051,6 +1189,114 @@ def _valid_occ_symbol(opt: dict) -> bool:
     except Exception:
         return False
     return symbol[-9] in ("C", "P")
+
+
+def _structural_direct_quote_skip(
+    engine,
+    opt: dict,
+    *,
+    direction: str,
+    ticker: str,
+    underlying_price: float,
+    today: date,
+    selector_budget: float,
+    request_context: SelectorRequestContext | None,
+) -> dict | None:
+    """Return a diagnostic when known chain facts make a provider call futile."""
+    if (
+        request_context is None
+        or str(request_context.selector_request_kind).strip().upper()
+        != SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+    ):
+        return None
+    direction_norm = str(direction or "").strip().upper()
+    if direction_norm.startswith("C"):
+        direction_norm = "CALL"
+    elif direction_norm.startswith("P"):
+        direction_norm = "PUT"
+    symbol = "".join(
+        str(opt.get("symbol") or opt.get("contract") or "").upper().split()
+    )
+    strike = _option_strike(opt)
+    exp_date = _option_expiration_date(opt)
+    dte = (exp_date - today).days if exp_date else None
+    delta, _ = _extract_abs_delta(opt)
+    chain_bid = _safe_float(opt.get("bid"))
+    chain_ask = _safe_float(opt.get("ask"))
+    estimated_cost = chain_ask * 100.0 if chain_ask and chain_ask > 0 else None
+    ticker_cap = _get_max_premium(ticker)
+    headroom = float(
+        getattr(request_context, "affordability_headroom_pct", 0.10) or 0.0
+    )
+    reason = None
+    if not _valid_occ_symbol(opt):
+        reason = "STRUCTURAL_INVALID_OCC"
+    elif _option_type(opt) != direction_norm:
+        reason = "STRUCTURAL_SIDE_MISMATCH"
+    elif exp_date is None or dte is None or dte < int(engine.min_dte) or dte > int(engine.max_dte):
+        reason = "STRUCTURAL_DTE_OUT_OF_RANGE"
+    elif strike is None or not underlying_price:
+        reason = "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+    else:
+        max_otm_pct = _bounded_float_env("MAX_OTM_PCT", 0.12, 0.0, 1.0)
+        if direction_norm == "CALL":
+            otm_pct = max(0.0, (float(strike) - float(underlying_price)) / float(underlying_price))
+        else:
+            otm_pct = max(0.0, (float(underlying_price) - float(strike)) / float(underlying_price))
+        if otm_pct > max_otm_pct:
+            reason = "STRUCTURAL_MONEYNESS_OUT_OF_RANGE"
+    if reason is None and delta is not None:
+        min_delta = max(0.05, float(engine.target_delta) - float(engine.delta_band))
+        max_delta = min(0.95, float(engine.target_delta) + float(engine.delta_band))
+        if delta < min_delta or delta > max_delta:
+            reason = "STRUCTURAL_DELTA_OUT_OF_RANGE"
+    if reason is None and symbol and request_context is not None:
+        if symbol in request_context.revalidated_contracts:
+            reason = "STRUCTURAL_ALREADY_ATTEMPTED"
+    # Affordability and premium-cap MUST NOT be derived from the chain ask at
+    # this seam: this prefilter is only reached because the chain row already
+    # failed a revalidatable quote-quality rule (zero/missing bid/ask, etc.).
+    # A stale or broken chain ask cannot suppress the fresh direct quote that
+    # may itself be affordable. Affordability and premium cap are authoritative
+    # only against the fresh direct-quote ask, which the existing live-quote
+    # quality / sizing paths evaluate after _revalidate_direct() succeeds.
+    # chain_ask / estimated_contract_cost / ticker_cap remain in diagnostics
+    # below but must never gate the provider call.
+    if reason is None:
+        return None
+
+    diagnostic = {
+        "symbol": symbol,
+        "skip_reason": reason,
+        "strike": strike,
+        "expiration": exp_date.isoformat() if exp_date else None,
+        "dte": dte,
+        "delta": delta,
+        "chain_bid": chain_bid,
+        "chain_ask": chain_ask,
+        "estimated_contract_cost": estimated_cost,
+        "selector_budget": float(selector_budget or 0.0),
+        "ticker_premium_cap": ticker_cap,
+        "affordability_headroom_pct": headroom,
+        "trigger_anchor_tier": None,
+        "provider_call_consumed": False,
+    }
+    if request_context is not None:
+        request_context.structural_skips.append(diagnostic)
+        request_context.structural_skips[:] = request_context.structural_skips[-200:]
+        from ap.selector_retry_policy import record_selector_structural_skip
+        request_context.recovery_cursor = record_selector_structural_skip(
+            request_context.recovery_cursor or {},
+            symbol=symbol,
+            skip_reason=reason,
+        )
+        _ctx_persist_structural_skip(
+            request_context,
+            symbol,
+            structural_skip_reason=reason,
+        )
+        _ctx_refresh_diagnostics(request_context)
+    return diagnostic
 
 
 def _order_chain_for_direct_quote_recovery(
@@ -2602,6 +2848,13 @@ class APContractSelectionEngine:
         # flag states; downstream selection is not affected.
         _preferred_strike_audit: dict = {
             "enabled": False,
+            "request_kind": str(
+                getattr(
+                    request_context,
+                    "selector_request_kind",
+                    SELECTOR_REQUEST_KIND_ORDINARY,
+                )
+            ),
             "anchor_source": TRIGGER_ANCHOR_SOURCE_NONE,
             "anchor_price": None,
             "primary_strike": None,
@@ -2612,7 +2865,17 @@ class APContractSelectionEngine:
         _preferred_strikes_for_quality_order: tuple[float, ...] = ()
         _preferred_primary: float | None = None
         _preferred_adjacent: float | None = None
-        if _request_playbook_enabled(request_context):
+        _deferred_recovery_request = (
+            str(
+                getattr(
+                    request_context,
+                    "selector_request_kind",
+                    SELECTOR_REQUEST_KIND_ORDINARY,
+                )
+            ).upper()
+            == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
+        )
+        if _request_playbook_enabled(request_context) or _deferred_recovery_request:
             _preferred_strike_audit["enabled"] = True
             _preference = resolve_trigger_anchored_preferred_strikes(
                 side=direction,
@@ -2699,8 +2962,20 @@ class APContractSelectionEngine:
                 _ordered_audit.append({
                     "symbol": _opt.get("symbol"),
                     "strike": _safe_float(_opt.get("strike")),
+                    "expiration": _opt.get("expiration_date") or _opt.get("expiration"),
                     "strike_policy_tier": _tier,
                     "strike_policy_label": _label,
+                    "trigger_tier": _label,
+                    "distance_to_trigger_anchor": (
+                        abs(float(_s) - float(_preferred_strike_audit["anchor_price"]))
+                        if _s is not None and _preferred_strike_audit.get("anchor_price")
+                        else None
+                    ),
+                    "delta": _extract_abs_delta(_opt)[0],
+                    "chain_bid": _safe_float(_opt.get("bid")),
+                    "chain_ask": _safe_float(_opt.get("ask")),
+                    "chain_index": int(_quality_chain.index(_opt)),
+                    "final_direct_quote_rank": len(_ordered_audit) + 1,
                 })
             _preferred_strike_audit["reordered"] = _original_ids != _final_ids
             _preferred_strike_audit["ordered_candidates"] = _ordered_audit
@@ -2738,11 +3013,31 @@ class APContractSelectionEngine:
                         request_context.direct_quote_eligible_candidates = len(
                             request_context.direct_quote_eligible_symbols
                         )
-                    _rv_pro = _revalidate_direct(
-                        self.data_broker,
+                    _structural_skip_pro = _structural_direct_quote_skip(
+                        self,
                         opt,
-                        pro_reason,
+                        direction=direction,
+                        ticker=ticker,
+                        underlying_price=float(underlying_price or 0.0),
+                        today=today,
+                        selector_budget=float(budget or 0.0),
                         request_context=request_context,
+                    )
+                    _rv_pro = (
+                        {
+                            "action": "SKIP_STRUCTURAL",
+                            "reason_code": _structural_skip_pro.get("skip_reason"),
+                            "direct_quote_used": False,
+                            "opt_updated": None,
+                            "audit": _structural_skip_pro,
+                        }
+                        if _structural_skip_pro
+                        else _revalidate_direct(
+                            self.data_broker,
+                            opt,
+                            pro_reason,
+                            request_context=request_context,
+                        )
                     )
                     if _rv_pro.get("action") == "PASS" and _rv_pro.get("opt_updated"):
                         _opt_pro = _rv_pro["opt_updated"]
@@ -2884,11 +3179,31 @@ class APContractSelectionEngine:
                     request_context.direct_quote_eligible_candidates = len(
                         request_context.direct_quote_eligible_symbols
                     )
-                _rv = _revalidate_direct(
-                    self.data_broker,
+                _structural_skip = _structural_direct_quote_skip(
+                    self,
                     opt,
-                    result,
+                    direction=direction,
+                    ticker=ticker,
+                    underlying_price=float(underlying_price or 0.0),
+                    today=today,
+                    selector_budget=float(budget or 0.0),
                     request_context=request_context,
+                )
+                _rv = (
+                    {
+                        "action": "SKIP_STRUCTURAL",
+                        "reason_code": _structural_skip.get("skip_reason"),
+                        "direct_quote_used": False,
+                        "opt_updated": None,
+                        "audit": _structural_skip,
+                    }
+                    if _structural_skip
+                    else _revalidate_direct(
+                        self.data_broker,
+                        opt,
+                        result,
+                        request_context=request_context,
+                    )
                 )
                 _rv_action = _rv.get("action")
                 if _rv_action == "PASS" and _rv.get("opt_updated"):
@@ -2950,6 +3265,28 @@ class APContractSelectionEngine:
                         # spread too wide at direct prices) — reject with the
                         # real reason from the re-run, not the chain reason.
                         result = _result2
+                        # Audit blocker 4 fix: _revalidate_direct already
+                        # durably persisted DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/
+                        # transient=False to the selector recovery cursor at
+                        # the transport-recovery stage, before this quality
+                        # re-check ran. Now that the re-check has actually
+                        # rejected the candidate, correct that record so the
+                        # cursor never remains classified as a successful
+                        # recovered candidate for a symbol that failed
+                        # quality -- persist the real final reason instead.
+                        # Any persistence failure here propagates naturally
+                        # (SelectorRecoveryCursorPersistFailed /
+                        # SelectorRecoveryOwnershipLost) to the same
+                        # existing catch sites that already handle every
+                        # other cursor write in this selector call.
+                        _correct_recovered_cursor_disposition(
+                            request_context,
+                            str(opt.get("symbol") or ""),
+                            final_reason=str(_result2),
+                            provider_timestamp=(
+                                _rv.get("audit", {}).get("provider_timestamp")
+                            ),
+                        )
                         # P0 PR #302 Fix 2: stamp quality re-failure audit so
                         # operators can distinguish "zero bid/ask" from "real
                         # bid/ask but spread/OI/volume gate re-fired".
@@ -3138,12 +3475,59 @@ class APContractSelectionEngine:
                     )
             except Exception:
                 pass
+            # The recovery final-reason resolver applies deferred-recovery-only
+            # precedence (budget exhaustion, transient dominance, full-set
+            # affordability accounting). Running it against ORDINARY selector
+            # failures would rewrite the truthful base-SHA _obs_reason and
+            # pollute paper/live diagnostics and downstream retry classification.
+            # Scope it strictly to deferred-breach contexts.
             if (
                 request_context is not None
-                and int(getattr(request_context, "direct_quote_unattempted_count", 0) or 0) > 0
-                and getattr(request_context, "budget_exhausted_stage", None) == "direct_quote"
+                and str(
+                    getattr(request_context, "selector_request_kind", "")
+                ).strip().upper()
+                == SELECTOR_REQUEST_KIND_DEFERRED_BREACH
             ):
-                _final_reason = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                try:
+                    from ap.selector_retry_policy import (
+                        resolve_selector_recovery_final_reason,
+                    )
+                    _cursor_attempted = dict(
+                        (request_context.recovery_cursor or {}).get(
+                            "attempted_symbols"
+                        )
+                        or {}
+                    )
+                    _structural_reasons = {
+                        item.get("symbol"): item.get("skip_reason")
+                        for item in request_context.structural_skips
+                        if isinstance(item, dict) and item.get("symbol")
+                    }
+                    _final_reason = resolve_selector_recovery_final_reason({
+                        "budget_exhausted_stage": request_context.budget_exhausted_stage,
+                        "budget_exhausted_detail": request_context.budget_exhausted_detail,
+                        "actual_limit_reached": bool(
+                            request_context.budget_exhausted_stage
+                            and request_context.budget_exhausted_detail
+                        ),
+                        "eligible_unattempted_symbols": list(
+                            request_context.direct_quote_unattempted_symbols
+                        ),
+                        "attempted_results": _cursor_attempted,
+                        "structural_skip_results": _structural_reasons,
+                        "quality_rejections": {
+                            _normalize_reason_code(key): value
+                            for key, value in _rejections.items()
+                        },
+                        "market_truth_outcome": (
+                            (request_context.recovery_cursor or {}).get(
+                                "last_market_truth_outcome"
+                            )
+                        ),
+                        "market_truth_reason": None,
+                    })
+                except Exception:
+                    pass
             _attach_selector_failure(
                 plan,
                 reason_code=_final_reason,
@@ -3376,6 +3760,23 @@ class APContractSelectionEngine:
             context: Optional[dict] = None,
             tradeability_diag: Optional[dict] = None,
         ) -> None:
+            # Audit blocker 4 fix (continued): any candidate reaching this
+            # rejection choke point that was earlier patched via direct-
+            # quote transport recovery (opt["_direct_quote_used"] is True,
+            # set at the patch site in contract_quote_revalidator.py) may
+            # already have a premature DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/
+            # transient=False record in the durable cursor from that
+            # transport-recovery stage -- correct it here with the real
+            # final rejection reason, covering every later-stage check
+            # (affordability, delta, moneyness, premium) in one place
+            # rather than duplicating the correction at each call site.
+            if opt.get("_direct_quote_used"):
+                _correct_recovered_cursor_disposition(
+                    request_context,
+                    str(opt.get("symbol") or ""),
+                    final_reason=str(reason_code or "UNKNOWN_FAIL_CLOSED"),
+                    provider_timestamp=opt.get("_direct_quote_fetched_at"),
+                )
             candidate_row = _build_candidate_row(
                 opt,
                 rank_score=score,
@@ -3697,6 +4098,30 @@ class APContractSelectionEngine:
                 continue
 
             selected = candidate
+            # Audit Blocker 2, true two-stage fix: this is the one place in
+            # the whole method where a candidate has passed EVERY gate
+            # (quality_filter's spread/OI/volume, then affordability,
+            # delta, premium, cheap-contract-gate) -- the only point at
+            # which "this direct-quote-recovered candidate genuinely
+            # succeeded" is actually, finally true. The premature write
+            # that used to happen inside revalidate_with_direct_quote
+            # immediately after a valid transport-level quote (before any
+            # of these checks ran) has been removed entirely -- there is
+            # no longer an earlier "recovered" record for a crash to catch
+            # in a false state. A rejection anywhere along the way is
+            # persisted at its own rejection point (via
+            # _correct_recovered_cursor_disposition, called from the
+            # quality-refail branch above and from
+            # _record_final_rejection); this call fires only for the
+            # single candidate that actually wins.
+            if candidate_opt.get("_direct_quote_used"):
+                _ctx_persist_attempt(
+                    request_context,
+                    str(candidate_opt.get("symbol") or ""),
+                    result_reason="DIRECT_QUOTE_RECOVERED_CHAIN_ZERO",
+                    transient=False,
+                    provider_timestamp=candidate_opt.get("_direct_quote_fetched_at"),
+                )
             break
 
         # Amendment 1: a valid candidate passed all final gates.

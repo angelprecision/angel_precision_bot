@@ -1079,6 +1079,11 @@ class APOrderStateMachine:
             updates.append("position_id=%s"); params.append(position_id)
         if new_status in (OrderStatus.FILLED, OrderStatus.EXIT_FILLED):
             updates.append("filled_ts=%s"); params.append(filled_ts or now_utc_iso())
+        if kind.upper() == "ENTRY" and OrderStatus.is_terminal(new_status):
+            updates.append(
+                "meta=COALESCE(meta, '{}'::jsonb) "
+                "|| '{\"selector_recovery_cursor_v1\":null}'::jsonb"
+            )
         # COMPARE-AND-SWAP: guard the UPDATE on the status we read above.
         # Without this, two concurrent callers (fill_monitor / order_monitor /
         # reconciler all run in separate threads) can both pass the Python-side
@@ -2279,6 +2284,172 @@ class APOrderStateMachine:
             )
             return False
 
+    def persist_selector_recovery_cursor(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        signal_id: str,
+        execution_mode: str,
+        cursor: dict,
+    ) -> bool:
+        """Persist bounded selector progress under the active materializer CAS."""
+        import json as _json_local
+
+        _owner = str(owner or "").strip()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = max(1, int(generation))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _owner
+            or not _signal
+            or _mode not in {"live", "paper"}
+            or not isinstance(cursor, dict)
+        ):
+            return False
+        try:
+            _cursor_json = _json_local.dumps(cursor, default=str)
+        except Exception:
+            return False
+        # Bound the serialized payload as a final defense behind the record
+        # limits enforced by selector_retry_policy.
+        if len(_cursor_json.encode("utf-8")) > 256_000:
+            return False
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb)
+                               || jsonb_build_object(
+                                    'selector_recovery_cursor_v1',
+                                    %s::jsonb
+                                  ),
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                    """,
+                    (
+                        _cursor_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal,
+                        _mode,
+                        _owner,
+                        _generation,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_selector_recovery_cursor failed order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+    def rearm_deferred_materialization_direction_reversal(
+        self,
+        local_order_id: str,
+        *,
+        owner: str,
+        generation: int,
+        signal_id: str,
+        execution_mode: str,
+        market_truth_audit: dict,
+    ) -> bool:
+        """Return the same deferred ENTRY identity to trigger-watcher ownership."""
+        import json as _json_local
+
+        _owner = str(owner or "").strip()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = max(1, int(generation))
+        except (TypeError, ValueError):
+            return False
+        if not _owner or not _signal or _mode not in {"live", "paper"}:
+            return False
+        _patch = {
+            "lifecycle_state": "",
+            "materialization_status": "REARM_DIRECTION_REVERSAL",
+            "materialization_in_flight": False,
+            "materialization_owner": "",
+            "materialization_lease_until": "",
+            "current_owner": "",
+            "watcher_token": "",
+            "broker_ready": False,
+            "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
+            "final_market_truth": dict(market_truth_audit or {}),
+            "selector_recovery_cursor_v1": None,
+            "rearmed_at": now_utc_iso(),
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _rearm():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
+                      AND COALESCE(meta->>'materialization_owner','') = %s
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                    """,
+                    (
+                        _patch_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal,
+                        _mode,
+                        _owner,
+                        _generation,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_rearm) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] rearm_deferred_materialization_direction_reversal failed "
+                "order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
     def persist_deferred_broker_ready(
         self,
         local_order_id: str,
@@ -2346,6 +2517,7 @@ class APOrderStateMachine:
             "selected_qty": _qty,
             "selected_reserved_cost": _reserved,
             "selector_failure": None,
+            "selector_recovery_cursor_v1": None,
             "signal_id": _signal_id,
             "local_order_id": str(local_order_id or ""),
             "client_id": self.client_id,
@@ -2477,6 +2649,9 @@ class APOrderStateMachine:
         max_attempts: int,
         next_retry_at: str,
         selector_failure: dict,
+        selector_recovery_cursor: dict | None = None,
+        signal_id: str = "",
+        execution_mode: str = "",
     ) -> bool:
         """Durably transfer a fenced materializer claim to retry ownership."""
         import json as _json_local
@@ -2486,6 +2661,12 @@ class APOrderStateMachine:
         _selector_failure = (
             dict(selector_failure) if isinstance(selector_failure, dict) else {}
         )
+        _signal_id = str(
+            signal_id or _selector_failure.get("signal_id") or ""
+        ).strip()
+        _execution_mode = str(
+            execution_mode or _selector_failure.get("execution_mode") or ""
+        ).strip().lower()
         _expected_outcome = (
             "RETRY_LATER_SELECTOR_BUDGET"
             if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
@@ -2508,7 +2689,13 @@ class APOrderStateMachine:
             _max_attempts = max(_attempt, int(max_attempts or _attempt))
         except (TypeError, ValueError):
             return False
-        if not _owner or not _reason or not str(next_retry_at or "").strip():
+        if (
+            not _owner
+            or not _reason
+            or not _signal_id
+            or _execution_mode not in {"live", "paper"}
+            or not str(next_retry_at or "").strip()
+        ):
             return False
         if (
             _outcome not in {
@@ -2568,6 +2755,8 @@ class APOrderStateMachine:
             "materialization_selector_failure": _selector_failure,
             "broker_ready": False,
         }
+        if isinstance(selector_recovery_cursor, dict):
+            _patch["selector_recovery_cursor_v1"] = selector_recovery_cursor
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
         except Exception:
@@ -2582,6 +2771,8 @@ class APOrderStateMachine:
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(NULLIF(execution_mode, ''), meta->>'execution_mode',''))) = %s
                       AND kind = 'ENTRY'
                       AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
                       AND (broker_order_id IS NULL OR broker_order_id = '')
@@ -2590,7 +2781,15 @@ class APOrderStateMachine:
                       AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
                       AND COALESCE(meta->>'lifecycle_state','') = 'MATERIALIZING'
                     """,
-                    (_patch_json, local_order_id, self.client_id, _owner, _generation),
+                    (
+                        _patch_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal_id,
+                        _execution_mode,
+                        _owner,
+                        _generation,
+                    ),
                 )
                 return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
 
@@ -2855,6 +3054,7 @@ class APOrderStateMachine:
             "materialization_retry_terminal_owner": _owner,
             "materialization_retry_terminal_generation": _generation,
             "materialization_retry_terminal_attempt": _attempt,
+            "selector_recovery_cursor_v1": None,
         })
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
@@ -2934,6 +3134,7 @@ class APOrderStateMachine:
             "final_reason": _reason,
             "materialization_finished_at": _now,
             "selector_completed_at": _now,
+            "selector_recovery_cursor_v1": None,
         })
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
