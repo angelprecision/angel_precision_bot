@@ -1251,6 +1251,22 @@ class APExecutionCore:
             return SCORE_FLOOR_LIVE, CONTEXT_FLOOR_LIVE
         return SCORE_FLOOR_PAPER, CONTEXT_FLOOR_PAPER
 
+    def _position_snapshot_mode(self) -> str:
+        """Return the canonical mode required by APPositionManager.snapshot().
+
+        Position truth must remain scoped to the runner's exact LIVE/PAPER
+        identity.  Never call snapshot without an explicit mode and never
+        invent a default when runtime identity is malformed.
+        """
+        mode = str(
+            getattr(self, "execution_mode", None)
+            or getattr(self, "mode", None)
+            or ""
+        ).strip().lower()
+        if mode not in {"live", "paper"}:
+            raise RuntimeError(f"position_snapshot_execution_mode_invalid:{mode or 'missing'}")
+        return mode
+
     def _current_open_position_count(self) -> int:
         """
         Return the most reliable open-position count available.
@@ -1260,7 +1276,9 @@ class APExecutionCore:
         """
         if self.position_manager is not None:
             try:
-                snap = self.position_manager.snapshot()
+                snap = self.position_manager.snapshot(
+                    mode=self._position_snapshot_mode()
+                )
                 return int(snap.get("open_count") or 0)
             except Exception as exc:
                 log.warning(
@@ -1274,7 +1292,9 @@ class APExecutionCore:
         """Return pending entry count from position-manager snapshot when available."""
         if self.position_manager is not None:
             try:
-                snap = self.position_manager.snapshot()
+                snap = self.position_manager.snapshot(
+                    mode=self._position_snapshot_mode()
+                )
                 return int(snap.get("pending_entries") or 0)
             except Exception:
                 return 0
@@ -3434,7 +3454,7 @@ class APExecutionCore:
             decision_status: str = "blocked_at_breach",
             context_notes: str | None = None,
             funnel_key: str = "order_failed",
-        ) -> None:
+        ) -> dict:
             if _ownership_context.get("is_recovered"):
                 # Recovery terminal truth belongs to the exact callback owner.
                 # Never write generic diagnostics or signal state before its
@@ -4157,7 +4177,7 @@ class APExecutionCore:
 
                 if _sel is not None and not _sel_result_valid:
                     _invalid_reason = "SELECTOR_RESULT_INVALID"
-                    _terminalize_deferred_breach_failure(
+                    return _terminalize_deferred_breach_failure(
                         _invalid_reason,
                         extra_meta={
                             "failure_stage": "selector_result_validation",
@@ -4166,7 +4186,6 @@ class APExecutionCore:
                             "selector_qty": _sel_qty_candidate,
                         },
                     )
-                    return {"disposition": "TERMINAL_DURABLE"}
 
                 # A deferred breach retry can start from a durable row that
                 # already contains an OCC-shaped contract while its executable
