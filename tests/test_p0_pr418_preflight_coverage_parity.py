@@ -158,6 +158,59 @@ def test_timestamp_only_row_is_fetched_and_rejected():
     assert "TRIGGER_PROVENANCE_MISSING" in result["findings"]
 
 
+@pytest.mark.parametrize(
+    ("suffix", "timestamp", "expected_safe"),
+    [
+        ("timestamp-null", None, True),
+        ("timestamp-empty", "", False),
+        ("timestamp-whitespace", "   ", False),
+        ("timestamp-false", False, False),
+        ("timestamp-zero", 0, False),
+    ],
+)
+def test_present_timestamp_key_is_fetched_and_classified_by_value(
+    suffix,
+    timestamp,
+    expected_safe,
+):
+    local_order_id = f"{_PREFIX}{suffix}"
+    _insert(local_order_id, {"trigger_crossed_at": timestamp})
+
+    result = _classify_row(_fetch_one(local_order_id))
+
+    assert result["safe"] is expected_safe
+    if timestamp is None:
+        assert "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" not in result["findings"]
+        assert "TRIGGER_PROVENANCE_MISSING" not in result["findings"]
+    else:
+        assert "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" in result["findings"]
+        assert "TRIGGER_PROVENANCE_MISSING" in result["findings"]
+
+
+@pytest.mark.parametrize(
+    ("suffix", "provenance"),
+    [
+        ("provenance-null", None),
+        ("provenance-empty", ""),
+        ("provenance-false", False),
+        ("provenance-zero", 0),
+        ("provenance-dict-empty", {}),
+    ],
+)
+def test_present_provenance_key_is_fetched_regardless_of_value(
+    suffix,
+    provenance,
+):
+    local_order_id = f"{_PREFIX}{suffix}"
+    _insert(local_order_id, {"trigger_crossed_at_provenance": provenance})
+
+    result = _classify_row(_fetch_one(local_order_id))
+
+    assert result["safe"] is False
+    assert "TRIGGER_CROSSED_TIMESTAMP_MISSING" in result["findings"]
+    assert "TRIGGER_PROVENANCE_INCOMPLETE" in result["findings"]
+
+
 def test_both_trigger_claim_keys_absent_remains_outside_candidate_query():
     local_order_id = f"{_PREFIX}ordinary"
     _insert(local_order_id, {"unrelated_field": "ordinary-pending-trigger"})
@@ -246,8 +299,8 @@ def test_candidate_fetch_executes_select_only(monkeypatch):
             assert normalized.startswith("SELECT ")
             for forbidden in (" INSERT ", " UPDATE ", " DELETE ", " MERGE "):
                 assert forbidden not in f" {normalized} "
-            assert "TRIGGER_CROSSED_AT" in normalized
-            assert "TRIGGER_CROSSED_AT_PROVENANCE" in normalized
+            assert "META ? 'TRIGGER_CROSSED_AT'" in normalized
+            assert "META ? 'TRIGGER_CROSSED_AT_PROVENANCE'" in normalized
             return _Result()
 
     connection = _Connection()
