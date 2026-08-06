@@ -794,3 +794,192 @@ class TestQueryNormalizationBtrim:
             "Ordinary ENTRY/PENDING_TRIGGER row without deferred evidence "
             "must not be fetched by the preflight query"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round 6: generation-evidence predicate must match the candidate query's
+# full deferred-evidence field set, not a narrower subset
+# ---------------------------------------------------------------------------
+
+class TestGenerationRequiredForAllEvidenceFields:
+    """The generation-mandatory predicate previously covered only
+    lifecycle_state, materialization_status, selector_recovery_cursor_v1,
+    materialization_lease_until, and materialization_owner -- a narrower set
+    than what the candidate query itself treats as deferred-materialization
+    evidence. A row carrying ONLY current_owner, watcher_token,
+    recovery_owner, next_retry_at, retry_attempt, materialization_attempts,
+    or breach_attempt_count (with no lifecycle_state/materialization_status/
+    cursor/lease/materialization_owner) was fetched by the query but exempt
+    from generation validation -- and could classify safe with no
+    materialization_generation at all.
+
+    _has_ownership_evidence now mirrors the query's evidence set exactly, and
+    uses key presence (`"field" in meta`) rather than truthiness, so an
+    explicitly empty ownership field (e.g. current_owner="") is still
+    evidence and still requires generation.
+
+    Each field below is tested in isolation: (a) the row is fetched by
+    _fetch_candidate_rows, and (b) _classify_row flags it unsafe for missing
+    generation.
+    """
+
+    def _insert_bare(self, local_order_id: str, meta: dict):
+        """Insert a row with meta exactly as given -- no lifecycle_state
+        default -- so each test isolates a single evidence field."""
+        with _pg_conn() as c:
+            with c.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM orders WHERE local_order_id = %s", (local_order_id,)
+                )
+                cur.execute(
+                    """
+                    INSERT INTO orders
+                        (local_order_id, client_id, kind, status, signal_id,
+                         canonical_signal_id, execution_mode, meta)
+                    VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER', %s, %s, 'paper', %s::jsonb)
+                    """,
+                    (
+                        local_order_id,
+                        "preflight-test@example.com",
+                        "sig-preflight-1",
+                        "sig-preflight-1",
+                        json.dumps(meta),
+                    ),
+                )
+            c.commit()
+
+    def _assert_fetched_and_generation_missing(self, local_order_id: str, meta: dict):
+        self._insert_bare(local_order_id, meta)
+        rows = _fetch_candidate_rows()
+        matching = [r for r in rows if r["local_order_id"] == local_order_id]
+        assert len(matching) == 1, (
+            f"Row {local_order_id} carrying evidence {meta!r} must be fetched "
+            f"by the broadened candidate query"
+        )
+        result = _classify_row(matching[0])
+        assert result["safe"] is False, (
+            f"Row {local_order_id} with evidence {meta!r} and no generation "
+            f"must classify unsafe; got safe=True"
+        )
+        assert any(
+            f in ("GENERATION_MISSING", "GENERATION_MALFORMED") or f.startswith("GENERATION_")
+            for f in result["findings"]
+        ), (
+            f"Row {local_order_id} must carry a GENERATION_* finding; "
+            f"got {result['findings']}"
+        )
+
+    def test_current_owner_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-current-owner", {"current_owner": "worker-1"}
+        )
+
+    def test_recovery_owner_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-recovery-owner", {"recovery_owner": "worker-2"}
+        )
+
+    def test_watcher_token_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-watcher-token", {"watcher_token": "tok-abc123"}
+        )
+
+    def test_next_retry_at_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-next-retry-at",
+            {"next_retry_at": "2026-08-10T00:00:00+00:00"},
+        )
+
+    def test_retry_attempt_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-retry-attempt", {"retry_attempt": 1}
+        )
+
+    def test_materialization_attempts_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-materialization-attempts", {"materialization_attempts": 1}
+        )
+
+    def test_breach_attempt_count_only_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-breach-attempt-count", {"breach_attempt_count": 1}
+        )
+
+    def test_empty_string_current_owner_still_requires_generation(self):
+        """Key presence, not truthiness: current_owner="" is itself
+        malformed/incomplete ownership evidence, not the same as the field
+        being absent. It must still trigger the generation requirement,
+        not silently exempt the row."""
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-empty-current-owner", {"current_owner": ""}
+        )
+
+    def test_empty_string_recovery_owner_still_requires_generation(self):
+        self._assert_fetched_and_generation_missing(
+            "r6-gen-empty-recovery-owner", {"recovery_owner": ""}
+        )
+
+    def test_original_reported_shape_current_owner_and_retry_attempt(self):
+        """The exact row shape from the audit report: current_owner plus
+        retry_attempt=1, no materialization_generation. Must resolve
+        attempt=1 (not a counter conflict) and still be flagged unsafe for
+        missing generation -- previously this combination classified safe."""
+        row = {
+            "local_order_id": "r6-gen-reported-shape",
+            "client_id": "preflight-test@example.com",
+            "execution_mode": "paper",
+            "signal_id": "sig-preflight-1",
+            "canonical_signal_id": "sig-preflight-1",
+            "status": "PENDING_TRIGGER",
+            "meta": {
+                "current_owner": "worker-1",
+                "retry_attempt": 1,
+            },
+            "updated_ts": None,
+        }
+        result = _classify_row(row)
+        assert result["resolved_attempt"] == 1
+        assert result["safe"] is False
+        assert "GENERATION_MISSING" in result["findings"], (
+            f"Expected GENERATION_MISSING; got {result['findings']}"
+        )
+
+    def test_evidence_field_with_valid_generation_present_is_not_flagged(self):
+        """Negative control: when one of the newly-covered evidence fields
+        is present AND a valid positive-integer generation is also present,
+        no generation finding should fire."""
+        row = {
+            "local_order_id": "r6-gen-valid-with-owner",
+            "client_id": "preflight-test@example.com",
+            "execution_mode": "paper",
+            "signal_id": "sig-preflight-1",
+            "canonical_signal_id": "sig-preflight-1",
+            "status": "PENDING_TRIGGER",
+            "meta": {
+                "current_owner": "worker-1",
+                "materialization_generation": 1,
+            },
+            "updated_ts": None,
+        }
+        result = _classify_row(row)
+        assert "GENERATION_MISSING" not in result["findings"], result["findings"]
+        assert "GENERATION_MALFORMED" not in result["findings"], result["findings"]
+
+    def test_row_with_zero_evidence_fields_still_not_flagged(self):
+        """Sanity check unrelated to the fix: a row matching none of the
+        evidence fields (would not even be fetched by the query in
+        practice) must not be flagged for generation when classified
+        directly."""
+        row = {
+            "local_order_id": "r6-gen-no-evidence",
+            "client_id": "preflight-test@example.com",
+            "execution_mode": "paper",
+            "signal_id": "sig-preflight-1",
+            "canonical_signal_id": "sig-preflight-1",
+            "status": "PENDING_TRIGGER",
+            "meta": {"unrelated_field": "nothing-to-do-with-deferred"},
+            "updated_ts": None,
+        }
+        result = _classify_row(row)
+        assert "GENERATION_MISSING" not in result["findings"], result["findings"]
+        assert "GENERATION_MALFORMED" not in result["findings"], result["findings"]

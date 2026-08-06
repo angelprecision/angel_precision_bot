@@ -137,13 +137,28 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     # positive integer generation.  Missing, zero, negative, boolean,
     # float, or malformed generation is unsafe regardless of what attempt
     # number the row reports.
+    # Evidence predicate mirrors the broadened candidate query's own
+    # deferred-materialization evidence set exactly -- any field that can
+    # cause a row to be *fetched* as deferred-materialization evidence must
+    # also cause generation to be *required*.  Key presence (not truthiness)
+    # is used deliberately: an explicitly empty ownership field (e.g.
+    # current_owner="") is itself malformed evidence, not the same as the
+    # field being absent, and must not quietly exempt the row from the
+    # generation requirement.
     _generation_raw = meta.get("materialization_generation")
     _has_ownership_evidence = bool(
         lifecycle_state.strip()
         or materialization_status.strip()
-        or meta.get("selector_recovery_cursor_v1") is not None
+        or "selector_recovery_cursor_v1" in meta
         or "materialization_lease_until" in meta
         or "materialization_owner" in meta
+        or "current_owner" in meta
+        or "watcher_token" in meta
+        or "recovery_owner" in meta
+        or "next_retry_at" in meta
+        or "retry_attempt" in meta
+        or "materialization_attempts" in meta
+        or "breach_attempt_count" in meta
     )
     _generation_int: int | None = None
     if _has_ownership_evidence:
