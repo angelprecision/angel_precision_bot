@@ -622,6 +622,98 @@ def _selector_cursor_retry_block_reason(
     return str(cursor_load_reason) if cursor_load_reason else None
 
 
+def _reset_direction_reversal_runtime_state(watched, approved_plan, signal: dict) -> None:
+    """Reset process-local retry state after a durable direction rearm.
+
+    The durable OSM transition clears the active selector attempt and archives
+    the prior confirmed breach.  The in-memory watcher and approved plan must
+    mirror that reset before the next poll; otherwise stale attempt counters or
+    trigger evidence can make the next genuine breach look like attempt 2+ with
+    no cursor.
+    """
+    signal = signal if isinstance(signal, dict) else {}
+    plan_meta = getattr(approved_plan, "metadata", None)
+    if not isinstance(plan_meta, dict):
+        plan_meta = {}
+        try:
+            approved_plan.metadata = plan_meta
+        except Exception:
+            pass
+    signal_meta = signal.get("metadata")
+    if not isinstance(signal_meta, dict):
+        signal_meta = {}
+        signal["metadata"] = signal_meta
+
+    prior_crossed_at = (
+        signal.get("trigger_crossed_at")
+        or plan_meta.get("trigger_crossed_at")
+        or signal_meta.get("trigger_crossed_at")
+        or signal.get("triggered_at")
+        or plan_meta.get("triggered_at")
+        or signal_meta.get("triggered_at")
+    )
+    prior_provenance = (
+        signal.get("trigger_crossed_at_provenance")
+        or plan_meta.get("trigger_crossed_at_provenance")
+        or signal_meta.get("trigger_crossed_at_provenance")
+    )
+
+    reset_patch = {
+        "lifecycle_state": "",
+        "materialization_status": "REARM_DIRECTION_REVERSAL",
+        "materialization_in_flight": False,
+        "materialization_owner": "",
+        "materialization_lease_until": "",
+        "broker_ready": False,
+        "retry_attempt": 0,
+        "retry_attempt_in_flight": 0,
+        "breach_attempt_count": 0,
+        "materialization_attempts": 0,
+        "retry_max_attempts": 0,
+        "next_retry_at": "",
+        "materialization_next_retry_at": "",
+        "retry_reason": "",
+        "materialization_reason": "",
+        "retry_owner": "",
+    }
+    for target in (plan_meta, signal_meta):
+        if prior_crossed_at and not target.get("first_trigger_crossed_at"):
+            target["first_trigger_crossed_at"] = prior_crossed_at
+        if (
+            isinstance(prior_provenance, dict)
+            and prior_provenance
+            and not target.get("first_trigger_crossed_at_provenance")
+        ):
+            target["first_trigger_crossed_at_provenance"] = dict(prior_provenance)
+        target.update(reset_patch)
+        for key in (
+            "selector_recovery_cursor_v1",
+            "trigger_crossed_at",
+            "trigger_crossed_at_provenance",
+            "triggered_at",
+        ):
+            target.pop(key, None)
+
+    signal.update(reset_patch)
+    for key in (
+        "selector_recovery_cursor_v1",
+        "trigger_crossed_at",
+        "trigger_crossed_at_provenance",
+        "triggered_at",
+    ):
+        signal.pop(key, None)
+
+    for attr, value in (
+        ("breach_count", 0),
+        ("trigger_crossed_at", None),
+        ("trigger_crossed_at_provenance", None),
+    ):
+        try:
+            setattr(watched, attr, value)
+        except Exception:
+            pass
+
+
 def _breach_retry_cutoff_hhmm() -> int:
     """
     HHMM (ET) after which NO new deferred-breach selector retries may be
@@ -4667,6 +4759,10 @@ class APExecutionCore:
                                 market_truth_audit=_truth_result.audit,
                             )
                         )
+                        if _rearmed:
+                            _reset_direction_reversal_runtime_state(
+                                watched, approved_plan, sig
+                            )
                         return {
                             "disposition": (
                                 "KEEP_WATCHER"

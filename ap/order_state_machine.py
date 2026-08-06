@@ -2394,9 +2394,28 @@ class APOrderStateMachine:
             "materialization_in_flight": False,
             "materialization_owner": "",
             "materialization_lease_until": "",
-            "current_owner": "",
-            "watcher_token": "",
+            # The same watcher token that owned the materialization claim keeps
+            # ownership after rearm.  Clearing these fields while returning
+            # KEEP_WATCHER creates a durable/runtime ownership split.
+            "current_owner": _owner,
+            "watcher_token": _owner,
             "broker_ready": False,
+            # Direction reversal starts a fresh selector attempt.  Preserve the
+            # monotonic materialization_generation, but clear every active
+            # attempt/schedule authority so the next confirmed breach is
+            # attempt 1 with no stale cursor requirement.
+            "retry_attempt": 0,
+            "retry_attempt_in_flight": 0,
+            "breach_attempt_count": 0,
+            "materialization_attempts": 0,
+            "retry_max_attempts": 0,
+            "next_retry_at": "",
+            "materialization_next_retry_at": "",
+            "retry_reason": "",
+            "materialization_reason": "",
+            "retry_owner": "",
+            "selector_failure": {},
+            "materialization_selector_failure": {},
             "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
             "final_market_truth": dict(market_truth_audit or {}),
             "selector_recovery_cursor_v1": None,
@@ -2412,7 +2431,27 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    SET meta = (
+                            COALESCE(meta, '{}'::jsonb)
+                            || %s::jsonb
+                            || jsonb_strip_nulls(jsonb_build_object(
+                                'first_trigger_crossed_at',
+                                COALESCE(
+                                    NULLIF(meta->>'first_trigger_crossed_at', ''),
+                                    NULLIF(meta->>'trigger_crossed_at', ''),
+                                    NULLIF(meta->>'triggered_at', '')
+                                ),
+                                'first_trigger_crossed_at_provenance',
+                                COALESCE(
+                                    meta->'first_trigger_crossed_at_provenance',
+                                    meta->'trigger_crossed_at_provenance'
+                                )
+                            ))
+                        )
+                        - 'selector_recovery_cursor_v1'
+                        - 'trigger_crossed_at'
+                        - 'trigger_crossed_at_provenance'
+                        - 'triggered_at',
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
