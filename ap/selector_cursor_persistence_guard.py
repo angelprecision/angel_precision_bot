@@ -5,16 +5,14 @@ invalid identity, malformed generation, JSON serialization errors, database
 outages, unknown rowcount, and a genuine exact-owner CAS miss. Execution core
 therefore mislabeled infrastructure failures as ownership loss. This guard
 preserves ``False`` for one condition only: the exact fenced UPDATE matched zero
-rows. Every other failure raises ``SelectorRecoveryCursorPersistFailed`` so the
-caller can keep the row recoverable and emit the correct diagnostic.
+rows. Every other failure raises ``SelectorRecoveryCursorPersistFailed``.
 """
 from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
-from ap.db import conn, run_with_retry
 from ap.logger import get_logger
 from ap.selector_retry_policy import SelectorRecoveryCursorPersistFailed
 
@@ -23,6 +21,20 @@ log = get_logger("ap.selector_cursor_persistence_guard")
 _PATCHED_ATTR = "_AP_SELECTOR_CURSOR_PERSIST_GUARD_PATCHED"
 _ORIGINAL_ATTR = "_AP_SELECTOR_CURSOR_PERSIST_GUARD_ORIGINAL"
 _MAX_CURSOR_BYTES = 256_000
+
+
+def _db_conn():
+    # Lazy import keeps package import/startup verification independent of an
+    # already-initialized connection pool. The actual write still fails closed.
+    from ap.db import conn
+
+    return conn()
+
+
+def _run_db_write(fn: Callable[[], Any]):
+    from ap.db import run_with_retry
+
+    return run_with_retry(fn)
 
 
 def _positive_generation(value: Any) -> int:
@@ -55,15 +67,21 @@ def _guarded_persist_selector_recovery_cursor(
     execution_mode: str,
     cursor: dict,
 ) -> bool:
-    local_id = str(local_order_id or "").strip()
-    durable_owner = str(owner or "").strip()
-    durable_signal = str(signal_id or "").strip()
+    local_raw = str(local_order_id or "")
+    owner_raw = str(owner or "")
+    signal_raw = str(signal_id or "")
+    local_id = local_raw.strip()
+    durable_owner = owner_raw.strip()
+    durable_signal = signal_raw.strip()
     durable_mode = str(execution_mode or "").strip().lower()
 
     if (
         not local_id
         or not durable_owner
         or not durable_signal
+        or local_raw != local_id
+        or owner_raw != durable_owner
+        or signal_raw != durable_signal
         or durable_mode not in {"live", "paper"}
         or not isinstance(cursor, dict)
     ):
@@ -90,7 +108,7 @@ def _guarded_persist_selector_recovery_cursor(
         )
 
     def _persist():
-        with conn() as c:
+        with _db_conn() as c:
             cur = c.execute(
                 """
                 UPDATE orders
@@ -125,7 +143,7 @@ def _guarded_persist_selector_recovery_cursor(
             return getattr(cur, "rowcount", getattr(c, "rowcount", None))
 
     try:
-        rowcount = run_with_retry(_persist)
+        rowcount = _run_db_write(_persist)
     except Exception as exc:
         log.critical(
             "[%s] SELECTOR_RECOVERY_CURSOR_PERSIST_FAILED order=%s "
