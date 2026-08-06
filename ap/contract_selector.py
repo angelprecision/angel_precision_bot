@@ -74,6 +74,7 @@ from ap.contract_quote_revalidator import (
     should_revalidate             as _should_revalidate,
     correct_recovered_cursor_disposition as _correct_recovered_cursor_disposition,
     _ctx_persist_structural_skip,
+    _ctx_persist_attempt,
     DEFAULT_REVALIDATE_TOP_N,
 )
 
@@ -4097,6 +4098,30 @@ class APContractSelectionEngine:
                 continue
 
             selected = candidate
+            # Audit Blocker 2, true two-stage fix: this is the one place in
+            # the whole method where a candidate has passed EVERY gate
+            # (quality_filter's spread/OI/volume, then affordability,
+            # delta, premium, cheap-contract-gate) -- the only point at
+            # which "this direct-quote-recovered candidate genuinely
+            # succeeded" is actually, finally true. The premature write
+            # that used to happen inside revalidate_with_direct_quote
+            # immediately after a valid transport-level quote (before any
+            # of these checks ran) has been removed entirely -- there is
+            # no longer an earlier "recovered" record for a crash to catch
+            # in a false state. A rejection anywhere along the way is
+            # persisted at its own rejection point (via
+            # _correct_recovered_cursor_disposition, called from the
+            # quality-refail branch above and from
+            # _record_final_rejection); this call fires only for the
+            # single candidate that actually wins.
+            if candidate_opt.get("_direct_quote_used"):
+                _ctx_persist_attempt(
+                    request_context,
+                    str(candidate_opt.get("symbol") or ""),
+                    result_reason="DIRECT_QUOTE_RECOVERED_CHAIN_ZERO",
+                    transient=False,
+                    provider_timestamp=candidate_opt.get("_direct_quote_fetched_at"),
+                )
             break
 
         # Amendment 1: a valid candidate passed all final gates.

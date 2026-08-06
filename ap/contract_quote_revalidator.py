@@ -1032,13 +1032,18 @@ def revalidate_with_direct_quote(
     patched["_chain_ask"] = chain_ask
 
     audit["contract_quote_source"] = "direct"
-    _ctx_persist_attempt(
-        request_context,
-        occ_key,
-        result_reason=REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO,
-        transient=False,
-        provider_timestamp=quote.get("provider_timestamp"),
-    )
+    # Audit Blocker 2, true two-stage fix: previously persisted
+    # DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/transient=False here, immediately
+    # after a valid transport-level quote and before ANY of the caller's
+    # spread/OI/volume/delta/premium/affordability checks ran -- a crash
+    # in that window left a false "successful recovery" record on
+    # restart, and the later correction (if the checks rejected the
+    # candidate) did not close that window, only shortened the time a
+    # false record could be read as final. No cursor write happens here
+    # at all now. The caller persists the true final disposition exactly
+    # once: at its own rejection point if any check fails, or at the one
+    # place in the whole selection loop where a candidate has passed
+    # every gate and is actually chosen.
     return {
         "action":            "PASS",
         "reason_code":       REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO,

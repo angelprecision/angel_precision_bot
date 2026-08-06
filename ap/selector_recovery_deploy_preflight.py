@@ -35,6 +35,18 @@ log = get_logger("ap.selector_recovery_deploy_preflight")
 
 
 def _fetch_candidate_rows() -> list[dict]:
+    """Fetch every PENDING_TRIGGER ENTRY row carrying ANY deferred-
+    materialization evidence -- not just the one exact
+    lifecycle_state='MATERIALIZING' combination. A classifier that only
+    queries the state it already expects cannot find the inconsistent
+    states it exists to detect (case/whitespace drift on lifecycle_state,
+    blank lifecycle with an active materialization_status, RUNNING or
+    retry-owned states outside the one exact combination, a cursor or
+    lease present with no matching lifecycle marker, etc.). This casts a
+    deliberately wide net on any evidence of deferred-materialization
+    involvement; _classify_row() does the actual safety determination for
+    every row this returns.
+    """
     with conn() as c:
         rows = c.execute(
             """
@@ -44,7 +56,30 @@ def _fetch_candidate_rows() -> list[dict]:
             FROM orders
             WHERE UPPER(COALESCE(kind, '')) = 'ENTRY'
               AND UPPER(COALESCE(status, '')) = 'PENDING_TRIGGER'
-              AND meta->>'lifecycle_state' = 'MATERIALIZING'
+              AND (
+                    -- Any lifecycle_state at all (case/whitespace drift,
+                    -- or a value other than exactly "MATERIALIZING").
+                    NULLIF(BTRIM(meta->>'lifecycle_state'), '') IS NOT NULL
+                    -- Blank/absent lifecycle but an active materialization
+                    -- status still present.
+                 OR NULLIF(BTRIM(meta->>'materialization_status'), '') IS NOT NULL
+                    -- Any attempt counter present.
+                 OR meta ? 'retry_attempt'
+                 OR meta ? 'materialization_attempts'
+                 OR meta ? 'breach_attempt_count'
+                    -- A durable cursor present.
+                 OR meta ? 'selector_recovery_cursor_v1'
+                    -- Lease/lock/ownership/generation metadata present.
+                 OR meta ? 'materialization_lease_until'
+                 OR meta ? 'materialization_owner'
+                 OR meta ? 'materialization_generation'
+                 OR meta ? 'current_owner'
+                 OR meta ? 'watcher_token'
+                    -- A retry schedule present.
+                 OR meta ? 'next_retry_at'
+                    -- Recovery-owner metadata (restart-recovery path).
+                 OR meta ? 'recovery_owner'
+                  )
             ORDER BY updated_ts ASC
             """
         ).fetchall()
@@ -102,12 +137,32 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
         if cursor_reason:
             findings.append(f"ATTEMPT_2PLUS_CURSOR_INVALID:{cursor_reason}")
 
-    # 3. Lifecycle/materialization-status conflict.
-    lifecycle_state = str(meta.get("lifecycle_state") or "")
-    materialization_status = str(meta.get("materialization_status") or "")
-    if lifecycle_state == "MATERIALIZING" and materialization_status in (
-        "SELECTED", "REARM_DIRECTION_REVERSAL", "FAILED_TERMINAL",
-    ):
+    # 3. Lifecycle/materialization-status conflict -- allowlist of known-
+    # valid pairings rather than a denylist of known-bad ones, so any
+    # combination this classifier doesn't already recognize is flagged by
+    # default rather than silently passing through.
+    lifecycle_raw = meta.get("lifecycle_state")
+    materialization_status_raw = meta.get("materialization_status")
+    lifecycle_state = str(lifecycle_raw) if lifecycle_raw is not None else ""
+    materialization_status = (
+        str(materialization_status_raw) if materialization_status_raw is not None else ""
+    )
+    if lifecycle_state and lifecycle_state != lifecycle_state.strip():
+        findings.append(f"LIFECYCLE_STATE_WHITESPACE_DRIFT:{lifecycle_state!r}")
+    _lifecycle_norm = lifecycle_state.strip().upper()
+    if lifecycle_state.strip() and _lifecycle_norm != lifecycle_state.strip():
+        findings.append(f"LIFECYCLE_STATE_CASE_DRIFT:{lifecycle_state!r}")
+    _materialization_norm = materialization_status.strip().upper()
+
+    _known_valid_pairs = {
+        ("MATERIALIZING", ""),
+        ("MATERIALIZING", "RUNNING"),
+        ("RETRY_WAIT", "RETRY_PENDING"),
+        ("BROKER_READY", "SELECTED"),
+        ("", "REARM_DIRECTION_REVERSAL"),
+        ("", ""),
+    }
+    if (_lifecycle_norm, _materialization_norm) not in _known_valid_pairs:
         findings.append(
             f"LIFECYCLE_MATERIALIZATION_STATUS_CONFLICT:"
             f"lifecycle={lifecycle_state}:status={materialization_status}"

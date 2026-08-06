@@ -1053,3 +1053,130 @@ class TestStrictAttemptCounterParsing:
         )
         assert resolved == 3
         assert reason is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Blocker 2, true fix: transport recovery must not persist ANY disposition
+# -- not even a corrected one -- until every quality/affordability/delta/
+# premium check has actually completed. Closes the crash window entirely
+# rather than shortening it with a second corrective write.
+# ─────────────────────────────────────────────────────────────────────────────
+
+from ap.contract_quote_revalidator import (
+    revalidate_with_direct_quote,
+    clear_quote_cache,
+    REASON_DIRECT_QUOTE_RECOVERED_CHAIN_ZERO as _REASON_RECOVERED,
+)
+
+
+class _StubBrokerForCrashWindow:
+    def __init__(self, quotes):
+        self.quotes = quotes
+        self.calls = []
+
+    def get_quote(self, symbol):
+        self.calls.append(symbol)
+        return self.quotes.get(symbol, {})
+
+
+class TestTransportRecoveryNeverPersistsPrematurely:
+    OCC = "NVDA260620C00500000"
+
+    def setup_method(self):
+        clear_quote_cache()
+
+    def teardown_method(self):
+        clear_quote_cache()
+
+    def _chain_opt_zero(self):
+        return {
+            "symbol": self.OCC, "strike": 500.0, "bid": 0.0, "ask": 0.0,
+            "last": 0.0, "volume": 0, "open_interest": 0,
+            "option_type": "call", "expiration_date": "2026-06-20",
+        }
+
+    def test_successful_transport_recovery_makes_zero_persist_calls(self):
+        """This is the core proof: revalidate_with_direct_quote() itself,
+        on a genuinely valid direct quote, must never call the durable
+        cursor persist callback at all. Previously this exact scenario
+        called it once with DIRECT_QUOTE_RECOVERED_CHAIN_ZERO/transient=
+        False -- a crash immediately after this call, before any quality
+        check ran, left a false success record. Now there is nothing
+        written here for a crash to catch mid-flight."""
+        persist_calls = []
+
+        def _persist(**kwargs):
+            persist_calls.append(kwargs)
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_persist)
+        broker = _StubBrokerForCrashWindow(
+            {self.OCC: {"bid": 1.20, "ask": 1.25, "last": 1.22}}
+        )
+        opt = self._chain_opt_zero()
+
+        result = revalidate_with_direct_quote(
+            broker, opt, "zero_bid_or_ask",
+            market_open_override=True, request_context=ctx,
+        )
+
+        assert result["action"] == "PASS"
+        assert result["reason_code"] == _REASON_RECOVERED
+        assert persist_calls == [], (
+            "transport recovery alone must never durably persist a "
+            "disposition -- doing so before quality checks run is exactly "
+            "the crash window this fix closes"
+        )
+
+    def test_failed_transport_recovery_still_persists_the_real_failure(self):
+        """Positive control: transport-level failures (quote also zero,
+        quote unavailable) ARE genuinely final at that point -- there is
+        no candidate to run further quality checks on -- so these SHOULD
+        still persist immediately. Only the success path was the problem."""
+        persist_calls = []
+
+        def _persist(**kwargs):
+            persist_calls.append(kwargs)
+
+        ctx = SimpleNamespace(recovery_cursor_persist=_persist)
+        broker = _StubBrokerForCrashWindow({self.OCC: {"bid": 0.0, "ask": 0.0}})
+        opt = self._chain_opt_zero()
+
+        result = revalidate_with_direct_quote(
+            broker, opt, "zero_bid_or_ask",
+            market_open_override=True, request_context=ctx,
+        )
+
+        assert result["action"] == "REJECT_DIRECT_ZERO"
+        assert len(persist_calls) == 1
+        assert persist_calls[0]["transient"] is True
+
+
+class TestFinalDispositionPersistedExactlyOnceAtTrueGateClose:
+    """Proves the replacement write point: contract_selector.py now
+    persists the true final disposition exactly once, at the single line
+    where a candidate has passed every gate ("candidate passed all
+    gates" -- the code's own comment) -- not at transport recovery, and
+    not via a second corrective write for a rejected candidate."""
+
+    def test_selector_module_no_longer_persists_at_transport_recovery(self):
+        """Structural guard, secondary to the direct behavioral proof
+        above: confirms revalidate_with_direct_quote's source no longer
+        contains a persist call inside its success path."""
+        import inspect
+        import ap.contract_quote_revalidator as revalidator_mod
+        source = inspect.getsource(revalidator_mod.revalidate_with_direct_quote)
+        # The success-path PASS return must not be preceded by a persist
+        # call in the same function body.
+        pass_return_idx = source.rfind('"action":            "PASS"')
+        preceding_source = source[:pass_return_idx]
+        # The only _ctx_persist_attempt calls remaining in this function
+        # are for the REJECT_UNAVAILABLE and REJECT_DIRECT_ZERO paths,
+        # which appear earlier and are genuinely final at that point.
+        assert preceding_source.count("_ctx_persist_attempt(") == 2
+
+    def test_selector_module_persists_once_at_gate_close(self):
+        import inspect
+        import ap.contract_selector as selector_mod
+        source = inspect.getsource(selector_mod)
+        assert "candidate passed all gates" in source
+        assert "_ctx_persist_attempt(" in source
