@@ -279,7 +279,7 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     # copied from another client/order/mode would otherwise pass the gate.
     trigger_crossed_raw = meta.get("trigger_crossed_at")
     provenance = meta.get("trigger_crossed_at_provenance")
-    if provenance and trigger_crossed_raw in (None, ""):
+    if provenance and not str(trigger_crossed_raw or "").strip():
         findings.append("TRIGGER_CROSSED_TIMESTAMP_MISSING")
     if trigger_crossed_raw:
         _parse_timestamp(
