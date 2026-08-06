@@ -678,18 +678,45 @@ class TestGenerationCompleteness:
             f"Attempt-1 row with null generation must be unsafe; got {result['findings']}"
         )
 
-    def test_row_with_only_retry_schedule_does_not_require_generation(self):
-        """A row carrying only a retry schedule (no lifecycle state, no cursor,
-        no owner, no lease) has no ownership evidence and must not be flagged
-        for a missing generation -- generation is not meaningful without
-        ownership context."""
+    def test_row_with_only_retry_schedule_requires_generation(self):
+        """SUPERSEDED BY ROUND 6: this test originally asserted that a
+        retry-schedule-only row (next_retry_at present, nothing else) does
+        NOT require generation -- on the theory that a bare retry schedule
+        wasn't "ownership evidence." Round 6's audit correctly identified
+        this as a gap: next_retry_at is part of the same deferred-evidence
+        set the candidate query itself uses to fetch rows, so a row that is
+        pulled in for having a retry schedule must not then be exempt from
+        generation validation. The assertion below is intentionally the
+        opposite of the original -- this is the corrected, currently-true
+        behavior. See TestGenerationRequiredForAllEvidenceFields for the
+        full field-by-field coverage this generalizes."""
         row = {
             **self._BASE,
             "local_order_id": "b3-gen-retry-schedule-only",
             "meta": {
                 "next_retry_at": "2026-08-10T00:00:00+00:00",
                 # No lifecycle_state, no materialization_status, no cursor,
-                # no lease, no owner.
+                # no lease, no owner -- but next_retry_at alone is now
+                # sufficient evidence per Round 6.
+            },
+        }
+        result = _classify_row(row)
+        assert "GENERATION_MISSING" in result["findings"], (
+            f"next_retry_at alone must require generation per Round 6; "
+            f"got {result['findings']}"
+        )
+
+    def test_row_with_zero_evidence_fields_does_not_require_generation(self):
+        """Genuine negative control (what the superseded test above was
+        actually trying to express): a row with NO evidence fields at all --
+        not even next_retry_at -- must not be flagged for generation."""
+        row = {
+            **self._BASE,
+            "local_order_id": "b3-gen-truly-no-evidence",
+            "meta": {
+                "unrelated_field": "nothing-to-do-with-deferred",
+                # No lifecycle_state, no materialization_status, no cursor,
+                # no lease, no owner, no next_retry_at, no attempt counters.
             },
         }
         result = _classify_row(row)
