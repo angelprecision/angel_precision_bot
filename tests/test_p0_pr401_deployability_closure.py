@@ -43,32 +43,34 @@ class TestActualOSMCursorPersistenceClassification:
         )
 
     def test_exact_owner_cas_miss_is_the_only_false_outcome(self, monkeypatch):
-        monkeypatch.setattr(cursor_guard, "run_with_retry", lambda _fn: 0)
+        monkeypatch.setattr(cursor_guard, "_run_db_write", lambda _fn: 0)
         assert _persist(APOrderStateMachine("client@example.com")) is False
 
     def test_database_failure_raises_persist_failed_not_ownership_loss(self, monkeypatch):
         def _raise(_fn):
             raise TimeoutError("database unavailable")
 
-        monkeypatch.setattr(cursor_guard, "run_with_retry", _raise)
+        monkeypatch.setattr(cursor_guard, "_run_db_write", _raise)
         with pytest.raises(SelectorRecoveryCursorPersistFailed):
             _persist(APOrderStateMachine("client@example.com"))
 
     @pytest.mark.parametrize("rowcount", [None, -1, 2, True, "unknown"])
     def test_unconfirmed_or_malformed_rowcount_raises(self, monkeypatch, rowcount):
-        monkeypatch.setattr(cursor_guard, "run_with_retry", lambda _fn: rowcount)
+        monkeypatch.setattr(cursor_guard, "_run_db_write", lambda _fn: rowcount)
         with pytest.raises(SelectorRecoveryCursorPersistFailed):
             _persist(APOrderStateMachine("client@example.com"))
 
     def test_confirmed_single_row_write_succeeds(self, monkeypatch):
-        monkeypatch.setattr(cursor_guard, "run_with_retry", lambda _fn: 1)
+        monkeypatch.setattr(cursor_guard, "_run_db_write", lambda _fn: 1)
         assert _persist(APOrderStateMachine("client@example.com")) is True
 
     @pytest.mark.parametrize(
         "overrides",
         [
             {"owner": ""},
+            {"owner": " materializer:test-owner "},
             {"signal_id": ""},
+            {"signal_id": " sig-pr401 "},
             {"execution_mode": "observe"},
             {"generation": 0},
             {"generation": True},
