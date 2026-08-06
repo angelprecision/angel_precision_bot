@@ -199,6 +199,8 @@ def test_timezone_aware_trigger_timestamp_remains_valid():
     assert result["findings"] == []
 
 
+# Lease and retry timestamps intentionally retain the pre-#419 compatibility
+# behavior. Only trigger-crossing evidence requires an explicit timezone.
 @pytest.mark.parametrize(
     ("finding", "raw"),
     [
