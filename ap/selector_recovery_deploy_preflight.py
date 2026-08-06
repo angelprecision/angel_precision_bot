@@ -2,9 +2,13 @@
 
 The command performs no writes and no broker calls. It uses the production
 attempt resolver, cursor loader, cursor retry gate, canonical signal helper,
-and retry-ceiling resolver. Exit 0 means every candidate row is safe and the
-retry configuration is coherent; exit 2 means at least one unsafe row or a
-configuration conflict; exit 1 means the tool itself failed.
+and retry-ceiling resolver. Exit 0 means candidate_row_count is zero (no
+deferred-materialization candidates remain before deployment) and there is
+no configuration conflict; exit 2 means candidate_row_count > 0 (even with
+zero unsafe rows -- a row can be individually well-formed and still be an
+in-flight candidate that must not be present at deploy time), or at least
+one unsafe row, or a configuration conflict; exit 1 means the tool itself
+failed.
 """
 from __future__ import annotations
 
@@ -373,8 +377,15 @@ def main() -> int:
         print(json.dumps({"tool_error": str(exc)}, indent=2, sort_keys=True))
         return 1
     print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    # The documented release gate requires candidate_row_count == 0, not
+    # merely unsafe_row_count == 0. "All discovered rows are internally
+    # consistent" is materially weaker than "no deferred-materialization
+    # candidates remain before deployment" -- a row can be individually
+    # well-formed (safe=true) and still represent an in-flight
+    # deferred-recovery candidate that must not be present at deploy time.
     return 2 if (
-        result["unsafe_row_count"] > 0
+        result["candidate_row_count"] > 0
+        or result["unsafe_row_count"] > 0
         or result.get("max_attempts_config_conflict") is not None
     ) else 0
 

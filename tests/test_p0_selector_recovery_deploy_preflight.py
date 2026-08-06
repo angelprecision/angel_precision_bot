@@ -14,6 +14,13 @@ Round 5 additions (surgical amendment -- four false-negative blockers):
   - TestConfigConflictPreflightExitCode  (Blocker 2)
   - TestGenerationCompleteness           (Blocker 3)
   - TestQueryNormalizationBtrim          (Blocker 4)
+
+Remaining-blocker addition (candidate_row_count enforcement):
+  - TestMainExitCodeEnforcesCandidateZero -- command-level tests calling
+    main() itself (not a reimplemented exit-code formula) with
+    run_preflight() monkeypatched to controlled results, proving the
+    actual executable deployment contract requires candidate_row_count==0,
+    not merely unsafe_row_count==0.
 """
 
 from __future__ import annotations
@@ -27,9 +34,11 @@ import psycopg2
 import psycopg2.extras
 import pytest
 
+import ap.selector_recovery_deploy_preflight as preflight_module
 from ap.selector_recovery_deploy_preflight import (
     _classify_row,
     _fetch_candidate_rows,
+    main,
     run_preflight,
 )
 
@@ -1010,3 +1019,161 @@ class TestGenerationRequiredForAllEvidenceFields:
         result = _classify_row(row)
         assert "GENERATION_MISSING" not in result["findings"], result["findings"]
         assert "GENERATION_MALFORMED" not in result["findings"], result["findings"]
+
+
+# ---------------------------------------------------------------------------
+# Remaining blocker: preflight must enforce candidate_row_count == 0, not
+# merely unsafe_row_count == 0, at the command level (main()).
+# ---------------------------------------------------------------------------
+
+class TestMainExitCodeEnforcesCandidateZero:
+    """The documented release gate is:
+
+        candidate_row_count = 0
+        unsafe_row_count = 0
+        max_attempts_config_conflict = null
+        exit code = 0
+
+    main() previously only checked unsafe_row_count and
+    max_attempts_config_conflict -- a row could be individually well-formed
+    (safe=true) and still leave candidate_row_count > 0, and the process
+    would incorrectly exit 0. "All discovered rows are internally
+    consistent" is a materially weaker claim than "no deferred-materialization
+    candidates remain before deployment," and the executable gate must
+    enforce the latter, which is what the PR body actually commits to.
+
+    These tests call main() itself -- the actual command-level entry point
+    -- with run_preflight() monkeypatched to return controlled results, so
+    they prove the real executable contract rather than re-deriving the
+    boolean formula independently (which would pass even if main() itself
+    drifted from that formula).
+    """
+
+    def _run_main_with_result(self, monkeypatch, capsys, result):
+        monkeypatch.setattr(preflight_module, "run_preflight", lambda: result)
+        exit_code = main()
+        captured = capsys.readouterr()
+        return exit_code, captured.out
+
+    def test_candidate_rows_present_zero_unsafe_still_exits_2(self, monkeypatch, capsys):
+        """candidate_row_count=1, unsafe_row_count=0 -> exit 2.  This is the
+        exact case the audit reported: a safe-but-unresolved candidate must
+        not be treated as a clean deployment."""
+        result = {
+            "tool": "ap.selector_recovery_deploy_preflight",
+            "candidate_row_count": 1,
+            "unsafe_row_count": 0,
+            "max_attempts_config_conflict": None,
+            "resolved_max_attempts": 5,
+            "rows": [{"local_order_id": "x", "safe": True, "findings": []}],
+        }
+        exit_code, out = self._run_main_with_result(monkeypatch, capsys, result)
+        assert exit_code == 2, f"Expected exit 2 for candidate_row_count=1; got {exit_code}"
+        assert json.loads(out)["candidate_row_count"] == 1
+
+    def test_zero_candidates_zero_unsafe_no_conflict_exits_0(self, monkeypatch, capsys):
+        """candidate_row_count=0, unsafe_row_count=0, no conflict -> exit 0.
+        This is the only condition under which the documented release gate
+        permits deployment."""
+        result = {
+            "tool": "ap.selector_recovery_deploy_preflight",
+            "candidate_row_count": 0,
+            "unsafe_row_count": 0,
+            "max_attempts_config_conflict": None,
+            "resolved_max_attempts": 5,
+            "rows": [],
+        }
+        exit_code, out = self._run_main_with_result(monkeypatch, capsys, result)
+        assert exit_code == 0, f"Expected exit 0 for the fully clean case; got {exit_code}"
+        assert json.loads(out)["candidate_row_count"] == 0
+
+    def test_candidate_and_unsafe_both_present_exits_2(self, monkeypatch, capsys):
+        """candidate_row_count=1, unsafe_row_count=1 -> exit 2 (both
+        conditions independently sufficient; this proves neither masks
+        the other)."""
+        result = {
+            "tool": "ap.selector_recovery_deploy_preflight",
+            "candidate_row_count": 1,
+            "unsafe_row_count": 1,
+            "max_attempts_config_conflict": None,
+            "resolved_max_attempts": 5,
+            "rows": [{"local_order_id": "x", "safe": False, "findings": ["GENERATION_MISSING"]}],
+        }
+        exit_code, out = self._run_main_with_result(monkeypatch, capsys, result)
+        assert exit_code == 2
+
+    def test_config_conflict_alone_with_zero_candidates_exits_2(self, monkeypatch, capsys):
+        """A configuration conflict must fail the gate even with zero
+        candidates and zero unsafe rows -- proves the three exit-2
+        conditions are independently sufficient, not just candidate_row_count."""
+        result = {
+            "tool": "ap.selector_recovery_deploy_preflight",
+            "candidate_row_count": 0,
+            "unsafe_row_count": 0,
+            "max_attempts_config_conflict": "MAX_BREACH_SELECTOR_RETRIES=5 conflicts with DEFERRED_MATERIALIZATION_MAX_ATTEMPTS=3",
+            "resolved_max_attempts": None,
+            "rows": [],
+        }
+        exit_code, out = self._run_main_with_result(monkeypatch, capsys, result)
+        assert exit_code == 2
+
+    def test_tool_exception_exits_1(self, monkeypatch, capsys):
+        """A genuine tool error (DB unreachable, etc.) must exit 1, distinct
+        from both the clean-pass (0) and unsafe/pending (2) codes -- callers
+        need to be able to distinguish 'the gate ran and found a problem'
+        from 'the gate could not run at all.'"""
+        def _raise():
+            raise RuntimeError("could not connect to database")
+
+        monkeypatch.setattr(preflight_module, "run_preflight", _raise)
+        exit_code = main()
+        captured = capsys.readouterr()
+        assert exit_code == 1, f"Expected exit 1 on tool error; got {exit_code}"
+        parsed = json.loads(captured.out)
+        assert "tool_error" in parsed
+        assert "could not connect to database" in parsed["tool_error"]
+
+    def test_end_to_end_run_preflight_result_respects_candidate_gate(self):
+        """Integration check: insert one deliberately safe-but-present
+        candidate row via the real DB path, run the real run_preflight()
+        (not monkeypatched), and confirm candidate_row_count reflects it.
+        This does not call main() (the shared test DB accumulates rows
+        across the whole module, so asserting a specific exit code here
+        would be flaky) -- it instead confirms the data run_preflight()
+        hands to main() is accurate, which combined with the monkeypatched
+        main() tests above proves the full chain end to end."""
+        row_id = "r7-candidate-gate-e2e"
+        with _pg_conn() as c:
+            with c.cursor() as cur:
+                cur.execute("DELETE FROM orders WHERE local_order_id = %s", (row_id,))
+                cur.execute(
+                    """
+                    INSERT INTO orders
+                        (local_order_id, client_id, kind, status, signal_id,
+                         canonical_signal_id, execution_mode, meta)
+                    VALUES (%s, %s, 'ENTRY', 'PENDING_TRIGGER', %s, %s, 'paper', %s::jsonb)
+                    """,
+                    (
+                        row_id, "preflight-test@example.com",
+                        "sig-preflight-1", "sig-preflight-1",
+                        json.dumps({
+                            "lifecycle_state": "MATERIALIZING",
+                            "materialization_status": "RUNNING",
+                            "materialization_generation": 1,
+                        }),
+                    ),
+                )
+            c.commit()
+        result = run_preflight()
+        matching = [r for r in result["rows"] if r["local_order_id"] == row_id]
+        assert len(matching) == 1
+        assert matching[0]["safe"] is True, (
+            "This row is individually well-formed (valid generation, no "
+            "counter conflict, no cursor issue) -- it must classify safe "
+            "at the row level even though the deployment gate must still "
+            "reject the overall run for candidate_row_count > 0"
+        )
+        assert result["candidate_row_count"] > 0, (
+            "candidate_row_count must reflect the inserted row so that "
+            "main() has the data it needs to correctly reject this deployment"
+        )
