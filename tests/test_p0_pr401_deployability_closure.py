@@ -196,3 +196,51 @@ class TestDeployPreflightStaleRetryScheduleClosure:
         }
         result = _classify_row(row, now=NOW)
         assert "RETRY_SCHEDULE_CONFLICT" in result["findings"]
+
+
+class TestDeployPreflightTriggerProvenanceClosure:
+    def _row_with_provenance(self, **provenance_overrides):
+        row = _row()
+        provenance = {
+            "local_order_id": row["local_order_id"],
+            "client_id": row["client_id"],
+            "execution_mode": row["execution_mode"],
+            "canonical_signal_id": row["canonical_signal_id"],
+        }
+        provenance.update(provenance_overrides)
+        row["meta"] = {
+            **row["meta"],
+            "trigger_crossed_at": "2026-08-06T16:45:00+00:00",
+            "trigger_crossed_at_provenance": provenance,
+        }
+        return row
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("local_order_id", "other-order"),
+            ("client_id", "other@example.com"),
+            ("execution_mode", "paper"),
+            ("canonical_signal_id", "other-canonical"),
+        ],
+    )
+    def test_provenance_identity_mismatch_is_unsafe(self, field, value):
+        result = _classify_row(
+            self._row_with_provenance(**{field: value}),
+            now=NOW,
+        )
+        assert (
+            f"TRIGGER_PROVENANCE_IDENTITY_MISMATCH:{field}"
+            in result["findings"]
+        )
+
+    def test_matching_provenance_remains_safe(self):
+        result = _classify_row(self._row_with_provenance(), now=NOW)
+        assert result["safe"] is True
+        assert result["findings"] == []
+
+    def test_malformed_trigger_timestamp_is_unsafe(self):
+        row = self._row_with_provenance()
+        row["meta"]["trigger_crossed_at"] = "not-a-timestamp"
+        result = _classify_row(row, now=NOW)
+        assert "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" in result["findings"]
