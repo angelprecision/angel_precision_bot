@@ -1,0 +1,186 @@
+diff --git a/.github/workflows/p0_regression.yml b/.github/workflows/p0_regression.yml
+index ef5fdb6752a064d65c3039b55bfc3e44017f19fe..d3d41d7d36c4056855fa731a4589d55ebafafc4b 100644
+--- a/.github/workflows/p0_regression.yml
++++ b/.github/workflows/p0_regression.yml
+@@ -111,6 +111,7 @@ jobs:
+             tests/test_p0_audit_blockers_401.py \
+             tests/test_p0_selector_recovery_deploy_preflight.py \
+             tests/test_p0_pr401_deployability_closure.py \
++            tests/test_p0_terminal_disposition_truth.py \
+             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
+             tests/test_p0_intelligence_postgres.py \
+             tests/test_p0_pending_trigger_restart_recovery.py \
+diff --git a/ap_execution_core.py b/ap_execution_core.py
+index 8d2af71067e0d906bd245d58de4a4c94fce62636..9cece1c70daab5aa95426d9696da62ad423aa0bb 100644
+--- a/ap_execution_core.py
++++ b/ap_execution_core.py
+@@ -4341,7 +4341,7 @@ class APExecutionCore:
+                     # revalidation, cursor identity, structural filtering)
+                     # can be trusted either. Terminalize before touching the
+                     # cursor at all.
+-                    _terminalize_deferred_breach_failure(
++                    return _terminalize_deferred_breach_failure(
+                         f"SELECTOR_RECOVERY_CURSOR_INVALID:{_attempt_conflict_reason}",
+                         extra_meta={
+                             "selector_recovery_cursor_load_reason": (
+@@ -4361,13 +4361,6 @@ class APExecutionCore:
+                             "broker_post_count": 0,
+                         },
+                     )
+-                    return {
+-                        "disposition": "TERMINAL_DURABLE",
+-                        "reason_code": (
+-                            f"SELECTOR_RECOVERY_CURSOR_INVALID:"
+-                            f"{_attempt_conflict_reason}"
+-                        ),
+-                    }
+                 _cursor_candidate = (
+                     _cursor_meta.get("selector_recovery_cursor_v1")
+                     if _cursor_enabled
+@@ -4392,7 +4385,7 @@ class APExecutionCore:
+                     cursor_load_reason=_cursor_load_reason,
+                 )
+                 if _cursor_failure_reason:
+-                    _terminalize_deferred_breach_failure(
++                    return _terminalize_deferred_breach_failure(
+                         f"SELECTOR_RECOVERY_CURSOR_INVALID:{_cursor_failure_reason}",
+                         extra_meta={
+                             "selector_recovery_cursor_load_reason": (
+@@ -4403,13 +4396,6 @@ class APExecutionCore:
+                             "broker_post_count": 0,
+                         },
+                     )
+-                    return {
+-                        "disposition": "TERMINAL_DURABLE",
+-                        "reason_code": (
+-                            f"SELECTOR_RECOVERY_CURSOR_INVALID:"
+-                            f"{_cursor_failure_reason}"
+-                        ),
+-                    }
+ 
+                 _cursor_pending_updates = 0
+ 
+@@ -4683,7 +4669,7 @@ class APExecutionCore:
+                             _truth_result.reason_code
+                             or "MARKET_SETUP_INVALIDATED"
+                         )
+-                        _terminalize_deferred_breach_failure(
++                        return _terminalize_deferred_breach_failure(
+                             _terminal_market_reason,
+                             extra_meta={
+                                 "final_market_truth": _truth_result.audit,
+@@ -4692,10 +4678,6 @@ class APExecutionCore:
+                                 "broker_post_count": 0,
+                             },
+                         )
+-                        return {
+-                            "disposition": "TERMINAL_DURABLE",
+-                            "reason_code": _terminal_market_reason,
+-                        }
+                     if (
+                         _truth_authority
+                         == MarketTruthAuthority.HOLD_MARKET_TRUTH_UNAVAILABLE
+@@ -4720,7 +4702,7 @@ class APExecutionCore:
+                                 "reason_code": "MATERIALIZATION_CONFIG_CONFLICT",
+                             }
+                         if _selector_attempt_number >= _max_attempts_truth:
+-                            _terminalize_deferred_breach_failure(
++                            return _terminalize_deferred_breach_failure(
+                                 f"BREACH_RETRY_EXHAUSTED:{_truth_result.reason_code}",
+                                 extra_meta={
+                                     "final_market_truth": _truth_result.audit,
+@@ -4728,10 +4710,6 @@ class APExecutionCore:
+                                     "broker_post_count": 0,
+                                 },
+                             )
+-                            return {
+-                                "disposition": "TERMINAL_DURABLE",
+-                                "reason_code": _truth_result.reason_code,
+-                            }
+                         _truth_delay = _positive_int_env_config(
+                             "BREACH_SELECTOR_RETRY_DELAY_SECONDS", 8
+                         )
+@@ -4869,7 +4847,7 @@ class APExecutionCore:
+ 
+                 if _sel is not None and not _sel_result_valid:
+                     _invalid_reason = "SELECTOR_RESULT_INVALID"
+-                    _terminalize_deferred_breach_failure(
++                    return _terminalize_deferred_breach_failure(
+                         _invalid_reason,
+                         extra_meta={
+                             "failure_stage": "selector_result_validation",
+@@ -4878,7 +4856,6 @@ class APExecutionCore:
+                             "selector_qty": _sel_qty_candidate,
+                         },
+                     )
+-                    return {"disposition": "TERMINAL_DURABLE"}
+ 
+                 # A deferred breach retry can start from a durable row that
+                 # already contains an OCC-shaped contract while its executable
+diff --git a/tests/test_p0_terminal_disposition_truth.py b/tests/test_p0_terminal_disposition_truth.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..08e09c92d0264013c45014ab685419474211ad53
+--- /dev/null
++++ b/tests/test_p0_terminal_disposition_truth.py
+@@ -0,0 +1,61 @@
++"""PR #401 follow-up: terminal disposition must reflect durable write truth.
++
++The existing end-to-end deferred-lifecycle suite exercises the runtime terminal
++write path.  This focused contract test prevents the five audited call sites in
++``APExecutionCore._on_entry_trigger`` from discarding that runtime result and
++fabricating ``TERMINAL_DURABLE`` after a failed terminal CAS.
++"""
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++
++SOURCE = Path(__file__).resolve().parents[1] / "ap_execution_core.py"
++MARKERS = {
++    "attempt_counter_conflict": "_attempt_conflict_reason",
++    "cursor_load_failure": "_cursor_failure_reason",
++    "terminal_market_truth": "_terminal_market_reason",
++    "retry_exhaustion": "BREACH_RETRY_EXHAUSTED",
++    "invalid_selector_result": "selector_result_validation",
++}
++
++
++def _on_entry_trigger_node() -> ast.FunctionDef:
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    for node in tree.body:
++        if isinstance(node, ast.ClassDef) and node.name == "APExecutionCore":
++            for item in node.body:
++                if isinstance(item, ast.FunctionDef) and item.name == "_on_entry_trigger":
++                    return item
++    raise AssertionError("APExecutionCore._on_entry_trigger not found")
++
++
++def _is_terminalizer_call(node: ast.AST) -> bool:
++    return (
++        isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Name)
++        and node.func.id == "_terminalize_deferred_breach_failure"
++    )
++
++
++def test_audited_terminal_branches_return_the_terminalizer_result_directly():
++    method = _on_entry_trigger_node()
++    source = SOURCE.read_text(encoding="utf-8")
++
++    direct_returns: list[str] = []
++    discarded_calls: list[str] = []
++    for node in ast.walk(method):
++        if isinstance(node, ast.Return) and _is_terminalizer_call(node.value):
++            direct_returns.append(ast.get_source_segment(source, node) or "")
++        elif isinstance(node, ast.Expr) and _is_terminalizer_call(node.value):
++            discarded_calls.append(ast.get_source_segment(source, node) or "")
++
++    for label, marker in MARKERS.items():
++        assert any(marker in segment for segment in direct_returns), (
++            f"{label} must return _terminalize_deferred_breach_failure(...) "
++            "so KEEP_WATCHER survives a failed durable terminal write"
++        )
++        assert not any(marker in segment for segment in discarded_calls), (
++            f"{label} still discards the terminalizer result"
++        )
