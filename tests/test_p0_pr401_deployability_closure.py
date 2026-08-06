@@ -234,6 +234,33 @@ class TestDeployPreflightTriggerProvenanceClosure:
             in result["findings"]
         )
 
+    @pytest.mark.parametrize("timestamp", [None, "", "   "])
+    def test_provenance_without_trigger_timestamp_is_unsafe(self, timestamp):
+        row = self._row_with_provenance()
+        row["meta"]["trigger_crossed_at"] = timestamp
+        result = _classify_row(row, now=NOW)
+        assert result["safe"] is False
+        assert "TRIGGER_CROSSED_TIMESTAMP_MISSING" in result["findings"]
+
+    @pytest.mark.parametrize("provenance", [{}, "", "   ", None])
+    def test_present_but_empty_provenance_without_timestamp_is_unsafe(
+        self, provenance
+    ):
+        row = _row()
+        row["meta"]["trigger_crossed_at_provenance"] = provenance
+        result = _classify_row(row, now=NOW)
+        assert result["safe"] is False
+        assert "TRIGGER_CROSSED_TIMESTAMP_MISSING" in result["findings"]
+        assert "TRIGGER_PROVENANCE_INCOMPLETE" in result["findings"]
+
+    def test_both_trigger_claim_keys_absent_remains_valid(self):
+        row = _row()
+        assert "trigger_crossed_at" not in row["meta"]
+        assert "trigger_crossed_at_provenance" not in row["meta"]
+        result = _classify_row(row, now=NOW)
+        assert result["safe"] is True
+        assert result["findings"] == []
+
     def test_matching_provenance_remains_safe(self):
         result = _classify_row(self._row_with_provenance(), now=NOW)
         assert result["safe"] is True
