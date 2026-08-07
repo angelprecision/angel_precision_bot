@@ -749,14 +749,118 @@ class TestRepeatedRecoveryPassIsIdempotent:
         assert not selector.select_contract.called
 
 
+class TestOwnershipAdoptionFailureEvictsWatcher:
+    def test_cas_loss_evicts_just_registered_watcher(self, monkeypatch):
+        """A real watcher registers in-process (PTR returns WATCHER_OWNED),
+        but the durable ownership-adoption CAS deliberately loses (rowcount
+        0). The handler must not report success, must evict exactly the
+        watched entry it just registered, and must leave the row
+        recovery-owned durably with zero selector/broker calls.
+        """
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        # Force ONLY the adoption's CAS UPDATE to lose (rowcount 0), while
+        # leaving the rearm's own UPDATE (a different WHERE-clause shape)
+        # succeeding normally, by distinguishing the two queries on their
+        # distinctive WHERE-clause text.
+        _original_rearm_write = None
+
+        def _rearm_write_with_adoption_cas_loss(sql, params):
+            if "recovery_scheduler" in sql and "watcher_token','') = ''" in sql:
+                # This is adopt_direction_reversal_watcher_ownership's CAS —
+                # simulate a concurrent loss: report zero rows matched, and
+                # do not apply the patch.
+                return
+            # Otherwise this is the rearm's own UPDATE — apply normally via
+            # the same emulation _build_harness already wires up.
+            if params and isinstance(params[0], str):
+                try:
+                    patch = json.loads(params[0])
+                except Exception:
+                    return
+                _cur_meta = dict(row_store["row"].get("meta") or {})
+                _cur_meta.update(patch)
+                for _rm_key in (
+                    "selector_recovery_cursor_v1", "trigger_crossed_at",
+                    "trigger_crossed_at_provenance", "triggered_at",
+                    "trigger_confirmed_at",
+                ):
+                    _cur_meta.pop(_rm_key, None)
+                row_store["row"]["meta"] = _cur_meta
+
+        def _cas_loss_cursor():
+            _cur = _FakeCursor(rowcount=1, on_write=None)
+            _cur.execute = lambda sql, params=None: (
+                _rearm_write_with_adoption_cas_loss(sql, params),
+                setattr(_cur, "rowcount", (
+                    0 if (
+                        "recovery_scheduler" in sql
+                        and "watcher_token','') = ''" in sql
+                    ) else 1
+                )),
+                _cur,
+            )[-1]
+            return _cur
+
+        monkeypatch.setattr(
+            osm_mod, "conn", lambda: _FakeConnCtx(_cas_loss_cursor()),
+        )
+        monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: fn())
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        # The mandatory failure seam:
+        assert watcher.has_order(LOCAL_ORDER_ID) is False, (
+            "a just-registered runtime watcher must be evicted when its "
+            "durable ownership adoption CAS loses"
+        )
+        assert len(watcher._pending) == 0
+        assert SIGNAL_ID not in watcher._dedup_set
+
+        final_meta = row_store["row"]["meta"]
+        assert not str(final_meta.get("watcher_token") or "").strip(), (
+            "no watcher token may be durably claimed after a failed adoption"
+        )
+        assert final_meta.get("recovery_ownership") == "recovery_scheduler"
+        assert str(final_meta.get("recovery_owner") or "").strip(), (
+            "the row must remain recovery-owned after a failed adoption"
+        )
+
+        assert any(
+            "ownership_adoption" in e for e in result.get("errors", [])
+        ), f"expected a structured adoption-failure error, got {result.get('errors')}"
+
+        assert not selector.select.called
+        assert not selector.select_contract.called
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
 class TestConcurrentRecoveryConvergence:
     def test_two_competing_recovery_instances_converge_to_one_owner(
         self, monkeypatch,
     ):
-        """Two independently-constructed APStartupRecovery instances (as if
-        two overlapping recovery passes raced against the same due row)
-        must converge to exactly one durable watcher owner — never a
-        duplicate watcher registration or duplicate retry ownership.
+        """Two independently-constructed APStartupRecovery instances race
+        against the SAME due row. recovery2 is triggered to run its entire
+        pipeline reentrantly from inside recovery1's own claim step —
+        before recovery1's claim has landed — so both instances genuinely
+        read the same still-RETRY_WAIT row and each attempt the claim
+        independently. The claim is CAS-gated against the row's actual
+        durable state (not blindly accepted), so only whichever instance's
+        claim executes first actually wins; the other observes the row has
+        already moved and backs off. This proves convergence under real
+        contention, not two serial no-op passes.
         """
         recovery1, core, osm, row_store, watcher, selector, broker_calls = (
             _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
@@ -770,10 +874,6 @@ class TestConcurrentRecoveryConvergence:
             ptr_mod, "_default_quote_check", _quote_check_available,
         )
 
-        # A second, independently-constructed recovery instance sharing the
-        # same durable row_store, OSM, watcher, and broker — modeling a
-        # second overlapping recovery pass rather than reusing recovery1's
-        # own in-memory state.
         recovery2 = APStartupRecovery(
             client_id=CLIENT_ID,
             broker=recovery1.broker,
@@ -784,16 +884,58 @@ class TestConcurrentRecoveryConvergence:
             execution_core=core,
         )
 
+        _original_claim = osm.claim_deferred_materialization
+        _reentered = {"done": False}
+
+        def _gated_claim(order_id, *, owner, new_generation, **kw):
+            # CAS gate: only apply if the row is still durably RETRY_WAIT at
+            # the exact expected prior generation at the moment this
+            # specific call executes — a real claim's WHERE clause would
+            # reject a stale attempt the same way.
+            _row_meta = row_store["row"].get("meta") or {}
+            if (
+                str(_row_meta.get("lifecycle_state") or "") != "RETRY_WAIT"
+                or int(_row_meta.get("materialization_generation") or 0)
+                != GENERATION
+            ):
+                return False  # a racer already advanced this row — lose
+
+            # Reentrant interleaving point: the FIRST time any claim call
+            # reaches here, run recovery2's entire pipeline before this
+            # call (recovery1's own claim) proceeds — modeling recovery2
+            # observing and acting on the same still-untouched row first.
+            if not _reentered["done"]:
+                _reentered["done"] = True
+                recovery2._recover_deferred_breach_lifecycles({"errors": []})
+
+            # Re-check after the reentrant run: if recovery2 already won
+            # the row in the interleaved call above, this (recovery1's
+            # original) attempt must now correctly lose too.
+            _row_meta_after = row_store["row"].get("meta") or {}
+            if (
+                str(_row_meta_after.get("lifecycle_state") or "") != "RETRY_WAIT"
+                or int(_row_meta_after.get("materialization_generation") or 0)
+                != GENERATION
+            ):
+                return False
+
+            return _original_claim(
+                order_id, owner=owner, new_generation=new_generation, **kw
+            )
+
+        osm.claim_deferred_materialization = _gated_claim
+
         result1 = {"errors": []}
         recovery1._recover_deferred_breach_lifecycles(result1)
-        result2 = {"errors": []}
-        recovery2._recover_deferred_breach_lifecycles(result2)
 
-        # Exactly one durable watcher owner — never two.
+        # Exactly one durable watcher owner — never two — despite two
+        # independent actors both contending for the same row.
         assert len(watcher._pending) == 1, (
             "two competing recovery passes must converge to exactly one "
-            "watcher registration, not duplicate it"
+            "watcher registration under genuine CAS contention, not "
+            "duplicate it"
         )
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
         final_meta = row_store["row"]["meta"]
         assert final_meta.get("current_owner") == watcher.owner_token
         assert final_meta.get("watcher_token") == watcher.owner_token

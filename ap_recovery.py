@@ -1345,6 +1345,69 @@ class APStartupRecovery:
                 return {}
         return {}
 
+    def _evict_just_registered_watcher(
+        self, entry_watcher, *, local_order_id, client_id, signal_id, execution_mode,
+    ) -> bool:
+        """Remove the exact watched entry PTR just registered, when a
+        subsequent durable ownership adoption fails.
+
+        No public removal method exists on APEntryWatcher — production code
+        there always removes a watched entry the same way (id-based match
+        against ``_pending`` under ``_lock``, then releases its dedup key).
+        This reuses that exact idiom rather than inventing a new one.
+
+        Fenced to full identity (not just local_order_id) so one losing
+        recovery actor's cleanup cannot evict a different, legitimate
+        watcher a concurrent winner just established for the same row.
+        """
+        try:
+            _pending = getattr(entry_watcher, "_pending", None)
+            if _pending is None:
+                return True  # nothing this fake/real watcher tracks — vacuously clean
+            _target = None
+            for w in list(_pending):
+                _sig = getattr(w, "signal", {}) or {}
+                if (
+                    str(_sig.get("local_order_id") or "").strip() == local_order_id
+                    and str(_sig.get("client_id") or "").strip().lower()
+                    == client_id.lower()
+                    and str(_sig.get("signal_id") or "").strip() == signal_id
+                    and str(_sig.get("execution_mode") or "").strip().lower()
+                    == execution_mode.lower()
+                ):
+                    _target = w
+                    break
+            if _target is None:
+                return True  # already absent — nothing to evict
+            _wid = id(_target)
+            _lock = getattr(entry_watcher, "_lock", None)
+            if _lock is not None:
+                with _lock:
+                    entry_watcher._pending = [
+                        p for p in entry_watcher._pending if id(p) != _wid
+                    ]
+            else:
+                entry_watcher._pending = [
+                    p for p in entry_watcher._pending if id(p) != _wid
+                ]
+            _release_fn = getattr(_target, "_release_dedup_key", None)
+            if callable(_release_fn):
+                try:
+                    _release_fn()
+                except Exception:
+                    pass
+            else:
+                _dedup = getattr(entry_watcher, "_dedup_set", None)
+                if isinstance(_dedup, set) and signal_id in _dedup:
+                    _dedup.discard(signal_id)
+            return True
+        except Exception as exc:
+            log.error(
+                "[%s] REARM_WATCHER_REQUIRED_EVICTION_ERROR local_order_id=%s "
+                "exc=%s", self.client_id, local_order_id, exc,
+            )
+            return False
+
     def _build_recovery_plan_from_order(self, order: dict):
         meta = self._coerce_order_meta(order.get("meta"))
 
@@ -2624,15 +2687,60 @@ class APStartupRecovery:
                                             execution_mode=_exp_mode,
                                         )
                                     )
+                                    # Do not trust the CAS rowcount alone as
+                                    # the final word — durably reread and
+                                    # confirm the exact ownership transfer
+                                    # actually landed before declaring
+                                    # success either.
+                                    _verified = False
                                     if _adopted:
+                                        _post = self.osm.get_order(_exp_loid)
+                                        _post_meta = self._coerce_order_meta(
+                                            (_post or {}).get("meta")
+                                        )
+                                        _verified = (
+                                            str(_post_meta.get("current_owner") or "")
+                                            == _real_token
+                                            and str(
+                                                _post_meta.get("watcher_token") or ""
+                                            ) == _real_token
+                                            and not _post_meta.get("recovery_owner")
+                                            and not _post_meta.get("recovery_ownership")
+                                        )
+                                    if _adopted and _verified:
                                         recovered += 1
                                     else:
                                         # Real watcher exists in-process but
                                         # durable ownership adoption lost its
-                                        # CAS or the token was unavailable —
-                                        # never claim success, never leave
-                                        # runtime/durable split silently.
-                                        _rwr_fail("ownership_adoption_failed")
+                                        # CAS, or a post-adoption reread could
+                                        # not confirm the transfer — never
+                                        # claim success. Evict ONLY the
+                                        # watched entry this exact handoff
+                                        # just registered (identity-fenced),
+                                        # so runtime and durable state never
+                                        # remain split under two contradictory
+                                        # authorities, and fall back to
+                                        # recovery ownership for a later pass.
+                                        _evicted = self._evict_just_registered_watcher(
+                                            self.entry_watcher,
+                                            local_order_id=_exp_loid,
+                                            client_id=_exp_client,
+                                            signal_id=_exp_signal,
+                                            execution_mode=_exp_mode,
+                                        )
+                                        _rwr_fail(
+                                            "ownership_adoption_failed"
+                                            if not _adopted
+                                            else "ownership_adoption_verification_failed"
+                                        )
+                                        if not _evicted:
+                                            log.critical(
+                                                "[%s] REARM_WATCHER_REQUIRED_EVICTION_FAILED "
+                                                "local_order_id=%s — a real watcher may "
+                                                "still be registered against a "
+                                                "recovery-owned row",
+                                                self.client_id, local_order_id,
+                                            )
                                 elif _rwr_outcome in (
                                     _RWR_RowOutcome.REARM_OWNED,
                                     _RWR_RowOutcome.RETRY_OWNED,
