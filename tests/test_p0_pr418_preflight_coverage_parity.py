@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import timezone
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 # --- DB safety fence -----------------------------------------------------
 #
@@ -20,6 +20,17 @@ from urllib.parse import urlparse
 # ambiguous or unsafe value raises immediately at import time, which aborts
 # collection of this entire module before any fixture -- and therefore
 # before any CREATE/DELETE/INSERT -- can run.
+#
+# Host/path validation alone is not sufficient: PostgreSQL/libpq connection
+# URIs also honor connection-identity parameters carried in the query
+# string (host, hostaddr, dbname, port, service, servicefile, ...). libpq
+# resolves the *effective* connection target from these, which can silently
+# override a hostname/dbname that already passed the scheme/host/path
+# checks below. e.g. a URL with hostname=localhost and path=intelligence_test
+# but a `?host=remote.example.com` query parameter would parse as "local"
+# under urlparse() alone while libpq actually connects to remote.example.com.
+# The query string must therefore be validated with an equally strict
+# positive allowlist, not left unexamined.
 
 _SAFE_TEST_DB_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _SAFE_TEST_DB_NAME = "intelligence_test"
@@ -27,10 +38,61 @@ _SAFE_DEFAULT_DATABASE_URL = (
     "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
 )
 
+# Positive allowlist of query-string keys this validator will accept, and
+# the exact value(s) permitted for each. Everything else -- including every
+# libpq connection-identity parameter (host, hostaddr, dbname, port,
+# service, servicefile, and any other key not listed here) -- is rejected.
+# This is intentionally not a blacklist: an unrecognized key is unsafe by
+# default, not safe until proven otherwise.
+_ALLOWED_QUERY_PARAMS = {
+    "sslmode": {"disable"},
+}
+
 
 class _UnsafeTestDatabaseError(RuntimeError):
     """Raised when DATABASE_URL does not positively identify the repo's
     known local CI/test Postgres database."""
+
+
+def _parse_query_pairs_strict(query: str) -> list[tuple[str, str]]:
+    """Manually parse a URL query string into (key, value) pairs.
+
+    Deliberately does not use urllib.parse.parse_qsl(): that function's
+    default behavior silently drops blank-valued pairs and silently
+    keeps only one of several duplicate keys, either of which would mean
+    validating a *sanitized* view of the query string rather than the
+    literal one libpq will actually receive. This parser preserves every
+    pair, including duplicates and blanks, so the caller can positively
+    reject anything that isn't clean and expected -- it never normalizes
+    an unsafe query string into something that merely looks safe.
+    """
+    if not query:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+    for component in query.split("&"):
+        if not component:
+            # A stray '&' (e.g. "a=b&&c=d") produces an empty component --
+            # ambiguous, reject rather than silently skip.
+            raise _UnsafeTestDatabaseError(
+                "DATABASE_URL query string contains an empty parameter "
+                "segment (stray '&') -- refusing to run DB-backed tests."
+            )
+        if "=" not in component:
+            raise _UnsafeTestDatabaseError(
+                f"DATABASE_URL query parameter {component!r} is malformed "
+                "(no '=') -- refusing to run DB-backed tests."
+            )
+        key, _, value = component.partition("=")
+        key = unquote(key)
+        value = unquote(value)
+        if not key:
+            raise _UnsafeTestDatabaseError(
+                "DATABASE_URL query string contains a blank parameter "
+                "key -- refusing to run DB-backed tests."
+            )
+        pairs.append((key, value))
+    return pairs
 
 
 def _validate_database_url(raw: str) -> None:
@@ -68,6 +130,39 @@ def _validate_database_url(raw: str) -> None:
             f"local test database {_SAFE_TEST_DB_NAME!r}. Refusing to run "
             "DB-backed tests against an unexpected database."
         )
+
+    # Query-string connection-identity parameters must not be able to
+    # redirect libpq to a different host/hostaddr/dbname/port/service away
+    # from the host/path already validated above.
+    query_pairs = _parse_query_pairs_strict(parsed.query)
+
+    seen_keys: set[str] = set()
+    for key, value in query_pairs:
+        if key in seen_keys:
+            raise _UnsafeTestDatabaseError(
+                f"DATABASE_URL query string contains a duplicate parameter "
+                f"{key!r} -- refusing to run DB-backed tests rather than "
+                "guess which occurrence libpq would honor."
+            )
+        seen_keys.add(key)
+
+        if key not in _ALLOWED_QUERY_PARAMS:
+            raise _UnsafeTestDatabaseError(
+                f"DATABASE_URL query parameter {key!r} is not on the "
+                f"allowlist ({sorted(_ALLOWED_QUERY_PARAMS)!r}). Refusing "
+                "to run DB-backed tests -- unrecognized connection "
+                "parameters are treated as unsafe by default, including "
+                "libpq connection-identity overrides (host, hostaddr, "
+                "dbname, port, service, servicefile)."
+            )
+
+        allowed_values = _ALLOWED_QUERY_PARAMS[key]
+        if value not in allowed_values:
+            raise _UnsafeTestDatabaseError(
+                f"DATABASE_URL query parameter {key}={value!r} is not an "
+                f"allow-listed value ({sorted(allowed_values)!r}). "
+                "Refusing to run DB-backed tests."
+            )
 
 
 def _assert_safe_test_database_url() -> str:
@@ -555,6 +650,137 @@ class TestDatabaseSafetyFence:
 
         with pytest.raises(_UnsafeTestDatabaseError):
             _assert_safe_test_database_url()
+
+
+# --- Regression coverage: query-string connection-identity bypass --------
+#
+# urlparse()'s hostname/path alone are not sufficient: libpq also honors
+# connection-identity parameters (host, hostaddr, dbname, port, service,
+# servicefile, ...) carried in the query string, which can redirect the
+# *effective* connection target away from an already-validated-safe
+# hostname/database. A URL can look local under host/path validation alone
+# while libpq actually connects elsewhere. This class proves the query
+# string itself is now validated against an equally strict allowlist.
+
+
+class TestDatabaseSafetyFenceQueryParameterBypass:
+    @pytest.mark.parametrize(
+        ("label", "url"),
+        [
+            (
+                "host",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?host=remote.example.com",
+            ),
+            (
+                "hostaddr",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?hostaddr=8.8.8.8",
+            ),
+            (
+                "dbname",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?dbname=postgres",
+            ),
+            (
+                "port",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?port=6543",
+            ),
+            (
+                "service",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?service=production",
+            ),
+            (
+                "servicefile",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?servicefile=/tmp/pg_service.conf",
+            ),
+            (
+                "unknown-parameter",
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?some_parameter=value",
+            ),
+        ],
+    )
+    def test_connection_identity_query_override_is_rejected(self, label, url):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(url)
+
+    def test_duplicate_query_keys_are_rejected_even_when_values_match(self):
+        """Duplicate keys must be rejected outright, never resolved by
+        silently picking the first or last occurrence -- the caller must
+        not guess which value libpq would actually honor."""
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?sslmode=disable&sslmode=disable"
+            )
+
+    def test_stray_ampersand_produces_empty_segment_and_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?sslmode=disable&&host=evil.example.com"
+            )
+
+    def test_query_parameter_with_no_equals_sign_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?sslmode"
+            )
+
+    def test_blank_query_key_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?=disable"
+            )
+
+    def test_sslmode_with_unapproved_value_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:5432/"
+                "intelligence_test?sslmode=require"
+            )
+
+    def test_known_ci_url_with_sslmode_disable_remains_accepted(self):
+        _validate_database_url(
+            "postgresql://postgres:postgres@localhost:5432/"
+            "intelligence_test?sslmode=disable"
+        )  # must not raise
+
+    def test_url_with_no_query_parameters_remains_accepted(self):
+        _validate_database_url(
+            "postgresql://postgres:postgres@localhost:5432/intelligence_test"
+        )  # must not raise
+
+    def test_query_override_fails_before_any_database_connection_is_attempted(
+        self, monkeypatch
+    ):
+        """One representative query-string bypass case (host override),
+        proving the same fail-before-connect invariant already established
+        for host/dbname bypasses also holds for query-string bypasses."""
+        unsafe = (
+            "postgresql://postgres:postgres@localhost:5432/"
+            "intelligence_test?host=remote.example.com"
+        )
+        monkeypatch.setenv("DATABASE_URL", unsafe)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                "psycopg2.connect was called despite a failed DB safety "
+                "check (query-string host override)"
+            )
+
+        monkeypatch.setattr(psycopg2, "connect", _fail_if_called)
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_test_database_url()
+
+        assert os.environ["DATABASE_URL"] == unsafe
 
 
 def test_candidate_fetch_executes_select_only(monkeypatch):
