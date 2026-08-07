@@ -3235,7 +3235,7 @@ class APExecutionCore:
             isinstance(_callback_result, dict)
             and str(
                 _callback_result.get("disposition") or ""
-            ).strip().upper() == "KEEP_WATCHER"
+            ).strip().upper() in {"KEEP_WATCHER", "REARM_WATCHER_REQUIRED"}
             and str(
                 _callback_result.get("reason_code") or ""
             ).strip().upper() == "REARM_DIRECTION_REVERSAL"
@@ -3244,18 +3244,54 @@ class APExecutionCore:
             # (lifecycle_state="", materialization_status="WAITING_FOR_TRIGGER").
             # Do not call schedule_deferred_materialization_retry(): that
             # method correctly requires MATERIALIZING ownership, which the
-            # rearm just released — calling it here is exactly the false
-            # reschedule this correction closes. This synthetic callback had
-            # no real registered watcher, so the row must stay recovery-owned
-            # until the existing recovery health loop attaches a real
-            # APEntryWatcher on a later pass.
+            # rearm just released.
+            #
+            # KEEP_WATCHER: a real, registered APEntryWatcher performed the
+            # direction-reversal rearm and stays alive to catch the next breach.
+            # Nothing further is needed in this recovery pass.
+            #
+            # REARM_WATCHER_REQUIRED: a synthetic due-retry callback performed
+            # the rearm but had no real registered watcher. Propagate the
+            # disposition so the recovery caller can route through
+            # PendingTriggerRestartRecovery on this same pass.  Must not be
+            # converted to KEEP_WATCHER, schedule a retry, or make any broker
+            # or selector call here.
+            _cb_disp = str(
+                _callback_result.get("disposition") or ""
+            ).strip().upper()
+            if _cb_disp == "KEEP_WATCHER":
+                return {
+                    **_base,
+                    "disposition": "KEEP_WATCHER",
+                    "reason_code": "REARM_DIRECTION_REVERSAL",
+                    "generation": _new_generation,
+                    "attempt": _expected_attempt,
+                }
             return {
                 **_base,
-                "disposition": "KEEP_WATCHER",
-                "reason_code": "REARM_DIRECTION_REVERSAL_RECOVERY_OWNED",
+                "disposition": "REARM_WATCHER_REQUIRED",
+                "reason_code": "REARM_DIRECTION_REVERSAL",
                 "generation": _new_generation,
                 "attempt": _expected_attempt,
-                "watcher_rearm_required": True,
+                # Exact-generation handoff (constraint A) — pass through
+                # unmodified from the production callback. The receiving
+                # ap_recovery.py handler is the sole consumer and must
+                # require durable materialization_generation == this exact
+                # expected_generation before routing into restart recovery.
+                "local_order_id": str(
+                    _callback_result.get("local_order_id") or local_order_id
+                ),
+                "expected_client_id": _callback_result.get("expected_client_id"),
+                "expected_execution_mode": _callback_result.get(
+                    "expected_execution_mode"
+                ),
+                "expected_signal_id": _callback_result.get("expected_signal_id"),
+                "expected_canonical_signal_id": _callback_result.get(
+                    "expected_canonical_signal_id"
+                ),
+                "expected_generation": _callback_result.get(
+                    "expected_generation"
+                ),
             }
 
         # ── Re-read to determine outcome ─────────────────────────────
@@ -5008,15 +5044,42 @@ class APExecutionCore:
                             )
                         return {
                             "disposition": (
-                                "KEEP_WATCHER"
+                                (
+                                    # Real registered watcher: keep it alive.
+                                    # Synthetic recovery callback: the OSM rearm
+                                    # succeeded but no real watcher exists.
+                                    # Propagate REARM_WATCHER_REQUIRED with an
+                                    # exact-generation handoff so the caller
+                                    # routes through PendingTriggerRestartRecovery
+                                    # on this same pass rather than masquerading
+                                    # as an attached watcher.
+                                    "KEEP_WATCHER"
+                                    if _rearm_watcher_token
+                                    else "REARM_WATCHER_REQUIRED"
+                                )
                                 if _rearmed
                                 else "MATERIALIZATION_REARM_WRITE_FAILED"
                             ),
                             "reason_code": "REARM_DIRECTION_REVERSAL",
-                            "watcher_rearm_required": bool(
-                                _rearmed and not _rearm_watcher_token
-                            ),
                             "materialization_generation": _mat_generation,
+                            # Exact-generation handoff (constraint A): the
+                            # receiving handler must require durable
+                            # materialization_generation == expected_generation
+                            # exactly, never >=. These fields are populated
+                            # only when the pre-claim bypass verified against
+                            # the durable row (_pv_row), which is exactly the
+                            # condition under which REARM_WATCHER_REQUIRED can
+                            # be returned.
+                            "local_order_id": str(queue_local_order_id or ""),
+                            "expected_client_id": _mat_client_id,
+                            "expected_execution_mode": _mat_exec_mode,
+                            "expected_signal_id": str(
+                                getattr(approved_plan, "signal_id", "") or ""
+                            ),
+                            "expected_canonical_signal_id": str(
+                                (_pv_row or {}).get("canonical_signal_id") or ""
+                            ),
+                            "expected_generation": _mat_generation,
                         }
                     if (
                         _truth_authority
