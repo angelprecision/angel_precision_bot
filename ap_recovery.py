@@ -1345,52 +1345,189 @@ class APStartupRecovery:
                 return {}
         return {}
 
+    @staticmethod
+    def _find_pending_watcher_by_logical_identity(
+        entry_watcher, *, local_order_id, client_id, signal_id, execution_mode,
+    ):
+        """Return the ``_pending`` entry matching this logical signal
+        identity, or None. Read-only — callers needing a consistent
+        snapshot must hold ``entry_watcher._lock`` around the call.
+
+        Logical identity alone (local_order_id/client_id/signal_id/
+        execution_mode) is NOT exact-registration identity: after an
+        ownership transition, a different, legitimate watcher object can
+        come to hold the same logical identity for the same row. Callers
+        that need to distinguish "the registration I created" from "some
+        registration matching my row" must additionally compare
+        ``_exact_identity_of()`` against a value captured at registration
+        time — see ``_capture_just_registered_watcher_id`` /
+        ``_evict_just_registered_watcher``.
+        """
+        _pending = getattr(entry_watcher, "_pending", None)
+        if _pending is None:
+            return None
+        for w in list(_pending):
+            _sig = getattr(w, "signal", {}) or {}
+            if (
+                str(_sig.get("local_order_id") or "").strip() == local_order_id
+                and str(_sig.get("client_id") or "").strip().lower()
+                == client_id.lower()
+                and str(_sig.get("signal_id") or "").strip() == signal_id
+                and str(_sig.get("execution_mode") or "").strip().lower()
+                == execution_mode.lower()
+            ):
+                return w
+        return None
+
+    @staticmethod
+    def _exact_identity_of(w):
+        """Return a stable, non-reusable identity for a single watcher
+        registration instance.
+
+        Prefers ``_registration_token`` — a UUID stamped once onto every
+        real ``WatchedSignal`` at construction (see ap_entry_watcher.py).
+        This is required, not merely convenient: CPython immediately
+        reuses a garbage-collected object's memory address for the next
+        allocation, so bare ``id()`` cannot safely tell "the exact
+        registration a recovery actor created" apart from "an unrelated
+        registration later allocated at the same freed address" once the
+        original object has been dereferenced — which is exactly what
+        happens to a losing recovery actor's own watcher between capture
+        and rollback. Falls back to ``id()`` only for objects that predate
+        this token (legacy test doubles); every production WatchedSignal
+        carries the token, so production correctness never depends on the
+        fallback.
+        """
+        token = getattr(w, "_registration_token", None)
+        if token is not None:
+            return ("token", token)
+        return ("id", id(w))
+
+    def _capture_just_registered_watcher_id(
+        self, entry_watcher, *, local_order_id, client_id, signal_id, execution_mode,
+    ):
+        """Snapshot the exact-registration identity (see
+        ``_exact_identity_of``) of the watcher this recovery actor just
+        registered.
+
+        Must be called immediately after a WATCHER_OWNED outcome, before
+        any durable CAS adoption attempt. The returned value is the sole
+        proof of "the exact registration this actor created" — later
+        rollback (``_evict_just_registered_watcher``) is fenced to it so a
+        stale loser can never evict or release dedup ownership belonging
+        to a legitimate concurrent winner's replacement registration that
+        happens to share the same logical identity.
+
+        Returns None if no matching registration is found at capture time
+        (rollback is then a no-op by construction — there is nothing this
+        actor can prove it owns).
+        """
+        _lock = getattr(entry_watcher, "_lock", None)
+        try:
+            if _lock is not None:
+                with _lock:
+                    w = self._find_pending_watcher_by_logical_identity(
+                        entry_watcher,
+                        local_order_id=local_order_id,
+                        client_id=client_id,
+                        signal_id=signal_id,
+                        execution_mode=execution_mode,
+                    )
+            else:
+                w = self._find_pending_watcher_by_logical_identity(
+                    entry_watcher,
+                    local_order_id=local_order_id,
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    execution_mode=execution_mode,
+                )
+            return self._exact_identity_of(w) if w is not None else None
+        except Exception as exc:
+            log.error(
+                "[%s] REARM_WATCHER_REQUIRED_CAPTURE_ID_ERROR local_order_id=%s "
+                "exc=%s", self.client_id, local_order_id, exc,
+            )
+            return None
+
     def _evict_just_registered_watcher(
         self, entry_watcher, *, local_order_id, client_id, signal_id, execution_mode,
+        expected_watcher_id,
     ) -> bool:
         """Remove the exact watched entry PTR just registered, when a
         subsequent durable ownership adoption fails.
 
         No public removal method exists on APEntryWatcher — production code
-        there always removes a watched entry the same way (id-based match
-        against ``_pending`` under ``_lock``, then releases its dedup key).
-        This reuses that exact idiom rather than inventing a new one.
+        there always removes a watched entry the same way (identity-based
+        match against ``_pending`` under ``_lock``, then releases its
+        dedup key). This reuses that exact idiom rather than inventing a
+        new one.
 
-        Fenced to full identity (not just local_order_id) so one losing
-        recovery actor's cleanup cannot evict a different, legitimate
-        watcher a concurrent winner just established for the same row.
+        ``expected_watcher_id`` must be the value captured by
+        ``_capture_just_registered_watcher_id`` at registration time — the
+        exact-registration fence, per ``_exact_identity_of``. Logical
+        identity (local_order_id / client_id / signal_id / execution_mode)
+        alone is NOT sufficient: it can legitimately match a *different*
+        watcher object after an ownership transition (this actor's
+        original registration was evicted elsewhere and a concurrent
+        winner registered its own watcher for the same row). This method
+        may only remove — and only release dedup for — the single
+        registration identity it was handed. A logically-matching object
+        that fails the identity check is left completely untouched,
+        including its dedup ownership.
         """
         try:
             _pending = getattr(entry_watcher, "_pending", None)
             if _pending is None:
                 return True  # nothing this fake/real watcher tracks — vacuously clean
-            _target = None
-            for w in list(_pending):
-                _sig = getattr(w, "signal", {}) or {}
-                if (
-                    str(_sig.get("local_order_id") or "").strip() == local_order_id
-                    and str(_sig.get("client_id") or "").strip().lower()
-                    == client_id.lower()
-                    and str(_sig.get("signal_id") or "").strip() == signal_id
-                    and str(_sig.get("execution_mode") or "").strip().lower()
-                    == execution_mode.lower()
-                ):
-                    _target = w
-                    break
-            if _target is None:
-                return True  # already absent — nothing to evict
-            _wid = id(_target)
+            if expected_watcher_id is None:
+                # Nothing was ever proven to belong to this actor at
+                # registration time — there is no exact registration this
+                # rollback is entitled to touch.
+                return True
+
             _lock = getattr(entry_watcher, "_lock", None)
+
+            def _find_and_evict_if_exact():
+                _target = self._find_pending_watcher_by_logical_identity(
+                    entry_watcher,
+                    local_order_id=local_order_id,
+                    client_id=client_id,
+                    signal_id=signal_id,
+                    execution_mode=execution_mode,
+                )
+                if _target is None:
+                    return "absent", None
+                if self._exact_identity_of(_target) != expected_watcher_id:
+                    # A legitimate concurrent winner now holds this
+                    # logical identity. Never evict it, never release its
+                    # dedup key — even though it matches on every logical
+                    # field this actor knows about.
+                    return "foreign", None
+                _target_token = self._exact_identity_of(_target)
+                entry_watcher._pending = [
+                    p for p in entry_watcher._pending
+                    if self._exact_identity_of(p) != _target_token
+                ]
+                return "evicted", _target
+
             if _lock is not None:
                 with _lock:
-                    entry_watcher._pending = [
-                        p for p in entry_watcher._pending if id(p) != _wid
-                    ]
+                    _status, _removed = _find_and_evict_if_exact()
             else:
-                entry_watcher._pending = [
-                    p for p in entry_watcher._pending if id(p) != _wid
-                ]
-            _release_fn = getattr(_target, "_release_dedup_key", None)
+                _status, _removed = _find_and_evict_if_exact()
+
+            if _status == "absent":
+                return True  # already absent — nothing to evict
+            if _status == "foreign":
+                log.warning(
+                    "[%s] REARM_WATCHER_REQUIRED_EVICTION_SKIPPED_FOREIGN_WINNER "
+                    "local_order_id=%s — logical identity now belongs to a "
+                    "different registration; dedup ownership left untouched",
+                    self.client_id, local_order_id,
+                )
+                return True
+
+            _release_fn = getattr(_removed, "_release_dedup_key", None)
             if callable(_release_fn):
                 try:
                     _release_fn()
@@ -2700,6 +2837,24 @@ class APStartupRecovery:
                                     # CAS-fenced adoption so durable state
                                     # truthfully matches: only THEN count the
                                     # row as recovered.
+                                    #
+                                    # Capture the exact registration identity
+                                    # NOW, before the CAS attempt below can
+                                    # race with a concurrent winner. This is
+                                    # the only proof, later, that a rollback
+                                    # is removing the registration THIS actor
+                                    # created rather than a legitimate
+                                    # replacement sharing the same logical
+                                    # identity.
+                                    _registered_watcher_id = (
+                                        self._capture_just_registered_watcher_id(
+                                            self.entry_watcher,
+                                            local_order_id=_exp_loid,
+                                            client_id=_exp_client,
+                                            signal_id=_exp_signal,
+                                            execution_mode=_exp_mode,
+                                        )
+                                    )
                                     _real_token = str(
                                         getattr(self.entry_watcher, "owner_token", "")
                                         or ""
@@ -2757,6 +2912,7 @@ class APStartupRecovery:
                                             client_id=_exp_client,
                                             signal_id=_exp_signal,
                                             execution_mode=_exp_mode,
+                                            expected_watcher_id=_registered_watcher_id,
                                         )
                                         _rwr_fail(
                                             "ownership_adoption_failed"

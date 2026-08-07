@@ -621,6 +621,18 @@ class WatchedSignal:
         self.signal_id = str(signal.get("signal_id") or uuid.uuid4())
         self.signal["signal_id"] = self.signal_id
 
+        # PR #421 watcher rollback fix: a per-instance identity token,
+        # unique for the life of the process. Never reused, unlike
+        # id(self) — CPython immediately reuses a garbage-collected
+        # object's memory address for the next allocation, so id() alone
+        # cannot safely distinguish "the exact registration a recovery
+        # actor created" from "a different registration that happens to
+        # have been allocated at the same freed address after the first
+        # one was evicted and dereferenced." Recovery rollback fencing
+        # (ap_recovery.py _capture_just_registered_watcher_id /
+        # _evict_just_registered_watcher) keys off this token, not id().
+        self._registration_token = uuid.uuid4().hex
+
         self.state = WatchState.PENDING
         self.created_at = datetime.now(timezone.utc)
         self.triggered_at: Optional[datetime] = None
