@@ -80,14 +80,40 @@ def _parse_timestamp(
     findings: list[str],
     require_timezone: bool = False,
 ) -> datetime | None:
+    if require_timezone:
+        # Strict trigger-timestamp path. Must match production's
+        # ap_entry_watcher._parse_trigger_crossed_at exactly: strip
+        # surrounding whitespace before parsing, and only replace a
+        # trailing 'Z' (not any 'Z' occurring anywhere in the string).
+        # A blank result after stripping is malformed, not silently
+        # absent — this path is only reached once the caller has already
+        # established the timestamp key is present and non-None, so an
+        # empty/whitespace-only value here must be flagged, never swallowed.
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            findings.append(finding)
+            return None
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except (TypeError, ValueError):
+            findings.append(finding)
+            return None
+        if parsed.tzinfo is None:
+            findings.append(finding)
+            return None
+        return parsed
+
+    # Legacy (non-strict) path — lease/retry timestamps. Behavior
+    # unchanged: no whitespace stripping, blank/None silently absent.
     if raw in (None, ""):
         return None
     try:
         parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
-            if require_timezone:
-                findings.append(finding)
-                return None
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
     except (TypeError, ValueError):
@@ -297,23 +323,26 @@ def _classify_row(row: dict, *, now: datetime | None = None) -> dict:
     provenance_present = "trigger_crossed_at_provenance" in meta
     provenance = meta.get("trigger_crossed_at_provenance")
 
+    # MISSING and MALFORMED must be mutually exclusive: a present, non-null
+    # timestamp key is never simultaneously "missing" just because provenance
+    # happens to be present. Blank/None/absent-with-provenance is MISSING;
+    # anything else present (False, 0, malformed non-blank string, or a
+    # blank string with no provenance) is evaluated for MALFORMED instead.
     if provenance_present and (
         not timestamp_present
         or trigger_crossed_raw is None
-        or not str(trigger_crossed_raw or "").strip()
+        or timestamp_blank
     ):
         findings.append("TRIGGER_CROSSED_TIMESTAMP_MISSING")
 
-    if timestamp_present and trigger_crossed_raw is not None:
-        if timestamp_blank:
-            findings.append("TRIGGER_CROSSED_TIMESTAMP_MALFORMED")
-        else:
-            _parse_timestamp(
-                trigger_crossed_raw,
-                finding="TRIGGER_CROSSED_TIMESTAMP_MALFORMED",
-                findings=findings,
-                require_timezone=True,
-            )
+    elif timestamp_present and trigger_crossed_raw is not None:
+        _parse_timestamp(
+            trigger_crossed_raw,
+            finding="TRIGGER_CROSSED_TIMESTAMP_MALFORMED",
+            findings=findings,
+            require_timezone=True,
+        )
+
         if not provenance_present:
             findings.append("TRIGGER_PROVENANCE_MISSING")
 

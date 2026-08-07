@@ -278,6 +278,117 @@ def test_naive_non_trigger_timestamps_preserve_legacy_utc_normalization(
     assert findings == []
 
 
+# --- Post-#419 review findings: mutual exclusivity + whitespace parity ---
+#
+# These close two blocking findings raised against d520c96 (PR #419):
+#
+# 1. With provenance present, a falsy-but-present trigger_crossed_at value
+#    (blank string, False, or 0) must produce exactly one of MISSING or
+#    MALFORMED, never both. Blank counts as MISSING; a non-blank falsy
+#    value (False, 0) counts as MALFORMED.
+# 2. The preflight parser must accept the same padded/tabbed timestamps
+#    the production runtime (ap_entry_watcher._parse_trigger_crossed_at)
+#    accepts, since it strips whitespace before parsing.
+
+
+@pytest.mark.parametrize(
+    ("suffix", "timestamp", "expect_missing", "expect_malformed"),
+    [
+        ("paired-blank-empty", "", True, False),
+        ("paired-blank-whitespace", "   ", True, False),
+        ("paired-false", False, False, True),
+        ("paired-zero", 0, False, True),
+    ],
+)
+def test_missing_and_malformed_are_mutually_exclusive_with_provenance(
+    suffix,
+    timestamp,
+    expect_missing,
+    expect_malformed,
+):
+    """A row with BOTH keys present must never receive both diagnostics."""
+    local_order_id = f"{_PREFIX}{suffix}"
+    _insert(
+        local_order_id,
+        {
+            "trigger_crossed_at": timestamp,
+            "trigger_crossed_at_provenance": _provenance(local_order_id),
+        },
+    )
+
+    result = _classify_row(_fetch_one(local_order_id))
+    findings = result["findings"]
+
+    has_missing = "TRIGGER_CROSSED_TIMESTAMP_MISSING" in findings
+    has_malformed = "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" in findings
+
+    assert has_missing is expect_missing, findings
+    assert has_malformed is expect_malformed, findings
+    assert not (has_missing and has_malformed), (
+        f"MISSING and MALFORMED both present for timestamp={timestamp!r}: "
+        f"{findings}"
+    )
+
+
+def test_blank_timestamp_without_provenance_is_consistent_across_forms():
+    """Empty-string and whitespace-only blanks must classify identically."""
+    empty_id = f"{_PREFIX}blank-noprov-empty"
+    ws_id = f"{_PREFIX}blank-noprov-whitespace"
+    _insert(empty_id, {"trigger_crossed_at": ""})
+    _insert(ws_id, {"trigger_crossed_at": "   "})
+
+    empty_findings = _classify_row(_fetch_one(empty_id))["findings"]
+    ws_findings = _classify_row(_fetch_one(ws_id))["findings"]
+
+    assert "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" in empty_findings
+    assert "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" in ws_findings
+    assert set(empty_findings) == set(ws_findings)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        " 2026-08-06T20:00:00+00:00 ",
+        "\t2026-08-06T20:00:00Z\n",
+    ],
+)
+def test_padded_trigger_timestamp_matches_production_parity(raw):
+    """Preflight must accept what ap_entry_watcher._parse_trigger_crossed_at
+    accepts: production strips whitespace before parsing, so padded/tabbed
+    ISO strings are valid trigger evidence, not malformed."""
+    local_order_id = f"{_PREFIX}padded-{hash(raw) & 0xffff}"
+    _insert(
+        local_order_id,
+        {
+            "trigger_crossed_at": raw,
+            "trigger_crossed_at_provenance": _provenance(local_order_id),
+        },
+    )
+
+    result = _classify_row(_fetch_one(local_order_id))
+
+    assert "TRIGGER_CROSSED_TIMESTAMP_MALFORMED" not in result["findings"], (
+        result["findings"]
+    )
+
+
+def test_padded_trigger_timestamp_parses_via_parse_timestamp_directly():
+    """Unit-level confirmation of the strict (require_timezone=True) path,
+    independent of the DB-backed classifier fixture above."""
+    findings: list[str] = []
+
+    parsed = _parse_timestamp(
+        " 2026-08-06T20:00:00+00:00 ",
+        finding="TRIGGER_CROSSED_TIMESTAMP_MALFORMED",
+        findings=findings,
+        require_timezone=True,
+    )
+
+    assert findings == []
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+
+
 def test_candidate_fetch_executes_select_only(monkeypatch):
     class _Result:
         @staticmethod
