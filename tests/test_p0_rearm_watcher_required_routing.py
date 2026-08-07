@@ -42,6 +42,8 @@ import json
 import os
 import threading
 
+import pytest
+
 os.environ.setdefault("DATABASE_URL", "postgresql://user:pass@localhost/db")
 
 from datetime import datetime, timedelta, timezone
@@ -253,7 +255,11 @@ class _FakeWatcher:
     def prove_restart_rearm_retry_owner(self, *a, **kw):
         return None
 
-    def watch(self, plan, local_oid=None, recovery_rearm=False, **kw):
+    def watch(self, plan, local_oid=None, recovery_rearm=False,
+              registration_provenance_out=None, **kw):
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = False
+            registration_provenance_out["registration_token"] = None
         _sig = {
             "local_order_id": str(local_oid or ""),
             "signal_id": str(getattr(plan, "signal_id", "") or ""),
@@ -262,9 +268,29 @@ class _FakeWatcher:
                 getattr(plan, "execution_mode", "") or ""
             ).strip().lower(),
         }
-        self._pending.append(_FakeWatched(_sig, "REARM"))
+        # Faithful to real APEntryWatcher.watch()'s recovery_rearm
+        # "RECOVERY_REARM_LEFT_ALONE" path: if a matching watcher already
+        # owns this exact row, watch() returns True WITHOUT creating a
+        # new registration or reporting any creation provenance — success
+        # here proves ownership, not authorship.
+        for _existing in self._pending:
+            _esig = getattr(_existing, "signal", {}) or {}
+            if (
+                str(_esig.get("local_order_id") or "") == _sig["local_order_id"]
+                and str(_esig.get("signal_id") or "") == _sig["signal_id"]
+                and str(_esig.get("client_id") or "") == _sig["client_id"]
+                and str(_esig.get("execution_mode") or "") == _sig["execution_mode"]
+            ):
+                return True
+        _watched = _FakeWatched(_sig, "REARM")
+        self._pending.append(_watched)
         if _sig["signal_id"]:
             self._dedup_set.add(_sig["signal_id"])
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = True
+            registration_provenance_out["registration_token"] = (
+                _watched._registration_token
+            )
         return True
 
     def dedup_held(self, oid, **kw):
@@ -1573,3 +1599,274 @@ class TestRetainRecoveryOwnershipFencedAgainstCommittedWatcher:
         assert ok is True
         assert row_store["meta"]["recovery_ownership"] == "recovery_scheduler"
         assert row_store["meta"]["recovery_owner"] == f"recovery_scheduler:{CLIENT_ID}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #421 FINAL P0 CORRECTION AMENDMENT
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# P0-1 — watcher creation provenance must be causal, not inferred from a
+#        post-watch() registry lookup: a concurrent actor can register the
+#        real watcher between PTR's initial ownership check and PTR's own
+#        watch() call; watch() then observes it and returns True via its
+#        "left alone" path WITHOUT creating anything. Proven against the
+#        exact head this amendment corrects (6f5abf5b...) by verifying the
+#        test fails without the fix.
+#
+# P0-2 — retain_recovery_ownership_if_no_watcher()'s watcher_generation
+#        fence must accept the real production no-watcher shape
+#        (watcher_generation=0, a JSON integer), not just the empty-string
+#        shape the original positive-control test used.
+
+
+class TestP01WatcherCreationProvenanceIsCausal:
+    """The current invocation must never claim it created a watcher it
+    merely observed. Reproduces the exact race: PTR's initial registry
+    check finds nothing, a concurrent actor registers watcher A before
+    PTR's own watch() call runs, watch() observes A and returns True
+    without creating B — provenance must reflect that PTR created
+    nothing, and rollback must never be able to touch A.
+    """
+
+    def test_concurrent_registration_between_initial_check_and_watch_call(
+        self, monkeypatch,
+    ):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False  # not yet through trigger — reaches WAITING_VALID
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        # PTR's OWN internal ownership check (inside _recover_one, before
+        # _rearm_and_verify is ever reached) must find NOTHING — the
+        # harness's watcher starts empty, so this is naturally satisfied;
+        # no watcher exists at that instant.
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+
+        # Inject the concurrent actor's registration at the exact moment
+        # PTR calls watch() — simulating "a concurrent actor won the race
+        # immediately after PTR's initial check passed, but before PTR's
+        # own watch() call runs." _FakeWatcher.watch() (patched above to
+        # be faithful to the real RECOVERY_REARM_LEFT_ALONE path) will
+        # observe this injected entry and return True WITHOUT creating a
+        # second registration or reporting any creation provenance.
+        _real_watch = watcher.watch
+        _injected = {"token": None, "done": False}
+
+        def _watch_with_injection(plan, local_oid=None, recovery_rearm=False,
+                                   registration_provenance_out=None, **kw):
+            if not _injected["done"]:
+                _injected["done"] = True
+                _sig = {
+                    "local_order_id": str(local_oid or ""),
+                    "signal_id": str(getattr(plan, "signal_id", "") or ""),
+                    "client_id": str(
+                        getattr(plan, "client_id", "") or ""
+                    ).strip().lower(),
+                    "execution_mode": str(
+                        getattr(plan, "execution_mode", "") or ""
+                    ).strip().lower(),
+                }
+                _concurrent_watched = _FakeWatched(_sig, "PENDING")
+                watcher._pending.append(_concurrent_watched)
+                if _sig["signal_id"]:
+                    watcher._dedup_set.add(_sig["signal_id"])
+                _injected["token"] = _concurrent_watched._registration_token
+            return _real_watch(
+                plan, local_oid, recovery_rearm=recovery_rearm,
+                registration_provenance_out=registration_provenance_out, **kw
+            )
+
+        monkeypatch.setattr(watcher, "watch", _watch_with_injection)
+
+        # Force the durable watcher-adoption CAS to lose — the only way
+        # to observe whether rollback incorrectly believes it may touch
+        # watcher A.
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            lambda *a, **kw: False,
+        )
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert _injected["done"], "setup: the concurrent injection must have fired"
+        assert _injected["token"] is not None
+
+        # Watcher A survives, untouched, exact same token, dedup intact.
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0]._registration_token == _injected["token"]
+        assert SIGNAL_ID in watcher._dedup_set
+
+        # No second watcher was ever created.
+        assert len({id(w) for w in watcher._pending}) == 1
+
+        assert any(
+            "ownership_adoption_failed" in e for e in result.get("errors", [])
+        )
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+        assert not selector.select.called
+        assert not selector.select_contract.called
+
+
+class TestP02RetentionAcceptsRealZeroGenerationShape:
+    """retain_recovery_ownership_if_no_watcher() must accept the actual
+    production no-watcher shape: watcher_generation written as the JSON
+    integer 0, not the empty string the original positive-control test
+    used. Postgres's meta->>'watcher_generation' renders integer 0 as
+    text "0", not "" — a fence requiring exact blank would reject #421's
+    own legitimate no-watcher state.
+    """
+
+    @staticmethod
+    def _cursor_class(row_store):
+        import re as _re
+
+        class _C:
+            rowcount = 0
+            def execute(self, sql, params):
+                _meta = row_store["meta"]
+                # Faithful text-conversion semantics of Postgres's
+                # meta->>key on a JSONB column: every stored value
+                # (string OR number) renders as its text form, exactly
+                # like the real ->> operator — not Python truthiness.
+                def _as_text(key):
+                    if key not in _meta:
+                        return ""
+                    v = _meta[key]
+                    if v is None:
+                        return ""
+                    return str(v)
+
+                # Derive the accepted watcher_generation text set FROM
+                # THE ACTUAL SQL STRING the production code generated —
+                # not a hardcoded Python re-implementation. A regression
+                # in the real SQL predicate (e.g. back to a bare
+                # `= ''`) must make this fake's behavior regress too,
+                # since it is reading that exact clause out of `sql`.
+                _gen_clause_match = _re.search(
+                    r"meta->>'watcher_generation'\s*,\s*''\)\s*(=|IN)\s*"
+                    r"(\([^)]*\)|'[^']*')",
+                    sql,
+                )
+                assert _gen_clause_match, (
+                    "fake cursor could not find the watcher_generation "
+                    "clause in the real SQL text — production predicate "
+                    "shape changed; update this fake to match"
+                )
+                _op, _rhs = _gen_clause_match.groups()
+                _accepted = set(_re.findall(r"'([^']*)'", _rhs))
+                _gen_ok = _as_text("watcher_generation") in _accepted
+
+                _blank = (
+                    _as_text("current_owner") == ""
+                    and _as_text("watcher_token") == ""
+                    and _gen_ok
+                )
+                if _blank:
+                    _patch = json.loads(params[0])
+                    _meta.update(_patch)
+                    self.rowcount = 1
+                else:
+                    self.rowcount = 0
+                return self
+        return _C
+
+    def _conn_ctx(self, row_store, monkeypatch):
+        _Cursor = self._cursor_class(row_store)
+        class _Conn:
+            def __enter__(self):
+                return _Cursor()
+            def __exit__(self, *a):
+                return False
+        monkeypatch.setattr(osm_mod, "conn", lambda: _Conn())
+        monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: fn())
+
+    def test_real_zero_generation_no_watcher_shape_succeeds(self, monkeypatch):
+        real_osm = object.__new__(APOrderStateMachine)
+        real_osm.client_id = CLIENT_ID
+        # The EXACT shape rearm_deferred_materialization_direction_reversal()
+        # writes when there is no real watcher_token: watcher_generation
+        # is the JSON integer 0, not "".
+        row_store = {
+            "meta": {
+                "current_owner": "",
+                "watcher_token": "",
+                "watcher_generation": 0,
+                "recovery_ownership": "recovery_scheduler",
+                "recovery_owner": f"recovery_scheduler:{CLIENT_ID}:prior",
+            }
+        }
+        self._conn_ctx(row_store, monkeypatch)
+
+        _expected_owner = f"recovery_scheduler:{CLIENT_ID}"
+        ok = real_osm.retain_recovery_ownership_if_no_watcher(
+            LOCAL_ORDER_ID,
+            recovery_owner=_expected_owner,
+            reason="test_real_zero_generation_shape",
+            recovery_retention_mode="paper",
+        )
+
+        assert ok is True
+        assert row_store["meta"]["current_owner"] == ""
+        assert row_store["meta"]["watcher_token"] == ""
+        assert row_store["meta"]["watcher_generation"] == 0
+        assert row_store["meta"]["recovery_ownership"] == "recovery_scheduler"
+        assert row_store["meta"]["recovery_owner"] == _expected_owner
+
+    @pytest.mark.parametrize("generation_value", [1, 4, "abc"])
+    def test_nonzero_or_malformed_generation_refused(self, monkeypatch, generation_value):
+        real_osm = object.__new__(APOrderStateMachine)
+        real_osm.client_id = CLIENT_ID
+        row_store = {
+            "meta": {
+                "current_owner": "",
+                "watcher_token": "",
+                "watcher_generation": generation_value,
+            }
+        }
+        self._conn_ctx(row_store, monkeypatch)
+
+        ok = real_osm.retain_recovery_ownership_if_no_watcher(
+            LOCAL_ORDER_ID,
+            recovery_owner=f"recovery_scheduler:{CLIENT_ID}",
+            reason="test_nonzero_generation_refused",
+            recovery_retention_mode="paper",
+        )
+
+        assert ok is False
+        assert row_store["meta"]["watcher_generation"] == generation_value
+        assert "recovery_ownership" not in row_store["meta"]
+
+    def test_committed_watcher_authority_still_refused(self, monkeypatch):
+        """Sanity re-check: the important half of the fence is unweakened."""
+        real_osm = object.__new__(APOrderStateMachine)
+        real_osm.client_id = CLIENT_ID
+        row_store = {
+            "meta": {
+                "current_owner": "watcher-token-committed",
+                "watcher_token": "watcher-token-committed",
+                "watcher_generation": 4,
+            }
+        }
+        self._conn_ctx(row_store, monkeypatch)
+
+        ok = real_osm.retain_recovery_ownership_if_no_watcher(
+            LOCAL_ORDER_ID,
+            recovery_owner=f"recovery_scheduler:{CLIENT_ID}",
+            reason="test_committed_watcher_still_refused",
+            recovery_retention_mode="paper",
+        )
+
+        assert ok is False
+        assert row_store["meta"]["current_owner"] == "watcher-token-committed"
+        assert row_store["meta"]["watcher_token"] == "watcher-token-committed"
+        assert "recovery_ownership" not in row_store["meta"]

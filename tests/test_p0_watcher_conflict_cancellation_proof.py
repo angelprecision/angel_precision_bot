@@ -358,8 +358,10 @@ def test_concurrent_watch_results_are_invocation_local_and_no_pending_row_is_own
     release_call = threading.Event()
 
     class OverlapWatcher(AuditWatcher):
-        def add_signal(self, payload):
-            result = super().add_signal(payload)
+        def add_signal(self, payload, *, registration_provenance_out=None):
+            result = super().add_signal(
+                payload, registration_provenance_out=registration_provenance_out,
+            )
             if payload.get("signal_id") == "call" and result:
                 call_armed.set()
                 assert release_call.wait(5)
@@ -423,4 +425,5 @@ def test_runtime_package_watch_forwards_recovery_compatibility_flags(monkeypatch
         "recovery_rearm": True,
         "no_cancel_on_reject": True,
         "materialization_resume": True,
+        "registration_provenance_out": None,
     }

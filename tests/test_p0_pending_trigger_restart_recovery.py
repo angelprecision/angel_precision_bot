@@ -125,11 +125,16 @@ class _MockWatcher:
         self._dedup_set: set  = set()
         self._watch_returns   = watch_returns
 
-    def watch(self, plan, local_order_id: str, *, recovery_rearm: bool = False) -> bool:
+    def watch(self, plan, local_order_id: str, *, recovery_rearm: bool = False,
+              registration_provenance_out: dict | None = None) -> bool:
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = False
+            registration_provenance_out["registration_token"] = None
         if self._watch_returns:
             w = MagicMock()
             w.state = "PENDING"
             w._ownership_quarantine = False
+            w._registration_token = f"mockwatcher-token-{id(w)}"
             sig_id = plan.get("signal_id", "")
             w.signal = {
                 "local_order_id": local_order_id,
@@ -140,6 +145,11 @@ class _MockWatcher:
             self._pending.append(w)
             if sig_id:
                 self._dedup_set.add(sig_id)
+            if registration_provenance_out is not None:
+                registration_provenance_out["created_by_this_call"] = True
+                registration_provenance_out["registration_token"] = (
+                    w._registration_token
+                )
         return self._watch_returns
 
 
@@ -224,7 +234,8 @@ class TestWatchTrueRegistryEmpty:
         r = _row(meta={"trigger_price": 450.0})
 
         class _NonRegistering(_MockWatcher):
-            def watch(self, plan, local_order_id, *, recovery_rearm=False):
+            def watch(self, plan, local_order_id, *, recovery_rearm=False,
+                      registration_provenance_out=None):
                 return True  # True but _pending NOT populated
 
         rec, osm = _make_recovery(r, watcher=_NonRegistering(), quote_result=False)

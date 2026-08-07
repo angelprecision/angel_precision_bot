@@ -2746,6 +2746,15 @@ class APOrderStateMachine:
         WHERE clause requires the watcher fields to already be blank, not
         a read-then-write check with a TOCTOU gap.
 
+        The watcher-generation half of that fence accepts both '' and '0':
+        ``rearm_deferred_materialization_direction_reversal`` writes
+        ``watcher_generation`` as the JSON integer 0 (not blank) for its
+        own legitimate no-watcher, recovery-owned state — Postgres's
+        ``meta->>'watcher_generation'`` renders that as the text "0", not
+        "". Requiring exact blank alone would make this fence reject the
+        very state it exists to protect. Any other value (1, 4, "abc",
+        etc.) still fails closed.
+
         Returns False (no-op, watcher authority preserved) if the row
         already carries committed watcher ownership, if the row does not
         exist, or on any write error. Callers must not treat False as
@@ -2779,7 +2788,7 @@ class APOrderStateMachine:
                       AND client_id = %s
                       AND COALESCE(meta->>'current_owner', '') = ''
                       AND COALESCE(meta->>'watcher_token', '') = ''
-                      AND COALESCE(meta->>'watcher_generation', '') = ''
+                      AND COALESCE(meta->>'watcher_generation', '') IN ('', '0')
                     """,
                     (_patch_json, local_order_id, self.client_id),
                 )

@@ -148,7 +148,7 @@ def test_ordinary_arm_already_through_trigger_rejected_no_late_seed(monkeypatch)
     _force_regular_session(monkeypatch)
 
     captured_signal = {}
-    def _capture_add_signal(sig):
+    def _capture_add_signal(sig, **_kw):
         captured_signal.update(sig)
         return True
     monkeypatch.setattr(w, "add_signal", _capture_add_signal)
@@ -179,7 +179,7 @@ def test_eligible_arm_within_continuation_seeds_late_state(monkeypatch):
     _force_regular_session(monkeypatch)
 
     captured = {}
-    def _capture_add_signal(sig):
+    def _capture_add_signal(sig, **_kw):
         captured.update(sig)
         return True
     monkeypatch.setattr(w, "add_signal", _capture_add_signal)
@@ -210,7 +210,7 @@ def test_eligible_put_pretrigger_stop_touch_keeps_arm_flow_open(monkeypatch):
     _force_regular_session(monkeypatch)
 
     captured = {}
-    monkeypatch.setattr(w, "add_signal", lambda sig: captured.update(sig) or True)
+    monkeypatch.setattr(w, "add_signal", lambda sig, **_kw: captured.update(sig) or True)
 
     plan = _eligible_plan(side="PUT", trigger=61.90, stop=62.49, target=30.0)
     result = w.watch(plan, local_order_id="local-bac-pretrigger-1")
@@ -231,7 +231,7 @@ def test_ordinary_put_arm_slightly_below_trigger_rejected(monkeypatch):
     monkeypatch.setattr(w, "_persist_watcher_audit", lambda *_a, **_kw: None)
     monkeypatch.setattr(w, "_is_live_runtime", lambda: False)
     _force_regular_session(monkeypatch)
-    monkeypatch.setattr(w, "add_signal", lambda _s: True)
+    monkeypatch.setattr(w, "add_signal", lambda _s, **_kw: True)
 
     plan = _ineligible_plan(side="PUT", trigger=100.0, stop=110.0)
     result = w.watch(plan, local_order_id="local-ordinary-put-1")

@@ -607,7 +607,16 @@ class PendingTriggerRestartRecovery:
             return _RowOutcome.WATCHER_OWNED
 
         try:
-            armed = bool(watcher.watch(plan, local_oid, recovery_rearm=True))
+            _provenance = {
+                "created_by_this_call": False,
+                "registration_token": None,
+            }
+            armed = bool(
+                watcher.watch(
+                    plan, local_oid, recovery_rearm=True,
+                    registration_provenance_out=_provenance,
+                )
+            )
         except Exception as exc:
             log.error("RESTART_RECOVERY_WATCH_RAISED local=%s: %s", local_oid, exc, exc_info=True)
             return _RowOutcome.UNRESOLVED
@@ -656,19 +665,23 @@ class PendingTriggerRestartRecovery:
             local_oid,
             {k: v for k, v in proof.items() if k != "watcher_obj"},
         )
-        # PR #421 final amendment: THIS invocation just registered this
-        # watcher via watch() above, and this same proof lookup (run
-        # immediately after that watch() call, within the same
-        # synchronous row-recovery pass) is the exact registration the
-        # caller may later roll back on adoption failure. Take the
-        # registration identity directly from the object this call itself
-        # just proved ownership of — never rediscovered afterward by the
-        # caller via a separate registry scan.
-        _watcher_obj = proof.get("watcher_obj")
-        self.last_watcher_registered_by_this_attempt = True
+        # PR #421 final amendment (P0-1): watch() returning True is proof
+        # ownership exists — it is NOT proof this invocation created it.
+        # watch()'s own recovery_rearm "left alone" path can return True
+        # after observing a watcher a CONCURRENT actor registered between
+        # this call's earlier registry check and watch()'s internal
+        # re-check, without ever calling add_signal(). Provenance must
+        # come only from _provenance, which watch() (via add_signal())
+        # sets causally, at the exact point of registration — never
+        # reconstructed here from the post-call registry proof, which
+        # proves ownership but not authorship.
+        self.last_watcher_registered_by_this_attempt = bool(
+            _provenance.get("created_by_this_call")
+        )
         self.last_registration_token = (
-            str(getattr(_watcher_obj, "_registration_token", "") or "").strip()
-            or None
+            _provenance.get("registration_token")
+            if self.last_watcher_registered_by_this_attempt
+            else None
         )
         return _RowOutcome.WATCHER_OWNED
 
