@@ -168,6 +168,15 @@ def _core(*, execution_mode: str = "paper"):
         order_state_machine=MagicMock(),
         broker=MagicMock(),
     )
+    # PR #421 final amendment: _retain_recovery_ownership() now prefers
+    # osm.retain_recovery_ownership_if_no_watcher() when present, falling
+    # back to the plain update_order_meta() merge otherwise. A bare
+    # MagicMock() auto-vivifies ANY attribute access — including that new
+    # method name — into a truthy, callable sub-mock, which would silently
+    # redirect these tests away from the update_order_meta() path they
+    # assert on. Explicitly remove it so this stub exercises the same
+    # fallback path it always has.
+    del core.order_state_machine.retain_recovery_ownership_if_no_watcher
     core.resume_deferred_materialization_retry = (
         ap_execution_core.APExecutionCore
         .resume_deferred_materialization_retry.__get__(core, type(core))

@@ -2718,6 +2718,85 @@ class APOrderStateMachine:
             )
             return False
 
+    def retain_recovery_ownership_if_no_watcher(
+        self,
+        local_order_id: str,
+        *,
+        recovery_owner: str,
+        reason: str,
+        recovery_retention_mode: str,
+    ) -> bool:
+        """Write recovery-authority retention markers, but ONLY if no
+        committed watcher authority already exists on the row.
+
+        PR #421 final amendment (§5): the plain recovery-retention write
+        this replaces (a bare ``update_order_meta`` merge) had no fencing
+        against existing watcher ownership at all — it could blindly write
+        ``recovery_ownership`` / ``recovery_owner`` on top of a row whose
+        watcher authority (``current_owner`` / ``watcher_token`` /
+        ``watcher_generation``) was already durably committed moments
+        earlier, e.g. by a watcher-adoption CAS that itself succeeded but
+        whose immediate post-write verification reread failed or raised.
+        That produces exactly the dual-authority state PR #421 exists to
+        prevent: a row simultaneously claimed by a real watcher and by
+        recovery.
+
+        Fenced the same way ``adopt_direction_reversal_watcher_ownership``
+        fences the opposite transfer: a single conditional UPDATE whose
+        WHERE clause requires the watcher fields to already be blank, not
+        a read-then-write check with a TOCTOU gap.
+
+        Returns False (no-op, watcher authority preserved) if the row
+        already carries committed watcher ownership, if the row does not
+        exist, or on any write error. Callers must not treat False as
+        confirmation the row is now in some other bad state — only that
+        this specific write did not happen.
+        """
+        _recovery_owner = str(recovery_owner or "").strip()
+        if not _recovery_owner:
+            return False
+        _now = now_utc_iso()
+        _patch = {
+            "recovery_ownership": "recovery_scheduler",
+            "recovery_owner": _recovery_owner,
+            "recovery_retained_at": _now,
+            "recovery_retention_reason": str(reason or ""),
+            "recovery_retention_mode": str(recovery_retention_mode or ""),
+        }
+        try:
+            _patch_json = json.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _retain():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND COALESCE(meta->>'current_owner', '') = ''
+                      AND COALESCE(meta->>'watcher_token', '') = ''
+                      AND COALESCE(meta->>'watcher_generation', '') = ''
+                    """,
+                    (_patch_json, local_order_id, self.client_id),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_retain) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retain_recovery_ownership_if_no_watcher failed "
+                "order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
     def persist_deferred_broker_ready(
         self,
         local_order_id: str,

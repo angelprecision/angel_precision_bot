@@ -219,6 +219,14 @@ class _FakeWatched:
         self.signal = signal
         self.state = state
         self._ownership_quarantine = False
+        # PR #421 final amendment: real WatchedSignal stamps an immutable
+        # _registration_token (uuid4) at construction — the exact-
+        # registration identity ap_recovery.py's rollback fencing and
+        # PTR's provenance reporting key off. This fake must carry the
+        # same contract so tests exercising those real production code
+        # paths against this double behave identically to production.
+        import uuid as _uuid
+        self._registration_token = _uuid.uuid4().hex
 
 
 class _FakeWatcher:
@@ -1241,3 +1249,327 @@ class TestMutationSurface:
         assert broker_calls["cancel"] == []
         assert not selector.select.called
         assert not selector.select_contract.called
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #421 FINAL AMENDMENT — watcher provenance + post-adoption ownership
+# safety (P0 races 1 and 2 found during merge audit)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Test A — pre-existing watcher survives adoption CAS loss
+# Test B — successful adoption + verification read failure cannot recreate
+#          recovery authority
+# Test C — rollback remains valid for a watcher genuinely created by this
+#          invocation (sanity counterpart to A/D, exercised through the
+#          full real end-to-end seam rather than the lower-level unit
+#          tests in test_p0_watcher_rollback_exact_registration_identity.py)
+# Test D — replacement watcher is never removed: already covered by
+#          test_stale_loser_cannot_evict_legitimate_winners_replacement_registration
+#          in tests/test_p0_watcher_rollback_exact_registration_identity.py,
+#          which exercises the exact same _evict_just_registered_watcher
+#          fencing this amendment does not modify. Not duplicated here.
+# Test E — _retain_recovery_ownership loses against committed watcher
+#          authority
+
+
+class TestPreExistingWatcherProvenance:
+    """P0 race 1: PendingTriggerRestartRecovery's read-only fast path can
+    return WATCHER_OWNED for a watcher that already existed BEFORE this
+    recovery invocation ran — no registration happened in this call. A
+    caller that assumed WATCHER_OWNED always means "I just registered
+    this" could roll back (evict + release dedup) a real, currently-owned
+    watcher that a live position may depend on, merely because this pass
+    observed it and its own durable-adoption CAS happened to lose.
+    """
+
+    def test_preexisting_watcher_survives_adoption_cas_loss(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False  # not yet through trigger — reaches WAITING_VALID
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        # Pre-register a REAL, already-owned watcher for this exact row
+        # BEFORE the recovery pass runs — simulating the watcher having
+        # been registered by some earlier, unrelated pass or actor, not by
+        # the invocation under test.
+        _preexisting_sig = {
+            "local_order_id": LOCAL_ORDER_ID,
+            "signal_id": SIGNAL_ID,
+            "client_id": CLIENT_ID.lower(),
+            "execution_mode": EXEC_MODE,
+        }
+        _preexisting_watched = _FakeWatched(_preexisting_sig, "PENDING")
+        watcher._pending.append(_preexisting_watched)
+        watcher._dedup_set.add(SIGNAL_ID)
+        _preexisting_token = _preexisting_watched._registration_token
+
+        # Force the durable watcher-adoption CAS to lose/fail — this must
+        # never be mistaken for permission to evict a watcher this pass
+        # did not create.
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            lambda *a, **kw: False,
+        )
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        # The exact pre-existing watcher registration remains, untouched.
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0] is _preexisting_watched
+        assert watcher._pending[0]._registration_token == _preexisting_token
+        assert SIGNAL_ID in watcher._dedup_set
+
+        # No broker activity of any kind.
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+        assert not selector.select.called
+        assert not selector.select_contract.called
+
+
+class TestSuccessfulAdoptionVerificationFailureNoAuthorityRecreated:
+    """P0 race 2: once the durable watcher-adoption CAS reports success,
+    watcher ownership is authoritative. A subsequent verification reread
+    that raises or returns inconclusive must NOT evict the watcher and
+    must NOT recreate recovery ownership on top of it — either outcome
+    would produce a row with contradictory dual authority (or an
+    unmonitored but "watcher-owned-looking" row).
+    """
+
+    def test_verification_read_exception_after_successful_cas(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        # Let the real (harness-faked) CAS write succeed as normal, but
+        # make the SEPARATE post-adoption verification reread raise —
+        # targeted precisely at the reread that happens AFTER a successful
+        # adoption, not any of the many earlier get_order() calls in the
+        # resume_deferred_materialization_retry / _on_entry_trigger chain.
+        _adoption_committed = {"flag": False}
+        _real_adopt = osm.adopt_direction_reversal_watcher_ownership
+
+        def _adopt_and_flag(*a, **kw):
+            ok = _real_adopt(*a, **kw)
+            if ok:
+                _adoption_committed["flag"] = True
+            return ok
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership", _adopt_and_flag,
+        )
+
+        _real_get_order = osm.get_order
+
+        def _get_order_raises_after_adoption(order_id):
+            if _adoption_committed["flag"]:
+                raise RuntimeError(
+                    "simulated transient read failure after successful CAS"
+                )
+            return _real_get_order(order_id)
+
+        monkeypatch.setattr(osm, "get_order", _get_order_raises_after_adoption)
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        # The CAS itself did commit — durable state shows it, proving this
+        # scenario is a genuine "committed but unverifiable this pass"
+        # case, not merely "nothing happened."
+        final_meta = row_store["row"]["meta"]
+        real_token = watcher.owner_token
+        assert final_meta.get("current_owner") == real_token
+        assert final_meta.get("watcher_token") == real_token
+
+        # No dual authority: the CAS's own patch already cleared recovery
+        # fields, and the inconclusive verification must not have written
+        # them again.
+        assert final_meta.get("recovery_owner") == ""
+        assert final_meta.get("recovery_ownership") == ""
+
+        # The watcher this pass registered was never evicted merely
+        # because the reread couldn't confirm what the CAS already
+        # committed.
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        assert len(watcher._pending) == 1
+        assert SIGNAL_ID in watcher._dedup_set
+
+        # Diagnostics recorded, but not as a hard failure that triggers
+        # retention/eviction.
+        assert any(
+            "adoption_verification_inconclusive" in e
+            for e in result.get("errors", [])
+        )
+
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestGenuineNewRegistrationRollbackStillWorksEndToEnd:
+    """Sanity counterpart to Test A, through the full real seam rather than
+    the lower-level unit tests: when NO watcher pre-exists and this exact
+    invocation registers one, a genuine CAS failure must still roll it
+    back — preserving the reason PR #421's original rollback fix exists.
+    """
+
+    def test_rollback_evicts_watcher_this_invocation_registered(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        # No pre-existing watcher. Force the CAS to lose so this pass's
+        # OWN just-registered watcher is the only thing rollback could
+        # legitimately touch.
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            lambda *a, **kw: False,
+        )
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        # This pass's own registration was rolled back — no orphaned
+        # runtime watcher left dangling against a recovery-owned row.
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert len(watcher._pending) == 0
+        assert SIGNAL_ID not in watcher._dedup_set
+
+        assert any(
+            "ownership_adoption_failed" in e for e in result.get("errors", [])
+        )
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestRetainRecoveryOwnershipFencedAgainstCommittedWatcher:
+    """§5: the fenced OSM write retain_recovery_ownership_if_no_watcher()
+    must refuse — as a no-op, not a silent success — when the row already
+    carries committed watcher authority (current_owner / watcher_token /
+    watcher_generation all non-blank). Recovery authority must never be
+    written on top of committed watcher authority.
+    """
+
+    def test_refuses_when_watcher_authority_already_committed(self, monkeypatch):
+        real_osm = object.__new__(APOrderStateMachine)
+        real_osm.client_id = CLIENT_ID
+
+        row_store = {
+            "meta": {
+                "current_owner": "watcher-token-committed",
+                "watcher_token": "watcher-token-committed",
+                "watcher_generation": 4,
+            }
+        }
+
+        class _C:
+            rowcount = 0
+            def execute(self, sql, params):
+                _meta = row_store["meta"]
+                _blank = (
+                    not str(_meta.get("current_owner") or "")
+                    and not str(_meta.get("watcher_token") or "")
+                    and not str(_meta.get("watcher_generation") or "")
+                )
+                if _blank:
+                    _patch = json.loads(params[0])
+                    _meta.update(_patch)
+                    self.rowcount = 1
+                else:
+                    self.rowcount = 0
+                return self
+
+        class _Conn:
+            def __enter__(self):
+                return _C()
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(osm_mod, "conn", lambda: _Conn())
+        monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: fn())
+
+        ok = real_osm.retain_recovery_ownership_if_no_watcher(
+            LOCAL_ORDER_ID,
+            recovery_owner=f"recovery_scheduler:{CLIENT_ID}",
+            reason="test_committed_watcher_fence",
+            recovery_retention_mode="paper",
+        )
+
+        assert ok is False
+        # Watcher authority completely unchanged.
+        assert row_store["meta"]["current_owner"] == "watcher-token-committed"
+        assert row_store["meta"]["watcher_token"] == "watcher-token-committed"
+        assert row_store["meta"]["watcher_generation"] == 4
+        # No recovery authority was written on top of it.
+        assert "recovery_ownership" not in row_store["meta"]
+        assert "recovery_owner" not in row_store["meta"]
+
+    def test_succeeds_when_no_watcher_authority_present(self, monkeypatch):
+        """Positive control: the fence must not be simply broken/always-
+        false — it must genuinely permit the write when watcher fields are
+        blank, matching the exact pre-#421 behavior for the ordinary case.
+        """
+        real_osm = object.__new__(APOrderStateMachine)
+        real_osm.client_id = CLIENT_ID
+
+        row_store = {"meta": {"current_owner": "", "watcher_token": "", "watcher_generation": ""}}
+
+        class _C:
+            rowcount = 0
+            def execute(self, sql, params):
+                _meta = row_store["meta"]
+                _blank = (
+                    not str(_meta.get("current_owner") or "")
+                    and not str(_meta.get("watcher_token") or "")
+                    and not str(_meta.get("watcher_generation") or "")
+                )
+                if _blank:
+                    _patch = json.loads(params[0])
+                    _meta.update(_patch)
+                    self.rowcount = 1
+                else:
+                    self.rowcount = 0
+                return self
+
+        class _Conn:
+            def __enter__(self):
+                return _C()
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(osm_mod, "conn", lambda: _Conn())
+        monkeypatch.setattr(osm_mod, "run_with_retry", lambda fn: fn())
+
+        ok = real_osm.retain_recovery_ownership_if_no_watcher(
+            LOCAL_ORDER_ID,
+            recovery_owner=f"recovery_scheduler:{CLIENT_ID}",
+            reason="test_no_watcher_present",
+            recovery_retention_mode="paper",
+        )
+
+        assert ok is True
+        assert row_store["meta"]["recovery_ownership"] == "recovery_scheduler"
+        assert row_store["meta"]["recovery_owner"] == f"recovery_scheduler:{CLIENT_ID}"

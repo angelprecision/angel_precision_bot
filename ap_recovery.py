@@ -2008,6 +2008,48 @@ class APStartupRecovery:
         # limit, selector evidence, tp/sl, direction and every trade-policy
         # field are preserved untouched.
         def _retain_recovery_ownership(loid, *, reason):
+            # PR #421 final amendment (§5): prefer the fenced OSM write —
+            # it refuses (returns False, no-op) if committed watcher
+            # authority (current_owner/watcher_token/watcher_generation)
+            # already exists on the row, closing the dual-authority gap a
+            # bare update_order_meta merge cannot close. Fall back to the
+            # unfenced merge only for OSM doubles that predate the fenced
+            # method (test mocks) — real production OrderStateMachine
+            # always provides it.
+            _fenced_fn = getattr(
+                self.osm, "retain_recovery_ownership_if_no_watcher", None
+            )
+            if callable(_fenced_fn):
+                try:
+                    ok = bool(_fenced_fn(
+                        loid,
+                        recovery_owner=f"recovery_scheduler:{self.client_id}",
+                        reason=reason,
+                        recovery_retention_mode=recovery_mode,
+                    ))
+                except Exception as exc:
+                    log.critical(
+                        "[%s] RECOVERY_RETENTION_RAISED local_order_id=%s "
+                        "reason=%s exc=%s",
+                        self.client_id, loid, reason, exc,
+                    )
+                    result.setdefault("errors", []).append(
+                        "recovery_retention_raised"
+                    )
+                    return False
+                if not ok:
+                    log.critical(
+                        "[%s] RECOVERY_RETENTION_WRITE_FAILED local_order_id=%s "
+                        "reason=%s — durable ownership marker not persisted "
+                        "(row missing, or watcher authority already committed "
+                        "and the fenced write correctly refused to overwrite it)",
+                        self.client_id, loid, reason,
+                    )
+                    result.setdefault("errors", []).append(
+                        "recovery_retention_write_failed"
+                    )
+                return ok
+
             update_meta = getattr(self.osm, "update_order_meta", None)
             if not callable(update_meta):
                 log.critical(
@@ -2838,22 +2880,48 @@ class APStartupRecovery:
                                     # truthfully matches: only THEN count the
                                     # row as recovered.
                                     #
-                                    # Capture the exact registration identity
-                                    # NOW, before the CAS attempt below can
-                                    # race with a concurrent winner. This is
-                                    # the only proof, later, that a rollback
-                                    # is removing the registration THIS actor
-                                    # created rather than a legitimate
-                                    # replacement sharing the same logical
-                                    # identity.
-                                    _registered_watcher_id = (
-                                        self._capture_just_registered_watcher_id(
-                                            self.entry_watcher,
-                                            local_order_id=_exp_loid,
-                                            client_id=_exp_client,
-                                            signal_id=_exp_signal,
-                                            execution_mode=_exp_mode,
+                                    # PR #421 final amendment (P0 race 1):
+                                    # WATCHER_OWNED does not prove THIS
+                                    # invocation created the watcher — PTR's
+                                    # own read-only fast path can return it
+                                    # for a watcher that already existed
+                                    # before this call. Provenance must come
+                                    # directly from PTR's own bookkeeping,
+                                    # set at the exact moment of registration
+                                    # inside PTR — never rediscovered here by
+                                    # scanning the registry, which cannot
+                                    # distinguish "I created this" from "I
+                                    # merely observed this."
+                                    _registered_by_this_attempt = bool(
+                                        getattr(
+                                            _rwr_ptr,
+                                            "last_watcher_registered_by_this_attempt",
+                                            False,
                                         )
+                                    )
+                                    _raw_registration_token = (
+                                        getattr(
+                                            _rwr_ptr, "last_registration_token", None,
+                                        )
+                                        if _registered_by_this_attempt
+                                        else None
+                                    )
+                                    # _evict_just_registered_watcher compares
+                                    # via _exact_identity_of(), which returns
+                                    # ("token", <value>) for any object
+                                    # carrying a _registration_token — the
+                                    # same shape every real WatchedSignal
+                                    # produces. PTR reports the raw token
+                                    # string; wrap it into that identical
+                                    # shape here so the comparison is a
+                                    # genuine identity check, not a
+                                    # tuple-vs-string mismatch that would
+                                    # make every legitimate match look
+                                    # "foreign."
+                                    _registered_watcher_id = (
+                                        ("token", _raw_registration_token)
+                                        if _raw_registration_token
+                                        else None
                                     )
                                     _real_token = str(
                                         getattr(self.entry_watcher, "owner_token", "")
@@ -2877,56 +2945,120 @@ class APStartupRecovery:
                                     # confirm the exact ownership transfer
                                     # actually landed before declaring
                                     # success either.
+                                    #
+                                    # PR #421 final amendment (P0 race 2): a
+                                    # failed/raised reread AFTER a successful
+                                    # CAS is not evidence the CAS didn't
+                                    # commit. Isolate the reread in its own
+                                    # try/except so an exception here lands
+                                    # in the same "inconclusive" branch as a
+                                    # merely-unconfirmed reread, rather than
+                                    # escaping to the outer exception handler
+                                    # that would otherwise unconditionally
+                                    # retain recovery ownership on top of a
+                                    # possibly-already-committed watcher.
                                     _verified = False
+                                    _verify_exc = None
                                     if _adopted:
-                                        _post = self.osm.get_order(_exp_loid)
-                                        _post_meta = self._coerce_order_meta(
-                                            (_post or {}).get("meta")
-                                        )
-                                        _verified = (
-                                            str(_post_meta.get("current_owner") or "")
-                                            == _real_token
-                                            and str(
-                                                _post_meta.get("watcher_token") or ""
-                                            ) == _real_token
-                                            and not _post_meta.get("recovery_owner")
-                                            and not _post_meta.get("recovery_ownership")
-                                        )
+                                        try:
+                                            _post = self.osm.get_order(_exp_loid)
+                                            _post_meta = self._coerce_order_meta(
+                                                (_post or {}).get("meta")
+                                            )
+                                            _verified = (
+                                                str(_post_meta.get("current_owner") or "")
+                                                == _real_token
+                                                and str(
+                                                    _post_meta.get("watcher_token") or ""
+                                                ) == _real_token
+                                                and not _post_meta.get("recovery_owner")
+                                                and not _post_meta.get("recovery_ownership")
+                                            )
+                                        except Exception as _verify_read_exc:
+                                            _verify_exc = _verify_read_exc
+                                            _verified = False
+
                                     if _adopted and _verified:
                                         recovered += 1
+                                    elif _adopted and not _verified:
+                                        # CAS reported success. A failed or
+                                        # inconclusive verification reread is
+                                        # NOT authoritative evidence the
+                                        # commit didn't land — it only proves
+                                        # THIS reread couldn't confirm it.
+                                        # Per the required invariant: once
+                                        # adoption CAS succeeds, watcher
+                                        # ownership is authoritative. Do not
+                                        # evict the watcher (it may be the
+                                        # very registration that just
+                                        # committed durable ownership) and do
+                                        # not retain recovery ownership on
+                                        # top of it (dual authority). Leave
+                                        # durable/runtime state exactly as it
+                                        # is; a later pass's read-only
+                                        # already-owned fast path will
+                                        # positively confirm convergence.
+                                        log.critical(
+                                            "[%s] REARM_WATCHER_REQUIRED_"
+                                            "ADOPTION_VERIFICATION_INCONCLUSIVE "
+                                            "local_order_id=%s exc=%r — CAS "
+                                            "reported success; leaving watcher "
+                                            "ownership authoritative, NOT "
+                                            "retaining recovery ownership, NOT "
+                                            "evicting the watcher",
+                                            self.client_id, local_order_id,
+                                            _verify_exc,
+                                        )
+                                        result.setdefault("errors", []).append(
+                                            "rearm_watcher_required_adoption_"
+                                            f"verification_inconclusive:{local_order_id}"
+                                        )
                                     else:
-                                        # Real watcher exists in-process but
-                                        # durable ownership adoption lost its
-                                        # CAS, or a post-adoption reread could
-                                        # not confirm the transfer — never
-                                        # claim success. Evict ONLY the
-                                        # watched entry this exact handoff
-                                        # just registered (identity-fenced),
-                                        # so runtime and durable state never
-                                        # remain split under two contradictory
-                                        # authorities, and fall back to
-                                        # recovery ownership for a later pass.
-                                        _evicted = self._evict_just_registered_watcher(
-                                            self.entry_watcher,
-                                            local_order_id=_exp_loid,
-                                            client_id=_exp_client,
-                                            signal_id=_exp_signal,
-                                            execution_mode=_exp_mode,
-                                            expected_watcher_id=_registered_watcher_id,
-                                        )
-                                        _rwr_fail(
-                                            "ownership_adoption_failed"
-                                            if not _adopted
-                                            else "ownership_adoption_verification_failed"
-                                        )
-                                        if not _evicted:
-                                            log.critical(
-                                                "[%s] REARM_WATCHER_REQUIRED_EVICTION_FAILED "
-                                                "local_order_id=%s — a real watcher may "
-                                                "still be registered against a "
-                                                "recovery-owned row",
+                                        # _adopted is False: the CAS itself
+                                        # did not commit. Rollback authority
+                                        # is fenced to exact provenance — only
+                                        # a watcher THIS invocation actually
+                                        # registered may be evicted. A
+                                        # pre-existing watcher this pass
+                                        # merely observed via PTR's read-only
+                                        # fast path must never be touched:
+                                        # this recovery attempt did not
+                                        # create it and has no authority over
+                                        # it, however its own adoption CAS
+                                        # turned out.
+                                        if (
+                                            _registered_by_this_attempt
+                                            and _registered_watcher_id is not None
+                                        ):
+                                            _evicted = self._evict_just_registered_watcher(
+                                                self.entry_watcher,
+                                                local_order_id=_exp_loid,
+                                                client_id=_exp_client,
+                                                signal_id=_exp_signal,
+                                                execution_mode=_exp_mode,
+                                                expected_watcher_id=_registered_watcher_id,
+                                            )
+                                            if not _evicted:
+                                                log.critical(
+                                                    "[%s] REARM_WATCHER_REQUIRED_EVICTION_FAILED "
+                                                    "local_order_id=%s — a real watcher may "
+                                                    "still be registered against a "
+                                                    "recovery-owned row",
+                                                    self.client_id, local_order_id,
+                                                )
+                                        else:
+                                            log.warning(
+                                                "[%s] REARM_WATCHER_REQUIRED_"
+                                                "PREEXISTING_WATCHER_ADOPTION_FAILED "
+                                                "local_order_id=%s — a pre-existing "
+                                                "watcher (not registered by this "
+                                                "recovery attempt) failed durable "
+                                                "adoption; preserving the watcher "
+                                                "untouched, retaining recovery "
+                                                "ownership for a later pass only",
                                                 self.client_id, local_order_id,
                                             )
+                                        _rwr_fail("ownership_adoption_failed")
                                 elif _rwr_outcome in (
                                     _RWR_RowOutcome.REARM_OWNED,
                                     _RWR_RowOutcome.RETRY_OWNED,
