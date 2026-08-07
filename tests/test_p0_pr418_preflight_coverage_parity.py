@@ -4,11 +4,91 @@ from __future__ import annotations
 import json
 import os
 from datetime import timezone
+from urllib.parse import urlparse
 
-os.environ.setdefault(
-    "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable",
+# --- DB safety fence -----------------------------------------------------
+#
+# This file executes real DDL/DML (CREATE TABLE, DELETE, INSERT) against
+# whatever DATABASE_URL resolves to. The previous `os.environ.setdefault(...)`
+# only filled in a value when DATABASE_URL was unset -- it did nothing to
+# protect against an already-configured DATABASE_URL pointing at staging or
+# production. If that happened, this file would run destructive operations
+# against the `orders` table of whatever database was configured.
+#
+# The guard below positively allowlists the exact local test database this
+# repo's CI uses. It never silently overwrites an existing DATABASE_URL: an
+# ambiguous or unsafe value raises immediately at import time, which aborts
+# collection of this entire module before any fixture -- and therefore
+# before any CREATE/DELETE/INSERT -- can run.
+
+_SAFE_TEST_DB_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_SAFE_TEST_DB_NAME = "intelligence_test"
+_SAFE_DEFAULT_DATABASE_URL = (
+    "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
 )
+
+
+class _UnsafeTestDatabaseError(RuntimeError):
+    """Raised when DATABASE_URL does not positively identify the repo's
+    known local CI/test Postgres database."""
+
+
+def _validate_database_url(raw: str) -> None:
+    """Pure validation: raises _UnsafeTestDatabaseError if `raw` is not a
+    positively-identified safe local test database URL. Performs no I/O
+    and no environment mutation, so it is safe to call directly in tests
+    against arbitrary strings.
+    """
+    try:
+        parsed = urlparse(raw)
+    except ValueError as exc:
+        raise _UnsafeTestDatabaseError(
+            f"DATABASE_URL is malformed and cannot be validated as safe: "
+            f"{exc}"
+        ) from exc
+
+    if parsed.scheme not in ("postgres", "postgresql"):
+        raise _UnsafeTestDatabaseError(
+            f"DATABASE_URL scheme {parsed.scheme!r} is not a recognized "
+            "Postgres URL -- refusing to run DB-backed tests."
+        )
+
+    hostname = parsed.hostname
+    if hostname not in _SAFE_TEST_DB_HOSTS:
+        raise _UnsafeTestDatabaseError(
+            f"DATABASE_URL host {hostname!r} is not an allow-listed local "
+            f"test host ({sorted(_SAFE_TEST_DB_HOSTS)!r}). Refusing to run "
+            "DB-backed tests against a non-local database."
+        )
+
+    dbname = (parsed.path or "").lstrip("/")
+    if dbname != _SAFE_TEST_DB_NAME:
+        raise _UnsafeTestDatabaseError(
+            f"DATABASE_URL database name {dbname!r} is not the expected "
+            f"local test database {_SAFE_TEST_DB_NAME!r}. Refusing to run "
+            "DB-backed tests against an unexpected database."
+        )
+
+
+def _assert_safe_test_database_url() -> str:
+    """Resolve and validate DATABASE_URL for this test module.
+
+    If DATABASE_URL is unset or blank, adopts the explicit known-safe
+    local default and validates that value like any other input (no
+    bypass). If DATABASE_URL is already set, it is never overwritten --
+    it is validated as-is, and an unsafe or ambiguous value raises before
+    this module finishes importing, which prevents pytest from collecting
+    any fixture or test in this file.
+    """
+    raw = os.environ.get("DATABASE_URL")
+    if raw is None or not raw.strip():
+        os.environ["DATABASE_URL"] = _SAFE_DEFAULT_DATABASE_URL
+        raw = _SAFE_DEFAULT_DATABASE_URL
+    _validate_database_url(raw)
+    return raw
+
+
+DATABASE_URL = _assert_safe_test_database_url()
 
 import psycopg2
 import pytest
@@ -26,7 +106,7 @@ _CLIENT_ID = "preflight-pr418@example.com"
 
 
 def _pg_conn():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
+    return psycopg2.connect(DATABASE_URL)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -387,6 +467,94 @@ def test_padded_trigger_timestamp_parses_via_parse_timestamp_directly():
     assert findings == []
     assert parsed is not None
     assert parsed.tzinfo is not None
+
+
+# --- Regression coverage for the DB safety fence itself ------------------
+#
+# Proves the guard fails closed before any mutating SQL in this module can
+# run, and that it never silently overwrites an ambiguous/unsafe
+# pre-existing DATABASE_URL.
+
+
+class TestDatabaseSafetyFence:
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable",
+            "postgresql://postgres:postgres@127.0.0.1:5432/intelligence_test?sslmode=disable",
+        ],
+    )
+    def test_allowlisted_local_test_database_is_accepted(self, url):
+        _validate_database_url(url)  # must not raise
+
+    def test_remote_host_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://user:pass@remote-host.example.com:5432/intelligence_test"
+            )
+
+    def test_supabase_style_host_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:pw@db.abcprojectref.supabase.co:5432/postgres"
+            )
+
+    def test_localhost_with_wrong_database_name_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:5432/postgres"
+            )
+
+    def test_malformed_database_url_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url("not a url at all :::")
+
+    def test_missing_database_url_adopts_explicit_local_default(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+        resolved = _assert_safe_test_database_url()
+
+        assert resolved == _SAFE_DEFAULT_DATABASE_URL
+        assert os.environ["DATABASE_URL"] == _SAFE_DEFAULT_DATABASE_URL
+
+    def test_blank_database_url_adopts_explicit_local_default(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "   ")
+
+        resolved = _assert_safe_test_database_url()
+
+        assert resolved == _SAFE_DEFAULT_DATABASE_URL
+
+    def test_preexisting_unsafe_database_url_is_not_overwritten(self, monkeypatch):
+        """An unsafe pre-existing value must be rejected, not silently
+        replaced with the safe default and then used anyway."""
+        unsafe = "postgresql://user:pass@db.someproj.supabase.co:5432/postgres"
+        monkeypatch.setenv("DATABASE_URL", unsafe)
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_test_database_url()
+
+        assert os.environ["DATABASE_URL"] == unsafe
+
+    def test_rejection_occurs_before_any_database_connection_is_attempted(
+        self, monkeypatch
+    ):
+        """The guard must raise on validation alone -- it must never reach
+        psycopg2.connect (and therefore never reach CREATE/DELETE/INSERT)
+        for an unsafe URL."""
+        unsafe = (
+            "postgresql://user:pass@remote-host.example.com:5432/intelligence_test"
+        )
+        monkeypatch.setenv("DATABASE_URL", unsafe)
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                "psycopg2.connect was called despite a failed DB safety check"
+            )
+
+        monkeypatch.setattr(psycopg2, "connect", _fail_if_called)
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_test_database_url()
 
 
 def test_candidate_fetch_executes_select_only(monkeypatch):
