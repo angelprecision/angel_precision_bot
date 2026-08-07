@@ -526,7 +526,13 @@ class TestQuoteAvailableRealWatcherAttached:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestQuoteUnavailableBoundedRetry:
-    def test_unavailable_quote_does_not_attach_watcher_or_crash(self, monkeypatch):
+    def test_unavailable_quote_persists_exact_bounded_retry(self, monkeypatch):
+        """When the quote is unavailable, PendingTriggerRestartRecovery's
+        existing bounded restart-rearm retry must be durably established —
+        not merely "no watcher and no crash". Assert the exact canonical
+        retry fields/owner it writes, proving this is a real, executable
+        bounded retry a later pass can pick up.
+        """
         recovery, core, osm, row_store, watcher, selector, broker_calls = (
             _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
         )
@@ -542,15 +548,52 @@ class TestQuoteUnavailableBoundedRetry:
         result = {"errors": []}
         recovery._recover_deferred_breach_lifecycles(result)
 
-        # No real watcher was attached in this scenario (may hit the known
-        # PTR evidence-gate limitation documented in
-        # tests/test_p0_direction_reversal_rearm.py — the row remains
-        # unowned by an in-process watcher either way).
+        final_meta = row_store["row"]["meta"]
+
+        # No watcher attached.
         assert len(watcher._pending) == 0
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+
+        # The exact canonical restart-rearm retry fields PTR's
+        # _enter_restart_rearm_retry() writes — proving this is a real,
+        # identity-bound, executable bounded retry, not a placeholder.
+        assert final_meta.get("restart_rearm_status") == "RETRY_PENDING"
+        _expected_owner_prefix = f"restart_rearm:{CLIENT_ID}:{EXEC_MODE}:"
+        assert str(final_meta.get("restart_rearm_owner") or "").startswith(
+            _expected_owner_prefix
+        ), (
+            f"restart_rearm_owner must be identity-bound to this exact "
+            f"client/mode/order, got {final_meta.get('restart_rearm_owner')!r}"
+        )
+        assert LOCAL_ORDER_ID in str(final_meta.get("restart_rearm_owner") or "")
+        assert final_meta.get("restart_rearm_attempt") == 1
+        assert final_meta.get("restart_rearm_next_at")
+        assert final_meta.get("restart_rearm_deadline")
+        assert final_meta.get("restart_rearm_reason")
+
+        # Never appears as UNRESOLVED-because-no-watcher: the outcome IS a
+        # durable bounded retry, not an absence of resolution.
+        assert final_meta.get("restart_rearm_status") != ""
+
+        # No fabricated watcher ownership.
+        assert not str(final_meta.get("watcher_token") or "").strip()
+        assert not str(final_meta.get("current_owner") or "").strip() or (
+            final_meta.get("current_owner") == final_meta.get("restart_rearm_owner")
+        )
+
+        # No deferred materialization retry was (re)scheduled — this is the
+        # restart-rearm retry subtype, not the materialization retry.
+        assert not final_meta.get("materialization_next_retry_at")
+        assert not final_meta.get("materialization_in_flight")
+
+        # Generation was not incorrectly incremented by the bounded-retry
+        # path itself — it must equal the post-rearm generation exactly.
+        assert final_meta.get("materialization_generation") == NEW_GEN
+
+        assert not selector.select.called
+        assert not selector.select_contract.called
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
-        # The row must never appear to have a fabricated watcher token.
-        assert not str(row_store["row"]["meta"].get("watcher_token") or "").strip()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -558,59 +601,91 @@ class TestQuoteUnavailableBoundedRetry:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestCrashAfterDurableWrite:
-    def test_fresh_recovery_instance_finds_restart_safe_row(self, monkeypatch):
-        """Simulates: real OSM rearm commits, then the process dies before
-        REARM_WATCHER_REQUIRED is consumed (no in-memory callback result
-        survives). A FRESH APStartupRecovery instance must still classify
-        the row correctly from durable state alone and either attach a
-        watcher or persist a bounded retry — never leave it silently lost.
+    def test_fresh_recovery_instance_recovers_via_real_orphan_scan(
+        self, monkeypatch,
+    ):
+        """Boundary: real rearm_deferred_materialization_direction_reversal()
+        commits durably, then the process dies before REARM_WATCHER_REQUIRED
+        is ever consumed — no in-memory callback result survives. A FRESH
+        APStartupRecovery instance must still recover the row purely from
+        durable state, via the real production path for exactly this row
+        shape: _reseed_watchers()'s orphaned-PENDING_TRIGGER scan, which
+        already calls PendingTriggerRestartRecovery.recover_one_row() for
+        kind=ENTRY/status=PENDING_TRIGGER/no-broker/no-submit rows. This is
+        not a new call site — it is pre-existing production code being
+        exercised for real, not a prepared/mocked outcome.
         """
-        # Build harness whose due row is ALREADY in the post-rearm shape
-        # (as if the OSM write committed but nothing consumed the result).
-        provenance = {
-            "canonical_signal_id": SIGNAL_ID, "client_id": CLIENT_ID,
-            "execution_mode": EXEC_MODE, "local_order_id": LOCAL_ORDER_ID,
-        }
-        post_rearm_meta = {
-            "lifecycle_state": "",
-            "materialization_status": "WAITING_FOR_TRIGGER",
-            "materialization_in_flight": False,
-            "materialization_owner": "",
-            "watcher_token": "",
-            "current_owner": OWNER,
-            "recovery_ownership": "recovery_scheduler",
-            "recovery_owner": OWNER,
-            "materialization_generation": NEW_GEN,
-            "retry_attempt": 0,
-            "breach_attempt_count": 0,
-            "materialization_attempts": 0,
-            "materialization_next_retry_at": None,
-            "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
-            "first_trigger_crossed_at": TRIGGER_TS,
-            "first_trigger_crossed_at_provenance": dict(provenance),
-            "first_trigger_confirmed_at": "2026-08-06T14:00:15+00:00",
-            "first_trigger_breach_bid": 100.5,
-            "first_trigger_breach_ask": 100.55,
-        }
-        # This row is NOT itself a due RETRY_WAIT row (the rearm already
-        # happened) — it must be found through the ORDINARY orphan-scan path
-        # a fresh startup recovery instance runs, independent of any due-
-        # retry bookkeeping. We construct the harness's due row directly in
-        # this post-rearm shape to prove the durable state alone (without
-        # any surviving in-memory callback) is restart-safe: a fresh
-        # APStartupRecovery reads it and does not error, corrupt it, or
-        # silently drop it.
         recovery, core, osm, row_store, watcher, selector, broker_calls = (
-            _build_harness(monkeypatch)
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
         )
-        row_store["row"]["meta"] = post_rearm_meta
-        row_store["row"]["status"] = "PENDING_TRIGGER"
-        row_store["row"]["broker_order_id"] = None
-        row_store["row"]["submitted_ts"] = None
 
-        result = {"errors": []}
-        # A fresh instance — proves no reliance on any previous instance's
-        # in-memory state.
+        # ── Step 1: perform the REAL rearm, durably, via the real OSM/SQL
+        # path already wired by _build_harness. ────────────────────────────
+        real_owner = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:{NEW_GEN + 1}"
+        # Advance the row to MATERIALIZING first (the rearm's CAS WHERE
+        # clause requires this), mirroring what resume_deferred's claim
+        # would have done.
+        row_store["row"]["meta"] = _materializing_meta(
+            generation=NEW_GEN, attempt=EXPECTED_ATT,
+        )
+        row_store["row"]["meta"]["materialization_owner"] = real_owner
+
+        ok = osm.rearm_deferred_materialization_direction_reversal(
+            LOCAL_ORDER_ID,
+            owner=real_owner,
+            watcher_token="",  # synthetic recovery — no real watcher yet
+            generation=NEW_GEN,
+            signal_id=SIGNAL_ID,
+            execution_mode=EXEC_MODE,
+            market_truth_audit={"reason": "CALL_NO_LONGER_ABOVE_TRIGGER"},
+        )
+        assert ok is True, "the real durable rearm must succeed"
+
+        # ── Step 2: post-write durable state must prove the exact corrected
+        # semantics before anything else happens. ──────────────────────────
+        post_write_meta = row_store["row"]["meta"]
+        assert post_write_meta["lifecycle_state"] == ""
+        assert post_write_meta["materialization_status"] == ""
+        assert post_write_meta["current_owner"] == ""
+        assert post_write_meta["watcher_token"] == ""
+        assert post_write_meta["recovery_owner"] == real_owner
+        assert post_write_meta["recovery_ownership"] == "recovery_scheduler"
+        assert post_write_meta["direction_reversal_rearm_requires_watcher"] is True
+
+        # ── Step 3: discard all process/callback state. The row_store dict
+        # itself stands in for durable Postgres state surviving a crash;
+        # nothing else from this point on may be reused. ───────────────────
+        durable_row = dict(row_store["row"])
+        durable_row["kind"] = "ENTRY"
+        durable_row["filled_ts"] = None
+
+        # ── Step 4: wire ap.db.conn/run_with_retry so _reseed_watchers()'s
+        # real SQL (_reset() UPDATE trade_queue, _load_orphaned_pending_
+        # trigger_orders() SELECT orders LEFT JOIN trade_queue) reflects
+        # exactly this one durable row and nothing else.
+        def _reseed_cursor():
+            _cur = _FakeCursor(select_rows=[dict(durable_row)])
+
+            def _exec(sql, params=None):
+                _sql_upper = sql.strip().upper()
+                if _sql_upper.startswith("UPDATE TRADE_QUEUE"):
+                    _cur.rowcount = 0  # no WATCHING queue row to reset
+                    _cur._select_rows = []
+                elif _sql_upper.startswith("SELECT"):
+                    _cur._select_rows = [dict(durable_row)]
+                return _cur
+
+            _cur.execute = _exec
+            return _cur
+
+        monkeypatch.setattr(
+            ap_db_mod, "conn", lambda: _FakeConnCtx(_reseed_cursor()),
+        )
+        monkeypatch.setattr(ap_db_mod, "run_with_retry", lambda fn: fn())
+
+        # ── Step 5: a fresh APStartupRecovery instance — proves no reliance
+        # on any previous instance's in-memory state or the original
+        # REARM_WATCHER_REQUIRED result object. ─────────────────────────────
         fresh_recovery = APStartupRecovery(
             client_id=CLIENT_ID,
             broker=recovery.broker,
@@ -620,18 +695,34 @@ class TestCrashAfterDurableWrite:
             entry_watcher=watcher,
             execution_core=core,
         )
-        # This row is not RETRY_WAIT, so the due-retry branch of
-        # _recover_deferred_breach_lifecycles will not fire for it; it is
-        # picked up by the ordinary should_resume path (lifecycle=="" and
-        # materialization_status in {"", "WAITING_FOR_TRIGGER"}). We assert
-        # the method completes without raising and without corrupting the
-        # row identity — the substantive routing guarantee for a genuinely
-        # due RETRY_WAIT row is already proven end-to-end by scenarios 1-2.
-        fresh_recovery._recover_deferred_breach_lifecycles(result)
 
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check",
+            lambda broker, symbol, side, trigger: False,  # quote available
+        )
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        # ── Step 6: the real production path (recover_one_row(), reused
+        # unmodified) must have either attached a real watcher or persisted
+        # a bounded restart-rearm retry — never silently dropped the row.
+        watcher_attached = watcher.has_order(LOCAL_ORDER_ID)
+        retry_meta = row_store["row"].get("meta") or {}
+        bounded_retry_persisted = (
+            str(retry_meta.get("restart_rearm_status") or "").upper()
+            == "RETRY_PENDING"
+        )
+        assert watcher_attached or bounded_retry_persisted, (
+            f"fresh recovery must attach a real watcher or persist a "
+            f"bounded restart-rearm retry from durable state alone; "
+            f"got watcher_attached={watcher_attached} "
+            f"bounded_retry_persisted={bounded_retry_persisted} "
+            f"meta={retry_meta}"
+        )
         assert row_store["row"]["local_order_id"] == LOCAL_ORDER_ID
         assert row_store["row"]["client_id"] == CLIENT_ID
-        # No order duplication / no broker submission from a restart alone.
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
 
@@ -689,6 +780,117 @@ class TestConcurrentGenerationAdvancement:
         ), f"expected a structured generation-mismatch error, got {result.get('errors')}"
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
+
+
+class TestStrictDurableGenerationValidation:
+    """Durable materialization_generation must reject Boolean and float
+    values before ever calling PendingTriggerRestartRecovery.recover_one_row()
+    — bare int(x) coercion would silently accept int(True)==1, int(1.9)==1.
+    """
+
+    def _run_with_durable_generation(self, monkeypatch, bad_value):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+        _original_get_order = osm.get_order
+        _mangled = {"done": False}
+
+        def _osm_get_order_then_mangle(order_id):
+            row = _original_get_order(order_id)
+            if (
+                not _mangled["done"]
+                and row
+                and (row.get("meta") or {}).get("lifecycle_state") == ""
+            ):
+                _mangled["done"] = True
+                row_store["row"]["meta"]["materialization_generation"] = bad_value
+                row = dict(row_store["row"])
+            return row
+
+        osm.get_order = _osm_get_order_then_mangle
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+        return watcher, selector, broker_calls, result
+
+    def test_durable_generation_boolean_rejected(self, monkeypatch):
+        watcher, selector, broker_calls, result = self._run_with_durable_generation(
+            monkeypatch, True,
+        )
+        assert len(watcher._pending) == 0
+        assert not selector.select.called
+        assert not selector.select_contract.called
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+        assert result.get("errors"), "expected a structured recovery error"
+
+    def test_durable_generation_float_rejected(self, monkeypatch):
+        watcher, selector, broker_calls, result = self._run_with_durable_generation(
+            monkeypatch, 1.9,
+        )
+        assert len(watcher._pending) == 0
+        assert not selector.select.called
+        assert not selector.select_contract.called
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+        assert result.get("errors"), "expected a structured recovery error"
+
+
+class TestBrokerReadyCrashWindowRejection:
+    def test_broker_ready_true_blocks_handoff_before_ptr(self, monkeypatch):
+        """A refreshed row with authoritative broker_ready=true (durable
+        crash-window evidence) must never reach
+        PendingTriggerRestartRecovery.recover_one_row() at all — not merely
+        produce a different PTR outcome.
+        """
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+        _original_get_order = osm.get_order
+        _mangled = {"done": False}
+
+        def _osm_get_order_then_set_broker_ready(order_id):
+            row = _original_get_order(order_id)
+            if (
+                not _mangled["done"]
+                and row
+                and (row.get("meta") or {}).get("lifecycle_state") == ""
+            ):
+                _mangled["done"] = True
+                row_store["row"]["meta"]["broker_ready"] = True
+                row = dict(row_store["row"])
+            return row
+
+        osm.get_order = _osm_get_order_then_set_broker_ready
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        _ptr_calls = []
+        _original_recover_one_row = ptr_mod.PendingTriggerRestartRecovery.recover_one_row
+
+        def _spy_recover_one_row(self, *a, **kw):
+            _ptr_calls.append((a, kw))
+            return _original_recover_one_row(self, *a, **kw)
+
+        monkeypatch.setattr(
+            ptr_mod.PendingTriggerRestartRecovery, "recover_one_row",
+            _spy_recover_one_row,
+        )
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert _ptr_calls == [], (
+            "recover_one_row() must never be invoked when durable "
+            "broker_ready evidence is present"
+        )
+        assert len(watcher._pending) == 0
+        assert not selector.select.called
+        assert not selector.select_contract.called
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+        assert result.get("errors"), (
+            "expected a structured recovery/crash-window error"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -963,6 +1165,45 @@ class TestMutationSurface:
             ptr_mod, "_default_quote_check", _quote_check_available,
         )
 
+        # Real spies: wrap the already-wired ap.db.conn and
+        # ap.order_state_machine.conn cursors so every SQL statement
+        # actually executed during this recovery pass is captured verbatim
+        # — not a tautological "not X.called or True" against an unrelated
+        # MagicMock, but the real SQL traffic on the two connections this
+        # flow uses.
+        _captured_sql = []
+
+        _orig_db_conn_factory = ap_db_mod.conn
+        _orig_osm_conn_factory = osm_mod.conn
+
+        def _spy_wrap(conn_factory):
+            def _factory():
+                _conn_ctx = conn_factory()
+                _real_cursor = _conn_ctx._cursor if hasattr(
+                    _conn_ctx, "_cursor"
+                ) else None
+
+                class _SpyConnCtx:
+                    def __enter__(self_inner):
+                        _cur = _conn_ctx.__enter__()
+                        _orig_execute = _cur.execute
+
+                        def _spy_execute(sql, params=None):
+                            _captured_sql.append(sql)
+                            return _orig_execute(sql, params)
+
+                        _cur.execute = _spy_execute
+                        return _cur
+
+                    def __exit__(self_inner, *exc):
+                        return _conn_ctx.__exit__(*exc)
+
+                return _SpyConnCtx()
+            return _factory
+
+        monkeypatch.setattr(ap_db_mod, "conn", _spy_wrap(_orig_db_conn_factory))
+        monkeypatch.setattr(osm_mod, "conn", _spy_wrap(_orig_osm_conn_factory))
+
         # pm (position manager) mutation surface — recovery must never call
         # any position-mutating method as a side effect of this handoff.
         pm = recovery.pm
@@ -979,6 +1220,24 @@ class TestMutationSurface:
                 assert not _attr.called, (
                     f"pm.{_forbidden}() must not be called by this handoff"
                 )
-        assert not core.store.update_status.called or True  # store is signal-log only
+
+        # Positive control: the spy must have actually captured real SQL
+        # traffic (the rearm's UPDATE orders ...), proving this is a
+        # meaningful assertion, not a vacuous pass because nothing ran.
+        assert any(
+            "orders" in sql.lower() for sql in _captured_sql
+        ), f"expected to capture real orders-table SQL, got {_captured_sql!r}"
+
+        # Negative control: no captured SQL statement references any of
+        # the three forbidden tables.
+        for _table in ("positions", "proof_trades", "trade_queue"):
+            _hits = [sql for sql in _captured_sql if _table in sql.lower()]
+            assert not _hits, (
+                f"direction-reversal rearm + watcher-recovery handoff must "
+                f"make zero {_table} writes, but captured: {_hits!r}"
+            )
+
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
+        assert not selector.select.called
+        assert not selector.select_contract.called

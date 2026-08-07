@@ -345,7 +345,11 @@ class TestDirectionReversalRearmCAS:
         assert ok is True
         assert after["status"] == "PENDING_TRIGGER"
         assert after["meta"]["lifecycle_state"] == ""
-        assert after["meta"]["materialization_status"] == "WAITING_FOR_TRIGGER"
+        # Truly blank pre-breach status at rearm time. WAITING_FOR_TRIGGER
+        # is written only by the later, separate durable ownership-adoption
+        # step (ap_recovery.py + adopt_direction_reversal_watcher_ownership),
+        # which this OSM-level test does not exercise.
+        assert after["meta"]["materialization_status"] == ""
         assert after["meta"]["materialization_owner"] == ""
         assert after["meta"]["current_owner"] == "watcher:real-owner"
         assert after["meta"]["watcher_token"] == "watcher:real-owner"
@@ -379,8 +383,10 @@ class TestDirectionReversalRearmCAS:
         )
         after = _fetch_row(self.LOID)
         assert ok is True
-        assert after["meta"]["materialization_status"] == "WAITING_FOR_TRIGGER"
-        assert after["meta"]["current_owner"] == "watcher:real-owner"
+        assert after["meta"]["materialization_status"] == ""
+        # A recovery takeover token is not watcher ownership -- current_owner
+        # must never fall back to it.
+        assert after["meta"]["current_owner"] == ""
         assert after["meta"]["watcher_token"] == ""
         assert after["meta"]["recovery_ownership"] == "recovery_scheduler"
         assert after["meta"]["recovery_owner"] == "watcher:real-owner"

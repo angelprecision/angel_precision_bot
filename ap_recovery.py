@@ -1394,8 +1394,12 @@ class APStartupRecovery:
             if callable(_release_fn):
                 try:
                     _release_fn()
-                except Exception:
-                    pass
+                except Exception as _release_exc:
+                    log.warning(
+                        "[%s] REARM_WATCHER_REQUIRED_EVICTION_RELEASE_DEDUP_FAILED "
+                        "local_order_id=%s exc=%s",
+                        self.client_id, local_order_id, _release_exc,
+                    )
             else:
                 _dedup = getattr(entry_watcher, "_dedup_set", None)
                 if isinstance(_dedup, set) and signal_id in _dedup:
@@ -2541,14 +2545,29 @@ class APStartupRecovery:
                             _exp_loid = str(
                                 _outcome.get("local_order_id") or local_order_id
                             ).strip()
+                            def _strict_generation(raw):
+                                # Reused for both expected_generation (from
+                                # the in-memory callback outcome) and durable
+                                # materialization_generation (from JSONB,
+                                # which psycopg2 deserializes into the same
+                                # Python int/float/bool/str/None shapes) —
+                                # one narrow parser, not a generalized
+                                # framework. Rejects missing, Boolean, float,
+                                # negative, blank, and any string (JSONB
+                                # numbers never deserialize as strings, so a
+                                # string here is always malformed/decimal/
+                                # scientific-notation input, not a valid
+                                # generation).
+                                return (
+                                    raw
+                                    if isinstance(raw, int)
+                                    and not isinstance(raw, bool)
+                                    and raw >= 1
+                                    else None
+                                )
+
                             _exp_gen_raw = _outcome.get("expected_generation")
-                            _exp_gen = (
-                                _exp_gen_raw
-                                if isinstance(_exp_gen_raw, int)
-                                and not isinstance(_exp_gen_raw, bool)
-                                and _exp_gen_raw >= 1
-                                else None
-                            )
+                            _exp_gen = _strict_generation(_exp_gen_raw)
 
                             def _rwr_fail(reason):
                                 log.critical(
@@ -2607,21 +2626,31 @@ class APStartupRecovery:
                                     _rwr_fail("identity_mismatch")
                                     continue
 
-                                # Exact generation — never >=.
-                                try:
-                                    _durable_gen = int(
-                                        _rwr_meta.get("materialization_generation")
-                                        or 0
-                                    )
-                                except (TypeError, ValueError):
-                                    _durable_gen = -1
+                                # Exact generation — never >=. Same strict
+                                # parser as expected_generation: a Boolean,
+                                # float, negative, or otherwise malformed
+                                # durable value fails closed rather than
+                                # silently coercing (Python's bare int(x)
+                                # would accept int(True)==1, int(1.9)==1).
+                                _durable_gen = _strict_generation(
+                                    _rwr_meta.get("materialization_generation")
+                                )
+                                if _durable_gen is None:
+                                    _rwr_fail("durable_generation_malformed")
+                                    continue
                                 if _durable_gen != _exp_gen:
                                     _rwr_fail("generation_advanced_concurrently")
                                     continue
 
                                 # Authoritative broker-absence columns +
-                                # existing crash-window rule (submit_intent_at
-                                # present with no landed broker_order_id).
+                                # existing crash-window rules (submit_intent_at
+                                # present with no landed broker_order_id, or
+                                # broker_ready durably true) — the same
+                                # authoritative idiom already used elsewhere
+                                # in this file for this exact lifecycle.
+                                _rwr_broker_ready = str(
+                                    _rwr_meta.get("broker_ready") or "false"
+                                ).lower()
                                 _authoritative_ok = (
                                     str(_rwr_row.get("kind") or "").strip().upper()
                                     == "ENTRY"
@@ -2632,6 +2661,7 @@ class APStartupRecovery:
                                     ).strip()
                                     and not _rwr_row.get("submitted_ts")
                                     and not _rwr_meta.get("submit_intent_at")
+                                    and _rwr_broker_ready in {"false", ""}
                                 )
                                 if not _authoritative_ok:
                                     _rwr_fail("state_invalid_or_crash_window")
