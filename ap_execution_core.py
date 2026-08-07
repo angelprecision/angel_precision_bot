@@ -738,11 +738,16 @@ def _reset_direction_reversal_runtime_state(
     _now_iso = now_utc_iso()
     reset_patch = {
         "lifecycle_state": "",
-        "materialization_status": "WAITING_FOR_TRIGGER",
+        # Truly blank pre-breach status — mirrors the durable OSM write.
+        # WAITING_FOR_TRIGGER is only ever set later, once a real watcher
+        # has actually been proven and durable ownership adopted.
+        "materialization_status": "",
         "materialization_in_flight": False,
         "materialization_owner": "",
         "materialization_lease_until": "",
-        "current_owner": watcher_token or recovery_owner,
+        # A recovery takeover token is not watcher ownership — never fall
+        # back to recovery_owner here.
+        "current_owner": watcher_token if watcher_token else "",
         "watcher_token": watcher_token,
         "watcher_generation": (generation if watcher_token else 0),
         "watcher_registered_at": (_now_iso if watcher_token else ""),

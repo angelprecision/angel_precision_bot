@@ -224,9 +224,14 @@ class _FakeWatched:
 class _FakeWatcher:
     """Faithful-enough fake of APEntryWatcher for registry-proof purposes."""
 
-    def __init__(self):
+    def __init__(self, owner_token="watcher-token-from-ptr"):
         self._pending = []
         self._dedup_set = set()
+        # Real APEntryWatcher.watch() stamps signal_dict["watcher_token"] =
+        # self.owner_token — a process-level token identifying this watcher
+        # instance. ap_recovery.py's ownership-adoption step reads this
+        # attribute directly to durably transfer ownership.
+        self.owner_token = owner_token
 
     def has_order(self, oid):
         return any(
@@ -478,16 +483,42 @@ class TestQuoteAvailableRealWatcherAttached:
         recovery._recover_deferred_breach_lifecycles(result)
 
         final_meta = row_store["row"]["meta"]
-        assert final_meta.get("watcher_token") == "watcher-token-from-ptr" or (
-            len(watcher._pending) == 1
-        ), "a real watcher must have been registered against the row"
+        real_token = watcher.owner_token
+
+        # entry_watcher.has_order(local_order_id) == True
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
         assert len(watcher._pending) == 1
         assert watcher._pending[0].signal["local_order_id"] == LOCAL_ORDER_ID
         assert watcher._pending[0].signal["signal_id"] == SIGNAL_ID
+
+        # Durable ownership must be truthfully transferred to the real
+        # watcher token — not left split between runtime and durable state.
+        assert final_meta.get("current_owner") == real_token
+        assert final_meta.get("watcher_token") == real_token
+        assert final_meta.get("recovery_owner") == ""
+        assert final_meta.get("recovery_ownership") == ""
+        assert final_meta.get("direction_reversal_rearm_requires_watcher") is False
+        assert final_meta.get("materialization_status") == "WAITING_FOR_TRIGGER"
+
+        # No stale selector cursor, retry counters, or retry schedule survive.
+        assert "selector_recovery_cursor_v1" not in final_meta
+        assert final_meta.get("retry_attempt") == 0
+        assert final_meta.get("breach_attempt_count") == 0
+        assert final_meta.get("materialization_attempts") == 0
+        assert not final_meta.get("materialization_next_retry_at")
+
+        # Exact identity preserved.
+        assert row_store["row"]["client_id"] == CLIENT_ID
+        assert row_store["row"]["execution_mode"] == EXEC_MODE
+
         assert not result.get("errors"), f"expected no errors, got {result['errors']}"
-        # Zero broker calls anywhere in this flow.
+        # Zero broker calls anywhere in this flow — the next genuine breach
+        # (not exercised by this recovery pass) is what starts selector
+        # attempt 1, never this rearm/adoption handoff itself.
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
+        assert not selector.select.called
+        assert not selector.select_contract.called
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -623,20 +654,27 @@ class TestConcurrentGenerationAdvancement:
         # After the real rearm commits (generation NEW_GEN), simulate a
         # concurrent worker bumping the generation further before the
         # REARM_WATCHER_REQUIRED handler in ap_recovery.py re-reads the row.
-        _original_update = osm.update_order_meta
-
+        # The rearm write itself goes through raw SQL (osm_mod.conn), not
+        # update_order_meta, so the bump is injected at the next read after
+        # the rearm has landed (identified by the telltale cleared
+        # lifecycle_state), which is exactly when a concurrent worker's
+        # advancement would actually be observed.
+        _original_get_order = osm.get_order
         _bumped = {"done": False}
 
-        def _osm_update_order_meta_then_bump(order_id, patch):
-            ok = _original_update(order_id, patch)
-            # Only bump once, right after the rearm's own write lands
-            # (identified by the rearm's telltale cleared lifecycle_state).
-            if not _bumped["done"] and patch.get("lifecycle_state") == "":
+        def _osm_get_order_then_bump(order_id):
+            row = _original_get_order(order_id)
+            if (
+                not _bumped["done"]
+                and row
+                and (row.get("meta") or {}).get("lifecycle_state") == ""
+            ):
                 _bumped["done"] = True
                 row_store["row"]["meta"]["materialization_generation"] = NEW_GEN + 1
-            return ok
+                row = dict(row_store["row"])
+            return row
 
-        osm.update_order_meta = _osm_update_order_meta_then_bump
+        osm.get_order = _osm_get_order_then_bump
 
         result = {"errors": []}
         recovery._recover_deferred_breach_lifecycles(result)
@@ -679,11 +717,13 @@ class TestRepeatedRecoveryPassIsIdempotent:
         _generation_after_pass1 = row_store["row"]["meta"].get(
             "materialization_generation"
         )
+        _owner_after_pass1 = row_store["row"]["meta"].get("current_owner")
+        _token_after_pass1 = row_store["row"]["meta"].get("watcher_token")
 
         # Second pass against the SAME (now-owned) row. Since the row's
         # lifecycle is no longer RETRY_WAIT (it is watcher-owned or blank),
         # the due-retry branch should not re-fire, and no additional
-        # watcher/generation mutation should occur.
+        # watcher/generation/ownership mutation should occur.
         result2 = {"errors": []}
         recovery._recover_deferred_breach_lifecycles(result2)
 
@@ -694,6 +734,12 @@ class TestRepeatedRecoveryPassIsIdempotent:
             row_store["row"]["meta"].get("materialization_generation")
             == _generation_after_pass1
         ), "a second recovery pass must not increment materialization_generation"
+        assert (
+            row_store["row"]["meta"].get("current_owner") == _owner_after_pass1
+        ), "a second recovery pass must not create duplicate watcher ownership"
+        assert (
+            row_store["row"]["meta"].get("watcher_token") == _token_after_pass1
+        ), "a second recovery pass must not create duplicate watcher ownership"
         assert not row_store["row"]["meta"].get("trigger_crossed_at"), (
             "a second recovery pass must not restore cleared active trigger evidence"
         )
@@ -701,6 +747,60 @@ class TestRepeatedRecoveryPassIsIdempotent:
         assert broker_calls["cancel"] == []
         assert not selector.select.called
         assert not selector.select_contract.called
+
+
+class TestConcurrentRecoveryConvergence:
+    def test_two_competing_recovery_instances_converge_to_one_owner(
+        self, monkeypatch,
+    ):
+        """Two independently-constructed APStartupRecovery instances (as if
+        two overlapping recovery passes raced against the same due row)
+        must converge to exactly one durable watcher owner — never a
+        duplicate watcher registration or duplicate retry ownership.
+        """
+        recovery1, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        # A second, independently-constructed recovery instance sharing the
+        # same durable row_store, OSM, watcher, and broker — modeling a
+        # second overlapping recovery pass rather than reusing recovery1's
+        # own in-memory state.
+        recovery2 = APStartupRecovery(
+            client_id=CLIENT_ID,
+            broker=recovery1.broker,
+            osm=osm,
+            pm=MagicMock(),
+            master_control=SimpleNamespace(mode="PAPER"),
+            entry_watcher=watcher,
+            execution_core=core,
+        )
+
+        result1 = {"errors": []}
+        recovery1._recover_deferred_breach_lifecycles(result1)
+        result2 = {"errors": []}
+        recovery2._recover_deferred_breach_lifecycles(result2)
+
+        # Exactly one durable watcher owner — never two.
+        assert len(watcher._pending) == 1, (
+            "two competing recovery passes must converge to exactly one "
+            "watcher registration, not duplicate it"
+        )
+        final_meta = row_store["row"]["meta"]
+        assert final_meta.get("current_owner") == watcher.owner_token
+        assert final_meta.get("watcher_token") == watcher.owner_token
+        assert final_meta.get("recovery_owner") == ""
+        assert final_meta.get("recovery_ownership") == ""
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

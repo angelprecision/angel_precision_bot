@@ -2458,244 +2458,124 @@ class APStartupRecovery:
                                 f"retry_schedule_failed:{local_order_id}"
                             )
                         elif _disp == "REARM_WATCHER_REQUIRED":
-                            # A synthetic due-retry callback completed a
-                            # direction-reversal rearm but had no real registered
-                            # watcher.  The OSM already committed the clean
-                            # pre-breach state. Re-read the exact durable row,
-                            # require an EXACT (not >=) generation match against
-                            # the callback's expected_generation, verify the
-                            # authoritative broker-absence + crash-window
-                            # predicates, and route through the existing
-                            # PendingTriggerRestartRecovery.recover_one_row()
-                            # single-row entry point on this same recovery pass.
-                            # Never returns UNRESOLVED merely because no watcher
-                            # existed during the synthetic callback.
-                            _rwr_exp_client = str(
+                            # Narrow adapter: verify the exact-generation
+                            # handoff, then hand off entirely to the
+                            # canonical PendingTriggerRestartRecovery engine.
+                            # No classification, watcher-admission, or
+                            # retry-persistence logic is duplicated here.
+                            _exp_client = str(
                                 _outcome.get("expected_client_id") or ""
                             ).strip().lower()
-                            _rwr_exp_mode = str(
+                            _exp_mode = str(
                                 _outcome.get("expected_execution_mode") or ""
                             ).strip().lower()
-                            _rwr_exp_signal = str(
+                            _exp_signal = str(
                                 _outcome.get("expected_signal_id") or ""
                             ).strip()
-                            _rwr_exp_canonical = str(
+                            _exp_canonical = str(
                                 _outcome.get("expected_canonical_signal_id") or ""
                             ).strip()
-                            _rwr_exp_loid = str(
+                            _exp_loid = str(
                                 _outcome.get("local_order_id") or local_order_id
                             ).strip()
-
-                            # Constraint A: fail closed on missing, malformed,
-                            # Boolean, floating-point, negative, or mismatched
-                            # expected_generation — accept only a genuine,
-                            # non-bool, non-negative int.
-                            def _rwr_parse_exact_generation(raw):
-                                if raw is None:
-                                    return None, "MISSING"
-                                if isinstance(raw, bool):
-                                    return None, "BOOLEAN"
-                                if isinstance(raw, float):
-                                    return None, "FLOAT"
-                                if isinstance(raw, int):
-                                    return (raw, None) if raw >= 0 else (None, "NEGATIVE")
-                                if isinstance(raw, str):
-                                    _s = raw.strip()
-                                    if not _s or not (
-                                        _s.lstrip("-").isdigit()
-                                    ) or "." in _s:
-                                        return None, "MALFORMED"
-                                    _v = int(_s)
-                                    return (_v, None) if _v >= 0 else (None, "NEGATIVE")
-                                return None, "MALFORMED"
-
-                            _rwr_exp_gen, _rwr_exp_gen_err = _rwr_parse_exact_generation(
-                                _outcome.get("expected_generation")
+                            _exp_gen_raw = _outcome.get("expected_generation")
+                            _exp_gen = (
+                                _exp_gen_raw
+                                if isinstance(_exp_gen_raw, int)
+                                and not isinstance(_exp_gen_raw, bool)
+                                and _exp_gen_raw >= 1
+                                else None
                             )
 
+                            def _rwr_fail(reason):
+                                log.critical(
+                                    "[%s] REARM_WATCHER_REQUIRED_%s local_order_id=%s "
+                                    "— retaining ownership, no watcher registered",
+                                    self.client_id, reason.upper(), local_order_id,
+                                )
+                                _retain_recovery_ownership(
+                                    local_order_id,
+                                    reason=f"rearm_watcher_required_{reason}",
+                                )
+                                result.setdefault("errors", []).append(
+                                    f"rearm_watcher_required_{reason}:{local_order_id}"
+                                )
+
+                            if (
+                                _exp_gen is None or not _exp_client
+                                or _exp_mode not in {"live", "paper"}
+                                or not _exp_signal or not _exp_loid
+                            ):
+                                _rwr_fail("expected_fields_invalid")
+                                continue
+
                             try:
-                                if _rwr_exp_gen_err or not _rwr_exp_client or \
-                                   _rwr_exp_mode not in {"live", "paper"} or \
-                                   not _rwr_exp_signal or not _rwr_exp_loid:
-                                    log.critical(
-                                        "[%s] REARM_WATCHER_REQUIRED_EXPECTED_FIELDS_INVALID "
-                                        "local_order_id=%s expected_generation_err=%s "
-                                        "expected_client=%r expected_mode=%r "
-                                        "expected_signal=%r — retaining ownership, "
-                                        "no watcher registered",
-                                        self.client_id, local_order_id,
-                                        _rwr_exp_gen_err, _rwr_exp_client,
-                                        _rwr_exp_mode, _rwr_exp_signal,
-                                    )
-                                    _retain_recovery_ownership(
-                                        local_order_id,
-                                        reason=(
-                                            "rearm_watcher_required_expected_fields_invalid:"
-                                            f"{_rwr_exp_gen_err or 'identity'}"
-                                        ),
-                                    )
-                                    result.setdefault("errors", []).append(
-                                        f"rearm_watcher_required_expected_fields_invalid:"
-                                        f"{local_order_id}"
-                                    )
-                                    continue
-
-                                _rwr_row = self.osm.get_order(_rwr_exp_loid)
+                                _rwr_row = self.osm.get_order(_exp_loid)
                                 if not _rwr_row:
-                                    log.critical(
-                                        "[%s] REARM_WATCHER_REQUIRED_ROW_MISSING "
-                                        "local_order_id=%s — retaining ownership",
-                                        self.client_id, local_order_id,
-                                    )
-                                    _retain_recovery_ownership(
-                                        local_order_id,
-                                        reason="rearm_watcher_required_row_missing",
-                                    )
-                                    result.setdefault("errors", []).append(
-                                        f"rearm_watcher_required_row_missing:{local_order_id}"
-                                    )
+                                    _rwr_fail("row_missing")
                                     continue
-                                _rwr_meta = _rwr_row.get("meta") or {}
-                                if isinstance(_rwr_meta, str):
-                                    import json as _rwr_json
-                                    try:
-                                        _rwr_meta = _rwr_json.loads(_rwr_meta)
-                                    except Exception:
-                                        _rwr_meta = {}
-                                if not isinstance(_rwr_meta, dict):
-                                    _rwr_meta = {}
+                                _rwr_meta = self._coerce_order_meta(
+                                    _rwr_row.get("meta")
+                                )
 
-                                # Exact identity — including canonical_signal_id
-                                # when the callback supplied one.
-                                _rwr_row_canonical = str(
+                                # Identity (constraint: local_order_id,
+                                # client_id, signal_id, canonical_signal_id
+                                # when expected, execution_mode).
+                                _rwr_canonical = str(
                                     _rwr_row.get("canonical_signal_id")
                                     or _rwr_meta.get("canonical_signal_id")
                                     or ""
                                 ).strip()
-                                _rwr_identity_ok = (
-                                    str(_rwr_row.get("client_id") or "").strip().lower()
-                                    == _rwr_exp_client
+                                _identity_ok = (
+                                    str(_rwr_row.get("local_order_id") or "").strip()
+                                    == _exp_loid
+                                    and str(_rwr_row.get("client_id") or "")
+                                    .strip().lower() == _exp_client
                                     and str(_rwr_row.get("signal_id") or "").strip()
-                                    == _rwr_exp_signal
+                                    == _exp_signal
                                     and str(_rwr_row.get("execution_mode") or "")
-                                    .strip().lower() == _rwr_exp_mode
-                                    and str(_rwr_row.get("local_order_id") or "").strip()
-                                    == _rwr_exp_loid
+                                    .strip().lower() == _exp_mode
                                     and (
-                                        not _rwr_exp_canonical
-                                        or _rwr_row_canonical == _rwr_exp_canonical
+                                        not _exp_canonical
+                                        or _rwr_canonical == _exp_canonical
                                     )
                                 )
-                                if not _rwr_identity_ok:
-                                    log.critical(
-                                        "[%s] REARM_WATCHER_REQUIRED_IDENTITY_MISMATCH "
-                                        "local_order_id=%s — retaining ownership",
-                                        self.client_id, local_order_id,
-                                    )
-                                    _retain_recovery_ownership(
-                                        local_order_id,
-                                        reason="rearm_watcher_required_identity_mismatch",
-                                    )
-                                    result.setdefault("errors", []).append(
-                                        f"rearm_watcher_required_identity_mismatch:"
-                                        f"{local_order_id}"
-                                    )
+                                if not _identity_ok:
+                                    _rwr_fail("identity_mismatch")
                                     continue
 
-                                # Constraint E: authoritative broker-absence
-                                # predicates from persisted order columns —
-                                # never from metadata alone.
-                                _rwr_kind_ok = (
-                                    str(_rwr_row.get("kind") or "").strip().upper()
-                                    == "ENTRY"
-                                )
-                                _rwr_status = str(
-                                    _rwr_row.get("status") or ""
-                                ).strip().upper()
-                                _rwr_broker_absent = not str(
-                                    _rwr_row.get("broker_order_id") or ""
-                                ).strip()
-                                _rwr_not_submitted = not _rwr_row.get("submitted_ts")
-
-                                # Constraint E: crash-window rule — reuses the
-                                # exact same durable predicate already applied
-                                # by the due-retry loop above (submit_intent_at
-                                # present with no broker_order_id landed means
-                                # the process may have crashed between broker
-                                # accept and id-commit; a live order may exist).
-                                _rwr_crash_window = bool(
-                                    _rwr_meta.get("submit_intent_at")
-                                    and _rwr_broker_absent
-                                )
-
-                                _rwr_lifecycle = str(
-                                    _rwr_meta.get("lifecycle_state") or ""
-                                ).strip()
-                                _rwr_watcher_token = str(
-                                    _rwr_meta.get("watcher_token") or ""
-                                ).strip()
+                                # Exact generation — never >=.
                                 try:
-                                    _rwr_generation = int(
+                                    _durable_gen = int(
                                         _rwr_meta.get("materialization_generation")
                                         or 0
                                     )
                                 except (TypeError, ValueError):
-                                    _rwr_generation = -1  # forces mismatch below
-
-                                _rwr_state_ok = (
-                                    _rwr_kind_ok
-                                    and _rwr_status == "PENDING_TRIGGER"
-                                    and _rwr_broker_absent
-                                    and _rwr_not_submitted
-                                    and not _rwr_crash_window
-                                    and not _rwr_lifecycle
-                                    and not _rwr_meta.get("trigger_crossed_at")
-                                    and not _rwr_watcher_token
-                                    # Constraint A: EXACT match, never >=. A
-                                    # greater durable generation means another
-                                    # worker advanced ownership concurrently —
-                                    # treat as concurrent advancement, not a
-                                    # stale-but-acceptable read.
-                                    and _rwr_generation == _rwr_exp_gen
-                                )
-                                if not _rwr_state_ok:
-                                    _rwr_reason = (
-                                        "generation_advanced_concurrently"
-                                        if _rwr_generation != _rwr_exp_gen
-                                        else "crash_window_evidence"
-                                        if _rwr_crash_window
-                                        else "state_invalid"
-                                    )
-                                    log.critical(
-                                        "[%s] REARM_WATCHER_REQUIRED_STATE_INVALID "
-                                        "local_order_id=%s reason=%s kind_ok=%s "
-                                        "status=%s lifecycle=%s broker_absent=%s "
-                                        "not_submitted=%s crash_window=%s "
-                                        "watcher_token=%s generation=%s expected_gen=%s "
-                                        "trigger_crossed_at=%s — retaining ownership, "
-                                        "no watcher registered",
-                                        self.client_id, local_order_id, _rwr_reason,
-                                        _rwr_kind_ok, _rwr_status, _rwr_lifecycle,
-                                        _rwr_broker_absent, _rwr_not_submitted,
-                                        _rwr_crash_window, bool(_rwr_watcher_token),
-                                        _rwr_generation, _rwr_exp_gen,
-                                        bool(_rwr_meta.get("trigger_crossed_at")),
-                                    )
-                                    _retain_recovery_ownership(
-                                        local_order_id,
-                                        reason=f"rearm_watcher_required_{_rwr_reason}",
-                                    )
-                                    result.setdefault("errors", []).append(
-                                        f"rearm_watcher_required_{_rwr_reason}:"
-                                        f"{local_order_id}"
-                                    )
+                                    _durable_gen = -1
+                                if _durable_gen != _exp_gen:
+                                    _rwr_fail("generation_advanced_concurrently")
                                     continue
 
-                                # Constraint B: reuse the existing public
-                                # single-row recovery entry point exactly —
-                                # never _recover_one(), never _reseed_watchers(),
-                                # never a duplicated classification or a direct
-                                # entry_watcher.watch() call from this handler.
+                                # Authoritative broker-absence columns +
+                                # existing crash-window rule (submit_intent_at
+                                # present with no landed broker_order_id).
+                                _authoritative_ok = (
+                                    str(_rwr_row.get("kind") or "").strip().upper()
+                                    == "ENTRY"
+                                    and str(_rwr_row.get("status") or "")
+                                    .strip().upper() == "PENDING_TRIGGER"
+                                    and not str(
+                                        _rwr_row.get("broker_order_id") or ""
+                                    ).strip()
+                                    and not _rwr_row.get("submitted_ts")
+                                    and not _rwr_meta.get("submit_intent_at")
+                                )
+                                if not _authoritative_ok:
+                                    _rwr_fail("state_invalid_or_crash_window")
+                                    continue
+
+                                # Sole authority for classification, watcher
+                                # admission, and bounded restart-rearm retry.
                                 from ap.pending_trigger_restart_recovery import (
                                     PendingTriggerRestartRecovery as _PTR_RWR,
                                     _RowOutcome as _RWR_RowOutcome,
@@ -2720,87 +2600,62 @@ class APStartupRecovery:
                                     self.client_id, local_order_id, _rwr_outcome,
                                 )
 
-                                # Constraint C: explicit result mapping.
                                 if _rwr_outcome == _RWR_RowOutcome.WATCHER_OWNED:
-                                    recovered += 1
-                                elif _rwr_outcome == _RWR_RowOutcome.REARM_OWNED:
-                                    # Bounded restart-rearm retry durably
-                                    # established — count as durably recovered.
-                                    recovered += 1
-                                elif _rwr_outcome == _RWR_RowOutcome.RETRY_OWNED:
-                                    # PTR's actual current bounded-retry return
-                                    # value (REARM_OWNED is reserved but not yet
-                                    # emitted by PTR) — same durable-recovery
-                                    # semantics as REARM_OWNED.
+                                    # PTR proved a real watcher registration
+                                    # in-process, but writes no durable
+                                    # ownership itself. Perform the narrow,
+                                    # CAS-fenced adoption so durable state
+                                    # truthfully matches: only THEN count the
+                                    # row as recovered.
+                                    _real_token = str(
+                                        getattr(self.entry_watcher, "owner_token", "")
+                                        or ""
+                                    ).strip()
+                                    _adopted = bool(
+                                        _real_token
+                                        and self.osm.adopt_direction_reversal_watcher_ownership(
+                                            _exp_loid,
+                                            recovery_owner=str(
+                                                _rwr_meta.get("recovery_owner") or ""
+                                            ),
+                                            watcher_token=_real_token,
+                                            generation=_exp_gen,
+                                            signal_id=_exp_signal,
+                                            execution_mode=_exp_mode,
+                                        )
+                                    )
+                                    if _adopted:
+                                        recovered += 1
+                                    else:
+                                        # Real watcher exists in-process but
+                                        # durable ownership adoption lost its
+                                        # CAS or the token was unavailable —
+                                        # never claim success, never leave
+                                        # runtime/durable split silently.
+                                        _rwr_fail("ownership_adoption_failed")
+                                elif _rwr_outcome in (
+                                    _RWR_RowOutcome.REARM_OWNED,
+                                    _RWR_RowOutcome.RETRY_OWNED,
+                                ):
+                                    # Existing canonical bounded restart-rearm
+                                    # retry durably established.
                                     recovered += 1
                                 elif _rwr_outcome == _RWR_RowOutcome.SKIPPED:
-                                    # Accept only when a fresh reread proves the
-                                    # row concurrently left PENDING_TRIGGER —
-                                    # never take PTR's word for it blindly.
-                                    _rwr_reread = self.osm.get_order(_rwr_exp_loid)
-                                    _rwr_reread_status = str(
-                                        (_rwr_reread or {}).get("status") or ""
+                                    _reread = self.osm.get_order(_exp_loid)
+                                    _reread_status = str(
+                                        (_reread or {}).get("status") or ""
                                     ).strip().upper()
-                                    if _rwr_reread and _rwr_reread_status != "PENDING_TRIGGER":
-                                        log.info(
-                                            "[%s] REARM_WATCHER_REQUIRED_SKIPPED_CONFIRMED "
-                                            "local_order_id=%s reread_status=%s",
-                                            self.client_id, local_order_id,
-                                            _rwr_reread_status,
-                                        )
-                                    else:
-                                        log.critical(
-                                            "[%s] REARM_WATCHER_REQUIRED_SKIPPED_UNCONFIRMED "
-                                            "local_order_id=%s reread_status=%s — "
-                                            "PTR returned SKIPPED but reread still shows "
-                                            "PENDING_TRIGGER; retaining ownership fail-closed",
-                                            self.client_id, local_order_id,
-                                            _rwr_reread_status,
-                                        )
-                                        _retain_recovery_ownership(
-                                            local_order_id,
-                                            reason="rearm_watcher_required_skipped_unconfirmed",
-                                        )
-                                        result.setdefault("errors", []).append(
-                                            f"rearm_watcher_required_skipped_unconfirmed:"
-                                            f"{local_order_id}"
-                                        )
+                                    if not _reread or _reread_status == "PENDING_TRIGGER":
+                                        _rwr_fail("skipped_unconfirmed")
                                 elif _rwr_outcome == _RWR_RowOutcome.UNRESOLVED:
-                                    # Constraint C: retain/preserve existing
-                                    # recovery ownership, add a structured
-                                    # error, register no watcher, never fall
-                                    # through to a legacy rearm path.
-                                    log.critical(
-                                        "[%s] REARM_WATCHER_REQUIRED_PTR_UNRESOLVED "
-                                        "local_order_id=%s — retaining ownership, "
-                                        "no watcher registered, no legacy fallback",
-                                        self.client_id, local_order_id,
-                                    )
-                                    _retain_recovery_ownership(
-                                        local_order_id,
-                                        reason="rearm_watcher_required_ptr_unresolved",
-                                    )
-                                    result.setdefault("errors", []).append(
-                                        f"rearm_watcher_required_ptr_unresolved:"
-                                        f"{local_order_id}"
-                                    )
-                                else:
-                                    # TERMINALIZED or any other PTR outcome is
-                                    # PTR's own durable disposition of the row;
-                                    # no additional recovery action required.
-                                    pass
+                                    _rwr_fail("ptr_unresolved")
+                                # TERMINALIZED or any other PTR-owned terminal
+                                # result: PTR already durably disposed the
+                                # row; no further action for this row.
                             except Exception as _rwr_exc:
-                                # Constraint D: on any exception during the
-                                # refreshed-row read or the PTR invocation —
-                                # zero selector calls, zero broker calls (none
-                                # were made above this point), register no
-                                # watcher, preserve/write the recovery-ownership
-                                # diagnostic, append a structured error, and
-                                # leave the row recoverable by a later pass.
                                 log.error(
                                     "[%s] REARM_WATCHER_REQUIRED_HANDLER_EXCEPTION "
-                                    "local_order_id=%s exc=%s — retaining ownership, "
-                                    "no watcher registered, row recoverable later",
+                                    "local_order_id=%s exc=%s — retaining ownership",
                                     self.client_id, local_order_id, _rwr_exc,
                                 )
                                 _retain_recovery_ownership(
@@ -2812,9 +2667,8 @@ class APStartupRecovery:
                                     f"rearm_watcher_required_exception:"
                                     f"{local_order_id}:{type(_rwr_exc).__name__}"
                                 )
-                            # Constraint C: after consuming REARM_WATCHER_REQUIRED,
-                            # the due-retry loop must not continue into another
-                            # rearm path for this same row this pass.
+                            # Terminate processing of this row for the
+                            # current due-retry iteration either way.
                         # All other dispositions (RETRY_WAIT / CLAIM_LOST /
                         # NOT_DUE / KEEP_WATCHER): row is owned by execution
                         # core; skip rearm.

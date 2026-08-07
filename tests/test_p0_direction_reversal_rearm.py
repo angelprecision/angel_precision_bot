@@ -93,7 +93,7 @@ def test_runtime_reset_archives_trigger_and_clears_attempt_state_uninterrupted_w
     )
 
     for target in (plan.metadata, signal["metadata"]):
-        assert target["materialization_status"] == "WAITING_FOR_TRIGGER"
+        assert target["materialization_status"] == ""
         assert target["current_owner"] == "watcher-token-1"
         assert target["watcher_token"] == "watcher-token-1"
         assert target["recovery_ownership"] == ""
@@ -192,8 +192,8 @@ def test_runtime_reset_synthetic_recovery_never_fabricates_watcher():
     )
 
     for target in (plan.metadata, signal["metadata"]):
-        assert target["materialization_status"] == "WAITING_FOR_TRIGGER"
-        assert target["current_owner"] == recovery_owner
+        assert target["materialization_status"] == ""
+        assert target["current_owner"] == ""
         assert target["watcher_token"] == ""
         assert target["recovery_ownership"] == "recovery_scheduler"
         assert target["recovery_owner"] == recovery_owner
@@ -269,7 +269,7 @@ def test_osm_rearm_uninterrupted_watcher_retains_real_token(monkeypatch):
     ) is True
 
     patch = json.loads(cursor.params[0])
-    assert patch["materialization_status"] == "WAITING_FOR_TRIGGER"
+    assert patch["materialization_status"] == ""
     assert patch["current_owner"] == "watcher-token-1"
     assert patch["watcher_token"] == "watcher-token-1"
     assert patch["recovery_ownership"] == ""
@@ -322,8 +322,8 @@ def test_osm_rearm_from_recovery_does_not_fabricate_watcher(monkeypatch):
     ) is True
 
     patch = json.loads(cursor.params[0])
-    assert patch["materialization_status"] == "WAITING_FOR_TRIGGER"
-    assert patch["current_owner"] == recovery_owner
+    assert patch["materialization_status"] == ""
+    assert patch["current_owner"] == ""
     assert patch["watcher_token"] == ""
     assert patch["recovery_ownership"] == "recovery_scheduler"
     assert patch["recovery_owner"] == recovery_owner
@@ -517,16 +517,18 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
         TRIGGER_PRICE, TRIGGER_TS, provenance,
     )
 
-    # ── Fake row: post-rearm WAITING_FOR_TRIGGER, returned by PTR re-read ──
+    # ── Fake row: post-rearm truly blank pre-breach state, returned by PTR
+    # re-read. current_owner and materialization_status stay blank until a
+    # real watcher's durable ownership is later adopted. ──────────────────
     post_rearm_row = {
         **retry_wait_row,
         "meta": {
             "lifecycle_state": "",
-            "materialization_status": "WAITING_FOR_TRIGGER",
+            "materialization_status": "",
             "materialization_in_flight": False,
             "materialization_owner": "",
             "watcher_token": "",
-            "current_owner": OWNER,
+            "current_owner": "",
             "recovery_ownership": "recovery_scheduler",
             "recovery_owner": OWNER,
             "direction_reversal_rearm_requires_watcher": True,
@@ -657,8 +659,9 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
         f"watcher_token must be blank for synthetic recovery, got "
         f"{rearm_patch_written.get('watcher_token')!r}"
     )
-    # current_owner = recovery takeover claim owner (for CAS), not a watcher proof
-    assert rearm_patch_written.get("current_owner") == OWNER
+    # current_owner is blank for synthetic recovery — a recovery takeover
+    # token is not watcher ownership. recovery_owner carries the claim.
+    assert rearm_patch_written.get("current_owner") == ""
     assert rearm_patch_written.get("recovery_owner") == OWNER
     assert rearm_patch_written.get("direction_reversal_rearm_requires_watcher") is True
 
@@ -836,18 +839,41 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
         # Return False = price below trigger, not yet through
         return False
 
+    # ── Mutable row-store-backed OSM for the PTR section ────────────────────
+    # PTR's restart-rearm-retry path durably writes a retry marker via
+    # update_order_meta() and then re-reads the row via get_order() to prove
+    # the write landed (_verify_restart_rearm_retry_ownership). A static,
+    # non-mutating fixture cannot support that round-trip — this mirrors the
+    # mutable row store already used in test_p0_rearm_watcher_required_routing.py.
+    _ptr_store = {"row": dict(post_rearm_row)}
+
+    def _ptr_get_order(order_id):
+        if str(order_id) != LOCAL_ORDER_ID:
+            return None
+        return dict(_ptr_store["row"])
+
+    def _ptr_update_order_meta(order_id, patch):
+        if str(order_id) != LOCAL_ORDER_ID:
+            return False
+        _ptr_store["row"]["meta"] = {
+            **_ptr_store["row"].get("meta", {}), **patch,
+        }
+        return True
+
+    ptr_osm = object.__new__(APOrderStateMachine)
+    ptr_osm.client_id = CLIENT_ID
+    ptr_osm.get_order = _ptr_get_order
+    ptr_osm.update_order_meta = _ptr_update_order_meta
+
     ptr = PendingTriggerRestartRecovery(
         client_id=CLIENT_ID,
         execution_mode=EXEC_MODE,
-        osm=real_osm,
+        osm=ptr_osm,
         entry_watcher=_FakeWatcher(),
         broker=MagicMock(),
         quote_check_fn=_quote_check_available,
         caller_source="test_seam",
     )
-
-    # Reset get_order to return post_rearm_row for PTR re-read
-    _get_order_call_count[0] = 99  # skip to post-rearm sequence
 
     def _plan_builder_fn(row):
         from types import SimpleNamespace
@@ -866,7 +892,7 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
         )
 
     ptr_outcome_watcher = ptr.recover_one_row(
-        dict(post_rearm_row),
+        dict(_ptr_store["row"]),
         plan_builder_fn=_plan_builder_fn,
     )
 
@@ -879,56 +905,56 @@ def test_seam_full_direction_reversal_recovery_chain(monkeypatch):
     def _quote_check_unavailable(broker, symbol, side, trigger):
         return None  # quote unavailable
 
+    _ptr_store_no_quote = {"row": dict(post_rearm_row)}
+
+    def _ptr_get_order_no_quote(order_id):
+        if str(order_id) != LOCAL_ORDER_ID:
+            return None
+        return dict(_ptr_store_no_quote["row"])
+
+    def _ptr_update_order_meta_no_quote(order_id, patch):
+        if str(order_id) != LOCAL_ORDER_ID:
+            return False
+        _ptr_store_no_quote["row"]["meta"] = {
+            **_ptr_store_no_quote["row"].get("meta", {}), **patch,
+        }
+        return True
+
+    ptr_osm_no_quote = object.__new__(APOrderStateMachine)
+    ptr_osm_no_quote.client_id = CLIENT_ID
+    ptr_osm_no_quote.get_order = _ptr_get_order_no_quote
+    ptr_osm_no_quote.update_order_meta = _ptr_update_order_meta_no_quote
+
     ptr_no_quote = PendingTriggerRestartRecovery(
         client_id=CLIENT_ID,
         execution_mode=EXEC_MODE,
-        osm=real_osm,
+        osm=ptr_osm_no_quote,
         entry_watcher=_FakeWatcher(),
         broker=MagicMock(),
         quote_check_fn=_quote_check_unavailable,
         caller_source="test_seam_no_quote",
     )
     ptr_outcome_no_quote = ptr_no_quote.recover_one_row(
-        dict(post_rearm_row),
+        dict(_ptr_store_no_quote["row"]),
         plan_builder_fn=_plan_builder_fn,
     )
 
-    # ── KNOWN LIMITATION (pre-existing, outside this PR's file scope) ───────
-    # PendingTriggerRestartRecovery._has_trigger_or_submit_evidence() treats
-    # ANY nonempty meta["materialization_status"] as trigger/submit evidence
-    # and blocks _enter_restart_rearm_retry(), returning UNRESOLVED instead of
-    # scheduling the bounded restart-rearm retry. The OSM's rearm deliberately
-    # persists materialization_status="WAITING_FOR_TRIGGER" (a value load-
-    # bearing across 4+ other passing tests and ap_recovery.py's own orphan
-    # scan at line ~2205) — it is not blank as an isolated reading of the
-    # rearm spec's illustrative snippet might suggest. Changing that value,
-    # or changing _has_trigger_or_submit_evidence's evidence-key set, would
-    # require touching ap/pending_trigger_restart_recovery.py — a fourth
-    # production file — which is an explicit stop condition for this PR.
-    #
-    # This test therefore documents PTR's true, current, REUSED (unmodified)
-    # behavior rather than asserting an outcome PTR cannot currently produce.
-    # This gap is called out verbatim in the PR report's "unresolved concerns"
-    # per the task's reporting requirement.
-    assert ptr_outcome_no_quote in {
-        _RowOutcome.RETRY_OWNED, _RowOutcome.UNRESOLVED,
-    }, (
-        f"PTR (reused unmodified) must classify the row through its existing "
-        f"ORPHAN_NO_WATCHER path — RETRY_OWNED if it schedules the bounded "
-        f"retry, or UNRESOLVED if the pre-existing evidence gate blocks it. "
-        f"Got {ptr_outcome_no_quote!r}, which is neither."
+    # ── Assertions 6-7: unavailable quote → bounded restart-rearm retry ────
+    # Now that the durable rearm leaves materialization_status truly blank
+    # (see production correction: current_owner/materialization_status fix),
+    # PendingTriggerRestartRecovery's existing _has_trigger_or_submit_evidence()
+    # gate no longer false-positives on a freshly-rearmed row, and the
+    # unavailable-quote path correctly reaches RETRY_OWNED via
+    # _enter_restart_rearm_retry(). This resolves a limitation that the
+    # prior head's WAITING_FOR_TRIGGER value had been tripping.
+    assert ptr_outcome_no_quote == _RowOutcome.RETRY_OWNED, (
+        f"PTR with unavailable quote must schedule the bounded restart-rearm "
+        f"retry (RETRY_OWNED), got {ptr_outcome_no_quote!r}"
     )
-    if ptr_outcome_no_quote == _RowOutcome.UNRESOLVED:
-        # Confirm it is UNRESOLVED for the KNOWN reason (evidence gate), not
-        # a new failure mode — a different reason would need investigation.
-        _no_quote_failure_reason = ptr_no_quote._row_failure_reasons.get(
-            LOCAL_ORDER_ID, ""
-        )
-        assert "trigger_or_submit_evidence" in _no_quote_failure_reason, (
-            f"Expected UNRESOLVED via the known evidence-gate limitation, "
-            f"got failure_reason={_no_quote_failure_reason!r} instead — "
-            f"this is a DIFFERENT, unexplained failure mode."
-        )
+    assert ptr_outcome_no_quote != _RowOutcome.UNRESOLVED, (
+        "PTR must never return UNRESOLVED merely because no watcher existed "
+        "during the synthetic callback"
+    )
 
     # ── Assertion 8: restart immediately after durable write is recoverable ─
     # A post-rearm row can be discovered by PTR and resolved without UNRESOLVED.

@@ -2432,16 +2432,20 @@ class APOrderStateMachine:
 
         _patch = {
             "lifecycle_state": "",
-            # WAITING_FOR_TRIGGER is a durable lifecycle state the existing
-            # recovery scan already understands. REARM_DIRECTION_REVERSAL is
-            # preserved only as a diagnostic (final_market_truth_status /
-            # last_direction_reversal_* below), never as the live
-            # materialization_status a recovery pass must classify.
-            "materialization_status": "WAITING_FOR_TRIGGER",
+            # A truly blank pre-breach materialization_status — never a
+            # populated lifecycle value here. WAITING_FOR_TRIGGER is only
+            # ever written later, by the durable ownership-adoption step,
+            # once a REAL watcher has actually been proven attached.
+            # REARM_DIRECTION_REVERSAL is preserved only as a diagnostic
+            # (final_market_truth_status / last_direction_reversal_* below).
+            "materialization_status": "",
             "materialization_in_flight": False,
             "materialization_owner": "",
             "materialization_lease_until": "",
-            "current_owner": _watcher_token or _owner,
+            # current_owner must never fall back to the recovery claim
+            # token. A recovery takeover token is not watcher ownership —
+            # `_watcher_token or _owner` is the exact defect this closes.
+            "current_owner": _watcher_token if _watcher_token else "",
             "watcher_token": _watcher_token,
             "watcher_generation": _generation if _watcher_token else 0,
             "watcher_registered_at": _now if _watcher_token else "",
@@ -2600,6 +2604,113 @@ class APOrderStateMachine:
         except Exception as exc:
             log.warning(
                 "[%s] rearm_deferred_materialization_direction_reversal failed "
+                "order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+    def adopt_direction_reversal_watcher_ownership(
+        self,
+        local_order_id: str,
+        *,
+        recovery_owner: str,
+        watcher_token: str,
+        generation: int,
+        signal_id: str,
+        execution_mode: str,
+    ) -> bool:
+        """Transfer durable watcher ownership from a recovery-owned,
+        direction-reversal-rearmed row to a real, just-registered watcher.
+
+        Reused nowhere else — this is the narrow gap left after
+        ``rearm_deferred_materialization_direction_reversal`` releases a row
+        to ``recovery_ownership='recovery_scheduler'`` (no real watcher
+        proven yet) and a later ``PendingTriggerRestartRecovery`` pass then
+        proves a real ``APEntryWatcher`` registration for it. Neither of
+        those two functions writes the other's half of durable ownership;
+        this is that missing, explicit, CAS-fenced write.
+
+        The CAS is fail-closed on exact identity, exact generation, and the
+        exact recovery-owned state left by the rearm — never a monotonic or
+        greater-than acceptance. It also requires ``watcher_token`` to still
+        be blank durably, so a second concurrent adoption cannot double-claim
+        the row.
+        """
+        import json as _json_local
+
+        _recovery_owner = str(recovery_owner or "").strip()
+        _token = str(watcher_token or "").strip()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _recovery_owner
+            or not _token
+            or not _signal
+            or _mode not in {"live", "paper"}
+            or _generation < 1
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "materialization_status": "WAITING_FOR_TRIGGER",
+            "current_owner": _token,
+            "watcher_token": _token,
+            "watcher_generation": _generation,
+            "watcher_registered_at": _now,
+            "recovery_owner": "",
+            "recovery_ownership": "",
+            "direction_reversal_rearm_requires_watcher": False,
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _adopt():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = ''
+                      AND COALESCE(meta->>'recovery_ownership','') = 'recovery_scheduler'
+                      AND COALESCE(meta->>'recovery_owner','') = %s
+                      AND COALESCE(meta->>'watcher_token','') = ''
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                    """,
+                    (
+                        _patch_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal,
+                        _mode,
+                        _recovery_owner,
+                        _generation,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_adopt) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] adopt_direction_reversal_watcher_ownership failed "
                 "order=%s: %s",
                 self.client_id,
                 local_order_id,
