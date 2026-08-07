@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlparse
 
 _SAFE_TEST_DB_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _SAFE_TEST_DB_NAME = "intelligence_test"
+_SAFE_TEST_DB_PORT = 5432
 _SAFE_DEFAULT_DATABASE_URL = (
     "postgresql://postgres:postgres@localhost:5432/intelligence_test?sslmode=disable"
 )
@@ -47,6 +48,12 @@ _SAFE_DEFAULT_DATABASE_URL = (
 _ALLOWED_QUERY_PARAMS = {
     "sslmode": {"disable"},
 }
+
+# libpq connection-target environment variables that can redirect or
+# supplement DATABASE_URL's connection parameters outside the validated
+# URI. A non-blank value for any of these is unsafe regardless of what
+# DATABASE_URL says.
+_FENCED_LIBPQ_ENV_VARS = ("PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE")
 
 
 class _UnsafeTestDatabaseError(RuntimeError):
@@ -131,6 +138,24 @@ def _validate_database_url(raw: str) -> None:
             "DB-backed tests against an unexpected database."
         )
 
+    # The port must be explicit and exactly 5432 -- do not rely on
+    # PostgreSQL's implicit default. A missing port, or one that fails to
+    # parse (malformed or out of range), is unsafe.
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise _UnsafeTestDatabaseError(
+            f"DATABASE_URL port could not be parsed: {exc}. Refusing to "
+            "run DB-backed tests."
+        ) from exc
+
+    if port != _SAFE_TEST_DB_PORT:
+        raise _UnsafeTestDatabaseError(
+            f"DATABASE_URL port {port!r} is not the expected local test "
+            f"port {_SAFE_TEST_DB_PORT!r}. Refusing to run DB-backed "
+            "tests against an unexpected port."
+        )
+
     # Query-string connection-identity parameters must not be able to
     # redirect libpq to a different host/hostaddr/dbname/port/service away
     # from the host/path already validated above.
@@ -165,6 +190,26 @@ def _validate_database_url(raw: str) -> None:
             )
 
 
+def _assert_safe_libpq_environment() -> None:
+    """Fail closed if any libpq connection-target environment variable is
+    present with a non-blank value. These can supplement or override
+    connection parameters absent from DATABASE_URL (e.g. PGHOSTADDR can
+    redirect the actual TCP target even when the URI host is validated).
+    Blank values are treated as absent -- not fenced -- since libpq itself
+    ignores an empty PG* variable. Never unsets or overwrites anything;
+    an unsafe value simply aborts before any DB connection is attempted.
+    """
+    for var in _FENCED_LIBPQ_ENV_VARS:
+        value = os.environ.get(var)
+        if value:
+            raise _UnsafeTestDatabaseError(
+                f"Environment variable {var}={value!r} is set. This can "
+                "redirect or supplement the validated DATABASE_URL's "
+                "connection target. Refusing to run DB-backed tests "
+                "until it is unset."
+            )
+
+
 def _assert_safe_test_database_url() -> str:
     """Resolve and validate DATABASE_URL for this test module.
 
@@ -174,12 +219,17 @@ def _assert_safe_test_database_url() -> str:
     it is validated as-is, and an unsafe or ambiguous value raises before
     this module finishes importing, which prevents pytest from collecting
     any fixture or test in this file.
+
+    Also validates the libpq target environment (PGHOSTADDR, PGSERVICE,
+    PGSERVICEFILE) before authorizing any connection, since a validated
+    URI alone does not prevent libpq from honoring these separately.
     """
     raw = os.environ.get("DATABASE_URL")
     if raw is None or not raw.strip():
         os.environ["DATABASE_URL"] = _SAFE_DEFAULT_DATABASE_URL
         raw = _SAFE_DEFAULT_DATABASE_URL
     _validate_database_url(raw)
+    _assert_safe_libpq_environment()
     return raw
 
 
@@ -781,6 +831,103 @@ class TestDatabaseSafetyFenceQueryParameterBypass:
             _assert_safe_test_database_url()
 
         assert os.environ["DATABASE_URL"] == unsafe
+
+
+# --- Regression coverage: direct URI port + libpq environment fence -----
+
+
+class TestDatabaseSafetyFencePort:
+    def test_exact_intended_port_is_accepted(self):
+        _validate_database_url(
+            "postgresql://postgres:postgres@localhost:5432/"
+            "intelligence_test?sslmode=disable"
+        )  # must not raise
+
+    def test_alternate_explicit_port_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:6543/"
+                "intelligence_test?sslmode=disable"
+            )
+
+    def test_missing_explicit_port_is_rejected(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost/"
+                "intelligence_test?sslmode=disable"
+            )
+
+    def test_malformed_port_fails_closed_without_leaking_value_error(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:notaport/"
+                "intelligence_test"
+            )
+
+    def test_out_of_range_port_fails_closed_without_leaking_value_error(self):
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _validate_database_url(
+                "postgresql://postgres:postgres@localhost:999999/"
+                "intelligence_test"
+            )
+
+
+class TestLibpqEnvironmentFence:
+    @pytest.mark.parametrize("var", ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"])
+    def test_nonblank_fenced_variable_is_rejected(self, var, monkeypatch):
+        monkeypatch.setenv(var, "unsafe-value")
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_libpq_environment()
+
+    @pytest.mark.parametrize("var", ["PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE"])
+    def test_blank_fenced_variable_does_not_reject(self, var, monkeypatch):
+        monkeypatch.setenv(var, "")
+
+        _assert_safe_libpq_environment()  # must not raise
+
+    def test_fenced_variable_is_rejected_before_psycopg2_connect(self, monkeypatch):
+        monkeypatch.setenv("PGHOSTADDR", "8.8.8.8")
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                "psycopg2.connect was called despite an unsafe PGHOSTADDR"
+            )
+
+        monkeypatch.setattr(psycopg2, "connect", _fail_if_called)
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_libpq_environment()
+
+    def test_rejection_does_not_modify_the_environment(self, monkeypatch):
+        monkeypatch.setenv("PGHOSTADDR", "8.8.8.8")
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_libpq_environment()
+
+        assert os.environ["PGHOSTADDR"] == "8.8.8.8"
+
+    def test_valid_url_with_unsafe_environment_fails_before_connect(
+        self, monkeypatch
+    ):
+        """Combined invariant: an otherwise-valid DATABASE_URL does not
+        bypass the environment fence, and no connection is attempted."""
+        monkeypatch.setenv(
+            "DATABASE_URL",
+            "postgresql://postgres:postgres@localhost:5432/"
+            "intelligence_test?sslmode=disable",
+        )
+        monkeypatch.setenv("PGHOSTADDR", "8.8.8.8")
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                "psycopg2.connect was called despite an unsafe PGHOSTADDR"
+            )
+
+        monkeypatch.setattr(psycopg2, "connect", _fail_if_called)
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_test_database_url()
 
 
 def test_candidate_fetch_executes_select_only(monkeypatch):
