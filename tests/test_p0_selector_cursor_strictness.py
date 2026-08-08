@@ -1022,9 +1022,10 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
       3. returns TERMINAL_DURABLE with exact reason
       4. zero selector/provider/broker continuation calls
 
-    Fail-closed fenced terminalization of the existing ENTRY row IS expected
-    and IS asserted (osm.terminalize_deferred_breach.call_count <= 1).
-    The invariant is zero selector/broker CONTINUATION, not zero order mutation.
+    Fail-closed fenced terminalization of the existing ENTRY row is part of the
+    invariant: the exact pre-claimed row must be terminalized once, with the
+    owner/generation fence supplied by the pre-claim, and no broker identity or
+    submit intent may be introduced by the failure path.
     """
     import ap_execution_core as ec_mod
     from ap import queue as queue_mod
@@ -1098,10 +1099,59 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
         },
     )
 
+    durable_rows = {_BASE_ORDER: row}
     osm = MagicMock()
-    osm.get_order.return_value = row
+    osm.get_order.side_effect = lambda local_order_id: durable_rows.get(local_order_id)
     osm.submit_existing_entry = MagicMock()
-    osm.terminalize_deferred_breach.return_value = True
+
+    def _stateful_terminalize_deferred_breach(
+        local_order_id,
+        *,
+        reason_code,
+        terminal_status="EXPIRED",
+        owner="",
+        generation=None,
+        diagnostics=None,
+    ):
+        """Model the production terminal CAS and mutate the durable row."""
+        candidate = durable_rows.get(local_order_id)
+        if not isinstance(candidate, dict):
+            return False
+        candidate_meta = candidate.get("meta")
+        if not isinstance(candidate_meta, dict):
+            return False
+        if (
+            candidate.get("kind") != "ENTRY"
+            or str(candidate.get("status") or "").upper()
+            not in {"CREATED", "PENDING_TRIGGER"}
+            or candidate.get("broker_order_id") not in (None, "")
+            or candidate.get("submitted_ts") is not None
+            or candidate_meta.get("materialization_owner") != owner
+            or candidate_meta.get("materialization_generation") != generation
+        ):
+            return False
+        candidate["status"] = str(terminal_status).upper()
+        candidate["last_error"] = reason_code
+        candidate_meta.update(
+            {
+                "lifecycle_state": candidate["status"],
+                "materialization_status": "FAILED_TERMINAL",
+                "materialization_in_flight": False,
+                "materialization_owner": "",
+                "current_owner": "",
+                "materialization_lease_until": "",
+                "broker_ready": False,
+                "reason_code": reason_code,
+                "materialization_reason": reason_code,
+                "final_reason": reason_code,
+                "selector_recovery_cursor_v1": None,
+            }
+        )
+        return True
+
+    osm.terminalize_deferred_breach = MagicMock(
+        side_effect=_stateful_terminalize_deferred_breach,
+    )
 
     selector = MagicMock()
     selector.select = MagicMock()
@@ -1185,9 +1235,46 @@ def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
     assert core.proof.method_calls == []
     # No queue execution continuation caused by selector processing.
     assert queue_execution_write.call_count == 0
-    # Existing fail-closed durable terminalization IS expected.
-    # Do not incorrectly assert zero order mutation.
-    assert osm.terminalize_deferred_breach.call_count <= 1
+    # The existing claimed ENTRY must be terminalized exactly once, using the
+    # same ownership fence that was verified before this real runtime call.
+    osm.terminalize_deferred_breach.assert_called_once()
+    terminalize_call = osm.terminalize_deferred_breach.call_args
+    assert terminalize_call.args == (_BASE_ORDER,)
+    assert terminalize_call.kwargs["reason_code"] == (
+        "SELECTOR_RECOVERY_CURSOR_INVALID:MALFORMED_CURSOR:attempted_symbols"
+    )
+    assert terminalize_call.kwargs["terminal_status"] == "EXPIRED"
+    assert terminalize_call.kwargs["owner"] == owner
+    assert terminalize_call.kwargs["generation"] == 2
+    assert terminalize_call.kwargs["diagnostics"]["selector_calls"] == 0
+    assert terminalize_call.kwargs["diagnostics"]["direct_quote_calls"] == 0
+    assert terminalize_call.kwargs["diagnostics"]["broker_post_count"] == 0
+
+    # The stateful terminalizer proves this exact durable row changed in place;
+    # it did not create a replacement ENTRY/EXIT or a broker-ready identity.
+    assert list(durable_rows) == [_BASE_ORDER]
+    assert durable_rows[_BASE_ORDER] is row
+    assert row["kind"] == "ENTRY"
+    assert row["local_order_id"] == _BASE_ORDER
+    assert row["client_id"] == _BASE_CLIENT
+    assert row["execution_mode"] == _BASE_MODE
+    assert row["signal_id"] == _BASE_SIGNAL
+    assert row["status"] == "EXPIRED"
+    assert row["last_error"] == terminalize_call.kwargs["reason_code"]
+    assert row["broker_order_id"] is None
+    assert row["submitted_ts"] is None
+    assert row["meta"].get("submit_intent_at") in (None, "")
+    assert row["meta"]["broker_ready"] is False
+    assert row["meta"]["lifecycle_state"] == "EXPIRED"
+    assert row["meta"]["materialization_status"] == "FAILED_TERMINAL"
+    assert row["meta"]["materialization_in_flight"] is False
+    assert row["meta"]["materialization_owner"] == ""
+    assert row["meta"]["current_owner"] == ""
+    assert row["meta"]["materialization_lease_until"] == ""
+    assert row["meta"]["selector_recovery_cursor_v1"] is None
+    assert osm.get_orders_for_position.call_count == 0
+    assert osm.persist_deferred_broker_ready.call_count == 0
+    assert osm.claim_deferred_broker_ready_submit.call_count == 0
 
 
 
