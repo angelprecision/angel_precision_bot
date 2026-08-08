@@ -1589,9 +1589,25 @@ def _order_chain_for_direct_quote_recovery(
             }
             if len(values) > 1:
                 dimensions.add(liquidity_key)
+
+        # Delta is both a hard eligibility gate and a ranking input. The same
+        # OCC may not inherit authority from whichever duplicate happens to
+        # carry the favorable Greek. Normalize exactly as the selector does so
+        # CALL/PUT sign does not create a false conflict, while missing/dirty
+        # versus valid and materially different deltas do.
+        normalized_deltas = {
+            (
+                round(float(_extract_abs_delta(item)[0]), 8)
+                if _extract_abs_delta(item)[0] is not None
+                else None
+            )
+            for _, item, _ in group
+        }
+        if len(normalized_deltas) > 1:
+            dimensions.add("delta")
         return tuple(
             dimension
-            for dimension in ("price", "open_interest", "volume")
+            for dimension in ("price", "open_interest", "volume", "delta")
             if dimension in dimensions
         )
 
@@ -1732,6 +1748,7 @@ def _order_chain_for_direct_quote_recovery(
                                     "volume": int(
                                         _safe_float(group_item[1].get("volume"), 0.0)
                                     ),
+                                    "delta": _extract_abs_delta(group_item[1])[0],
                                 }
                                 for group_item in group
                             ],
@@ -1740,6 +1757,11 @@ def _order_chain_for_direct_quote_recovery(
                                 representation["ask"],
                                 -representation["open_interest"],
                                 -representation["volume"],
+                                (
+                                    representation["delta"]
+                                    if representation["delta"] is not None
+                                    else float("inf")
+                                ),
                             ),
                         ),
                     })
@@ -3392,17 +3414,18 @@ class APContractSelectionEngine:
                 _action = str(_rv_duplicate.get("action") or "")
                 _rv_audit = _rv_duplicate.get("audit") or {}
                 if _action == "PASS" and _rv_duplicate.get("opt_updated"):
-                    _missing_liquidity = [
+                    _missing_authority = [
                         dimension
-                        for dimension in ("open_interest", "volume")
+                        for dimension in ("open_interest", "volume", "delta")
                         if dimension in _conflict_dimensions
                         and _rv_audit.get(f"direct_{dimension}") is None
                     ]
-                    if _missing_liquidity:
-                        # A direct price without disputed liquidity fields is
-                        # not a complete authority. Never inherit the first
-                        # duplicate's non-zero OI/volume and launder it across
-                        # the group.
+                    if _missing_authority:
+                        # A direct price without every disputed decision field
+                        # is not a complete authority. Tradier's deployed
+                        # get_quote adapter requests greeks=false, so a delta
+                        # conflict deliberately fails closed here instead of
+                        # inheriting the first/favorable duplicate Greek.
                         _authority = None
                         _failure_reason = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
                         request_context.duplicate_quote_authority_failures[_symbol] = (
@@ -3415,7 +3438,7 @@ class APContractSelectionEngine:
                             "failure": _failure_reason,
                             "missing_authority_fields": [
                                 f"direct_{dimension}"
-                                for dimension in _missing_liquidity
+                                for dimension in _missing_authority
                             ],
                         })
                     else:
@@ -3489,13 +3512,13 @@ class APContractSelectionEngine:
                 _authoritative_fields = set(
                     _authority.get("_duplicate_quote_authoritative_fields", ())
                 )
-                _missing_liquidity = [
+                _missing_authority = [
                     dimension
-                    for dimension in ("open_interest", "volume")
+                    for dimension in ("open_interest", "volume", "delta")
                     if dimension in _conflict_dimensions
                     and dimension not in _authoritative_fields
                 ]
-                if _missing_liquidity:
+                if _missing_authority:
                     _failure_reason = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
                     request_context.duplicate_quote_authority_failures[_symbol] = (
                         _failure_reason

@@ -159,6 +159,13 @@ _POLICY_TABLE: dict[str, SelectorRetryPolicy] = {
         final_reason_code="DIRECT_QUOTE_UNAVAILABLE",
         queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
     ),
+    "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED": SelectorRetryPolicy(
+        classification=RETRYABLE_DATA,
+        selector_rerun_allowed=True, retain_existing_contract=False,
+        retry_delay_applies=True, max_attempts_applies=True,
+        final_reason_code="DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+        queue_facing_reason="RETRY_LATER_DATA_UNAVAILABLE",
+    ),
     "CHAIN_ROW_ZERO_BID_ASK": SelectorRetryPolicy(
         classification=RETRYABLE_DATA,
         selector_rerun_allowed=True, retain_existing_contract=False,

@@ -21,6 +21,7 @@ from ap.selector_retry_policy import (
     get_policy,
     classify_selector_reason,
     is_retryable_selector_reason,
+    resolve_selector_recovery_final_reason,
     RETRYABLE_BREACH_SELECTOR_REASONS,
     RETRYABLE_MATERIALIZATION_REASONS,
     RETRYABLE_DATA,
@@ -66,6 +67,7 @@ SELECTOR_EMITTED_CODES = {
     "CHEAP_CONTRACT_NO_UPGRADE",
     "CHEAP_CONTRACT_ONLY_CHOICE",
     "DELTA_OUT_OF_RANGE",
+    "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
     "DIRECT_QUOTE_UNAVAILABLE",
     "DIRECT_QUOTE_ZERO_BID_ASK",
     "DTE_OUT_OF_RANGE",
@@ -216,6 +218,43 @@ def test_materialization_reasons_equals_selector_reasons():
         f"In SELECTOR only: {RETRYABLE_BREACH_SELECTOR_REASONS - RETRYABLE_MATERIALIZATION_REASONS}\n"
         f"In MATERIALIZER only: {RETRYABLE_MATERIALIZATION_REASONS - RETRYABLE_BREACH_SELECTOR_REASONS}"
     )
+
+
+def test_duplicate_conflict_reason_has_runtime_restart_materializer_parity():
+    """Every durable consumer sees the same bounded data-retry authority."""
+    from ap import deferred_materializer
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    reason = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+    policy = get_policy(reason)
+    runtime = _classify_deferred_breach_retry_decision(
+        reason,
+        queue_local_order_id="local-pr408-parity",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+    restart_reduced = resolve_selector_recovery_final_reason({
+        "quality_rejections": {reason: 2},
+        "attempted_results": {},
+        "structural_skip_results": {},
+        "eligible_unattempted_symbols": [],
+    })
+
+    assert policy.classification == RETRYABLE_DATA
+    assert policy.selector_rerun_allowed is True
+    assert policy.retry_delay_applies is True
+    assert policy.max_attempts_applies is True
+    assert runtime == {
+        "action": "retry_schedule",
+        "reason_code": reason,
+        "retryable_reason": True,
+    }
+    assert restart_reduced == reason
+    assert reason in RETRYABLE_BREACH_SELECTOR_REASONS
+    assert deferred_materializer.is_reason_retryable(reason) is True
+    assert reason in RETRYABLE_MATERIALIZATION_REASONS
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -870,6 +870,10 @@ def revalidate_with_direct_quote(
         "direct_mid":                      None,
         "direct_volume":                   None,
         "direct_open_interest":            None,
+        # The deployed Tradier quote adapter requests greeks=false. Keep the
+        # absence explicit so duplicate-delta authority fails closed rather
+        # than being inferred from a chain representation.
+        "direct_delta":                    None,
         "direct_bid_size":                 None,
         "direct_ask_size":                 None,
         "direct_quote_age_ms":             None,

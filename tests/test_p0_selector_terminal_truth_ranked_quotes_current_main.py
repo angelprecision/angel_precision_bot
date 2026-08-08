@@ -1059,6 +1059,164 @@ def test_duplicate_liquidity_conflict_with_price_only_direct_quote_fails_closed(
     assert observed == [observed[0]] * len(observed)
 
 
+@pytest.mark.parametrize("execution_mode", ["LIVE", "PAPER"])
+@pytest.mark.parametrize("conflict_shape", ["in_band_vs_out_of_band", "missing_vs_valid"])
+def test_duplicate_delta_conflict_fails_closed_independent_of_payload_order(
+    monkeypatch,
+    execution_mode,
+    conflict_shape,
+):
+    """Contradictory duplicate Greeks never inherit the favorable row."""
+    valid = _row(
+        "SPY", 101.0, bid=1.45, ask=1.50, delta=0.39, oi=1200, volume=300
+    )
+    conflicting = dict(valid)
+    conflicting["symbol"] = f" {valid['symbol'].lower()} "
+    conflicting["greeks"] = (
+        {"delta": 0.79}
+        if conflict_shape == "in_band_vs_out_of_band"
+        else {}
+    )
+    interleaver = _row("SPY", 102.0)
+    valid_symbol = valid["symbol"]
+    observed = []
+
+    for chain in (
+        [valid, conflicting, interleaver],
+        [conflicting, valid, interleaver],
+        [valid, interleaver, conflicting],
+        [conflicting, interleaver, valid],
+    ):
+        clear_quote_cache()
+        plan = _plan(
+            ticker="SPY",
+            underlying=100.0,
+            budget=2000.0,
+            execution_mode=execution_mode,
+            client_id=(
+                "jasoncosby1@gmail.com"
+                if execution_mode == "LIVE"
+                else "tradefluencehq@gmail.com"
+            ),
+        )
+        selected, broker, context, failure, diagnostics = _run_selector(
+            monkeypatch,
+            plan=plan,
+            chain=list(chain),
+            limit=1,
+            request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+            valid_symbol=valid_symbol,
+            # Price and liquidity authority are available, but the deployed
+            # Tradier quote lane requests greeks=false. Even a stray greeks
+            # field must not be treated as reliable direct-delta authority.
+            valid_quote={
+                "bid": 1.45,
+                "ask": 1.50,
+                "volume": 300,
+                "open_interest": 1200,
+                "greeks": {"delta": 0.40},
+            },
+        )
+
+        assert selected is None
+        assert failure["reason_code"] == "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        assert failure["canonical_selector_reason"] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert failure["data_failure"] is True
+        assert failure["quality_failure"] is False
+        assert context.duplicate_quote_conflict_dimensions[valid_symbol] == (
+            "delta",
+        )
+        assert diagnostics["duplicate_quote_conflict_dimensions"][valid_symbol] == [
+            "delta"
+        ]
+        assert diagnostics["duplicate_quote_authority_failures"][valid_symbol] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+            valid_symbol
+        ]
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+        observed.append(
+            (
+                failure["reason_code"],
+                failure["data_failure"],
+                failure["quality_failure"],
+                tuple(diagnostics["duplicate_quote_conflict_dimensions"][valid_symbol]),
+            )
+        )
+
+    assert observed == [observed[0]] * len(observed)
+
+
+def test_execution_core_duplicate_liquidity_conflict_schedules_one_durable_retry(
+    monkeypatch,
+):
+    """The real selector-to-owner LIVE path preserves data truth and retries."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    high_liquidity = _row(
+        "SPY", 101.0, bid=1.45, ask=1.50, oi=1200, volume=300
+    )
+    low_liquidity = dict(high_liquidity)
+    low_liquidity["symbol"] = f" {high_liquidity['symbol'].lower()} "
+    low_liquidity["open_interest"] = 10
+    low_liquidity["volume"] = 1
+    valid_symbol = high_liquidity["symbol"]
+    broker = _DirectQuoteBroker(
+        [high_liquidity, low_liquidity],
+        valid_symbol=valid_symbol,
+        valid_quote={"bid": 1.45, "ask": 1.50},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    plan = _execution_plan(breach_attempt_count=0)
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+    thread_factory = MagicMock()
+    thread_factory.return_value = MagicMock()
+    monkeypatch.setattr(ec_mod.threading, "Thread", thread_factory)
+
+    result = core._on_entry_trigger(_execution_watched("LIVE"))
+
+    assert result["disposition"] == "RETRY_WAIT"
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+    schedule_call = (
+        core.order_state_machine.schedule_deferred_materialization_retry.call_args
+    )
+    selector_failure = schedule_call.kwargs["selector_failure"]
+    assert selector_failure["reason_code"] == "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+    assert selector_failure["canonical_selector_reason"] == (
+        "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+    )
+    assert selector_failure["selector_terminal_reason"] == (
+        "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+    )
+    assert selector_failure["data_failure"] is True
+    assert selector_failure["quality_failure"] is False
+    assert selector_failure["reason_code"] != "CONTRACT_SELECTION_QUALITY_REJECT"
+    core.order_state_machine.submit_existing_entry.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_not_called()
+    thread_factory.return_value.start.assert_not_called()
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+
+
 @pytest.mark.parametrize(
     ("breach_attempt_count", "expected_disposition"),
     [(0, "RETRY_WAIT"), (5, "TERMINAL_DURABLE")],
