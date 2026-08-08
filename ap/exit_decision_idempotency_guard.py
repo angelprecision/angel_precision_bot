@@ -867,6 +867,25 @@ def _extract_callback_trace_identity(callback_trace: dict) -> dict:
             identity[target_key] = str(value).strip()
     if "accepted" not in identity and "accepted" in result:
         identity["accepted"] = bool(result.get("accepted"))
+    if not identity.get("broker_submitted_ts"):
+        # Only consume fields that describe broker order acceptance/creation.
+        # A generic callback timestamp is not sufficient evidence and must
+        # not reset stale-order chronology during recovery.
+        for source_key in (
+            "broker_submitted_ts",
+            "broker_submitted_at",
+            "submitted_ts",
+            "submitted_at",
+            "accepted_ts",
+            "accepted_at",
+            "order_created_at",
+            "create_date",
+        ):
+            value = result.get(source_key)
+            if value is not None and str(value).strip():
+                identity["broker_submitted_ts"] = value
+                identity["broker_submitted_ts_source"] = source_key
+                break
     if not identity.get("raw_status"):
         raw_status = result.get("status") or result.get("raw_status") or result.get("state")
         if raw_status is not None:
@@ -960,6 +979,7 @@ def _adopt_callback_broker_ownership(
                 ).strip(),
                 position_id=position_id,
                 expected_qty=expected_qty,
+                broker_submitted_ts=identity.get("broker_submitted_ts"),
                 source="exit_decision_callback",
             )
         except Exception as exc:

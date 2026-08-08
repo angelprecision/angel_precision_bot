@@ -329,6 +329,7 @@ def get_broker_owned_exit_requests(client_id: str) -> list[dict]:
                     execution_mode,
                     filled_ts,
                     meta,
+                    meta->>'broker_submitted_ts' AS broker_submitted_ts,
                     meta->>'canonical_signal_id' AS canonical_signal_id,
                     meta->>'underlying_entry'    AS underlying_entry_meta,
                     meta->>'entry_underlying'    AS entry_underlying_meta,
@@ -387,6 +388,7 @@ def _adopt_broker_owned_exit_request(
         }
     else:
         try:
+            broker_submitted_ts = order.get("broker_submitted_ts")
             result = adopt(
                 local_id,
                 broker_order_id=broker_id,
@@ -394,6 +396,7 @@ def _adopt_broker_owned_exit_request(
                 client_id=client_id,
                 position_id=position_id,
                 expected_qty=expected_qty,
+                broker_submitted_ts=broker_submitted_ts,
                 source=source,
             )
         except Exception as exc:

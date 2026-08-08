@@ -66,6 +66,29 @@ except ImportError:
     pg_errors = None
 from ap.utils import now_utc_iso
 
+
+def _normalize_broker_submitted_ts(value) -> str | None:
+    """Normalize an explicitly broker-sourced acceptance timestamp.
+
+    Recovery time is not broker submission time.  Callers may supply this
+    value only when the callback or another exact broker response carries it;
+    otherwise adoption deliberately leaves ``submitted_ts`` NULL so monitor
+    age calculations fall back to the original ``created_ts`` chronology.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("broker_submitted_ts must be ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("broker_submitted_ts must be timezone-aware")
+    return parsed.astimezone(timezone.utc).isoformat()
+
 # P0 client-parity (2026-06-04): canonical_signal_id groups the same
 # market opportunity across every active eligible client account so the
 # parity ledger and audit queries can detect fanout failures.
@@ -1270,6 +1293,7 @@ class APOrderStateMachine:
         position_id: str | None = None,
         client_id: str | None = None,
         expected_qty: int | None = None,
+        broker_submitted_ts=None,
         source: str = "broker_owned_exit_request_recovery",
     ) -> dict:
         """Adopt one exact broker-owned EXIT_REQUESTED row into EXIT_SUBMITTED.
@@ -1284,7 +1308,10 @@ class APOrderStateMachine:
         position identity, positive quantity, optional exact position/quantity
         identity, and exact-or-empty broker identity in one UPDATE.  Recovery
         callers must use the returned disposition and must not submit or cancel
-        on a miss.
+        on a miss.  ``broker_submitted_ts`` is optional exact broker acceptance
+        evidence; when absent, adoption does not stamp recovery time into
+        ``submitted_ts`` and the original ``created_ts`` remains the monitor's
+        stale-age reference.
         """
         local_id = str(local_order_id or "").strip()
         broker_id = str(broker_order_id or "").strip()
@@ -1301,6 +1328,16 @@ class APOrderStateMachine:
             except (TypeError, ValueError):
                 expected_qty_value = 0
 
+        try:
+            normalized_broker_submitted_ts = _normalize_broker_submitted_ts(
+                broker_submitted_ts
+            )
+        except ValueError as exc:
+            normalized_broker_submitted_ts = None
+            invalid_submitted_ts_error = str(exc)
+        else:
+            invalid_submitted_ts_error = ""
+
         def _result(
             disposition: str,
             *,
@@ -1308,6 +1345,7 @@ class APOrderStateMachine:
             status: str = "",
             error: str = "",
             order: dict | None = None,
+            submitted_ts_source: str = "unproven_recovery",
         ) -> dict:
             adopted = disposition in {"ADOPTED", "ALREADY_ADOPTED"}
             return {
@@ -1320,6 +1358,8 @@ class APOrderStateMachine:
                 "reason_code": reason_code,
                 "error": error,
                 "order": order,
+                "broker_submitted_ts": normalized_broker_submitted_ts,
+                "broker_submitted_ts_source": submitted_ts_source,
             }
 
         if (
@@ -1335,20 +1375,50 @@ class APOrderStateMachine:
                 reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
                 error="invalid_recovery_identity",
             )
+        if invalid_submitted_ts_error:
+            return _result(
+                "IDENTITY_MISMATCH",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"invalid_broker_submitted_ts:{invalid_submitted_ts_error}",
+            )
+
+        submitted_ts_source = (
+            "broker_acceptance_evidence"
+            if normalized_broker_submitted_ts
+            else "unproven_recovery"
+        )
+        adoption_timestamp = now_utc_iso()
+        diagnostic_payload = {
+            "broker_ownership_adopted_from_exit_requested": True,
+            "broker_ownership_adoption_source": str(source or "recovery"),
+            "broker_ownership_adoption_broker_order_id": broker_id,
+            # This is intentionally named as recovery/adoption time.  It must
+            # never be mistaken for historical broker submission chronology.
+            "broker_ownership_adoption_timestamp": adoption_timestamp,
+            "broker_ownership_adopted_at": adoption_timestamp,
+            "broker_ownership_submitted_ts_proven": bool(
+                normalized_broker_submitted_ts
+            ),
+            "broker_ownership_submitted_ts_source": submitted_ts_source,
+            "broker_ownership_stale_age_reference": (
+                "submitted_ts_or_created_ts"
+                if normalized_broker_submitted_ts
+                else "created_ts"
+            ),
+        }
+        if normalized_broker_submitted_ts:
+            diagnostic_payload["broker_ownership_submitted_ts"] = (
+                normalized_broker_submitted_ts
+            )
 
         diagnostic = json.dumps(
-            {
-                "broker_ownership_adopted_from_exit_requested": True,
-                "broker_ownership_adoption_source": str(source or "recovery"),
-                "broker_ownership_adoption_broker_order_id": broker_id,
-                "broker_ownership_adopted_at": now_utc_iso(),
-            }
+            diagnostic_payload
         )
         sql = (
             "UPDATE orders SET "
             "status=%s, "
             "broker_order_id=%s, "
-            "submitted_ts=COALESCE(submitted_ts, NOW()), "
+            "submitted_ts=COALESCE(submitted_ts, %s::timestamptz), "
             "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
             "updated_ts=NOW() "
             "WHERE local_order_id=%s "
@@ -1365,6 +1435,7 @@ class APOrderStateMachine:
         params: list = [
             OrderStatus.EXIT_SUBMITTED,
             broker_id,
+            normalized_broker_submitted_ts,
             diagnostic,
             local_id,
             self.client_id,
@@ -1438,6 +1509,11 @@ class APOrderStateMachine:
                     "position_id": expected_position or adopted_order.get("position_id"),
                     "requested_qty": adopted_order.get("qty"),
                     "source": source,
+                    "broker_submitted_ts": normalized_broker_submitted_ts,
+                    "broker_submitted_ts_source": submitted_ts_source,
+                    "stale_age_reference": diagnostic_payload[
+                        "broker_ownership_stale_age_reference"
+                    ],
                 },
             )
             self._handle_exit_engine_hooks(
@@ -1452,6 +1528,7 @@ class APOrderStateMachine:
                 reason_code="EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
                 status=OrderStatus.EXIT_SUBMITTED,
                 order=adopted_order,
+                submitted_ts_source=submitted_ts_source,
             )
 
         if latest_dict:
@@ -1496,6 +1573,11 @@ class APOrderStateMachine:
                     reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_ADOPTED",
                     status=latest_status,
                     order=latest_dict,
+                    submitted_ts_source=(
+                        "existing_durable_value"
+                        if latest_dict.get("submitted_ts")
+                        else submitted_ts_source
+                    ),
                 )
             if latest_status in OrderStatus.TERMINAL:
                 return _result(

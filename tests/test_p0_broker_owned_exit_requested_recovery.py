@@ -64,6 +64,7 @@ class _FakeCursor:
             (
                 new_status,
                 broker_id,
+                submitted_ts,
                 diagnostic,
                 local_id,
                 client_id,
@@ -103,7 +104,7 @@ class _FakeCursor:
             if matches:
                 row["status"] = str(new_status)
                 row["broker_order_id"] = str(broker_id)
-                row["submitted_ts"] = row.get("submitted_ts") or "adopted-ts"
+                row["submitted_ts"] = row.get("submitted_ts") or submitted_ts
                 row["updated_ts"] = "updated-ts"
                 patch = json.loads(diagnostic)
                 row["meta"] = {**(row.get("meta") or {}), **patch}
@@ -191,11 +192,79 @@ def test_orcl_shape_adopts_once_and_preserves_diagnostics(fake_osm_db):
     assert second["disposition"] == "ALREADY_ADOPTED"
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
     assert db.rows["exit-orcl-1"]["broker_order_id"] == "36661364"
-    assert db.rows["exit-orcl-1"]["submitted_ts"] == "adopted-ts"
+    assert db.rows["exit-orcl-1"]["submitted_ts"] is None
     assert db.rows["exit-orcl-1"]["meta"]["original_failure"] == "submit_transition_failed"
     assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_adopted_from_exit_requested"] is True
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_submitted_ts_proven"] is False
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_submitted_ts_source"] == (
+        "unproven_recovery"
+    )
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_stale_age_reference"] == (
+        "created_ts"
+    )
     assert not OrderStatus.can_transition(OrderStatus.EXIT_REQUESTED, OrderStatus.EXIT_FILLED)
     osm._handle_exit_engine_hooks.assert_called()
+
+
+def test_adoption_uses_only_explicit_broker_acceptance_timestamp(fake_osm_db):
+    db, osm = fake_osm_db
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        broker_submitted_ts="2026-08-08T15:00:00Z",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "ADOPTED"
+    assert db.rows["exit-orcl-1"]["submitted_ts"] == "2026-08-08T15:00:00+00:00"
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_submitted_ts_proven"] is True
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_submitted_ts_source"] == (
+        "broker_acceptance_evidence"
+    )
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_stale_age_reference"] == (
+        "submitted_ts_or_created_ts"
+    )
+
+
+def test_invalid_broker_acceptance_timestamp_fails_closed(fake_osm_db):
+    db, osm = fake_osm_db
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        broker_submitted_ts="not-a-timestamp",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "IDENTITY_MISMATCH"
+    assert result["adopted"] is False
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
+    assert db.rows["exit-orcl-1"]["submitted_ts"] is None
+
+
+def test_callback_trace_preserves_explicit_broker_acceptance_timestamp():
+    identity = guard._extract_callback_trace_identity(
+        {
+            "identity": {},
+            "result": {
+                "order": {
+                    "order_id": "36661364",
+                    "accepted_at": "2026-08-08T15:00:00Z",
+                }
+            },
+        }
+    )
+
+    assert identity["broker_order_id"] == "36661364"
+    assert identity["broker_submitted_ts"] == "2026-08-08T15:00:00Z"
+    assert identity["broker_submitted_ts_source"] == "accepted_at"
 
 
 @pytest.mark.parametrize(
@@ -324,11 +393,15 @@ def test_fill_monitor_orcl_replay_adopts_then_uses_canonical_fill_path(
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
     monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: None)
 
+    original_order = dict(db.rows["exit-orcl-1"])
     fm.process_pending_order(
         broker,
-        dict(db.rows["exit-orcl-1"]),
+        original_order,
         osm=recovery_osm,
     )
+    # A replay of the same broker-owned request must not poll/finalize it a
+    # second time after the durable row has reached its terminal fill state.
+    fm.process_pending_order(broker, original_order, osm=recovery_osm)
 
     assert broker.calls == ["36661364"]
     assert [call[1] for call in recovery_osm.transition_calls] == ["EXIT_FILLED"]
@@ -473,7 +546,11 @@ class _MonitorOSM:
                 "error": "identity_or_status_cas_miss",
             }
         self.order["status"] = "EXIT_SUBMITTED"
-        self.order["submitted_ts"] = self.order["created_ts"]
+        # Adoption must not manufacture broker submission chronology.  A test
+        # row may opt into an explicit broker timestamp when that evidence is
+        # part of the input.
+        if self.order.get("broker_submitted_ts"):
+            self.order["submitted_ts"] = self.order["broker_submitted_ts"]
         return {
             "disposition": "ADOPTED",
             "adopted": True,
@@ -502,21 +579,120 @@ def _monitor(order, osm, broker):
     return monitor
 
 
-def test_order_monitor_adopts_before_advancing_broker_status(monkeypatch):
+def test_order_monitor_adopts_nonstale_open_without_submit_or_cancel(monkeypatch):
     order = _row(broker_order_id="36661364")
+    order["created_ts"] = datetime.now(timezone.utc)
     osm = _MonitorOSM(order)
     broker = _Broker({"status": "OPEN"})
     monitor = _monitor(order, osm, broker)
+    monitor._query_broker_order = MagicMock()
+    monitor._handle_stale_exit = MagicMock()
+    monitor._cancel_broker_order = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 300)
+
+    monitor._check_exit_orders()
+
+    assert len(osm.adopt_calls) == 1
+    assert broker.calls == []
+    assert osm.transition_calls == []
+    monitor._query_broker_order.assert_not_called()
+    monitor._handle_stale_exit.assert_not_called()
+    monitor._cancel_broker_order.assert_not_called()
+    assert monitor._emit_order_event.call_args_list[0].kwargs["reason_code"] == (
+        "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+    )
+
+
+def test_adopted_stale_open_uses_existing_stale_exit_path_once(monkeypatch):
+    order = _row(broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    monitor = _monitor(order, osm, _Broker({"status": "OPEN"}))
+    monitor._query_broker_order = MagicMock(return_value="open")
+    monitor._handle_stale_exit = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
 
     monitor._check_exit_orders()
 
     assert len(osm.adopt_calls) == 1
-    assert broker.calls == ["36661364"]
-    assert [call[1] for call in osm.transition_calls] == ["EXIT_ACKNOWLEDGED"]
-    assert monitor._emit_order_event.call_args_list[0].kwargs["reason_code"] == (
-        "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+    monitor._query_broker_order.assert_called_once_with("36661364")
+    monitor._handle_stale_exit.assert_called_once()
+    assert monitor._handle_stale_exit.call_args.args[1] == "EXIT_SUBMITTED"
+    assert osm.transition_calls == []
+
+
+@pytest.mark.parametrize("raw_status", ["OPEN", "WORKING"])
+def test_existing_stale_exit_submitted_active_broker_status_uses_stale_path(
+    monkeypatch, raw_status
+):
+    order = _row(status="EXIT_SUBMITTED", broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    monitor = _monitor(order, osm, _Broker({"status": raw_status}))
+    monitor._query_broker_order = MagicMock(return_value=raw_status)
+    monitor._handle_stale_exit = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+
+    monitor._check_exit_orders()
+
+    assert osm.adopt_calls == []
+    monitor._query_broker_order.assert_called_once_with("36661364")
+    monitor._handle_stale_exit.assert_called_once()
+    assert monitor._handle_stale_exit.call_args.args[1] == "EXIT_SUBMITTED"
+    assert osm.transition_calls == []
+
+
+def test_actor_mode_stale_open_exit_keeps_existing_cancel_logic_reachable(monkeypatch):
+    order = _row(status="EXIT_SUBMITTED", broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    monitor = _monitor(order, osm, _Broker({"status": "OPEN"}))
+    monitor._query_broker_order = MagicMock(return_value="open")
+    monitor._cancel_broker_order = MagicMock(return_value={"status": "canceled"})
+    monitor._guarded_revert_position_open_after_exit_cancel = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    monitor._cancel_broker_order.assert_called_once_with("36661364")
+    assert [call[1] for call in osm.transition_calls] == ["CANCELED"]
+    assert monitor._guarded_revert_position_open_after_exit_cancel.call_count == 1
+    assert any(
+        call.kwargs.get("reason_code") == "STALE_EXIT_TIMEOUT"
+        for call in monitor._emit_order_event.call_args_list
     )
+
+
+def test_watchdog_mode_stale_open_exit_alerts_without_cancel(monkeypatch):
+    order = _row(status="EXIT_SUBMITTED", broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    monitor = _monitor(order, osm, _Broker({"status": "OPEN"}))
+    monitor._query_broker_order = MagicMock(return_value="open")
+    monitor._cancel_broker_order = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", False)
+
+    monitor._check_exit_orders()
+
+    monitor._cancel_broker_order.assert_not_called()
+    assert osm.transition_calls == []
+    assert any(
+        call.kwargs.get("reason_code") == "STALE_EXIT_TIMEOUT"
+        for call in monitor._emit_order_event.call_args_list
+    )
+    assert any("WATCHDOG ONLY" in str(call.args[0]) for call in monitor._alert.call_args_list)
+
+
+@pytest.mark.parametrize(
+    "raw_status",
+    ["accepted", "working", "live", "queued", "held", "routed", "new", "pending_review"],
+)
+def test_generic_entry_aliases_remain_unmapped(raw_status):
+    order = _row(kind="ENTRY", status="SUBMITTED", broker_order_id="entry-broker-1")
+    osm = _MonitorOSM(order)
+    monitor = _monitor(order, osm, _Broker({"status": raw_status}))
+
+    monitor._advance_from_broker_status("exit-orcl-1", raw_status, "ORCL")
+
+    assert osm.transition_calls == []
 
 
 def test_order_monitor_holds_when_adoption_cas_fails(monkeypatch):

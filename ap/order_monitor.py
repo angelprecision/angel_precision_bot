@@ -784,23 +784,7 @@ class APOrderMonitor:
 
                 if age_secs > TIMEOUT_ACKNOWLEDGED:
                     broker_status = self._query_broker_order(broker_oid)
-                    normalized_broker_status = self._normalize_broker_status(broker_status)
-                    if (
-                        self._is_executed_status(broker_status)
-                        or self._is_terminal_failure_status(broker_status)
-                        or normalized_broker_status in {
-                            "pending",
-                            "open",
-                            "accepted",
-                            "working",
-                            "live",
-                            "queued",
-                            "held",
-                            "routed",
-                            "new",
-                            "pending_review",
-                        }
-                    ):
+                    if broker_status:
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_entry(
@@ -2288,6 +2272,7 @@ class APOrderMonitor:
                 expected_qty = int(order.get("qty") or 0)
             except (TypeError, ValueError):
                 expected_qty = 0
+            broker_submitted_ts = order.get("broker_submitted_ts")
             try:
                 result = adopt(
                     local_id,
@@ -2296,6 +2281,7 @@ class APOrderMonitor:
                     client_id=self.client_id,
                     position_id=position_id,
                     expected_qty=expected_qty,
+                    broker_submitted_ts=broker_submitted_ts,
                     source="order_monitor",
                 )
             except Exception as exc:
@@ -2414,7 +2400,7 @@ class APOrderMonitor:
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if broker_status:
+                    if self._is_executed_status(broker_status) or self._is_terminal_failure_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_exit(
@@ -3834,14 +3820,6 @@ class APOrderMonitor:
                 "expired": "EXPIRED",
                 "pending": "EXIT_SUBMITTED",
                 "open": "EXIT_ACKNOWLEDGED",
-                "accepted": "EXIT_ACKNOWLEDGED",
-                "working": "EXIT_ACKNOWLEDGED",
-                "live": "EXIT_ACKNOWLEDGED",
-                "queued": "EXIT_ACKNOWLEDGED",
-                "held": "EXIT_ACKNOWLEDGED",
-                "routed": "EXIT_ACKNOWLEDGED",
-                "new": "EXIT_ACKNOWLEDGED",
-                "pending_review": "EXIT_ACKNOWLEDGED",
             }
         else:
             mapping = {
@@ -3852,14 +3830,6 @@ class APOrderMonitor:
                 "expired": "EXPIRED",
                 "pending": "SUBMITTED",
                 "open": "ACKNOWLEDGED",
-                "accepted": "ACKNOWLEDGED",
-                "working": "ACKNOWLEDGED",
-                "live": "ACKNOWLEDGED",
-                "queued": "ACKNOWLEDGED",
-                "held": "ACKNOWLEDGED",
-                "routed": "ACKNOWLEDGED",
-                "new": "ACKNOWLEDGED",
-                "pending_review": "ACKNOWLEDGED",
             }
         new_status = mapping.get(s)
         if not new_status:
@@ -4030,6 +4000,7 @@ class APOrderMonitor:
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, qty, execution_mode,
                            created_ts, submitted_ts,
+                           meta->>'broker_submitted_ts' AS broker_submitted_ts,
                            fill_price,
                            fill_price AS avg_fill,
                            limit_price AS entry_price,
