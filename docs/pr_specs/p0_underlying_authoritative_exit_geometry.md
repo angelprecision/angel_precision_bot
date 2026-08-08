@@ -2,9 +2,9 @@
 
 > **DRAFT IMPLEMENTATION CONTRACT ONLY. DO NOT MERGE OR DEPLOY.**
 >
-> Base: `main` at `3315a633a6061563ecd92a9c15b1615051b90176`
+> Amendment base: current `main` at `188f2338de3ca4b3e687aa07fd6b2c5ea4b2ab0b`
 >
-> This branch preserves the July 28, 2026 NOW LIVE incident and the smallest safe implementation contract. It does not claim the production fix is complete.
+> This branch preserves the July 28, 2026 NOW LIVE incident and the smallest safe implementation contract. The amendment is rebased onto current `main`; it remains a draft and must be rebased again after PR #425 is complete.
 
 ## Incident
 
@@ -150,4 +150,14 @@ Before this PR can become mergeable, the final PR description must contain:
 
 ## Current status
 
-Preserved as a draft contract. Production implementation and exact-head tests are still required.
+The production-path amendment is limited to `ap_exit_engine.py` plus this contract
+and its focused regression matrix. It reuses the existing QPM truth fields,
+confirmation timer, hard-exit resolver, entry-grace ordering, and exit-in-flight
+submission fence; no broker, queue, selector, scoring, sizing, or proof-trade
+architecture was added.
+
+The focused deterministic matrix is green locally (`17 passed`). The adjacent
+current-main exit suites are also green (`438 passed`). These are local
+pre-push results; exact-head GitHub CI remains the publication gate. This PR
+stays Draft/HARD HOLD and is not authorized to merge or deploy until PR #425 is
+complete and this branch has been rebased again.

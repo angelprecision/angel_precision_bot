@@ -185,6 +185,17 @@ SOFT_EXIT_DEFERRED_UNDERLYING_STALE                 = "SOFT_EXIT_DEFERRED_UNDERL
 SOFT_EXIT_DEFERRED_ENTRY_GRACE                      = "SOFT_EXIT_DEFERRED_ENTRY_GRACE"
 SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED = "SOFT_EXIT_DEFERRED_EXECUTABLE_THRESHOLD_UNCONFIRMED"
 
+# PR #403: explicit authority taxonomy.  These codes are intentionally
+# separate from the legacy STOP_HIT/HARD_STOP text so a consumer can tell
+# whether the stored underlying geometry or the independent option-loss
+# airbag authorized the decision.
+UNDERLYING_TECHNICAL_STOP_CONFIRMED = "UNDERLYING_TECHNICAL_STOP_CONFIRMED"
+UNDERLYING_STOP_CONFIRMING          = "UNDERLYING_STOP_CONFIRMING"
+UNDERLYING_STOP_DEFERRED_DATA_UNAVAILABLE = "UNDERLYING_STOP_DEFERRED_DATA_UNAVAILABLE"
+UNDERLYING_STOP_IDENTITY_UNPROVEN       = "UNDERLYING_STOP_IDENTITY_UNPROVEN"
+OPTION_CATASTROPHIC_STOP            = "OPTION_CATASTROPHIC_STOP"
+SOFT_LOSS_CONFIRMING                = "SOFT_LOSS_CONFIRMING"
+
 
 def _et_session_date():
     """Return the current market/session calendar date in America/New_York."""
@@ -277,6 +288,8 @@ class ExitDecisionSnapshot:
 
     underlying_available   — current underlying price is a real positive number
     underlying_fresh       — underlying timestamp within UNDERLYING_QUOTE_STALE_SEC
+    underlying_quote_ts    — timestamp of the underlying observation used here
+    underlying_quote_source — transport/provenance label when available
     in_grace_window        — position is inside the soft-exit grace window
     """
     # Option truth
@@ -301,6 +314,10 @@ class ExitDecisionSnapshot:
     display_pnl_pct:          Optional[float]
     touched_profit:           bool
     in_grace_window:          bool
+    # Defaults preserve compatibility with current-main tests that construct
+    # snapshots directly instead of going through the builder.
+    underlying_quote_ts:      Optional[datetime] = None
+    underlying_quote_source:  str = ""
 
 
 def _build_exit_decision_snapshot(
@@ -324,6 +341,27 @@ def _build_exit_decision_snapshot(
             if v is not None:
                 return v
         return None
+
+    def _quote_age_seconds(value) -> Optional[float]:
+        """Parse a quote timestamp and reject materially future observations."""
+        try:
+            timestamp = value
+            if isinstance(timestamp, str):
+                timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            elif isinstance(timestamp, (int, float)):
+                timestamp = datetime.fromtimestamp(float(timestamp), timezone.utc)
+            if not isinstance(timestamp, datetime):
+                return None
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            else:
+                timestamp = timestamp.astimezone(timezone.utc)
+            age_sec = (now_utc - timestamp).total_seconds()
+            if age_sec < -60.0:
+                return None
+            return max(0.0, age_sec)
+        except Exception:
+            return None
 
     # ── Option bid / ask / mid ────────────────────────────────────────────────
     bid = _positive_or_none(_attr(pos, "current_bid", "currentbid"))
@@ -365,10 +403,7 @@ def _build_exit_decision_snapshot(
 
     opt_age_sec: Optional[float] = None
     if opt_ts is not None:
-        try:
-            opt_age_sec = max(0.0, (now_utc - opt_ts).total_seconds())
-        except Exception:
-            opt_age_sec = None
+        opt_age_sec = _quote_age_seconds(opt_ts)
 
     # Timestamp-derived freshness (always current):
     if opt_age_sec is None:
@@ -403,10 +438,7 @@ def _build_exit_decision_snapshot(
 
     und_age_sec: Optional[float] = None
     if und_ts is not None:
-        try:
-            und_age_sec = max(0.0, (now_utc - und_ts).total_seconds())
-        except Exception:
-            und_age_sec = None
+        und_age_sec = _quote_age_seconds(und_ts)
     _und_ts_fresh = (und_age_sec is not None and und_age_sec <= _und_stale_sec)
 
     # AMENDMENT #3 (blocker 2): explicit False vetoes; True cannot survive without ts proof.
@@ -436,8 +468,24 @@ def _build_exit_decision_snapshot(
             except Exception:
                 pass
 
+    underlying_source = str(
+        _attr(
+            pos,
+            "underlying_quote_source",
+            "underlyingquotesource",
+            "last_underlying_quote_source",
+            "lastunderlyingquotesource",
+        )
+        or ""
+    ).strip()
+    if not underlying_source and und_ts is not None:
+        # Current main's QPM writes the canonical observation timestamp on the
+        # position. That timestamp is the minimum transport provenance even
+        # when an older hydrated position has no separate source label.
+        underlying_source = "position_quote_monitor"
+
     # ── Grace window ──────────────────────────────────────────────────────────
-    age_min = _position_age_minutes(pos)
+    age_min = _position_age_minutes(pos, now_utc=now_utc)
     in_grace = age_min < _MIN_HOLD_BEFORE_EXIT_MIN
 
     return ExitDecisionSnapshot(
@@ -458,6 +506,8 @@ def _build_exit_decision_snapshot(
         display_pnl_pct       = disp_pnl,
         touched_profit        = bool(getattr(pos, "touched_profit", False)),
         in_grace_window       = in_grace,
+        underlying_quote_ts   = und_ts,
+        underlying_quote_source = underlying_source,
     )
 
 
@@ -522,6 +572,9 @@ def _soft_exit_entry_grace_decision(snap: ExitDecisionSnapshot) -> "Optional[Exi
 
 def _soft_exit_underlying_truth_gate(
     snap: ExitDecisionSnapshot,
+    *,
+    unavailable_code: str = SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+    stale_code: str = SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
 ) -> "Optional[ExitDecision]":
     """Return a HOLD ExitDecision if underlying truth is insufficient for
     underlying-dependent soft exits.  Returns None when truth is sufficient.
@@ -536,7 +589,7 @@ def _soft_exit_underlying_truth_gate(
             reason="SOFT_EXIT_DEFERRED — underlying price unavailable; cannot confirm thesis for soft exit",
             urgency="NORMAL",
             pnl_pct=snap.exit_executable_pnl_pct or 0.0,
-            reason_code=SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
+            reason_code=unavailable_code,
         )
     if not snap.underlying_fresh:
         age_str = f"{snap.underlying_age_sec:.0f}s" if snap.underlying_age_sec is not None else "unknown"
@@ -545,7 +598,7 @@ def _soft_exit_underlying_truth_gate(
             reason=f"SOFT_EXIT_DEFERRED — underlying quote stale ({age_str}); fresh truth required",
             urgency="NORMAL",
             pnl_pct=snap.exit_executable_pnl_pct or 0.0,
-            reason_code=SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
+            reason_code=stale_code,
         )
     return None
 
@@ -1348,6 +1401,7 @@ class ManagedPosition:
     # (consistent with FIX-8 applied earlier to last_rejection_ts).
     _stop_breach_ts:              Optional[datetime] = None
     _underlying_stop_breach_ts:   Optional[datetime] = None
+    _underlying_stop_breach_quote_ts: Optional[datetime] = None
 
     # PR-B: Execution-core ghost fields. Previously assigned dynamically
     # in ap_execution_core.py via `# type: ignore[attr-defined]`:
@@ -1450,27 +1504,50 @@ class ManagedPosition:
 
     @property
     def is_at_target(self) -> bool:
-        # P0 (PR #385 audit): current_underlying must be a real positive price.
-        # With missing underlying data (0.0), a PUT's `current <= target` was
-        # ALWAYS true (0 <= target), firing TARGET HIT instantly on data gaps.
-        # This is the exact premature-PUT-exit signature (PEP PUT, LULU PUT).
-        # Missing truth is not a market signal.
-        if self.underlying_target <= 0 or self.current_underlying <= 0:
+        # Missing truth and an invalid direction are not market signals. Keep
+        # target geometry fail-closed for the same reason as the PR #403 stop
+        # geometry below.
+        side = str(self.side or "").strip().upper()
+        try:
+            target = float(self.underlying_target or 0.0)
+            current = float(self.current_underlying or 0.0)
+        except (TypeError, ValueError):
             return False
-        if self.side == "CALL":
-            return self.current_underlying >= self.underlying_target
-        return self.current_underlying <= self.underlying_target
+        if (
+            side not in {"CALL", "PUT"}
+            or not math.isfinite(target)
+            or not math.isfinite(current)
+            or target <= 0
+            or current <= 0
+        ):
+            return False
+        if side == "CALL":
+            return current >= target
+        return current <= target
 
     @property
     def is_at_stop(self) -> bool:
-        # P0 (PR #385 audit): same zero-guard as is_at_target. A CALL's
-        # `current <= stop` was always true with current_underlying=0,
-        # firing STOP HIT on data gaps for CALLs.
-        if self.underlying_stop <= 0 or self.current_underlying <= 0:
+        # PR #403: this property remains a compatibility helper, but it must
+        # not invent PUT geometry for an invalid direction or accept
+        # non-finite/malformed levels. The authoritative decision path uses
+        # _underlying_stop_evidence() plus the quote snapshot.
+        side = str(self.side or "").strip().upper()
+        try:
+            stop = float(self.underlying_stop or 0.0)
+            current = float(self.current_underlying or 0.0)
+        except (TypeError, ValueError):
             return False
-        if self.side == "CALL":
-            return self.current_underlying <= self.underlying_stop
-        return self.current_underlying >= self.underlying_stop
+        if (
+            side not in {"CALL", "PUT"}
+            or not math.isfinite(stop)
+            or not math.isfinite(current)
+            or stop <= 0
+            or current <= 0
+        ):
+            return False
+        if side == "CALL":
+            return current <= stop
+        return current >= stop
 
 
 # ── EXIT DECISION ─────────────────────────────────────────────────────────────
@@ -1535,14 +1612,169 @@ def _underlying_still_confirming(pos: ManagedPosition) -> tuple[bool, str]:
     return False, "unknown_side"
 
 
-def _position_age_minutes(pos: ManagedPosition) -> float:
+def _evaluation_now_utc(
+    now_et: Optional[datetime],
+    *,
+    pos: Optional["ManagedPosition"] = None,
+) -> datetime:
+    """Normalize the caller's evaluation clock to an aware UTC datetime.
+
+    ``evaluate_exit`` accepts an ET clock for the session rules. Reusing that
+    same instant for quote age, entry grace, and confirmation prevents a
+    historical replay from mixing a pinned session date with host wall-clock
+    state.
+    """
+    if now_et is None:
+        return datetime.now(timezone.utc)
+    try:
+        if now_et.tzinfo is None:
+            now_et = now_et.replace(tzinfo=ET)
+        candidate = now_et.astimezone(timezone.utc)
+
+        # Some legacy callers pin only the ET session hour while constructing
+        # the position and quote timestamps from the current wall clock. Do
+        # not let those future timestamps become authoritative. A coherent
+        # historical replay (all position timestamps at or before candidate)
+        # still uses the supplied clock end-to-end.
+        if pos is not None:
+            for name in (
+                "opened_at",
+                "last_option_bid_update_ts",
+                "last_option_quote_update_ts",
+                "last_underlying_quote_update_ts",
+                "hard_exit_reference_ts",
+            ):
+                value = getattr(pos, name, None)
+                if not isinstance(value, datetime):
+                    continue
+                timestamp = value
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                else:
+                    timestamp = timestamp.astimezone(timezone.utc)
+                if (timestamp - candidate).total_seconds() > 60.0:
+                    return datetime.now(timezone.utc)
+        return candidate
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def _position_age_minutes(
+    pos: ManagedPosition,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> float:
     """Return how many minutes old the position is."""
+    now_utc = now_utc or datetime.now(timezone.utc)
     try:
         if pos.opened_at:
-            return (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
+            opened_at = pos.opened_at
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            return (now_utc - opened_at).total_seconds() / 60
     except Exception:
         pass
     return 999.0  # unknown age — do not block exits
+
+
+def _technical_stop_identity_proven(pos: ManagedPosition) -> bool:
+    """Return whether ordinary technical-stop classification has safe identity.
+
+    LIVE requires the full durable identity used by the submit seam. PAPER keeps
+    the existing isolated-evaluation compatibility contract but still requires
+    an explicit mode and option contract; an empty/unknown mode never silently
+    authorizes a technical stop.
+    """
+    mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+    contract = str(getattr(pos, "option_symbol", "") or "").strip()
+    if mode == "paper":
+        return bool(contract)
+    if mode != "live":
+        return False
+    return bool(
+        contract
+        and str(getattr(pos, "position_id", "") or "").strip()
+        and str(getattr(pos, "client_id", "") or "").strip()
+        and str(getattr(pos, "ticker", "") or "").strip()
+    )
+
+
+def _underlying_stop_evidence(
+    pos: ManagedPosition,
+    snap: ExitDecisionSnapshot,
+) -> dict:
+    """Evaluate only the stored, side-aware underlying-stop geometry.
+
+    This helper deliberately does not inspect option P&L. A missing/stale
+    quote, invalid side, or invalid stored stop is a deferred technical-stop
+    evaluation, never an adverse price observation.
+    """
+    side = str(getattr(pos, "side", "") or "").strip().upper()
+    if side not in {"CALL", "PUT"}:
+        return {
+            "valid": False,
+            "breached": False,
+            "detail": f"invalid_direction={side or 'missing'}",
+            "side": side,
+            "stop": None,
+            "price": snap.underlying_price,
+        }
+
+    try:
+        stop = float(getattr(pos, "underlying_stop", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        stop = 0.0
+    if not math.isfinite(stop) or stop <= 0.0:
+        return {
+            "valid": False,
+            "breached": False,
+            "detail": "invalid_stop_level",
+            "side": side,
+            "stop": stop,
+            "price": snap.underlying_price,
+        }
+
+    if not snap.underlying_available or snap.underlying_price is None:
+        return {
+            "valid": False,
+            "breached": False,
+            "detail": "underlying_missing",
+            "side": side,
+            "stop": stop,
+            "price": None,
+        }
+    if not snap.underlying_fresh:
+        return {
+            "valid": False,
+            "breached": False,
+            "detail": "underlying_stale",
+            "side": side,
+            "stop": stop,
+            "price": snap.underlying_price,
+        }
+    if snap.underlying_quote_ts is None:
+        return {
+            "valid": False,
+            "breached": False,
+            "detail": "underlying_timestamp_missing",
+            "side": side,
+            "stop": stop,
+            "price": snap.underlying_price,
+        }
+
+    price = snap.underlying_price
+    if side == "CALL":
+        breached = price <= stop
+    else:
+        breached = price >= stop
+    return {
+        "valid": True,
+        "breached": breached,
+        "detail": "underlying_stop_breached" if breached else "underlying_stop_not_breached",
+        "side": side,
+        "stop": stop,
+        "price": price,
+    }
 
 
 def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> ExitDecision:
@@ -1577,7 +1809,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # ── Build canonical decision snapshot ────────────────────────────────────
     # One snapshot per evaluation; all soft exit branches consume it.
-    now_utc = datetime.now(timezone.utc)
+    now_utc = _evaluation_now_utc(now_et, pos=pos)
     snap = _build_exit_decision_snapshot(pos, now_utc)
     _effective_hard_ref = get_effective_hard_exit_reference(pos, now_utc)
 
@@ -1590,6 +1822,62 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
     # May be None when bid is missing.  Soft exit gates will catch None.
     exec_pnl     = snap.exit_executable_pnl_pct
     qty_rem      = pos.quantity_remaining
+
+    # ── PR #403: underlying technical-stop evidence ──────────────────────────
+    # This state is computed independently of option P&L.  The soft-loss
+    # timer below must never be promoted into technical-stop authority.
+    _underlying_evidence = _underlying_stop_evidence(pos, snap)
+    _technical_stop_state = "DEFERRED"
+    _technical_stop_age_sec = 0.0
+    if not _underlying_evidence["valid"]:
+        pos._underlying_stop_breach_ts = None
+        pos._underlying_stop_breach_quote_ts = None
+    elif _underlying_evidence["breached"]:
+        _UNDERLYING_CONFIRM_SEC = float(
+            os.getenv("UNDERLYING_STOP_CONFIRM_SECONDS", "30")
+        )
+        _now_dt = now_utc
+        _stop_dt = getattr(pos, "_underlying_stop_breach_ts", None)
+        _quote_ts = snap.underlying_quote_ts
+        _prior_quote_ts = getattr(pos, "_underlying_stop_breach_quote_ts", None)
+
+        if _stop_dt is None:
+            pos._underlying_stop_breach_ts = _now_dt
+            pos._underlying_stop_breach_quote_ts = _quote_ts
+            _technical_stop_state = "CONFIRMING"
+        else:
+            try:
+                _technical_stop_age_sec = max(0.0, (_now_dt - _stop_dt).total_seconds())
+            except Exception:
+                _technical_stop_age_sec = 0.0
+
+            # A confirmation window needs a later fresh observation.  A
+            # single timestamped quote cannot sit on the shelf until the
+            # wall-clock interval expires and certify a breach by itself.
+            _later_quote_observation = True
+            if _prior_quote_ts is not None:
+                try:
+                    _later_quote_observation = _quote_ts > _prior_quote_ts
+                except Exception:
+                    _later_quote_observation = False
+
+            if (
+                _technical_stop_age_sec >= _UNDERLYING_CONFIRM_SEC
+                and _later_quote_observation
+            ):
+                _technical_stop_state = "CONFIRMED"
+            else:
+                _technical_stop_state = "CONFIRMING"
+    else:
+        # Underlying recovered to the valid side of the stored stop.
+        if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
+            log.info(
+                "[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level",
+                pos.ticker,
+            )
+        pos._underlying_stop_breach_ts = None
+        pos._underlying_stop_breach_quote_ts = None
+        _technical_stop_state = "CLEAR"
 
     # ── 1. TARGET HIT ────────────────────────────────────────────────────────
     # AMENDMENT #4 (blocker 1): pos.is_at_target already zero-guards
@@ -1604,58 +1892,6 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="IMMEDIATE",
             pnl_pct=_decision_pnl,
         )
-
-    # ── 2. STOP HIT ──────────────────────────────────────────────────────────
-    # AMENDMENT #4 (blocker 1): STOP HIT is an underlying-driven risk-reducing
-    # exit and must NOT fire from retained underlying=0.
-    # AMENDMENT #5 (blocker 2): also requires underlying_fresh.  When underlying
-    # is stale/unavailable, we also RESET the breach timer — otherwise elapsed
-    # wall-clock on a single stale observation would satisfy the confirmation
-    # window (reviewer's "produce aging on the shelf" case).
-    if not (snap.underlying_available and snap.underlying_fresh):
-        if getattr(pos, "_underlying_stop_breach_ts", None) is not None:
-            pos._underlying_stop_breach_ts = None
-    elif pos.is_at_stop:
-        _stop_pnl_authority = _decision_pnl
-        # PR-A / BUG-2: stamp is datetime now (was time.time() float).
-        _now_dt = datetime.now(timezone.utc)
-        _stop_dt = pos._underlying_stop_breach_ts
-        _UNDERLYING_CONFIRM_SEC = float(os.getenv("UNDERLYING_STOP_CONFIRM_SECONDS", "30"))
-
-        if _stop_dt is None:
-            pos._underlying_stop_breach_ts = _now_dt
-            log.info(
-                "[%s] UNDERLYING_STOP_BREACH_STARTED — $%.2f at stop $%.2f "
-                "| will exit if holds >%.0fs",
-                pos.ticker, pos.current_underlying,
-                pos.underlying_stop, _UNDERLYING_CONFIRM_SEC,
-            )
-        else:
-            _breach_age_sec = (_now_dt - _stop_dt).total_seconds()
-            if _breach_age_sec >= _UNDERLYING_CONFIRM_SEC:
-                # Breach confirmed — exit with bid-limit
-                pos._underlying_stop_breach_ts = None
-                return ExitDecision(
-                    action="STOP", quantity=qty_rem,
-                    reason=(
-                        f"STOP HIT — underlying ${pos.current_underlying:.2f} "
-                        f"held below stop ${pos.underlying_stop:.2f} "
-                        f"for {_breach_age_sec:.0f}s"
-                    ),
-                    urgency="HIGH", pnl_pct=_stop_pnl_authority,
-                )
-            else:
-                log.info(
-                    "[%s] UNDERLYING_STOP_CONFIRMING — $%.2f below stop $%.2f "
-                    "| breach=%.0fs/%.0fs",
-                    pos.ticker, pos.current_underlying,
-                    pos.underlying_stop, _breach_age_sec, _UNDERLYING_CONFIRM_SEC,
-                )
-    else:
-        # Underlying recovered above stop — reset confirmation timer
-        if pos._underlying_stop_breach_ts is not None:
-            pos._underlying_stop_breach_ts = None
-            log.info("[%s] UNDERLYING_STOP_RECOVERED — price reclaimed stop level", pos.ticker)
 
     # ══ P0 (PR #385 amendment #3, blocker 1): HARD-EXIT PRE-EVALUATION ════════
     # Hard exits fire BEFORE every soft branch AND every soft truth gate.
@@ -1682,13 +1918,41 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # HARD STOP (pre-evaluated, using dedicated loss authority)
     if _hard_loss_pnl is not None and _hard_loss_pnl <= _hard_stop:
+        _dte_hard, _is_idx_hard, _profile_hard = _option_profile(
+            pos, session_date=_session_date,
+        )
+        _hard_ref_price = getattr(
+            pos, "hard_exit_reference_price", getattr(pos, "hardexitreferenceprice", None)
+        )
+        _hard_ref_source = getattr(
+            pos, "hard_exit_reference_source", getattr(pos, "hardexitreferencesource", "")
+        )
+        _hard_ref_validity = getattr(
+            pos, "hard_exit_reference_validity", getattr(pos, "hardexitreferencevalidity", "")
+        )
+        if _has_fresh_dedicated_bid(pos, now_utc=now_utc):
+            _hard_authority_source = "fresh_executable_bid"
+            _hard_authority_price = getattr(pos, "current_bid", getattr(pos, "currentbid", 0.0))
+        else:
+            _hard_authority_source = str(_hard_ref_source or "proven_hard_exit_reference")
+            _hard_authority_price = _hard_ref_price
         return ExitDecision(
             action="STOP", quantity=qty_rem,
             reason=(
-                f"HARD STOP -- {_hard_loss_pnl*100:.0f}% (hard-exit ref) exceeded "
-                f"-{abs(_hard_stop)*100:.0f}% max loss"
+                f"STOP HIT — HARD STOP — OPTION_CATASTROPHIC_STOP "
+                f"(independent option-loss authority; underlying stop not asserted) — "
+                f"{_hard_loss_pnl*100:.0f}% exceeded {abs(_hard_stop)*100:.0f}% "
+                f"threshold | contract={pos.option_symbol} entry={pos.entry_price:.4f} "
+                f"authority_price={_hard_authority_price} "
+                f"authority_source={_hard_authority_source} "
+                f"reference_validity={_hard_ref_validity or 'n/a'} "
+                f"dte={_dte_hard} profile={_profile_hard} "
+                f"client_id={getattr(pos, 'client_id', '') or 'n/a'} "
+                f"execution_mode={getattr(pos, 'execution_mode', '') or 'unknown'} "
+                f"position_id={getattr(pos, 'position_id', '') or 'n/a'}"
             ),
             urgency="IMMEDIATE", pnl_pct=_hard_loss_pnl,
+            reason_code=OPTION_CATASTROPHIC_STOP,
         )
 
     # EOD FORCE CLOSE (pre-evaluated) — deliberately independent of quote
@@ -1703,6 +1967,94 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             action="CLOSE_ALL", quantity=qty_rem,
             reason=f"EOD FORCE CLOSE -- {hour}:{minute:02d} ET {'(market closed)' if _pre_market_closed else f'past {EOD_HARD_CLOSE_HOUR}:{EOD_HARD_CLOSE_MIN:02d}'}",
             urgency="IMMEDIATE", pnl_pct=_eod_audit_pnl,
+        )
+
+    # Technical underlying-stop authority is returned only after the hard and
+    # EOD protections above have had their independent chance to act.
+    if _technical_stop_state == "CONFIRMED":
+        if not _technical_stop_identity_proven(pos):
+            pos._underlying_stop_breach_ts = None
+            pos._underlying_stop_breach_quote_ts = None
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=(
+                    f"{UNDERLYING_STOP_IDENTITY_UNPROVEN} — ordinary technical stop "
+                    f"requires explicit client/mode/position/contract identity"
+                ),
+                urgency="NORMAL", pnl_pct=_decision_pnl,
+                reason_code=UNDERLYING_STOP_IDENTITY_UNPROVEN,
+            )
+        pos._underlying_stop_breach_ts = None
+        pos._underlying_stop_breach_quote_ts = None
+        _quote_ts_text = (
+            snap.underlying_quote_ts.isoformat()
+            if hasattr(snap.underlying_quote_ts, "isoformat")
+            else str(snap.underlying_quote_ts or "")
+        )
+        return ExitDecision(
+            action="STOP", quantity=qty_rem,
+            reason=(
+                f"STOP HIT — {UNDERLYING_TECHNICAL_STOP_CONFIRMED} — "
+                f"{_underlying_evidence['side']} underlying "
+                f"${_underlying_evidence['price']:.4f} crossed stored stop "
+                f"${_underlying_evidence['stop']:.4f} for {_technical_stop_age_sec:.0f}s "
+                f"| quote_ts={_quote_ts_text} "
+                f"quote_age_sec={snap.underlying_age_sec} "
+                f"source={snap.underlying_quote_source or 'unknown'} "
+                f"contract={pos.option_symbol} "
+                f"client_id={getattr(pos, 'client_id', '') or 'n/a'} "
+                f"execution_mode={getattr(pos, 'execution_mode', '') or 'unknown'} "
+                f"position_id={getattr(pos, 'position_id', '') or 'n/a'}"
+            ),
+            urgency="HIGH", pnl_pct=_decision_pnl,
+            reason_code=UNDERLYING_TECHNICAL_STOP_CONFIRMED,
+        )
+    if _technical_stop_state == "CONFIRMING":
+        # Winner-protection remains gated by fresh executable option truth.
+        # Preserve that current-main deferral when a touched-profit position
+        # has a stale BID; the underlying confirmation timer remains persisted
+        # and is still the only state that can produce a technical STOP.
+        if (
+            bool(getattr(pos, "touched_profit", False))
+            and snap.option_bid_valid
+            and not snap.option_quote_fresh
+        ):
+            _winner_option_gate = _soft_exit_option_truth_gate(
+                snap, qty_rem=qty_rem,
+            )
+            if _winner_option_gate is not None:
+                return _winner_option_gate
+        if not _technical_stop_identity_proven(pos):
+            pos._underlying_stop_breach_ts = None
+            pos._underlying_stop_breach_quote_ts = None
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=(
+                    f"{UNDERLYING_STOP_IDENTITY_UNPROVEN} — ordinary technical stop "
+                    f"confirmation deferred until identity is proven"
+                ),
+                urgency="NORMAL", pnl_pct=_decision_pnl,
+                reason_code=UNDERLYING_STOP_IDENTITY_UNPROVEN,
+            )
+        _quote_ts_text = (
+            snap.underlying_quote_ts.isoformat()
+            if hasattr(snap.underlying_quote_ts, "isoformat")
+            else str(snap.underlying_quote_ts or "")
+        )
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=(
+                f"{UNDERLYING_STOP_CONFIRMING} — "
+                f"{_underlying_evidence['side']} underlying "
+                f"${_underlying_evidence['price']:.4f} beyond stored stop "
+                f"${_underlying_evidence['stop']:.4f} "
+                f"| breach_age_sec={_technical_stop_age_sec:.0f} "
+                f"| quote_ts={_quote_ts_text} "
+                f"quote_age_sec={snap.underlying_age_sec} "
+                f"source={snap.underlying_quote_source or 'unknown'}"
+            ),
+            urgency="NORMAL", pnl_pct=_decision_pnl,
+            reason_code=UNDERLYING_STOP_CONFIRMING,
         )
     # ══════════════════════════════════════════════════════════════════════════
 
@@ -1747,7 +2099,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             # Underlying data is fresh and available — check direction.
             # A single penny drop on a cheap contract (-9%) is not a real signal
             # if the underlying is still moving in our direction.
-            _age_min = _position_age_minutes(pos)
+            _age_min = _position_age_minutes(pos, now_utc=now_utc)
             _confirming, _confirm_reason = _underlying_still_confirming(pos)
             _MAX_THESIS_OVERRIDE = float(
                 os.getenv("MAX_HOLD_MINUTES_WHILE_RED", "5")
@@ -1974,14 +2326,40 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
         # ── Underlying truth gate ─────────────────────────────────────────────
         # Missing or stale underlying → DEFER (not genuine non-confirmation).
-        _sl_und_gate = _soft_exit_underlying_truth_gate(snap)
+        _live_risk_mode = str(getattr(pos, "execution_mode", "") or "").strip().lower() == "live"
+        _strict_underlying_defer = _live_risk_mode and _technical_stop_state == "DEFERRED"
+        _sl_und_gate = _soft_exit_underlying_truth_gate(
+            snap,
+            unavailable_code=(
+                UNDERLYING_STOP_DEFERRED_DATA_UNAVAILABLE
+                if _strict_underlying_defer
+                else SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE
+            ),
+            stale_code=(
+                UNDERLYING_STOP_DEFERRED_DATA_UNAVAILABLE
+                if _strict_underlying_defer
+                else SOFT_EXIT_DEFERRED_UNDERLYING_STALE
+            ),
+        )
         if _sl_und_gate is not None:
             return _sl_und_gate
+        if _technical_stop_state == "DEFERRED" and _underlying_evidence["detail"] not in {
+            "underlying_missing", "underlying_stale",
+        }:
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=(
+                    f"{UNDERLYING_STOP_DEFERRED_DATA_UNAVAILABLE} — "
+                    f"technical stop cannot be evaluated: {_underlying_evidence['detail']}"
+                ),
+                urgency="NORMAL", pnl_pct=_sl_pnl,
+                reason_code=UNDERLYING_STOP_DEFERRED_DATA_UNAVAILABLE,
+            )
         _sl_grace_gate = _soft_exit_entry_grace_decision(snap)
         if _sl_grace_gate is not None:
             return _sl_grace_gate
 
-        _soft_age       = _position_age_minutes(pos)
+        _soft_age       = _position_age_minutes(pos, now_utc=now_utc)
         _soft_confirm, _soft_reason = _underlying_still_confirming(pos)
 
         # Measure how strongly the underlying is moving in our direction
@@ -1997,7 +2375,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
         # Stop confirmation: track when this stop level was first breached
         # If stop just breached (< STOP_CONFIRM_SECONDS ago), give it time to recover
         # PR-A / BUG-2: stamp is datetime now (was time.time() float).
-        _now_dt = datetime.now(timezone.utc)
+        _now_dt = now_utc
         _breach_dt = pos._stop_breach_ts
         if _breach_dt is None:
             # First time we see this breach — stamp it, don't exit yet
@@ -2009,8 +2387,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
-                reason=f"STOP_BREACH_STARTED — {_sl_pnl*100:.1f}% exec/bid loss | breach stamped, waiting for confirmation window",
-                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_STARTED",
+                reason=f"{SOFT_LOSS_CONFIRMING} — {_sl_pnl*100:.1f}% exec/bid loss | soft-policy confirmation stamped; stored underlying stop not confirmed",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code=SOFT_LOSS_CONFIRMING,
             )
 
         _breach_age_sec = (_now_dt - _breach_dt).total_seconds()
@@ -2040,8 +2418,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             )
             return ExitDecision(
                 action="HOLD", quantity=0,
-                reason=f"STOP_BREACH_CONFIRMING — {_sl_pnl*100:.1f}% exec/bid loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | {_soft_reason}",
-                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="STOP_BREACH_CONFIRMING",
+                reason=f"{SOFT_LOSS_CONFIRMING} — {_sl_pnl*100:.1f}% exec/bid loss | {_breach_age_sec:.0f}s/{_STOP_CONFIRM_SEC:.0f}s window | stored underlying stop not confirmed | {_soft_reason}",
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code=SOFT_LOSS_CONFIRMING,
             )
 
         # ── Breach confirmed (held past confirmation window) ──────────────────
@@ -2074,19 +2452,20 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             )
 
         if not _soft_confirm:
-            # Thesis confirmed broken — underlying not holding, breach confirmed
-            # NOTE: _underlying_still_confirming returning "no_underlying_data" is NOT
-            # reachable here because the underlying gate above already deferred for
-            # missing/stale data.  Any "not confirming" here is genuine adverse movement.
+            # A move against the entry is not enough to certify the stored
+            # technical stop. The dedicated underlying-stop path above would
+            # already have returned CONFIRMING or CONFIRMED when its geometry
+            # was valid. Keep this separate soft policy in a watch state rather
+            # than manufacturing THESIS_FAIL_SOFT_STOP from entry geometry.
             pos._stop_breach_ts = None
             return ExitDecision(
-                action="CLOSE_ALL", quantity=qty_rem,
+                action="HOLD", quantity=0,
                 reason=(
-                    f"THESIS_FAIL_SOFT_STOP — {_sl_pnl*100:.0f}% exec/bid loss "
-                    f"and underlying not confirming ({_soft_reason}) | "
-                    f"age={_soft_age:.1f}min | confirmed {_breach_age_sec:.0f}s"
+                    f"SOFT_LOSS_WATCH — {_sl_pnl*100:.0f}% exec/bid loss "
+                    f"and stored underlying stop not confirmed "
+                    f"({_soft_reason}) | age={_soft_age:.1f}min"
                 ),
-                urgency="HIGH", pnl_pct=_sl_pnl,
+                urgency="NORMAL", pnl_pct=_sl_pnl, reason_code="SOFT_LOSS_WATCH",
             )
 
         # Thesis still valid — watch, don't exit on time alone
@@ -2104,10 +2483,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
     # ── NEVER-GREEN ESCALATING STOP ───────────────────────────────────────────
     if not pos.touched_profit:
-        _age_min = (
-            (datetime.now(timezone.utc) - pos.opened_at).total_seconds() / 60
-            if pos.opened_at else 0
-        )
+        _age_min = _position_age_minutes(pos, now_utc=now_utc) if pos.opened_at else 0
         # AMENDMENT (PR #385 review): use the SAME session date that
         # _effective_thresholds consumed above.  Without this, one
         # evaluate_exit() call could pick its hard-stop profile from the
@@ -2160,7 +2536,7 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             if _ng_grace_gate is not None:
                 return _ng_grace_gate
 
-            _ng_age_min = _position_age_minutes(pos)
+            _ng_age_min = _position_age_minutes(pos, now_utc=now_utc)
             _ng_confirming, _ng_confirm_reason = _underlying_still_confirming(pos)
             # PR-A / BUG-4: read from unified module-level constant; previously
             # defaulted to 3 here vs 5 in the soft-loss path — asymmetric when
@@ -2370,6 +2746,8 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
 
 EXIT_RULE_PRECEDENCE = (
     "STOP_HIT",
+    UNDERLYING_TECHNICAL_STOP_CONFIRMED,
+    OPTION_CATASTROPHIC_STOP,
     "HARD_STOP",
     "EOD_FORCE_CLOSE",
     "SENTINEL_FORCED_EXIT",
@@ -2427,6 +2805,8 @@ PROTECTIVE_STATE_RESOLVED = "RESOLVED"
 FORCED_RISK_EXIT_CODES = {
     "EOD_FORCE_CLOSE",
     "STOP_HIT",
+    UNDERLYING_TECHNICAL_STOP_CONFIRMED,
+    OPTION_CATASTROPHIC_STOP,
     "SENTINEL_FORCED_EXIT",
     "HARD_STOP",
     "EMERGENCY_STOP",
@@ -2521,6 +2901,10 @@ def _classify_exit_decision(decision: "ExitDecision") -> str:
         return explicit_code
     r      = (getattr(decision, "reason", "") or "").upper()
     action = (getattr(decision, "action", "") or "").upper()
+    if UNDERLYING_TECHNICAL_STOP_CONFIRMED in r:
+        return UNDERLYING_TECHNICAL_STOP_CONFIRMED
+    if OPTION_CATASTROPHIC_STOP in r:
+        return OPTION_CATASTROPHIC_STOP
     if "SENTINEL" in r:              return "SENTINEL_FORCED_EXIT"
     if "EOD FORCE CLOSE" in r:       return "EOD_FORCE_CLOSE"
     if "THETA STOP" in r:            return "THETA_STOP"
@@ -2616,7 +3000,7 @@ def _positive_or_none(value) -> Optional[float]:
         num = float(value)
     except Exception:
         return None
-    return num if num > 0 else None
+    return num if num > 0 and math.isfinite(num) else None
 
 
 def _decision_window(decision: "ExitDecision", now_et: Optional[datetime] = None) -> str:
@@ -2624,7 +3008,12 @@ def _decision_window(decision: "ExitDecision", now_et: Optional[datetime] = None
     reason = (getattr(decision, "reason", "") or "").upper()
     if code == "EOD_FORCE_CLOSE" or "EOD" in reason:
         return "EOD"
-    if code in {"HARD_STOP", "STOP_HIT"} or "HARD STOP" in reason:
+    if code in {
+        "HARD_STOP",
+        "STOP_HIT",
+        UNDERLYING_TECHNICAL_STOP_CONFIRMED,
+        OPTION_CATASTROPHIC_STOP,
+    } or "HARD STOP" in reason:
         return "HARD_STOP"
     if code == "THETA_STOP" or "THETA STOP" in reason:
         return "THETA_STOP"
@@ -2690,10 +3079,31 @@ def build_exit_decision_stamp(
         except Exception:
             pnl_pct = None
 
+    _underlying_quote_ts = (
+        getattr(pos, "last_underlying_quote_update_ts", None)
+        or getattr(pos, "lastunderlyingquoteupdatets", None)
+    )
+    _underlying_quote_age_sec = None
+    if _underlying_quote_ts is not None:
+        try:
+            _quote_dt = _underlying_quote_ts
+            if isinstance(_quote_dt, str):
+                _quote_dt = datetime.fromisoformat(_quote_dt.replace("Z", "+00:00"))
+            if _quote_dt.tzinfo is None:
+                _quote_dt = _quote_dt.replace(tzinfo=timezone.utc)
+            else:
+                _quote_dt = _quote_dt.astimezone(timezone.utc)
+            _quote_age = (_evaluation_now_utc(now_et) - _quote_dt).total_seconds()
+            if _quote_age >= 0:
+                _underlying_quote_age_sec = max(0.0, _quote_age)
+        except Exception:
+            _underlying_quote_age_sec = None
+
     return {
         "event": "exit_decision",
         "window": _decision_window(decision, now_et),
         "action": "fired" if getattr(decision, "should_act", False) else "skipped",
+        "reason_code": getattr(decision, "reason_code", "") or _classify_exit_decision(decision),
         "reason": getattr(decision, "reason", "") or "",
         "client_id": str(client_id or getattr(pos, "client_id", "") or ""),
         "execution_mode": str(execution_mode or getattr(pos, "execution_mode", "") or ""),
@@ -2707,6 +3117,22 @@ def build_exit_decision_stamp(
         "option_mid": mid,
         "option_last": _positive_or_none(getattr(pos, "current_last", None)),
         "underlying_price": _positive_or_none(getattr(pos, "current_underlying", None)),
+        "underlying_stop": _positive_or_none(getattr(pos, "underlying_stop", None)),
+        "underlying_side": str(getattr(pos, "side", "") or "").upper(),
+        "underlying_quote_ts": str(
+            _underlying_quote_ts
+            or ""
+        ),
+        "underlying_quote_source": str(
+            getattr(pos, "underlying_quote_source", "")
+            or getattr(pos, "underlyingquotesource", "")
+            or ("position_quote_monitor" if _underlying_quote_ts else "")
+        ),
+        "underlying_quote_age_sec": _underlying_quote_age_sec,
+        "hard_exit_reference_price": getattr(pos, "hard_exit_reference_price", None),
+        "hard_exit_reference_source": getattr(pos, "hard_exit_reference_source", ""),
+        "hard_exit_reference_validity": getattr(pos, "hard_exit_reference_validity", ""),
+        "hard_exit_reference_pnl_pct": getattr(pos, "hard_exit_reference_pnl_pct", None),
         "pnl_pct_at_decision": pnl_pct,
         "mfe_pct_so_far": (
             float(getattr(pos, "peak_pnl_pct", 0.0) or 0.0)
@@ -2757,6 +3183,7 @@ def build_exit_decision_stamp(
 # Reason codes that this guard gates when the position is live-risk + degraded.
 _PR176_GATED_SOFT_REASON_CODES = frozenset({
     "SOFT_LOSS",
+    SOFT_LOSS_CONFIRMING,
     "SOFT_LOSS_WATCH",
     "DEEP_LOSS_STOP",
     "STOP_BREACH_CONFIRMING",
@@ -2768,6 +3195,8 @@ _PR176_GATED_SOFT_REASON_CODES = frozenset({
 _PR176_ALWAYS_ALLOWED_REASON_CODES = frozenset({
     "EOD_FORCE_CLOSE",
     "HARD_STOP",
+    OPTION_CATASTROPHIC_STOP,
+    UNDERLYING_TECHNICAL_STOP_CONFIRMED,
     "HARD_DISASTER_STOP",
     "EMERGENCY_FLATTEN",
     "BROKER_FORCE_CLOSE",
@@ -8054,7 +8483,9 @@ class APExitEngine:
                 # Classify urgency from the exit reason code
                 _code = _classify_exit_decision(decision)
                 _RISK_CODES = {
-                    "EOD_FORCE_CLOSE", "HARD_STOP", "STOP_HIT", "THETA_STOP",
+                    "EOD_FORCE_CLOSE", "HARD_STOP", "STOP_HIT",
+                    OPTION_CATASTROPHIC_STOP, UNDERLYING_TECHNICAL_STOP_CONFIRMED,
+                    "THETA_STOP",
                     "SENTINEL_FORCED_EXIT", "NEVER_GREEN_STOP", "TIME_STOP",
                 }
                 _TRAIL_CODES = {
