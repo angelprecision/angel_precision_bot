@@ -1373,6 +1373,9 @@ def _order_chain_for_direct_quote_recovery(
         vol_missing = opt.get("volume") in (None, "")
         open_interest = int(_safe_float(opt.get("open_interest"), 0.0)) if not oi_missing else None
         volume = int(_safe_float(opt.get("volume"), 0.0)) if not vol_missing else None
+        canonical_symbol = "".join(
+            str(opt.get("symbol") or opt.get("contract") or "").upper().split()
+        )
         ranking = {
             "rank": 0,
             "symbol": opt.get("symbol") or opt.get("contract"),
@@ -1390,6 +1393,18 @@ def _order_chain_for_direct_quote_recovery(
             "volume": volume,
             "original_index": original_index,
         }
+        # Raw provider order is not a stable tie-break authority.  The same
+        # candidate set can arrive in a different insertion order after a
+        # restart, provider pagination, or JSON normalization; equivalent
+        # equal-ranked contracts must still consume direct-quote capacity in
+        # the same order.  Keep original_index as diagnostic evidence only.
+        stable_tie_key = (
+            canonical_symbol,
+            exp_date.isoformat() if exp_date else "",
+            opt_type,
+            float(strike) if strike is not None else float("inf"),
+            float(abs_delta) if abs_delta is not None else float("inf"),
+        )
         sort_key = (
             0 if _valid_occ_symbol(opt) else 1,
             0 if valid_expiration else 1,
@@ -1401,7 +1416,7 @@ def _order_chain_for_direct_quote_recovery(
             delta_distance if delta_distance is not None else float("inf"),
             -(open_interest or 0),
             -(volume or 0),
-            original_index,
+            stable_tie_key,
         )
         rows.append((sort_key, opt, ranking))
     rows.sort(key=lambda item: item[0])
