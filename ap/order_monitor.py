@@ -302,12 +302,10 @@ _ACTIONABLE_BROKER_STATUSES = frozenset({
 def _is_unproven_broker_status(value) -> bool:
     """True only when the broker status lookup produced no truth at all.
 
-    This is deliberately narrow.  Earlier revisions of #425 treated every
-    unrecognized string as unknown, which silently converted authoritative
-    live broker states (``held``, ``calculated``) and every ``None`` return
-    into a permanent HOLD with no cancel, reprice, or retry — a liveness
-    regression on money-at-risk exits and an invasion of the stale
-    working-exit surface owned by #423.
+    Retained as the explicit vocabulary of a failed lookup.  It is folded
+    into ``_requires_broker_owned_exit_fence`` rather than applied on its
+    own: an unproven status is by definition not actionable, and gating on
+    it independently would change behavior for rows this PR does not own.
     """
     return str(value or "").strip().lower() in _UNPROVEN_BROKER_STATUSES
 
@@ -350,15 +348,21 @@ def _broker_ownership_adopted_at(order):
 
 
 def _requires_broker_owned_exit_fence(value) -> bool:
-    """HOLD predicate for rows this PR owns.
+    """HOLD predicate, applied only to rows this PR recovered.
 
-    A row whose EXIT lifecycle was recovered from ``EXIT_REQUESTED`` via exact
-    broker ownership is fenced whenever broker truth is unproven *or* not
-    actionable: adoption alone does not license cancel/reprice on an exit the
-    broker may already have worked.  Rows this PR does not own keep their
-    pre-existing behavior.
+    A row whose EXIT lifecycle was adopted from ``EXIT_REQUESTED`` via exact
+    broker ownership is fenced whenever broker truth is unproven or simply
+    not actionable: adoption alone does not license cancel/reprice on an exit
+    the broker may already have worked.
+
+    This predicate is never consulted for any other row.  Rows this PR does
+    not own keep main's behavior exactly, so the stale working-exit surface
+    owned by #423 is unchanged by this PR.
     """
-    return not _is_actionable_broker_status(value)
+    return (
+        _is_unproven_broker_status(value)
+        or not _is_actionable_broker_status(value)
+    )
 
 
 class APOrderMonitor:
@@ -2557,10 +2561,9 @@ class APOrderMonitor:
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if (
-                        broker_owned_recovery
-                        and _requires_broker_owned_exit_fence(broker_status)
-                    ) or _is_unproven_broker_status(broker_status):
+                    if broker_owned_recovery and _requires_broker_owned_exit_fence(
+                        broker_status
+                    ):
                         self._hold_on_unknown_broker_status(
                             local_id,
                             status,
@@ -2584,10 +2587,9 @@ class APOrderMonitor:
             elif status == "EXIT_ACKNOWLEDGED":
                 if age_secs > TIMEOUT_EXIT_ACK:
                     broker_status = self._query_broker_order(broker_oid)
-                    if (
-                        broker_owned_recovery
-                        and _requires_broker_owned_exit_fence(broker_status)
-                    ) or _is_unproven_broker_status(broker_status):
+                    if broker_owned_recovery and _requires_broker_owned_exit_fence(
+                        broker_status
+                    ):
                         self._hold_on_unknown_broker_status(
                             local_id,
                             status,
@@ -3676,10 +3678,9 @@ class APOrderMonitor:
         broker_owned_recovery = _is_broker_ownership_adopted_row(
             self.osm.get_order(local_order_id) or {}
         )
-        if (
-            broker_owned_recovery
-            and _requires_broker_owned_exit_fence(broker_status)
-        ) or _is_unproven_broker_status(broker_status):
+        if broker_owned_recovery and _requires_broker_owned_exit_fence(
+            broker_status
+        ):
             self._hold_on_unknown_broker_status(
                 local_order_id,
                 status,

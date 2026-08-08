@@ -2353,12 +2353,17 @@ def test_f1_unmapped_broker_status_holds_for_broker_owned_recovery_rows(
     )
 
 
-def test_f1_lookup_failure_holds_regardless_of_row_ownership(monkeypatch):
-    """F1: a lookup that produced no truth at all is always a HOLD."""
-    order = _row(status="EXIT_SUBMITTED", broker_order_id="unowned-425")
-    osm = _MonitorOSM(order)
-    broker = _Broker({})
-    monitor = _monitor(order, osm, broker)
+def test_f1_lookup_failure_holds_only_for_broker_owned_recovery_rows(monkeypatch):
+    """F1: a failed lookup fences rows this PR owns and nothing else.
+
+    Holding on lookup failure is correct for a row we adopted, but applying
+    it to every exit row would be a behavior change against main on the
+    stale working-exit surface owned by #423.  This PR must leave that
+    surface byte-identical.
+    """
+    owned = _adopted_row()
+    osm = _MonitorOSM(owned)
+    monitor = _monitor(owned, osm, _Broker({}))
     monitor._query_broker_order = MagicMock(return_value=None)
     monitor._handle_stale_exit = MagicMock()
     monitor._cancel_broker_order = MagicMock()
@@ -2370,6 +2375,25 @@ def test_f1_lookup_failure_holds_regardless_of_row_ownership(monkeypatch):
     monitor._handle_stale_exit.assert_not_called()
     monitor._cancel_broker_order.assert_not_called()
     assert any(
+        call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
+        for call in monitor._emit_order_event.call_args_list
+    )
+
+
+def test_f1_lookup_failure_preserves_main_behavior_for_unowned_rows(monkeypatch):
+    """F1: #423's surface is unchanged — a failed lookup still escalates."""
+    unowned = _row(status="EXIT_SUBMITTED", broker_order_id="unowned-425")
+    osm = _MonitorOSM(unowned)
+    monitor = _monitor(unowned, osm, _Broker({}))
+    monitor._query_broker_order = MagicMock(return_value=None)
+    monitor._handle_stale_exit = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    monitor._handle_stale_exit.assert_called_once()
+    assert not any(
         call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
         for call in monitor._emit_order_event.call_args_list
     )
