@@ -2302,3 +2302,96 @@ class TestRWRRetentionExactFenceCatchesLateAdvancementDuringAdoption:
         )
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
+
+
+class TestRWROuterExceptionHandlerNeverRetainsStaleAuthority:
+    """The broad outer `except Exception as _rwr_exc:` wraps the ENTIRE RWR
+    validation+processing sequence. An unexpected exception there proves
+    nothing about whether this actor's generation/identity/state
+    expectation still matches the durable row -- it can fire well after a
+    concurrent actor has already advanced authority. Falling back to the
+    older, generic _retain_recovery_ownership() (fenced only on blank
+    watcher fields, not on exact generation/identity/state) let a stale
+    actor write recovery ownership onto a row it no longer owned. The
+    fix removes that fallback entirely: the exception path must be fail-
+    closed for durable ownership writes.
+    """
+
+    def test_unexpected_exception_after_stale_advance_performs_zero_mutation(
+        self, monkeypatch,
+    ):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        # At the exact moment this actor's own RWR validation read would
+        # run (the same injection point empirically confirmed for Tests
+        # A-D: the first get_order() call whose row shows
+        # direction_reversal_rearm_requires_watcher=True), genuinely
+        # advance the UNDERLYING durable generation (not merely a
+        # returned copy -- this must remain visible after the exception
+        # path runs) and then raise, landing in the broad outer
+        # REARM_WATCHER_REQUIRED_HANDLER_EXCEPTION branch rather than any
+        # reason-classified _rwr_fail() path.
+        _fired = {"done": False}
+        _real_get_order = osm.get_order
+
+        def _wrapped(order_id):
+            row = _real_get_order(order_id)
+            if (
+                not _fired["done"]
+                and row
+                and (row.get("meta") or {}).get(
+                    "direction_reversal_rearm_requires_watcher"
+                ) is True
+            ):
+                _fired["done"] = True
+                row_store["row"]["meta"]["materialization_generation"] = (
+                    NEW_GEN + 1
+                )
+                raise RuntimeError(
+                    "simulated unexpected exception reaching the outer "
+                    "REARM_WATCHER_REQUIRED exception handler"
+                )
+            return row
+
+        osm.get_order = _wrapped
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert _fired["done"], "setup: the injected exception must have fired"
+
+        # (4) The exact-fenced retention CAS was never invoked either.
+        assert retention_calls == []
+        # (5) No retention write of any kind landed -- this field is only
+        # ever populated by an actual retention CAS write.
+        assert "recovery_retained_at" not in row_store["row"]["meta"]
+        # (6) The advanced durable generation is exactly what the
+        # concurrent actor set it to -- untouched by the stale actor.
+        assert row_store["row"]["meta"]["materialization_generation"] == (
+            NEW_GEN + 1
+        )
+        # (7) Zero watcher side effects.
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert len(watcher._pending) == 0
+        # (8) Zero broker/submission side effects.
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+        # The exception is still logged/recorded as an error, just
+        # without any ownership mutation.
+        assert any(
+            "rearm_watcher_required_exception" in e
+            for e in result.get("errors", [])
+        )

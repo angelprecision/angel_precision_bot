@@ -3162,15 +3162,30 @@ class APStartupRecovery:
                                 # result: PTR already durably disposed the
                                 # row; no further action for this row.
                             except Exception as _rwr_exc:
+                                # PR #421 final exception-path correction:
+                                # this catch-all wraps the ENTIRE RWR
+                                # validation+processing sequence. An
+                                # unexpected exception here proves nothing
+                                # about whether this actor's generation/
+                                # identity/state expectation still matches
+                                # the durable row — it may fire well after
+                                # a concurrent actor has already advanced
+                                # authority. The old fallback to the
+                                # weaker, generic _retain_recovery_ownership
+                                # (fenced only on blank watcher fields, not
+                                # on the exact generation/identity/state
+                                # this pass was validating) could let a
+                                # stale actor write recovery ownership onto
+                                # a row it no longer owns. Fail closed:
+                                # log and record telemetry only, zero
+                                # durable ownership mutation.
                                 log.error(
                                     "[%s] REARM_WATCHER_REQUIRED_HANDLER_EXCEPTION "
-                                    "local_order_id=%s exc=%s — retaining ownership",
+                                    "local_order_id=%s exc=%s — zero ownership "
+                                    "mutation; this actor cannot prove it still "
+                                    "holds exact generation/identity/state "
+                                    "authority after an unexpected exception",
                                     self.client_id, local_order_id, _rwr_exc,
-                                )
-                                _retain_recovery_ownership(
-                                    local_order_id,
-                                    reason=f"rearm_watcher_required_exception:"
-                                    f"{type(_rwr_exc).__name__}",
                                 )
                                 result.setdefault("errors", []).append(
                                     f"rearm_watcher_required_exception:"
