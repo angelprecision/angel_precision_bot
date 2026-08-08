@@ -23,8 +23,12 @@ from __future__ import annotations
 import os
 from datetime import datetime, timedelta, timezone
 
-# Stub DATABASE_URL so ap/__init__.py can import without a live Supabase connection.
-os.environ.setdefault("DATABASE_URL", "postgresql://fake-host/fake-db")
+# Stub DATABASE_URL only while importing modules that require it. Restore the
+# caller's value immediately so this module cannot poison later DB-backed tests
+# in the same pytest process.
+_ORIGINAL_DATABASE_URL = os.environ.get("DATABASE_URL")
+if _ORIGINAL_DATABASE_URL is None:
+    os.environ["DATABASE_URL"] = "postgresql://fake-host/fake-db"
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -43,6 +47,9 @@ from ap.selector_retry_policy import (
     record_selector_structural_skip,
     selector_symbol_may_retry,
 )
+
+if _ORIGINAL_DATABASE_URL is None:
+    os.environ.pop("DATABASE_URL", None)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
