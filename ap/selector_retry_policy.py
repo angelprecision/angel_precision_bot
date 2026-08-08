@@ -62,7 +62,6 @@ Unknown reasons fail closed — they are NOT retryable by default.
 from __future__ import annotations
 
 import os
-import re
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -777,6 +776,36 @@ def _strict_positive_cursor_int(value) -> int | None:
     return None
 
 
+def _parse_cursor_aware_timestamp(value) -> datetime | None:
+    """Resolve a durable cursor timestamp string to a timezone-aware datetime.
+
+    Never raises.  Requirements:
+      - value must be a str
+      - nonblank
+      - valid ISO-8601 parseable via datetime.fromisoformat
+      - timezone-aware (tzinfo must not be None after parsing)
+
+    Trailing Z is accepted because _utc_iso (the canonical producer) emits
+    trailing +00:00 on CPython 3.11+ but some upstream test representations
+    use Z; both resolve unambiguously to UTC.
+
+    Timezone-naive timestamps are rejected without silent UTC normalization.
+    The durable producer (_utc_iso) already emits aware timestamps; this
+    loader must not manufacture authority that was never stored.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        # Naive timestamp — producer would not emit this.
+        # Reject rather than silently attaching UTC.
+        return None
+    return dt
+
+
 def new_selector_recovery_cursor(
     *,
     local_order_id: str,
@@ -829,23 +858,25 @@ def load_selector_recovery_cursor(
     TRUSTED EXPECTED AUTHORITY
     ──────────────────────────
     materialization_generation and selector_attempt_count are caller-supplied
-    expected authority.  They must resolve to positive integers via
-    _strict_positive_cursor_int.  bool and float are not accepted.
-    The single post-#421 production caller (selector_recovery_deploy_preflight)
-    passes either a validated positive int or None for materialization_generation
-    and a validated positive int for selector_attempt_count.  None is not a
-    positive integer; the function returns a classified authority failure.
+    expected authority.  Runtime and preflight callers must provide
+    already-resolved positive integer authority.  bool and float are not
+    accepted.  None is not a positive integer; the function returns a
+    classified authority failure.
 
     DURABLE CURSOR FIELDS
     ─────────────────────
     All numeric fields from the untrusted JSON cursor are validated with
     _strict_positive_cursor_int.  No bool, float, or string coercion.
 
-    COLLECTION SHAPES
-    ─────────────────
+    COLLECTION SHAPES AND NESTED RECORDS
+    ─────────────────────────────────────
     All four cursor collections must be the expected container type before any
     bounded-truncation is applied.  Malformed collections return a stable
     MALFORMED_CURSOR:<field> reason and never silently erase durable evidence.
+    Nested attempted-symbol and structural-skip records are validated against
+    the actual producer schema before any bounding.  A malformed nested record
+    anywhere in the map — including beyond the bounded window — rejects the
+    entire cursor.
     """
     # ── 1. Validate trusted expected authority ────────────────────────────────
     expected_generation = _strict_positive_cursor_int(materialization_generation)
@@ -932,19 +963,73 @@ def load_selector_recovery_cursor(
     expirations = candidate["expirations_probed"]
     ranked = candidate["last_ranked_index_by_expiration"]
 
-    # ── 8. Collection element shapes ─────────────────────────────────────────
-    for field, records in (
-        ("attempted_symbols", attempted),
-        ("structurally_skipped_symbols", skipped),
-    ):
-        if any(
+    # ── 8. Attempted-symbol records: canonical key + nested field validation ──
+    #
+    # Producer canonical key: "".join(str(symbol).upper().split())
+    # Durable keys differing from their canonical form represent laundered
+    # corruption (duplicate evidence for the same symbol under different
+    # representations). Reject rather than normalizing.
+    #
+    # Validation covers ALL records BEFORE any bounding. A malformed record
+    # anywhere in the map — including beyond the bounded retention window —
+    # causes the entire cursor to be rejected.
+    #
+    # Producer record shape (record_selector_recovery_attempt):
+    #   attempt_number    : positive int  (max(1, int(attempt_number or 1)))
+    #   expiration        : str           (str(expiration or ""), may be empty)
+    #   result_reason     : str           (str(result_reason or ""), may be empty)
+    #   attempted_at      : aware ISO str (_utc_iso())
+    #   provider_timestamp: any JSON-compatible value including None
+    #   transient         : exact bool    (bool(transient))
+    for symbol, record in attempted.items():
+        canonical_symbol = "".join(str(symbol).upper().split())
+        if (
             not isinstance(symbol, str)
-            or not symbol.strip()
+            or not canonical_symbol
+            or symbol != canonical_symbol
             or not isinstance(record, dict)
-            for symbol, record in records.items()
         ):
-            return fresh, f"MALFORMED_CURSOR:{field}"
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # attempt_number: strict positive int; no bool/float/string coercion
+        if _strict_positive_cursor_int(record.get("attempt_number")) is None:
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # transient: exact bool; "true"/"false"/1/0/None are not acceptable
+        if type(record.get("transient")) is not bool:  # noqa: E721
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # attempted_at: nonblank str, valid ISO, timezone-aware
+        if _parse_cursor_aware_timestamp(record.get("attempted_at")) is None:
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # expiration: str (empty string allowed — producer emits str(expiration or ""))
+        if not isinstance(record.get("expiration"), str):
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # result_reason: str (empty string allowed — producer emits str(result_reason or ""))
+        if not isinstance(record.get("result_reason"), str):
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # provider_timestamp: allow any JSON-compatible value including None.
+        # The producer stores an opaque provider-side value; no further constraint.
 
+    # ── 9. Structural-skip records: canonical key + nested field validation ───
+    #
+    # Producer record shape (record_selector_structural_skip):
+    #   skip_reason : str           (str(skip_reason or ""), may be empty)
+    #   observed_at : aware ISO str (_utc_iso())
+    for symbol, record in skipped.items():
+        canonical_symbol = "".join(str(symbol).upper().split())
+        if (
+            not isinstance(symbol, str)
+            or not canonical_symbol
+            or symbol != canonical_symbol
+            or not isinstance(record, dict)
+        ):
+            return fresh, "MALFORMED_CURSOR:structurally_skipped_symbols"
+        # skip_reason: str (empty string allowed — producer emits str(skip_reason or ""))
+        if not isinstance(record.get("skip_reason"), str):
+            return fresh, "MALFORMED_CURSOR:structurally_skipped_symbols"
+        # observed_at: nonblank str, valid ISO, timezone-aware
+        if _parse_cursor_aware_timestamp(record.get("observed_at")) is None:
+            return fresh, "MALFORMED_CURSOR:structurally_skipped_symbols"
+
+    # ── 10. Expiration list and ranked-index map element shapes ───────────────
     if any(
         not isinstance(entry, str) or not entry.strip()
         for entry in expirations
@@ -960,7 +1045,7 @@ def load_selector_recovery_cursor(
     ):
         return fresh, "MALFORMED_CURSOR:last_ranked_index_by_expiration"
 
-    # ── 9. All validation passed — build bounded output cursor ────────────────
+    # ── 11. All validation passed — build bounded output cursor ───────────────
     cursor = dict(candidate)
     cursor["materialization_generation"] = expected_generation
     # Advance attempt to trusted current authority if cursor trails behind.
@@ -987,14 +1072,23 @@ def selector_symbol_may_retry(
     refresh_seconds: int,
     now=None,
 ) -> bool:
-    if not isinstance(record, dict) or not bool(record.get("transient")):
+    """Return True if a symbol's most recent attempt may be retried after cooldown.
+
+    Requires exact Boolean retry authority — bool("false") is True in Python
+    and therefore str("false") must not reach this helper as retry authority.
+    The loader validates transient before a cursor can reach execution; this
+    helper enforces the same invariant as defense in depth.
+
+    Returns False for any malformed or missing record field without raising.
+    """
+    if not isinstance(record, dict):
         return False
-    raw = record.get("attempted_at")
-    try:
-        attempted_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if attempted_at.tzinfo is None:
-            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
+    # Exact bool required. "true", "false", 1, 0, None are all rejected.
+    if record.get("transient") is not True:
+        return False
+    attempted_at = _parse_cursor_aware_timestamp(record.get("attempted_at"))
+    if attempted_at is None:
+        # Malformed, blank, non-string, or timezone-naive timestamp — fail closed.
         return False
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
