@@ -60,6 +60,11 @@ _NAIVE_TS = "2026-08-07T14:30:00"   # No tzinfo — must be rejected
 # Canonical symbol per producer rule: "".join(str(s).upper().split())
 _CANON_SYMBOL = "SPY260807C00600000"
 _CANON_SYMBOL_2 = "QQQ260807C00550000"
+# Aliases used by seam-test helpers (matches b1a64dd passing harness)
+_BASE_SYMBOL = _CANON_SYMBOL
+_BASE_SKIP_SYMBOL = _CANON_SYMBOL_2
+_BASE_EXPIRATION = "2026-08-07"
+_BASE_NOW = datetime(2026, 8, 7, 16, 0, tzinfo=timezone.utc)
 
 
 # ── Fixture helpers ───────────────────────────────────────────────────────────
@@ -78,18 +83,32 @@ def _base_cursor(**overrides) -> dict:
     return c
 
 
+def _producer_attempt_cursor(
+    *,
+    transient=True,
+    attempt_number=2,
+    expiration=_BASE_EXPIRATION,
+    result_reason="DIRECT_QUOTE_ZERO_BID_ASK",
+    provider_timestamp=None,
+    now=_BASE_NOW,
+    symbol=_BASE_SYMBOL,
+) -> dict:
+    """Build a cursor with one canonical attempted-symbol record via the real producer."""
+    return record_selector_recovery_attempt(
+        _base_cursor(),
+        symbol=symbol,
+        attempt_number=attempt_number,
+        expiration=expiration,
+        result_reason=result_reason,
+        transient=transient,
+        provider_timestamp=provider_timestamp,
+        now=now,
+    )
+
+
 def _cursor_with_attempt(symbol=_CANON_SYMBOL, **attempt_overrides) -> dict:
     """Cursor with one canonical attempted-symbol record (via real producer)."""
-    base = _base_cursor()
-    return record_selector_recovery_attempt(
-        base,
-        symbol=symbol,
-        attempt_number=2,
-        expiration="2026-08-07",
-        result_reason="NO_CHAIN_DATA",
-        transient=True,
-        provider_timestamp=None,
-    )
+    return _producer_attempt_cursor(symbol=symbol)
 
 
 def _cursor_with_skip(symbol=_CANON_SYMBOL_2) -> dict:
@@ -624,7 +643,7 @@ class TestValidCursorLoads:
         assert record["attempt_number"] == 2
         assert record["transient"] is True
         assert record["expiration"] == "2026-08-07"
-        assert record["result_reason"] == "NO_CHAIN_DATA"
+        assert record["result_reason"] == "DIRECT_QUOTE_ZERO_BID_ASK"
         assert isinstance(record["attempted_at"], str)
         assert "provider_timestamp" in record
 
@@ -982,81 +1001,187 @@ class TestParseCursorAwareTimestamp:
                 pytest.fail(f"Raised for {v!r}: {exc}")
 
 
-# ── Runtime seam — malformed transient blocks before selector work ────────────
+# ── Real deferred runtime seam ───────────────────────────────────────────────
 
-class TestRuntimeSeam:
-    """Proves that a cursor with transient='false' in attempted_symbols routes
-    through the existing cursor-invalid terminalization path and does not reach
-    selector/provider/broker work.
+def test_runtime_string_false_cursor_stops_before_selector_provider_or_broker(
+    monkeypatch,
+):
+    """Malformed nested retry authority terminalizes before selector continuation.
 
-    The seam tested:
-      load_selector_recovery_cursor(...) -> cursor_load_reason
-      _selector_cursor_retry_block_reason(...) -> cursor_failure_reason
-      if cursor_failure_reason: _terminalize_... ; return TERMINAL_DURABLE
+    This test invokes the real _on_entry_trigger() through the deferred-breach
+    pre-claimed path and proves the actual production runtime behavior:
+      1. cursor loaded → MALFORMED_CURSOR:attempted_symbols
+      2. runtime routes to _terminalize_deferred_breach_failure
+      3. returns TERMINAL_DURABLE with exact reason
+      4. zero selector/provider/broker continuation calls
 
-    We import _selector_cursor_retry_block_reason from ap_execution_core (no
-    modification) and exercise the pure-function chain to prove block activation.
-    Downstream selector/broker functions are mocked to assert zero calls.
+    Fail-closed fenced terminalization of the existing ENTRY row IS expected
+    and IS asserted (osm.terminalize_deferred_breach.call_count <= 1).
+    The invariant is zero selector/broker CONTINUATION, not zero order mutation.
     """
+    import ap_execution_core as ec_mod
+    from ap import queue as queue_mod
 
-    def test_string_false_transient_blocks_before_selector_on_attempt_2(self):
-        from ap_execution_core import _selector_cursor_retry_block_reason
+    cursor = _producer_attempt_cursor(transient=True)
+    cursor["attempted_symbols"][_BASE_SYMBOL]["transient"] = "false"
 
-        # 1. Build cursor via real producer then corrupt transient
-        base = _base_cursor()
-        cursor_with_bad_transient = record_selector_recovery_attempt(
-            base,
-            symbol=_CANON_SYMBOL,
-            attempt_number=2,
-            expiration="2026-08-07",
-            result_reason="NO_CHAIN_DATA",
-            transient=True,  # valid first; will corrupt below
-        )
-        cursor_with_bad_transient["attempted_symbols"][_CANON_SYMBOL]["transient"] = "false"
+    owner = "recovery:cursor-strictness"
+    row = {
+        "local_order_id": _BASE_ORDER,
+        "client_id": _BASE_CLIENT,
+        "execution_mode": _BASE_MODE,
+        "signal_id": _BASE_SIGNAL,
+        "kind": "ENTRY",
+        "status": "PENDING_TRIGGER",
+        "contract": "DEFERRED:SPY",
+        "broker_order_id": None,
+        "submitted_ts": None,
+        "meta": {
+            "contract_deferred": True,
+            "lifecycle_state": "MATERIALIZING",
+            "materialization_in_flight": True,
+            "materialization_owner": owner,
+            "materialization_generation": 2,
+            "retry_attempt": 2,
+            "breach_attempt_count": 2,
+            "materialization_attempts": 2,
+            "selector_recovery_cursor_v1": cursor,
+        },
+    }
+    plan = SimpleNamespace(
+        ticker="SPY",
+        side="CALL",
+        direction="CALL",
+        contract_symbol="DEFERRED:SPY",
+        limit_price=0.01,
+        contracts=1,
+        max_position_usd=500.0,
+        trigger_price=600.0,
+        signal_id=_BASE_SIGNAL,
+        client_id=_BASE_CLIENT,
+        execution_mode=_BASE_MODE,
+        tier="A",
+        score=88.0,
+        metadata={
+            "contract_deferred": True,
+            "deferred_breach_selection": True,
+            "selection_context": "deferred_breach",
+        },
+    )
+    watched = SimpleNamespace(
+        ticker="SPY",
+        trigger_price=600.0,
+        entry_trigger=600.0,
+        stop_level=None,
+        target_price=None,
+        last_quote_ask=600.1,
+        last_quote_bid=600.0,
+        signal={
+            "signal_id": _BASE_SIGNAL,
+            "client_id": _BASE_CLIENT,
+            "execution_mode": _BASE_MODE,
+            "local_order_id": _BASE_ORDER,
+            "_approved_plan": plan,
+            "_recovery_pre_claimed": True,
+            "_recovery_pre_claimed_owner": owner,
+            "_recovery_pre_claimed_generation": 2,
+            "_recovery_pre_claimed_attempt": 2,
+            "_recovery_pre_claimed_client_id": _BASE_CLIENT,
+            "_recovery_pre_claimed_mode": _BASE_MODE,
+        },
+    )
 
-        # 2. Cursor load must return MALFORMED reason
-        _loaded, cursor_load_reason = _load(cursor_with_bad_transient, attempt=2)
-        assert cursor_load_reason == "MALFORMED_CURSOR:attempted_symbols"
+    osm = MagicMock()
+    osm.get_order.return_value = row
+    osm.submit_existing_entry = MagicMock()
+    osm.terminalize_deferred_breach.return_value = True
 
-        # 3. Runtime block-reason function must signal a block
-        cursor_failure_reason = _selector_cursor_retry_block_reason(
-            cursor_enabled=True,
-            selector_attempt_number=2,
-            cursor_candidate=cursor_with_bad_transient,
-            cursor_load_reason=cursor_load_reason,
-        )
-        assert cursor_failure_reason is not None, (
-            "Runtime seam must produce a block reason for malformed cursor"
-        )
+    selector = MagicMock()
+    selector.select = MagicMock()
+    selector.data_broker = MagicMock()
+    selector.data_broker.get_quote = MagicMock()
 
-        # 4. Assert zero selector/broker/position calls.
-        #    The runtime early-returns at `if _cursor_failure_reason: return {TERMINAL}`
-        #    before calling any selector, quote, or broker function.
-        #    We patch the production selector entry point to verify zero calls.
-        selector_calls = []
-        quote_calls = []
-        broker_submit_calls = []
-        broker_cancel_calls = []
+    broker = MagicMock()
+    broker.data_broker = MagicMock()
+    broker.data_broker.get_quote = MagicMock()
+    broker.place_order = MagicMock()
+    broker.submit_order = MagicMock()
+    broker.cancel_order = MagicMock()
+    broker.cancel = MagicMock()
 
-        with patch(
-            "ap.contract_selector.APContractSelectionEngine.select",
-            side_effect=lambda *a, **k: selector_calls.append(1),
-        ):
-            # Since cursor_failure_reason is truthy, runtime calls
-            # _terminalize_deferred_breach_failure and returns TERMINAL_DURABLE.
-            # It never reaches the selector. Verify block reason is set.
-            assert bool(cursor_failure_reason)  # runtime gate is open — would stop
-            # No selector, quote, broker, position, or queue calls occurred:
-            assert selector_calls == [], "selector must not be called for malformed cursor"
-            assert quote_calls == [], "direct quote must not be called"
-            assert broker_submit_calls == [], "broker submit must not be called"
-            assert broker_cancel_calls == [], "broker cancel must not be called"
+    core = ec_mod.APExecutionCore.__new__(ec_mod.APExecutionCore)
+    core.paper = False
+    core.mode = "LIVE"
+    core.execution_mode = "LIVE"
+    core.email = _BASE_CLIENT
+    core.client_email = _BASE_CLIENT
+    core.client_id = _BASE_CLIENT
+    core.contract_selector = selector
+    core.order_state_machine = osm
+    core.broker = broker
+    core.store = MagicMock()
+    core.entry_watcher = MagicMock()
+    core.exit_eng = MagicMock()
+    core.tracker = MagicMock()
+    core.position_manager = MagicMock()
+    core.proof = MagicMock()
+    core._max_positions = 7
+    core.master_control = SimpleNamespace(
+        revalidate_exposure=MagicMock(return_value=SimpleNamespace(ok=True))
+    )
+    core._emit_breach_diag = MagicMock()
+    core._alert_degraded = MagicMock()
 
-        # 5. Money-path safety: all expected counts are zero
-        assert len(selector_calls) == 0
-        assert len(quote_calls) == 0
-        assert len(broker_submit_calls) == 0
-        assert len(broker_cancel_calls) == 0
+    monkeypatch.setattr(ec_mod.APExecutionCore, "_breach_risk_check", lambda self, w: True)
+    monkeypatch.setattr(
+        ec_mod.APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, w: plan,
+    )
+    monkeypatch.setattr(
+        ec_mod.APExecutionCore,
+        "_refresh_hydrated_prebreach_plan",
+        lambda self, *a, **kw: False,
+        raising=False,
+    )
+    monkeypatch.setattr(ec_mod.funnel, "inc", lambda *a, **kw: None)
+
+    queue_execution_write = MagicMock()
+    monkeypatch.setattr(
+        queue_mod,
+        "write_deferred_breach_last_error",
+        queue_execution_write,
+        raising=False,
+    )
+
+    result = core._on_entry_trigger(watched)
+
+    assert isinstance(result, dict)
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert result["reason_code"] == (
+        "SELECTOR_RECOVERY_CURSOR_INVALID:MALFORMED_CURSOR:attempted_symbols"
+    )
+
+    # Selector/provider continuation must never start.
+    assert selector.select.call_count == 0
+    assert selector.data_broker.get_quote.call_count == 0
+    assert broker.data_broker.get_quote.call_count == 0
+    # No broker-ready submit path.
+    assert osm.submit_existing_entry.call_count == 0
+    assert broker.place_order.call_count == 0
+    assert broker.submit_order.call_count == 0
+    # No cancellation side effects.
+    assert broker.cancel_order.call_count == 0
+    assert broker.cancel.call_count == 0
+    # No downstream money-path bookkeeping.
+    assert core.position_manager.method_calls == []
+    assert core.proof.method_calls == []
+    # No queue execution continuation caused by selector processing.
+    assert queue_execution_write.call_count == 0
+    # Existing fail-closed durable terminalization IS expected.
+    # Do not incorrectly assert zero order mutation.
+    assert osm.terminalize_deferred_breach.call_count <= 1
+
 
 
 # ── Pre-amendment regression proof ───────────────────────────────────────────
