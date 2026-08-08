@@ -431,7 +431,7 @@ def _adopt_broker_owned_exit_request(
         }
     elif not callable(adopt):
         result = {
-            "disposition": "ADOPTION_METHOD_UNAVAILABLE",
+            "disposition": "DB_ERROR",
             "adopted": False,
             "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
             "error": "osm_adoption_method_unavailable",
@@ -459,7 +459,7 @@ def _adopt_broker_owned_exit_request(
 
     if not isinstance(result, dict):
         result = {
-            "disposition": "ADOPTED" if bool(result) else "CAS_MISS",
+            "disposition": "ADOPTED" if bool(result) else "IDENTITY_MISMATCH",
             "adopted": bool(result),
             "reason_code": (
                 "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
@@ -473,7 +473,6 @@ def _adopt_broker_owned_exit_request(
         or result.get("disposition") in {
             "ADOPTED",
             "ALREADY_BROKER_OWNED_ACTIVE",
-            "ALREADY_ADOPTED",
         }
     )
     result["adopted"] = adopted

@@ -1566,10 +1566,10 @@ class APOrderStateMachine:
             # could launder malformed persisted identity after the strict CAS
             # correctly rejected it.
             latest_status = latest_dict.get("status")
-            latest_broker_id = str(latest_dict.get("broker_order_id") or "")
+            latest_broker_id = latest_dict.get("broker_order_id")
             latest_client = latest_dict.get("client_id")
             latest_mode = latest_dict.get("execution_mode")
-            latest_position = str(latest_dict.get("position_id") or "")
+            latest_position = latest_dict.get("position_id")
             latest_kind = latest_dict.get("kind")
             try:
                 latest_qty = int(latest_dict.get("qty") or 0)

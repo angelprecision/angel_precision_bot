@@ -405,6 +405,39 @@ def test_noncanonical_durable_mode_cannot_be_laundered_by_recovery(
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
 
 
+@pytest.mark.parametrize(
+    ("field", "durable_value"),
+    [
+        ("client_id", " tradefluence "),
+        ("execution_mode", " paper "),
+        ("position_id", " position-orcl-1 "),
+        ("kind", "exit"),
+    ],
+)
+def test_post_cas_reread_does_not_normalize_durable_identity(
+    fake_osm_db, field, durable_value
+):
+    db, osm = fake_osm_db
+    db.rows["exit-orcl-1"].update(
+        status="EXIT_SUBMITTED",
+        broker_order_id="36661364",
+        **{field: durable_value},
+    )
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "IDENTITY_MISMATCH"
+    assert result["already_terminal"] is False
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
+
+
 @pytest.mark.parametrize("terminal_status", ["EXIT_FILLED", "CANCELED", "REJECTED", "EXPIRED"])
 def test_terminal_reread_with_malformed_mode_is_identity_mismatch(
     fake_osm_db, terminal_status
@@ -450,6 +483,7 @@ def test_adoption_reread_exception_returns_db_error(fake_osm_db, monkeypatch):
     assert result["adopted"] is False
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
     osm._emit_transition_event.assert_not_called()
+    osm._handle_exit_engine_hooks.assert_not_called()
 
 
 def test_adoption_success_without_reread_proof_returns_db_error(fake_osm_db, monkeypatch):
@@ -711,6 +745,14 @@ def test_broker_lookup_failure_holds_without_replacement_or_cancel(fake_osm_db, 
             self.calls.append(str(broker_order_id))
             raise RuntimeError("broker lookup unavailable")
 
+        def cancel_order(self, broker_order_id):
+            self.calls.append(f"cancel:{broker_order_id}")
+            return {"status": "canceled"}
+
+        def submit_order(self, *args, **kwargs):
+            self.calls.append("submit")
+            return {"status": "accepted"}
+
     broker = _LookupFailureBroker({})
     monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
     monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
@@ -740,6 +782,10 @@ def test_order_monitor_unknown_broker_status_holds_without_cancel(monkeypatch):
             self.calls.append(f"cancel:{broker_order_id}")
             return {"status": "canceled"}
 
+        def submit_order(self, *args, **kwargs):
+            self.calls.append("submit")
+            return {"status": "accepted"}
+
     broker = _LookupFailureBroker({})
     monitor = _monitor(order, osm, broker)
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
@@ -748,6 +794,38 @@ def test_order_monitor_unknown_broker_status_holds_without_cancel(monkeypatch):
     monitor._check_exit_orders()
 
     assert broker.calls == ["unknown-broker-425"]
+    assert osm.transition_calls == []
+    assert any(
+        call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
+        for call in monitor._emit_order_event.call_args_list
+    )
+
+
+@pytest.mark.parametrize("raw_status", ["UNKNOWN", "BROKER_MAYBE"])
+def test_order_monitor_unproven_broker_status_never_reaches_cancel(
+    monkeypatch, raw_status
+):
+    broker_id = f"unproven-{raw_status.lower()}-425"
+    order = _row(broker_order_id=broker_id)
+    osm = _MonitorOSM(order)
+
+    class _UnprovenStatusBroker(_Broker):
+        def cancel_order(self, broker_order_id):
+            self.calls.append(f"cancel:{broker_order_id}")
+            return {"status": "canceled"}
+
+        def submit_order(self, *args, **kwargs):
+            self.calls.append("submit")
+            return {"status": "accepted"}
+
+    broker = _UnprovenStatusBroker({"status": raw_status})
+    monitor = _monitor(order, osm, broker)
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    assert broker.calls == [broker_id]
     assert osm.transition_calls == []
     assert any(
         call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
@@ -791,17 +869,28 @@ def test_self_healing_restart_does_not_invent_live_recovery_mode(monkeypatch):
 
 
 class _CanonicalExitEngine:
-    def __init__(self):
+    def __init__(self, *, position_id="position-orcl-1", quantity_remaining=4):
         self.client_id = "tradefluence"
         self.pending_calls = []
+        self.partial_calls = []
         self.closed_calls = []
-        self.position = SimpleNamespace(position_id="position-orcl-1", quantity_remaining=4)
+        self.position = SimpleNamespace(
+            position_id=position_id,
+            quantity_remaining=quantity_remaining,
+        )
 
     def get_position(self, position_id):
         return self.position if position_id == self.position.position_id else None
 
     def set_pending_exit_order(self, position_id, **kwargs):
         self.pending_calls.append((position_id, kwargs))
+
+    def note_partial_exit_fill(self, position_id, delta, **kwargs):
+        self.partial_calls.append((position_id, delta, kwargs))
+        self.position.quantity_remaining = max(
+            0,
+            self.position.quantity_remaining - int(delta or 0),
+        )
 
     def mark_position_closed(self, position_id, **kwargs):
         self.closed_calls.append((position_id, kwargs))
@@ -853,6 +942,61 @@ def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
     assert db.rows["exit-orcl-1"]["filled_qty"] == 4
     assert len(engine.pending_calls) == 1
     assert len(engine.closed_calls) == 1
+
+
+def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_position(
+    fake_osm_db, monkeypatch
+):
+    db, osm = fake_osm_db
+    db.rows["exit-orcl-1"].update(
+        broker_order_id="partial-broker-425",
+        position_id="position-partial-1",
+        qty=3,
+    )
+    engine = _CanonicalExitEngine(
+        position_id="position-partial-1",
+        quantity_remaining=10,
+    )
+    monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
+    osm._handle_exit_engine_hooks = APOrderStateMachine._handle_exit_engine_hooks.__get__(
+        osm, APOrderStateMachine
+    )
+    osm._finalize_position_from_exit_order = MagicMock()
+    broker = _Broker(
+        {
+            "status": "FILLED",
+            "exec_quantity": 3,
+            "avg_fill_price": 1.25,
+            "quantity": 3,
+        }
+    )
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
+    monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: None)
+    original_order = dict(db.rows["exit-orcl-1"])
+
+    fm.process_pending_order(
+        broker,
+        original_order,
+        osm=osm,
+        runtime_execution_mode="paper",
+    )
+    fm.process_pending_order(
+        broker,
+        original_order,
+        osm=osm,
+        runtime_execution_mode="paper",
+    )
+
+    assert broker.calls == ["partial-broker-425"]
+    assert len(engine.pending_calls) == 1
+    assert engine.pending_calls[0][1]["qty"] == 3
+    assert [(call[0], call[1]) for call in engine.partial_calls] == [
+        ("position-partial-1", 3)
+    ]
+    assert engine.position.quantity_remaining == 7
+    assert engine.closed_calls == []
+    osm._finalize_position_from_exit_order.assert_not_called()
 
 
 def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypatch):

@@ -266,6 +266,26 @@ def _has_proven_broker_order_id(value) -> bool:
     return bool(broker_id and broker_id.upper() != "N/A")
 
 
+_KNOWN_BROKER_STATUSES = frozenset({
+    "pending",
+    "open",
+    "working",
+    "new",
+    "accepted",
+    "ack",
+    "acked",
+    "ok",
+    "submitted",
+    "filled",
+    "partially_filled",
+    "partial_fill",
+    "partial_filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+})
+
 _UNKNOWN_BROKER_STATUSES = frozenset({
     "",
     "unknown",
@@ -277,8 +297,12 @@ _UNKNOWN_BROKER_STATUSES = frozenset({
 
 
 def _is_unknown_broker_status(value) -> bool:
-    """Treat missing/error/unknown broker truth as HOLD, never as cancelable."""
-    return str(value or "").strip().lower() in _UNKNOWN_BROKER_STATUSES
+    """Treat missing/error/unparseable broker truth as HOLD, never cancelable."""
+    status = str(value or "").strip().lower()
+    return (
+        status in _UNKNOWN_BROKER_STATUSES
+        or status not in _KNOWN_BROKER_STATUSES
+    )
 
 
 class APOrderMonitor:
@@ -2289,7 +2313,7 @@ class APOrderMonitor:
             }
         elif not callable(adopt):
             result = {
-                "disposition": "ADOPTION_METHOD_UNAVAILABLE",
+                "disposition": "DB_ERROR",
                 "adopted": False,
                 "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
                 "error": "osm_adoption_method_unavailable",
@@ -2334,7 +2358,7 @@ class APOrderMonitor:
 
         if not isinstance(result, dict):
             result = {
-                "disposition": "ADOPTED" if bool(result) else "CAS_MISS",
+                "disposition": "ADOPTED" if bool(result) else "IDENTITY_MISMATCH",
                 "adopted": bool(result),
             }
         result = dict(result)
@@ -2343,7 +2367,6 @@ class APOrderMonitor:
             or result.get("disposition") in {
                 "ADOPTED",
                 "ALREADY_BROKER_OWNED_ACTIVE",
-                "ALREADY_ADOPTED",
             }
         )
         if result.get("already_terminal") or result.get("disposition") == "ALREADY_TERMINAL":

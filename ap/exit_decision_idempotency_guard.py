@@ -1090,7 +1090,7 @@ def _adopt_callback_broker_ownership(
         # adoption seam is unavailable.  Treat that as an explicit
         # durability gap so the generation cannot be released as no-submit.
         result = {
-            "disposition": "ADOPTION_METHOD_UNAVAILABLE",
+            "disposition": "DB_ERROR",
             "adopted": False,
             "reason_code": "OSM_ADOPTION_METHOD_UNAVAILABLE",
             "error": "osm_adoption_method_unavailable",
@@ -1122,7 +1122,7 @@ def _adopt_callback_broker_ownership(
 
     if not isinstance(result, dict):
         result = {
-            "disposition": "ADOPTED" if bool(result) else "CAS_MISS",
+            "disposition": "ADOPTED" if bool(result) else "IDENTITY_MISMATCH",
             "adopted": bool(result),
             "reason_code": (
                 "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
@@ -1141,7 +1141,6 @@ def _adopt_callback_broker_ownership(
         or result.get("disposition") in {
             "ADOPTED",
             "ALREADY_BROKER_OWNED_ACTIVE",
-            "ALREADY_ADOPTED",
         }
     )
     result["adopted"] = adopted
