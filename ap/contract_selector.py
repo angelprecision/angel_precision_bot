@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import logging
 import contextvars
@@ -199,6 +200,7 @@ class SelectorRequestContext:
     direct_quote_unattempted_set: set[str] = field(default_factory=set)
     direct_quote_unattempted_count: int = 0
     direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
+    direct_quote_duplicate_symbols: list[str] = field(default_factory=list)
     max_total_elapsed_ms: int = 15000
     budget_exhausted_stage: str | None = None
     budget_exhausted_detail: str | None = None
@@ -989,6 +991,7 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "direct_quote_unattempted_count": int(ctx.direct_quote_unattempted_count or 0),
         "direct_quote_unattempted_symbols": list(ctx.direct_quote_unattempted_symbols[:25]),
         "direct_quote_candidate_ranking": list(ctx.direct_quote_candidate_ranking[:25]),
+        "direct_quote_duplicate_symbols": list(ctx.direct_quote_duplicate_symbols[:25]),
         "selector_request_kind": str(ctx.selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY),
         "recovery_attempt_number": int(ctx.recovery_attempt_number or 1),
         "structural_skips": list(ctx.structural_skips[:200]),
@@ -1337,6 +1340,28 @@ def _order_chain_for_direct_quote_recovery(
         )
 
     rows: list[tuple[tuple, dict, dict]] = []
+
+    def _canonical_occ_symbol(opt: dict) -> str:
+        return "".join(
+            str(opt.get("symbol") or opt.get("contract") or "").upper().split()
+        )
+
+    def _stable_row_key(opt: dict) -> str:
+        # A repeated normalized OCC identity must not fall back to provider
+        # insertion order when duplicate rows carry different quote payloads.
+        # JSON key sorting makes the representative independent of dictionary
+        # insertion order while ``default=str`` keeps malformed provider fields
+        # observable rather than making ranking itself raise.
+        try:
+            return json.dumps(
+                opt,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+        except Exception:
+            return repr(sorted((str(key), repr(value)) for key, value in opt.items()))
+
     for original_index, opt in enumerate(list(chain or [])):
         exp_date = _option_expiration_date(opt)
         strike = _option_strike(opt)
@@ -1373,9 +1398,7 @@ def _order_chain_for_direct_quote_recovery(
         vol_missing = opt.get("volume") in (None, "")
         open_interest = int(_safe_float(opt.get("open_interest"), 0.0)) if not oi_missing else None
         volume = int(_safe_float(opt.get("volume"), 0.0)) if not vol_missing else None
-        canonical_symbol = "".join(
-            str(opt.get("symbol") or opt.get("contract") or "").upper().split()
-        )
+        canonical_symbol = _canonical_occ_symbol(opt)
         ranking = {
             "rank": 0,
             "symbol": opt.get("symbol") or opt.get("contract"),
@@ -1404,6 +1427,7 @@ def _order_chain_for_direct_quote_recovery(
             opt_type,
             float(strike) if strike is not None else float("inf"),
             float(abs_delta) if abs_delta is not None else float("inf"),
+            _stable_row_key(opt),
         )
         sort_key = (
             0 if _valid_occ_symbol(opt) else 1,
@@ -1420,6 +1444,28 @@ def _order_chain_for_direct_quote_recovery(
         )
         rows.append((sort_key, opt, ranking))
     rows.sort(key=lambda item: item[0])
+
+    # Tradier normally returns one row per OCC contract, but merged/paginated
+    # payloads and test/replay fixtures can repeat the same normalized symbol.
+    # The quote revalidator fences by normalized OCC identity, so allowing both
+    # rows into this list would make the first raw duplicate consume the quote
+    # slot and silently discard the second. Keep the deterministic first row
+    # selected by the complete sort key and remove later valid OCC duplicates.
+    deduplicated_rows: list[tuple[tuple, dict, dict]] = []
+    seen_occ_symbols: set[str] = set()
+    duplicate_symbols: list[str] = []
+    for item in rows:
+        opt = item[1]
+        canonical_symbol = _canonical_occ_symbol(opt)
+        if _valid_occ_symbol(opt) and canonical_symbol:
+            if canonical_symbol in seen_occ_symbols:
+                if canonical_symbol not in duplicate_symbols:
+                    duplicate_symbols.append(canonical_symbol)
+                continue
+            seen_occ_symbols.add(canonical_symbol)
+        deduplicated_rows.append(item)
+    rows = deduplicated_rows
+
     rankings = []
     for rank, (_, _, ranking) in enumerate(rows, start=1):
         ranked = dict(ranking)
@@ -1441,6 +1487,7 @@ def _order_chain_for_direct_quote_recovery(
         )
         request_context.direct_quote_structural_candidates = structural_rows
         request_context.direct_quote_candidate_ranking = rankings
+        request_context.direct_quote_duplicate_symbols = duplicate_symbols
         _ctx_refresh_diagnostics(request_context)
     return [opt for _, opt, _ in rows]
 

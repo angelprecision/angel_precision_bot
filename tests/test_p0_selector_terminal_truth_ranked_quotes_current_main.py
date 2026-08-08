@@ -5,20 +5,24 @@ import os
 import time
 from datetime import date, timedelta
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql://mock/mock")
 
+import ap_execution_core as ec_mod
 from ap.contract_quote_revalidator import clear_quote_cache
 from ap.contract_selector import (
     APContractSelectionEngine,
+    SELECTOR_REQUEST_KIND_ORDINARY,
     SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
     SelectorRequestContext,
     _new_selector_request_context,
     _order_chain_for_direct_quote_recovery,
     _structural_direct_quote_skip,
 )
+from ap_execution_core import APExecutionCore
 from ap.selector_retry_policy import resolve_selector_recovery_final_reason
 from ap_execution_core import (
     _build_deferred_retry_schedule_meta,
@@ -43,7 +47,15 @@ def _selector_test_isolation(monkeypatch):
     monkeypatch.setattr(
         APContractSelectionEngine,
         "_emit_selector_event",
-        lambda *args, **kwargs: None,
+        lambda self, plan, stage, decision, reason_code, explanation, **kwargs: (
+            self._set_last_failure({
+                "stage": str(stage or ""),
+                "reason_code": str(reason_code or "") or "UNKNOWN_REJECTION",
+                "explanation": str(explanation or ""),
+            })
+            if str(decision or "").upper() == "REJECT"
+            else None
+        ),
     )
     yield
     clear_quote_cache()
@@ -116,12 +128,21 @@ def _plan(
     }
 
 
-def _run_selector(monkeypatch, *, plan: dict, chain: list[dict], limit: int):
+def _run_selector(
+    monkeypatch,
+    *,
+    plan: dict,
+    chain: list[dict],
+    limit: int,
+    request_kind: str = SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+    valid_symbol: str = "__NO_VALID_DIRECT_QUOTE__",
+    valid_quote: dict | None = None,
+):
     monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", str(limit))
     broker = _DirectQuoteBroker(
         chain,
-        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
-        valid_quote={"bid": 0.0, "ask": 0.0},
+        valid_symbol=valid_symbol,
+        valid_quote=valid_quote or {"bid": 0.0, "ask": 0.0},
         underlying_price=float(plan["target_underlying"]),
     )
     selector = APContractSelectionEngine(
@@ -136,12 +157,118 @@ def _run_selector(monkeypatch, *, plan: dict, chain: list[dict], limit: int):
     context = _new_selector_request_context(
         plan["ticker"],
         str(plan["execution_mode"]).lower(),
-        selector_request_kind=SELECTOR_REQUEST_KIND_DEFERRED_BREACH,
+        selector_request_kind=request_kind,
     )
     selected = selector.select(plan, request_context=context)
     failure = plan.get("metadata", {}).get("selector_failure") or {}
     diagnostics = failure.get("selection_diagnostics") or {}
     return selected, broker, context, failure, diagnostics
+
+
+def _execution_plan(
+    *,
+    execution_mode: str = "LIVE",
+    breach_attempt_count: int = 0,
+    budget: float = 2000.0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        ticker="SPY",
+        side="CALL",
+        contract_symbol="DEFERRED:SPY",
+        limit_price=0.01,
+        contracts=1,
+        max_position_usd=budget,
+        trigger_price=100.0,
+        signal_id="sig-pr408-execution-core",
+        client_id=(
+            "jasoncosby1@gmail.com"
+            if execution_mode.upper() == "LIVE"
+            else "tradefluencehq@gmail.com"
+        ),
+        execution_mode=execution_mode,
+        metadata={
+            "contract_deferred": True,
+            "queue_id": 408,
+            "breach_attempt_count": breach_attempt_count,
+            "sizing_context": {
+                "budget": budget,
+                "account_equity": 10000.0,
+                "risk_pct": 0.20,
+                "max_affordable_premium": budget,
+            },
+        },
+    )
+
+
+def _execution_watched(execution_mode: str = "LIVE") -> SimpleNamespace:
+    client_id = (
+        "jasoncosby1@gmail.com"
+        if execution_mode.upper() == "LIVE"
+        else "tradefluencehq@gmail.com"
+    )
+    return SimpleNamespace(
+        ticker="SPY",
+        trigger_price=100.0,
+        signal={
+            "signal_id": "sig-pr408-execution-core",
+            "client_id": client_id,
+            "local_order_id": "local-pr408-execution-core",
+            "queue_id": 408,
+            "contract_deferred": True,
+            "score": 85,
+        },
+    )
+
+
+def _execution_core(selector, broker, execution_mode: str = "LIVE") -> APExecutionCore:
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.paper = execution_mode.upper() == "PAPER"
+    core.mode = execution_mode.upper()
+    core.execution_mode = execution_mode.upper()
+    core.email = (
+        "jasoncosby1@gmail.com"
+        if execution_mode.upper() == "LIVE"
+        else "tradefluencehq@gmail.com"
+    )
+    core.client_id = core.email
+    core.contract_selector = selector
+    core.order_state_machine = MagicMock()
+    core.order_state_machine.expire_pending_entry.return_value = True
+    core.order_state_machine.transition.return_value = True
+    core.order_state_machine.update_order_meta.return_value = True
+    core.order_state_machine.schedule_deferred_materialization_retry.return_value = True
+    core.order_state_machine.terminalize_deferred_breach.return_value = False
+    core.store = MagicMock()
+    core.entry_watcher = MagicMock()
+    core.exit_eng = MagicMock()
+    core.tracker = MagicMock()
+    core.position_manager = MagicMock()
+    core.broker = broker
+    return core
+
+
+class _ChainFailureBroker(_DirectQuoteBroker):
+    def _session_get(self, url, *, params=None, headers=None, timeout=None):
+        if "options/chains" in url:
+            raise RuntimeError("simulated chain provider outage")
+        return super()._session_get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+
+
+def _actual_selector(broker, execution_mode: str = "LIVE") -> APContractSelectionEngine:
+    return APContractSelectionEngine(
+        broker,
+        mode=execution_mode,
+        data_broker=broker,
+        min_premium=1.0,
+        max_premium=1000.0,
+        min_oi=1,
+        min_volume=0,
+    )
 
 
 def test_ibm_affordability_remains_root_after_later_budget_exhaustion(monkeypatch):
@@ -430,6 +557,240 @@ def test_equal_rank_ties_have_stable_symbol_tiebreak():
     expected = sorted(row["symbol"] for row in rows)
     assert [row["symbol"] for row in ordered_a] == expected
     assert [row["symbol"] for row in ordered_b] == expected
+
+
+@pytest.mark.parametrize("execution_mode", ["LIVE", "PAPER"])
+def test_ordinary_select_equal_ranked_contracts_use_stable_quote_order_with_cap(
+    monkeypatch,
+    execution_mode,
+):
+    later_expiry = date.fromisoformat(_NEAR_EXPIRY) + timedelta(days=1)
+    while later_expiry.weekday() >= 5:
+        later_expiry += timedelta(days=1)
+    near = _row("SPY", 101.0, expiration=_NEAR_EXPIRY)
+    later = _row("SPY", 101.0, expiration=later_expiry.isoformat())
+    expected = min(near["symbol"], later["symbol"])
+    plan = _plan(
+        ticker="SPY",
+        underlying=100.0,
+        budget=2000.0,
+        client_id=(
+            "jasoncosby1@gmail.com"
+            if execution_mode == "LIVE"
+            else "tradefluencehq@gmail.com"
+        ),
+        execution_mode=execution_mode,
+    )
+
+    selected, broker, context, failure, _ = _run_selector(
+        monkeypatch,
+        plan=plan,
+        chain=[later, near],
+        limit=1,
+        request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+        valid_symbol=expected,
+        valid_quote={
+            "bid": 1.10,
+            "ask": 1.14,
+            "volume": 300,
+            "open_interest": 1200,
+        },
+    )
+
+    assert selected is not None
+    assert selected.contract_symbol == expected
+    assert failure == {}
+    assert [call.args[0] for call in broker.get_quote.call_args_list] == [expected]
+    assert context.selector_request_kind == SELECTOR_REQUEST_KIND_ORDINARY
+    assert context.provider_call_counts["direct_quote_calls"] == 1
+    assert [row["symbol"] for row in context.direct_quote_candidate_ranking] == [
+        expected,
+        later["symbol"] if expected == near["symbol"] else near["symbol"],
+    ]
+
+
+def test_duplicate_occ_rows_are_deduplicated_before_quote_budget_and_stable_across_input_order(
+    monkeypatch,
+):
+    duplicate_a = _row("SPY", 101.0)
+    duplicate_a["_provider_index"] = 0
+    duplicate_b = dict(duplicate_a)
+    duplicate_b["_provider_index"] = 1
+    duplicate_b["symbol"] = f" {duplicate_a['symbol'].lower()} "
+    next_rank = _row("SPY", 102.0)
+    valid_symbol = duplicate_a["symbol"]
+    plan = _plan(ticker="SPY", underlying=100.0, budget=2000.0)
+    observed = []
+
+    for chain in ([duplicate_a, next_rank, duplicate_b], [duplicate_b, next_rank, duplicate_a]):
+        clear_quote_cache()
+        selected, broker, context, failure, _ = _run_selector(
+            monkeypatch,
+            plan=plan,
+            chain=list(chain),
+            limit=1,
+            valid_symbol=valid_symbol,
+            valid_quote={
+                "bid": 1.10,
+                "ask": 1.14,
+                "volume": 300,
+                "open_interest": 1200,
+            },
+        )
+        assert selected is not None
+        assert selected.contract_symbol == valid_symbol
+        assert failure == {}
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [valid_symbol]
+        assert context.direct_quote_duplicate_symbols == [valid_symbol]
+        observed.append(
+            (
+                [row["symbol"] for row in context.direct_quote_candidate_ranking],
+                [call.args[0] for call in broker.get_quote.call_args_list],
+            )
+        )
+
+    assert observed[0] == observed[1]
+    assert len(observed[0][0]) == len(set(observed[0][0]))
+
+
+@pytest.mark.parametrize(
+    ("breach_attempt_count", "expected_disposition"),
+    [(0, "RETRY_WAIT"), (5, "TERMINAL_DURABLE")],
+)
+def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth_fields(
+    monkeypatch,
+    breach_attempt_count,
+    expected_disposition,
+):
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_DELAY_SECONDS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    # Every row is a real OCC candidate with a zero chain quote. The actual
+    # selector reaches the production chain-row failure path, and the outer
+    # execution core must preserve that reason while retrying or terminalizing.
+    chain = [_row("SPY", strike) for strike in (101.0, 102.0, 103.0)]
+    broker = _DirectQuoteBroker(
+        chain,
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    plan = _execution_plan(breach_attempt_count=breach_attempt_count)
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+    thread_factory = MagicMock()
+    thread_factory.return_value = MagicMock()
+    monkeypatch.setattr(ec_mod.threading, "Thread", thread_factory)
+
+    result = core._on_entry_trigger(_execution_watched("LIVE"))
+
+    assert result["disposition"] == expected_disposition
+    core.order_state_machine.submit_existing_entry.assert_not_called()
+    assert broker.submit_order.call_count == 0
+    assert broker.cancel_order.call_count == 0
+
+    if expected_disposition == "RETRY_WAIT":
+        core.order_state_machine.schedule_deferred_materialization_retry.assert_called_once()
+        thread_factory.return_value.start.assert_not_called()
+        schedule_call = core.order_state_machine.schedule_deferred_materialization_retry.call_args
+        selector_failure = schedule_call.kwargs["selector_failure"]
+        assert selector_failure["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        assert selector_failure["canonical_selector_reason"] == (
+            "CHAIN_ROW_ZERO_BID_ASK"
+        )
+        assert selector_failure["last_observed_selector_reason"] == (
+            "CHAIN_ROW_ZERO_BID_ASK"
+        )
+        assert selector_failure["selector_terminal_reason"] == (
+            "CHAIN_ROW_ZERO_BID_ASK"
+        )
+        assert selector_failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert selector_failure["retry_class"] == "OPERATIONAL_REQUEST_BUDGET"
+        assert selector_failure["materialization_outcome"] == (
+            "RETRY_LATER_DATA_UNAVAILABLE"
+        )
+    else:
+        thread_factory.return_value.start.assert_not_called()
+        terminal_updates = [
+            call.args[1]
+            for call in core.order_state_machine.update_order_meta.call_args_list
+            if "last_breach_selector_audit" in call.args[1]
+        ]
+        assert terminal_updates
+        selector_failure = terminal_updates[-1]["last_breach_selector_audit"]
+        assert selector_failure["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        assert selector_failure["canonical_selector_reason"] == (
+            "CHAIN_ROW_ZERO_BID_ASK"
+        )
+        assert selector_failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        core.order_state_machine.expire_pending_entry.assert_called_once()
+
+
+def test_execution_core_real_selector_provider_failure_terminalizes_without_fake_failure_payload(
+    monkeypatch,
+):
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+    broker = _ChainFailureBroker(
+        [],
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=100.0,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    plan = _execution_plan(breach_attempt_count=5)
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+    thread_factory = MagicMock()
+    thread_factory.return_value = MagicMock()
+    monkeypatch.setattr(ec_mod.threading, "Thread", thread_factory)
+
+    result = core._on_entry_trigger(_execution_watched("LIVE"))
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert selector.get_last_failure()["reason_code"] == "CHAIN_PROVIDER_ERROR"
+    terminal_updates = [
+        call.args[1]
+        for call in core.order_state_machine.update_order_meta.call_args_list
+        if "last_breach_selector_audit" in call.args[1]
+    ]
+    assert terminal_updates
+    selector_failure = terminal_updates[-1]["last_breach_selector_audit"]
+    assert selector_failure["canonical_selector_reason"] == "CHAIN_PROVIDER_ERROR"
+    assert selector_failure["last_observed_selector_reason"] == "CHAIN_PROVIDER_ERROR"
+    assert selector_failure["selector_terminal_reason"] == "CHAIN_PROVIDER_ERROR"
+    assert selector_failure["operational_reason"] is None
+    thread_factory.return_value.start.assert_not_called()
+    core.order_state_machine.expire_pending_entry.assert_called_once()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
 
 
 def test_retry_terminal_meta_uses_current_equivalent_truth_fields():
