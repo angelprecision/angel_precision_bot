@@ -3558,14 +3558,58 @@ class APStartupRecovery:
                         "downstream checks",
                         self.client_id, local_order_id, _gate_exc,
                     )
+                # PR #421 Blocker 1 completion: parsed once, early, and
+                # reused later — never recomputed after PTR runs.
+                # Defaults ensure these are always defined even if the
+                # early parse/has_order check below raises.
+                _reseed_row_meta = {}
+                _requires_durable_adoption = False
                 try:
-                    if hasattr(self.entry_watcher, "has_order") and self.entry_watcher.has_order(local_order_id):
+                    _reseed_row_meta = self._coerce_order_meta(
+                        order.get("meta")
+                    )
+                    _requires_durable_adoption = bool(
+                        _reseed_row_meta.get(
+                            "direction_reversal_rearm_requires_watcher"
+                        )
+                    )
+                    _runtime_watcher_exists = bool(
+                        hasattr(self.entry_watcher, "has_order")
+                        and self.entry_watcher.has_order(local_order_id)
+                    )
+                    if _runtime_watcher_exists:
+                        if not _requires_durable_adoption:
+                            # Ordinary already-owned row — unchanged
+                            # behavior.
+                            log.info(
+                                "[%s] RECOVERY: watcher already owns "
+                                "local_order_id=%s — skipping duplicate "
+                                "reseed",
+                                self.client_id, local_order_id,
+                            )
+                            already_verified_owner_rows += 1
+                            continue
+                        # PR #421 Blocker 1 completion: a real runtime
+                        # watcher already exists, but the durable row is
+                        # still in the direction-reversal recovery-owned
+                        # state (never converged). The prior fast path
+                        # would skip this row forever — a runtime watcher
+                        # alone is not release authority, and skipping
+                        # here means PTR (and therefore the adoption CAS)
+                        # would never run for it. Fall through into the
+                        # normal PTR/adoption path instead of continuing;
+                        # PTR itself remains the causal authority for
+                        # provenance (it will correctly report
+                        # last_watcher_registered_by_this_attempt=False
+                        # for a watcher it did not just create).
                         log.info(
-                            "[%s] RECOVERY: watcher already owns local_order_id=%s — skipping duplicate reseed",
+                            "[%s] RECOVERY: runtime watcher exists but "
+                            "direction-reversal durable adoption is still "
+                            "required | local_order_id=%s — routing "
+                            "through PTR/adoption instead of the "
+                            "runtime-only skip",
                             self.client_id, local_order_id,
                         )
-                        already_verified_owner_rows += 1
-                        continue
                 except Exception as exc:
                     log.warning(
                         "[%s] RECOVERY: watcher ownership check failed for local_order_id=%s: %s",
@@ -3633,14 +3677,15 @@ class APStartupRecovery:
                         # recovery-owned direction-reversal rearm state
                         # need no such transfer — WATCHER_OWNED already
                         # means their durable ownership was correct.
-                        _reseed_row_meta = self._coerce_order_meta(
-                            order.get("meta")
-                        )
-                        _requires_durable_adoption = bool(
-                            _reseed_row_meta.get(
-                                "direction_reversal_rearm_requires_watcher"
-                            )
-                        )
+                        #
+                        # _reseed_row_meta / _requires_durable_adoption
+                        # were already parsed once, early, before the
+                        # has_order() fast-path decision above. Reused
+                        # here rather than re-parsed — PTR's
+                        # recover_one_row() does not itself mutate
+                        # direction_reversal_rearm_requires_watcher, only
+                        # the separate adoption CAS below does, so the
+                        # earlier snapshot remains valid.
                         if not _requires_durable_adoption:
                             rearmed += 1
                             log.info(
@@ -3743,12 +3788,28 @@ class APStartupRecovery:
                                             _reseed_post_meta.get("watcher_token")
                                             or ""
                                         ) == _reseed_real_token
+                                        and _reseed_strict_generation(
+                                            _reseed_post_meta.get(
+                                                "watcher_generation"
+                                            )
+                                        ) == _reseed_gen
                                         and not _reseed_post_meta.get(
                                             "recovery_owner"
                                         )
                                         and not _reseed_post_meta.get(
                                             "recovery_ownership"
                                         )
+                                        # Explicit False required — missing
+                                        # metadata must not pass. A row
+                                        # whose adoption patch never landed
+                                        # (or landed against a different
+                                        # key shape) would otherwise read
+                                        # as "flag absent" and incorrectly
+                                        # satisfy `not ...get(...)`.
+                                        and _reseed_post_meta.get(
+                                            "direction_reversal_rearm_"
+                                            "requires_watcher"
+                                        ) is False
                                         and str(
                                             _reseed_post_meta.get(
                                                 "materialization_status"
