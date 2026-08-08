@@ -1542,6 +1542,9 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 )
                 active_order = None
             reserved_local_order_id = _claim_local_order_id(pos)
+            reserved_exit_requires_final_fence = bool(reserved_local_order_id) or active_exit_order_blocks(
+                active_order
+            )
             if active_order_lookup_failed or (
                 reserved_local_order_id and active_order is None
             ):
@@ -1673,39 +1676,40 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     # A pending local id is only a pointer. Re-read and prove
                     # the row after durable claim acquisition, immediately
                     # before the irreversible callback boundary.
-                    try:
-                        active_order = _active_exit_order(self, position_id)
-                    except Exception as exc:
-                        log.critical(
-                            "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_LOOKUP_FAILED position=%s local_order_id=%s error=%s",
-                            getattr(pos, "ticker", ""),
-                            position_id,
-                            local_order_id,
-                            exc,
-                        )
-                        return False
-                    if not _is_exact_reserved_exit_intent(
-                        self,
-                        pos,
-                        active_order,
-                        expected_client_id=resolved_client,
-                    ):
+                    if reserved_exit_requires_final_fence:
                         try:
-                            _mark_active_exit_owned(self, pos, active_order or {})
+                            active_order = _active_exit_order(self, position_id)
                         except Exception as exc:
-                            log.debug(
-                                "[%s] final reserved exit ownership hydration failed position=%s error=%s",
+                            log.critical(
+                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_LOOKUP_FAILED position=%s local_order_id=%s error=%s",
                                 getattr(pos, "ticker", ""),
                                 position_id,
+                                local_order_id,
                                 exc,
                             )
-                        log.critical(
-                            "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s",
-                            getattr(pos, "ticker", ""),
-                            position_id,
-                            local_order_id,
-                        )
-                        return False
+                            return False
+                        if not _is_exact_reserved_exit_intent(
+                            self,
+                            pos,
+                            active_order,
+                            expected_client_id=resolved_client,
+                        ):
+                            try:
+                                _mark_active_exit_owned(self, pos, active_order or {})
+                            except Exception as exc:
+                                log.debug(
+                                    "[%s] final reserved exit ownership hydration failed position=%s error=%s",
+                                    getattr(pos, "ticker", ""),
+                                    position_id,
+                                    exc,
+                                )
+                            log.critical(
+                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s",
+                                getattr(pos, "ticker", ""),
+                                position_id,
+                                local_order_id,
+                            )
+                            return False
 
             callback_attr = (
                 "on_scale"
