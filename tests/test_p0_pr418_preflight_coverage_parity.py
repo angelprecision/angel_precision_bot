@@ -4,22 +4,25 @@ from __future__ import annotations
 import json
 import os
 from datetime import timezone
+from unittest.mock import patch
 from urllib.parse import unquote, urlparse
 
 # --- DB safety fence -----------------------------------------------------
 #
 # This file executes real DDL/DML (CREATE TABLE, DELETE, INSERT) against
-# whatever DATABASE_URL resolves to. The previous `os.environ.setdefault(...)`
-# only filled in a value when DATABASE_URL was unset -- it did nothing to
-# protect against an already-configured DATABASE_URL pointing at staging or
-# production. If that happened, this file would run destructive operations
-# against the `orders` table of whatever database was configured.
+# whatever database URL the module resolves to. The previous
+# `os.environ.setdefault(...)` only filled in a value when DATABASE_URL was
+# unset -- it did nothing to protect against an already-configured
+# DATABASE_URL pointing at staging or production. If that happened, this file
+# would run destructive operations against the `orders` table of whatever
+# database was configured.
 #
 # The guard below positively allowlists the exact local test database this
-# repo's CI uses. It never silently overwrites an existing DATABASE_URL: an
-# ambiguous or unsafe value raises immediately at import time, which aborts
-# collection of this entire module before any fixture -- and therefore
-# before any CREATE/DELETE/INSERT -- can run.
+# repo's CI uses. It never silently overwrites an existing DATABASE_URL or
+# mutates the caller's process environment: an ambiguous or unsafe value
+# raises immediately at import time, which aborts collection of this entire
+# module before any fixture -- and therefore before any CREATE/DELETE/INSERT
+# -- can run.
 #
 # Host/path validation alone is not sufficient: PostgreSQL/libpq connection
 # URIs also honor connection-identity parameters carried in the query
@@ -213,12 +216,12 @@ def _assert_safe_libpq_environment() -> None:
 def _assert_safe_test_database_url() -> str:
     """Resolve and validate DATABASE_URL for this test module.
 
-    If DATABASE_URL is unset or blank, adopts the explicit known-safe
-    local default and validates that value like any other input (no
-    bypass). If DATABASE_URL is already set, it is never overwritten --
-    it is validated as-is, and an unsafe or ambiguous value raises before
-    this module finishes importing, which prevents pytest from collecting
-    any fixture or test in this file.
+    If DATABASE_URL is unset or blank, returns the explicit known-safe local
+    default and validates that value like any other input (no bypass). The
+    process environment is never filled in or overwritten. If DATABASE_URL
+    is already set, it is validated as-is, and an unsafe or ambiguous value
+    raises before this module finishes importing, which prevents pytest from
+    collecting any fixture or test in this file.
 
     Also validates the libpq target environment (PGHOSTADDR, PGSERVICE,
     PGSERVICEFILE) before authorizing any connection, since a validated
@@ -226,7 +229,6 @@ def _assert_safe_test_database_url() -> str:
     """
     raw = os.environ.get("DATABASE_URL")
     if raw is None or not raw.strip():
-        os.environ["DATABASE_URL"] = _SAFE_DEFAULT_DATABASE_URL
         raw = _SAFE_DEFAULT_DATABASE_URL
     _validate_database_url(raw)
     _assert_safe_libpq_environment()
@@ -238,7 +240,13 @@ DATABASE_URL = _assert_safe_test_database_url()
 import psycopg2
 import pytest
 
-import ap.selector_recovery_deploy_preflight as preflight_module
+# ap.db requires DATABASE_URL at import time. Scope the safe URL to that
+# import only; the module-level test connection helper uses the already
+# validated `DATABASE_URL` constant below, so later test modules cannot inherit
+# a process-wide environment mutation from this file.
+with patch.dict(os.environ, {"DATABASE_URL": DATABASE_URL}, clear=False):
+    import ap.selector_recovery_deploy_preflight as preflight_module
+
 from ap.selector_recovery_deploy_preflight import (
     _classify_row,
     _fetch_candidate_rows,
@@ -660,7 +668,7 @@ class TestDatabaseSafetyFence:
         resolved = _assert_safe_test_database_url()
 
         assert resolved == _SAFE_DEFAULT_DATABASE_URL
-        assert os.environ["DATABASE_URL"] == _SAFE_DEFAULT_DATABASE_URL
+        assert "DATABASE_URL" not in os.environ
 
     def test_blank_database_url_adopts_explicit_local_default(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "   ")
@@ -668,6 +676,7 @@ class TestDatabaseSafetyFence:
         resolved = _assert_safe_test_database_url()
 
         assert resolved == _SAFE_DEFAULT_DATABASE_URL
+        assert os.environ["DATABASE_URL"] == "   "
 
     def test_preexisting_unsafe_database_url_is_not_overwritten(self, monkeypatch):
         """An unsafe pre-existing value must be rejected, not silently
@@ -928,6 +937,19 @@ class TestLibpqEnvironmentFence:
 
         with pytest.raises(_UnsafeTestDatabaseError):
             _assert_safe_test_database_url()
+
+    def test_unsafe_environment_does_not_fill_missing_database_url(
+        self, monkeypatch
+    ):
+        """A failed environment fence must not leave a synthesized URL
+        behind when DATABASE_URL was absent before validation."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setenv("PGHOSTADDR", "8.8.8.8")
+
+        with pytest.raises(_UnsafeTestDatabaseError):
+            _assert_safe_test_database_url()
+
+        assert "DATABASE_URL" not in os.environ
 
 
 def test_candidate_fetch_executes_select_only(monkeypatch):
