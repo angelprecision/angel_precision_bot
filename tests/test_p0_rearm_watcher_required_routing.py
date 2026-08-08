@@ -1870,3 +1870,435 @@ class TestP02RetentionAcceptsRealZeroGenerationShape:
         assert row_store["meta"]["current_owner"] == "watcher-token-committed"
         assert row_store["meta"]["watcher_token"] == "watcher-token-committed"
         assert "recovery_ownership" not in row_store["meta"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #421 FINAL P0 CORRECTION — RWR recovery-retention CAS exact fencing
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# retain_recovery_ownership_if_no_watcher() only fences on committed WATCHER
+# authority (current_owner/watcher_token/watcher_generation blank). That is
+# not enough for REARM_WATCHER_REQUIRED: a stale actor whose own generation/
+# identity/broker-state expectation no longer matches the durable row must
+# not be able to write recovery ownership just because watcher fields
+# happen to still read blank. These tests prove the new exact-fenced
+# retain_rearm_watcher_required_recovery_ownership() closes that gap, and
+# that authority-lost reasons never even attempt retention at all.
+
+
+def _install_get_order_injector(osm, mutate_fn):
+    """Wrap osm.get_order so the FIRST call whose row shows
+    direction_reversal_rearm_requires_watcher=True (empirically confirmed
+    to be the RWR block's own _rwr_row = self.osm.get_order(_exp_loid)
+    validation read — the earlier in-memory _outcome/_exp_gen capture
+    needs no DB read at all) is mutated by mutate_fn before being
+    returned. All other calls pass through unmodified.
+    """
+    _fired = {"done": False}
+    _real_get_order = osm.get_order
+
+    def _wrapped(order_id):
+        row = _real_get_order(order_id)
+        if (
+            not _fired["done"]
+            and row
+            and (row.get("meta") or {}).get(
+                "direction_reversal_rearm_requires_watcher"
+            ) is True
+        ):
+            _fired["done"] = True
+            row = dict(row)
+            row["meta"] = dict(row.get("meta") or {})
+            mutate_fn(row["meta"])
+        return row
+
+    osm.get_order = _wrapped
+    return _fired
+
+
+def _install_fenced_rwr_retention(osm, row_store):
+    """Attach a genuinely conditional (not blind-merge) fake for
+    retain_rearm_watcher_required_recovery_ownership, mirroring the real
+    SQL predicate against row_store directly. The harness's shared
+    osm_mod.conn patch is a rearm-shaped blind-merge cursor that would
+    otherwise make ANY CAS "succeed" regardless of its real WHERE clause
+    — this fake restores genuine fencing for tests that need to prove the
+    CAS itself refuses, not just that the caller chose not to call it.
+    Returns a call-log list of every invocation for spying.
+    """
+    calls = []
+
+    def _fake(local_order_id, *, recovery_owner, reason, recovery_retention_mode,
+              client_id, signal_id, execution_mode, generation,
+              expected_recovery_owner, canonical_signal_id=""):
+        calls.append({
+            "local_order_id": local_order_id, "reason": reason,
+            "generation": generation, "client_id": client_id,
+            "signal_id": signal_id, "execution_mode": execution_mode,
+        })
+        if local_order_id != LOCAL_ORDER_ID:
+            return False
+        _meta = row_store["row"].get("meta") or {}
+        _row = row_store["row"]
+        _ok = (
+            str(_row.get("client_id") or "").strip().lower() == str(client_id).lower()
+            and str(_row.get("signal_id") or "").strip() == str(signal_id)
+            and str(_row.get("execution_mode") or "").strip().lower()
+            == str(execution_mode).lower()
+            and str(_row.get("kind") or "").strip().upper() == "ENTRY"
+            and str(_row.get("status") or "").strip().upper() == "PENDING_TRIGGER"
+            and not str(_row.get("broker_order_id") or "").strip()
+            and not _row.get("submitted_ts")
+            and not str(_meta.get("submit_intent_at") or "")
+            and str(_meta.get("broker_ready") or "false").lower() in ("false", "")
+            and int(_meta.get("materialization_generation") or 0) == int(generation)
+            and str(_meta.get("recovery_ownership") or "") == "recovery_scheduler"
+            and str(_meta.get("recovery_owner") or "") == str(expected_recovery_owner)
+            and not str(_meta.get("current_owner") or "")
+            and not str(_meta.get("watcher_token") or "")
+            and str(_meta.get("watcher_generation") or "") in ("", "0")
+        )
+        if not _ok:
+            return False
+        _meta = dict(_meta)
+        _meta.update({
+            "recovery_ownership": "recovery_scheduler",
+            "recovery_owner": recovery_owner,
+        })
+        row_store["row"]["meta"] = _meta
+        return True
+
+    osm.retain_rearm_watcher_required_recovery_ownership = _fake
+    return calls
+
+
+class TestRWRRetentionRefusedAfterGenerationAdvancement:
+    """Test A — a newer pass already advanced the row's generation past
+    what this actor expected. Retention must never even be attempted."""
+
+    def test_stale_generation_performs_zero_ownership_mutation(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        def _advance_generation(meta):
+            meta["materialization_generation"] = NEW_GEN + 1
+
+        _install_get_order_injector(osm, _advance_generation)
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        # Retention was never even attempted for this reason.
+        assert retention_calls == []
+        # Definitive proof no retention write landed via ANY path
+        # (including a pre-fix fallback to the older, less-fenced
+        # retain_recovery_ownership_if_no_watcher): that field is
+        # populated only by an actual retention CAS write, never by
+        # the rearm write itself.
+        assert "recovery_retained_at" not in row_store["row"]["meta"]
+        # The underlying durable row was never mutated by the stale
+        # actor — it still shows exactly the generation it had before
+        # the injected concurrent-advance was observed (the injector
+        # mutates only the copy returned to validation code, mirroring
+        # "another actor's write already landed and this stale actor's
+        # own read now sees it" without this test needing a second real
+        # writer).
+        assert row_store["row"]["meta"]["materialization_generation"] == NEW_GEN
+        assert any(
+            "generation_advanced_concurrently" in e
+            for e in result.get("errors", [])
+        )
+        # No watcher/broker side effects from the stale actor either.
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestRWRRetentionRefusedAfterBrokerAdvancement:
+    """Test B — the row gained broker/submission activity (crossed the
+    crash window) since this actor's expectation was formed."""
+
+    @pytest.mark.parametrize("field,value", [
+        ("broker_order_id", "brk-12345"),
+        ("submitted_ts", "2026-08-07T12:00:00Z"),
+    ])
+    def test_broker_column_advancement_performs_zero_mutation(
+        self, monkeypatch, field, value,
+    ):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        _real_get_order = osm.get_order
+        _fired = {"done": False}
+
+        def _wrapped(order_id):
+            row = _real_get_order(order_id)
+            if (
+                not _fired["done"]
+                and row
+                and (row.get("meta") or {}).get(
+                    "direction_reversal_rearm_requires_watcher"
+                ) is True
+            ):
+                _fired["done"] = True
+                row = dict(row)
+                row[field] = value
+            return row
+
+        osm.get_order = _wrapped
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert retention_calls == []
+        # Definitive proof no retention write landed via ANY path
+        # (including a pre-fix fallback to the older, less-fenced
+        # retain_recovery_ownership_if_no_watcher): that field is
+        # populated only by an actual retention CAS write, never by
+        # the rearm write itself.
+        assert "recovery_retained_at" not in row_store["row"]["meta"]
+        assert row_store["row"].get(field) in (None, "", 0)
+        assert any(
+            "state_invalid_or_crash_window" in e for e in result.get("errors", [])
+        )
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+    def test_broker_ready_advancement_performs_zero_mutation(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        def _advance_broker_ready(meta):
+            meta["broker_ready"] = True
+
+        _install_get_order_injector(osm, _advance_broker_ready)
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert retention_calls == []
+        # Definitive proof no retention write landed via ANY path
+        # (including a pre-fix fallback to the older, less-fenced
+        # retain_recovery_ownership_if_no_watcher): that field is
+        # populated only by an actual retention CAS write, never by
+        # the rearm write itself.
+        assert "recovery_retained_at" not in row_store["row"]["meta"]
+        assert row_store["row"]["meta"].get("broker_ready") in (None, False, "false")
+        assert any(
+            "state_invalid_or_crash_window" in e for e in result.get("errors", [])
+        )
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+
+
+class TestRWRRetentionRefusedAfterIdentityAdvancement:
+    """Test C — durable identity no longer matches what this actor
+    expected (a different signal now occupies the row's identity slot,
+    or execution_mode changed)."""
+
+    def test_signal_id_mismatch_performs_zero_mutation(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        _real_get_order = osm.get_order
+        _fired = {"done": False}
+
+        def _wrapped(order_id):
+            row = _real_get_order(order_id)
+            if (
+                not _fired["done"]
+                and row
+                and (row.get("meta") or {}).get(
+                    "direction_reversal_rearm_requires_watcher"
+                ) is True
+            ):
+                _fired["done"] = True
+                row = dict(row)
+                row["signal_id"] = "sig-DIFFERENT-001"
+            return row
+
+        osm.get_order = _wrapped
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert retention_calls == []
+        # Definitive proof no retention write landed via ANY path
+        # (including a pre-fix fallback to the older, less-fenced
+        # retain_recovery_ownership_if_no_watcher): that field is
+        # populated only by an actual retention CAS write, never by
+        # the rearm write itself.
+        assert "recovery_retained_at" not in row_store["row"]["meta"]
+        assert row_store["row"]["signal_id"] == SIGNAL_ID  # unchanged
+        assert any(
+            "identity_mismatch" in e for e in result.get("errors", [])
+        )
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+    def test_execution_mode_mismatch_performs_zero_mutation(self, monkeypatch):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        _real_get_order = osm.get_order
+        _fired = {"done": False}
+
+        def _wrapped(order_id):
+            row = _real_get_order(order_id)
+            if (
+                not _fired["done"]
+                and row
+                and (row.get("meta") or {}).get(
+                    "direction_reversal_rearm_requires_watcher"
+                ) is True
+            ):
+                _fired["done"] = True
+                row = dict(row)
+                row["execution_mode"] = "live"
+            return row
+
+        osm.get_order = _wrapped
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        assert retention_calls == []
+        # Definitive proof no retention write landed via ANY path
+        # (including a pre-fix fallback to the older, less-fenced
+        # retain_recovery_ownership_if_no_watcher): that field is
+        # populated only by an actual retention CAS write, never by
+        # the rearm write itself.
+        assert "recovery_retained_at" not in row_store["row"]["meta"]
+        assert row_store["row"]["execution_mode"] == EXEC_MODE  # unchanged
+        assert any(
+            "identity_mismatch" in e for e in result.get("errors", [])
+        )
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+
+
+class TestRWRRetentionExactFenceCatchesLateAdvancementDuringAdoption:
+    """Test D — watcher registration succeeds (this attempt's own
+    provenance is genuine), but before durable adoption lands, another
+    actor advances the row's generation. The adoption CAS naturally
+    loses; this attempt's own watcher rollback fires correctly (exact-
+    registration fencing, unregressed); and — the point of this test —
+    the SEPARATE, later recovery-retention attempt must ALSO be refused
+    by the exact-fenced CAS, even though nothing in the reason-based
+    retain=False skip-list caught it (ownership_adoption_failed defaults
+    to retain=True). This proves the CAS itself is a real second line of
+    defense, not merely the caller's reason-based routing.
+    """
+
+    def test_late_advance_between_registration_and_adoption_blocks_retention(
+        self, monkeypatch,
+    ):
+        recovery, core, osm, row_store, watcher, selector, broker_calls = (
+            _build_harness(monkeypatch, quote_bid=98.0, quote_ask=98.5)
+        )
+
+        def _quote_check_available(broker, symbol, side, trigger):
+            return False
+
+        import ap.pending_trigger_restart_recovery as ptr_mod
+        monkeypatch.setattr(
+            ptr_mod, "_default_quote_check", _quote_check_available,
+        )
+
+        retention_calls = _install_fenced_rwr_retention(osm, row_store)
+
+        # Validation itself must PASS (generation still matches at that
+        # point) — registration proceeds normally. The advance happens
+        # ONLY at the adoption-CAS boundary: force the real adopt CAS to
+        # report loss, and as a side effect of that exact call, advance
+        # the durable row's generation — simulating a concurrent actor's
+        # write landing in the gap between this attempt's registration
+        # and its own adoption CAS.
+        def _adopt_loses_and_advances(*a, **kw):
+            row_store["row"]["meta"]["materialization_generation"] = NEW_GEN + 1
+            return False
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            _adopt_loses_and_advances,
+        )
+
+        result = {"errors": []}
+        recovery._recover_deferred_breach_lifecycles(result)
+
+        # This attempt's own watcher rollback still worked correctly —
+        # unregressed exact-registration fencing.
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert len(watcher._pending) == 0
+        assert SIGNAL_ID not in watcher._dedup_set
+
+        # Retention WAS attempted (ownership_adoption_failed defaults to
+        # retain=True) ...
+        assert len(retention_calls) == 1
+        assert retention_calls[0]["generation"] == NEW_GEN
+        # ... but the exact-fenced CAS itself refused it: the advanced
+        # generation is untouched, and no recovery-owner write landed on
+        # top of it from this stale attempt.
+        assert row_store["row"]["meta"]["materialization_generation"] == (
+            NEW_GEN + 1
+        )
+        assert any(
+            "ownership_adoption_failed" in e for e in result.get("errors", [])
+        )
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []

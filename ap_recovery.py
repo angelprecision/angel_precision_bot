@@ -2748,16 +2748,74 @@ class APStartupRecovery:
                             _exp_gen_raw = _outcome.get("expected_generation")
                             _exp_gen = _strict_generation(_exp_gen_raw)
 
-                            def _rwr_fail(reason):
+                            def _rwr_retain_exact(reason):
+                                # PR #421 final correction: RWR validates a
+                                # much larger exact surface than the
+                                # general-purpose _retain_recovery_ownership
+                                # closure fences (identity, generation,
+                                # crash-window state) — a stale actor whose
+                                # own snapshot has since diverged from the
+                                # durable row must not be able to write
+                                # recovery authority just because watcher
+                                # fields happen to still read blank. This
+                                # re-asserts every fact this pass validated,
+                                # atomically, at write time.
+                                _retain_fn = getattr(
+                                    self.osm,
+                                    "retain_rearm_watcher_required_recovery_ownership",
+                                    None,
+                                )
+                                if not callable(_retain_fn):
+                                    return _retain_recovery_ownership(
+                                        local_order_id,
+                                        reason=f"rearm_watcher_required_{reason}",
+                                    )
+                                _existing_recovery_owner = str(
+                                    _rwr_meta.get("recovery_owner") or ""
+                                )
+                                try:
+                                    ok = bool(_retain_fn(
+                                        local_order_id,
+                                        recovery_owner=_existing_recovery_owner,
+                                        reason=f"rearm_watcher_required_{reason}",
+                                        recovery_retention_mode=recovery_mode,
+                                        client_id=_exp_client,
+                                        signal_id=_exp_signal,
+                                        execution_mode=_exp_mode,
+                                        generation=_exp_gen,
+                                        expected_recovery_owner=_existing_recovery_owner,
+                                        canonical_signal_id=_exp_canonical or "",
+                                    ))
+                                except Exception as exc:
+                                    log.critical(
+                                        "[%s] REARM_WATCHER_REQUIRED_RETENTION_RAISED "
+                                        "local_order_id=%s reason=%s exc=%s",
+                                        self.client_id, local_order_id, reason, exc,
+                                    )
+                                    return False
+                                if not ok:
+                                    log.critical(
+                                        "[%s] REARM_WATCHER_REQUIRED_RETENTION_CAS_MISS "
+                                        "local_order_id=%s reason=%s — durable state "
+                                        "advanced since this actor validated authority; "
+                                        "retention correctly refused",
+                                        self.client_id, local_order_id, reason,
+                                    )
+                                return ok
+
+                            def _rwr_fail(reason, *, retain=True):
                                 log.critical(
                                     "[%s] REARM_WATCHER_REQUIRED_%s local_order_id=%s "
-                                    "— retaining ownership, no watcher registered",
+                                    "— %s",
                                     self.client_id, reason.upper(), local_order_id,
+                                    (
+                                        "retaining ownership, no watcher registered"
+                                        if retain else
+                                        "authority already lost — no ownership write"
+                                    ),
                                 )
-                                _retain_recovery_ownership(
-                                    local_order_id,
-                                    reason=f"rearm_watcher_required_{reason}",
-                                )
+                                if retain:
+                                    _rwr_retain_exact(reason)
                                 result.setdefault("errors", []).append(
                                     f"rearm_watcher_required_{reason}:{local_order_id}"
                                 )
@@ -2767,13 +2825,17 @@ class APStartupRecovery:
                                 or _exp_mode not in {"live", "paper"}
                                 or not _exp_signal or not _exp_loid
                             ):
-                                _rwr_fail("expected_fields_invalid")
+                                # Cannot even form a valid expectation to
+                                # fence a retention write against — no
+                                # exact state exists to reassert.
+                                _rwr_fail("expected_fields_invalid", retain=False)
                                 continue
 
                             try:
                                 _rwr_row = self.osm.get_order(_exp_loid)
                                 if not _rwr_row:
-                                    _rwr_fail("row_missing")
+                                    # Nothing to retain ownership of.
+                                    _rwr_fail("row_missing", retain=False)
                                     continue
                                 _rwr_meta = self._coerce_order_meta(
                                     _rwr_row.get("meta")
@@ -2802,7 +2864,10 @@ class APStartupRecovery:
                                     )
                                 )
                                 if not _identity_ok:
-                                    _rwr_fail("identity_mismatch")
+                                    # Authority already proven lost — this
+                                    # actor's expected identity no longer
+                                    # matches the durable row.
+                                    _rwr_fail("identity_mismatch", retain=False)
                                     continue
 
                                 # Exact generation — never >=. Same strict
@@ -2815,10 +2880,21 @@ class APStartupRecovery:
                                     _rwr_meta.get("materialization_generation")
                                 )
                                 if _durable_gen is None:
-                                    _rwr_fail("durable_generation_malformed")
+                                    # Cannot prove ownership against an
+                                    # unusable durable generation.
+                                    _rwr_fail(
+                                        "durable_generation_malformed", retain=False,
+                                    )
                                     continue
                                 if _durable_gen != _exp_gen:
-                                    _rwr_fail("generation_advanced_concurrently")
+                                    # A newer pass already advanced this
+                                    # row's generation — this actor's
+                                    # authority is over, not merely
+                                    # unconfirmed.
+                                    _rwr_fail(
+                                        "generation_advanced_concurrently",
+                                        retain=False,
+                                    )
                                     continue
 
                                 # Authoritative broker-absence columns +
@@ -2843,7 +2919,14 @@ class APStartupRecovery:
                                     and _rwr_broker_ready in {"false", ""}
                                 )
                                 if not _authoritative_ok:
-                                    _rwr_fail("state_invalid_or_crash_window")
+                                    # The row advanced past the crash window
+                                    # (broker/submission activity) since this
+                                    # actor's expectation was formed —
+                                    # authority is no longer this actor's to
+                                    # retain.
+                                    _rwr_fail(
+                                        "state_invalid_or_crash_window", retain=False,
+                                    )
                                     continue
 
                                 # Sole authority for classification, watcher

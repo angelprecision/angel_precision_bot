@@ -2806,6 +2806,146 @@ class APOrderStateMachine:
             )
             return False
 
+    def retain_rearm_watcher_required_recovery_ownership(
+        self,
+        local_order_id: str,
+        *,
+        recovery_owner: str,
+        reason: str,
+        recovery_retention_mode: str,
+        client_id: str,
+        signal_id: str,
+        execution_mode: str,
+        generation: int,
+        expected_recovery_owner: str,
+        canonical_signal_id: str = "",
+    ) -> bool:
+        """RWR-specific recovery-retention CAS.
+
+        PR #421 final correction: ``retain_recovery_ownership_if_no_watcher``
+        above only fences against committed WATCHER authority (current_owner
+        / watcher_token / watcher_generation blank). That is not enough for
+        the REARM_WATCHER_REQUIRED path, which validates a much larger
+        exact-identity/exact-generation/exact-lifecycle surface before ever
+        deciding to retain. A stale actor whose own expectations (generation
+        N, say) no longer match the durable row — because a newer pass
+        already advanced it to N+1, changed identity, or moved it past the
+        crash window — must not be able to stamp recovery ownership back
+        onto a row it has already lost authority over, merely because
+        watcher fields happen to still read blank.
+
+        This CAS re-asserts, atomically, at write time, the SAME exact
+        facts the caller validated moments earlier by reading the row:
+        exact identity (local_order_id/client_id/signal_id/execution_mode,
+        and canonical_signal_id when the caller expected one), exact
+        materialization_generation, ENTRY/PENDING_TRIGGER lifecycle, the
+        same crash-window broker-absence columns, the exact prior
+        recovery_owner this actor itself claimed the row with, and no
+        committed watcher authority. Any mismatch — the row moved on in
+        any of these dimensions since the caller's read — is rowcount=0:
+        fail closed, no ownership write, by construction of one
+        conditional UPDATE rather than a read-then-write decision.
+
+        Callers whose validation itself already proved authority was lost
+        (row missing, identity mismatch, generation advanced, malformed
+        generation, crash-window/broker state advanced) must not call this
+        at all — there is no exact state left to fence to, and calling it
+        anyway would be a masked, less legible way of doing the same
+        no-op. This method exists only for the legitimate-retention case:
+        the row was proven to still be this actor's exact row, and only
+        watcher registration/adoption itself failed this pass.
+        """
+        _recovery_owner = str(recovery_owner or "").strip()
+        _expected_recovery_owner = str(expected_recovery_owner or "").strip()
+        _client = str(client_id or "").strip().lower()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _canonical = str(canonical_signal_id or "").strip()
+        try:
+            _generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _recovery_owner
+            or not _expected_recovery_owner
+            or not _client
+            or not _signal
+            or _mode not in {"live", "paper"}
+            or _generation < 1
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "recovery_ownership": "recovery_scheduler",
+            "recovery_owner": _recovery_owner,
+            "recovery_retained_at": _now,
+            "recovery_retention_reason": str(reason or ""),
+            "recovery_retention_mode": str(recovery_retention_mode or ""),
+        }
+        try:
+            _patch_json = json.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _retain_exact():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'submit_intent_at', '') = ''
+                      AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'recovery_ownership', '') = 'recovery_scheduler'
+                      AND COALESCE(meta->>'recovery_owner', '') = %s
+                      AND COALESCE(meta->>'current_owner', '') = ''
+                      AND COALESCE(meta->>'watcher_token', '') = ''
+                      AND COALESCE(meta->>'watcher_generation', '') IN ('', '0')
+                      AND (
+                          %s = ''
+                          OR COALESCE(
+                              NULLIF(canonical_signal_id, ''),
+                              meta->>'canonical_signal_id',
+                              ''
+                          ) = %s
+                      )
+                    """,
+                    (
+                        _patch_json,
+                        local_order_id,
+                        _client,
+                        _signal,
+                        _mode,
+                        _generation,
+                        _expected_recovery_owner,
+                        _canonical,
+                        _canonical,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_retain_exact) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retain_rearm_watcher_required_recovery_ownership "
+                "failed order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
     def persist_deferred_broker_ready(
         self,
         local_order_id: str,
