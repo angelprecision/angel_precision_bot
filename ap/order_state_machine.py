@@ -2200,6 +2200,14 @@ class APOrderStateMachine:
             "materialization_owner": _owner,
             "watcher_token": _owner,
             "current_owner": _owner,
+            # A fresh confirmed breach supersedes any recovery-owned
+            # direction-reversal waiting state.
+            "recovery_ownership": "",
+            "recovery_owner": "",
+            "direction_reversal_rearm_requires_watcher": False,
+            "watcher_generation": _new_generation,
+            "final_market_truth_status": "",
+            "final_market_truth": {},
             "materialization_generation": _new_generation,
             "materialization_claimed_at": _now,
             "materialization_lease_until": str(lease_until or ""),
@@ -2371,15 +2379,37 @@ class APOrderStateMachine:
         local_order_id: str,
         *,
         owner: str,
+        watcher_token: str = "",
         generation: int,
         signal_id: str,
         execution_mode: str,
         market_truth_audit: dict,
     ) -> bool:
-        """Return the same deferred ENTRY identity to trigger-watcher ownership."""
+        """Return the same deferred ENTRY to a clean pre-breach state.
+
+        A real in-process watcher may retain its exact watcher token by
+        passing it as ``watcher_token``. A restart/due-retry callback runs
+        against a synthetic (unregistered) watched object and MUST NOT pass
+        one — the recovery takeover token used to win the original CAS
+        (``owner``) is a claim authority only, never a proof of a live,
+        registered APEntryWatcher. Persisting it as ``watcher_token`` is the
+        exact defect this correction closes: it let a synthetic recovery
+        callback masquerade as an attached watcher, after which
+        ``resume_deferred_materialization_retry`` would try (and fail) to
+        reschedule a materialization retry against a row this method had
+        already released from MATERIALIZING.
+
+        When no watcher_token is supplied, the row is left explicitly
+        recovery-owned (``recovery_ownership='recovery_scheduler'``,
+        ``direction_reversal_rearm_requires_watcher=True``) so the existing
+        recovery health loop recognizes it must attach a real watcher on a
+        later pass, rather than silently leaving an orphaned PENDING_TRIGGER
+        row outside every executable retry path.
+        """
         import json as _json_local
 
         _owner = str(owner or "").strip()
+        _watcher_token = str(watcher_token or "").strip()
         _signal = str(signal_id or "").strip()
         _mode = str(execution_mode or "").strip().lower()
         try:
@@ -2388,19 +2418,82 @@ class APOrderStateMachine:
             return False
         if not _owner or not _signal or _mode not in {"live", "paper"}:
             return False
+
+        # In the uninterrupted watcher path, materialization ownership came
+        # from this exact watcher token. Any disagreement is an ownership
+        # conflict — fail closed rather than silently accepting a mismatched
+        # token as authoritative.
+        if _watcher_token and _watcher_token != _owner:
+            return False
+
+        _now = now_utc_iso()
+        _recovery_owned = not bool(_watcher_token)
+        _audit = dict(market_truth_audit or {})
+
         _patch = {
             "lifecycle_state": "",
-            "materialization_status": "REARM_DIRECTION_REVERSAL",
+            # A truly blank pre-breach materialization_status — never a
+            # populated lifecycle value here. WAITING_FOR_TRIGGER is only
+            # ever written later, by the durable ownership-adoption step,
+            # once a REAL watcher has actually been proven attached.
+            # REARM_DIRECTION_REVERSAL is preserved only as a diagnostic
+            # (final_market_truth_status / last_direction_reversal_* below).
+            "materialization_status": "",
             "materialization_in_flight": False,
             "materialization_owner": "",
             "materialization_lease_until": "",
-            "current_owner": "",
-            "watcher_token": "",
+            # current_owner must never fall back to the recovery claim
+            # token. A recovery takeover token is not watcher ownership —
+            # `_watcher_token or _owner` is the exact defect this closes.
+            "current_owner": _watcher_token if _watcher_token else "",
+            "watcher_token": _watcher_token,
+            "watcher_generation": _generation if _watcher_token else 0,
+            "watcher_registered_at": _now if _watcher_token else "",
+            "recovery_ownership": (
+                "recovery_scheduler" if _recovery_owned else ""
+            ),
+            "recovery_owner": _owner if _recovery_owned else "",
+            "direction_reversal_rearm_requires_watcher": _recovery_owned,
             "broker_ready": False,
+            # Direction reversal starts a fresh selector attempt.  Preserve the
+            # monotonic materialization_generation, but clear every active
+            # attempt/schedule authority so the next confirmed breach is
+            # attempt 1 with no stale cursor requirement.
+            "retry_attempt": 0,
+            "retry_attempt_in_flight": 0,
+            "breach_attempt_count": 0,
+            "materialization_attempts": 0,
+            "retry_max_attempts": 0,
+            "next_retry_at": "",
+            "materialization_next_retry_at": "",
+            "deferred_retry_scheduled": False,
+            "deferred_retry_reason_code": "",
+            "deferred_retry_attempt": 0,
+            "deferred_retry_max_attempts": 0,
+            "deferred_retry_delay_seconds": 0,
+            "deferred_retry_scheduled_at": "",
+            "deferred_retry_next_attempt_at": "",
+            "deferred_retry_terminal_reason": "",
+            "retry_reason": "",
+            "materialization_reason": "",
+            "retry_owner": "",
+            "materialization_retry_owner": "",
+            "materialization_retry_attempt": 0,
+            "materialization_retry_max_attempts": 0,
+            "watcher_retry_attempt": 0,
+            "watcher_next_retry_at": "",
+            "selector_failure": {},
+            "materialization_selector_failure": {},
+            "materialization_outcome": "",
+            "materialization_detail": "",
+            "entry_path": "",
+            # Preserve the decision as diagnostics only.
             "final_market_truth_status": "REARM_DIRECTION_REVERSAL",
-            "final_market_truth": dict(market_truth_audit or {}),
+            "final_market_truth": _audit,
+            "last_direction_reversal_market_truth": _audit,
+            "last_direction_reversal_rearmed_at": _now,
             "selector_recovery_cursor_v1": None,
-            "rearmed_at": now_utc_iso(),
+            "rearmed_at": _now,
         }
         try:
             _patch_json = _json_local.dumps(_patch, default=str)
@@ -2412,7 +2505,75 @@ class APOrderStateMachine:
                 cur = c.execute(
                     """
                     UPDATE orders
-                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                    SET meta = (
+                            COALESCE(meta, '{}'::jsonb)
+                            || %s::jsonb
+                            || jsonb_strip_nulls(jsonb_build_object(
+                                'first_trigger_crossed_at',
+                                COALESCE(
+                                    NULLIF(meta->>'first_trigger_crossed_at', ''),
+                                    NULLIF(meta->>'trigger_crossed_at', ''),
+                                    NULLIF(meta->>'triggered_at', '')
+                                ),
+                                'first_trigger_crossed_at_provenance',
+                                COALESCE(
+                                    meta->'first_trigger_crossed_at_provenance',
+                                    meta->'trigger_crossed_at_provenance'
+                                ),
+                                'first_trigger_confirmed_at',
+                                COALESCE(
+                                    NULLIF(
+                                        meta->>'first_trigger_confirmed_at',
+                                        ''
+                                    ),
+                                    NULLIF(meta->>'trigger_confirmed_at', ''),
+                                    NULLIF(
+                                        meta->>'last_confirmed_trigger_at',
+                                        ''
+                                    )
+                                ),
+                                'first_trigger_breach_bid',
+                                COALESCE(
+                                    meta->'first_trigger_breach_bid',
+                                    meta->'first_breach_bid'
+                                ),
+                                'first_trigger_breach_ask',
+                                COALESCE(
+                                    meta->'first_trigger_breach_ask',
+                                    meta->'first_breach_ask'
+                                ),
+                                'first_trigger_confirmation_quote',
+                                COALESCE(
+                                    meta->'first_trigger_confirmation_quote',
+                                    meta->'last_trigger_confirmation_quote'
+                                ),
+                                'last_direction_reversal_retry_reason',
+                                COALESCE(
+                                    NULLIF(meta->>'retry_reason', ''),
+                                    NULLIF(
+                                        meta->>'materialization_reason',
+                                        ''
+                                    )
+                                ),
+                                'last_direction_reversal_selector_failure',
+                                COALESCE(
+                                    meta->'materialization_selector_failure',
+                                    meta->'selector_failure'
+                                ),
+                                'last_direction_reversal_materialization_outcome',
+                                NULLIF(meta->>'materialization_outcome', '')
+                            ))
+                        )
+                        - 'selector_recovery_cursor_v1'
+                        - 'trigger_crossed_at'
+                        - 'trigger_crossed_at_provenance'
+                        - 'triggered_at'
+                        - 'trigger_confirmed_at'
+                        - 'last_confirmed_trigger_at'
+                        - 'original_trigger_crossed_at'
+                        - 'first_breach_bid'
+                        - 'first_breach_ask'
+                        - 'last_trigger_confirmation_quote',
                         updated_ts = NOW()
                     WHERE local_order_id = %s
                       AND client_id = %s
@@ -2444,6 +2605,341 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] rearm_deferred_materialization_direction_reversal failed "
                 "order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+    def adopt_direction_reversal_watcher_ownership(
+        self,
+        local_order_id: str,
+        *,
+        recovery_owner: str,
+        watcher_token: str,
+        generation: int,
+        signal_id: str,
+        execution_mode: str,
+    ) -> bool:
+        """Transfer durable watcher ownership from a recovery-owned,
+        direction-reversal-rearmed row to a real, just-registered watcher.
+
+        Reused nowhere else — this is the narrow gap left after
+        ``rearm_deferred_materialization_direction_reversal`` releases a row
+        to ``recovery_ownership='recovery_scheduler'`` (no real watcher
+        proven yet) and a later ``PendingTriggerRestartRecovery`` pass then
+        proves a real ``APEntryWatcher`` registration for it. Neither of
+        those two functions writes the other's half of durable ownership;
+        this is that missing, explicit, CAS-fenced write.
+
+        The CAS is fail-closed on exact identity, exact generation, and the
+        exact recovery-owned state left by the rearm — never a monotonic or
+        greater-than acceptance. It also requires ``watcher_token`` to still
+        be blank durably, so a second concurrent adoption cannot double-claim
+        the row.
+        """
+        import json as _json_local
+
+        _recovery_owner = str(recovery_owner or "").strip()
+        _token = str(watcher_token or "").strip()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        try:
+            _generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _recovery_owner
+            or not _token
+            or not _signal
+            or _mode not in {"live", "paper"}
+            or _generation < 1
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "materialization_status": "WAITING_FOR_TRIGGER",
+            "current_owner": _token,
+            "watcher_token": _token,
+            "watcher_generation": _generation,
+            "watcher_registered_at": _now,
+            "recovery_owner": "",
+            "recovery_ownership": "",
+            "direction_reversal_rearm_requires_watcher": False,
+        }
+        try:
+            _patch_json = _json_local.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _adopt():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'lifecycle_state','') = ''
+                      AND COALESCE(meta->>'recovery_ownership','') = 'recovery_scheduler'
+                      AND COALESCE(meta->>'recovery_owner','') = %s
+                      AND COALESCE(meta->>'watcher_token','') = ''
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                    """,
+                    (
+                        _patch_json,
+                        local_order_id,
+                        self.client_id,
+                        _signal,
+                        _mode,
+                        _recovery_owner,
+                        _generation,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_adopt) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] adopt_direction_reversal_watcher_ownership failed "
+                "order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+    def retain_recovery_ownership_if_no_watcher(
+        self,
+        local_order_id: str,
+        *,
+        recovery_owner: str,
+        reason: str,
+        recovery_retention_mode: str,
+    ) -> bool:
+        """Write recovery-authority retention markers, but ONLY if no
+        committed watcher authority already exists on the row.
+
+        PR #421 final amendment (§5): the plain recovery-retention write
+        this replaces (a bare ``update_order_meta`` merge) had no fencing
+        against existing watcher ownership at all — it could blindly write
+        ``recovery_ownership`` / ``recovery_owner`` on top of a row whose
+        watcher authority (``current_owner`` / ``watcher_token`` /
+        ``watcher_generation``) was already durably committed moments
+        earlier, e.g. by a watcher-adoption CAS that itself succeeded but
+        whose immediate post-write verification reread failed or raised.
+        That produces exactly the dual-authority state PR #421 exists to
+        prevent: a row simultaneously claimed by a real watcher and by
+        recovery.
+
+        Fenced the same way ``adopt_direction_reversal_watcher_ownership``
+        fences the opposite transfer: a single conditional UPDATE whose
+        WHERE clause requires the watcher fields to already be blank, not
+        a read-then-write check with a TOCTOU gap.
+
+        The watcher-generation half of that fence accepts both '' and '0':
+        ``rearm_deferred_materialization_direction_reversal`` writes
+        ``watcher_generation`` as the JSON integer 0 (not blank) for its
+        own legitimate no-watcher, recovery-owned state — Postgres's
+        ``meta->>'watcher_generation'`` renders that as the text "0", not
+        "". Requiring exact blank alone would make this fence reject the
+        very state it exists to protect. Any other value (1, 4, "abc",
+        etc.) still fails closed.
+
+        Returns False (no-op, watcher authority preserved) if the row
+        already carries committed watcher ownership, if the row does not
+        exist, or on any write error. Callers must not treat False as
+        confirmation the row is now in some other bad state — only that
+        this specific write did not happen.
+        """
+        _recovery_owner = str(recovery_owner or "").strip()
+        if not _recovery_owner:
+            return False
+        _now = now_utc_iso()
+        _patch = {
+            "recovery_ownership": "recovery_scheduler",
+            "recovery_owner": _recovery_owner,
+            "recovery_retained_at": _now,
+            "recovery_retention_reason": str(reason or ""),
+            "recovery_retention_mode": str(recovery_retention_mode or ""),
+        }
+        try:
+            _patch_json = json.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _retain():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND COALESCE(meta->>'current_owner', '') = ''
+                      AND COALESCE(meta->>'watcher_token', '') = ''
+                      AND COALESCE(meta->>'watcher_generation', '') IN ('', '0')
+                    """,
+                    (_patch_json, local_order_id, self.client_id),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_retain) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retain_recovery_ownership_if_no_watcher failed "
+                "order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
+    def retain_rearm_watcher_required_recovery_ownership(
+        self,
+        local_order_id: str,
+        *,
+        recovery_owner: str,
+        reason: str,
+        recovery_retention_mode: str,
+        client_id: str,
+        signal_id: str,
+        execution_mode: str,
+        generation: int,
+        expected_recovery_owner: str,
+        canonical_signal_id: str = "",
+    ) -> bool:
+        """RWR-specific recovery-retention CAS.
+
+        PR #421 final correction: ``retain_recovery_ownership_if_no_watcher``
+        above only fences against committed WATCHER authority (current_owner
+        / watcher_token / watcher_generation blank). That is not enough for
+        the REARM_WATCHER_REQUIRED path, which validates a much larger
+        exact-identity/exact-generation/exact-lifecycle surface before ever
+        deciding to retain. A stale actor whose own expectations (generation
+        N, say) no longer match the durable row — because a newer pass
+        already advanced it to N+1, changed identity, or moved it past the
+        crash window — must not be able to stamp recovery ownership back
+        onto a row it has already lost authority over, merely because
+        watcher fields happen to still read blank.
+
+        This CAS re-asserts, atomically, at write time, the SAME exact
+        facts the caller validated moments earlier by reading the row:
+        exact identity (local_order_id/client_id/signal_id/execution_mode,
+        and canonical_signal_id when the caller expected one), exact
+        materialization_generation, ENTRY/PENDING_TRIGGER lifecycle, the
+        same crash-window broker-absence columns, the exact prior
+        recovery_owner this actor itself claimed the row with, and no
+        committed watcher authority. Any mismatch — the row moved on in
+        any of these dimensions since the caller's read — is rowcount=0:
+        fail closed, no ownership write, by construction of one
+        conditional UPDATE rather than a read-then-write decision.
+
+        Callers whose validation itself already proved authority was lost
+        (row missing, identity mismatch, generation advanced, malformed
+        generation, crash-window/broker state advanced) must not call this
+        at all — there is no exact state left to fence to, and calling it
+        anyway would be a masked, less legible way of doing the same
+        no-op. This method exists only for the legitimate-retention case:
+        the row was proven to still be this actor's exact row, and only
+        watcher registration/adoption itself failed this pass.
+        """
+        _recovery_owner = str(recovery_owner or "").strip()
+        _expected_recovery_owner = str(expected_recovery_owner or "").strip()
+        _client = str(client_id or "").strip().lower()
+        _signal = str(signal_id or "").strip()
+        _mode = str(execution_mode or "").strip().lower()
+        _canonical = str(canonical_signal_id or "").strip()
+        try:
+            _generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        if (
+            not _recovery_owner
+            or not _expected_recovery_owner
+            or not _client
+            or not _signal
+            or _mode not in {"live", "paper"}
+            or _generation < 1
+        ):
+            return False
+
+        _now = now_utc_iso()
+        _patch = {
+            "recovery_ownership": "recovery_scheduler",
+            "recovery_owner": _recovery_owner,
+            "recovery_retained_at": _now,
+            "recovery_retention_reason": str(reason or ""),
+            "recovery_retention_mode": str(recovery_retention_mode or ""),
+        }
+        try:
+            _patch_json = json.dumps(_patch, default=str)
+        except Exception:
+            return False
+
+        def _retain_exact():
+            with conn() as c:
+                cur = c.execute(
+                    """
+                    UPDATE orders
+                    SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                        updated_ts = NOW()
+                    WHERE local_order_id = %s
+                      AND client_id = %s
+                      AND signal_id = %s
+                      AND LOWER(TRIM(COALESCE(execution_mode,''))) = %s
+                      AND kind = 'ENTRY'
+                      AND UPPER(COALESCE(status,'')) = 'PENDING_TRIGGER'
+                      AND (broker_order_id IS NULL OR broker_order_id = '')
+                      AND submitted_ts IS NULL
+                      AND COALESCE(meta->>'submit_intent_at', '') = ''
+                      AND LOWER(COALESCE(meta->>'broker_ready', 'false')) IN ('false', '')
+                      AND COALESCE((meta->>'materialization_generation')::int, 0) = %s
+                      AND COALESCE(meta->>'recovery_ownership', '') = 'recovery_scheduler'
+                      AND COALESCE(meta->>'recovery_owner', '') = %s
+                      AND COALESCE(meta->>'current_owner', '') = ''
+                      AND COALESCE(meta->>'watcher_token', '') = ''
+                      AND COALESCE(meta->>'watcher_generation', '') IN ('', '0')
+                      AND (
+                          %s = ''
+                          OR COALESCE(
+                              NULLIF(canonical_signal_id, ''),
+                              meta->>'canonical_signal_id',
+                              ''
+                          ) = %s
+                      )
+                    """,
+                    (
+                        _patch_json,
+                        local_order_id,
+                        _client,
+                        _signal,
+                        _mode,
+                        _generation,
+                        _expected_recovery_owner,
+                        _canonical,
+                        _canonical,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_retain_exact) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] retain_rearm_watcher_required_recovery_ownership "
+                "failed order=%s: %s",
                 self.client_id,
                 local_order_id,
                 exc,

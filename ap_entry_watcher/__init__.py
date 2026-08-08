@@ -385,11 +385,18 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             (old.signal or {}).get("timeframe")
         )
 
-    def add_signal(self, signal: dict) -> bool:
+    def add_signal(
+        self, signal: dict, *, registration_provenance_out: dict | None = None,
+    ) -> bool:
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = False
+            registration_provenance_out["registration_token"] = None
         ticker = str((signal or {}).get("ticker") or "").upper().strip()
         side = _normalize_watcher_side((signal or {}).get("side"))
         if not ticker or not side:
-            return super().add_signal(signal)
+            return super().add_signal(
+                signal, registration_provenance_out=registration_provenance_out,
+            )
         with self._watch_admission_gate:
             opposites = self._opposites(ticker, side)
             prune = [item for item in opposites if self._prunable(signal, item)]
@@ -417,7 +424,9 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             with self._lock:
                 dedup_seen = bool(dedup_key and dedup_key in self._dedup_set)
             if dedup_seen:
-                return super().add_signal(signal)
+                return super().add_signal(
+                    signal, registration_provenance_out=registration_provenance_out,
+                )
             same_side = self._same_side(ticker, side)
             if same_side:
                 best = max(same_side, key=lambda item: float(item.score or 0))
@@ -430,11 +439,14 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                     )
                 if not self._prove_remove_all(signal, same_side, "same_side_replace_watcher_cancel"):
                     return False
-            return super().add_signal(signal)
+            return super().add_signal(
+                signal, registration_provenance_out=registration_provenance_out,
+            )
 
     def watch(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        registration_provenance_out: dict | None = None,
     ) -> bool:
         current_call = _CALL_RESULT.get()
         if current_call is not None and current_call.watcher_id == id(self):
@@ -444,6 +456,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                registration_provenance_out=registration_provenance_out,
             )
         token = _CALL_RESULT.set(_CallResult(id(self)))
         try:
@@ -453,6 +466,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
                 recovery_rearm=recovery_rearm,
                 no_cancel_on_reject=no_cancel_on_reject,
                 materialization_resume=materialization_resume,
+                registration_provenance_out=registration_provenance_out,
             )
         finally:
             _CALL_RESULT.reset(token)
@@ -460,7 +474,11 @@ class APEntryWatcher(_BaseAPEntryWatcher):
     def _watch_impl(
         self, plan, local_order_id: str, *, recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False, materialization_resume: bool = False,
+        registration_provenance_out: dict | None = None,
     ) -> bool:
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = False
+            registration_provenance_out["registration_token"] = None
         if plan is None:
             _base.log.warning("watch() called with None plan -- skipping")
             return False
@@ -493,6 +511,7 @@ class APEntryWatcher(_BaseAPEntryWatcher):
             recovery_rearm=recovery_rearm,
             no_cancel_on_reject=no_cancel_on_reject,
             materialization_resume=materialization_resume,
+            registration_provenance_out=registration_provenance_out,
         )
 
     def watch_with_result(

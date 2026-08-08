@@ -324,10 +324,20 @@ class TestDirectionReversalRearmCAS:
         assert "final_market_truth" not in after["meta"]
 
     def test_positive_control_rearms_and_clears_ownership_and_cursor(self):
+        # P0 correction: a real, uninterrupted watcher retains its exact
+        # watcher token through rearm rather than being blanked to "".
+        # Blanking a real watcher's ownership on a clean pre-breach reset
+        # was the original (incorrect) behavior this test previously
+        # locked in; it is superseded because it made a real watcher
+        # indistinguishable from a synthetic recovery callback with no
+        # registered watcher at all.
         osm = _osm()
         audit = {"outcome": "REARM_DIRECTION_REVERSAL", "mid": 449.9}
         ok = osm.rearm_deferred_materialization_direction_reversal(
-            self.LOID, owner="watcher:real-owner", generation=1,
+            self.LOID,
+            owner="watcher:real-owner",
+            watcher_token="watcher:real-owner",
+            generation=1,
             signal_id="sig-item11-1", execution_mode="paper",
             market_truth_audit=audit,
         )
@@ -335,13 +345,53 @@ class TestDirectionReversalRearmCAS:
         assert ok is True
         assert after["status"] == "PENDING_TRIGGER"
         assert after["meta"]["lifecycle_state"] == ""
-        assert after["meta"]["materialization_status"] == "REARM_DIRECTION_REVERSAL"
+        # Truly blank pre-breach status at rearm time. WAITING_FOR_TRIGGER
+        # is written only by the later, separate durable ownership-adoption
+        # step (ap_recovery.py + adopt_direction_reversal_watcher_ownership),
+        # which this OSM-level test does not exercise.
+        assert after["meta"]["materialization_status"] == ""
         assert after["meta"]["materialization_owner"] == ""
-        assert after["meta"]["current_owner"] == ""
-        assert after["meta"]["watcher_token"] == ""
-        assert after["meta"]["selector_recovery_cursor_v1"] is None
+        assert after["meta"]["current_owner"] == "watcher:real-owner"
+        assert after["meta"]["watcher_token"] == "watcher:real-owner"
+        assert after["meta"]["recovery_ownership"] == ""
+        assert after["meta"]["recovery_owner"] == ""
+        assert after["meta"]["direction_reversal_rearm_requires_watcher"] is False
+        assert "selector_recovery_cursor_v1" not in after["meta"]
+        assert "trigger_crossed_at" not in after["meta"]
+        assert "trigger_crossed_at_provenance" not in after["meta"]
+        # REARM_DIRECTION_REVERSAL is preserved only as a diagnostic, never
+        # as the live materialization_status a recovery pass must classify.
+        assert after["meta"]["final_market_truth_status"] == "REARM_DIRECTION_REVERSAL"
         assert after["meta"]["final_market_truth"] == audit
         assert after["meta"]["unrelated_sentinel"] == "do-not-touch-item11"
+
+    def test_synthetic_recovery_rearm_never_fabricates_watcher(self):
+        # A restart/due-retry callback has no real registered watcher. The
+        # recovery takeover claim that won the original CAS must remain the
+        # only ownership authority on the row -- it is never persisted as
+        # watcher_token, and the row is explicitly marked as still needing a
+        # real watcher attachment.
+        osm = _osm()
+        audit = {"outcome": "REARM_DIRECTION_REVERSAL", "mid": 449.9}
+        ok = osm.rearm_deferred_materialization_direction_reversal(
+            self.LOID,
+            owner="watcher:real-owner",
+            watcher_token="",
+            generation=1,
+            signal_id="sig-item11-1", execution_mode="paper",
+            market_truth_audit=audit,
+        )
+        after = _fetch_row(self.LOID)
+        assert ok is True
+        assert after["meta"]["materialization_status"] == ""
+        # A recovery takeover token is not watcher ownership -- current_owner
+        # must never fall back to it.
+        assert after["meta"]["current_owner"] == ""
+        assert after["meta"]["watcher_token"] == ""
+        assert after["meta"]["recovery_ownership"] == "recovery_scheduler"
+        assert after["meta"]["recovery_owner"] == "watcher:real-owner"
+        assert after["meta"]["direction_reversal_rearm_requires_watcher"] is True
+        assert "selector_recovery_cursor_v1" not in after["meta"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

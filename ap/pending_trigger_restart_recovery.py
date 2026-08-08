@@ -154,6 +154,19 @@ class PendingTriggerRestartRecovery:
         self._row_retry_subtypes: dict[str, str] = {}
         self._row_failure_reasons: dict[str, str] = {}
 
+        # PR #421 final amendment — watcher provenance. Set fresh at the
+        # start of every _recover_one() call and read by the caller
+        # IMMEDIATELY after a WATCHER_OWNED outcome, before any durable
+        # adoption CAS attempt. This is the sole authoritative source of
+        # "did THIS invocation register a new watcher, or did it merely
+        # observe one that already existed" — callers must never
+        # rediscover provenance later by scanning the watcher registry,
+        # matching logical fields, or comparing Python object ids: none of
+        # those can distinguish "I created this" from "this already
+        # existed and I looked it up."
+        self.last_watcher_registered_by_this_attempt: bool = False
+        self.last_registration_token: Optional[str] = None
+
     # ── Public entry point ────────────────────────────────────────────────────
 
     def recover_all(self, rows: list[dict], *, plan_builder_fn=None) -> dict:
@@ -189,6 +202,12 @@ class PendingTriggerRestartRecovery:
     # ── Per-row dispatch ──────────────────────────────────────────────────────
 
     def _recover_one(self, row: dict, *, plan_builder_fn=None) -> str:
+        # PR #421 final amendment: reset watcher provenance for every row.
+        # A stale True/token from a PRIOR row must never leak into this
+        # one's WATCHER_OWNED handling.
+        self.last_watcher_registered_by_this_attempt = False
+        self.last_registration_token = None
+
         local_oid  = str(row.get("local_order_id") or "").strip()
         signal_id  = str(row.get("signal_id") or "").strip()
         row_client = str(row.get("client_id") or "").strip().lower()
@@ -310,6 +329,16 @@ class PendingTriggerRestartRecovery:
             # selector, broker, or cleanup action and preserves the exact row.
             proof = self._verify_registry_ownership(local_oid, row)
             if proof and proof.get("dedup_held"):
+                # PR #421 final amendment: this watcher demonstrably existed
+                # BEFORE this invocation ran — nothing was registered here.
+                # A caller that treated this WATCHER_OWNED the same as a
+                # fresh registration could later "roll back" (evict +
+                # release dedup) a real, currently-owned watcher merely
+                # because this pass observed it. Explicit, not just
+                # inherited from the top-of-function reset, so this
+                # invariant survives any future refactor of the reset.
+                self.last_watcher_registered_by_this_attempt = False
+                self.last_registration_token = None
                 return _RowOutcome.WATCHER_OWNED
             # Proof failed despite watcher reporting owned — treat as orphan.
             log.warning(
@@ -572,10 +601,22 @@ class PendingTriggerRestartRecovery:
 
         if self.dry_run:
             log.info("RESTART_RECOVERY_DRY_RUN local=%s — would watch(recovery_rearm=True)", local_oid)
+            # Nothing was actually registered — no provenance to claim.
+            self.last_watcher_registered_by_this_attempt = False
+            self.last_registration_token = None
             return _RowOutcome.WATCHER_OWNED
 
         try:
-            armed = bool(watcher.watch(plan, local_oid, recovery_rearm=True))
+            _provenance = {
+                "created_by_this_call": False,
+                "registration_token": None,
+            }
+            armed = bool(
+                watcher.watch(
+                    plan, local_oid, recovery_rearm=True,
+                    registration_provenance_out=_provenance,
+                )
+            )
         except Exception as exc:
             log.error("RESTART_RECOVERY_WATCH_RAISED local=%s: %s", local_oid, exc, exc_info=True)
             return _RowOutcome.UNRESOLVED
@@ -623,6 +664,24 @@ class PendingTriggerRestartRecovery:
             "RESTART_RECOVERY_REARM_OK local=%s proof=%s",
             local_oid,
             {k: v for k, v in proof.items() if k != "watcher_obj"},
+        )
+        # PR #421 final amendment (P0-1): watch() returning True is proof
+        # ownership exists — it is NOT proof this invocation created it.
+        # watch()'s own recovery_rearm "left alone" path can return True
+        # after observing a watcher a CONCURRENT actor registered between
+        # this call's earlier registry check and watch()'s internal
+        # re-check, without ever calling add_signal(). Provenance must
+        # come only from _provenance, which watch() (via add_signal())
+        # sets causally, at the exact point of registration — never
+        # reconstructed here from the post-call registry proof, which
+        # proves ownership but not authorship.
+        self.last_watcher_registered_by_this_attempt = bool(
+            _provenance.get("created_by_this_call")
+        )
+        self.last_registration_token = (
+            _provenance.get("registration_token")
+            if self.last_watcher_registered_by_this_attempt
+            else None
         )
         return _RowOutcome.WATCHER_OWNED
 

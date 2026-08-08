@@ -621,6 +621,18 @@ class WatchedSignal:
         self.signal_id = str(signal.get("signal_id") or uuid.uuid4())
         self.signal["signal_id"] = self.signal_id
 
+        # PR #421 watcher rollback fix: a per-instance identity token,
+        # unique for the life of the process. Never reused, unlike
+        # id(self) — CPython immediately reuses a garbage-collected
+        # object's memory address for the next allocation, so id() alone
+        # cannot safely distinguish "the exact registration a recovery
+        # actor created" from "a different registration that happens to
+        # have been allocated at the same freed address after the first
+        # one was evicted and dereferenced." Recovery rollback fencing
+        # (ap_recovery.py _capture_just_registered_watcher_id /
+        # _evict_just_registered_watcher) keys off this token, not id().
+        self._registration_token = uuid.uuid4().hex
+
         self.state = WatchState.PENDING
         self.created_at = datetime.now(timezone.utc)
         self.triggered_at: Optional[datetime] = None
@@ -2815,7 +2827,19 @@ class APEntryWatcher:
                 w.rearm_count,
             )
 
-    def add_signal(self, signal: dict) -> bool:
+    def add_signal(
+        self, signal: dict, *, registration_provenance_out: Optional[dict] = None,
+    ) -> bool:
+        # PR #421 final amendment (P0-1): reset the caller's per-call
+        # provenance output BEFORE any possible return path, including
+        # every rejection below. Provenance is call-local — never shared
+        # mutable self state, which a second concurrent caller could
+        # overwrite between this caller's registration and its read of
+        # the result.
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = False
+            registration_provenance_out["registration_token"] = None
+
         now_et = datetime.now(ET)
         post_session = (
             now_et.hour > OVERNIGHT_THRESHOLD_HOUR
@@ -3270,6 +3294,18 @@ class APEntryWatcher:
                 self._dedup_set.add(dedup_key)
 
             self._pending.append(watched)
+            # PR #421 final amendment (P0-1): this is the exact, sole
+            # point a new WatchedSignal registration is committed to the
+            # registry. Provenance must be set here, from the object this
+            # call itself just created and inserted — never rediscovered
+            # afterward by scanning _pending for a logical-identity match,
+            # which cannot distinguish "I created this" from "I merely
+            # observed this."
+            if registration_provenance_out is not None:
+                registration_provenance_out["created_by_this_call"] = True
+                registration_provenance_out["registration_token"] = (
+                    watched._registration_token
+                )
 
             # P0-W2: consume rearm marker placed by watch() arm-time path.
             # The marker is a private key in watched.signal (which IS signal_dict
@@ -3333,6 +3369,7 @@ class APEntryWatcher:
         recovery_rearm: bool = False,
         no_cancel_on_reject: bool = False,
         materialization_resume: bool = False,
+        registration_provenance_out: Optional[dict] = None,
     ) -> bool:
         """Plan-aware entrypoint called by queue/execution orchestration.
 
@@ -3344,9 +3381,28 @@ class APEntryWatcher:
             - add_signal() cancel_pending_entry calls are suppressed
             - The watch() cancel_pending_entry call at the end is suppressed
             - Only watcher audit metadata is written
+
+        registration_provenance_out — PR #421 final amendment (P0-1):
+          optional per-call, caller-owned dict. If supplied, is reset to
+          {"created_by_this_call": False, "registration_token": None}
+          immediately, before any early return. Several paths in this
+          method can return True because a watcher matching this row
+          ALREADY exists (e.g. the recovery_rearm "left alone" path below)
+          WITHOUT this call ever creating a new registration — watch()
+          returning True is proof ownership exists, never proof this
+          invocation created it. Only the actual add_signal() call at the
+          bottom of this method can flip created_by_this_call to True, and
+          only by reporting the exact object it itself just inserted. Must
+          be a value the caller owns exclusively for this one call — never
+          shared self state, which a second concurrent watch() call could
+          overwrite before the first caller reads its own result.
           This guarantees that a row with a valid trigger can be re-owned by
           the watcher without any risk of DB mutation or OSM state change.
         """
+        if registration_provenance_out is not None:
+            registration_provenance_out["created_by_this_call"] = False
+            registration_provenance_out["registration_token"] = None
+
         if plan is None:
             log.warning("watch() called with None plan -- skipping")
             return False
@@ -4310,7 +4366,10 @@ class APEntryWatcher:
         # via _cleanup_pending_entry_order. Here we proactively cancel
         # the pending entry order through the existing OSM helper.
         try:
-            ok = self.add_signal(signal_dict)
+            ok = self.add_signal(
+                signal_dict,
+                registration_provenance_out=registration_provenance_out,
+            )
         finally:
             signal_dict.pop("__watcher_rearm_pending", None)
             signal_dict.pop("__watcher_rearm_reason", None)
