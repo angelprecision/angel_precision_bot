@@ -1336,16 +1336,6 @@ def _active_exit_order(engine: Any, position_id: str) -> dict | None:
     return row if isinstance(row, dict) else None
 
 
-def _active_exit_lookup_wired(engine: Any) -> bool:
-    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
-    if osm is None:
-        return False
-    return callable(
-        getattr(osm, "_get_active_exit_order", None)
-        or getattr(osm, "get_active_exit_order", None)
-    )
-
-
 def _terminal_position_snapshot(pos: Any, engine: Any) -> dict | None:
     client_id = str(
         getattr(pos, "client_id", "")
@@ -1539,16 +1529,6 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             claims.add(key)
 
         try:
-            if (
-                _runtime_execution_mode(self, pos) == "live"
-                and not _active_exit_lookup_wired(self)
-            ):
-                log.critical(
-                    "[%s] EXIT_DECISION_ACTIVE_EXIT_LOOKUP_UNWIRED position=%s",
-                    getattr(pos, "ticker", ""),
-                    position_id,
-                )
-                return False
             active_order_lookup_failed = False
             try:
                 active_order = _active_exit_order(self, position_id)
