@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from threading import RLock
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
@@ -189,6 +191,19 @@ def test_call_first_fresh_breach_starts_underlying_confirmation_without_exit():
     assert decision.reason_code == UNDERLYING_STOP_CONFIRMING
     assert pos._underlying_stop_breach_ts == INCIDENT_UTC
     assert pos._stop_breach_ts is None
+
+
+def test_winner_protection_runs_during_first_technical_breach_confirmation():
+    pos = _now_call(option_bid=2.00, underlying_price=104.80)
+    pos.touched_profit = True
+    pos.max_profit_seen = 0.25
+
+    decision = _eval(pos)
+
+    assert decision.action == "CLOSE_ALL", decision.reason
+    assert "TOUCHED PROFIT STOP" in decision.reason
+    assert decision.reason_code != UNDERLYING_STOP_CONFIRMING
+    assert pos._underlying_stop_breach_ts == INCIDENT_UTC
 
 
 def test_call_later_fresh_breach_confirms_once():
@@ -386,6 +401,114 @@ def test_duplicate_evaluation_is_blocked_by_existing_exit_in_flight_fence():
     assert engine._submit_exit_decision(pos, decision) is False
     broker.assert_not_called()
     assert pos.exit_in_flight is True
+
+
+def test_confirmed_technical_stop_uses_one_real_submit_handoff(monkeypatch):
+    import ap_exit_engine as exit_engine_mod
+    import ap.exit_safety as exit_safety_mod
+
+    pos = _now_call(option_bid=1.45, underlying_price=104.80)
+    assert _eval(pos).reason_code == UNDERLYING_STOP_CONFIRMING
+
+    second_et = INCIDENT_ET + timedelta(seconds=CONFIRM_SECONDS + 1)
+    _advance_underlying(pos, now_et=second_et, price=104.70)
+    decision = _eval(pos, second_et)
+
+    assert decision.action == "STOP", decision.reason
+    assert decision.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+
+    class _NoSnapshotBroker:
+        def __init__(self):
+            self.cancel_calls = []
+
+        def list_positions(self):
+            raise RuntimeError("test broker snapshot unavailable")
+
+        def cancel_order(self, *args, **kwargs):
+            self.cancel_calls.append((args, kwargs))
+
+    broker = _NoSnapshotBroker()
+    engine = APExitEngine.__new__(APExitEngine)
+    engine.client_id = pos.client_id
+    engine._email = pos.client_id
+    engine._lock = RLock()
+    engine._thread = None
+    engine._running = False
+    engine.run_id = "pr403-run"
+    engine.strategy_version = "pr403-test"
+    engine.git_commit = "pr403-test"
+    engine.master_control = SimpleNamespace(mode="live")
+    engine.on_scale = None
+    engine.order_state_machine = None
+    engine.osm = None
+    engine.broker = broker
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    engine.hydrate_pending_exit_identity_from_db = lambda *_args, **_kwargs: False
+    engine._emit_exit_event = lambda *args, **kwargs: None
+    engine._clear_degraded_monitoring_state = lambda *args, **kwargs: None
+
+    callback_calls = []
+
+    def _on_exit(callback_pos, callback_decision):
+        callback_calls.append((callback_pos, callback_decision))
+        return {
+            "accepted": True,
+            "local_order_id": "local-pr403-technical",
+            "broker_order_id": "broker-pr403-technical",
+            "status": "accepted",
+        }
+
+    engine.on_exit = _on_exit
+    monkeypatch.setattr(
+        exit_engine_mod,
+        "_is_option_quote_stale",
+        lambda _pos, _now: (False, 0.0, "fresh"),
+    )
+    monkeypatch.setattr(
+        exit_safety_mod,
+        "evaluate_exit_submission_safety",
+        lambda **kwargs: {
+            "blocked": False,
+            "reason": None,
+            "position_state": {"entry_ts": None},
+            "circuit_breaker": {"blocked": False, "reason": None},
+        },
+    )
+
+    quantity_before = pos.quantity_remaining
+    proof_before = (
+        pos._proof_staged,
+        pos._proof_finalized,
+        pos.proof_logged,
+    )
+    assert engine._submit_exit_decision(pos, decision) is True
+
+    assert len(callback_calls) == 1
+    submitted_pos, submitted_decision = callback_calls[0]
+    assert submitted_pos.client_id == "jasoncosby1@gmail.com"
+    assert submitted_pos.execution_mode == "live"
+    assert submitted_pos.position_id == "pr403-position-1"
+    assert submitted_pos.option_symbol == "NOW260731C00113000"
+    assert submitted_decision.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "local-pr403-technical"
+    assert pos.pending_exit_broker_order_id == "broker-pr403-technical"
+    assert pos.quantity_remaining == quantity_before
+    assert pos.closed is False
+    assert (
+        pos._proof_staged,
+        pos._proof_finalized,
+        pos.proof_logged,
+    ) == proof_before
+    assert broker.cancel_calls == []
+
+    repeated = _eval(pos, second_et + timedelta(seconds=1))
+    if repeated.should_act:
+        engine._submit_exit_decision(pos, repeated)
+    assert repeated.reason_code == UNDERLYING_STOP_CONFIRMING
+    assert len(callback_calls) == 1
+    assert broker.cancel_calls == []
 
 
 @pytest.mark.parametrize("execution_mode", ["paper", "live"])

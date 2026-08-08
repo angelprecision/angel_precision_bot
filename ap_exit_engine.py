@@ -2009,53 +2009,10 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             urgency="HIGH", pnl_pct=_decision_pnl,
             reason_code=UNDERLYING_TECHNICAL_STOP_CONFIRMED,
         )
-    if _technical_stop_state == "CONFIRMING":
-        # Winner-protection remains gated by fresh executable option truth.
-        # Preserve that current-main deferral when a touched-profit position
-        # has a stale BID; the underlying confirmation timer remains persisted
-        # and is still the only state that can produce a technical STOP.
-        if (
-            bool(getattr(pos, "touched_profit", False))
-            and snap.option_bid_valid
-            and not snap.option_quote_fresh
-        ):
-            _winner_option_gate = _soft_exit_option_truth_gate(
-                snap, qty_rem=qty_rem,
-            )
-            if _winner_option_gate is not None:
-                return _winner_option_gate
-        if not _technical_stop_identity_proven(pos):
-            pos._underlying_stop_breach_ts = None
-            pos._underlying_stop_breach_quote_ts = None
-            return ExitDecision(
-                action="HOLD", quantity=0,
-                reason=(
-                    f"{UNDERLYING_STOP_IDENTITY_UNPROVEN} — ordinary technical stop "
-                    f"confirmation deferred until identity is proven"
-                ),
-                urgency="NORMAL", pnl_pct=_decision_pnl,
-                reason_code=UNDERLYING_STOP_IDENTITY_UNPROVEN,
-            )
-        _quote_ts_text = (
-            snap.underlying_quote_ts.isoformat()
-            if hasattr(snap.underlying_quote_ts, "isoformat")
-            else str(snap.underlying_quote_ts or "")
-        )
-        return ExitDecision(
-            action="HOLD", quantity=0,
-            reason=(
-                f"{UNDERLYING_STOP_CONFIRMING} — "
-                f"{_underlying_evidence['side']} underlying "
-                f"${_underlying_evidence['price']:.4f} beyond stored stop "
-                f"${_underlying_evidence['stop']:.4f} "
-                f"| breach_age_sec={_technical_stop_age_sec:.0f} "
-                f"| quote_ts={_quote_ts_text} "
-                f"quote_age_sec={snap.underlying_age_sec} "
-                f"source={snap.underlying_quote_source or 'unknown'}"
-            ),
-            urgency="NORMAL", pnl_pct=_decision_pnl,
-            reason_code=UNDERLYING_STOP_CONFIRMING,
-        )
+    # A first technical-stop breach is intentionally remembered while the
+    # existing winner-protection branches below still get priority. If none
+    # of those branches acts, the confirmation HOLD is returned immediately
+    # before option-loss/never-green policy can manufacture a competing exit.
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── TOUCHED PROFIT PROTECTION ─────────────────────────────────────────────
@@ -2261,6 +2218,43 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
                 ),
                 urgency="HIGH", pnl_pct=_sw_pnl,
             )
+
+    if _technical_stop_state == "CONFIRMING":
+        # Winner protection had first opportunity above. Only when no existing
+        # winner branch fires should the technical-stop hysteresis surface its
+        # normal HOLD state; the timer itself remains underlying-only.
+        if not _technical_stop_identity_proven(pos):
+            pos._underlying_stop_breach_ts = None
+            pos._underlying_stop_breach_quote_ts = None
+            return ExitDecision(
+                action="HOLD", quantity=0,
+                reason=(
+                    f"{UNDERLYING_STOP_IDENTITY_UNPROVEN} — ordinary technical stop "
+                    f"confirmation deferred until identity is proven"
+                ),
+                urgency="NORMAL", pnl_pct=_decision_pnl,
+                reason_code=UNDERLYING_STOP_IDENTITY_UNPROVEN,
+            )
+        _quote_ts_text = (
+            snap.underlying_quote_ts.isoformat()
+            if hasattr(snap.underlying_quote_ts, "isoformat")
+            else str(snap.underlying_quote_ts or "")
+        )
+        return ExitDecision(
+            action="HOLD", quantity=0,
+            reason=(
+                f"{UNDERLYING_STOP_CONFIRMING} — "
+                f"{_underlying_evidence['side']} underlying "
+                f"${_underlying_evidence['price']:.4f} beyond stored stop "
+                f"${_underlying_evidence['stop']:.4f} "
+                f"| breach_age_sec={_technical_stop_age_sec:.0f} "
+                f"| quote_ts={_quote_ts_text} "
+                f"quote_age_sec={snap.underlying_age_sec} "
+                f"source={snap.underlying_quote_source or 'unknown'}"
+            ),
+            urgency="NORMAL", pnl_pct=_decision_pnl,
+            reason_code=UNDERLYING_STOP_CONFIRMING,
+        )
 
     # Underlying progress: if 60%+ toward scanner target, log but do NOT close.
     # Closing the entire position at +5% because the underlying made partial

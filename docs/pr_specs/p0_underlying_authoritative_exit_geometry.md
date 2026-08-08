@@ -111,6 +111,12 @@ The current five-minute entry grace may defer soft loss exits. It must not:
 - reset or erase a confirmed underlying breach;
 - interfere with winner protection.
 
+The first fresh technical-stop breach is remembered for confirmation, but it
+does not preempt existing winner protection. Touched-profit, profit-floor /
+giveback, scale-out, runner-trail, and small-win branches retain priority. If
+none of those branches acts, the engine returns `UNDERLYING_STOP_CONFIRMING`
+as a HOLD; only the confirmed state produces the technical-stop exit.
+
 ## Client and mode safety
 
 Every exit stamp and broker submission must preserve:
@@ -127,7 +133,7 @@ No PAPER midpoint or analytics mark may gain LIVE exit authority.
 
 1. NOW CALL, option BID approximately `-29.7%`, fresh underlying above `104.94`: HOLD; no technical stop.
 2. Same position, first fresh underlying reading below `104.94`: start confirmation; no broker exit yet.
-3. Same position, second fresh reading below `104.94`: one technical-stop exit submission.
+3. Same position, second fresh reading below `104.94`: one technical-stop exit submission through the real `_submit_exit_decision()` handoff; a repeated poll is idempotent.
 4. PUT mirror geometry.
 5. Missing underlying, option loss above catastrophic threshold: defer technical stop; catastrophic path evaluated separately.
 6. Missing underlying, option loss below catastrophic threshold: HOLD with recovery diagnostics.
@@ -156,8 +162,10 @@ confirmation timer, hard-exit resolver, entry-grace ordering, and exit-in-flight
 submission fence; no broker, queue, selector, scoring, sizing, or proof-trade
 architecture was added.
 
-The focused deterministic matrix is green locally (`17 passed`). The adjacent
-current-main exit suites are also green (`438 passed`). These are local
-pre-push results; exact-head GitHub CI remains the publication gate. This PR
-stays Draft/HARD HOLD and is not authorized to merge or deploy until PR #425 is
-complete and this branch has been rebased again.
+The focused deterministic matrix is green locally (`19 passed`), including the
+first-breach winner-protection regression and the confirmed technical-stop
+submit/idempotency handoff. The adjacent current-main exit suites are also
+green (`438 passed` in `20:38.99`). These are local pre-push results;
+exact-head GitHub CI remains the publication gate. This PR stays Draft/HARD
+HOLD and is not authorized to merge or deploy until PR #425 is complete and
+this branch has been rebased again.
