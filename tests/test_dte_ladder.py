@@ -375,6 +375,46 @@ class TestLadderRouting:
         assert result is None
         assert sel._last_failure["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
         assert plan.metadata["selector_failure"]["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        failure = plan.metadata["selector_failure"]
+        assert failure["canonical_selector_reason"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert failure["last_observed_selector_reason"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert failure["selector_terminal_reason"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert failure["operational_reason"] is None
+
+    def test_ladder_budget_failure_preserves_operational_selector_truth(self):
+        """An expiration-cap stop must not lose the selector-owned budget reason."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = "live"
+        sel.deferred_dte_legacy_fallback = False
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+        sel._fetch_expirations_list = MagicMock(
+            side_effect=mod.SelectorRequestBudgetExhausted(
+                "expirations", "expiration_calls=3 limit=3"
+            )
+        )
+        plan = _make_plan()
+        plan.execution_mode = "live"
+        plan.metadata = {"deferred_breach_selection": True}
+
+        result = sel._select_with_dte_ladder(plan)
+
+        assert result is None
+        failure = plan.metadata["selector_failure"]
+        assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert failure["canonical_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["last_observed_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["selector_terminal_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
 
     @pytest.mark.parametrize("mode,explicit_flag,expected_fallback", [
         ("paper", False, True),

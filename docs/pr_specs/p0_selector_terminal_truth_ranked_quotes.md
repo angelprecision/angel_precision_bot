@@ -110,10 +110,12 @@ When candidates are ranked for recovery/revalidation:
 
 Normalized duplicate OCC rows remain available to the quality loop so a stale or
 zero-quoted row cannot suppress a valid representation of the same contract.
-Duplicate groups are ordered by quote usability, execution ask, spread, and
-liquidity; unrelated provider metadata is not financial authority. The direct
-quote revalidator still fences calls by normalized OCC identity, so duplicates
-consume at most one direct-quote slot per request.
+Duplicate groups are built by normalized identity before being flattened at the
+earliest ranked position, so an interleaved same-strike candidate cannot bypass
+the group ordering. Groups are ordered by quote usability, execution ask,
+spread, and liquidity; unrelated provider metadata is not financial authority.
+The direct quote revalidator still fences calls by normalized OCC identity, so
+duplicates consume at most one direct-quote slot per request.
 
 ### Retry eligibility
 
@@ -125,6 +127,11 @@ The selector publishes `canonical_selector_reason`,
 the canonical field unchanged and only adds lifecycle taxonomy around it; it
 does not reconstruct canonical truth from reject buckets or raw last-failure
 events.
+
+DTE-ladder exits that occur before a normal single-expiration `select()` call
+publish the same selector-owned fields, including the operational budget reason
+for an expiration-fetch cap. These exits must not fall back to a legacy
+`reason_code`-only payload.
 
 When canonical result is terminal affordability:
 

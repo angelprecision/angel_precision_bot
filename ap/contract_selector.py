@@ -1493,30 +1493,38 @@ def _order_chain_for_direct_quote_recovery(
     # duplicate group by real quote/quality fields, then let the quality loop
     # inspect every row. ``revalidate_with_direct_quote`` independently fences
     # actual provider calls with request_context.revalidated_contracts, so a
-    # repeated OCC can never consume the direct-quote budget twice.
+    # repeated OCC can never consume the direct-quote budget twice. Build the
+    # groups by identity first, then flatten each group at its earliest ranked
+    # position. This does not rely on duplicate rows being adjacent: a distinct
+    # same-strike candidate with different liquidity can otherwise interleave
+    # two representations and bypass the financial duplicate-resolution key.
+    duplicate_groups: dict[str, list[tuple[tuple, dict, dict]]] = {}
+    for item in rows:
+        opt = item[1]
+        canonical_symbol = _canonical_occ_symbol(opt)
+        if _valid_occ_symbol(opt) and canonical_symbol:
+            duplicate_groups.setdefault(canonical_symbol, []).append(item)
+
     resolved_rows: list[tuple[tuple, dict, dict]] = []
     duplicate_symbols: list[str] = []
-    row_idx = 0
-    while row_idx < len(rows):
-        item = rows[row_idx]
+    emitted_symbols: set[str] = set()
+    for item in rows:
         opt = item[1]
         canonical_symbol = _canonical_occ_symbol(opt)
         if not (_valid_occ_symbol(opt) and canonical_symbol):
             resolved_rows.append(item)
-            row_idx += 1
             continue
-        group_end = row_idx + 1
-        while group_end < len(rows):
-            next_symbol = _canonical_occ_symbol(rows[group_end][1])
-            if next_symbol != canonical_symbol:
-                break
-            group_end += 1
-        group = rows[row_idx:group_end]
+        if canonical_symbol in emitted_symbols:
+            continue
+        group = duplicate_groups[canonical_symbol]
         if len(group) > 1:
-            group.sort(key=lambda group_item: _duplicate_resolution_key(group_item[1]))
+            group = sorted(
+                group,
+                key=lambda group_item: _duplicate_resolution_key(group_item[1]),
+            )
             duplicate_symbols.append(canonical_symbol)
         resolved_rows.extend(group)
-        row_idx = group_end
+        emitted_symbols.add(canonical_symbol)
     rows = resolved_rows
 
     rankings = []
@@ -5186,6 +5194,40 @@ class APContractSelectionEngine:
             audit["selection_diagnostics"] = _selector_request_diagnostics(request_context)
             _persist_dte_ladder_audit(self, plan, audit)
 
+        def _ladder_selector_failure_meta(
+            reason_code: str,
+            *,
+            stage: str,
+            explanation: str,
+            execution_mode: str,
+        ) -> dict:
+            """Build selector-owned truth for ladder paths that bypass select().
+
+            Expiration-fetch and no-expiration ladder exits do not pass through
+            the normal ``_attach_selector_failure`` seam. Keep their durable
+            metadata shape identical so execution core never has to infer
+            canonical truth from a ladder exception or a stale loop reason.
+            """
+            _reason = str(reason_code or "UNKNOWN_REJECTION").strip() or "UNKNOWN_REJECTION"
+            _operational = (
+                "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                else None
+            )
+            return {
+                "stage": str(stage or "dte_ladder"),
+                "reason_code": _reason,
+                "canonical_selector_reason": _reason,
+                "last_observed_selector_reason": _reason,
+                "selector_terminal_reason": _reason,
+                "operational_reason": _operational,
+                "queue_reason_code": _to_queue_reason(_reason),
+                "explanation": str(explanation or ""),
+                "chain_rows": 0,
+                "survivor_count": 0,
+                "execution_mode": str(execution_mode or "unknown").lower(),
+            }
+
         def _expiration_failure(reason_code: str, exc: Exception, *, allow_fallback: bool):
             audit.update({
                 "expiration_fetch_attempts": int(getattr(exc, "attempts", 1) or 1),
@@ -5206,21 +5248,15 @@ class APContractSelectionEngine:
             )
             audit["fallback_allowed"] = _fallback_allowed
             audit["fallback_policy"] = "paper" if _mode == "PAPER" else "explicit_env"
-            _failure = {
-                "stage": "dte_ladder_expirations",
-                "reason_code": reason_code,
-                "explanation": str(exc),
-            }
+            _failure = _ladder_selector_failure_meta(
+                reason_code,
+                stage="dte_ladder_expirations",
+                explanation=str(exc),
+                execution_mode=_mode,
+            )
             audit["failure"] = dict(_failure)
             self._set_last_failure(_failure)
-            _failure_meta = {
-                "reason_code": reason_code,
-                "queue_reason_code": _to_queue_reason(reason_code),
-                "explanation": str(exc),
-                "chain_rows": 0,
-                "survivor_count": 0,
-                "execution_mode": _mode.lower(),
-            }
+            _failure_meta = dict(_failure)
             _restore_selector_failure(plan, _failure_meta)
 
             if _fallback_allowed:
@@ -5348,11 +5384,20 @@ class APContractSelectionEngine:
                         _playbook_reason = ((playbook_audit.get("diagnostics") or {}).get("error_reason"))
                         _playbook_explanation = ((playbook_audit.get("diagnostics") or {}).get("error_explanation"))
                     _reason_code = _playbook_reason or "PLAYBOOK_NO_POLICY_MATCH"
-                    self._set_last_failure({
-                        "stage": "dte_ladder",
-                        "reason_code": _reason_code,
-                        "explanation": _playbook_explanation or "Playbook produced no approved expiration inside the DTE window",
-                    })
+                    _no_policy_failure = _ladder_selector_failure_meta(
+                        _reason_code,
+                        stage="dte_ladder",
+                        explanation=(
+                            _playbook_explanation
+                            or "Playbook produced no approved expiration inside the DTE window"
+                        ),
+                        execution_mode=(
+                            _safe_plan_attr(plan, "execution_mode", None)
+                            or getattr(self, "mode", "unknown")
+                        ),
+                    )
+                    self._set_last_failure(_no_policy_failure)
+                    _restore_selector_failure(plan, _no_policy_failure)
                     if playbook_audit is not None:
                         playbook_audit["selection_reason"] = _reason_code
                         self._set_playbook_audit(plan, request_context, playbook_audit)
@@ -5493,14 +5538,20 @@ class APContractSelectionEngine:
                 )
                 return None
             _final_reason = "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT" if bool(getattr(request_context, "playbook_enabled", False)) else "NO_VALID_PLAYBOOK_DTE_CONTRACT"
-            self._set_last_failure({
-                "stage": "dte_ladder",
-                "reason_code": _final_reason,
-                "explanation": (
+            _no_survivor_failure = _ladder_selector_failure_meta(
+                _final_reason,
+                stage="dte_ladder",
+                explanation=(
                     "No quality survivor in any evaluated DTE bucket "
                     f"(order={order}, buckets={ {k: len(v) for k, v in buckets.items()} })"
                 ),
-            })
+                execution_mode=(
+                    _safe_plan_attr(plan, "execution_mode", None)
+                    or getattr(self, "mode", "unknown")
+                ),
+            )
+            self._set_last_failure(_no_survivor_failure)
+            _restore_selector_failure(plan, _no_survivor_failure)
             log.warning(
                 "[%s] DTE_LADDER_NO_SURVIVOR order=%s buckets=%s",
                 ticker, order, {k: len(v) for k, v in buckets.items()},
@@ -5517,22 +5568,14 @@ class APContractSelectionEngine:
                 "reason_code": "DTE_LADDER_ERROR",
                 "explanation": str(exc),
             }
-            self._set_last_failure({
-                "stage": "dte_ladder",
-                "reason_code": "DTE_LADDER_ERROR",
-                "explanation": str(exc),
-            })
-            _restore_selector_failure(
-                plan,
-                {
-                    "reason_code": "DTE_LADDER_ERROR",
-                    "queue_reason_code": _to_queue_reason("DTE_LADDER_ERROR"),
-                    "explanation": str(exc),
-                    "chain_rows": 0,
-                    "survivor_count": 0,
-                    "execution_mode": str(getattr(self, "mode", "unknown") or "unknown").lower(),
-                },
+            _ladder_error_failure = _ladder_selector_failure_meta(
+                "DTE_LADDER_ERROR",
+                stage="dte_ladder",
+                explanation=str(exc),
+                execution_mode=str(getattr(self, "mode", "unknown") or "unknown"),
             )
+            self._set_last_failure(_ladder_error_failure)
+            _restore_selector_failure(plan, _ladder_error_failure)
             _persist("DTE_LADDER_ERROR")
             return None
 
