@@ -3620,11 +3620,223 @@ class APStartupRecovery:
                     )
                     from ap.pending_trigger_restart_recovery import _RowOutcome
                     if _outcome == _RowOutcome.WATCHER_OWNED:
-                        rearmed += 1
-                        log.info(
-                            "[%s] RECOVERY: watcher re-armed+verified | local_order_id=%s cls=%s",
-                            self.client_id, local_order_id, _outcome,
+                        # PR #421 Blocker 1: WATCHER_OWNED alone does not
+                        # prove durable database ownership has converged
+                        # from recovery to watcher for a direction-
+                        # reversal watcher-required row — PTR may have
+                        # only proved/registered a REAL RUNTIME watcher.
+                        # A runtime watcher is not release authority; the
+                        # durable orders.meta row must actually show the
+                        # watcher as current_owner/watcher_token before
+                        # this counts as a successful rearm. Ordinary
+                        # PENDING_TRIGGER rows that never went through the
+                        # recovery-owned direction-reversal rearm state
+                        # need no such transfer — WATCHER_OWNED already
+                        # means their durable ownership was correct.
+                        _reseed_row_meta = self._coerce_order_meta(
+                            order.get("meta")
                         )
+                        _requires_durable_adoption = bool(
+                            _reseed_row_meta.get(
+                                "direction_reversal_rearm_requires_watcher"
+                            )
+                        )
+                        if not _requires_durable_adoption:
+                            rearmed += 1
+                            log.info(
+                                "[%s] RECOVERY: watcher re-armed+verified | "
+                                "local_order_id=%s cls=%s",
+                                self.client_id, local_order_id, _outcome,
+                            )
+                        else:
+                            def _reseed_strict_generation(raw):
+                                # Same strict parser as the due-retry RWR
+                                # path: reject missing, Boolean, float,
+                                # negative, blank, or string values rather
+                                # than silently coercing.
+                                return (
+                                    raw
+                                    if isinstance(raw, int)
+                                    and not isinstance(raw, bool)
+                                    and raw >= 1
+                                    else None
+                                )
+
+                            _reseed_registered_by_this_attempt = bool(
+                                getattr(
+                                    _ptr,
+                                    "last_watcher_registered_by_this_attempt",
+                                    False,
+                                )
+                            )
+                            _reseed_raw_token = (
+                                getattr(_ptr, "last_registration_token", None)
+                                if _reseed_registered_by_this_attempt
+                                else None
+                            )
+                            # Wrap into the exact-identity tuple shape
+                            # _evict_just_registered_watcher/_exact_identity_of
+                            # compare against — a bare token string would
+                            # never equal ("token", value) and every
+                            # legitimate match would look "foreign".
+                            _reseed_registration_id = (
+                                ("token", _reseed_raw_token)
+                                if _reseed_raw_token
+                                else None
+                            )
+                            _reseed_real_token = str(
+                                getattr(self.entry_watcher, "owner_token", "")
+                                or ""
+                            ).strip()
+                            _reseed_signal = str(
+                                order.get("signal_id") or ""
+                            ).strip()
+                            _reseed_mode = str(
+                                self._execution_mode() or ""
+                            ).strip().lower()
+                            _reseed_gen = _reseed_strict_generation(
+                                _reseed_row_meta.get(
+                                    "materialization_generation"
+                                )
+                            )
+                            _reseed_recovery_owner = str(
+                                _reseed_row_meta.get("recovery_owner") or ""
+                            )
+
+                            _reseed_adopted = bool(
+                                _reseed_real_token
+                                and _reseed_gen is not None
+                                and _reseed_signal
+                                and _reseed_mode in {"live", "paper"}
+                                and self.osm.adopt_direction_reversal_watcher_ownership(
+                                    local_order_id,
+                                    recovery_owner=_reseed_recovery_owner,
+                                    watcher_token=_reseed_real_token,
+                                    generation=_reseed_gen,
+                                    signal_id=_reseed_signal,
+                                    execution_mode=_reseed_mode,
+                                )
+                            )
+
+                            # Do not trust the CAS rowcount alone — durably
+                            # reread and confirm the exact ownership
+                            # transfer actually landed. Isolate the reread
+                            # in its own try/except so a raised exception
+                            # lands in the "inconclusive" branch, not a
+                            # false "not adopted" classification.
+                            _reseed_verified = False
+                            _reseed_verify_exc = None
+                            if _reseed_adopted:
+                                try:
+                                    _reseed_post = self.osm.get_order(
+                                        local_order_id
+                                    )
+                                    _reseed_post_meta = self._coerce_order_meta(
+                                        (_reseed_post or {}).get("meta")
+                                    )
+                                    _reseed_verified = (
+                                        str(
+                                            _reseed_post_meta.get("current_owner")
+                                            or ""
+                                        ) == _reseed_real_token
+                                        and str(
+                                            _reseed_post_meta.get("watcher_token")
+                                            or ""
+                                        ) == _reseed_real_token
+                                        and not _reseed_post_meta.get(
+                                            "recovery_owner"
+                                        )
+                                        and not _reseed_post_meta.get(
+                                            "recovery_ownership"
+                                        )
+                                        and str(
+                                            _reseed_post_meta.get(
+                                                "materialization_status"
+                                            ) or ""
+                                        ) == "WAITING_FOR_TRIGGER"
+                                    )
+                                except Exception as _reseed_verify_read_exc:
+                                    _reseed_verify_exc = _reseed_verify_read_exc
+                                    _reseed_verified = False
+
+                            if _reseed_adopted and _reseed_verified:
+                                rearmed += 1
+                                log.info(
+                                    "[%s] RECOVERY: startup direction-reversal "
+                                    "watcher durably adopted+verified | "
+                                    "local_order_id=%s",
+                                    self.client_id, local_order_id,
+                                )
+                            elif _reseed_adopted and not _reseed_verified:
+                                # CAS reported success; a failed/inconclusive
+                                # reread is not evidence the commit didn't
+                                # land. Do not evict the watcher, do not
+                                # restore recovery ownership, do not count
+                                # as rearmed — leave durable/runtime state
+                                # exactly as it is for a later pass to
+                                # positively confirm.
+                                log.critical(
+                                    "[%s] STARTUP_RESEED_ADOPTION_VERIFICATION_"
+                                    "INCONCLUSIVE local_order_id=%s exc=%r — CAS "
+                                    "reported success; leaving watcher "
+                                    "ownership authoritative, not retaining "
+                                    "recovery ownership, not evicting the "
+                                    "watcher",
+                                    self.client_id, local_order_id,
+                                    _reseed_verify_exc,
+                                )
+                                result.setdefault("errors", []).append(
+                                    "startup_reseed_adoption_verification_"
+                                    f"inconclusive:{local_order_id}"
+                                )
+                            else:
+                                # Adoption CAS did not succeed. Rollback
+                                # authority is fenced to exact provenance —
+                                # only a watcher THIS invocation actually
+                                # registered may be evicted. A pre-existing
+                                # watcher this pass merely observed must
+                                # never be touched; the row remains
+                                # recoverable through the existing bounded
+                                # recovery mechanism (its durable
+                                # recovery-owned state is untouched here).
+                                if (
+                                    _reseed_registered_by_this_attempt
+                                    and _reseed_registration_id is not None
+                                ):
+                                    _reseed_evicted = (
+                                        self._evict_just_registered_watcher(
+                                            self.entry_watcher,
+                                            local_order_id=local_order_id,
+                                            client_id=self.client_id,
+                                            signal_id=_reseed_signal,
+                                            execution_mode=_reseed_mode,
+                                            expected_watcher_id=(
+                                                _reseed_registration_id
+                                            ),
+                                        )
+                                    )
+                                    if not _reseed_evicted:
+                                        log.critical(
+                                            "[%s] STARTUP_RESEED_EVICTION_FAILED "
+                                            "local_order_id=%s — a real watcher "
+                                            "may still be registered against a "
+                                            "recovery-owned row",
+                                            self.client_id, local_order_id,
+                                        )
+                                else:
+                                    log.warning(
+                                        "[%s] STARTUP_RESEED_PREEXISTING_WATCHER_"
+                                        "ADOPTION_FAILED local_order_id=%s — a "
+                                        "pre-existing watcher (not registered "
+                                        "by this startup attempt) failed "
+                                        "durable adoption; preserving the "
+                                        "watcher untouched",
+                                        self.client_id, local_order_id,
+                                    )
+                                result.setdefault("errors", []).append(
+                                    "startup_reseed_ownership_adoption_failed:"
+                                    f"{local_order_id}"
+                                )
                     elif _outcome == _RowOutcome.RETRY_OWNED:
                         already_verified_owner_rows += 1
                         log.info(

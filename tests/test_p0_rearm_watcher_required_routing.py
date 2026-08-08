@@ -739,9 +739,14 @@ class TestCrashAfterDurableWrite:
         result = {"errors": []}
         fresh_recovery._reseed_watchers(result)
 
-        # ── Step 6: the real production path (recover_one_row(), reused
-        # unmodified) must have either attached a real watcher or persisted
-        # a bounded restart-rearm retry — never silently dropped the row.
+        # ── Step 6: PR #421 Blocker 1 — WATCHER_OWNED alone is not
+        # sufficient for a direction-reversal watcher-required row.
+        # rearmed may only increment after durable ownership has
+        # actually converged to the real watcher token: current_owner/
+        # watcher_token = the exact token, recovery fields cleared,
+        # materialization_status="WAITING_FOR_TRIGGER". A runtime watcher
+        # alone (watcher_attached True) with the durable row still
+        # showing recovery ownership must NOT count as success.
         watcher_attached = watcher.has_order(LOCAL_ORDER_ID)
         retry_meta = row_store["row"].get("meta") or {}
         bounded_retry_persisted = (
@@ -755,8 +760,382 @@ class TestCrashAfterDurableWrite:
             f"bounded_retry_persisted={bounded_retry_persisted} "
             f"meta={retry_meta}"
         )
+        if watcher_attached:
+            _real_token = watcher.owner_token
+            assert retry_meta.get("current_owner") == _real_token, (
+                "durable current_owner must equal the exact real watcher "
+                "token before this counts as a successful startup rearm"
+            )
+            assert retry_meta.get("watcher_token") == _real_token
+            assert retry_meta.get("recovery_owner") == ""
+            assert retry_meta.get("recovery_ownership") == ""
+            assert (
+                retry_meta.get("direction_reversal_rearm_requires_watcher")
+                is False
+            )
+            assert retry_meta.get("materialization_status") == (
+                "WAITING_FOR_TRIGGER"
+            )
+            assert result.get("pending_trigger_watchers_rearmed") == 1, (
+                "rearmed must not increment until complete durable "
+                "convergence is proven"
+            )
         assert row_store["row"]["local_order_id"] == LOCAL_ORDER_ID
         assert row_store["row"]["client_id"] == CLIENT_ID
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #421 Blocker 1 — fresh startup _reseed_watchers() must durably adopt
+# watcher ownership, not merely count WATCHER_OWNED as success
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _build_reseed_scenario(monkeypatch, *, quote_bid=98.0, quote_ask=98.5):
+    """Shared setup for the startup-reseed durable-adoption regressions:
+    a real durable rearm to the direction-reversal recovery-owned,
+    no-watcher state, wired into a fresh APStartupRecovery's real
+    _reseed_watchers() SQL path. Returns (fresh_recovery, osm, row_store,
+    watcher, selector, broker_calls).
+    """
+    recovery, core, osm, row_store, watcher, selector, broker_calls = (
+        _build_harness(monkeypatch, quote_bid=quote_bid, quote_ask=quote_ask)
+    )
+
+    real_owner = f"recovery_retry:{CLIENT_ID}:{LOCAL_ORDER_ID}:{NEW_GEN + 1}"
+    row_store["row"]["meta"] = _materializing_meta(
+        generation=NEW_GEN, attempt=EXPECTED_ATT,
+    )
+    row_store["row"]["meta"]["materialization_owner"] = real_owner
+
+    ok = osm.rearm_deferred_materialization_direction_reversal(
+        LOCAL_ORDER_ID,
+        owner=real_owner,
+        watcher_token="",
+        generation=NEW_GEN,
+        signal_id=SIGNAL_ID,
+        execution_mode=EXEC_MODE,
+        market_truth_audit={"reason": "CALL_NO_LONGER_ABOVE_TRIGGER"},
+    )
+    assert ok is True, "setup: the real durable rearm must succeed"
+    assert row_store["row"]["meta"]["direction_reversal_rearm_requires_watcher"] is True
+
+    durable_row = dict(row_store["row"])
+    durable_row["kind"] = "ENTRY"
+    durable_row["filled_ts"] = None
+
+    def _reseed_cursor():
+        _cur = _FakeCursor(select_rows=[dict(durable_row)])
+
+        def _exec(sql, params=None):
+            _sql_upper = sql.strip().upper()
+            if _sql_upper.startswith("UPDATE TRADE_QUEUE"):
+                _cur.rowcount = 0
+                _cur._select_rows = []
+            elif _sql_upper.startswith("SELECT"):
+                _cur._select_rows = [dict(durable_row)]
+            return _cur
+
+        _cur.execute = _exec
+        return _cur
+
+    monkeypatch.setattr(
+        ap_db_mod, "conn", lambda: _FakeConnCtx(_reseed_cursor()),
+    )
+    monkeypatch.setattr(ap_db_mod, "run_with_retry", lambda fn: fn())
+
+    fresh_recovery = APStartupRecovery(
+        client_id=CLIENT_ID,
+        broker=recovery.broker,
+        osm=osm,
+        pm=MagicMock(),
+        master_control=SimpleNamespace(mode="PAPER"),
+        entry_watcher=watcher,
+        execution_core=core,
+    )
+
+    import ap.pending_trigger_restart_recovery as ptr_mod
+    monkeypatch.setattr(
+        ptr_mod, "_default_quote_check",
+        lambda broker, symbol, side, trigger: False,
+    )
+
+    return fresh_recovery, osm, row_store, watcher, selector, broker_calls
+
+
+class TestStartupFreshWatcherAdoptionSucceeds:
+    """Test A — PTR creates a real watcher for a direction-reversal
+    watcher-required row; durable adoption CAS succeeds; the reread
+    confirms convergence. Only then does rearmed increment."""
+
+    def test_fresh_watcher_adoption_and_verification_succeed(self, monkeypatch):
+        fresh_recovery, osm, row_store, watcher, selector, broker_calls = (
+            _build_reseed_scenario(monkeypatch)
+        )
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        _real_token = watcher.owner_token
+        _meta = row_store["row"]["meta"]
+        assert _meta["current_owner"] == _real_token
+        assert _meta["watcher_token"] == _real_token
+        assert _meta["recovery_owner"] == ""
+        assert _meta["recovery_ownership"] == ""
+        assert _meta["direction_reversal_rearm_requires_watcher"] is False
+        assert _meta["materialization_status"] == "WAITING_FOR_TRIGGER"
+        assert result.get("pending_trigger_watchers_rearmed") == 1
+
+        assert not selector.select.called
+        assert not selector.select_contract.called
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestStartupFreshWatcherAdoptionCASLoses:
+    """Test B — PTR creates a real watcher; durable adoption CAS returns
+    False. Startup must not count success, and only the watcher THIS
+    startup attempt created may be rolled back."""
+
+    def test_adoption_cas_loss_rolls_back_only_own_registration(
+        self, monkeypatch,
+    ):
+        fresh_recovery, osm, row_store, watcher, selector, broker_calls = (
+            _build_reseed_scenario(monkeypatch)
+        )
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            lambda *a, **kw: False,
+        )
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        # This attempt's own registration was rolled back — no orphaned
+        # runtime watcher left dangling against a recovery-owned row, and
+        # no broad/other watcher cleanup occurred (only one entry could
+        # ever have existed here).
+        assert watcher.has_order(LOCAL_ORDER_ID) is False
+        assert len(watcher._pending) == 0
+        assert result.get("pending_trigger_watchers_rearmed") in (0, None)
+        assert any(
+            "startup_reseed_ownership_adoption_failed" in e
+            for e in result.get("errors", [])
+        )
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestStartupPreExistingWatcherNeverEvicted:
+    """Test C — a watcher already existed before this startup invocation
+    (PTR's read-only fast path returns WATCHER_OWNED with zero
+    registration). If durable adoption then fails, the pre-existing
+    watcher must never be evicted — this invocation did not create it."""
+
+    def test_preexisting_watcher_survives_adoption_cas_loss(self, monkeypatch):
+        fresh_recovery, osm, row_store, watcher, selector, broker_calls = (
+            _build_reseed_scenario(monkeypatch)
+        )
+
+        _preexisting_sig = {
+            "local_order_id": LOCAL_ORDER_ID,
+            "signal_id": SIGNAL_ID,
+            "client_id": CLIENT_ID.lower(),
+            "execution_mode": EXEC_MODE,
+        }
+        _preexisting_watched = _FakeWatched(_preexisting_sig, "PENDING")
+        watcher._pending.append(_preexisting_watched)
+        watcher._dedup_set.add(SIGNAL_ID)
+        _preexisting_token = _preexisting_watched._registration_token
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            lambda *a, **kw: False,
+        )
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0] is _preexisting_watched
+        assert watcher._pending[0]._registration_token == _preexisting_token
+        assert SIGNAL_ID in watcher._dedup_set
+        assert result.get("pending_trigger_watchers_rearmed") in (0, None)
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestStartupReplacementWatcherSurvivesStaleRollback:
+    """Test D — this startup invocation registers watcher A; before its
+    own rollback runs, watcher A is replaced by watcher B (a concurrent
+    actor); adoption fails; the stale startup cleanup must remove only
+    the exact registration it created (A's token) and must never touch
+    B, using the same exact-registration-identity fencing already
+    proven for the due-retry RWR path."""
+
+    def test_replacement_watcher_survives_stale_startup_cleanup(
+        self, monkeypatch,
+    ):
+        fresh_recovery, osm, row_store, watcher, selector, broker_calls = (
+            _build_reseed_scenario(monkeypatch)
+        )
+
+        def _adopt_loses_after_replacement(*a, **kw):
+            # Simulate: between this attempt's registration and its own
+            # adoption CAS, a concurrent actor's cleanup removed A and a
+            # legitimate winner registered B for the same identity.
+            watcher._pending.clear()
+            watcher._dedup_set.discard(SIGNAL_ID)
+            _sig = {
+                "local_order_id": LOCAL_ORDER_ID,
+                "signal_id": SIGNAL_ID,
+                "client_id": CLIENT_ID.lower(),
+                "execution_mode": EXEC_MODE,
+            }
+            _winner = _FakeWatched(_sig, "PENDING")
+            watcher._pending.append(_winner)
+            watcher._dedup_set.add(SIGNAL_ID)
+            _adopt_loses_after_replacement.winner_token = (
+                _winner._registration_token
+            )
+            return False
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership",
+            _adopt_loses_after_replacement,
+        )
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        winner_token = _adopt_loses_after_replacement.winner_token
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        assert len(watcher._pending) == 1
+        assert watcher._pending[0]._registration_token == winner_token
+        assert SIGNAL_ID in watcher._dedup_set
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestStartupAdoptionVerificationRaises:
+    """Test E — adoption CAS reports success, but the verification
+    reread raises. rearmed must not increment, the watcher must not be
+    evicted, recovery ownership must not be restored, and no generic
+    retention helper may run."""
+
+    def test_verification_read_exception_after_successful_cas(
+        self, monkeypatch,
+    ):
+        fresh_recovery, osm, row_store, watcher, selector, broker_calls = (
+            _build_reseed_scenario(monkeypatch)
+        )
+
+        _adoption_committed = {"flag": False}
+        _real_adopt = osm.adopt_direction_reversal_watcher_ownership
+
+        def _adopt_and_flag(*a, **kw):
+            ok = _real_adopt(*a, **kw)
+            if ok:
+                _adoption_committed["flag"] = True
+            return ok
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership", _adopt_and_flag,
+        )
+
+        _real_get_order = osm.get_order
+
+        def _get_order_raises_after_adoption(order_id):
+            if _adoption_committed["flag"]:
+                raise RuntimeError(
+                    "simulated transient read failure after successful CAS"
+                )
+            return _real_get_order(order_id)
+
+        monkeypatch.setattr(osm, "get_order", _get_order_raises_after_adoption)
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        # The CAS itself did commit -- proving this is a genuine
+        # "committed but unverifiable this pass" case.
+        _real_token = watcher.owner_token
+        _meta = row_store["row"]["meta"]
+        assert _meta.get("current_owner") == _real_token
+        assert _meta.get("watcher_token") == _real_token
+
+        # Not counted as rearmed, watcher not evicted, no recovery
+        # ownership restored (recovery fields stay exactly as the CAS
+        # itself left them -- cleared, not reasserted).
+        assert result.get("pending_trigger_watchers_rearmed") in (0, None)
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        assert _meta.get("recovery_owner") == ""
+        assert _meta.get("recovery_ownership") == ""
+        assert any(
+            "startup_reseed_adoption_verification_inconclusive" in e
+            for e in result.get("errors", [])
+        )
+        assert broker_calls["post"] == []
+        assert broker_calls["cancel"] == []
+
+
+class TestStartupAdoptionVerificationInconclusiveState:
+    """Test F — same invariants as Test E, but the reread itself succeeds
+    while returning a state that cannot conclusively prove convergence
+    (e.g. a stale/lagging read that still shows blank current_owner)."""
+
+    def test_verification_returns_unconvincing_state(self, monkeypatch):
+        fresh_recovery, osm, row_store, watcher, selector, broker_calls = (
+            _build_reseed_scenario(monkeypatch)
+        )
+
+        _adoption_committed = {"flag": False}
+        _real_adopt = osm.adopt_direction_reversal_watcher_ownership
+
+        def _adopt_and_flag(*a, **kw):
+            ok = _real_adopt(*a, **kw)
+            if ok:
+                _adoption_committed["flag"] = True
+            return ok
+
+        monkeypatch.setattr(
+            osm, "adopt_direction_reversal_watcher_ownership", _adopt_and_flag,
+        )
+
+        _real_get_order = osm.get_order
+
+        def _get_order_stale_read_after_adoption(order_id):
+            _row = _real_get_order(order_id)
+            if _adoption_committed["flag"] and _row:
+                # A read that "succeeds" but cannot prove convergence --
+                # current_owner still reads blank despite the CAS commit.
+                _row = dict(_row)
+                _row["meta"] = dict(_row.get("meta") or {})
+                _row["meta"]["current_owner"] = ""
+            return _row
+
+        monkeypatch.setattr(
+            osm, "get_order", _get_order_stale_read_after_adoption,
+        )
+
+        result = {"errors": []}
+        fresh_recovery._reseed_watchers(result)
+
+        assert result.get("pending_trigger_watchers_rearmed") in (0, None)
+        assert watcher.has_order(LOCAL_ORDER_ID) is True
+        # The REAL underlying durable state (not the injected stale
+        # read) was never reverted or double-written.
+        _meta = row_store["row"]["meta"]
+        assert _meta.get("recovery_owner") == ""
+        assert _meta.get("recovery_ownership") == ""
+        assert any(
+            "startup_reseed_adoption_verification_inconclusive" in e
+            for e in result.get("errors", [])
+        )
         assert broker_calls["post"] == []
         assert broker_calls["cancel"] == []
 
