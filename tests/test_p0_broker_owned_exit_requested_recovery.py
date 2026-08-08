@@ -87,8 +87,8 @@ class _FakeCursor:
                 and str(row.get("client_id") or "") == str(client_id)
                 and str(row.get("kind") or "").upper() == "EXIT"
                 and str(row.get("status") or "").upper() == "EXIT_REQUESTED"
-                and str(row.get("execution_mode") or "").strip().lower()
-                == str(execution_mode).strip().lower()
+                and str(row.get("execution_mode") or "").strip()
+                == str(execution_mode).strip()
                 and str(row.get("position_id") or "").strip()
                 and int(row.get("qty") or 0) > 0
                 and (
@@ -189,7 +189,7 @@ def test_orcl_shape_adopts_once_and_preserves_diagnostics(fake_osm_db):
     )
 
     assert first["disposition"] == "ADOPTED"
-    assert second["disposition"] == "ALREADY_ADOPTED"
+    assert second["disposition"] == "ALREADY_BROKER_OWNED_ACTIVE"
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
     assert db.rows["exit-orcl-1"]["broker_order_id"] == "36661364"
     assert db.rows["exit-orcl-1"]["submitted_ts"] is None
@@ -203,7 +203,7 @@ def test_orcl_shape_adopts_once_and_preserves_diagnostics(fake_osm_db):
         "created_ts"
     )
     assert not OrderStatus.can_transition(OrderStatus.EXIT_REQUESTED, OrderStatus.EXIT_FILLED)
-    osm._handle_exit_engine_hooks.assert_called()
+    osm._handle_exit_engine_hooks.assert_called_once()
 
 
 def test_adoption_uses_only_explicit_broker_acceptance_timestamp(fake_osm_db):
@@ -272,9 +272,12 @@ def test_callback_trace_preserves_explicit_broker_acceptance_timestamp():
     [
         ({"client_id": "other-client"}, "IDENTITY_MISMATCH"),
         ({"execution_mode": "unknown"}, "IDENTITY_MISMATCH"),
+        ({"execution_mode": "PAPER"}, "IDENTITY_MISMATCH"),
         ({"position_id": "other-position"}, "CAS_MISS"),
         ({"expected_qty": 3}, "CAS_MISS"),
         ({"broker_order_id": "N/A"}, "IDENTITY_MISMATCH"),
+        ({"position_id": ""}, "IDENTITY_MISMATCH"),
+        ({"source": ""}, "IDENTITY_MISMATCH"),
     ],
 )
 def test_adoption_fails_closed_on_identity_or_mode(call_kwargs, expected, fake_osm_db):
@@ -315,7 +318,7 @@ def test_adoption_database_error_is_not_treated_as_submit_success(monkeypatch):
         expected_qty=4,
     )
 
-    assert result["disposition"] == "DATABASE_ERROR"
+    assert result["disposition"] == "DB_ERROR"
     assert result["adopted"] is False
     osm._handle_exit_engine_hooks.assert_not_called()
 
@@ -336,6 +339,57 @@ def test_existing_broker_id_mismatch_cannot_be_replaced(fake_osm_db):
     assert result["disposition"] == "CAS_MISS"
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
     assert db.rows["exit-orcl-1"]["broker_order_id"] == "historical-broker-id"
+
+
+def test_noncanonical_durable_mode_cannot_be_laundered_by_recovery(fake_osm_db):
+    db, osm = fake_osm_db
+    db.rows["exit-orcl-1"]["execution_mode"] = "PAPER"
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "CAS_MISS"
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
+
+
+@pytest.mark.parametrize("terminal_status", ["EXIT_FILLED", "CANCELED", "REJECTED", "EXPIRED"])
+def test_terminal_re_read_is_idempotent_and_identity_fenced(fake_osm_db, terminal_status):
+    db, osm = fake_osm_db
+    db.rows["exit-orcl-1"].update(
+        status=terminal_status,
+        broker_order_id="36661364",
+    )
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "ALREADY_TERMINAL"
+    assert result["already_terminal"] is True
+    assert result["status"] == terminal_status
+    assert db.rows["exit-orcl-1"]["status"] == terminal_status
+
+    mismatch = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="different-broker-id",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+    assert mismatch["disposition"] == "IDENTITY_MISMATCH"
+    assert mismatch["error"] == "terminal_broker_order_id_mismatch"
 
 
 class _Broker:
@@ -398,10 +452,16 @@ def test_fill_monitor_orcl_replay_adopts_then_uses_canonical_fill_path(
         broker,
         original_order,
         osm=recovery_osm,
+        runtime_execution_mode="paper",
     )
     # A replay of the same broker-owned request must not poll/finalize it a
     # second time after the durable row has reached its terminal fill state.
-    fm.process_pending_order(broker, original_order, osm=recovery_osm)
+    fm.process_pending_order(
+        broker,
+        original_order,
+        osm=recovery_osm,
+        runtime_execution_mode="paper",
+    )
 
     assert broker.calls == ["36661364"]
     assert [call[1] for call in recovery_osm.transition_calls] == ["EXIT_FILLED"]
@@ -445,6 +505,7 @@ def test_fill_monitor_recovery_uses_existing_status_reducer(
         broker,
         dict(db.rows["exit-orcl-1"]),
         osm=recovery_osm,
+        runtime_execution_mode="paper",
     )
 
     assert broker.calls == ["36661364"]
@@ -470,11 +531,34 @@ def test_broker_lookup_failure_holds_without_replacement_or_cancel(fake_osm_db, 
         broker,
         dict(db.rows["exit-orcl-1"]),
         osm=recovery_osm,
+        runtime_execution_mode="paper",
     )
 
     assert broker.calls == ["36661364"]
     assert recovery_osm.transition_calls == []
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
+
+
+def test_fill_monitor_holds_on_runtime_mode_conflict_before_broker_poll(
+    fake_osm_db, monkeypatch
+):
+    db, real_osm = fake_osm_db
+    db.rows["exit-orcl-1"]["broker_order_id"] = "36661364"
+    recovery_osm = _RecoveryOSM(real_osm, db)
+    broker = _Broker({"status": "FILLED", "exec_quantity": 4})
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
+
+    fm.process_pending_order(
+        broker,
+        dict(db.rows["exit-orcl-1"]),
+        osm=recovery_osm,
+        runtime_execution_mode="live",
+    )
+
+    assert broker.calls == []
+    assert recovery_osm.transition_calls == []
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
 
 
 def test_brokerless_exit_requested_is_not_polled_or_advanced(monkeypatch):
@@ -523,7 +607,46 @@ def test_broker_owned_query_excludes_local_intents(monkeypatch):
     assert "btrim(broker_order_id) <> ''" in sql
     assert "upper(btrim(broker_order_id)) <> 'n/a'" in sql
     assert "qty > 0" in sql
-    assert "execution_mode" in sql
+    assert "execution_mode in ('live','paper')" in sql
+
+
+def test_order_monitor_active_exit_select_carries_adoption_identity_fields(monkeypatch):
+    captured = {}
+
+    class _QueryCursor:
+        def execute(self, sql, params):
+            captured["sql"] = " ".join(str(sql).split()).lower()
+            return self
+
+        def fetchall(self):
+            return []
+
+    class _QueryConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params):
+            return _QueryCursor().execute(sql, params)
+
+    monitor = om.APOrderMonitor(
+        client_id="tradefluence",
+        broker=MagicMock(),
+        order_state_machine=MagicMock(),
+        position_manager=MagicMock(),
+        exit_engine=MagicMock(),
+        client_mode="PAPER",
+    )
+    monkeypatch.setattr(om, "conn", lambda: _QueryConn())
+    monkeypatch.setattr(om, "run_with_retry", lambda fn, **kwargs: fn())
+
+    assert monitor._get_active_exit_orders() == []
+    sql = captured["sql"]
+    assert "qty, execution_mode" in sql
+    assert "meta," in sql
+    assert "meta->>'broker_submitted_ts'" in sql
 
 
 class _MonitorOSM:
@@ -564,14 +687,264 @@ class _MonitorOSM:
         return True
 
 
-def _monitor(order, osm, broker):
+class _GuardOSM:
+    def __init__(self, active_order):
+        self.active_order = active_order
+        self.adopt_broker_owned_exit_request = MagicMock()
+
+    def get_active_exit_order(self, position_id):
+        if str(self.active_order.get("position_id") or "") == str(position_id or ""):
+            return self.active_order
+        return None
+
+
+def _guard_pos(**overrides):
+    values = {
+        "position_id": "position-guard-1",
+        "client_id": "tradefluence",
+        "ticker": "ORCL",
+        "option_symbol": "ORCL260807P00155000",
+        "side": "PUT",
+        "quantity_remaining": 4,
+        "closed": False,
+        "exit_in_flight": False,
+        "pending_exit_local_order_id": "",
+        "pending_exit_broker_order_id": "",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_callback_local_identity_conflict_holds_without_osm_adoption():
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = {
+        "local_order_id": "exit-local-reserved",
+        "broker_order_id": "",
+        "status": "EXIT_REQUESTED",
+        "position_id": pos.position_id,
+        "qty": 4,
+    }
+    osm = _GuardOSM(active_order)
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=osm,
+        osm=None,
+        master_control=SimpleNamespace(mode="PAPER"),
+    )
+
+    result = guard._adopt_callback_broker_ownership(
+        engine,
+        pos,
+        {
+            "identity": {
+                "local_order_id": "different-local-id",
+                "broker_order_id": "broker-exact-1",
+            },
+            "result": None,
+        },
+    )
+
+    assert result["attempted"] is True
+    assert result["adopted"] is False
+    assert result["identity_conflict"] is True
+    assert result["reason_code"] == "EXIT_BROKER_OWNERSHIP_IDENTITY_CONFLICT"
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-local-reserved"
+    assert pos.pending_exit_broker_order_id == "broker-exact-1"
+    osm.adopt_broker_owned_exit_request.assert_not_called()
+
+
+def test_callback_broker_identity_conflict_holds_without_choosing_an_id():
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = {
+        "local_order_id": "exit-local-reserved",
+        "broker_order_id": "broker-active-1",
+        "status": "EXIT_REQUESTED",
+        "position_id": pos.position_id,
+        "qty": 4,
+    }
+    osm = _GuardOSM(active_order)
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=osm,
+        osm=None,
+        master_control=SimpleNamespace(mode="PAPER"),
+    )
+
+    result = guard._adopt_callback_broker_ownership(
+        engine,
+        pos,
+        {
+            "identity": {"broker_order_id": "broker-callback-1"},
+            "result": None,
+        },
+    )
+
+    assert result["attempted"] is True
+    assert result["adopted"] is False
+    assert result["identity_conflict"] is True
+    assert result["broker_order_id"] == ""
+    assert result["broker_order_ids"] == ["broker-callback-1", "broker-active-1"]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-local-reserved"
+    assert pos.pending_exit_broker_order_id == ""
+    osm.adopt_broker_owned_exit_request.assert_not_called()
+
+
+def test_submit_wrapper_reconciles_callback_exception_before_reraising(monkeypatch):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-uncertain")
+    active_order = {
+        "local_order_id": "exit-local-uncertain",
+        "broker_order_id": "",
+        "status": "EXIT_REQUESTED",
+        "position_id": pos.position_id,
+        "qty": 4,
+        "execution_mode": "paper",
+        "meta": {"broker_submitted_ts": "2026-08-08T15:00:00Z"},
+    }
+    osm = _GuardOSM(active_order)
+    adoption = osm.adopt_broker_owned_exit_request
+    adoption.return_value = {
+        "disposition": "ADOPTED",
+        "adopted": True,
+        "status": "EXIT_SUBMITTED",
+        "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
+    }
+
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=osm,
+        osm=None,
+        master_control=SimpleNamespace(mode="PAPER"),
+    )
+
+    def callback(callback_pos, _decision):
+        callback_pos.exit_in_flight = True
+        callback_pos.pending_exit_broker_order_id = "broker-uncertain-1"
+        engine.order_state_machine.active_order["broker_order_id"] = "broker-uncertain-1"
+        raise RuntimeError("submit response uncertain")
+
+    engine.on_scale = callback
+    engine.on_exit = callback
+    updates = []
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_args: ("tradefluence|position-guard-1|4|1", 1),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **_kwargs: {"claimed": True},
+    )
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append((generation_key, kwargs)),
+    )
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="submit response uncertain"):
+        wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=1, should_act=True))
+
+    adoption.assert_called_once()
+    assert adoption.call_args.kwargs["broker_order_id"] == "broker-uncertain-1"
+    assert adoption.call_args.kwargs["broker_submitted_ts"] == "2026-08-08T15:00:00Z"
+    assert updates[0][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates[0][1]["broker_order_id"] == "broker-uncertain-1"
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_broker_order_id == "broker-uncertain-1"
+
+
+def test_submit_wrapper_broker_identity_conflict_keeps_claim_unresolved(monkeypatch):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-conflict")
+    active_order = {
+        "local_order_id": "exit-local-conflict",
+        "broker_order_id": "",
+        "status": "EXIT_REQUESTED",
+        "position_id": pos.position_id,
+        "qty": 4,
+        "execution_mode": "paper",
+    }
+    osm = _GuardOSM(active_order)
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=osm,
+        osm=None,
+        master_control=SimpleNamespace(mode="PAPER"),
+    )
+    callback_calls = []
+
+    def callback(callback_pos, _decision):
+        callback_calls.append(True)
+        callback_pos.pending_exit_local_order_id = "callback-local-conflict"
+        engine.order_state_machine.active_order["broker_order_id"] = "broker-active-1"
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "EXIT_SUBMITTED",
+            "local_order_id": "callback-local-conflict",
+            "broker_order_id": "broker-callback-1",
+        }
+
+    engine.on_scale = callback
+    engine.on_exit = callback
+    updates = []
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_args: ("tradefluence|position-guard-1|4|1", 1),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **_kwargs: {"claimed": True},
+    )
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append((generation_key, kwargs)),
+    )
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision).get("ok")
+        )
+    )
+
+    assert wrapped(
+        engine,
+        pos,
+        SimpleNamespace(action="SCALE_OUT", quantity=1, should_act=True),
+    ) is True
+
+    assert callback_calls == [True]
+    osm.adopt_broker_owned_exit_request.assert_not_called()
+    assert updates[0][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates[0][1]["broker_order_id"] == ""
+    assert updates[0][1]["local_order_id"] == "exit-local-conflict"
+    assert updates[0][1]["error_text"].startswith(
+        "BROKER_OWNED_DURABILITY_GAP:EXIT_BROKER_OWNERSHIP_IDENTITY_CONFLICT:"
+    )
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-local-conflict"
+
+
+def _monitor(order, osm, broker, *, client_mode="PAPER"):
     monitor = om.APOrderMonitor(
         client_id="tradefluence",
         broker=broker,
         order_state_machine=osm,
         position_manager=MagicMock(),
         exit_engine=MagicMock(),
-        client_mode="PAPER",
+        client_mode=client_mode,
     )
     monitor._emit_order_event = MagicMock()
     monitor._alert = MagicMock()
@@ -712,6 +1085,73 @@ def test_order_monitor_holds_when_adoption_cas_fails(monkeypatch):
     )
 
 
+def test_order_monitor_holds_when_runtime_mode_is_not_explicitly_proven(monkeypatch):
+    order = _row(broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    broker = _Broker({"status": "FILLED", "exec_quantity": 4})
+    monitor = _monitor(order, osm, broker, client_mode=None)
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+
+    monitor._check_exit_orders()
+
+    assert osm.adopt_calls == []
+    assert broker.calls == []
+    assert osm.transition_calls == []
+    assert monitor._emit_order_event.call_args.kwargs["reason_code"] == (
+        "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD"
+    )
+
+
+def test_order_monitor_does_not_repeat_same_submitted_transition():
+    order = _row(status="EXIT_SUBMITTED", broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    monitor = _monitor(order, osm, _Broker({"status": "PENDING"}))
+
+    monitor._advance_from_broker_status("exit-orcl-1", "PENDING", "ORCL")
+
+    assert osm.transition_calls == []
+
+
+def test_fill_monitor_loop_deduplicates_recovery_and_normal_snapshots(monkeypatch):
+    recovery = _row(broker_order_id="36661364")
+    normal = dict(recovery)
+    normal["status"] = "EXIT_SUBMITTED"
+    calls = []
+
+    monkeypatch.setattr(fm, "get_pending_orders", lambda _client_id: [normal])
+    monkeypatch.setattr(fm, "get_broker_owned_exit_requests", lambda _client_id: [recovery])
+    monkeypatch.setattr(
+        fm,
+        "process_pending_order",
+        lambda _broker, order, **kwargs: calls.append((dict(order), kwargs)),
+    )
+
+    class _Stop:
+        def __init__(self):
+            self.wait_calls = 0
+
+        def is_set(self):
+            return self.wait_calls > 0
+
+        def wait(self, _seconds):
+            self.wait_calls += 1
+
+    stop = _Stop()
+    exit_engine = SimpleNamespace(master_control=SimpleNamespace(mode="PAPER"))
+    fm.fill_monitor_loop(
+        broker=MagicMock(),
+        poll_seconds=0,
+        osm=SimpleNamespace(client_id="tradefluence"),
+        exit_engine=exit_engine,
+        stop_event=stop,
+        client_id="tradefluence",
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0]["status"] == "EXIT_REQUESTED"
+    assert calls[0][1]["runtime_execution_mode"] == "paper"
+
+
 def test_idempotency_claim_stays_broker_owned_on_adoption_gap(monkeypatch):
     pos = SimpleNamespace(
         position_id="position-gap",
@@ -740,7 +1180,7 @@ def test_idempotency_claim_stays_broker_owned_on_adoption_gap(monkeypatch):
 
         def adopt_broker_owned_exit_request(self, *args, **kwargs):
             return {
-                "disposition": "DATABASE_ERROR",
+                "disposition": "DB_ERROR",
                 "adopted": False,
                 "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
                 "error": "rowcount_unconfirmed",

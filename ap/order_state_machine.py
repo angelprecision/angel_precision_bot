@@ -1315,12 +1315,13 @@ class APOrderStateMachine:
         """
         local_id = str(local_order_id or "").strip()
         broker_id = str(broker_order_id or "").strip()
-        mode = str(execution_mode or "").strip().lower()
+        mode = str(execution_mode or "").strip()
         self_client_id = str(self.client_id or "").strip()
         expected_client = str(
             self_client_id if client_id is None else client_id
-        ).strip().lower()
+        ).strip()
         expected_position = str(position_id or "").strip()
+        source_text = str(source or "").strip()
         expected_qty_value = None
         if expected_qty is not None:
             try:
@@ -1347,11 +1348,19 @@ class APOrderStateMachine:
             order: dict | None = None,
             submitted_ts_source: str = "unproven_recovery",
         ) -> dict:
-            adopted = disposition in {"ADOPTED", "ALREADY_ADOPTED"}
+            adopted = disposition in {
+                "ADOPTED",
+                "ALREADY_BROKER_OWNED_ACTIVE",
+                "ALREADY_ADOPTED",
+            }
             return {
                 "disposition": disposition,
                 "adopted": adopted,
-                "already_adopted": disposition == "ALREADY_ADOPTED",
+                "already_adopted": disposition in {
+                    "ALREADY_BROKER_OWNED_ACTIVE",
+                    "ALREADY_ADOPTED",
+                },
+                "already_terminal": disposition == "ALREADY_TERMINAL",
                 "local_order_id": local_id,
                 "broker_order_id": broker_id,
                 "status": status,
@@ -1367,7 +1376,9 @@ class APOrderStateMachine:
             or not broker_id
             or broker_id.upper() == "N/A"
             or mode not in {"live", "paper"}
-            or expected_client != self_client_id.lower()
+            or expected_client != self_client_id
+            or not expected_position
+            or not source_text
             or expected_qty_value is not None and expected_qty_value <= 0
         ):
             return _result(
@@ -1390,8 +1401,11 @@ class APOrderStateMachine:
         adoption_timestamp = now_utc_iso()
         diagnostic_payload = {
             "broker_ownership_adopted_from_exit_requested": True,
-            "broker_ownership_adoption_source": str(source or "recovery"),
+            "broker_ownership_adoption_source": source_text,
             "broker_ownership_adoption_broker_order_id": broker_id,
+            "broker_ownership_adoption_reason": (
+                "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+            ),
             # This is intentionally named as recovery/adoption time.  It must
             # never be mistaken for historical broker submission chronology.
             "broker_ownership_adoption_timestamp": adoption_timestamp,
@@ -1425,7 +1439,7 @@ class APOrderStateMachine:
             "  AND client_id=%s "
             "  AND kind='EXIT' "
             "  AND status='EXIT_REQUESTED' "
-            "  AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
+            "  AND execution_mode=%s "
             "  AND position_id IS NOT NULL "
             "  AND BTRIM(position_id::text)<>'' "
             "  AND qty > 0 "
@@ -1462,14 +1476,14 @@ class APOrderStateMachine:
                 self.client_id, local_id, broker_id, exc,
             )
             return _result(
-                "DATABASE_ERROR",
+                "DB_ERROR",
                 reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
                 error=f"{type(exc).__name__}:{exc}",
             )
 
         if rowcount is None:
             return _result(
-                "DATABASE_ERROR",
+                "DB_ERROR",
                 reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
                 error="rowcount_unconfirmed",
             )
@@ -1508,7 +1522,7 @@ class APOrderStateMachine:
                     "execution_mode": mode,
                     "position_id": expected_position or adopted_order.get("position_id"),
                     "requested_qty": adopted_order.get("qty"),
-                    "source": source,
+                    "source": source_text,
                     "broker_submitted_ts": normalized_broker_submitted_ts,
                     "broker_submitted_ts_source": submitted_ts_source,
                     "stale_age_reference": diagnostic_payload[
@@ -1534,18 +1548,20 @@ class APOrderStateMachine:
         if latest_dict:
             latest_status = str(latest_dict.get("status") or "").strip().upper()
             latest_broker_id = str(latest_dict.get("broker_order_id") or "").strip()
-            latest_mode = str(latest_dict.get("execution_mode") or "").strip().lower()
+            latest_client = str(latest_dict.get("client_id") or "").strip()
+            latest_mode = str(latest_dict.get("execution_mode") or "").strip()
             latest_position = str(latest_dict.get("position_id") or "").strip()
+            latest_kind = str(latest_dict.get("kind") or "").strip().upper()
             try:
                 latest_qty = int(latest_dict.get("qty") or 0)
             except (TypeError, ValueError):
                 latest_qty = 0
             latest_identity_matches = bool(
-                str(latest_dict.get("client_id") or "").strip().lower() == self_client_id.lower()
-                and str(latest_dict.get("kind") or "").strip().upper() == "EXIT"
+                latest_client == self_client_id
+                and latest_kind == "EXIT"
                 and latest_mode == mode
                 and latest_position
-                and (not expected_position or latest_position == expected_position)
+                and latest_position == expected_position
                 and latest_qty > 0
                 and (
                     expected_qty_value is None
@@ -1561,15 +1577,13 @@ class APOrderStateMachine:
                 and latest_broker_id == broker_id
                 and latest_identity_matches
             ):
-                self._handle_exit_engine_hooks(
-                    current=latest_dict,
-                    new_status=OrderStatus.EXIT_SUBMITTED,
-                    position_id=expected_position or latest_dict.get("position_id"),
-                    broker_order_id=broker_id,
-                    local_order_id=local_id,
-                )
+                # The first successful CAS already emitted the transition and
+                # hydrated the exit owner.  A concurrent/replayed adoption is
+                # an idempotent read-only result; repeating the ownership hook
+                # would create duplicate side effects without another durable
+                # mutation.
                 return _result(
-                    "ALREADY_ADOPTED",
+                    "ALREADY_BROKER_OWNED_ACTIVE",
                     reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_ADOPTED",
                     status=latest_status,
                     order=latest_dict,
@@ -1580,6 +1594,27 @@ class APOrderStateMachine:
                     ),
                 )
             if latest_status in OrderStatus.TERMINAL:
+                if latest_broker_id == broker_id and latest_identity_matches:
+                    return _result(
+                        "ALREADY_TERMINAL",
+                        reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_TERMINAL",
+                        status=latest_status,
+                        error="order_already_terminal",
+                        order=latest_dict,
+                        submitted_ts_source=(
+                            "existing_durable_value"
+                            if latest_dict.get("submitted_ts")
+                            else submitted_ts_source
+                        ),
+                    )
+                if latest_broker_id and latest_broker_id != broker_id:
+                    return _result(
+                        "IDENTITY_MISMATCH",
+                        reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                        status=latest_status,
+                        error="terminal_broker_order_id_mismatch",
+                        order=latest_dict,
+                    )
                 return _result(
                     "TERMINAL_ROW",
                     reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",

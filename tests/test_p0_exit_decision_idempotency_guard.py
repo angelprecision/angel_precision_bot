@@ -1687,14 +1687,15 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
         if index == 1:
             first_callback_entered.set()
             assert callback_release.wait(timeout=2.0)
+        local_order_id = str(pos.pending_exit_local_order_id or "").strip()
+        assert local_order_id
         pos.exit_in_flight = True
-        pos.pending_exit_local_order_id = f"exit-local-{pos.position_id}"
         pos.pending_exit_broker_order_id = f"exit-broker-{pos.position_id}"
         return {
             "ok": True,
             "accepted": True,
             "status": "EXIT_SUBMITTED",
-            "local_order_id": f"exit-local-{pos.position_id}",
+            "local_order_id": local_order_id,
             "broker_order_id": f"exit-broker-{pos.position_id}",
         }
 
@@ -1714,6 +1715,11 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     monkeypatch.setattr(guard.threading, "Lock", fake_thread_lock)
     wrapped = guard.wrap_submit(_invoke_submit_callback)
     engine = _make_submit_engine(_pos(position_id="position-anchor"), callback=callback)
+    engine.order_state_machine.adopt_broker_owned_exit_request = lambda *args, **kwargs: {
+        "disposition": "ADOPTED",
+        "adopted": True,
+        "status": "EXIT_SUBMITTED",
+    }
     pos_a = _pos(position_id="position-a")
     pos_b = _pos(position_id="position-b")
     results = []
@@ -1742,22 +1748,23 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     assert sorted(results) == [("a", True), ("b", True)]
     assert callback_count == 2
     rows = _claim_rows()
-    assert rows == [
-        {
-            "generation_key": "client|position-a|3|1",
-            "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
-            "local_order_id": "exit-local-position-a",
-            "broker_order_id": "exit-broker-position-a",
-            "last_error": None,
-        },
-        {
-            "generation_key": "client|position-b|3|1",
-            "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
-            "local_order_id": "exit-local-position-b",
-            "broker_order_id": "exit-broker-position-b",
-            "last_error": None,
-        },
+    assert [row["claim_state"] for row in rows] == [
+        guard._CLAIM_STATE_BROKER_OWNED,
+        guard._CLAIM_STATE_BROKER_OWNED,
     ]
+    assert [row["generation_key"] for row in rows] == [
+        "client|position-a|3|1",
+        "client|position-b|3|1",
+    ]
+    assert [row["local_order_id"] for row in rows] == [
+        pos_a.pending_exit_local_order_id,
+        pos_b.pending_exit_local_order_id,
+    ]
+    assert [row["broker_order_id"] for row in rows] == [
+        "exit-broker-position-a",
+        "exit-broker-position-b",
+    ]
+    assert [row["last_error"] for row in rows] == [None, None]
 
 
 def test_submit_wrapper_post_submit_claim_update_failure_does_not_raise(

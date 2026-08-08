@@ -292,10 +292,10 @@ class APOrderMonitor:
         entry_watcher=None,
         contract_selector=None,
         alert_fn=None,
-        # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
-        # forgets to pass client_mode uses the strict 90s ceiling rather than
-        # the relaxed 180s paper ceiling. Missing wiring fails safe, not relaxed.
-        client_mode: str = "LIVE",
+        # PR66: "PAPER" or "LIVE". Unrelated monitor policy retains its
+        # historical LIVE fallback, while broker-owned EXIT recovery records
+        # whether a valid mode was explicitly wired by the caller.
+        client_mode: str | None = None,
         data_broker=None,
     ):
         self.client_id   = client_id
@@ -307,8 +307,13 @@ class APOrderMonitor:
         self.contract_selector = contract_selector
         self.alert_fn    = alert_fn
         self.data_broker = data_broker or getattr(broker, "data_broker", None)
+        raw_recovery_mode = str(client_mode or "").strip().lower()
+        self._broker_owned_exit_recovery_mode = (
+            raw_recovery_mode if raw_recovery_mode in {"live", "paper"} else ""
+        )
         # PR66: store mode for per-mode max-age selection.
-        # "or LIVE" guards against explicit None/empty being passed — fail safe.
+        # "or LIVE" guards against explicit None/empty being passed — preserve
+        # the legacy monitor policy without granting recovery authority.
         self.client_mode = str(client_mode or "LIVE").strip().upper()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -2248,12 +2253,26 @@ class APOrderMonitor:
         local_id = str(order.get("local_order_id") or "").strip()
         broker_id = str(order.get("broker_order_id") or "").strip()
         position_id = str(order.get("position_id") or "").strip()
-        execution_mode = str(order.get("execution_mode") or "").strip().lower()
+        execution_mode = str(order.get("execution_mode") or "").strip()
+        runtime_mode = str(
+            getattr(self, "_broker_owned_exit_recovery_mode", "") or ""
+        ).strip().lower()
+        try:
+            expected_qty = int(order.get("qty") or 0)
+        except (TypeError, ValueError):
+            expected_qty = 0
         if not _has_proven_broker_order_id(broker_id):
             return False, dict(order)
 
         adopt = getattr(self.osm, "adopt_broker_owned_exit_request", None)
-        if not callable(adopt):
+        if not local_id or not position_id or expected_qty <= 0:
+            result = {
+                "disposition": "IDENTITY_MISMATCH",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": "local_or_position_identity_missing_or_qty_invalid",
+            }
+        elif not callable(adopt):
             result = {
                 "disposition": "ADOPTION_METHOD_UNAVAILABLE",
                 "adopted": False,
@@ -2267,11 +2286,17 @@ class APOrderMonitor:
                 "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
                 "error": "execution_mode_missing_or_invalid",
             }
+        elif not runtime_mode or runtime_mode != execution_mode:
+            result = {
+                "disposition": "IDENTITY_MISMATCH",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": (
+                    "runtime_execution_mode_unproven_or_conflict:"
+                    f"runtime={runtime_mode or 'unknown'}:durable={execution_mode}"
+                ),
+            }
         else:
-            try:
-                expected_qty = int(order.get("qty") or 0)
-            except (TypeError, ValueError):
-                expected_qty = 0
             broker_submitted_ts = order.get("broker_submitted_ts")
             try:
                 result = adopt(
@@ -2286,7 +2311,7 @@ class APOrderMonitor:
                 )
             except Exception as exc:
                 result = {
-                    "disposition": "DATABASE_ERROR",
+                    "disposition": "DB_ERROR",
                     "adopted": False,
                     "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
                     "error": f"{type(exc).__name__}:{exc}",
@@ -2300,8 +2325,31 @@ class APOrderMonitor:
         result = dict(result)
         adopted = bool(
             result.get("adopted")
-            or result.get("disposition") in {"ADOPTED", "ALREADY_ADOPTED"}
+            or result.get("disposition") in {
+                "ADOPTED",
+                "ALREADY_BROKER_OWNED_ACTIVE",
+                "ALREADY_ADOPTED",
+            }
         )
+        if result.get("already_terminal") or result.get("disposition") == "ALREADY_TERMINAL":
+            self._emit_order_event(
+                local_order_id=local_id,
+                stage="order_monitor",
+                decision="CONFIRMED",
+                reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_TERMINAL",
+                explanation=(
+                    "The exact broker-owned EXIT row is already terminal; stopping "
+                    "recovery without replaying broker polling or fill side effects."
+                ),
+                contract=order.get("contract") or order.get("symbol"),
+                position_id=position_id,
+                inputs={
+                    "execution_mode": execution_mode,
+                    "broker_order_id": broker_id,
+                    "source": "order_monitor",
+                },
+            )
+            return False, dict(order)
         if adopted:
             try:
                 refreshed = self.osm.get_order(local_id) if callable(getattr(self.osm, "get_order", None)) else None
@@ -3835,6 +3883,16 @@ class APOrderMonitor:
         if not new_status:
             log.debug(f"[{self.client_id}] Unknown broker status '{s}' — no transition")
             return
+        current_status = str(order.get("status") or "").strip().upper()
+        if current_status == new_status:
+            log.debug(
+                "[%s] Broker status %s already represented by durable status %s | %s",
+                self.client_id,
+                s,
+                current_status,
+                local_order_id,
+            )
+            return
         kwargs = {}
         if s in {"filled", "partially_filled"}:
             fill_status = (
@@ -4000,6 +4058,7 @@ class APOrderMonitor:
                     SELECT local_order_id, broker_order_id, status, symbol,
                            contract, position_id, qty, execution_mode,
                            created_ts, submitted_ts,
+                           meta,
                            meta->>'broker_submitted_ts' AS broker_submitted_ts,
                            fill_price,
                            fill_price AS avg_fill,

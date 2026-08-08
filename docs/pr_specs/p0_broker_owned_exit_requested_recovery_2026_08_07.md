@@ -40,7 +40,7 @@ This proves the ORCL incident is not a single bad tick. It is a recurrent broker
 
 Current baseline for this specification:
 
-`564dedb47046412f9b6efb6021bcca1745ae5797`
+`188f2338de3ca4b3e687aa07fd6b2c5ea4b2ab0b`
 
 The current OSM transition graph intentionally permits:
 
@@ -279,4 +279,3 @@ Before MERGE consideration:
 - issue MERGE / HOLD / HARD HOLD.
 
 Until all of the above is complete, verdict is **HARD HOLD**.
-

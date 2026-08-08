@@ -6,7 +6,7 @@ This amendment is binding on the implementation. It narrows the repair to the ex
 
 Start from current main:
 
-`564dedb47046412f9b6efb6021bcca1745ae5797`
+`188f2338de3ca4b3e687aa07fd6b2c5ea4b2ab0b`
 
 Before implementation, confirm main has not moved. If main has moved, re-read the four production files and re-resolve this map before editing. Do not transplant stale hunks by line number.
 
@@ -176,4 +176,3 @@ EXIT_REQUESTED + broker id + submitted_ts null
 ## Audit verdict
 
 HARD HOLD until runtime implementation, focused real-method tests, changed-file audit, comments review, exact-head P0 CI, and a fresh independent release verdict are complete.
-
