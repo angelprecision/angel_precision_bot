@@ -107,6 +107,11 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _has_proven_broker_order_id(value: Any) -> bool:
+    broker_id = str(value or "").strip()
+    return bool(broker_id and broker_id.upper() != "N/A")
+
+
 # Documented deployment bounds: TTLs are at least one second and at most one
 # day; caches retain at least 128 entries and never exceed 100k entries.
 _ACTION_LEDGER_TTL = _bounded_float_env(
@@ -839,6 +844,13 @@ def _extract_callback_trace_identity(callback_trace: dict) -> dict:
     if not isinstance(result, dict):
         return identity
 
+    nested_order = result.get("order")
+    if isinstance(nested_order, dict):
+        # Adapters may return the canonical identity under ``order`` while
+        # keeping only ``ok``/``status`` at the top level.  Flatten identity
+        # fields only; nested status is not proof of durable persistence.
+        result = {**nested_order, **result}
+
     for source_key, target_key in (
         ("local_order_id", "local_order_id"),
         ("exit_local_order_id", "local_order_id"),
@@ -847,8 +859,12 @@ def _extract_callback_trace_identity(callback_trace: dict) -> dict:
         ("id", "broker_order_id"),
     ):
         value = result.get(source_key)
-        if value is not None and not identity.get(target_key):
-            identity[target_key] = str(value)
+        existing = str(identity.get(target_key) or "").strip()
+        if value is not None and (
+            not existing
+            or (target_key == "broker_order_id" and not _has_proven_broker_order_id(existing))
+        ):
+            identity[target_key] = str(value).strip()
     if "accepted" not in identity and "accepted" in result:
         identity["accepted"] = bool(result.get("accepted"))
     if not identity.get("raw_status"):
@@ -856,6 +872,158 @@ def _extract_callback_trace_identity(callback_trace: dict) -> dict:
         if raw_status is not None:
             identity["raw_status"] = str(raw_status)
     return identity
+
+
+def _adopt_callback_broker_ownership(
+    engine: Any,
+    pos: Any,
+    callback_trace: dict,
+) -> dict:
+    """Route callback broker identity through the OSM adoption CAS.
+
+    The external callback is the irreversible boundary.  If it returns an
+    exact broker id while the local EXIT row is still EXIT_REQUESTED, the
+    idempotency claim must remain broker-owned even when the local adoption
+    fails.  This helper deliberately has no broker submit/cancel authority.
+    """
+    identity = _extract_callback_trace_identity(callback_trace)
+    position_id = str(getattr(pos, "position_id", "") or "").strip()
+    try:
+        active_order = _active_exit_order(engine, position_id)
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_BROKER_OWNERSHIP_ACTIVE_ROW_LOOKUP_FAILED position=%s error=%s",
+            getattr(pos, "ticker", ""), position_id, exc,
+        )
+        active_order = None
+
+    local_order_id = str(
+        identity.get("local_order_id")
+        or (active_order or {}).get("local_order_id")
+        or getattr(pos, "pending_exit_local_order_id", "")
+        or ""
+    ).strip()
+    broker_order_id = str(
+        identity.get("broker_order_id")
+        or (active_order or {}).get("broker_order_id")
+        or getattr(pos, "pending_exit_broker_order_id", "")
+        or ""
+    ).strip()
+    if not local_order_id or not broker_order_id or broker_order_id.upper() == "N/A":
+        return {
+            "attempted": False,
+            "adopted": False,
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "reason_code": "BROKER_IDENTITY_NOT_RETURNED",
+        }
+
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    adopt = getattr(osm, "adopt_broker_owned_exit_request", None) if osm else None
+    if isinstance(active_order, dict) and "execution_mode" in active_order:
+        # The durable EXIT row is the strongest mode authority.  Do not let a
+        # process-wide master-control mode relabel a row from the other mode.
+        expected_mode = str(active_order.get("execution_mode") or "").strip().lower()
+    else:
+        expected_mode = _execution_mode(engine, pos).strip().lower()
+    expected_qty = (active_order or {}).get("qty") if isinstance(active_order, dict) else None
+    if not callable(adopt):
+        # Lightweight test doubles and older non-production adapters do not
+        # expose the recovery seam.  Leave their existing claim classifier in
+        # charge; the production APOrderStateMachine always provides this
+        # method, while fill/order monitor recovery remains fail-closed.
+        return {
+            "attempted": False,
+            "adopted": False,
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "reason_code": "OSM_ADOPTION_METHOD_UNAVAILABLE",
+        }
+    elif expected_mode not in {"live", "paper"}:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+            "error": "execution_mode_missing_or_invalid",
+        }
+    else:
+        try:
+            result = adopt(
+                local_order_id,
+                broker_order_id=broker_order_id,
+                execution_mode=expected_mode,
+                client_id=str(
+                    getattr(pos, "client_id", "")
+                    or getattr(engine, "client_id", "")
+                    or getattr(engine, "_email", "")
+                    or ""
+                ).strip(),
+                position_id=position_id,
+                expected_qty=expected_qty,
+                source="exit_decision_callback",
+            )
+        except Exception as exc:
+            result = {
+                "disposition": "DATABASE_ERROR",
+                "adopted": False,
+                "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                "error": f"{type(exc).__name__}:{exc}",
+            }
+
+    if not isinstance(result, dict):
+        result = {
+            "disposition": "ADOPTED" if bool(result) else "CAS_MISS",
+            "adopted": bool(result),
+            "reason_code": (
+                "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+                if bool(result)
+                else "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED"
+            ),
+        }
+    result = dict(result)
+    result.update({
+        "attempted": True,
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+    })
+    adopted = bool(
+        result.get("adopted")
+        or result.get("disposition") in {"ADOPTED", "ALREADY_ADOPTED"}
+    )
+    result["adopted"] = adopted
+
+    # Preserve the exact in-memory owner token after broker acceptance.  Do
+    # not overwrite a different already-durable broker identity.
+    durable_broker_id = str((active_order or {}).get("broker_order_id") or "").strip()
+    if not durable_broker_id or durable_broker_id == broker_order_id:
+        try:
+            _mark_active_exit_owned(
+                engine,
+                pos,
+                {
+                    "local_order_id": local_order_id,
+                    "broker_order_id": broker_order_id,
+                },
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] EXIT_BROKER_OWNERSHIP_IN_MEMORY_MARK_FAILED position=%s error=%s",
+                getattr(pos, "ticker", ""), position_id, exc,
+            )
+    if not adopted:
+        result.setdefault("reason_code", "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED")
+        result.setdefault("error", "adoption_not_confirmed")
+        log.critical(
+            "[%s] BROKER_OWNED_DURABILITY_GAP client_id=%s position_id=%s local=%s broker=%s disposition=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "client_id", "") or getattr(engine, "client_id", ""),
+            position_id,
+            local_order_id,
+            broker_order_id,
+            result.get("disposition"),
+            result.get("error"),
+        )
+    return result
 
 
 def _classify_submit_claim_outcome(
@@ -879,7 +1047,7 @@ def _classify_submit_claim_outcome(
     active_meta = _claim_meta_dict(active_order or {})
     active_order_status = str((active_order or {}).get("status") or "").strip().upper()
     active_order_has_broker_ownership = bool(
-        str((active_order or {}).get("broker_order_id") or "").strip()
+        _has_proven_broker_order_id((active_order or {}).get("broker_order_id"))
         or (active_order or {}).get("submitted_ts")
         or str(active_meta.get("submit_intent_at") or "").strip()
         or bool(active_meta.get("split_brain_quarantine"))
@@ -899,6 +1067,8 @@ def _classify_submit_claim_outcome(
         or (active_order or {}).get("broker_order_id")
         or ""
     ).strip()
+    if not _has_proven_broker_order_id(broker_order_id):
+        broker_order_id = ""
     raw_status = str(identity.get("raw_status") or callback_trace.get("status") or "").strip().upper()
     error_text = str(callback_trace.get("error") or "")
     if not error_text and callback_trace.get("exception") is not None:
@@ -1360,6 +1530,13 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             else:
                 callback_returned = bool(original(self, pos, decision, *args, **kwargs))
 
+            adoption_result = _adopt_callback_broker_ownership(
+                self,
+                pos,
+                callback_trace,
+            )
+            callback_trace["adoption"] = adoption_result
+
             if generation_key:
                 claim_state, local_order_id, broker_order_id, error_text = _classify_submit_claim_outcome(
                     self,
@@ -1367,6 +1544,26 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     callback_trace,
                     callback_returned,
                 )
+                if (
+                    adoption_result.get("attempted")
+                    and adoption_result.get("broker_order_id")
+                    and not adoption_result.get("adopted")
+                ):
+                    # The broker id is exact acceptance evidence even when the
+                    # local CAS failed.  Never release this generation as
+                    # no-submit; preserve it for restart recovery.
+                    claim_state = _CLAIM_STATE_BROKER_OWNED
+                    local_order_id = str(
+                        adoption_result.get("local_order_id") or local_order_id or ""
+                    ).strip()
+                    broker_order_id = str(
+                        adoption_result.get("broker_order_id") or broker_order_id or ""
+                    ).strip()
+                    error_text = (
+                        "BROKER_OWNED_DURABILITY_GAP:"
+                        f"{adoption_result.get('reason_code') or 'adoption_failed'}"
+                        f":{adoption_result.get('error') or 'unconfirmed'}"
+                    )
                 try:
                     _update_durable_decision_generation(
                         generation_key,
@@ -1392,6 +1589,21 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         local_order_id,
                         error_text=error_text,
                     )
+            elif (
+                adoption_result.get("attempted")
+                and adoption_result.get("broker_order_id")
+                and not adoption_result.get("adopted")
+            ):
+                # No durable generation row was available, but the callback
+                # still crossed the broker boundary.  Keep the local/in-memory
+                # owner fenced and make the gap operator-visible.
+                log.critical(
+                    "[%s] BROKER_OWNED_DURABILITY_GAP_WITHOUT_GENERATION position=%s local=%s broker=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                    adoption_result.get("local_order_id"),
+                    adoption_result.get("broker_order_id"),
+                )
             return callback_returned
         finally:
             with self._lock:

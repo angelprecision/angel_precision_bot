@@ -756,6 +756,56 @@ def _utc_iso(now=None) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
+def _strict_positive_cursor_int(value) -> int | None:
+    """Resolve a cursor integer field to a positive int without bool/float coercion.
+
+    Rules:
+      - bool is not int even though isinstance(True, int) is True in Python.
+      - float is never acceptable regardless of fractional part.
+      - bare int ≥ 1 is accepted.
+      - numeric-string produced by a proven production cursor producer is NOT
+        accepted here; this helper is used for both trusted expected-authority
+        args and for durable cursor fields.  Callers that need decimal-string
+        compatibility must add their own documented allowance.
+      - Returns None for every rejected value; never raises.
+    """
+    if isinstance(value, bool) or isinstance(value, float):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    return None
+
+
+def _parse_cursor_aware_timestamp(value) -> datetime | None:
+    """Resolve a durable cursor timestamp string to a timezone-aware datetime.
+
+    Never raises.  Requirements:
+      - value must be a str
+      - nonblank
+      - valid ISO-8601 parseable via datetime.fromisoformat
+      - timezone-aware (tzinfo must not be None after parsing)
+
+    Trailing Z is accepted because _utc_iso (the canonical producer) emits
+    trailing +00:00 on CPython 3.11+ but some upstream test representations
+    use Z; both resolve unambiguously to UTC.
+
+    Timezone-naive timestamps are rejected without silent UTC normalization.
+    The durable producer (_utc_iso) already emits aware timestamps; this
+    loader must not manufacture authority that was never stored.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        # Naive timestamp — producer would not emit this.
+        # Reject rather than silently attaching UTC.
+        return None
+    return dt
+
+
 def new_selector_recovery_cursor(
     *,
     local_order_id: str,
@@ -799,41 +849,88 @@ def load_selector_recovery_cursor(
 ) -> tuple[dict, str | None]:
     """Validate identity and bound untrusted JSON cursor input.
 
-    A mismatched cursor is never reused.  The sole previous-generation
-    allowance supports the existing atomic claim transition N→N+1: callers may
-    opt in only after proving the canonical row is owned by the exact new
-    generation.
+    A mismatched or malformed cursor is never reused.  The sole
+    previous-generation allowance supports the existing atomic claim
+    transition N→N+1: callers may opt in only after proving the canonical row
+    is owned by the exact new generation.  Untrusted cursor data never raises;
+    every malformed field returns one stable classified reason.
+
+    TRUSTED EXPECTED AUTHORITY
+    ──────────────────────────
+    materialization_generation and selector_attempt_count are caller-supplied
+    expected authority.  Runtime and preflight callers must provide
+    already-resolved positive integer authority.  bool and float are not
+    accepted.  None is not a positive integer; the function returns a
+    classified authority failure.
+
+    DURABLE CURSOR FIELDS
+    ─────────────────────
+    All numeric fields from the untrusted JSON cursor are validated with
+    _strict_positive_cursor_int.  No bool, float, or string coercion.
+
+    COLLECTION SHAPES AND NESTED RECORDS
+    ─────────────────────────────────────
+    All four cursor collections must be the expected container type before any
+    bounded-truncation is applied.  Malformed collections return a stable
+    MALFORMED_CURSOR:<field> reason and never silently erase durable evidence.
+    Nested attempted-symbol and structural-skip records are validated against
+    the actual producer schema before any bounding.  A malformed nested record
+    anywhere in the map — including beyond the bounded window — rejects the
+    entire cursor.
     """
+    # ── 1. Validate trusted expected authority ────────────────────────────────
+    expected_generation = _strict_positive_cursor_int(materialization_generation)
+    expected_attempt = _strict_positive_cursor_int(selector_attempt_count)
+    # Build fresh using safe fallback values so new_selector_recovery_cursor
+    # never receives None (it calls int(... or 0) internally).
+    safe_generation = expected_generation if expected_generation is not None else 0
+    safe_attempt = expected_attempt if expected_attempt is not None else 1
     fresh = new_selector_recovery_cursor(
         local_order_id=local_order_id,
         client_id=client_id,
         execution_mode=execution_mode,
         signal_id=signal_id,
-        materialization_generation=materialization_generation,
-        selector_attempt_count=selector_attempt_count,
+        materialization_generation=safe_generation,
+        selector_attempt_count=safe_attempt,
         now=now,
     )
+    if expected_generation is None:
+        return fresh, "INVALID_EXPECTED_CURSOR_AUTHORITY:materialization_generation"
+    if expected_attempt is None:
+        return fresh, "INVALID_EXPECTED_CURSOR_AUTHORITY:selector_attempt_count"
+
+    # ── 2. Absent cursor is a fresh start ─────────────────────────────────────
     if candidate in (None, ""):
         return fresh, None
     if not isinstance(candidate, dict):
         return fresh, "MALFORMED_CURSOR"
-    expected = {
-        "version": 1,
+
+    # ── 3. Version — exact integer 1 only ────────────────────────────────────
+    # type(version) is int explicitly rejects bool because bool is a subclass
+    # of int in Python (isinstance(True, int) is True, but type(True) is bool).
+    version = candidate.get("version")
+    if type(version) is not int or version != 1:  # noqa: E721
+        return fresh, "IDENTITY_MISMATCH:version"
+
+    # ── 4. String identity fields ─────────────────────────────────────────────
+    string_identity = {
         "local_order_id": str(local_order_id or ""),
         "client_id": str(client_id or "").strip().lower(),
         "execution_mode": str(execution_mode or "").strip().lower(),
         "signal_id": str(signal_id or ""),
     }
-    for key, value in expected.items():
+    for key, expected_value in string_identity.items():
         actual = candidate.get(key)
         if key in {"client_id", "execution_mode"}:
             actual = str(actual or "").strip().lower()
-        if actual != value:
+        if actual != expected_value:
             return fresh, f"IDENTITY_MISMATCH:{key}"
-    try:
-        actual_generation = int(candidate.get("materialization_generation"))
-        expected_generation = int(materialization_generation)
-    except (TypeError, ValueError):
+
+    # ── 5. Cursor generation — strict positive integer, no bool/float ─────────
+    actual_generation = _strict_positive_cursor_int(
+        candidate.get("materialization_generation")
+    )
+    if actual_generation is None:
         return fresh, "IDENTITY_MISMATCH:materialization_generation"
     allowed_generations = {expected_generation}
     if allow_previous_generation and expected_generation > 1:
@@ -841,27 +938,129 @@ def load_selector_recovery_cursor(
     if actual_generation not in allowed_generations:
         return fresh, "IDENTITY_MISMATCH:materialization_generation"
 
+    # ── 6. Cursor attempt count — strict positive integer, no bool/float ──────
+    actual_attempt = _strict_positive_cursor_int(
+        candidate.get("selector_attempt_count")
+    )
+    if actual_attempt is None:
+        return fresh, "MALFORMED_CURSOR:selector_attempt_count"
+
+    # ── 7. Collection container types — reject before any truncation ──────────
+    # A malformed collection must never be silently replaced with {} or [].
+    # That would destroy durable provider-call and structural-skip evidence.
+    required_shapes = {
+        "attempted_symbols": dict,
+        "structurally_skipped_symbols": dict,
+        "expirations_probed": list,
+        "last_ranked_index_by_expiration": dict,
+    }
+    for field, expected_type in required_shapes.items():
+        if not isinstance(candidate.get(field), expected_type):
+            return fresh, f"MALFORMED_CURSOR:{field}"
+
+    attempted = candidate["attempted_symbols"]
+    skipped = candidate["structurally_skipped_symbols"]
+    expirations = candidate["expirations_probed"]
+    ranked = candidate["last_ranked_index_by_expiration"]
+
+    # ── 8. Attempted-symbol records: canonical key + nested field validation ──
+    #
+    # Producer canonical key: "".join(str(symbol).upper().split())
+    # Durable keys differing from their canonical form represent laundered
+    # corruption (duplicate evidence for the same symbol under different
+    # representations). Reject rather than normalizing.
+    #
+    # Validation covers ALL records BEFORE any bounding. A malformed record
+    # anywhere in the map — including beyond the bounded retention window —
+    # causes the entire cursor to be rejected.
+    #
+    # Producer record shape (record_selector_recovery_attempt):
+    #   attempt_number    : positive int  (max(1, int(attempt_number or 1)))
+    #   expiration        : str           (str(expiration or ""), may be empty)
+    #   result_reason     : str           (str(result_reason or ""), may be empty)
+    #   attempted_at      : aware ISO str (_utc_iso())
+    #   provider_timestamp: any JSON-compatible value including None
+    #   transient         : exact bool    (bool(transient))
+    for symbol, record in attempted.items():
+        canonical_symbol = "".join(str(symbol).upper().split())
+        if (
+            not isinstance(symbol, str)
+            or not canonical_symbol
+            or symbol != canonical_symbol
+            or not isinstance(record, dict)
+        ):
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # attempt_number: strict positive int; no bool/float/string coercion
+        if _strict_positive_cursor_int(record.get("attempt_number")) is None:
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # transient: exact bool; "true"/"false"/1/0/None are not acceptable
+        if type(record.get("transient")) is not bool:  # noqa: E721
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # attempted_at: nonblank str, valid ISO, timezone-aware
+        if _parse_cursor_aware_timestamp(record.get("attempted_at")) is None:
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # expiration: str (empty string allowed — producer emits str(expiration or ""))
+        if not isinstance(record.get("expiration"), str):
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # result_reason: str (empty string allowed — producer emits str(result_reason or ""))
+        if not isinstance(record.get("result_reason"), str):
+            return fresh, "MALFORMED_CURSOR:attempted_symbols"
+        # provider_timestamp: allow any JSON-compatible value including None.
+        # The producer stores an opaque provider-side value; no further constraint.
+
+    # ── 9. Structural-skip records: canonical key + nested field validation ───
+    #
+    # Producer record shape (record_selector_structural_skip):
+    #   skip_reason : str           (str(skip_reason or ""), may be empty)
+    #   observed_at : aware ISO str (_utc_iso())
+    for symbol, record in skipped.items():
+        canonical_symbol = "".join(str(symbol).upper().split())
+        if (
+            not isinstance(symbol, str)
+            or not canonical_symbol
+            or symbol != canonical_symbol
+            or not isinstance(record, dict)
+        ):
+            return fresh, "MALFORMED_CURSOR:structurally_skipped_symbols"
+        # skip_reason: str (empty string allowed — producer emits str(skip_reason or ""))
+        if not isinstance(record.get("skip_reason"), str):
+            return fresh, "MALFORMED_CURSOR:structurally_skipped_symbols"
+        # observed_at: nonblank str, valid ISO, timezone-aware
+        if _parse_cursor_aware_timestamp(record.get("observed_at")) is None:
+            return fresh, "MALFORMED_CURSOR:structurally_skipped_symbols"
+
+    # ── 10. Expiration list and ranked-index map element shapes ───────────────
+    if any(
+        not isinstance(entry, str) or not entry.strip()
+        for entry in expirations
+    ):
+        return fresh, "MALFORMED_CURSOR:expirations_probed"
+
+    if any(
+        not isinstance(expiration, str)
+        or not expiration.strip()
+        or type(index) is not int  # noqa: E721 — reject bool
+        or index < 0
+        for expiration, index in ranked.items()
+    ):
+        return fresh, "MALFORMED_CURSOR:last_ranked_index_by_expiration"
+
+    # ── 11. All validation passed — build bounded output cursor ───────────────
     cursor = dict(candidate)
     cursor["materialization_generation"] = expected_generation
-    cursor["selector_attempt_count"] = max(
-        int(cursor.get("selector_attempt_count") or 0),
-        max(1, int(selector_attempt_count or 1)),
-    )
-    attempted = cursor.get("attempted_symbols")
-    skipped = cursor.get("structurally_skipped_symbols")
-    expirations = cursor.get("expirations_probed")
-    ranked = cursor.get("last_ranked_index_by_expiration")
+    # Advance attempt to trusted current authority if cursor trails behind.
+    cursor["selector_attempt_count"] = max(actual_attempt, expected_attempt)
     cursor["attempted_symbols"] = dict(
-        list((attempted if isinstance(attempted, dict) else {}).items())[-_CURSOR_MAX_SYMBOLS:]
+        list(attempted.items())[-_CURSOR_MAX_SYMBOLS:]
     )
     cursor["structurally_skipped_symbols"] = dict(
-        list((skipped if isinstance(skipped, dict) else {}).items())[-_CURSOR_MAX_SYMBOLS:]
+        list(skipped.items())[-_CURSOR_MAX_SYMBOLS:]
     )
     cursor["expirations_probed"] = list(
-        dict.fromkeys(expirations if isinstance(expirations, list) else [])
+        dict.fromkeys(expirations)
     )[-_CURSOR_MAX_EXPIRATIONS:]
     cursor["last_ranked_index_by_expiration"] = dict(
-        list((ranked if isinstance(ranked, dict) else {}).items())[-_CURSOR_MAX_EXPIRATIONS:]
+        list(ranked.items())[-_CURSOR_MAX_EXPIRATIONS:]
     )
     cursor["updated_at"] = _utc_iso(now)
     return cursor, None
@@ -873,14 +1072,23 @@ def selector_symbol_may_retry(
     refresh_seconds: int,
     now=None,
 ) -> bool:
-    if not isinstance(record, dict) or not bool(record.get("transient")):
+    """Return True if a symbol's most recent attempt may be retried after cooldown.
+
+    Requires exact Boolean retry authority — bool("false") is True in Python
+    and therefore str("false") must not reach this helper as retry authority.
+    The loader validates transient before a cursor can reach execution; this
+    helper enforces the same invariant as defense in depth.
+
+    Returns False for any malformed or missing record field without raising.
+    """
+    if not isinstance(record, dict):
         return False
-    raw = record.get("attempted_at")
-    try:
-        attempted_at = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if attempted_at.tzinfo is None:
-            attempted_at = attempted_at.replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
+    # Exact bool required. "true", "false", 1, 0, None are all rejected.
+    if record.get("transient") is not True:
+        return False
+    attempted_at = _parse_cursor_aware_timestamp(record.get("attempted_at"))
+    if attempted_at is None:
+        # Malformed, blank, non-string, or timezone-naive timestamp — fail closed.
         return False
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:

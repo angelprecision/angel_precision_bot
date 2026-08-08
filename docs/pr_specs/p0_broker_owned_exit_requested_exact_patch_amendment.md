@@ -176,3 +176,4 @@ EXIT_REQUESTED + broker id + submitted_ts null
 ## Audit verdict
 
 HARD HOLD until runtime implementation, focused real-method tests, changed-file audit, comments review, exact-head P0 CI, and a fresh independent release verdict are complete.
+

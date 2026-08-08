@@ -1261,6 +1261,259 @@ class APOrderStateMachine:
         )
         return True
 
+    def adopt_broker_owned_exit_request(
+        self,
+        local_order_id: str,
+        *,
+        broker_order_id: str,
+        execution_mode: str,
+        position_id: str | None = None,
+        client_id: str | None = None,
+        expected_qty: int | None = None,
+        source: str = "broker_owned_exit_request_recovery",
+    ) -> dict:
+        """Adopt one exact broker-owned EXIT_REQUESTED row into EXIT_SUBMITTED.
+
+        A broker order id is ownership evidence, but it is not permission to
+        weaken the generic transition graph or to fabricate a fill.  This
+        method is the narrow recovery seam for the case where the broker
+        accepted an EXIT and the durable submit handoff did not complete.
+
+        The database CAS owns the safety decision.  It validates client, local
+        order, EXIT kind, requested status, exact execution mode, nonblank
+        position identity, positive quantity, optional exact position/quantity
+        identity, and exact-or-empty broker identity in one UPDATE.  Recovery
+        callers must use the returned disposition and must not submit or cancel
+        on a miss.
+        """
+        local_id = str(local_order_id or "").strip()
+        broker_id = str(broker_order_id or "").strip()
+        mode = str(execution_mode or "").strip().lower()
+        self_client_id = str(self.client_id or "").strip()
+        expected_client = str(
+            self_client_id if client_id is None else client_id
+        ).strip().lower()
+        expected_position = str(position_id or "").strip()
+        expected_qty_value = None
+        if expected_qty is not None:
+            try:
+                expected_qty_value = int(expected_qty)
+            except (TypeError, ValueError):
+                expected_qty_value = 0
+
+        def _result(
+            disposition: str,
+            *,
+            reason_code: str,
+            status: str = "",
+            error: str = "",
+            order: dict | None = None,
+        ) -> dict:
+            adopted = disposition in {"ADOPTED", "ALREADY_ADOPTED"}
+            return {
+                "disposition": disposition,
+                "adopted": adopted,
+                "already_adopted": disposition == "ALREADY_ADOPTED",
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "status": status,
+                "reason_code": reason_code,
+                "error": error,
+                "order": order,
+            }
+
+        if (
+            not local_id
+            or not broker_id
+            or broker_id.upper() == "N/A"
+            or mode not in {"live", "paper"}
+            or expected_client != self_client_id.lower()
+            or expected_qty_value is not None and expected_qty_value <= 0
+        ):
+            return _result(
+                "IDENTITY_MISMATCH",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error="invalid_recovery_identity",
+            )
+
+        diagnostic = json.dumps(
+            {
+                "broker_ownership_adopted_from_exit_requested": True,
+                "broker_ownership_adoption_source": str(source or "recovery"),
+                "broker_ownership_adoption_broker_order_id": broker_id,
+                "broker_ownership_adopted_at": now_utc_iso(),
+            }
+        )
+        sql = (
+            "UPDATE orders SET "
+            "status=%s, "
+            "broker_order_id=%s, "
+            "submitted_ts=COALESCE(submitted_ts, NOW()), "
+            "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+            "updated_ts=NOW() "
+            "WHERE local_order_id=%s "
+            "  AND client_id=%s "
+            "  AND kind='EXIT' "
+            "  AND status='EXIT_REQUESTED' "
+            "  AND LOWER(TRIM(COALESCE(execution_mode,'')))=%s "
+            "  AND position_id IS NOT NULL "
+            "  AND BTRIM(position_id::text)<>'' "
+            "  AND qty > 0 "
+            "  AND (broker_order_id IS NULL OR BTRIM(broker_order_id)='' "
+            "       OR broker_order_id=%s)"
+        )
+        params: list = [
+            OrderStatus.EXIT_SUBMITTED,
+            broker_id,
+            diagnostic,
+            local_id,
+            self.client_id,
+            mode,
+            broker_id,
+        ]
+        if expected_position:
+            sql += " AND position_id::text=%s"
+            params.append(expected_position)
+        if expected_qty_value is not None:
+            sql += " AND qty=%s"
+            params.append(expected_qty_value)
+
+        try:
+            def _adopt():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+            rowcount = run_with_retry(_adopt)
+        except Exception as exc:
+            log.critical(
+                "[%s] EXIT broker ownership adoption DB failure | order=%s broker=%s error=%s",
+                self.client_id, local_id, broker_id, exc,
+            )
+            return _result(
+                "DATABASE_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"{type(exc).__name__}:{exc}",
+            )
+
+        if rowcount is None:
+            return _result(
+                "DATABASE_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error="rowcount_unconfirmed",
+            )
+
+        try:
+            latest = self._get_order(local_id)
+        except Exception as exc:
+            log.warning(
+                "[%s] EXIT broker ownership adoption reload failed | order=%s broker=%s error=%s",
+                self.client_id, local_id, broker_id, exc,
+            )
+            latest = None
+        latest_dict = dict(latest) if latest else None
+        if int(rowcount or 0) > 0:
+            adopted_order = latest_dict or {
+                "local_order_id": local_id,
+                "client_id": self.client_id,
+                "kind": "EXIT",
+                "status": OrderStatus.EXIT_SUBMITTED,
+                "broker_order_id": broker_id,
+                "position_id": expected_position,
+            }
+            self._emit_transition_event(
+                local_order_id=local_id,
+                old_status=OrderStatus.EXIT_REQUESTED,
+                new_status=OrderStatus.EXIT_SUBMITTED,
+                order=adopted_order,
+                decision="CONFIRMED",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
+                explanation=(
+                    "Exact broker ownership adopted after EXIT submit handoff "
+                    "left the durable row in EXIT_REQUESTED."
+                ),
+                broker_order_id=broker_id,
+                extra_inputs={
+                    "execution_mode": mode,
+                    "position_id": expected_position or adopted_order.get("position_id"),
+                    "requested_qty": adopted_order.get("qty"),
+                    "source": source,
+                },
+            )
+            self._handle_exit_engine_hooks(
+                current=adopted_order,
+                new_status=OrderStatus.EXIT_SUBMITTED,
+                position_id=expected_position or adopted_order.get("position_id"),
+                broker_order_id=broker_id,
+                local_order_id=local_id,
+            )
+            return _result(
+                "ADOPTED",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
+                status=OrderStatus.EXIT_SUBMITTED,
+                order=adopted_order,
+            )
+
+        if latest_dict:
+            latest_status = str(latest_dict.get("status") or "").strip().upper()
+            latest_broker_id = str(latest_dict.get("broker_order_id") or "").strip()
+            latest_mode = str(latest_dict.get("execution_mode") or "").strip().lower()
+            latest_position = str(latest_dict.get("position_id") or "").strip()
+            try:
+                latest_qty = int(latest_dict.get("qty") or 0)
+            except (TypeError, ValueError):
+                latest_qty = 0
+            latest_identity_matches = bool(
+                str(latest_dict.get("client_id") or "").strip().lower() == self_client_id.lower()
+                and str(latest_dict.get("kind") or "").strip().upper() == "EXIT"
+                and latest_mode == mode
+                and latest_position
+                and (not expected_position or latest_position == expected_position)
+                and latest_qty > 0
+                and (
+                    expected_qty_value is None
+                    or latest_qty == expected_qty_value
+                )
+            )
+            if (
+                latest_status in {
+                    OrderStatus.EXIT_SUBMITTED,
+                    OrderStatus.EXIT_ACKNOWLEDGED,
+                    OrderStatus.EXIT_PARTIAL_FILL,
+                }
+                and latest_broker_id == broker_id
+                and latest_identity_matches
+            ):
+                self._handle_exit_engine_hooks(
+                    current=latest_dict,
+                    new_status=OrderStatus.EXIT_SUBMITTED,
+                    position_id=expected_position or latest_dict.get("position_id"),
+                    broker_order_id=broker_id,
+                    local_order_id=local_id,
+                )
+                return _result(
+                    "ALREADY_ADOPTED",
+                    reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_ADOPTED",
+                    status=latest_status,
+                    order=latest_dict,
+                )
+            if latest_status in OrderStatus.TERMINAL:
+                return _result(
+                    "TERMINAL_ROW",
+                    reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                    status=latest_status,
+                    error="order_already_terminal",
+                    order=latest_dict,
+                )
+
+        return _result(
+            "CAS_MISS",
+            reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+            status=str((latest_dict or {}).get("status") or ""),
+            error="identity_or_status_cas_miss",
+            order=latest_dict,
+        )
+
     # =====================================================================
     # PR81 Final Amendment v2 §3 — opportunity-ledger lifecycle bridge
     # =====================================================================
