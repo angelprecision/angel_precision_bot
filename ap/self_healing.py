@@ -173,11 +173,11 @@ class APSelfHealingSystem:
                     exit_engine=getattr(getattr(runner, "core", None), "exit_eng", None),
                     entry_watcher=getattr(getattr(runner, "core", None), "entry_watcher", None),
                     contract_selector=getattr(getattr(runner, "core", None), "contract_selector", None),
-                    # PR66: propagate the runner's actual mode so a LIVE runner
-                    # that self-heals keeps the strict 90s ceiling.
-                    # getattr(..., "LIVE") fallback: if mode is somehow unset after
-                    # a partial restart, fail safe to LIVE (strict), not PAPER (relaxed).
-                    client_mode=getattr(runner, "mode", "LIVE"),
+                    # Propagate only an actually wired mode.  APOrderMonitor keeps
+                    # its historical LIVE fallback for unrelated timeout policy,
+                    # but #425 broker-owned EXIT recovery must hold when the
+                    # runner's runtime mode is absent or invalid.
+                    client_mode=getattr(runner, "mode", None),
                 )
                 runner.order_monitor.start()
                 return True

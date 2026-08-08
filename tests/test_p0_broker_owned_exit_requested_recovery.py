@@ -16,6 +16,7 @@ from ap import exit_decision_idempotency_guard as guard  # noqa: E402
 from ap import fill_monitor as fm  # noqa: E402
 from ap import order_monitor as om  # noqa: E402
 from ap import order_state_machine as osm_module  # noqa: E402
+from ap import self_healing as self_healing_module  # noqa: E402
 from ap.order_state_machine import APOrderStateMachine, OrderStatus  # noqa: E402
 
 
@@ -107,6 +108,50 @@ class _FakeCursor:
                 row["updated_ts"] = "updated-ts"
                 patch = json.loads(diagnostic)
                 row["meta"] = {**(row.get("meta") or {}), **patch}
+                self.rowcount = 1
+            else:
+                self.rowcount = 0
+            return self
+
+        if normalized.startswith("UPDATE orders SET status=%s, updated_ts=NOW()"):
+            new_status = params[0]
+            index = 1
+            updates = {"status": new_status}
+            set_clause, _, where_clause = normalized.partition(" WHERE ")
+            for column in (
+                "broker_order_id",
+                "filled_qty",
+                "fill_price",
+                "last_error",
+                "submitted_ts",
+                "position_id",
+                "filled_ts",
+            ):
+                if f"{column}=%s" in set_clause:
+                    updates[column] = params[index]
+                    index += 1
+            local_id = str(params[index])
+            client_id = str(params[index + 1])
+            expected_status = params[index + 2]
+            index += 3
+            expected_broker_id = None
+            if "AND (broker_order_id IS NULL OR broker_order_id='' OR broker_order_id=%s)" in where_clause:
+                expected_broker_id = str(params[index])
+
+            row = self.db.rows.get(local_id)
+            matches = bool(
+                row
+                and str(row.get("client_id")) == client_id
+                and row.get("status") == expected_status
+                and (
+                    expected_broker_id is None
+                    or not str(row.get("broker_order_id") or "")
+                    or str(row.get("broker_order_id")) == expected_broker_id
+                )
+            )
+            if matches:
+                row.update(updates)
+                row["updated_ts"] = "updated-ts"
                 self.rowcount = 1
             else:
                 self.rowcount = 0
@@ -680,6 +725,364 @@ def test_broker_lookup_failure_holds_without_replacement_or_cancel(fake_osm_db, 
     assert broker.calls == ["36661364"]
     assert recovery_osm.transition_calls == []
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
+
+
+def test_order_monitor_unknown_broker_status_holds_without_cancel(monkeypatch):
+    order = _row(broker_order_id="unknown-broker-425")
+    osm = _MonitorOSM(order)
+
+    class _LookupFailureBroker(_Broker):
+        def get_order(self, broker_order_id):
+            self.calls.append(str(broker_order_id))
+            raise RuntimeError("broker lookup unavailable")
+
+        def cancel_order(self, broker_order_id):
+            self.calls.append(f"cancel:{broker_order_id}")
+            return {"status": "canceled"}
+
+    broker = _LookupFailureBroker({})
+    monitor = _monitor(order, osm, broker)
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    assert broker.calls == ["unknown-broker-425"]
+    assert osm.transition_calls == []
+    assert any(
+        call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
+        for call in monitor._emit_order_event.call_args_list
+    )
+
+
+def test_self_healing_restart_does_not_invent_live_recovery_mode(monkeypatch):
+    captured = {}
+
+    class _RestartedMonitor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(om, "APOrderMonitor", _RestartedMonitor, raising=False)
+    runner = SimpleNamespace(
+        email="tradefluence",
+        order_monitor=None,
+        order_state_machine=MagicMock(),
+        position_manager=MagicMock(),
+        core=SimpleNamespace(
+            broker=object(),
+            exit_eng=MagicMock(),
+            entry_watcher=None,
+            contract_selector=None,
+        ),
+    )
+    system = self_healing_module.APSelfHealingSystem()
+    self_healing_module.restart_registry.unregister_client(runner.email)
+    system._register_restart_fns(runner)
+    try:
+        restart = self_healing_module.restart_registry.get(runner.email, "order_monitor")
+        assert restart is not None
+        assert restart() is True
+        assert captured["client_mode"] is None
+    finally:
+        self_healing_module.restart_registry.unregister_client(runner.email)
+
+
+class _CanonicalExitEngine:
+    def __init__(self):
+        self.client_id = "tradefluence"
+        self.pending_calls = []
+        self.closed_calls = []
+        self.position = SimpleNamespace(position_id="position-orcl-1", quantity_remaining=4)
+
+    def get_position(self, position_id):
+        return self.position if position_id == self.position.position_id else None
+
+    def set_pending_exit_order(self, position_id, **kwargs):
+        self.pending_calls.append((position_id, kwargs))
+
+    def mark_position_closed(self, position_id, **kwargs):
+        self.closed_calls.append((position_id, kwargs))
+        self.position.quantity_remaining = max(
+            0,
+            self.position.quantity_remaining - int(kwargs.get("qty_filled") or 0),
+        )
+
+
+def test_orcl_replay_uses_real_osm_transition_and_applies_close_once(
+    fake_osm_db, monkeypatch
+):
+    db, osm = fake_osm_db
+    db.rows["exit-orcl-1"]["broker_order_id"] = "36661364"
+    engine = _CanonicalExitEngine()
+    monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
+    osm._handle_exit_engine_hooks = APOrderStateMachine._handle_exit_engine_hooks.__get__(
+        osm, APOrderStateMachine
+    )
+    osm._finalize_position_from_exit_order = MagicMock()
+    broker = _Broker(
+        {
+            "status": "FILLED",
+            "exec_quantity": 4,
+            "avg_fill_price": 1.25,
+            "quantity": 4,
+        }
+    )
+    monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
+    monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: None)
+    original_order = dict(db.rows["exit-orcl-1"])
+
+    fm.process_pending_order(
+        broker,
+        original_order,
+        osm=osm,
+        runtime_execution_mode="paper",
+    )
+    fm.process_pending_order(
+        broker,
+        original_order,
+        osm=osm,
+        runtime_execution_mode="paper",
+    )
+
+    assert broker.calls == ["36661364"]
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_FILLED"
+    assert db.rows["exit-orcl-1"]["filled_qty"] == 4
+    assert len(engine.pending_calls) == 1
+    assert len(engine.closed_calls) == 1
+
+
+def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypatch):
+    """Use disposable PostgreSQL for adoption CAS, fill transition, and replay fencing."""
+    from contextlib import contextmanager
+    import uuid
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    extras = pytest.importorskip("psycopg2.extras")
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url:
+        pytest.skip("DATABASE_URL not configured")
+
+    try:
+        admin = psycopg2.connect(database_url, connect_timeout=2)
+    except Exception as exc:
+        pytest.skip(f"disposable PostgreSQL unavailable: {type(exc).__name__}")
+
+    schema = f"pr425_{uuid.uuid4().hex}"
+
+    @contextmanager
+    def _pg_conn():
+        connection = psycopg2.connect(database_url, connect_timeout=2)
+        cursor = connection.cursor(cursor_factory=extras.RealDictCursor)
+        try:
+            cursor.execute(f'SET search_path TO "{schema}"')
+            yield _RealPostgresConnection(connection, cursor)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            cursor.close()
+            connection.close()
+
+    class _RealPostgresConnection:
+        def __init__(self, connection, cursor):
+            self.connection = connection
+            self.cursor = cursor
+
+        @property
+        def rowcount(self):
+            return self.cursor.rowcount
+
+        def execute(self, sql, params=None):
+            self.cursor.execute(sql, params)
+            return self
+
+        def fetchone(self):
+            return self.cursor.fetchone()
+
+        def fetchall(self):
+            return self.cursor.fetchall()
+
+    try:
+        admin.autocommit = True
+        with admin.cursor() as cursor:
+            cursor.execute(f'CREATE SCHEMA "{schema}"')
+            cursor.execute(
+                f"""
+                CREATE TABLE "{schema}".orders (
+                    local_order_id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    position_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    broker_order_id TEXT,
+                    submitted_ts TIMESTAMPTZ,
+                    filled_ts TIMESTAMPTZ,
+                    filled_qty INTEGER NOT NULL DEFAULT 0,
+                    fill_price NUMERIC,
+                    execution_mode TEXT NOT NULL,
+                    qty INTEGER NOT NULL,
+                    meta JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    last_error TEXT,
+                    symbol TEXT,
+                    contract TEXT,
+                    created_ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_ts TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE TABLE "{schema}".positions (
+                    id TEXT PRIMARY KEY,
+                    client_id TEXT NOT NULL,
+                    quantity_remaining INTEGER NOT NULL,
+                    qty INTEGER NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                f"""
+                INSERT INTO "{schema}".positions
+                    (id, client_id, quantity_remaining, qty)
+                VALUES ('position-orcl-1', 'tradefluence', 4, 4)
+                """
+            )
+            cursor.execute(
+                f"""
+                INSERT INTO "{schema}".orders
+                    (local_order_id, client_id, position_id, kind, status,
+                     broker_order_id, execution_mode, qty, symbol, contract)
+                VALUES
+                    ('exit-orcl-concurrent', 'tradefluence', 'position-orcl-1',
+                     'EXIT', 'EXIT_REQUESTED', NULL, 'paper', 4, 'ORCL',
+                     'ORCL260807P00155000'),
+                    ('exit-orcl-real-pg', 'tradefluence', 'position-orcl-1',
+                     'EXIT', 'EXIT_REQUESTED', '36661364', 'paper', 4, 'ORCL',
+                     'ORCL260807P00155000')
+                """
+            )
+
+        monkeypatch.setattr(osm_module, "conn", _pg_conn)
+        monkeypatch.setattr(osm_module, "run_with_retry", lambda fn, **kwargs: fn())
+        engine = _CanonicalExitEngine()
+        monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
+
+        osm_a = APOrderStateMachine("tradefluence")
+        osm_b = APOrderStateMachine("tradefluence")
+        for state_machine in (osm_a, osm_b):
+            state_machine._emit_transition_event = MagicMock()
+            state_machine._notify_opportunity_ledger = MagicMock()
+
+        barrier = threading.Barrier(2)
+        adoption_results = []
+        adoption_errors = []
+
+        def _concurrent_adopt(state_machine):
+            try:
+                barrier.wait(timeout=5)
+                adoption_results.append(
+                    state_machine.adopt_broker_owned_exit_request(
+                        "exit-orcl-concurrent",
+                        broker_order_id="concurrent-broker-425",
+                        execution_mode="paper",
+                        client_id="tradefluence",
+                        position_id="position-orcl-1",
+                        expected_qty=4,
+                        source="real_postgres_concurrency_replay",
+                    )
+                )
+            except Exception as exc:
+                adoption_errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_concurrent_adopt, args=(osm_a,)),
+            threading.Thread(target=_concurrent_adopt, args=(osm_b,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert adoption_errors == []
+        assert all(not thread.is_alive() for thread in threads)
+        assert {result["disposition"] for result in adoption_results} == {
+            "ADOPTED",
+            "ALREADY_BROKER_OWNED_ACTIVE",
+        }
+        with _pg_conn() as connection:
+            connection.execute(
+                "SELECT status, broker_order_id FROM orders "
+                "WHERE local_order_id=%s AND client_id=%s",
+                ("exit-orcl-concurrent", "tradefluence"),
+            )
+            concurrent_row = dict(connection.fetchone())
+        assert concurrent_row == {
+            "status": "EXIT_SUBMITTED",
+            "broker_order_id": "concurrent-broker-425",
+        }
+        assert len(engine.pending_calls) == 1
+
+        osm = APOrderStateMachine("tradefluence")
+        osm._emit_transition_event = MagicMock()
+        osm._notify_opportunity_ledger = MagicMock()
+        osm._finalize_position_from_exit_order = MagicMock()
+        broker = _Broker(
+            {
+                "status": "FILLED",
+                "exec_quantity": 4,
+                "avg_fill_price": 1.25,
+                "quantity": 4,
+            }
+        )
+        monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
+        monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
+        monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: None)
+        with _pg_conn() as connection:
+            connection.execute(
+                "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
+                ("exit-orcl-real-pg", "tradefluence"),
+            )
+            original_order = dict(connection.fetchone())
+
+        fm.process_pending_order(
+            broker,
+            original_order,
+            osm=osm,
+            runtime_execution_mode="paper",
+        )
+        fm.process_pending_order(
+            broker,
+            original_order,
+            osm=osm,
+            runtime_execution_mode="paper",
+        )
+
+        with _pg_conn() as connection:
+            connection.execute(
+                "SELECT status, filled_qty, fill_price FROM orders "
+                "WHERE local_order_id=%s AND client_id=%s",
+                ("exit-orcl-real-pg", "tradefluence"),
+            )
+            filled_row = dict(connection.fetchone())
+        assert broker.calls == ["36661364"]
+        assert filled_row["status"] == "EXIT_FILLED"
+        assert filled_row["filled_qty"] == 4
+        assert float(filled_row["fill_price"]) == 1.25
+        assert len(engine.pending_calls) == 2
+        assert len(engine.closed_calls) == 1
+        assert engine.position.quantity_remaining == 0
+        osm._finalize_position_from_exit_order.assert_called_once()
+    finally:
+        try:
+            with admin.cursor() as cursor:
+                cursor.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        finally:
+            admin.close()
 
 
 def test_fill_monitor_holds_on_runtime_mode_conflict_before_broker_poll(

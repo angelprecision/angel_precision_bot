@@ -266,6 +266,21 @@ def _has_proven_broker_order_id(value) -> bool:
     return bool(broker_id and broker_id.upper() != "N/A")
 
 
+_UNKNOWN_BROKER_STATUSES = frozenset({
+    "",
+    "unknown",
+    "error",
+    "unavailable",
+    "not_found",
+    "not found",
+})
+
+
+def _is_unknown_broker_status(value) -> bool:
+    """Treat missing/error/unknown broker truth as HOLD, never as cancelable."""
+    return str(value or "").strip().lower() in _UNKNOWN_BROKER_STATUSES
+
+
 class APOrderMonitor:
     """
     Background stale-order monitor per client.
@@ -2448,7 +2463,16 @@ class APOrderMonitor:
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if self._is_executed_status(broker_status) or self._is_terminal_failure_status(broker_status):
+                    if _is_unknown_broker_status(broker_status):
+                        self._hold_on_unknown_broker_status(
+                            local_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason="stale exit broker status lookup failed or was unknown",
+                        )
+                    elif self._is_executed_status(broker_status) or self._is_terminal_failure_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_exit(
@@ -2463,7 +2487,16 @@ class APOrderMonitor:
             elif status == "EXIT_ACKNOWLEDGED":
                 if age_secs > TIMEOUT_EXIT_ACK:
                     broker_status = self._query_broker_order(broker_oid)
-                    if broker_status:
+                    if _is_unknown_broker_status(broker_status):
+                        self._hold_on_unknown_broker_status(
+                            local_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason="acknowledged exit broker status lookup failed or was unknown",
+                        )
+                    elif broker_status:
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_exit(
@@ -3461,6 +3494,38 @@ class APOrderMonitor:
                     f"{contract} | {local_order_id} | broker_status={confirmed_status or 'unknown'}"
                 )
 
+    def _hold_on_unknown_broker_status(
+        self,
+        local_order_id: str,
+        status: str,
+        contract: str,
+        *,
+        position_id: Optional[str],
+        broker_order_id: Optional[str],
+        reason: str,
+    ) -> None:
+        """Hold stale exits when broker truth is unavailable or non-authoritative."""
+        self._emit_order_event(
+            local_order_id=local_order_id,
+            stage="order_monitor",
+            decision="ALERT",
+            reason_code="BROKER_STATUS_UNKNOWN",
+            explanation=(
+                f"{reason}; no cancel, clear, reopen, or replacement is allowed"
+            ),
+            contract=contract,
+            position_id=position_id,
+            inputs={
+                "status": status,
+                "broker_order_id": broker_order_id,
+                "broker_status": "unknown",
+            },
+        )
+        self._alert(
+            f"BROKER_STATUS_UNKNOWN — HOLD | {self.client_id} | {contract} | "
+            f"{local_order_id} | broker={broker_order_id or 'unknown'}"
+        )
+
     def _handle_stale_exit(
         self,
         local_order_id: str,
@@ -3507,6 +3572,17 @@ class APOrderMonitor:
 
         broker_oid = self._get_broker_order_id(local_order_id)
         broker_status = self._query_broker_order(broker_oid)
+
+        if _is_unknown_broker_status(broker_status):
+            self._hold_on_unknown_broker_status(
+                local_order_id,
+                status,
+                contract,
+                position_id=position_id,
+                broker_order_id=broker_oid,
+                reason="stale exit broker status lookup failed or was unknown",
+            )
+            return
 
         if self._is_executed_status(broker_status):
             log.info(
