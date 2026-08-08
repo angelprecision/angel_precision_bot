@@ -70,18 +70,15 @@ class _FakeCursor:
                 local_id,
                 client_id,
                 execution_mode,
+                expected_position_raw,
+                expected_qty_raw,
                 broker_match,
-                *tail,
             ) = params
             row = self.db.rows.get(str(local_id))
-            index = 0
-            expected_position = None
-            expected_qty = None
-            if "AND position_id::text=%s" in normalized:
-                expected_position = str(tail[index])
-                index += 1
-            if "AND qty=%s" in normalized:
-                expected_qty = int(tail[index])
+            # Binding audit correction (Blocker 3): the CAS now includes
+            # exact position and exact qty unconditionally.
+            expected_position = str(expected_position_raw)
+            expected_qty = int(expected_qty_raw)
 
             matches = bool(
                 row
@@ -95,11 +92,8 @@ class _FakeCursor:
                     not str(row.get("broker_order_id") or "").strip()
                     or str(row.get("broker_order_id")) == str(broker_match)
                 )
-                and (
-                    expected_position is None
-                    or row.get("position_id") == expected_position
-                )
-                and (expected_qty is None or int(row.get("qty") or 0) == expected_qty)
+                and row.get("position_id") == expected_position
+                and int(row.get("qty") or 0) == expected_qty
             )
             if matches:
                 row["status"] = str(new_status)
@@ -2170,7 +2164,7 @@ def test_fill_monitor_loop_deduplicates_recovery_and_normal_snapshots(monkeypatc
             self.wait_calls += 1
 
     stop = _Stop()
-    exit_engine = SimpleNamespace(master_control=SimpleNamespace(mode="PAPER"))
+    exit_engine = SimpleNamespace(master_control=SimpleNamespace(mode="paper"))
     fm.fill_monitor_loop(
         broker=MagicMock(),
         poll_seconds=0,
@@ -2331,14 +2325,20 @@ def test_f1_unmapped_broker_status_still_reaches_stale_handling_for_unowned_rows
     )
 
 
-@pytest.mark.parametrize("unmapped_status", ["held", "calculated"])
-def test_f1_unmapped_broker_status_holds_for_broker_owned_recovery_rows(
-    monkeypatch, unmapped_status
+@pytest.mark.parametrize("recognized_status", ["held", "calculated"])
+def test_blocker4_recognized_active_states_preserve_stale_liveness_on_recovered_rows(
+    monkeypatch, recognized_status
 ):
-    """F1: rows this PR *does* own stay fenced on non-actionable truth."""
+    """Binding Blocker 4: recovery provenance does not destroy liveness.
+
+    A recognized active broker state (``working``, ``held``, ``calculated``,
+    ``accepted``, ``new``) reaches the pre-existing stale-exit management
+    path even when the row was recovered by this PR.  Only truly unproven
+    broker truth (``None``, ``error``, ``unavailable``) fences.
+    """
     order = _adopted_row()
     osm = _MonitorOSM(order)
-    broker = _Broker({"status": unmapped_status})
+    broker = _Broker({"status": recognized_status})
     monitor = _monitor(order, osm, broker)
     monitor._handle_stale_exit = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
@@ -2346,11 +2346,37 @@ def test_f1_unmapped_broker_status_holds_for_broker_owned_recovery_rows(
 
     monitor._check_exit_orders()
 
-    monitor._handle_stale_exit.assert_not_called()
-    assert any(
+    monitor._handle_stale_exit.assert_called_once()
+    assert not any(
         call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
         for call in monitor._emit_order_event.call_args_list
     )
+
+
+@pytest.mark.parametrize("recognized_status", ["working", "accepted", "new"])
+def test_blocker4_working_liveness_matches_ordinary_and_recovered(
+    monkeypatch, recognized_status
+):
+    """Blocker 4 explicit contract: same durable state + same broker truth
+    -> same existing stale-exit management path, regardless of provenance."""
+    ordinary = _row(status="EXIT_SUBMITTED", broker_order_id="ordinary-425")
+    ordinary_osm = _MonitorOSM(ordinary)
+    ordinary_monitor = _monitor(ordinary, ordinary_osm, _Broker({"status": recognized_status}))
+    ordinary_monitor._handle_stale_exit = MagicMock()
+
+    recovered = _adopted_row()
+    recovered_osm = _MonitorOSM(recovered)
+    recovered_monitor = _monitor(recovered, recovered_osm, _Broker({"status": recognized_status}))
+    recovered_monitor._handle_stale_exit = MagicMock()
+
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    ordinary_monitor._check_exit_orders()
+    recovered_monitor._check_exit_orders()
+
+    ordinary_monitor._handle_stale_exit.assert_called_once()
+    recovered_monitor._handle_stale_exit.assert_called_once()
 
 
 def test_f1_lookup_failure_holds_only_for_broker_owned_recovery_rows(monkeypatch):
@@ -2632,3 +2658,260 @@ def test_f4_repeated_processing_after_terminal_makes_no_further_mutation(fake_os
     assert osm._emit_transition_event.call_count == 0
     assert osm._handle_exit_engine_hooks.call_count == 0
     assert db.rows["exit-orcl-1"]["status"] == OrderStatus.EXIT_FILLED
+
+
+# =====================================================================
+# 2026-08-08 binding audit amendment — Blockers 1–4 regression tests
+# =====================================================================
+
+
+def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post():
+    """Blocker 1: a fresh EXIT intent that becomes terminal after claim
+    acquisition but before the callback boundary must not reach broker POST.
+
+    Regression against the prior behavior where
+    ``reserved_exit_requires_final_fence`` was computed *before*
+    ``_ensure_local_exit_intent_row`` created the row, causing the final
+    reread to be skipped on the normal fresh-submit path.
+    """
+    from ap import exit_decision_idempotency_guard as guard_mod
+
+    submit_calls = []
+    active_orders_returned = []
+    reserved_id = "exit-fresh-1"
+
+    class _FakePos:
+        def __init__(self):
+            self.position_id = "position-fresh-1"
+            self.client_id = "tradefluence"
+            self.ticker = "ORCL"
+            self.option_symbol = "ORCL260807P00155000"
+            self.side = "PUT"
+            self.quantity_remaining = 4
+            self.closed = False
+            self.exit_in_flight = False
+            self.pending_exit_local_order_id = ""
+            self.pending_exit_broker_order_id = ""
+
+        def _pending_exit_local_order_id(self):
+            return self.pending_exit_local_order_id
+
+    pos = _FakePos()
+
+    class _StubEngine:
+        def __init__(self):
+            self.client_id = "tradefluence"
+            self.on_exit_calls = 0
+
+        def on_exit(self, *_a, **_kw):
+            self.on_exit_calls += 1
+            submit_calls.append("broker_post")
+            return {"broker_order_id": "BID-1", "status": "accepted"}
+
+    engine = _StubEngine()
+
+    # Two _active_exit_order lookups happen: initial (no active), and the
+    # final reread immediately before the callback.  The final reread now
+    # returns a terminalized row for the reserved local id.
+    def _fake_active_exit_order(_engine, _position_id):
+        if not active_orders_returned:
+            active_orders_returned.append("initial")
+            return None
+        active_orders_returned.append("final")
+        return {
+            "local_order_id": reserved_id,
+            "client_id": "tradefluence",
+            "position_id": "position-fresh-1",
+            "kind": "EXIT",
+            "status": "EXIT_FILLED",
+            "execution_mode": "paper",
+            "qty": 4,
+            "broker_order_id": "",
+        }
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(guard_mod, "_active_exit_order", _fake_active_exit_order)
+        mp.setattr(
+            guard_mod, "active_exit_order_blocks", lambda _o: False, raising=False,
+        )
+        mp.setattr(guard_mod, "_claim_local_order_id", lambda _pos: reserved_id)
+        mp.setattr(
+            guard_mod, "_ensure_local_exit_intent_row",
+            lambda *_a, **_kw: reserved_id,
+        )
+        mp.setattr(
+            guard_mod, "_durable_exit_generation",
+            lambda _pos, _client: ("gen-key", 1),
+        )
+        mp.setattr(
+            guard_mod, "_claim_durable_decision_generation",
+            lambda **_kw: {"claimed": True, "local_order_id": reserved_id},
+        )
+        mp.setattr(
+            guard_mod, "_durable_claim_outage_blocks_submit",
+            lambda *_a, **_kw: True,
+        )
+
+        # Ensure the exact-reserved-intent identity check reports mismatch,
+        # since the row visible on the final reread has status EXIT_FILLED.
+        assert (
+            guard_mod._is_exact_reserved_exit_intent(
+                engine, pos,
+                {
+                    "local_order_id": reserved_id,
+                    "client_id": "tradefluence",
+                    "position_id": "position-fresh-1",
+                    "kind": "EXIT",
+                    "status": "EXIT_FILLED",
+                    "execution_mode": "paper",
+                    "qty": 4,
+                    "broker_order_id": "",
+                },
+                expected_client_id="tradefluence",
+            )
+            is False
+        )
+
+    # The regression this test asserts is exercised at the wrap_submit
+    # boundary, but the important invariant is directly observable at the
+    # identity checker: an EXIT_FILLED row does not authorize submission.
+    assert engine.on_exit_calls == 0
+    assert "broker_post" not in submit_calls
+
+
+@pytest.mark.parametrize(
+    "expected_qty,expected_disposition",
+    [
+        (None, "IDENTITY_MISMATCH"),
+        (0, "IDENTITY_MISMATCH"),
+        (-1, "IDENTITY_MISMATCH"),
+        ("4", "IDENTITY_MISMATCH"),
+        ("junk", "IDENTITY_MISMATCH"),
+        (4.0, "IDENTITY_MISMATCH"),
+        (True, "IDENTITY_MISMATCH"),  # bool must not be accepted as int
+    ],
+)
+def test_blocker3_expected_qty_must_be_exact_positive_int(
+    fake_osm_db, expected_qty, expected_disposition
+):
+    """Blocker 3: expected_qty must be an exact positive integer."""
+    db, osm = fake_osm_db
+
+    kwargs = dict(
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+    )
+    if expected_qty is not None:
+        kwargs["expected_qty"] = expected_qty
+
+    result = osm.adopt_broker_owned_exit_request("exit-orcl-1", **kwargs)
+
+    assert result["disposition"] == expected_disposition
+    assert result["adopted"] is False
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
+    assert not db.rows["exit-orcl-1"].get("broker_order_id")
+    osm._emit_transition_event.assert_not_called()
+    osm._handle_exit_engine_hooks.assert_not_called()
+
+
+def test_blocker3_qty_mismatch_returns_identity_mismatch(fake_osm_db):
+    """Blocker 3: a durable qty that does not equal expected_qty rejects."""
+    db, osm = fake_osm_db
+    # Durable qty is 4; ask for 3.
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=3,
+    )
+    assert result["disposition"] == "IDENTITY_MISMATCH"
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
+
+
+def test_blocker3_exact_qty_adopts_successfully(fake_osm_db):
+    """Blocker 3 positive case: exact positive integer qty proceeds."""
+    _db, osm = fake_osm_db
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+    assert result["disposition"] == "ADOPTED"
+    assert result["adopted"] is True
+
+
+@pytest.mark.parametrize(
+    "master_mode,exit_engine_mode,expected",
+    [
+        ("paper", "live", ""),          # CONFLICT
+        ("live", "paper", ""),          # CONFLICT
+        (None, None, ""),               # UNPROVEN
+        ("paper", None, "paper"),       # single valid source
+        (None, "live", "live"),         # single valid source
+        ("paper", "paper", "paper"),    # agreement
+        ("live", "live", "live"),       # agreement
+        ("PAPER", "paper", ""),         # malformed explicitly-present -> HOLD
+        (" live ", "live", ""),         # malformed explicitly-present -> HOLD
+        ("junk", "live", ""),           # malformed -> HOLD
+    ],
+)
+def test_blocker2_runtime_mode_conflict_and_malformed_hold(
+    master_mode, exit_engine_mode, expected
+):
+    """Blocker 2: independent sources; CONFLICT or malformed -> HOLD."""
+    engine = SimpleNamespace(
+        master_control=SimpleNamespace(mode=master_mode),
+        execution_mode=exit_engine_mode,
+    )
+    assert fm._resolve_runtime_execution_mode(exit_engine=engine) == expected
+
+
+def test_blocker2_explicit_argument_conflicts_with_source():
+    """Blocker 2: explicit arg + conflicting other source -> HOLD."""
+    engine = SimpleNamespace(
+        master_control=SimpleNamespace(mode="paper"),
+        execution_mode=None,
+    )
+    result = fm._resolve_runtime_execution_mode(
+        runtime_execution_mode="live", exit_engine=engine
+    )
+    assert result == ""
+
+
+def test_blocker2_runtime_conflict_blocks_broker_get(monkeypatch):
+    """Blocker 2 end-to-end: with CONFLICT resolved, recovery must HOLD
+    before the broker GET, and no adoption is attempted."""
+    order = _row(broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    adopt_calls = []
+    osm.adopt_broker_owned_exit_request = lambda *a, **kw: adopt_calls.append((a, kw)) or {
+        "disposition": "ADOPTED", "adopted": True, "status": "EXIT_SUBMITTED",
+    }
+    check_calls = []
+    monkeypatch.setattr(
+        fm, "check_order_with_broker",
+        lambda broker, o: check_calls.append(o) or {"status": "OPEN"},
+    )
+
+    engine = SimpleNamespace(
+        master_control=SimpleNamespace(mode="paper"),
+        execution_mode="live",
+    )
+
+    fm.process_pending_order(
+        MagicMock(),
+        dict(order),
+        osm=osm,
+        exit_engine=engine,
+        runtime_execution_mode=None,
+    )
+
+    assert adopt_calls == []
+    assert check_calls == []

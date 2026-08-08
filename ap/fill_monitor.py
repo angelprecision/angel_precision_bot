@@ -285,9 +285,22 @@ def _has_proven_broker_order_id(value) -> bool:
     return bool(broker_id and broker_id.upper() != "N/A")
 
 
-def _normalize_runtime_execution_mode(value) -> str:
-    mode = str(value or "").strip().lower()
-    return mode if mode in {"live", "paper"} else ""
+def _mode_source_state(value) -> tuple[str, str]:
+    """Classify one runtime mode source: ('absent'|'malformed'|'valid', mode).
+
+    ``absent`` covers ``None`` and unset; ``malformed`` covers explicitly
+    present but non-canonical (e.g. ``"LIVE"``, ``"  live  "``, unrelated
+    strings); ``valid`` returns the canonical ``live``/``paper``.
+    """
+    if value is None:
+        return ("absent", "")
+    raw = str(value)
+    stripped = raw.strip().lower()
+    if stripped in {"live", "paper"} and raw == stripped:
+        return ("valid", stripped)
+    if stripped == "":
+        return ("absent", "")
+    return ("malformed", "")
 
 
 def _resolve_runtime_execution_mode(
@@ -295,18 +308,43 @@ def _resolve_runtime_execution_mode(
     runtime_execution_mode=None,
     exit_engine=None,
 ) -> str:
-    """Resolve only an explicitly wired runtime mode for recovery fencing."""
-    if runtime_execution_mode is not None:
-        return _normalize_runtime_execution_mode(runtime_execution_mode)
+    """Resolve runtime execution-mode authority with CONFLICT detection.
+
+    Binding audit correction: runtime authority is independent per source.
+    Conflicts and malformed-but-present values must HOLD, never resolve by
+    precedence.  Behavior:
+
+    - zero valid sources -> ``""`` (UNPROVEN / HOLD)
+    - one or more valid sources agreeing -> canonical ``live``/``paper``
+    - two or more valid sources disagreeing -> ``""`` (CONFLICT / HOLD)
+    - any explicitly-present malformed source -> ``""`` (HOLD)
+
+    Durable row mode is not part of this resolution.  Callers apply the
+    exact-equality gate between this result and the row's own
+    ``execution_mode``.
+    """
     master_control = getattr(exit_engine, "master_control", None)
-    for candidate in (
+    candidates = (
+        runtime_execution_mode,
         getattr(master_control, "mode", None),
         getattr(exit_engine, "execution_mode", None),
-    ):
-        normalized = _normalize_runtime_execution_mode(candidate)
-        if normalized:
-            return normalized
-    return ""
+    )
+    proven: set[str] = set()
+    for candidate in candidates:
+        state, mode = _mode_source_state(candidate)
+        if state == "malformed":
+            return ""
+        if state == "valid":
+            proven.add(mode)
+    if len(proven) != 1:
+        return ""
+    return next(iter(proven))
+
+
+# Backwards-compatible shim: some call sites and tests import this name.
+def _normalize_runtime_execution_mode(value) -> str:
+    state, mode = _mode_source_state(value)
+    return mode if state == "valid" else ""
 
 
 def get_broker_owned_exit_requests(client_id: str) -> list[dict]:

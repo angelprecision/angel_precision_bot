@@ -1079,12 +1079,35 @@ def _adopt_callback_broker_ownership(
         }
     else:
         result = None
-    expected_qty = (active_order or {}).get("qty") if isinstance(active_order, dict) else None
+    # Binding audit correction (Blocker 3): the adoption seam requires an
+    # exact positive integer.  Convert here so a malformed durable qty
+    # becomes an explicit durability gap rather than a silent
+    # IDENTITY_MISMATCH from the seam.
+    raw_qty = (active_order or {}).get("qty") if isinstance(active_order, dict) else None
+    expected_qty: int | None = None
+    if isinstance(raw_qty, bool):
+        expected_qty = None
+    elif isinstance(raw_qty, int) and raw_qty > 0:
+        expected_qty = raw_qty
+    else:
+        try:
+            candidate = int(str(raw_qty).strip())
+            if candidate > 0:
+                expected_qty = candidate
+        except (TypeError, ValueError):
+            expected_qty = None
     broker_submitted_ts = identity.get("broker_submitted_ts")
     if not broker_submitted_ts and isinstance(active_order, dict):
         broker_submitted_ts = active_order.get("broker_submitted_ts")
         if not broker_submitted_ts:
             broker_submitted_ts = _claim_meta_dict(active_order).get("broker_submitted_ts")
+    if result is None and expected_qty is None:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+            "error": "durable_expected_qty_missing_or_invalid",
+        }
     if result is None and not callable(adopt):
         # An exact broker id crossed the external boundary, but the local
         # adoption seam is unavailable.  Treat that as an explicit
@@ -1675,7 +1698,19 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     # A pending local id is only a pointer. Re-read and prove
                     # the row after durable claim acquisition, immediately
                     # before the irreversible callback boundary.
-                    if reserved_exit_requires_final_fence:
+                    #
+                    # Binding audit correction: this fence must fire for BOTH
+                    # a reservation that existed before this invocation AND a
+                    # fresh EXIT_REQUESTED created by
+                    # ``_ensure_local_exit_intent_row`` during this invocation.
+                    # Gating on ``reserved_exit_requires_final_fence`` (which
+                    # was computed *before* intent-row creation) let the
+                    # normal fresh-submit path — no pre-existing pending id,
+                    # no blocking active EXIT — bypass the reread and reach
+                    # the broker POST after a concurrent worker terminalized,
+                    # replaced, or invalidated the row.  The existence of a
+                    # nonblank ``local_order_id`` here is sufficient.
+                    if local_order_id or reserved_exit_requires_final_fence:
                         try:
                             active_order = _active_exit_order(self, position_id)
                         except Exception as exc:

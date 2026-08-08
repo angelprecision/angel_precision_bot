@@ -280,11 +280,8 @@ _UNPROVEN_BROKER_STATUSES = frozenset({
     "not found",
 })
 
-# Statuses the broker really reports and that ``_advance_from_broker_status``
-# can act on.  Anything outside this set is authoritative broker truth that
-# this monitor simply has no transition for (for example Tradier ``held`` or
-# ``calculated``); it is NOT a lookup failure and must not be reclassified as
-# one.
+# Statuses the monitor has a direct canonical OSM transition for.  These
+# will be advanced by ``_advance_from_broker_status`` on their own.
 _ACTIONABLE_BROKER_STATUSES = frozenset({
     "pending",
     "open",
@@ -298,15 +295,28 @@ _ACTIONABLE_BROKER_STATUSES = frozenset({
     "rejected",
 })
 
+# Statuses that are recognized live broker states with no direct OSM
+# transition but that the pre-existing stale-exit machinery already handles
+# as active broker truth.  Binding audit correction (Blocker 4): these must
+# preserve stale-exit liveness on rows this PR recovered, exactly as they do
+# on ordinary rows.  Recovery provenance may not strand a legitimate working
+# exit indefinitely.
+_RECOGNIZED_ACTIVE_BROKER_STATUSES = frozenset({
+    "working",
+    "accepted",
+    "ack",
+    "acked",
+    "new",
+    "submitted",
+    "held",
+    "hold",
+    "calculated",
+    "ok",
+})
+
 
 def _is_unproven_broker_status(value) -> bool:
-    """True only when the broker status lookup produced no truth at all.
-
-    Retained as the explicit vocabulary of a failed lookup.  It is folded
-    into ``_requires_broker_owned_exit_fence`` rather than applied on its
-    own: an unproven status is by definition not actionable, and gating on
-    it independently would change behavior for rows this PR does not own.
-    """
+    """True only when the broker status lookup produced no truth at all."""
     return str(value or "").strip().lower() in _UNPROVEN_BROKER_STATUSES
 
 
@@ -314,6 +324,18 @@ def _is_actionable_broker_status(value) -> bool:
     """True when the monitor has a canonical transition for this status."""
     status = str(value or "").strip().lower()
     return status in _ACTIONABLE_BROKER_STATUSES
+
+
+def _is_recognized_active_broker_status(value) -> bool:
+    """True when this is a live broker state we know is active, but unmapped.
+
+    An ordinary EXIT_SUBMITTED + WORKING row already reaches the existing
+    stale-exit management path.  A #425-recovered row on the same broker
+    truth must reach the same path — recovery provenance does not destroy
+    liveness.
+    """
+    status = str(value or "").strip().lower()
+    return status in _RECOGNIZED_ACTIVE_BROKER_STATUSES
 
 
 def _coerce_meta(order) -> dict:
@@ -350,19 +372,28 @@ def _broker_ownership_adopted_at(order):
 def _requires_broker_owned_exit_fence(value) -> bool:
     """HOLD predicate, applied only to rows this PR recovered.
 
-    A row whose EXIT lifecycle was adopted from ``EXIT_REQUESTED`` via exact
-    broker ownership is fenced whenever broker truth is unproven or simply
-    not actionable: adoption alone does not license cancel/reprice on an exit
-    the broker may already have worked.
+    Binding audit correction (Blocker 4): recovery provenance does not
+    destroy stale-exit liveness.  A row this PR recovered fences ONLY when
+    broker truth was not produced at all (transport failure, unknown,
+    unavailable) or when the broker returned an unrecognized string we have
+    no policy for.  Recognized live broker states such as ``working``,
+    ``accepted``, ``new``, ``held``, and ``calculated`` — which the
+    pre-existing stale-exit machinery already treats as active broker truth
+    — must reach that same path for a recovered row.  Otherwise a legitimate
+    working exit would be permanently fenced merely because #425 recovered
+    it.
 
-    This predicate is never consulted for any other row.  Rows this PR does
-    not own keep main's behavior exactly, so the stale working-exit surface
-    owned by #423 is unchanged by this PR.
+    This predicate is never consulted for any other row.
     """
-    return (
-        _is_unproven_broker_status(value)
-        or not _is_actionable_broker_status(value)
-    )
+    if _is_unproven_broker_status(value):
+        return True
+    if _is_actionable_broker_status(value):
+        return False
+    if _is_recognized_active_broker_status(value):
+        return False
+    # Anything else is a broker string with no policy at all — fail closed
+    # rather than pretend it authorizes cancel/reprice.
+    return True
 
 
 class APOrderMonitor:

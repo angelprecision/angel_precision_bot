@@ -1294,8 +1294,15 @@ class APOrderStateMachine:
         # rejected by the identity guard below, so a permissive default only
         # let callers construct a guaranteed IDENTITY_MISMATCH.
         position_id: str,
-        client_id: str | None = None,
+        # Binding audit correction (Blocker 3): expected_qty is required
+        # authoritative economic identity.  The signature still accepts a
+        # default so a caller that omits it does not TypeError at the seam
+        # itself, but omission — like ``None``, non-integers, or any
+        # non-positive value — deterministically returns IDENTITY_MISMATCH.
+        # Caller-side validation is not sufficient; the OSM seam must own
+        # this invariant.
         expected_qty: int | None = None,
+        client_id: str | None = None,
         broker_submitted_ts=None,
         source: str = "broker_owned_exit_request_recovery",
     ) -> dict:
@@ -1308,13 +1315,13 @@ class APOrderStateMachine:
 
         The database CAS owns the safety decision.  It validates client, local
         order, EXIT kind, requested status, exact execution mode, nonblank
-        position identity, positive quantity, optional exact position/quantity
-        identity, and exact-or-empty broker identity in one UPDATE.  Recovery
-        callers must use the returned disposition and must not submit or cancel
-        on a miss.  ``broker_submitted_ts`` is optional exact broker acceptance
+        position identity, exact position identity, exact expected quantity,
+        and exact-or-empty broker identity in one UPDATE.  Recovery callers
+        must use the returned disposition and must not submit or cancel on a
+        miss.  ``broker_submitted_ts`` is optional exact broker acceptance
         evidence; when absent, adoption does not stamp recovery time into
-        ``submitted_ts`` and the original ``created_ts`` remains the monitor's
-        stale-age reference.
+        ``submitted_ts`` and ``broker_ownership_adopted_at`` becomes the
+        monitor's stale-age reference.
         """
         local_id = str(local_order_id or "").strip()
         broker_id = str(broker_order_id or "").strip()
@@ -1325,12 +1332,17 @@ class APOrderStateMachine:
         ).strip()
         expected_position = str(position_id or "").strip()
         source_text = str(source or "").strip()
-        expected_qty_value = None
-        if expected_qty is not None:
-            try:
-                expected_qty_value = int(expected_qty)
-            except (TypeError, ValueError):
-                expected_qty_value = 0
+        # Binding audit correction (Blocker 3): reject anything that is not
+        # an exact positive integer.  ``bool`` inherits from ``int`` in
+        # Python and is rejected explicitly.  Strings, floats, ``None``,
+        # zero, and negatives all fail closed.
+        expected_qty_value: int | None = None
+        if isinstance(expected_qty, bool) or not isinstance(expected_qty, int):
+            expected_qty_value = None
+        elif expected_qty <= 0:
+            expected_qty_value = None
+        else:
+            expected_qty_value = int(expected_qty)
 
         try:
             normalized_broker_submitted_ts = _normalize_broker_submitted_ts(
@@ -1385,7 +1397,10 @@ class APOrderStateMachine:
             or str(self.client_id or "") != self_client_id
             or not expected_position
             or not source_text
-            or (expected_qty_value is not None and expected_qty_value <= 0)
+            # Binding audit correction (Blocker 3): expected_qty is now
+            # mandatory positive-integer identity.  ``None`` here means the
+            # caller omitted it or supplied a non-positive/non-integer.
+            or expected_qty_value is None
         ):
             return _result(
                 "IDENTITY_MISMATCH",
@@ -1456,7 +1471,14 @@ class APOrderStateMachine:
             "  AND execution_mode=%s "
             "  AND position_id IS NOT NULL "
             "  AND BTRIM(position_id::text)<>'' "
+            "  AND position_id::text=%s "
+            # Binding audit correction (Blocker 3): exact quantity identity
+            # is now unconditional at the CAS.  ``qty > 0`` remains as a
+            # sanity predicate, but ``qty=%s`` cannot be omitted.  The
+            # identity guard above already refuses to run this UPDATE
+            # without a proven positive integer.
             "  AND qty > 0 "
+            "  AND qty=%s "
             "  AND (broker_order_id IS NULL OR BTRIM(broker_order_id)='' "
             "       OR broker_order_id=%s)"
         )
@@ -1472,14 +1494,10 @@ class APOrderStateMachine:
             # match zero rows, misreported as IDENTITY_MISMATCH.
             self_client_id,
             mode,
+            expected_position,
+            expected_qty_value,
             broker_id,
         ]
-        if expected_position:
-            sql += " AND position_id::text=%s"
-            params.append(expected_position)
-        if expected_qty_value is not None:
-            sql += " AND qty=%s"
-            params.append(expected_qty_value)
 
         try:
             def _adopt():
@@ -1602,10 +1620,10 @@ class APOrderStateMachine:
                 and latest_position
                 and latest_position == expected_position
                 and latest_qty > 0
-                and (
-                    expected_qty_value is None
-                    or latest_qty == expected_qty_value
-                )
+                # Binding audit correction (Blocker 3): reload identity
+                # requires exact quantity equality unconditionally.
+                and expected_qty_value is not None
+                and latest_qty == expected_qty_value
             )
             if (
                 latest_status in {
