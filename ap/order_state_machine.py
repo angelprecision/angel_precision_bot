@@ -1290,7 +1290,10 @@ class APOrderStateMachine:
         *,
         broker_order_id: str,
         execution_mode: str,
-        position_id: str | None = None,
+        # F5: position identity is mandatory.  A blank value has always been
+        # rejected by the identity guard below, so a permissive default only
+        # let callers construct a guaranteed IDENTITY_MISMATCH.
+        position_id: str,
         client_id: str | None = None,
         expected_qty: int | None = None,
         broker_submitted_ts=None,
@@ -1375,9 +1378,14 @@ class APOrderStateMachine:
             or broker_id.upper() == "N/A"
             or mode not in {"live", "paper"}
             or expected_client != self_client_id
+            # F6: the CAS binds the normalized id while the authoritative
+            # reload (_get_order) binds the raw instance id.  Rather than
+            # launder a malformed identity into a money-path mutation, refuse
+            # to adopt when the instance id is not already canonical.
+            or str(self.client_id or "") != self_client_id
             or not expected_position
             or not source_text
-            or expected_qty_value is not None and expected_qty_value <= 0
+            or (expected_qty_value is not None and expected_qty_value <= 0)
         ):
             return _result(
                 "IDENTITY_MISMATCH",
@@ -1413,13 +1421,21 @@ class APOrderStateMachine:
             ),
             "broker_ownership_submitted_ts_source": submitted_ts_source,
             "broker_ownership_stale_age_reference": (
-                "submitted_ts_or_created_ts"
+                "submitted_ts"
                 if normalized_broker_submitted_ts
-                else "created_ts"
+                else "broker_ownership_adopted_at"
             ),
         }
         if normalized_broker_submitted_ts:
             diagnostic_payload["broker_ownership_submitted_ts"] = (
+                normalized_broker_submitted_ts
+            )
+            # F2: the recovery predicates in fill_monitor and order_monitor
+            # read ``meta->>'broker_submitted_ts'``.  Writing only the
+            # ``broker_ownership_`` prefixed key left the read and write
+            # sides permanently disjoint, so proven acceptance evidence
+            # could never survive a round trip.
+            diagnostic_payload["broker_submitted_ts"] = (
                 normalized_broker_submitted_ts
             )
 
@@ -1450,7 +1466,11 @@ class APOrderStateMachine:
             normalized_broker_submitted_ts,
             diagnostic,
             local_id,
-            self.client_id,
+            # F6: the guard above compares the *stripped* client id, so the
+            # CAS must bind the same value.  Binding raw ``self.client_id``
+            # let a whitespace-padded id pass identity validation and then
+            # match zero rows, misreported as IDENTITY_MISMATCH.
+            self_client_id,
             mode,
             broker_id,
         ]

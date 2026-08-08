@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -266,16 +267,27 @@ def _has_proven_broker_order_id(value) -> bool:
     return bool(broker_id and broker_id.upper() != "N/A")
 
 
-_KNOWN_BROKER_STATUSES = frozenset({
+# Statuses that mean "the lookup itself did not produce broker truth".
+# ``_query_broker_order`` returns None on transport failure, missing broker
+# wiring, or an exception, so None/"" belong here rather than in any
+# vocabulary of real broker states.
+_UNPROVEN_BROKER_STATUSES = frozenset({
+    "",
+    "unknown",
+    "error",
+    "unavailable",
+    "not_found",
+    "not found",
+})
+
+# Statuses the broker really reports and that ``_advance_from_broker_status``
+# can act on.  Anything outside this set is authoritative broker truth that
+# this monitor simply has no transition for (for example Tradier ``held`` or
+# ``calculated``); it is NOT a lookup failure and must not be reclassified as
+# one.
+_ACTIONABLE_BROKER_STATUSES = frozenset({
     "pending",
     "open",
-    "working",
-    "new",
-    "accepted",
-    "ack",
-    "acked",
-    "ok",
-    "submitted",
     "filled",
     "partially_filled",
     "partial_fill",
@@ -286,23 +298,67 @@ _KNOWN_BROKER_STATUSES = frozenset({
     "rejected",
 })
 
-_UNKNOWN_BROKER_STATUSES = frozenset({
-    "",
-    "unknown",
-    "error",
-    "unavailable",
-    "not_found",
-    "not found",
-})
+
+def _is_unproven_broker_status(value) -> bool:
+    """True only when the broker status lookup produced no truth at all.
+
+    This is deliberately narrow.  Earlier revisions of #425 treated every
+    unrecognized string as unknown, which silently converted authoritative
+    live broker states (``held``, ``calculated``) and every ``None`` return
+    into a permanent HOLD with no cancel, reprice, or retry — a liveness
+    regression on money-at-risk exits and an invasion of the stale
+    working-exit surface owned by #423.
+    """
+    return str(value or "").strip().lower() in _UNPROVEN_BROKER_STATUSES
 
 
-def _is_unknown_broker_status(value) -> bool:
-    """Treat missing/error/unparseable broker truth as HOLD, never cancelable."""
+def _is_actionable_broker_status(value) -> bool:
+    """True when the monitor has a canonical transition for this status."""
     status = str(value or "").strip().lower()
-    return (
-        status in _UNKNOWN_BROKER_STATUSES
-        or status not in _KNOWN_BROKER_STATUSES
+    return status in _ACTIONABLE_BROKER_STATUSES
+
+
+def _coerce_meta(order) -> dict:
+    """Return an order's ``meta`` as a dict without raising on bad shapes."""
+    meta = (order or {}).get("meta")
+    if isinstance(meta, dict):
+        return meta
+    if isinstance(meta, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(meta)
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _is_broker_ownership_adopted_row(order) -> bool:
+    """True when this row's EXIT lifecycle was recovered from EXIT_REQUESTED.
+
+    The marker is written by
+    ``OrderStateMachine.adopt_broker_owned_exit_request`` and is what scopes
+    the #425 HOLD fence to the rows this PR actually owns.
+    """
+    return bool(
+        _coerce_meta(order).get("broker_ownership_adopted_from_exit_requested")
     )
+
+
+def _broker_ownership_adopted_at(order):
+    """Return the durable adoption timestamp written at recovery, if any."""
+    return _coerce_meta(order).get("broker_ownership_adopted_at")
+
+
+def _requires_broker_owned_exit_fence(value) -> bool:
+    """HOLD predicate for rows this PR owns.
+
+    A row whose EXIT lifecycle was recovered from ``EXIT_REQUESTED`` via exact
+    broker ownership is fenced whenever broker truth is unproven *or* not
+    actionable: adoption alone does not license cancel/reprice on an exit the
+    broker may already have worked.  Rows this PR does not own keep their
+    pre-existing behavior.
+    """
+    return not _is_actionable_broker_status(value)
 
 
 class APOrderMonitor:
@@ -2459,6 +2515,8 @@ class APOrderMonitor:
             submitted_ts = self._parse_ts(order.get("submitted_ts"))
             contract = order.get("contract") or order.get("symbol", "?")
 
+            broker_owned_recovery = _is_broker_ownership_adopted_row(order)
+
             if (
                 str(status or "").strip().upper() == "EXIT_REQUESTED"
                 and _has_proven_broker_order_id(broker_oid)
@@ -2469,6 +2527,7 @@ class APOrderMonitor:
                     # local adoption CAS cannot be proven.  In particular,
                     # do not run stale-exit cleanup or clear in-flight state.
                     continue
+                broker_owned_recovery = True
                 status = order.get("status", "EXIT_SUBMITTED")
                 local_id = order.get("local_order_id", local_id)
                 broker_oid = order.get("broker_order_id", broker_oid)
@@ -2480,13 +2539,28 @@ class APOrderMonitor:
             if not created_ts:
                 continue
 
-            ref_ts = submitted_ts or created_ts
+            # F2 interaction: adoption deliberately leaves ``submitted_ts``
+            # NULL when broker acceptance time was never proven, so a row
+            # recovered today would otherwise age off a ``created_ts`` that
+            # may be days old and be treated as instantly stale — making it
+            # cancel/reprice eligible on the very first pass after recovery.
+            # The durable adoption timestamp is the correct reference for
+            # that window.
+            adoption_ts = (
+                self._parse_ts(_broker_ownership_adopted_at(order))
+                if broker_owned_recovery
+                else None
+            )
+            ref_ts = submitted_ts or adoption_ts or created_ts
             age_secs = (now - ref_ts).total_seconds()
 
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if _is_unknown_broker_status(broker_status):
+                    if (
+                        broker_owned_recovery
+                        and _requires_broker_owned_exit_fence(broker_status)
+                    ) or _is_unproven_broker_status(broker_status):
                         self._hold_on_unknown_broker_status(
                             local_id,
                             status,
@@ -2510,7 +2584,10 @@ class APOrderMonitor:
             elif status == "EXIT_ACKNOWLEDGED":
                 if age_secs > TIMEOUT_EXIT_ACK:
                     broker_status = self._query_broker_order(broker_oid)
-                    if _is_unknown_broker_status(broker_status):
+                    if (
+                        broker_owned_recovery
+                        and _requires_broker_owned_exit_fence(broker_status)
+                    ) or _is_unproven_broker_status(broker_status):
                         self._hold_on_unknown_broker_status(
                             local_id,
                             status,
@@ -3596,7 +3673,13 @@ class APOrderMonitor:
         broker_oid = self._get_broker_order_id(local_order_id)
         broker_status = self._query_broker_order(broker_oid)
 
-        if _is_unknown_broker_status(broker_status):
+        broker_owned_recovery = _is_broker_ownership_adopted_row(
+            self.osm.get_order(local_order_id) or {}
+        )
+        if (
+            broker_owned_recovery
+            and _requires_broker_owned_exit_fence(broker_status)
+        ) or _is_unproven_broker_status(broker_status):
             self._hold_on_unknown_broker_status(
                 local_order_id,
                 status,

@@ -2296,15 +2296,19 @@ def process_pending_order(
         emit_fill_event(
             order,
             decision="CONFIRMED",
-            reason_code=(
-                "ORDER_FILLED" if kind == "ENTRY"
-                else "EXIT_REQUESTED_BROKER_FILLED_RECOVERED"
-                if requested_exit_recovery
-                else "EXIT_FILLED"
-            ),
+            # F7: the canonical terminal reason code must not fork.  Emitting
+            # a recovery-specific code here made post-adoption fills invisible
+            # to every existing consumer that matches on EXIT_FILLED.
+            # Provenance belongs in context, not in the taxonomy.
+            reason_code="ORDER_FILLED" if kind == "ENTRY" else "EXIT_FILLED",
             explanation=f"{kind} filled via broker",
             result=result,
-            extra_context={"osm_status": mapped},
+            extra_context={
+                "osm_status": mapped,
+                "broker_owned_exit_request_recovered": bool(
+                    requested_exit_recovery
+                ),
+            },
         )
 
         ok = False
@@ -2822,12 +2826,16 @@ def fill_monitor_loop(
         "wired" if pm else "none",
         "wired" if exit_engine else "none",
     )
-    runtime_execution_mode = _resolve_runtime_execution_mode(
-        exit_engine=exit_engine,
-    )
-
     while not (stop_event and stop_event.is_set()):
         try:
+            # F3: resolve per iteration.  Resolving once before the loop meant
+            # an exit_engine/master_control whose mode was not yet hydrated at
+            # startup pinned the fence to "" for the entire process lifetime,
+            # holding every broker-owned recovery forever — reproducing the
+            # exact stranded-row condition this PR exists to close.
+            runtime_execution_mode = _resolve_runtime_execution_mode(
+                exit_engine=exit_engine,
+            )
             normal_pending = get_pending_orders(client_id)
             recovery_pending = get_broker_owned_exit_requests(client_id)
             pending = []

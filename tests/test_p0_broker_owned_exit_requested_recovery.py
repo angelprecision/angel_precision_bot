@@ -243,9 +243,16 @@ def test_orcl_shape_adopts_once_and_preserves_diagnostics(fake_osm_db):
     assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_submitted_ts_source"] == (
         "unproven_recovery"
     )
+    # F2: an adopted row whose broker acceptance time was never proven must
+    # age off the adoption timestamp.  Aging off created_ts made a row
+    # recovered today instantly stale and cancel/reprice eligible on the very
+    # first monitor pass after recovery.
     assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_stale_age_reference"] == (
-        "created_ts"
+        "broker_ownership_adopted_at"
     )
+    assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_adopted_at"]
+    # No proven acceptance evidence means no round-trippable key is written.
+    assert "broker_submitted_ts" not in db.rows["exit-orcl-1"]["meta"]
     assert not OrderStatus.can_transition(OrderStatus.EXIT_REQUESTED, OrderStatus.EXIT_FILLED)
     osm._handle_exit_engine_hooks.assert_called_once()
 
@@ -270,7 +277,13 @@ def test_adoption_uses_only_explicit_broker_acceptance_timestamp(fake_osm_db):
         "broker_acceptance_evidence"
     )
     assert db.rows["exit-orcl-1"]["meta"]["broker_ownership_stale_age_reference"] == (
-        "submitted_ts_or_created_ts"
+        "submitted_ts"
+    )
+    # F2: the recovery predicates read meta->>'broker_submitted_ts'.  Proven
+    # acceptance evidence must round trip through that exact key, or the
+    # read and write sides stay permanently disjoint.
+    assert db.rows["exit-orcl-1"]["meta"]["broker_submitted_ts"] == (
+        "2026-08-08T15:00:00+00:00"
     )
 
 
@@ -2264,3 +2277,334 @@ def test_idempotency_claim_stays_broker_owned_on_adoption_gap(monkeypatch):
     assert updates[0][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
     assert updates[0][1]["broker_order_id"] == "36661364"
     assert updates[0][1]["error_text"].startswith("BROKER_OWNED_DURABILITY_GAP:")
+
+
+# =====================================================================
+# 2026-08-08 amendment — audit findings F1, F2, F3, F4, F6, F7
+# =====================================================================
+
+
+def _adopted_row(**overrides):
+    """A row already recovered by this PR in a previous monitor pass."""
+    meta = {
+        "original_failure": "submit_transition_failed",
+        "broker_ownership_adopted_from_exit_requested": True,
+        "broker_ownership_adopted_at": (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        ).isoformat(),
+    }
+    meta.update(overrides.pop("meta", {}) or {})
+    return _row(
+        status="EXIT_SUBMITTED",
+        broker_order_id="36661364",
+        meta=meta,
+        **overrides,
+    )
+
+
+@pytest.mark.parametrize("unmapped_status", ["held", "calculated"])
+def test_f1_unmapped_broker_status_still_reaches_stale_handling_for_unowned_rows(
+    monkeypatch, unmapped_status
+):
+    """F1: authoritative-but-unmapped broker truth is not a lookup failure.
+
+    Rows this PR did not recover must keep their pre-existing stale-exit
+    liveness.  Treating every unrecognized string as unknown silently
+    converted real Tradier states into permanent holds with no cancel,
+    reprice, or retry — a regression on money-at-risk exits and an invasion
+    of the surface owned by #423.
+    """
+    order = _row(status="EXIT_SUBMITTED", broker_order_id="unowned-425")
+    osm = _MonitorOSM(order)
+    broker = _Broker({"status": unmapped_status})
+    monitor = _monitor(order, osm, broker)
+    monitor._handle_stale_exit = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    monitor._handle_stale_exit.assert_called_once()
+    assert not any(
+        call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
+        for call in monitor._emit_order_event.call_args_list
+    )
+
+
+@pytest.mark.parametrize("unmapped_status", ["held", "calculated"])
+def test_f1_unmapped_broker_status_holds_for_broker_owned_recovery_rows(
+    monkeypatch, unmapped_status
+):
+    """F1: rows this PR *does* own stay fenced on non-actionable truth."""
+    order = _adopted_row()
+    osm = _MonitorOSM(order)
+    broker = _Broker({"status": unmapped_status})
+    monitor = _monitor(order, osm, broker)
+    monitor._handle_stale_exit = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    monitor._handle_stale_exit.assert_not_called()
+    assert any(
+        call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
+        for call in monitor._emit_order_event.call_args_list
+    )
+
+
+def test_f1_lookup_failure_holds_regardless_of_row_ownership(monkeypatch):
+    """F1: a lookup that produced no truth at all is always a HOLD."""
+    order = _row(status="EXIT_SUBMITTED", broker_order_id="unowned-425")
+    osm = _MonitorOSM(order)
+    broker = _Broker({})
+    monitor = _monitor(order, osm, broker)
+    monitor._query_broker_order = MagicMock(return_value=None)
+    monitor._handle_stale_exit = MagicMock()
+    monitor._cancel_broker_order = MagicMock()
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    monitor._handle_stale_exit.assert_not_called()
+    monitor._cancel_broker_order.assert_not_called()
+    assert any(
+        call.kwargs.get("reason_code") == "BROKER_STATUS_UNKNOWN"
+        for call in monitor._emit_order_event.call_args_list
+    )
+
+
+def test_f2_adopted_row_ages_off_adoption_timestamp_not_created_ts(monkeypatch):
+    """F2: an adopted row must not be instantly stale after recovery.
+
+    Adoption leaves ``submitted_ts`` NULL when acceptance time was never
+    proven.  Aging off ``created_ts`` made a row recovered today look days
+    stale on the very first pass and therefore cancel/reprice eligible.
+    """
+    order = _adopted_row()
+    order["created_ts"] = datetime.now(timezone.utc) - timedelta(days=3)
+    osm = _MonitorOSM(order)
+    broker = _Broker({"status": "open"})
+    monitor = _monitor(order, osm, broker)
+    monitor._handle_stale_exit = MagicMock()
+    monitor._cancel_broker_order = MagicMock()
+    # 5 minutes: far below the 3-day created_ts age, far above the 30s
+    # adoption age.  Only the adoption reference keeps this row non-stale.
+    monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 300)
+    monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", True)
+
+    monitor._check_exit_orders()
+
+    monitor._handle_stale_exit.assert_not_called()
+    monitor._cancel_broker_order.assert_not_called()
+
+
+def test_f2_adoption_marker_survives_json_encoded_meta():
+    """F2: meta arrives as a JSON string from some query paths."""
+    encoded = _adopted_row()
+    encoded["meta"] = json.dumps(encoded["meta"])
+    assert om._is_broker_ownership_adopted_row(encoded) is True
+    assert om._broker_ownership_adopted_at(encoded)
+    assert om._is_broker_ownership_adopted_row({"meta": "not json"}) is False
+    assert om._is_broker_ownership_adopted_row({}) is False
+
+
+def test_f3_runtime_mode_resolves_per_iteration(monkeypatch):
+    """F3: a mode hydrated after loop start must not be pinned to unknown.
+
+    Resolving the fence once before the loop stranded every recovery for the
+    life of the process whenever master_control was not yet wired at startup
+    — reproducing the exact condition this PR exists to close.
+    """
+    exit_engine = SimpleNamespace(master_control=SimpleNamespace(mode=None))
+    observed: list[str] = []
+
+    monkeypatch.setattr(fm, "get_pending_orders", lambda client_id: [])
+    monkeypatch.setattr(fm, "get_broker_owned_exit_requests", lambda client_id: [
+        _row(broker_order_id="36661364")
+    ])
+
+    stop_event = threading.Event()
+
+    def _fake_process(broker, order, **kwargs):
+        observed.append(kwargs.get("runtime_execution_mode"))
+        # Hydrate the runtime mode only after the first pass.
+        exit_engine.master_control.mode = "paper"
+        if len(observed) >= 2:
+            stop_event.set()
+
+    monkeypatch.setattr(fm, "process_pending_order", _fake_process)
+
+    fm.fill_monitor_loop(
+        MagicMock(),
+        poll_seconds=0.01,
+        client_id="tradefluence",
+        osm=MagicMock(),
+        exit_engine=exit_engine,
+        stop_event=stop_event,
+    )
+
+    assert observed[0] == ""
+    assert observed[1] == "paper"
+
+
+def test_f6_whitespace_padded_client_id_binds_the_normalized_value(fake_osm_db):
+    """F6: the CAS must bind the same client id the guard validated."""
+    db, osm = fake_osm_db
+    osm.client_id = " tradefluence "
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id=" tradefluence ",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    # Before F6 the guard compared the stripped id while the CAS bound the
+    # raw padded one and the authoritative reload bound a third variant.
+    # A money-path mutation must not proceed on a non-canonical identity, so
+    # adoption fails closed and leaves the durable row untouched.
+    assert result["disposition"] == "IDENTITY_MISMATCH"
+    assert result["adopted"] is False
+    assert result["error"] == "invalid_recovery_identity"
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
+    assert not db.rows["exit-orcl-1"].get("broker_order_id")
+
+
+def test_f6_canonical_client_id_still_adopts(fake_osm_db):
+    """F6: the fail-closed check must not block the normal canonical path."""
+    db, osm = fake_osm_db
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "ADOPTED"
+    assert db.rows["exit-orcl-1"]["status"] == OrderStatus.EXIT_SUBMITTED
+
+
+def test_f7_recovered_fill_keeps_canonical_exit_filled_reason_code(monkeypatch):
+    """F7: post-adoption fills must stay visible to EXIT_FILLED consumers."""
+    order = _row(broker_order_id="36661364")
+    osm = _MonitorOSM(order)
+    emitted = []
+    monkeypatch.setattr(
+        fm, "emit_fill_event",
+        lambda o, **kw: emitted.append(kw) or True,
+    )
+    monkeypatch.setattr(
+        fm, "check_order_with_broker",
+        lambda broker, o: {"status": "EXIT_FILLED", "filled_qty": 4, "fill_price": 1.25},
+    )
+    monkeypatch.setattr(fm, "reduce_position_on_fill", MagicMock(), raising=False)
+
+    fm.process_pending_order(
+        MagicMock(),
+        dict(order),
+        osm=osm,
+        exit_engine=SimpleNamespace(master_control=SimpleNamespace(mode="paper")),
+        runtime_execution_mode="paper",
+    )
+
+    fill_events = [e for e in emitted if e.get("reason_code") == "EXIT_FILLED"]
+    assert fill_events, f"no canonical EXIT_FILLED emitted: {emitted}"
+    assert fill_events[-1]["extra_context"]["broker_owned_exit_request_recovered"] is True
+    assert not any(
+        e.get("reason_code") == "EXIT_REQUESTED_BROKER_FILLED_RECOVERED"
+        for e in emitted
+    )
+
+
+def test_f4_concurrent_adoption_produces_exactly_one_transition_and_hook(fake_osm_db):
+    """F4: only the CAS winner may emit the transition and hydrate the owner.
+
+    ``ALREADY_BROKER_OWNED_ACTIVE`` deliberately reports ``adopted=True`` so
+    the loser's caller can proceed to canonical broker polling, but it must
+    not replay the transition event or the exit-engine hook.  Without this,
+    two workers racing the same stranded row would double-hydrate ownership.
+    """
+    db, osm = fake_osm_db
+    barrier = threading.Barrier(2)
+    results: list[dict] = []
+    lock = threading.Lock()
+
+    def _race(source):
+        barrier.wait()
+        outcome = osm.adopt_broker_owned_exit_request(
+            "exit-orcl-1",
+            broker_order_id="36661364",
+            execution_mode="paper",
+            client_id="tradefluence",
+            position_id="position-orcl-1",
+            expected_qty=4,
+            source=source,
+        )
+        with lock:
+            results.append(outcome)
+
+    threads = [
+        threading.Thread(target=_race, args=(f"concurrent_worker_{i}",))
+        for i in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(results) == 2
+    dispositions = sorted(r["disposition"] for r in results)
+    assert dispositions == ["ADOPTED", "ALREADY_BROKER_OWNED_ACTIVE"]
+
+    # Both callers are cleared to continue to canonical broker polling.
+    assert all(r["adopted"] is True for r in results)
+
+    # But exactly one durable mutation, one transition event, one hook.
+    assert osm._emit_transition_event.call_count == 1
+    assert osm._handle_exit_engine_hooks.call_count == 1
+    assert db.rows["exit-orcl-1"]["status"] == OrderStatus.EXIT_SUBMITTED
+    assert db.rows["exit-orcl-1"]["broker_order_id"] == "36661364"
+
+
+def test_f4_repeated_processing_after_terminal_makes_no_further_mutation(fake_osm_db):
+    """F4: a replay after the exit already closed must be inert."""
+    db, osm = fake_osm_db
+
+    first = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+    assert first["disposition"] == "ADOPTED"
+
+    # The canonical fill reducer closes the row.
+    db.rows["exit-orcl-1"]["status"] = OrderStatus.EXIT_FILLED
+    osm._emit_transition_event.reset_mock()
+    osm._handle_exit_engine_hooks.reset_mock()
+
+    replay = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+        source="post_terminal_replay",
+    )
+
+    assert replay["disposition"] == "ALREADY_TERMINAL"
+    assert replay["adopted"] is False
+    assert replay["already_terminal"] is True
+    assert osm._emit_transition_event.call_count == 0
+    assert osm._handle_exit_engine_hooks.call_count == 0
+    assert db.rows["exit-orcl-1"]["status"] == OrderStatus.EXIT_FILLED
