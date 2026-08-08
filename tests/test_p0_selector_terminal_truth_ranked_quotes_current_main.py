@@ -721,8 +721,8 @@ def test_duplicate_occ_rows_resolve_quality_before_quote_budget_and_stay_stable(
     duplicate_b["symbol"] = f" {duplicate_a['symbol'].lower()} "
     duplicate_b["bid"] = 1.10
     duplicate_b["ask"] = 1.11
-    duplicate_b["open_interest"] = 500
-    duplicate_b["volume"] = 100
+    duplicate_b["open_interest"] = duplicate_a["open_interest"]
+    duplicate_b["volume"] = duplicate_a["volume"]
     duplicate_b["provider_metadata"] = {"source": "feed-b", "page": 99}
     next_rank = _row("SPY", 102.0)
     valid_symbol = duplicate_a["symbol"]
@@ -846,6 +846,213 @@ def test_conflicting_valid_duplicate_occ_quotes_use_one_authority_and_fail_close
                 failure["operational_reason"],
                 diagnostics["direct_quote_budget"]["used"],
                 best["tradeability_diag"]["premium_per_contract_usd"],
+            )
+        )
+
+    assert observed == [observed[0]] * len(observed)
+
+
+def test_small_duplicate_ask_boundary_requires_authority_in_all_payload_orders(
+    monkeypatch,
+):
+    """A ten-cent ask gap can still change LIVE affordability."""
+    duplicate_a = _row(
+        "SPY", 101.0, bid=1.45, ask=1.50, oi=1200, volume=300
+    )
+    duplicate_b = dict(duplicate_a)
+    duplicate_b["symbol"] = f" {duplicate_a['symbol'].lower()} "
+    duplicate_b["bid"] = 1.55
+    duplicate_b["ask"] = 1.60
+    duplicate_b["provider_metadata"] = {"source": "untrusted-feed", "page": 2}
+    interleaver = _row("SPY", 102.0)
+    later = _row("SPY", 103.0)
+    valid_symbol = duplicate_a["symbol"]
+    observed = []
+
+    for chain in (
+        [duplicate_a, interleaver, duplicate_b, later],
+        [duplicate_b, interleaver, duplicate_a, later],
+        [interleaver, duplicate_a, later, duplicate_b],
+    ):
+        clear_quote_cache()
+        plan = _plan(
+            ticker="SPY",
+            underlying=100.0,
+            budget=155.0,
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="LIVE",
+        )
+        selected, broker, context, failure, diagnostics = _run_selector(
+            monkeypatch,
+            plan=plan,
+            chain=list(chain),
+            limit=1,
+            request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+            valid_symbol=valid_symbol,
+            valid_quote={
+                "bid": 1.55,
+                "ask": 1.60,
+                "volume": 300,
+                "open_interest": 1200,
+            },
+        )
+
+        assert selected is None
+        assert failure["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+        assert failure["canonical_selector_reason"] == (
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["best_rejected_candidate"]["tradeability_diag"][
+            "premium_per_contract_usd"
+        ] == 160.0
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["duplicate_quote_conflict_dimensions"][valid_symbol] == [
+            "price"
+        ]
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+            valid_symbol
+        ]
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+        observed.append(
+            (
+                failure["reason_code"],
+                failure["operational_reason"],
+                diagnostics["direct_quote_budget"]["used"],
+                failure["best_rejected_candidate"]["tradeability_diag"][
+                    "premium_per_contract_usd"
+                ],
+            )
+        )
+
+    assert observed == [observed[0]] * len(observed)
+
+
+def test_liquidity_only_duplicate_conflict_uses_authoritative_direct_liquidity(
+    monkeypatch,
+):
+    """Duplicate OI/volume cannot be resolved by the higher-liquidity row."""
+    high_liquidity = _row(
+        "SPY", 101.0, bid=1.45, ask=1.50, oi=1200, volume=300
+    )
+    low_liquidity = dict(high_liquidity)
+    low_liquidity["symbol"] = f" {high_liquidity['symbol'].lower()} "
+    low_liquidity["open_interest"] = 10
+    low_liquidity["volume"] = 1
+    low_liquidity["provider_metadata"] = {"source": "feed-b", "page": 7}
+    interleaver = _row("SPY", 102.0)
+    valid_symbol = high_liquidity["symbol"]
+    observed = []
+
+    for chain in (
+        [high_liquidity, interleaver, low_liquidity],
+        [low_liquidity, interleaver, high_liquidity],
+    ):
+        clear_quote_cache()
+        plan = _plan(
+            ticker="SPY",
+            underlying=100.0,
+            budget=2000.0,
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="LIVE",
+        )
+        selected, broker, context, failure, diagnostics = _run_selector(
+            monkeypatch,
+            plan=plan,
+            chain=list(chain),
+            limit=1,
+            request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+            valid_symbol=valid_symbol,
+            valid_quote={
+                "bid": 1.45,
+                "ask": 1.50,
+                "volume": 300,
+                "open_interest": 1200,
+            },
+        )
+
+        assert selected is not None
+        assert selected.contract_symbol == valid_symbol
+        assert selected.open_interest == 1200
+        assert selected.volume == 300
+        assert failure == {}
+        assert context.duplicate_quote_conflict_dimensions[valid_symbol] == (
+            "open_interest",
+            "volume",
+        )
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+            valid_symbol
+        ]
+        observed.append(
+            (
+                selected.contract_symbol,
+                selected.open_interest,
+                selected.volume,
+                context.provider_call_counts["direct_quote_calls"],
+            )
+        )
+
+    assert observed == [observed[0]] * len(observed)
+
+
+def test_duplicate_liquidity_conflict_with_price_only_direct_quote_fails_closed(
+    monkeypatch,
+):
+    """Price authority without disputed OI/volume must not launder liquidity."""
+    high_liquidity = _row(
+        "SPY", 101.0, bid=1.45, ask=1.50, oi=1200, volume=300
+    )
+    low_liquidity = dict(high_liquidity)
+    low_liquidity["symbol"] = f" {high_liquidity['symbol'].lower()} "
+    low_liquidity["open_interest"] = 10
+    low_liquidity["volume"] = 1
+    interleaver = _row("SPY", 102.0)
+    valid_symbol = high_liquidity["symbol"]
+    observed = []
+
+    for chain in (
+        [high_liquidity, interleaver, low_liquidity],
+        [low_liquidity, interleaver, high_liquidity],
+    ):
+        clear_quote_cache()
+        plan = _plan(
+            ticker="SPY",
+            underlying=100.0,
+            budget=2000.0,
+            client_id="jasoncosby1@gmail.com",
+            execution_mode="LIVE",
+        )
+        selected, broker, context, failure, diagnostics = _run_selector(
+            monkeypatch,
+            plan=plan,
+            chain=list(chain),
+            limit=1,
+            request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+            valid_symbol=valid_symbol,
+            valid_quote={"bid": 1.45, "ask": 1.50},
+        )
+
+        assert selected is None
+        assert failure["reason_code"] == "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        assert failure["canonical_selector_reason"] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert diagnostics["duplicate_quote_authority_failures"][valid_symbol] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+            valid_symbol
+        ]
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+        observed.append(
+            (
+                failure["reason_code"],
+                diagnostics["direct_quote_budget"]["used"],
             )
         )
 

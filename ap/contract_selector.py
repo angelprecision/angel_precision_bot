@@ -203,11 +203,14 @@ class SelectorRequestContext:
     direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
     direct_quote_duplicate_symbols: list[str] = field(default_factory=list)
     # A normalized OCC can appear more than once with independently valid but
-    # materially different chain prices. Those rows are not financially
-    # authoritative; select() must obtain one normalized direct quote and
-    # reuse it for every representation before applying quality/affordability.
+    # decision-relevant price or liquidity values. Those rows are not
+    # financially authoritative; select() must obtain one normalized direct
+    # quote and reuse it for every representation before quality/affordability.
     duplicate_quote_conflicts: list[dict] = field(default_factory=list)
     duplicate_quote_conflict_symbols: set[str] = field(default_factory=set)
+    duplicate_quote_conflict_dimensions: dict[str, tuple[str, ...]] = field(
+        default_factory=dict
+    )
     duplicate_quote_authority: dict[str, dict] = field(default_factory=dict)
     duplicate_quote_authority_attempted: set[str] = field(default_factory=set)
     duplicate_quote_authority_failures: dict[str, str] = field(default_factory=dict)
@@ -1127,6 +1130,12 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "duplicate_quote_conflict_symbols": sorted(
             str(symbol) for symbol in ctx.duplicate_quote_conflict_symbols
         )[:25],
+        "duplicate_quote_conflict_dimensions": {
+            str(symbol): list(dimensions)
+            for symbol, dimensions in list(
+                ctx.duplicate_quote_conflict_dimensions.items()
+            )[:25]
+        },
         "duplicate_quote_authority_symbols": sorted(
             str(symbol) for symbol in ctx.duplicate_quote_authority
         )[:25],
@@ -1502,12 +1511,14 @@ def _order_chain_for_direct_quote_recovery(
     def _duplicate_resolution_key(opt: dict) -> tuple:
         """Order repeated OCC rows by fields that affect selection quality.
 
-        Duplicate rows are deliberately kept through the quality loop.  This
-        key only makes the quality evidence deterministic: a usable quote wins
-        over a zero/crossed quote, then the lower execution ask, tighter spread,
-        and stronger liquidity win.  Provider metadata is a final tie-breaker
-        only after the financial fields are equal; unrelated raw payload fields
-        never decide which quote representation is authoritative.
+        Duplicate rows are deliberately kept through the quality loop. For
+        non-conflicting rows this key makes quality evidence deterministic: a
+        usable quote wins over a zero/crossed quote, then the lower execution
+        ask, tighter spread, and stronger liquidity win. A conflict group is
+        resolved by normalized direct-quote authority before these fields can
+        affect selection; this key is then diagnostic ordering only. Provider
+        metadata is a final tie-breaker only after financial fields are equal;
+        unrelated raw payload fields never decide authority.
         """
         bid = _safe_float(opt.get("bid"), 0.0)
         ask = _safe_float(opt.get("ask"), 0.0)
@@ -1531,20 +1542,20 @@ def _order_chain_for_direct_quote_recovery(
             provider_index,
         )
 
-    def _materially_different_price(left: float, right: float) -> bool:
-        """Return True when two valid prices cannot safely be treated as one.
+    def _price_difference_is_decision_relevant(left: float, right: float) -> bool:
+        """Require authority for any quote disagreement beyond tick rounding.
 
-        The threshold is intentionally conservative: a five-cent floor avoids
-        treating harmless sub-penny/rounding noise as a conflict, while a ten
-        percent relative difference catches stale/optimistic representations.
-        This is only a conflict detector. It never chooses the lower price as
-        an authority.
+        A percentage threshold is unsafe here: the selector has hard dollar
+        affordability boundaries, so a small absolute difference can change
+        whether a LIVE order exists. Tradier option prices are cent-granular;
+        half a cent is the only tolerance allowed for representation noise.
         """
-        if left <= 0.0 or right <= 0.0:
-            return False
-        return abs(left - right) > max(0.05, min(left, right) * 0.10)
+        return abs(left - right) > 0.005
 
-    def _duplicate_has_financial_conflict(group: list[tuple[tuple, dict, dict]]) -> bool:
+    def _duplicate_conflict_dimensions(
+        group: list[tuple[tuple, dict, dict]],
+    ) -> tuple[str, ...]:
+        dimensions: set[str] = set()
         valid_quotes = []
         for _, item, _ in group:
             bid = _safe_float(item.get("bid"), 0.0)
@@ -1554,11 +1565,35 @@ def _order_chain_for_direct_quote_recovery(
         for index, (bid, ask) in enumerate(valid_quotes):
             for other_bid, other_ask in valid_quotes[index + 1:]:
                 if (
-                    _materially_different_price(bid, other_bid)
-                    or _materially_different_price(ask, other_ask)
+                    _price_difference_is_decision_relevant(bid, other_bid)
+                    or _price_difference_is_decision_relevant(ask, other_ask)
                 ):
-                    return True
-        return False
+                    dimensions.add("price")
+                    break
+            if "price" in dimensions:
+                break
+
+        def _numeric_representation(item: dict, key: str):
+            raw_value = item.get(key)
+            if raw_value in (None, ""):
+                return None
+            try:
+                return round(float(raw_value), 8)
+            except (TypeError, ValueError):
+                return "INVALID"
+
+        for liquidity_key in ("open_interest", "volume"):
+            values = {
+                _numeric_representation(item, liquidity_key)
+                for _, item, _ in group
+            }
+            if len(values) > 1:
+                dimensions.add(liquidity_key)
+        return tuple(
+            dimension
+            for dimension in ("price", "open_interest", "volume")
+            if dimension in dimensions
+        )
 
     for original_index, opt in enumerate(list(chain or [])):
         exp_date = _option_expiration_date(opt)
@@ -1674,13 +1709,18 @@ def _order_chain_for_direct_quote_recovery(
             continue
         group = duplicate_groups[canonical_symbol]
         if len(group) > 1:
-            if _duplicate_has_financial_conflict(group) and request_context is not None:
+            _conflict_dimensions = _duplicate_conflict_dimensions(group)
+            if _conflict_dimensions and request_context is not None:
+                request_context.duplicate_quote_conflict_dimensions[canonical_symbol] = (
+                    _conflict_dimensions
+                )
                 if canonical_symbol not in request_context.duplicate_quote_conflict_symbols:
                     request_context.duplicate_quote_conflict_symbols.add(canonical_symbol)
                     request_context.duplicate_quote_conflicts.append({
                         "symbol": canonical_symbol,
                         "authority": "DIRECT_QUOTE_NORMALIZED_OCC",
                         "reason": "DUPLICATE_QUOTE_CONFLICT",
+                        "dimensions": list(_conflict_dimensions),
                         "representations": sorted(
                             [
                                 {
@@ -1703,6 +1743,11 @@ def _order_chain_for_direct_quote_recovery(
                             ),
                         ),
                     })
+                else:
+                    for conflict in request_context.duplicate_quote_conflicts:
+                        if conflict.get("symbol") == canonical_symbol:
+                            conflict["dimensions"] = list(_conflict_dimensions)
+                            break
             group = sorted(
                 group,
                 key=lambda group_item: _duplicate_resolution_key(group_item[1]),
@@ -3321,6 +3366,11 @@ class APContractSelectionEngine:
             )
             if not _symbol or _symbol not in _conflict_symbols:
                 return _opt, None
+            _conflict_dimensions = set(
+                request_context.duplicate_quote_conflict_dimensions.get(
+                    _symbol, ()
+                )
+            )
 
             _authority = request_context.duplicate_quote_authority.get(_symbol)
             if (
@@ -3342,36 +3392,68 @@ class APContractSelectionEngine:
                 _action = str(_rv_duplicate.get("action") or "")
                 _rv_audit = _rv_duplicate.get("audit") or {}
                 if _action == "PASS" and _rv_duplicate.get("opt_updated"):
-                    _authority = dict(_rv_duplicate["opt_updated"])
-                    # revalidate_with_direct_quote intentionally preserves
-                    # non-zero chain liquidity for ordinary recovery. For a
-                    # conflicting duplicate, direct quote values are the
-                    # financial authority for both price and liquidity.
-                    _direct_fields = {
-                        "direct_bid": "bid",
-                        "direct_ask": "ask",
-                        "direct_volume": "volume",
-                        "direct_open_interest": "open_interest",
-                        "direct_bid_size": "bid_size",
-                        "direct_ask_size": "ask_size",
-                    }
-                    for _audit_key, _opt_key in _direct_fields.items():
-                        if _rv_audit.get(_audit_key) is not None:
-                            _authority[_opt_key] = _rv_audit[_audit_key]
-                    _authority["_duplicate_quote_authority"] = True
-                    request_context.duplicate_quote_authority[_symbol] = _authority
-                    _direct_bid = _safe_float(_rv_audit.get("direct_bid"), 0.0)
-                    _direct_ask = _safe_float(_rv_audit.get("direct_ask"), 0.0)
-                    _direct_quote_recovery_audit.update({
-                        "attempted": True,
-                        "selected": False,
-                        "contract": _symbol,
-                        "bid": _direct_bid,
-                        "ask": _direct_ask,
-                        "mid": round((_direct_bid + _direct_ask) / 2.0, 4),
-                        "failure": None,
-                        "duplicate_quote_authority": True,
-                    })
+                    _missing_liquidity = [
+                        dimension
+                        for dimension in ("open_interest", "volume")
+                        if dimension in _conflict_dimensions
+                        and _rv_audit.get(f"direct_{dimension}") is None
+                    ]
+                    if _missing_liquidity:
+                        # A direct price without disputed liquidity fields is
+                        # not a complete authority. Never inherit the first
+                        # duplicate's non-zero OI/volume and launder it across
+                        # the group.
+                        _authority = None
+                        _failure_reason = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+                        request_context.duplicate_quote_authority_failures[_symbol] = (
+                            _failure_reason
+                        )
+                        _direct_quote_recovery_audit.update({
+                            "attempted": True,
+                            "selected": False,
+                            "contract": _symbol,
+                            "failure": _failure_reason,
+                            "missing_authority_fields": [
+                                f"direct_{dimension}"
+                                for dimension in _missing_liquidity
+                            ],
+                        })
+                    else:
+                        _authority = dict(_rv_duplicate["opt_updated"])
+                        # revalidate_with_direct_quote intentionally preserves
+                        # non-zero chain liquidity for ordinary recovery. For
+                        # a conflicting duplicate, direct quote values are the
+                        # financial authority for both price and liquidity.
+                        _direct_fields = {
+                            "direct_bid": "bid",
+                            "direct_ask": "ask",
+                            "direct_volume": "volume",
+                            "direct_open_interest": "open_interest",
+                            "direct_bid_size": "bid_size",
+                            "direct_ask_size": "ask_size",
+                        }
+                        _authoritative_fields = {"bid", "ask"}
+                        for _audit_key, _opt_key in _direct_fields.items():
+                            if _rv_audit.get(_audit_key) is not None:
+                                _authority[_opt_key] = _rv_audit[_audit_key]
+                                _authoritative_fields.add(_opt_key)
+                        _authority["_duplicate_quote_authoritative_fields"] = tuple(
+                            sorted(_authoritative_fields)
+                        )
+                        _authority["_duplicate_quote_authority"] = True
+                        request_context.duplicate_quote_authority[_symbol] = _authority
+                        _direct_bid = _safe_float(_rv_audit.get("direct_bid"), 0.0)
+                        _direct_ask = _safe_float(_rv_audit.get("direct_ask"), 0.0)
+                        _direct_quote_recovery_audit.update({
+                            "attempted": True,
+                            "selected": False,
+                            "contract": _symbol,
+                            "bid": _direct_bid,
+                            "ask": _direct_ask,
+                            "mid": round((_direct_bid + _direct_ask) / 2.0, 4),
+                            "failure": None,
+                            "duplicate_quote_authority": True,
+                        })
                 else:
                     if _action == "SKIP_BUDGET_EXHAUSTED":
                         _failure_reason = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
@@ -3404,6 +3486,21 @@ class APContractSelectionEngine:
                 _ctx_refresh_diagnostics(request_context)
 
             if _authority is not None:
+                _authoritative_fields = set(
+                    _authority.get("_duplicate_quote_authoritative_fields", ())
+                )
+                _missing_liquidity = [
+                    dimension
+                    for dimension in ("open_interest", "volume")
+                    if dimension in _conflict_dimensions
+                    and dimension not in _authoritative_fields
+                ]
+                if _missing_liquidity:
+                    _failure_reason = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+                    request_context.duplicate_quote_authority_failures[_symbol] = (
+                        _failure_reason
+                    )
+                    return _opt, _failure_reason
                 _patched = dict(_opt)
                 for _key in (
                     "bid", "ask", "last", "volume", "open_interest",
