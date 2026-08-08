@@ -186,9 +186,10 @@ class SelectorRequestContext:
     configured_selector_max_direct_quote_calls: int | None = None
     configured_direct_quote_recovery_top_n: int | None = None
     configured_contract_revalidate_top_n: int | None = None
-    # Unique OCC identities that are at least structurally direct-quotable
-    # (valid OCC, valid expiration, directional fit). Set at chain-ordering
-    # time; duplicate raw rows are retained for quality resolution.
+    # Rows that are at least structurally direct-quotable (valid OCC, valid
+    # expiration, directional fit). Set at chain-ordering time. Duplicate raw
+    # rows remain visible here for quality diagnostics; actual provider calls
+    # are separately fenced by normalized OCC identity.
     direct_quote_structural_candidates: int = 0
     # Rows whose chain-reject reason was one _should_revalidate() accepted —
     # i.e., the ones that actually reached the direct-quote branch. Set in
@@ -1532,15 +1533,14 @@ def _order_chain_for_direct_quote_recovery(
         # direct-quote eligibility depends on the chain reject reason being
         # one that ``_should_revalidate(...)`` accepts, which is not known
         # here and gets counted in the quality-filter loop.
-        structural_symbols = {
-            _canonical_occ_symbol(opt)
+        structural_rows = sum(
+            1
             for sort_key, _, _ in rows
             if sort_key[0] == 0
             and sort_key[1] == 0
             and sort_key[2] == 0
-            and _canonical_occ_symbol(opt)
-        }
-        request_context.direct_quote_structural_candidates = len(structural_symbols)
+        )
+        request_context.direct_quote_structural_candidates = structural_rows
         request_context.direct_quote_candidate_ranking = rankings
         request_context.direct_quote_duplicate_symbols = duplicate_symbols
         _ctx_refresh_diagnostics(request_context)
