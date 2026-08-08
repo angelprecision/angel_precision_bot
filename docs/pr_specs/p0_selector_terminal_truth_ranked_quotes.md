@@ -108,9 +108,23 @@ When candidates are ranked for recovery/revalidation:
 - do not increase direct-quote, chain, expiration, or elapsed-time budgets in this PR;
 - stamp attempted symbol, rank, request number, and remaining budget consistently.
 
+Normalized duplicate OCC rows remain available to the quality loop so a stale or
+zero-quoted row cannot suppress a valid representation of the same contract.
+Duplicate groups are ordered by quote usability, execution ask, spread, and
+liquidity; unrelated provider metadata is not financial authority. The direct
+quote revalidator still fences calls by normalized OCC identity, so duplicates
+consume at most one direct-quote slot per request.
+
 ### Retry eligibility
 
 The retry owner must consume the selector's canonical reduced reason, not merely the last loop iteration's reason.
+
+The selector publishes `canonical_selector_reason`,
+`last_observed_selector_reason`, and (when a request cap stopped the attempt)
+`operational_reason` in its attached `selector_failure`. Execution core copies
+the canonical field unchanged and only adds lifecycle taxonomy around it; it
+does not reconstruct canonical truth from reject buckets or raw last-failure
+events.
 
 When canonical result is terminal affordability:
 
@@ -212,6 +226,21 @@ Expected:
 - zero broker submit/cancel calls
 - durable diagnostics retain `$174.71` budget and `$315` required cost
 - lifecycle exhaustion does not replace the root cause
+
+The replay must pass through the actual deferred execution owner, prove one
+selector invocation with no retry-owner reschedule, and retain the canonical
+root plus the `$174.71` / `$315` affordability evidence after terminal cleanup.
+
+### Duplicate OCC quality resolution
+
+Use the same normalized OCC twice with one stale/zero chain quote and one valid
+chain quote, reverse provider order, and vary liquidity plus irrelevant provider
+metadata. Expected:
+
+- the valid representation remains selectable;
+- the normalized selected contract is identical in both orders;
+- direct-quote call count and canonical selection truth are identical;
+- the duplicate does not consume a second quote-budget slot.
 
 ### Ranked direct-quote order
 

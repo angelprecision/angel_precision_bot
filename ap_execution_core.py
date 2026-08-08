@@ -1045,6 +1045,11 @@ def _build_deferred_retry_schedule_meta(
             "operational_reason": None,
             "may_retry_with_fresh_budget": False,
         }
+    _selector_canonical_reason = None
+    if isinstance(selector_audit, dict):
+        _selector_canonical_reason = str(
+            selector_audit.get("canonical_selector_reason") or ""
+        ).strip() or None
     return {
         "deferred_retry_scheduled": True,
         "deferred_retry_reason_code": str(reason_code or ""),
@@ -1082,7 +1087,13 @@ def _build_deferred_retry_schedule_meta(
         # P0 §5: honest taxonomy — both operational and candidate-quality
         # dimensions preserved together on the durable row.
         "retry_class": _taxonomy["retry_class"],
-        "selector_terminal_reason": _taxonomy["selector_terminal_reason"],
+        # Prefer the selector's explicit canonical reduction. The taxonomy
+        # fallback remains for legacy callers that only supplied a raw
+        # reason_code plus last-candidate quality evidence.
+        "selector_terminal_reason": (
+            _selector_canonical_reason
+            or _taxonomy["selector_terminal_reason"]
+        ),
         "operational_reason": _taxonomy["operational_reason"],
         "may_retry_with_fresh_budget": _taxonomy["may_retry_with_fresh_budget"],
     }
@@ -5566,111 +5577,66 @@ class APExecutionCore:
                             or _attached_sf_dict.get(_name)
                         )
 
-                    def _quality_reason(*values):
-                        _candidate = _text_reason(*values)
-                        if _candidate and _is_operational_request_budget_reason(_candidate):
-                            return None
-                        return _candidate
-
+                    # The selector is the only reducer.  Its attached failure
+                    # carries the final canonical result; execution core may
+                    # preserve adjacent evidence and classify the lifecycle,
+                    # but it must not derive a new canonical reason from reject
+                    # buckets, best-candidate payloads, or the last raw event.
                     _attached_reason = _text_reason(
                         _attached_sf_dict.get("reason_code")
                     )
+                    _explicit_canonical_reason = _text_reason(
+                        _attached_sf_dict.get("canonical_selector_reason"),
+                        _sf_dict.get("canonical_selector_reason"),
+                    )
+                    if override_reason_code:
+                        _canonical_selector_reason = str(override_reason_code).strip()
+                    else:
+                        _canonical_selector_reason = _text_reason(
+                            _explicit_canonical_reason,
+                            _attached_reason,
+                            _sf_dict.get("reason_code"),
+                        )
+
                     _last_observed_selector_reason = _text_reason(
+                        _attached_sf_dict.get("last_observed_selector_reason"),
                         _sf_dict.get("last_observed_selector_reason"),
                         _rc,
-                        _attached_sf_dict.get("last_observed_selector_reason"),
                         _attached_reason,
                     )
-
                     _operational_reason = _text_reason(
-                        _sf_dict.get("operational_reason"),
                         _attached_sf_dict.get("operational_reason"),
+                        _sf_dict.get("operational_reason"),
                     )
                     if _operational_reason and not _is_operational_request_budget_reason(
                         _operational_reason
                     ):
                         _operational_reason = None
-                    if not _operational_reason:
-                        for _observed_reason in (
-                            _rc,
-                            _last_observed_selector_reason,
-                            _attached_reason,
-                        ):
-                            if _is_operational_request_budget_reason(_observed_reason):
-                                _operational_reason = _observed_reason
-                                break
 
-                    _explicit_last_candidate_reason = _quality_reason(
-                        _sf_dict.get("last_candidate_reject_reason"),
+                    _explicit_last_candidate_reason = _text_reason(
                         _attached_sf_dict.get("last_candidate_reject_reason"),
+                        _sf_dict.get("last_candidate_reject_reason"),
                     )
-                    _explicit_best_candidate_reason = _quality_reason(
-                        _sf_dict.get("best_candidate_reject_reason"),
+                    _explicit_best_candidate_reason = _text_reason(
                         _attached_sf_dict.get("best_candidate_reject_reason"),
+                        _sf_dict.get("best_candidate_reject_reason"),
                     )
-                    _explicit_last_reject_reason = _quality_reason(
-                        _sf_dict.get("last_reject_reason"),
+                    _explicit_last_reject_reason = _text_reason(
                         _attached_sf_dict.get("last_reject_reason"),
+                        _sf_dict.get("last_reject_reason"),
                     )
-                    _selector_terminal_reason = _quality_reason(
-                        _sf_dict.get("selector_terminal_reason"),
+                    _selector_terminal_reason = _text_reason(
                         _attached_sf_dict.get("selector_terminal_reason"),
+                        _sf_dict.get("selector_terminal_reason"),
+                        _canonical_selector_reason,
                     )
                     _best_rejected = _failure_field("best_rejected_candidate")
-                    _best_candidate_reason = None
-                    if isinstance(_best_rejected, dict):
-                        _best_candidate_reason = _quality_reason(
-                            _best_rejected.get("rejection_reason"),
-                            _best_rejected.get("reason_code"),
-                        )
+                    _best_candidate_reason = _explicit_best_candidate_reason
                     _top_reject_buckets = _failure_field("top_reject_buckets")
-                    _top_bucket_reason = None
-                    if isinstance(_top_reject_buckets, dict):
-                        _top_bucket_reason = next(
-                            (
-                                _quality_reason(_reason)
-                                for _reason in _top_reject_buckets
-                                if _quality_reason(_reason)
-                            ),
-                            None,
-                        )
                     _last_quality_reason = _text_reason(
                         _explicit_last_candidate_reason,
                         _explicit_best_candidate_reason,
                         _explicit_last_reject_reason,
-                        _best_candidate_reason,
-                        _top_bucket_reason,
-                        _selector_terminal_reason,
-                    )
-                    if not _last_quality_reason:
-                        for _fallback_reason in (
-                            _attached_reason,
-                            _rc,
-                            _last_observed_selector_reason,
-                        ):
-                            _fallback_quality = _quality_reason(_fallback_reason)
-                            if _fallback_quality:
-                                _last_quality_reason = _fallback_quality
-                                break
-
-                    _explicit_canonical_reason = _quality_reason(
-                        _sf_dict.get("canonical_selector_reason"),
-                        _attached_sf_dict.get("canonical_selector_reason"),
-                    )
-                    if _explicit_canonical_reason:
-                        _canonical_selector_reason = _explicit_canonical_reason
-                    elif _operational_reason:
-                        _canonical_selector_reason = _last_quality_reason
-                    else:
-                        _canonical_selector_reason = _text_reason(
-                            _attached_reason,
-                            _selector_terminal_reason,
-                            _rc,
-                            _last_quality_reason,
-                        )
-                    _canonical_selector_reason = _text_reason(
-                        _canonical_selector_reason,
-                        _last_observed_selector_reason,
                     )
                     _error = (
                         f"breach_time_contract_selection:{_canonical_selector_reason}"
@@ -5715,6 +5681,9 @@ class APExecutionCore:
                         "survivor_count":        int(_failure_field("survivor_count") or 0),
                         "top_reject_buckets":    _top_reject_buckets or {},
                         "best_rejected_candidate": _best_rejected,
+                        "selection_diagnostics": (
+                            _failure_field("selection_diagnostics") or {}
+                        ),
                         "quote_source":          _failure_field("quote_source") or "unknown",
                         "tradier_base_url":      _failure_field("tradier_base_url") or "",
                         "sandbox_mode":          bool(_failure_field("sandbox_mode")),

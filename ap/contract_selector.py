@@ -39,7 +39,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import logging
 import contextvars
@@ -187,8 +186,9 @@ class SelectorRequestContext:
     configured_selector_max_direct_quote_calls: int | None = None
     configured_direct_quote_recovery_top_n: int | None = None
     configured_contract_revalidate_top_n: int | None = None
-    # Rows that are at least structurally direct-quotable (valid OCC, valid
-    # expiration, directional fit). Set at chain-ordering time.
+    # Unique OCC identities that are at least structurally direct-quotable
+    # (valid OCC, valid expiration, directional fit). Set at chain-ordering
+    # time; duplicate raw rows are retained for quality resolution.
     direct_quote_structural_candidates: int = 0
     # Rows whose chain-reject reason was one _should_revalidate() accepted —
     # i.e., the ones that actually reached the direct-quote branch. Set in
@@ -345,6 +345,9 @@ def _attach_selector_failure(
     plan,
     *,
     reason_code: str,
+    canonical_selector_reason: str | None = None,
+    last_observed_selector_reason: str | None = None,
+    operational_reason: str | None = None,
     explanation: str,
     chain_rows: int = 0,
     survivor_count: int = 0,
@@ -364,6 +367,9 @@ def _attach_selector_failure(
 
     Fields:
         reason_code        — canonical internal code (e.g. CHAIN_ROW_ZERO_BID_ASK)
+        canonical_selector_reason — selector-owned reduced reason consumed by retry owners
+        last_observed_selector_reason — most recent raw stage/candidate observation
+        operational_reason — separate request-budget/throttle reason, when present
         queue_reason_code  — stable dashboard-facing code (e.g. QUOTE_ZERO_BID_ASK)
         explanation        — human-readable detail
         chain_rows         — count of rows returned by the option chain fetch
@@ -379,7 +385,12 @@ def _attach_selector_failure(
     """
     try:
         _rc  = str(reason_code or "UNKNOWN_REJECTION")
-        _qrc = _to_queue_reason(_rc)
+        _canonical = str(canonical_selector_reason or _rc).strip() or _rc
+        _last_observed = (
+            str(last_observed_selector_reason or _rc).strip() or _canonical
+        )
+        _operational = str(operational_reason or "").strip() or None
+        _qrc = _to_queue_reason(_canonical)
         _base = str(base_url or "")
         if "api.tradier.com" in _base:
             _quote_src = "tradier_live"
@@ -398,7 +409,10 @@ def _attach_selector_failure(
         }
 
         failure = {
-            "reason_code":        _rc,
+            "reason_code":        _canonical,
+            "canonical_selector_reason": _canonical,
+            "last_observed_selector_reason": _last_observed,
+            "operational_reason": _operational,
             "queue_reason_code":  _qrc,
             "explanation":        str(explanation or ""),
             "chain_rows":         int(chain_rows or 0),
@@ -427,14 +441,14 @@ def _attach_selector_failure(
         # P0 PR #302 Fix 3: failure classification
         try:
             _fclass, _dfail, _qfail = _classify_selector_failure(
-                _rc,
+                _canonical,
                 chain_quote_validity=chain_quote_validity,
                 sandbox_mode="sandbox" in _base.lower(),
                 execution_mode=str(execution_mode or "unknown"),
             )
             failure["selector_failure_class"]   = _fclass
             failure["selector_reason_detail"]   = str(explanation or "")
-            failure["selector_terminal_reason"] = _rc
+            failure["selector_terminal_reason"] = _canonical
             failure["data_failure"]             = _dfail
             failure["quality_failure"]          = _qfail
         except Exception:
@@ -1012,6 +1026,17 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
     }
 
 
+def _selector_operational_reason(ctx: SelectorRequestContext | None) -> str | None:
+    """Return the selector-owned operational stop reason, if this request hit a cap."""
+    if ctx is None:
+        return None
+    if getattr(ctx, "budget_exhausted_stage", None) and getattr(
+        ctx, "budget_exhausted_detail", None
+    ):
+        return "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    return None
+
+
 # ── P0 PR #302 — Fix 3: Selector failure classification ──────────────────────
 
 def _classify_selector_failure(
@@ -1346,21 +1371,37 @@ def _order_chain_for_direct_quote_recovery(
             str(opt.get("symbol") or opt.get("contract") or "").upper().split()
         )
 
-    def _stable_row_key(opt: dict) -> str:
-        # A repeated normalized OCC identity must not fall back to provider
-        # insertion order when duplicate rows carry different quote payloads.
-        # JSON key sorting makes the representative independent of dictionary
-        # insertion order while ``default=str`` keeps malformed provider fields
-        # observable rather than making ranking itself raise.
+    def _duplicate_resolution_key(opt: dict) -> tuple:
+        """Order repeated OCC rows by fields that affect selection quality.
+
+        Duplicate rows are deliberately kept through the quality loop.  This
+        key only makes the quality evidence deterministic: a usable quote wins
+        over a zero/crossed quote, then the lower execution ask, tighter spread,
+        and stronger liquidity win.  Provider metadata is a final tie-breaker
+        only after the financial fields are equal; unrelated raw payload fields
+        never decide which quote representation is authoritative.
+        """
+        bid = _safe_float(opt.get("bid"), 0.0)
+        ask = _safe_float(opt.get("ask"), 0.0)
+        quote_usable = bid > 0.0 and ask > 0.0 and ask >= bid
+        spread_pct = (
+            (ask - bid) / ask
+            if quote_usable and ask > 0.0
+            else float("inf")
+        )
+        provider_index = opt.get("_provider_index")
         try:
-            return json.dumps(
-                opt,
-                sort_keys=True,
-                default=str,
-                separators=(",", ":"),
-            )
-        except Exception:
-            return repr(sorted((str(key), repr(value)) for key, value in opt.items()))
+            provider_index = float(provider_index)
+        except (TypeError, ValueError):
+            provider_index = float("inf")
+        return (
+            0 if quote_usable else 1,
+            ask if quote_usable else float("inf"),
+            spread_pct,
+            -_safe_float(opt.get("open_interest"), 0.0),
+            -_safe_float(opt.get("volume"), 0.0),
+            provider_index,
+        )
 
     for original_index, opt in enumerate(list(chain or [])):
         exp_date = _option_expiration_date(opt)
@@ -1416,18 +1457,17 @@ def _order_chain_for_direct_quote_recovery(
             "volume": volume,
             "original_index": original_index,
         }
-        # Raw provider order is not a stable tie-break authority.  The same
+        # Raw provider order is not a stable tie-break authority. The same
         # candidate set can arrive in a different insertion order after a
-        # restart, provider pagination, or JSON normalization; equivalent
-        # equal-ranked contracts must still consume direct-quote capacity in
-        # the same order.  Keep original_index as diagnostic evidence only.
+        # restart or provider pagination; equal-ranked OCC identities are
+        # resolved by the explicit duplicate-quality pass below. Keep
+        # original_index as diagnostic evidence only.
         stable_tie_key = (
             canonical_symbol,
             exp_date.isoformat() if exp_date else "",
             opt_type,
             float(strike) if strike is not None else float("inf"),
             float(abs_delta) if abs_delta is not None else float("inf"),
-            _stable_row_key(opt),
         )
         sort_key = (
             0 if _valid_occ_symbol(opt) else 1,
@@ -1446,25 +1486,37 @@ def _order_chain_for_direct_quote_recovery(
     rows.sort(key=lambda item: item[0])
 
     # Tradier normally returns one row per OCC contract, but merged/paginated
-    # payloads and test/replay fixtures can repeat the same normalized symbol.
-    # The quote revalidator fences by normalized OCC identity, so allowing both
-    # rows into this list would make the first raw duplicate consume the quote
-    # slot and silently discard the second. Keep the deterministic first row
-    # selected by the complete sort key and remove later valid OCC duplicates.
-    deduplicated_rows: list[tuple[tuple, dict, dict]] = []
-    seen_occ_symbols: set[str] = set()
+    # payloads and replay fixtures can repeat the same normalized symbol. Do
+    # not discard a duplicate before quality evaluation: one row may be stale
+    # or zero-quoted while another carries the usable chain quote. Resolve the
+    # duplicate group by real quote/quality fields, then let the quality loop
+    # inspect every row. ``revalidate_with_direct_quote`` independently fences
+    # actual provider calls with request_context.revalidated_contracts, so a
+    # repeated OCC can never consume the direct-quote budget twice.
+    resolved_rows: list[tuple[tuple, dict, dict]] = []
     duplicate_symbols: list[str] = []
-    for item in rows:
+    row_idx = 0
+    while row_idx < len(rows):
+        item = rows[row_idx]
         opt = item[1]
         canonical_symbol = _canonical_occ_symbol(opt)
-        if _valid_occ_symbol(opt) and canonical_symbol:
-            if canonical_symbol in seen_occ_symbols:
-                if canonical_symbol not in duplicate_symbols:
-                    duplicate_symbols.append(canonical_symbol)
-                continue
-            seen_occ_symbols.add(canonical_symbol)
-        deduplicated_rows.append(item)
-    rows = deduplicated_rows
+        if not (_valid_occ_symbol(opt) and canonical_symbol):
+            resolved_rows.append(item)
+            row_idx += 1
+            continue
+        group_end = row_idx + 1
+        while group_end < len(rows):
+            next_symbol = _canonical_occ_symbol(rows[group_end][1])
+            if next_symbol != canonical_symbol:
+                break
+            group_end += 1
+        group = rows[row_idx:group_end]
+        if len(group) > 1:
+            group.sort(key=lambda group_item: _duplicate_resolution_key(group_item[1]))
+            duplicate_symbols.append(canonical_symbol)
+        resolved_rows.extend(group)
+        row_idx = group_end
+    rows = resolved_rows
 
     rankings = []
     for rank, (_, _, ranking) in enumerate(rows, start=1):
@@ -1480,12 +1532,15 @@ def _order_chain_for_direct_quote_recovery(
         # direct-quote eligibility depends on the chain reject reason being
         # one that ``_should_revalidate(...)`` accepts, which is not known
         # here and gets counted in the quality-filter loop.
-        structural_rows = sum(
-            1
+        structural_symbols = {
+            _canonical_occ_symbol(opt)
             for sort_key, _, _ in rows
-            if sort_key[0] == 0 and sort_key[1] == 0 and sort_key[2] == 0
-        )
-        request_context.direct_quote_structural_candidates = structural_rows
+            if sort_key[0] == 0
+            and sort_key[1] == 0
+            and sort_key[2] == 0
+            and _canonical_occ_symbol(opt)
+        }
+        request_context.direct_quote_structural_candidates = len(structural_symbols)
         request_context.direct_quote_candidate_ranking = rankings
         request_context.direct_quote_duplicate_symbols = duplicate_symbols
         _ctx_refresh_diagnostics(request_context)
@@ -2365,6 +2420,7 @@ class APContractSelectionEngine:
             _attach_selector_failure(
                 plan,
                 reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                operational_reason="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                 explanation=_expl,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
@@ -2613,6 +2669,7 @@ class APContractSelectionEngine:
             _attach_selector_failure(
                 plan,
                 reason_code="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                operational_reason="SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                 explanation=_expl,
                 base_url=_sel_base_url,
                 execution_mode=_sel_mode,
@@ -3593,6 +3650,9 @@ class APContractSelectionEngine:
             _attach_selector_failure(
                 plan,
                 reason_code=_final_reason,
+                canonical_selector_reason=_final_reason,
+                last_observed_selector_reason=_obs_reason,
+                operational_reason=_selector_operational_reason(request_context),
                 explanation=(
                     "No contracts passed quality gates"
                     f" | chain={_sel_chain_rows}"
@@ -4293,6 +4353,9 @@ class APContractSelectionEngine:
             _attach_selector_failure(
                 plan,
                 reason_code=_final_reason_code,
+                canonical_selector_reason=_final_reason_code,
+                last_observed_selector_reason=_final_reason_code,
+                operational_reason=_selector_operational_reason(request_context),
                 explanation=_final_explanation,
                 chain_rows=_sel_chain_rows,
                 survivor_count=_sel_survivors,
@@ -5784,8 +5847,15 @@ class APContractSelectionEngine:
             _MAX_CONTRACTS_HARD_CAP   = int(os.getenv("MAX_CONTRACTS", "15"))
             affordable                = min(_raw_affordable, _MAX_CONTRACTS_HARD_CAP)
 
+            # OCC identity is canonical at the selection boundary as well as
+            # at direct-quote/revalidation boundaries. This prevents a
+            # whitespace/case variant from escaping duplicate normalization
+            # into the plan or broker-facing contract field.
+            contract_symbol = "".join(
+                str(opt.get("symbol") or opt.get("contract") or "").upper().split()
+            )
             return SelectedContract(
-                contract_symbol      = opt.get("symbol", ""),
+                contract_symbol      = contract_symbol,
                 expiration           = exp_str,
                 strike               = float(opt.get("strike") or 0),
                 option_type          = opt.get("option_type", "").lower(),

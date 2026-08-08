@@ -170,15 +170,18 @@ def _execution_plan(
     execution_mode: str = "LIVE",
     breach_attempt_count: int = 0,
     budget: float = 2000.0,
+    ticker: str = "SPY",
+    underlying: float = 100.0,
+    side: str = "CALL",
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        ticker="SPY",
-        side="CALL",
-        contract_symbol="DEFERRED:SPY",
+        ticker=ticker,
+        side=side,
+        contract_symbol=f"DEFERRED:{ticker}",
         limit_price=0.01,
         contracts=1,
         max_position_usd=budget,
-        trigger_price=100.0,
+        trigger_price=underlying,
         signal_id="sig-pr408-execution-core",
         client_id=(
             "jasoncosby1@gmail.com"
@@ -200,19 +203,25 @@ def _execution_plan(
     )
 
 
-def _execution_watched(execution_mode: str = "LIVE") -> SimpleNamespace:
+def _execution_watched(
+    execution_mode: str = "LIVE",
+    *,
+    ticker: str = "SPY",
+    trigger_price: float = 100.0,
+    local_order_id: str = "local-pr408-execution-core",
+) -> SimpleNamespace:
     client_id = (
         "jasoncosby1@gmail.com"
         if execution_mode.upper() == "LIVE"
         else "tradefluencehq@gmail.com"
     )
     return SimpleNamespace(
-        ticker="SPY",
-        trigger_price=100.0,
+        ticker=ticker,
+        trigger_price=trigger_price,
         signal={
             "signal_id": "sig-pr408-execution-core",
             "client_id": client_id,
-            "local_order_id": "local-pr408-execution-core",
+            "local_order_id": local_order_id,
             "queue_id": 408,
             "contract_deferred": True,
             "score": 85,
@@ -304,6 +313,94 @@ def test_ibm_affordability_remains_root_after_later_budget_exhaustion(monkeypatc
     ]
     assert broker.submit_order.call_count == 0
     assert broker.cancel_order.call_count == 0
+
+
+def test_execution_core_ibm_affordability_terminalizes_without_retry_owner_reschedule(
+    monkeypatch,
+):
+    """Run the historical IBM affordability result through the real owner."""
+    monkeypatch.setenv("SELECTOR_MAX_DIRECT_QUOTE_CALLS", "1")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_ENABLED", "1")
+    monkeypatch.setenv("MAX_BREACH_SELECTOR_RETRIES", "5")
+    monkeypatch.setenv("BREACH_SELECTOR_RETRY_CUTOFF_ET", "2359")
+    monkeypatch.setattr(APExecutionCore, "_breach_risk_check", lambda self, watched: True)
+    monkeypatch.setattr(
+        "ap.queue.write_deferred_breach_last_error",
+        lambda *args, **kwargs: None,
+    )
+
+    ibm = _row(
+        "IBM",
+        230.0,
+        bid=2.95,
+        ask=3.15,
+        delta=0.4082,
+        oi=2045,
+        volume=1249,
+    )
+    ibm["symbol"] = "IBM260731C00230000"
+    later_one = _row("IBM", 231.0)
+    later_two = _row("IBM", 232.0)
+    broker = _DirectQuoteBroker(
+        [ibm, later_one, later_two],
+        valid_symbol="__NO_VALID_DIRECT_QUOTE__",
+        valid_quote={"bid": 0.0, "ask": 0.0},
+        underlying_price=228.98,
+    )
+    selector = _actual_selector(broker, execution_mode="LIVE")
+    selector.select = MagicMock(wraps=selector.select)
+    core = _execution_core(selector, broker, execution_mode="LIVE")
+    plan = _execution_plan(
+        ticker="IBM",
+        underlying=228.98,
+        budget=174.71,
+        breach_attempt_count=0,
+    )
+    monkeypatch.setattr(
+        APExecutionCore,
+        "_recover_plan_for_revalidation",
+        lambda self, watched: plan,
+    )
+    thread_factory = MagicMock()
+    thread_factory.return_value = MagicMock()
+    monkeypatch.setattr(ec_mod.threading, "Thread", thread_factory)
+
+    result = core._on_entry_trigger(
+        _execution_watched(
+            "LIVE",
+            ticker="IBM",
+            trigger_price=228.98,
+            local_order_id="local-pr408-ibm",
+        )
+    )
+
+    assert result["disposition"] == "TERMINAL_DURABLE"
+    assert selector.select.call_count == 1
+    assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+        later_one["symbol"]
+    ]
+    core.order_state_machine.schedule_deferred_materialization_retry.assert_not_called()
+    thread_factory.return_value.start.assert_not_called()
+
+    terminal_updates = [
+        call.args[1]
+        for call in core.order_state_machine.update_order_meta.call_args_list
+        if "last_breach_selector_audit" in call.args[1]
+    ]
+    assert terminal_updates
+    audit = terminal_updates[-1]["last_breach_selector_audit"]
+    assert audit["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    assert audit["canonical_selector_reason"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    assert audit["last_observed_selector_reason"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    assert audit["selector_terminal_reason"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+    assert audit["operational_reason"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+    assert audit["selection_diagnostics"]["direct_quote_budget"]["used"] == 1
+    tradeability = audit["best_rejected_candidate"]["tradeability_diag"]
+    assert tradeability["budget"] == pytest.approx(174.71)
+    assert tradeability["premium_per_contract_usd"] == pytest.approx(315.0)
+    core.order_state_machine.expire_pending_entry.assert_called_once()
+    broker.submit_order.assert_not_called()
+    broker.cancel_order.assert_not_called()
 
 
 def test_paper_live_explanation_parity_keeps_quality_equal_and_budget_distinct(
@@ -609,14 +706,24 @@ def test_ordinary_select_equal_ranked_contracts_use_stable_quote_order_with_cap(
     ]
 
 
-def test_duplicate_occ_rows_are_deduplicated_before_quote_budget_and_stable_across_input_order(
+def test_duplicate_occ_rows_resolve_quality_before_quote_budget_and_stay_stable(
     monkeypatch,
 ):
-    duplicate_a = _row("SPY", 101.0)
+    # The same OCC arrives once with a zero/stale chain quote and once with a
+    # usable quote but weaker liquidity and unrelated provider metadata. The
+    # usable financial representation must win quality resolution regardless
+    # of payload order; the duplicate must not consume a second direct quote.
+    duplicate_a = _row("SPY", 101.0, oi=5000, volume=1000)
     duplicate_a["_provider_index"] = 0
+    duplicate_a["provider_metadata"] = {"source": "feed-a", "page": 1}
     duplicate_b = dict(duplicate_a)
     duplicate_b["_provider_index"] = 1
     duplicate_b["symbol"] = f" {duplicate_a['symbol'].lower()} "
+    duplicate_b["bid"] = 1.10
+    duplicate_b["ask"] = 1.11
+    duplicate_b["open_interest"] = 500
+    duplicate_b["volume"] = 100
+    duplicate_b["provider_metadata"] = {"source": "feed-b", "page": 99}
     next_rank = _row("SPY", 102.0)
     valid_symbol = duplicate_a["symbol"]
     plan = _plan(ticker="SPY", underlying=100.0, budget=2000.0)
@@ -631,26 +738,29 @@ def test_duplicate_occ_rows_are_deduplicated_before_quote_budget_and_stable_acro
             limit=1,
             valid_symbol=valid_symbol,
             valid_quote={
-                "bid": 1.10,
-                "ask": 1.14,
-                "volume": 300,
-                "open_interest": 1200,
+                "bid": 0.0,
+                "ask": 0.0,
             },
         )
         assert selected is not None
         assert selected.contract_symbol == valid_symbol
         assert failure == {}
-        assert [call.args[0] for call in broker.get_quote.call_args_list] == [valid_symbol]
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+            valid_symbol
+        ]
         assert context.direct_quote_duplicate_symbols == [valid_symbol]
+        assert context.provider_call_counts["direct_quote_calls"] == 1
         observed.append(
             (
                 [row["symbol"] for row in context.direct_quote_candidate_ranking],
                 [call.args[0] for call in broker.get_quote.call_args_list],
+                context.provider_call_counts["direct_quote_calls"],
             )
         )
 
     assert observed[0] == observed[1]
-    assert len(observed[0][0]) == len(set(observed[0][0]))
+    assert len(observed[0][0]) == len(observed[1][0])
+    assert observed[0][2] == observed[1][2] == 1
 
 
 @pytest.mark.parametrize(
@@ -707,22 +817,24 @@ def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth
         thread_factory.return_value.start.assert_not_called()
         schedule_call = core.order_state_machine.schedule_deferred_materialization_retry.call_args
         selector_failure = schedule_call.kwargs["selector_failure"]
-        assert selector_failure["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        assert selector_failure["reason_code"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
         assert selector_failure["canonical_selector_reason"] == (
-            "CHAIN_ROW_ZERO_BID_ASK"
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
         assert selector_failure["last_observed_selector_reason"] == (
             "CHAIN_ROW_ZERO_BID_ASK"
         )
         assert selector_failure["selector_terminal_reason"] == (
-            "CHAIN_ROW_ZERO_BID_ASK"
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
         assert selector_failure["operational_reason"] == (
             "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
         assert selector_failure["retry_class"] == "OPERATIONAL_REQUEST_BUDGET"
         assert selector_failure["materialization_outcome"] == (
-            "RETRY_LATER_DATA_UNAVAILABLE"
+            "RETRY_LATER_SELECTOR_BUDGET"
         )
     else:
         thread_factory.return_value.start.assert_not_called()
@@ -733,9 +845,11 @@ def test_execution_core_real_selector_failure_retries_or_terminalizes_with_truth
         ]
         assert terminal_updates
         selector_failure = terminal_updates[-1]["last_breach_selector_audit"]
-        assert selector_failure["reason_code"] == "CHAIN_ROW_ZERO_BID_ASK"
+        assert selector_failure["reason_code"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
         assert selector_failure["canonical_selector_reason"] == (
-            "CHAIN_ROW_ZERO_BID_ASK"
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
         assert selector_failure["operational_reason"] == (
             "SELECTOR_REQUEST_BUDGET_EXHAUSTED"

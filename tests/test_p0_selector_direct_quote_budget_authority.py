@@ -448,7 +448,7 @@ class TestCandidateOrderingAndReasonHonesty:
         assert ctx.direct_quote_candidate_ranking[0]["original_index"] == 100
         assert ctx.direct_quote_candidate_ranking[0]["directional_strike_fit"] is True
 
-    def test_duplicate_occ_rows_are_reduced_to_one_deterministic_candidate(self):
+    def test_duplicate_occ_rows_stay_visible_to_quality_resolution(self):
         ctx = _ctx(20)
         chain = [_option(0), _option(1)]
 
@@ -461,7 +461,10 @@ class TestCandidateOrderingAndReasonHonesty:
             request_context=ctx,
         )
 
-        assert [row["_provider_index"] for row in ordered] == [0]
+        # Duplicate rows are not discarded before the quality loop. The
+        # canonical OCC revalidation set, not this ranking helper, owns the
+        # one-call direct-quote cap.
+        assert [row["_provider_index"] for row in ordered] == [0, 1]
         assert ctx.direct_quote_duplicate_symbols == [chain[0]["symbol"]]
 
     def test_budget_skip_keeps_original_reason_and_counts_unattempted(self):
