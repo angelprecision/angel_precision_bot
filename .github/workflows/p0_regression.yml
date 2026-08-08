@@ -111,6 +111,7 @@ jobs:
             tests/test_p0_audit_blockers_401.py \
             tests/test_p0_selector_recovery_deploy_preflight.py \
             tests/test_p0_pr401_deployability_closure.py \
+            tests/test_p0_selector_cursor_strictness.py \
             tests/test_p0_direction_reversal_rearm.py \
             tests/test_p0_rearm_watcher_required_routing.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \

@@ -70,18 +70,26 @@ def _guarded_persist_selector_recovery_cursor(
     local_raw = str(local_order_id or "")
     owner_raw = str(owner or "")
     signal_raw = str(signal_id or "")
+    # Capture and validate runner identity before any database access.
+    # A blank or whitespace-padded self.client_id must never reach the CAS
+    # query where it would cause a zero-row UPDATE that is then misclassified
+    # as ordinary ownership loss.  Invalid runner identity raises immediately.
+    client_raw = str(getattr(self, "client_id", "") or "")
     local_id = local_raw.strip()
     durable_owner = owner_raw.strip()
     durable_signal = signal_raw.strip()
+    durable_client = client_raw.strip()
     durable_mode = str(execution_mode or "").strip().lower()
 
     if (
         not local_id
         or not durable_owner
         or not durable_signal
+        or not durable_client
         or local_raw != local_id
         or owner_raw != durable_owner
         or signal_raw != durable_signal
+        or client_raw != durable_client
         or durable_mode not in {"live", "paper"}
         or not isinstance(cursor, dict)
     ):
@@ -133,7 +141,7 @@ def _guarded_persist_selector_recovery_cursor(
                 (
                     cursor_json,
                     local_id,
-                    self.client_id,
+                    durable_client,
                     durable_signal,
                     durable_mode,
                     durable_owner,
@@ -148,7 +156,7 @@ def _guarded_persist_selector_recovery_cursor(
         log.critical(
             "[%s] SELECTOR_RECOVERY_CURSOR_PERSIST_FAILED order=%s "
             "generation=%s error=%s",
-            self.client_id,
+            durable_client,
             local_id,
             durable_generation,
             exc,
