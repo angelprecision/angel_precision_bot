@@ -85,10 +85,9 @@ class _FakeCursor:
             matches = bool(
                 row
                 and str(row.get("client_id") or "") == str(client_id)
-                and str(row.get("kind") or "").upper() == "EXIT"
-                and str(row.get("status") or "").upper() == "EXIT_REQUESTED"
-                and str(row.get("execution_mode") or "").strip()
-                == str(execution_mode).strip()
+                and row.get("kind") == "EXIT"
+                and row.get("status") == "EXIT_REQUESTED"
+                and row.get("execution_mode") == execution_mode
                 and str(row.get("position_id") or "").strip()
                 and int(row.get("qty") or 0) > 0
                 and (
@@ -97,7 +96,7 @@ class _FakeCursor:
                 )
                 and (
                     expected_position is None
-                    or str(row.get("position_id")) == expected_position
+                    or row.get("position_id") == expected_position
                 )
                 and (expected_qty is None or int(row.get("qty") or 0) == expected_qty)
             )
@@ -273,8 +272,8 @@ def test_callback_trace_preserves_explicit_broker_acceptance_timestamp():
         ({"client_id": "other-client"}, "IDENTITY_MISMATCH"),
         ({"execution_mode": "unknown"}, "IDENTITY_MISMATCH"),
         ({"execution_mode": "PAPER"}, "IDENTITY_MISMATCH"),
-        ({"position_id": "other-position"}, "CAS_MISS"),
-        ({"expected_qty": 3}, "CAS_MISS"),
+        ({"position_id": "other-position"}, "IDENTITY_MISMATCH"),
+        ({"expected_qty": 3}, "IDENTITY_MISMATCH"),
         ({"broker_order_id": "N/A"}, "IDENTITY_MISMATCH"),
         ({"position_id": ""}, "IDENTITY_MISMATCH"),
         ({"source": ""}, "IDENTITY_MISMATCH"),
@@ -336,14 +335,17 @@ def test_existing_broker_id_mismatch_cannot_be_replaced(fake_osm_db):
         expected_qty=4,
     )
 
-    assert result["disposition"] == "CAS_MISS"
+    assert result["disposition"] == "IDENTITY_MISMATCH"
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
     assert db.rows["exit-orcl-1"]["broker_order_id"] == "historical-broker-id"
 
 
-def test_noncanonical_durable_mode_cannot_be_laundered_by_recovery(fake_osm_db):
+@pytest.mark.parametrize("durable_mode", ["PAPER", " paper "])
+def test_noncanonical_durable_mode_cannot_be_laundered_by_recovery(
+    fake_osm_db, durable_mode
+):
     db, osm = fake_osm_db
-    db.rows["exit-orcl-1"]["execution_mode"] = "PAPER"
+    db.rows["exit-orcl-1"]["execution_mode"] = durable_mode
 
     result = osm.adopt_broker_owned_exit_request(
         "exit-orcl-1",
@@ -354,8 +356,149 @@ def test_noncanonical_durable_mode_cannot_be_laundered_by_recovery(fake_osm_db):
         expected_qty=4,
     )
 
-    assert result["disposition"] == "CAS_MISS"
+    assert result["disposition"] == "IDENTITY_MISMATCH"
     assert db.rows["exit-orcl-1"]["status"] == "EXIT_REQUESTED"
+
+
+@pytest.mark.parametrize("terminal_status", ["EXIT_FILLED", "CANCELED", "REJECTED", "EXPIRED"])
+def test_terminal_reread_with_malformed_mode_is_identity_mismatch(
+    fake_osm_db, terminal_status
+):
+    db, osm = fake_osm_db
+    db.rows["exit-orcl-1"].update(
+        status=terminal_status,
+        broker_order_id="36661364",
+        execution_mode=" paper ",
+    )
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "IDENTITY_MISMATCH"
+    assert result["already_terminal"] is False
+    assert db.rows["exit-orcl-1"]["status"] == terminal_status
+
+
+def test_adoption_reread_exception_returns_db_error(fake_osm_db, monkeypatch):
+    db, osm = fake_osm_db
+
+    def _raise(_local_order_id):
+        raise RuntimeError("reread unavailable")
+
+    monkeypatch.setattr(osm, "_get_order", _raise)
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "DB_ERROR"
+    assert result["adopted"] is False
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
+    osm._emit_transition_event.assert_not_called()
+
+
+def test_adoption_success_without_reread_proof_returns_db_error(fake_osm_db, monkeypatch):
+    db, osm = fake_osm_db
+    monkeypatch.setattr(osm, "_get_order", lambda _local_order_id: None)
+
+    result = osm.adopt_broker_owned_exit_request(
+        "exit-orcl-1",
+        broker_order_id="36661364",
+        execution_mode="paper",
+        client_id="tradefluence",
+        position_id="position-orcl-1",
+        expected_qty=4,
+    )
+
+    assert result["disposition"] == "DB_ERROR"
+    assert result["error"] == "adoption_reload_unconfirmed"
+    assert db.rows["exit-orcl-1"]["status"] == "EXIT_SUBMITTED"
+    osm._emit_transition_event.assert_not_called()
+
+
+def test_adoption_disposition_contract_is_closed(fake_osm_db, monkeypatch):
+    db, osm = fake_osm_db
+    allowed = {
+        "ADOPTED",
+        "ALREADY_BROKER_OWNED_ACTIVE",
+        "ALREADY_TERMINAL",
+        "IDENTITY_MISMATCH",
+        "DB_ERROR",
+    }
+
+    results = [
+        osm.adopt_broker_owned_exit_request(
+            "exit-orcl-1",
+            broker_order_id="36661364",
+            execution_mode="paper",
+            client_id="tradefluence",
+            position_id="position-orcl-1",
+            expected_qty=4,
+        )
+    ]
+    results.append(
+        osm.adopt_broker_owned_exit_request(
+            "exit-orcl-1",
+            broker_order_id="36661364",
+            execution_mode="paper",
+            client_id="tradefluence",
+            position_id="position-orcl-1",
+            expected_qty=4,
+        )
+    )
+    db.rows["exit-orcl-1"].update(status="EXIT_FILLED")
+    results.append(
+        osm.adopt_broker_owned_exit_request(
+            "exit-orcl-1",
+            broker_order_id="36661364",
+            execution_mode="paper",
+            client_id="tradefluence",
+            position_id="position-orcl-1",
+            expected_qty=4,
+        )
+    )
+    db.rows["exit-orcl-1"].update(
+        status="EXIT_REQUESTED",
+        broker_order_id=None,
+        execution_mode=" paper ",
+    )
+    results.append(
+        osm.adopt_broker_owned_exit_request(
+            "exit-orcl-1",
+            broker_order_id="36661364",
+            execution_mode="paper",
+            client_id="tradefluence",
+            position_id="position-orcl-1",
+            expected_qty=4,
+        )
+    )
+
+    def _raise(_local_order_id):
+        raise RuntimeError("reread unavailable")
+
+    monkeypatch.setattr(osm, "_get_order", _raise)
+    results.append(
+        osm.adopt_broker_owned_exit_request(
+            "exit-orcl-1",
+            broker_order_id="36661364",
+            execution_mode="paper",
+            client_id="tradefluence",
+            position_id="position-orcl-1",
+            expected_qty=4,
+        )
+    )
+
+    assert {result["disposition"] for result in results} == allowed
 
 
 @pytest.mark.parametrize("terminal_status", ["EXIT_FILLED", "CANCELED", "REJECTED", "EXPIRED"])
@@ -663,10 +806,10 @@ class _MonitorOSM:
         self.adopt_calls.append((local_order_id, kwargs))
         if not self.adopt:
             return {
-                "disposition": "CAS_MISS",
+                "disposition": "IDENTITY_MISMATCH",
                 "adopted": False,
                 "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
-                "error": "identity_or_status_cas_miss",
+                "error": "identity_or_status_mismatch",
             }
         self.order["status"] = "EXIT_SUBMITTED"
         # Adoption must not manufacture broker submission chronology.  A test

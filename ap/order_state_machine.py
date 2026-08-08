@@ -1351,14 +1351,12 @@ class APOrderStateMachine:
             adopted = disposition in {
                 "ADOPTED",
                 "ALREADY_BROKER_OWNED_ACTIVE",
-                "ALREADY_ADOPTED",
             }
             return {
                 "disposition": disposition,
                 "adopted": adopted,
                 "already_adopted": disposition in {
                     "ALREADY_BROKER_OWNED_ACTIVE",
-                    "ALREADY_ADOPTED",
                 },
                 "already_terminal": disposition == "ALREADY_TERMINAL",
                 "local_order_id": local_id,
@@ -1487,6 +1485,20 @@ class APOrderStateMachine:
                 reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
                 error="rowcount_unconfirmed",
             )
+        try:
+            rowcount_value = int(rowcount)
+        except (TypeError, ValueError, OverflowError):
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error="rowcount_unconfirmed",
+            )
+        if rowcount_value not in {0, 1}:
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"rowcount_unconfirmed:{rowcount_value}",
+            )
 
         try:
             latest = self._get_order(local_id)
@@ -1495,17 +1507,20 @@ class APOrderStateMachine:
                 "[%s] EXIT broker ownership adoption reload failed | order=%s broker=%s error=%s",
                 self.client_id, local_id, broker_id, exc,
             )
-            latest = None
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"{type(exc).__name__}:{exc}",
+            )
         latest_dict = dict(latest) if latest else None
-        if int(rowcount or 0) > 0:
-            adopted_order = latest_dict or {
-                "local_order_id": local_id,
-                "client_id": self.client_id,
-                "kind": "EXIT",
-                "status": OrderStatus.EXIT_SUBMITTED,
-                "broker_order_id": broker_id,
-                "position_id": expected_position,
-            }
+        if rowcount_value > 0:
+            if latest_dict is None:
+                return _result(
+                    "DB_ERROR",
+                    reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                    error="adoption_reload_unconfirmed",
+                )
+            adopted_order = latest_dict
             self._emit_transition_event(
                 local_order_id=local_id,
                 old_status=OrderStatus.EXIT_REQUESTED,
@@ -1546,12 +1561,16 @@ class APOrderStateMachine:
             )
 
         if latest_dict:
-            latest_status = str(latest_dict.get("status") or "").strip().upper()
-            latest_broker_id = str(latest_dict.get("broker_order_id") or "").strip()
-            latest_client = str(latest_dict.get("client_id") or "").strip()
-            latest_mode = str(latest_dict.get("execution_mode") or "").strip()
-            latest_position = str(latest_dict.get("position_id") or "").strip()
-            latest_kind = str(latest_dict.get("kind") or "").strip().upper()
+            # The reread is an authority check, not a presentation layer.
+            # Preserve durable values exactly; stripping or case-folding here
+            # could launder malformed persisted identity after the strict CAS
+            # correctly rejected it.
+            latest_status = latest_dict.get("status")
+            latest_broker_id = str(latest_dict.get("broker_order_id") or "")
+            latest_client = latest_dict.get("client_id")
+            latest_mode = latest_dict.get("execution_mode")
+            latest_position = str(latest_dict.get("position_id") or "")
+            latest_kind = latest_dict.get("kind")
             try:
                 latest_qty = int(latest_dict.get("qty") or 0)
             except (TypeError, ValueError):
@@ -1616,18 +1635,18 @@ class APOrderStateMachine:
                         order=latest_dict,
                     )
                 return _result(
-                    "TERMINAL_ROW",
+                    "IDENTITY_MISMATCH",
                     reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
                     status=latest_status,
-                    error="order_already_terminal",
+                    error="identity_or_status_mismatch",
                     order=latest_dict,
                 )
 
         return _result(
-            "CAS_MISS",
+            "IDENTITY_MISMATCH",
             reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
             status=str((latest_dict or {}).get("status") or ""),
-            error="identity_or_status_cas_miss",
+            error="identity_or_status_mismatch",
             order=latest_dict,
         )
 
