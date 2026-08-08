@@ -202,6 +202,15 @@ class SelectorRequestContext:
     direct_quote_unattempted_count: int = 0
     direct_quote_candidate_ranking: list[dict] = field(default_factory=list)
     direct_quote_duplicate_symbols: list[str] = field(default_factory=list)
+    # A normalized OCC can appear more than once with independently valid but
+    # materially different chain prices. Those rows are not financially
+    # authoritative; select() must obtain one normalized direct quote and
+    # reuse it for every representation before applying quality/affordability.
+    duplicate_quote_conflicts: list[dict] = field(default_factory=list)
+    duplicate_quote_conflict_symbols: set[str] = field(default_factory=set)
+    duplicate_quote_authority: dict[str, dict] = field(default_factory=dict)
+    duplicate_quote_authority_attempted: set[str] = field(default_factory=set)
+    duplicate_quote_authority_failures: dict[str, str] = field(default_factory=dict)
     max_total_elapsed_ms: int = 15000
     budget_exhausted_stage: str | None = None
     budget_exhausted_detail: str | None = None
@@ -315,6 +324,7 @@ _TO_QUEUE_REASON: dict[str, str] = {
     # Zero-quote rows — data was returned but bid/ask is unusable
     "CHAIN_ROW_ZERO_BID_ASK":         "QUOTE_ZERO_BID_ASK",
     "DIRECT_QUOTE_ZERO_BID_ASK":      "QUOTE_ZERO_BID_ASK",
+    "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
     # 1:1 pass-through — reason is already dashboard-safe and actionable
     "BID_BELOW_MIN":                  "BID_BELOW_MIN",
     "SPREAD_TOO_WIDE":                "SPREAD_TOO_WIDE",
@@ -340,6 +350,112 @@ def _to_queue_reason(reason_code: str) -> str:
     as-is rather than silently collapsing to a misleading generic bucket).
     """
     return _TO_QUEUE_REASON.get(str(reason_code or ""), str(reason_code or "UNKNOWN_REJECTION"))
+
+
+# One shared, explicit precedence list keeps final-gate and DTE-ladder
+# reductions from depending on dictionary insertion order or whichever
+# expiration happened to be evaluated last.
+_SELECTOR_FINAL_REASON_PRECEDENCE: tuple[str, ...] = (
+    "CAPITAL_NO_REMAINING",
+    "INVALID_POSITION_BUDGET",
+    "UNTRADEABLE_FOR_ACCOUNT_SIZE",
+    "DELTA_OUT_OF_RANGE",
+    "MONEYNESS_OUT_OF_RANGE",
+    "CHEAP_CONTRACT_NO_UPGRADE",
+    "PREMIUM_CAP_EXCEEDED",
+    "PAPER_PREMIUM_CAP",
+    "CONTRACT_BUILD_FAILED",
+    "NO_AFFORDABLE_CONTRACT",
+)
+
+_DTE_QUALITY_REASON_PRECEDENCE: tuple[str, ...] = (
+    *_SELECTOR_FINAL_REASON_PRECEDENCE,
+    "DTE_OUT_OF_RANGE",
+    "BID_BELOW_MIN",
+    "SPREAD_TOO_WIDE",
+    "OI_TOO_LOW",
+    "VOLUME_TOO_LOW",
+    "NO_CONTRACT_AFTER_FILTERS",
+)
+
+
+def _dte_failure_reason(failure: dict | None) -> str:
+    if not isinstance(failure, dict):
+        return "UNKNOWN_REJECTION"
+    return str(
+        failure.get("canonical_selector_reason")
+        or failure.get("reason_code")
+        or "UNKNOWN_REJECTION"
+    ).strip() or "UNKNOWN_REJECTION"
+
+
+def _choose_stronger_dte_quality_failure(
+    current: dict | None,
+    candidate: dict | None,
+) -> dict | None:
+    """Reduce DTE quality failures deterministically.
+
+    The first failure wins only when both reasons have the same explicit
+    precedence. Different reasons use the fixed policy order above, so a
+    later expiration cannot replace an economically stronger earlier truth
+    merely because it was observed later.
+    """
+    if not isinstance(current, dict):
+        return dict(candidate) if isinstance(candidate, dict) else None
+    if not isinstance(candidate, dict):
+        return dict(current)
+    _rank = {
+        reason: index for index, reason in enumerate(_DTE_QUALITY_REASON_PRECEDENCE)
+    }
+    _current_reason = _dte_failure_reason(current)
+    _candidate_reason = _dte_failure_reason(candidate)
+    _current_key = (
+        _rank.get(_current_reason, len(_rank)),
+        _current_reason,
+    )
+    _candidate_key = (
+        _rank.get(_candidate_reason, len(_rank)),
+        _candidate_reason,
+    )
+    return dict(current if _current_key <= _candidate_key else candidate)
+
+
+def _merge_dte_operational_failure(
+    canonical_failure: dict,
+    operational_failure: dict,
+) -> dict:
+    """Keep a prior selector verdict while recording the later stop reason."""
+    _canonical = dict(canonical_failure or {})
+    _operational = dict(operational_failure or {})
+    _canonical_reason = _dte_failure_reason(_canonical)
+    _operational_reason = _dte_failure_reason(_operational)
+    _canonical["reason_code"] = _canonical_reason
+    _canonical["canonical_selector_reason"] = _canonical_reason
+    _canonical["selector_terminal_reason"] = _canonical_reason
+    # This is intentionally the latest observed reason, not the canonical
+    # decision. Consumers can see both dimensions without inference.
+    _canonical["last_observed_selector_reason"] = _operational_reason
+    _canonical["operational_reason"] = _operational_reason
+    _canonical["operational_selector_reason"] = _operational_reason
+    _canonical["operational_queue_reason_code"] = _to_queue_reason(_operational_reason)
+    _canonical["queue_reason_code"] = _to_queue_reason(_canonical_reason)
+    _canonical["operational_failure"] = _operational
+    _base_explanation = str(_canonical.get("explanation") or "").strip()
+    _stop_explanation = str(_operational.get("explanation") or "").strip()
+    if _stop_explanation:
+        _canonical["explanation"] = (
+            f"{_base_explanation} | ladder_stop={_operational_reason}: {_stop_explanation}"
+            if _base_explanation
+            else f"ladder_stop={_operational_reason}: {_stop_explanation}"
+        )
+
+    _base_diag = _canonical.get("selection_diagnostics")
+    _operational_diag = _operational.get("selection_diagnostics")
+    if isinstance(_base_diag, dict) or isinstance(_operational_diag, dict):
+        _merged_diag = dict(_base_diag or {})
+        _merged_diag.update(dict(_operational_diag or {}))
+        _canonical["selection_diagnostics"] = _merged_diag
+    return _canonical
 
 
 def _attach_selector_failure(
@@ -1007,6 +1123,16 @@ def _selector_request_diagnostics(ctx: SelectorRequestContext | None) -> dict:
         "direct_quote_unattempted_symbols": list(ctx.direct_quote_unattempted_symbols[:25]),
         "direct_quote_candidate_ranking": list(ctx.direct_quote_candidate_ranking[:25]),
         "direct_quote_duplicate_symbols": list(ctx.direct_quote_duplicate_symbols[:25]),
+        "duplicate_quote_conflicts": list(ctx.duplicate_quote_conflicts[:25]),
+        "duplicate_quote_conflict_symbols": sorted(
+            str(symbol) for symbol in ctx.duplicate_quote_conflict_symbols
+        )[:25],
+        "duplicate_quote_authority_symbols": sorted(
+            str(symbol) for symbol in ctx.duplicate_quote_authority
+        )[:25],
+        "duplicate_quote_authority_failures": dict(
+            list(ctx.duplicate_quote_authority_failures.items())[:25]
+        ),
         "selector_request_kind": str(ctx.selector_request_kind or SELECTOR_REQUEST_KIND_ORDINARY),
         "recovery_attempt_number": int(ctx.recovery_attempt_number or 1),
         "structural_skips": list(ctx.structural_skips[:200]),
@@ -1083,7 +1209,8 @@ def _classify_selector_failure(
         # Direct quote returning zero is always a data-source issue.
         return "data_quality_zero_quotes", True, False
 
-    if _rc in ("QUOTE_ZERO_BID_ASK", "CHAIN_PROVIDER_EMPTY_OPTIONS",
+    if _rc in ("QUOTE_ZERO_BID_ASK", "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+               "CHAIN_PROVIDER_EMPTY_OPTIONS",
                "CHAIN_PROVIDER_EMPTY_EXPIRATIONS", "NO_CHAIN_DATA",
                "CHAIN_PROVIDER_ERROR", "CHAIN_AUTH_ERROR"):
         return "data_quality_zero_quotes", True, False
@@ -1404,6 +1531,35 @@ def _order_chain_for_direct_quote_recovery(
             provider_index,
         )
 
+    def _materially_different_price(left: float, right: float) -> bool:
+        """Return True when two valid prices cannot safely be treated as one.
+
+        The threshold is intentionally conservative: a five-cent floor avoids
+        treating harmless sub-penny/rounding noise as a conflict, while a ten
+        percent relative difference catches stale/optimistic representations.
+        This is only a conflict detector. It never chooses the lower price as
+        an authority.
+        """
+        if left <= 0.0 or right <= 0.0:
+            return False
+        return abs(left - right) > max(0.05, min(left, right) * 0.10)
+
+    def _duplicate_has_financial_conflict(group: list[tuple[tuple, dict, dict]]) -> bool:
+        valid_quotes = []
+        for _, item, _ in group:
+            bid = _safe_float(item.get("bid"), 0.0)
+            ask = _safe_float(item.get("ask"), 0.0)
+            if bid > 0.0 and ask > 0.0 and ask >= bid:
+                valid_quotes.append((bid, ask))
+        for index, (bid, ask) in enumerate(valid_quotes):
+            for other_bid, other_ask in valid_quotes[index + 1:]:
+                if (
+                    _materially_different_price(bid, other_bid)
+                    or _materially_different_price(ask, other_ask)
+                ):
+                    return True
+        return False
+
     for original_index, opt in enumerate(list(chain or [])):
         exp_date = _option_expiration_date(opt)
         strike = _option_strike(opt)
@@ -1518,6 +1674,35 @@ def _order_chain_for_direct_quote_recovery(
             continue
         group = duplicate_groups[canonical_symbol]
         if len(group) > 1:
+            if _duplicate_has_financial_conflict(group) and request_context is not None:
+                if canonical_symbol not in request_context.duplicate_quote_conflict_symbols:
+                    request_context.duplicate_quote_conflict_symbols.add(canonical_symbol)
+                    request_context.duplicate_quote_conflicts.append({
+                        "symbol": canonical_symbol,
+                        "authority": "DIRECT_QUOTE_NORMALIZED_OCC",
+                        "reason": "DUPLICATE_QUOTE_CONFLICT",
+                        "representations": sorted(
+                            [
+                                {
+                                    "bid": _safe_float(group_item[1].get("bid"), 0.0),
+                                    "ask": _safe_float(group_item[1].get("ask"), 0.0),
+                                    "open_interest": int(
+                                        _safe_float(group_item[1].get("open_interest"), 0.0)
+                                    ),
+                                    "volume": int(
+                                        _safe_float(group_item[1].get("volume"), 0.0)
+                                    ),
+                                }
+                                for group_item in group
+                            ],
+                            key=lambda representation: (
+                                representation["bid"],
+                                representation["ask"],
+                                -representation["open_interest"],
+                                -representation["volume"],
+                            ),
+                        ),
+                    })
             group = sorted(
                 group,
                 key=lambda group_item: _duplicate_resolution_key(group_item[1]),
@@ -3116,7 +3301,139 @@ class APContractSelectionEngine:
                 _ctx_refresh_diagnostics(request_context)
         except Exception:
             pass
+        def _apply_duplicate_quote_authority(_opt: dict) -> tuple[dict, str | None]:
+            """Use one direct quote for a conflicting normalized OCC group.
+
+            Chain rows with materially different valid prices cannot establish
+            LIVE/PAPER affordability by themselves. The first representation
+            invokes the bounded direct-quote revalidator; every later
+            representation reuses that exact normalized-OCC authority. A
+            missing/blocked authority rejects the group instead of selecting
+            whichever row happened to advertise the lower ask.
+            """
+            if request_context is None:
+                return _opt, None
+            _symbol = "".join(
+                str(_opt.get("symbol") or _opt.get("contract") or "").upper().split()
+            )
+            _conflict_symbols = getattr(
+                request_context, "duplicate_quote_conflict_symbols", set()
+            )
+            if not _symbol or _symbol not in _conflict_symbols:
+                return _opt, None
+
+            _authority = request_context.duplicate_quote_authority.get(_symbol)
+            if (
+                _authority is None
+                and _symbol not in request_context.duplicate_quote_authority_attempted
+            ):
+                request_context.duplicate_quote_authority_attempted.add(_symbol)
+                if _symbol not in request_context.direct_quote_eligible_symbols:
+                    request_context.direct_quote_eligible_symbols.add(_symbol)
+                    request_context.direct_quote_eligible_candidates = len(
+                        request_context.direct_quote_eligible_symbols
+                    )
+                _rv_duplicate = _revalidate_direct(
+                    self.data_broker,
+                    _opt,
+                    "DUPLICATE_QUOTE_CONFLICT",
+                    request_context=request_context,
+                )
+                _action = str(_rv_duplicate.get("action") or "")
+                _rv_audit = _rv_duplicate.get("audit") or {}
+                if _action == "PASS" and _rv_duplicate.get("opt_updated"):
+                    _authority = dict(_rv_duplicate["opt_updated"])
+                    # revalidate_with_direct_quote intentionally preserves
+                    # non-zero chain liquidity for ordinary recovery. For a
+                    # conflicting duplicate, direct quote values are the
+                    # financial authority for both price and liquidity.
+                    _direct_fields = {
+                        "direct_bid": "bid",
+                        "direct_ask": "ask",
+                        "direct_volume": "volume",
+                        "direct_open_interest": "open_interest",
+                        "direct_bid_size": "bid_size",
+                        "direct_ask_size": "ask_size",
+                    }
+                    for _audit_key, _opt_key in _direct_fields.items():
+                        if _rv_audit.get(_audit_key) is not None:
+                            _authority[_opt_key] = _rv_audit[_audit_key]
+                    _authority["_duplicate_quote_authority"] = True
+                    request_context.duplicate_quote_authority[_symbol] = _authority
+                    _direct_bid = _safe_float(_rv_audit.get("direct_bid"), 0.0)
+                    _direct_ask = _safe_float(_rv_audit.get("direct_ask"), 0.0)
+                    _direct_quote_recovery_audit.update({
+                        "attempted": True,
+                        "selected": False,
+                        "contract": _symbol,
+                        "bid": _direct_bid,
+                        "ask": _direct_ask,
+                        "mid": round((_direct_bid + _direct_ask) / 2.0, 4),
+                        "failure": None,
+                        "duplicate_quote_authority": True,
+                    })
+                else:
+                    if _action == "SKIP_BUDGET_EXHAUSTED":
+                        _failure_reason = "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                        _direct_quote_recovery_audit["budget_skipped"] = True
+                        _direct_quote_recovery_audit["budget_skip_reason"] = _failure_reason
+                    elif _action == "REJECT_DIRECT_ZERO":
+                        _failure_reason = "DIRECT_QUOTE_ZERO_BID_ASK"
+                        _direct_quote_recovery_audit.update({
+                            "attempted": True,
+                            "selected": False,
+                            "failure": _failure_reason,
+                        })
+                    elif _action == "REJECT_UNAVAILABLE":
+                        _failure_reason = str(
+                            _rv_duplicate.get("reason_code")
+                            or "DIRECT_QUOTE_UNAVAILABLE"
+                        )
+                        _direct_quote_recovery_audit.update({
+                            "attempted": True,
+                            "selected": False,
+                            "failure": _failure_reason,
+                        })
+                    else:
+                        # Off-hours and already-revalidated states do not
+                        # establish a current authority for this conflict.
+                        _failure_reason = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+                    request_context.duplicate_quote_authority_failures[_symbol] = (
+                        _failure_reason
+                    )
+                _ctx_refresh_diagnostics(request_context)
+
+            if _authority is not None:
+                _patched = dict(_opt)
+                for _key in (
+                    "bid", "ask", "last", "volume", "open_interest",
+                    "bid_size", "ask_size", "_direct_quote_used",
+                    "_direct_quote_age_ms", "_direct_quote_fetch_latency_ms",
+                    "_direct_quote_fetched_at", "_direct_quote_age_semantics",
+                    "_chain_bid", "_chain_ask",
+                ):
+                    if _authority.get(_key) is not None:
+                        _patched[_key] = _authority[_key]
+                _patched["_duplicate_quote_authority"] = True
+                return _patched, None
+
+            return _opt, request_context.duplicate_quote_authority_failures.get(
+                _symbol, "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+            )
+
         for opt in _quality_chain:
+            opt, _duplicate_authority_reason = _apply_duplicate_quote_authority(opt)
+            if _duplicate_authority_reason:
+                _rejections[_duplicate_authority_reason] = _rejections.get(
+                    _duplicate_authority_reason, 0
+                ) + 1
+                log.warning(
+                    "[%s] duplicate OCC authority unavailable symbol=%s reason=%s",
+                    ticker,
+                    opt.get("symbol") or opt.get("contract"),
+                    _duplicate_authority_reason,
+                )
+                continue
             if _PRO_QUALITY_ENABLED:
                 exp_str = opt.get("expiration_date", "")
                 _dte = 0
@@ -3133,7 +3450,11 @@ class APContractSelectionEngine:
                 # and the request budget allows it, fetch a direct option quote
                 # and rerun pro_quality on the patched opt before rejecting.
                 # One context enforces the hard cap across every DTE probe.
-                if pro_tier == "REJECT" and _should_revalidate(pro_reason):
+                if (
+                    pro_tier == "REJECT"
+                    and _should_revalidate(pro_reason)
+                    and not opt.get("_duplicate_quote_authority")
+                ):
                     _sym_for_count = str(opt.get("symbol") or "").strip().upper()
                     if _sym_for_count and _sym_for_count not in request_context.direct_quote_eligible_symbols:
                         request_context.direct_quote_eligible_symbols.add(_sym_for_count)
@@ -3299,7 +3620,11 @@ class APContractSelectionEngine:
             # Safety rules (spread, premium, affordability, capital) are
             # re-enforced against the direct quote — never bypassed.
             # One context enforces the hard cap across every DTE probe.
-            if result is not None and _should_revalidate(result):
+            if (
+                result is not None
+                and _should_revalidate(result)
+                and not opt.get("_duplicate_quote_authority")
+            ):
                 _sym_for_count = str(opt.get("symbol") or "").strip().upper()
                 if _sym_for_count and _sym_for_count not in request_context.direct_quote_eligible_symbols:
                     request_context.direct_quote_eligible_symbols.add(_sym_for_count)
@@ -4228,6 +4553,17 @@ class APContractSelectionEngine:
                 continue
 
             selected = candidate
+            if candidate_opt.get("_duplicate_quote_authority"):
+                _direct_quote_recovery_audit.update({
+                    "attempted": True,
+                    "selected": True,
+                    "contract": str(candidate.contract_symbol or ""),
+                    "bid": _safe_float(candidate.bid, 0.0),
+                    "ask": _safe_float(candidate.ask, 0.0),
+                    "mid": _safe_float(candidate.mid, 0.0),
+                    "failure": None,
+                    "duplicate_quote_authority": True,
+                })
             # Audit Blocker 2, true two-stage fix: this is the one place in
             # the whole method where a candidate has passed EVERY gate
             # (quality_filter's spread/OI/volume, then affordability,
@@ -4297,18 +4633,7 @@ class APContractSelectionEngine:
             #   PAPER_PREMIUM_CAP           — paper-mode cap blocks all candidates
             #   CONTRACT_BUILD_FAILED       — internal _build_selected() error
             #   NO_AFFORDABLE_CONTRACT      — generic fallback
-            _FINAL_REASON_PRECEDENCE = [
-                "CAPITAL_NO_REMAINING",
-                "INVALID_POSITION_BUDGET",
-                "UNTRADEABLE_FOR_ACCOUNT_SIZE",
-                "DELTA_OUT_OF_RANGE",
-                "MONEYNESS_OUT_OF_RANGE",
-                "CHEAP_CONTRACT_NO_UPGRADE",
-                "PREMIUM_CAP_EXCEEDED",
-                "PAPER_PREMIUM_CAP",
-                "CONTRACT_BUILD_FAILED",
-                "NO_AFFORDABLE_CONTRACT",
-            ]
+            _FINAL_REASON_PRECEDENCE = _SELECTOR_FINAL_REASON_PRECEDENCE
             _reason_counts: dict[str, int] = {}
             for _rej in _final_candidate_rejections:
                 _rc = str(_rej.get("reason_code") or "UNKNOWN")
@@ -5210,8 +5535,11 @@ class APContractSelectionEngine:
             """
             _reason = str(reason_code or "UNKNOWN_REJECTION").strip() or "UNKNOWN_REJECTION"
             _operational = (
-                "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
-                if _reason == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+                _reason
+                if _reason in {
+                    "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "MARKET_DATA_THROTTLE_UNAVAILABLE",
+                }
                 else None
             )
             return {
@@ -5227,6 +5555,24 @@ class APContractSelectionEngine:
                 "survivor_count": 0,
                 "execution_mode": str(execution_mode or "unknown").lower(),
             }
+
+        def _finalize_ladder_failure(failure: dict | None) -> dict:
+            """Restore the complete selector-owned failure shape after probing."""
+            _final = dict(failure or {})
+            _reason = _dte_failure_reason(_final)
+            _final.setdefault("stage", "dte_ladder")
+            _final.setdefault("reason_code", _reason)
+            _final.setdefault("canonical_selector_reason", _reason)
+            _final.setdefault(
+                "last_observed_selector_reason",
+                str(_final.get("reason_code") or _reason),
+            )
+            _final.setdefault("selector_terminal_reason", _reason)
+            _final.setdefault("operational_reason", None)
+            _final.setdefault("queue_reason_code", _to_queue_reason(_reason))
+            self._set_last_failure(_final)
+            _restore_selector_failure(plan, _final)
+            return _final
 
         def _expiration_failure(reason_code: str, exc: Exception, *, allow_fallback: bool):
             audit.update({
@@ -5356,6 +5702,8 @@ class APContractSelectionEngine:
                 "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
                 "CHAIN_AUTH_ERROR",
                 "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+            }
+            _OPERATIONAL_STOP_REASONS = {
                 "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                 "MARKET_DATA_THROTTLE_UNAVAILABLE",
             }
@@ -5435,7 +5783,46 @@ class APContractSelectionEngine:
                     )
                     _sub_fail = _get_selector_failure(plan)
                     if result is None and isinstance(_sub_fail, dict):
-                        _reason_code = _sub_fail.get("reason_code")
+                        _reason_code = _dte_failure_reason(_sub_fail)
+                        if _reason_code in _OPERATIONAL_STOP_REASONS:
+                            # A request-budget/throttle stop curtails further
+                            # provider work, but it is not allowed to replace
+                            # a stronger selector verdict already observed in
+                            # an earlier expiration.
+                            bucket_rec["expirations_probed"].append({
+                                "exp": exp, "dte": _dte, "hit": False,
+                                "failure": dict(_sub_fail),
+                            })
+                            audit["buckets_attempted"].append(bucket_rec)
+                            _prior_failure = (
+                                _preserved_terminal
+                                or _preserved_quality
+                                or _preserved_retryable
+                            )
+                            _final_failure = (
+                                _merge_dte_operational_failure(
+                                    _prior_failure,
+                                    _sub_fail,
+                                )
+                                if _prior_failure is not None
+                                else dict(_sub_fail)
+                            )
+                            _finalize_ladder_failure(_final_failure)
+                            if playbook_audit is not None:
+                                playbook_audit["selection_reason"] = _dte_failure_reason(
+                                    _final_failure
+                                )
+                                self._set_playbook_audit(
+                                    plan, request_context, playbook_audit
+                                )
+                            _persist(_dte_failure_reason(_final_failure))
+                            log.warning(
+                                "[%s] DTE_LADDER_OPERATIONAL_STOP observed=%s canonical=%s ",
+                                ticker,
+                                _reason_code,
+                                _dte_failure_reason(_final_failure),
+                            )
+                            return None
                         if _reason_code in _TERMINAL_NON_DTE:
                             # True non-DTE terminal — stop laddering immediately.
                             _preserved_terminal = dict(_sub_fail)
@@ -5446,13 +5833,8 @@ class APContractSelectionEngine:
                             })
                             audit["buckets_attempted"].append(bucket_rec)
                             # Short-circuit everything.
-                            self._set_last_failure({
-                                "stage": str(_preserved_terminal.get("stage") or "dte_ladder"),
-                                "reason_code": str(_preserved_terminal.get("reason_code") or "UNKNOWN_REJECTION"),
-                                "explanation": str(_preserved_terminal.get("explanation") or ""),
-                            })
-                            _persist(str(_preserved_terminal.get("reason_code") or "UNKNOWN_REJECTION"))
-                            _restore_selector_failure(plan, _preserved_terminal)
+                            _finalize_ladder_failure(_preserved_terminal)
+                            _persist(_dte_failure_reason(_preserved_terminal))
                             log.warning(
                                 "[%s] DTE_LADDER_TERMINAL_NON_DTE preserved reason=%s "
                                 "— stopping ladder immediately (non-DTE verdict)",
@@ -5467,8 +5849,13 @@ class APContractSelectionEngine:
                         elif _reason_code:
                             # Quality reject (OI_TOO_LOW, SPREAD_TOO_WIDE, etc.)
                             # Keep probing — a different expiration might pass.
-                            # Remember the most specific quality reason seen.
-                            _preserved_quality = dict(_sub_fail)
+                            # Reduce by fixed policy precedence rather than
+                            # letting the last expiration overwrite earlier
+                            # economic/quality truth.
+                            _preserved_quality = _choose_stronger_dte_quality_failure(
+                                _preserved_quality,
+                                _sub_fail,
+                            )
                     bucket_rec["expirations_probed"].append({
                         "exp": exp, "dte": _dte, "hit": result is not None,
                         "failure": dict(_sub_fail) if result is None and isinstance(_sub_fail, dict) else None,
@@ -5504,37 +5891,31 @@ class APContractSelectionEngine:
             # NOTE: _preserved_terminal is handled above via early return; it
             # should be None here.
             if _preserved_quality is not None:
-                self._set_last_failure({
-                    "stage": str(_preserved_quality.get("stage") or "dte_ladder"),
-                    "reason_code": str(_preserved_quality.get("reason_code") or "UNKNOWN_REJECTION"),
-                    "explanation": str(_preserved_quality.get("explanation") or ""),
-                })
-                _restore_selector_failure(plan, _preserved_quality)
+                _finalize_ladder_failure(_preserved_quality)
                 if playbook_audit is not None:
-                    playbook_audit["selection_reason"] = str(_preserved_quality.get("reason_code") or "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT")
+                    playbook_audit["selection_reason"] = _dte_failure_reason(
+                        _preserved_quality
+                    )
                     self._set_playbook_audit(plan, request_context, playbook_audit)
-                _persist(str(_preserved_quality.get("reason_code") or "UNKNOWN_REJECTION"))
+                _persist(_dte_failure_reason(_preserved_quality))
                 log.warning(
                     "[%s] DTE_LADDER_QUALITY_REASON preserved reason=%s "
                     "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
-                    ticker, _preserved_quality.get("reason_code"),
+                    ticker, _dte_failure_reason(_preserved_quality),
                 )
                 return None
             if _preserved_retryable is not None:
-                self._set_last_failure({
-                    "stage": str(_preserved_retryable.get("stage") or "dte_ladder"),
-                    "reason_code": str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"),
-                    "explanation": str(_preserved_retryable.get("explanation") or ""),
-                })
-                _restore_selector_failure(plan, _preserved_retryable)
+                _finalize_ladder_failure(_preserved_retryable)
                 if playbook_audit is not None:
-                    playbook_audit["selection_reason"] = str(_preserved_retryable.get("reason_code") or "CHAIN_PROVIDER_ERROR")
+                    playbook_audit["selection_reason"] = _dte_failure_reason(
+                        _preserved_retryable
+                    )
                     self._set_playbook_audit(plan, request_context, playbook_audit)
-                _persist(str(_preserved_retryable.get("reason_code") or "UNKNOWN_REJECTION"))
+                _persist(_dte_failure_reason(_preserved_retryable))
                 log.warning(
                     "[%s] DTE_LADDER_RETRYABLE_REASON preserved reason=%s "
                     "— not masking with NO_VALID_PLAYBOOK_DTE_CONTRACT",
-                    ticker, _preserved_retryable.get("reason_code"),
+                    ticker, _dte_failure_reason(_preserved_retryable),
                 )
                 return None
             _final_reason = "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT" if bool(getattr(request_context, "playbook_enabled", False)) else "NO_VALID_PLAYBOOK_DTE_CONTRACT"

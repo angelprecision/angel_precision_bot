@@ -763,6 +763,95 @@ def test_duplicate_occ_rows_resolve_quality_before_quote_budget_and_stay_stable(
     assert observed[0][2] == observed[1][2] == 1
 
 
+def test_conflicting_valid_duplicate_occ_quotes_use_one_authority_and_fail_closed(
+    monkeypatch,
+):
+    """A cheap duplicate must not make an unaffordable OCC appear affordable."""
+    duplicate_a = _row(
+        "SPY", 101.0, bid=1.45, ask=1.50, oi=5000, volume=1000
+    )
+    duplicate_a["_provider_index"] = 0
+    duplicate_a["provider_metadata"] = {"source": "feed-a", "page": 1}
+    duplicate_b = dict(duplicate_a)
+    duplicate_b["_provider_index"] = 1
+    duplicate_b["symbol"] = f" {duplicate_a['symbol'].lower()} "
+    duplicate_b["bid"] = 2.95
+    duplicate_b["ask"] = 3.15
+    duplicate_b["open_interest"] = 1
+    duplicate_b["volume"] = 1
+    duplicate_b["provider_metadata"] = {"source": "feed-b", "page": 99}
+    interleaver = _row("SPY", 102.0)
+    later = _row("SPY", 103.0)
+    valid_symbol = duplicate_a["symbol"]
+    execution_mode = "LIVE"
+    observed = []
+
+    chains = (
+        [duplicate_a, interleaver, duplicate_b, later],
+        [duplicate_b, interleaver, duplicate_a, later],
+        [interleaver, duplicate_a, later, duplicate_b],
+    )
+    for chain in chains:
+        clear_quote_cache()
+        plan = _plan(
+            ticker="SPY",
+            underlying=100.0,
+            budget=174.71,
+            client_id=(
+                "jasoncosby1@gmail.com"
+                if execution_mode == "LIVE"
+                else "tradefluencehq@gmail.com"
+            ),
+            execution_mode=execution_mode,
+        )
+        selected, broker, context, failure, diagnostics = _run_selector(
+            monkeypatch,
+            plan=plan,
+            chain=list(chain),
+            limit=1,
+            request_kind=SELECTOR_REQUEST_KIND_ORDINARY,
+            valid_symbol=valid_symbol,
+            valid_quote={
+                "bid": 2.95,
+                "ask": 3.15,
+                "volume": 300,
+                "open_interest": 1200,
+            },
+        )
+
+        assert selected is None
+        assert failure["reason_code"] == "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+        assert failure["canonical_selector_reason"] == (
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert diagnostics["direct_quote_budget"]["used"] == 1
+        assert diagnostics["duplicate_quote_authority_symbols"] == [valid_symbol]
+        assert diagnostics["duplicate_quote_conflicts"][0]["authority"] == (
+            "DIRECT_QUOTE_NORMALIZED_OCC"
+        )
+        assert [call.args[0] for call in broker.get_quote.call_args_list] == [
+            valid_symbol
+        ]
+        assert broker.submit_order.call_count == 0
+        assert broker.cancel_order.call_count == 0
+        best = failure["best_rejected_candidate"]
+        assert best["tradeability_diag"]["premium_per_contract_usd"] == 315.0
+        observed.append(
+            (
+                failure["reason_code"],
+                failure["canonical_selector_reason"],
+                failure["operational_reason"],
+                diagnostics["direct_quote_budget"]["used"],
+                best["tradeability_diag"]["premium_per_contract_usd"],
+            )
+        )
+
+    assert observed == [observed[0]] * len(observed)
+
+
 @pytest.mark.parametrize(
     ("breach_attempt_count", "expected_disposition"),
     [(0, "RETRY_WAIT"), (5, "TERMINAL_DURABLE")],

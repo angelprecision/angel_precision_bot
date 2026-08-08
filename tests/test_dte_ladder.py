@@ -416,6 +416,129 @@ class TestLadderRouting:
             "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
         )
 
+    @pytest.mark.parametrize(
+        "first_reason",
+        ["UNTRADEABLE_FOR_ACCOUNT_SIZE", "DIRECT_QUOTE_ZERO_BID_ASK"],
+    )
+    def test_ladder_operational_stop_keeps_prior_canonical_reason(
+        self, first_reason
+    ):
+        """A later budget stop ends probing without erasing earlier truth."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = "live"
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 1
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        b_exp = _next_weekday(today, 5)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, b_exp])
+        probed = []
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            probed.append(expiration_override)
+            if len(probed) == 1:
+                plan.metadata["selector_failure"] = {
+                    "stage": "quality_filter",
+                    "reason_code": first_reason,
+                    "canonical_selector_reason": first_reason,
+                    "last_observed_selector_reason": first_reason,
+                    "selector_terminal_reason": first_reason,
+                    "operational_reason": None,
+                    "explanation": "first expiration had a truthful selector result",
+                    "selection_diagnostics": {
+                        "direct_quote_budget": {"used": 0, "remaining": 1},
+                    },
+                }
+            else:
+                plan.metadata["selector_failure"] = {
+                    "stage": "selector_request_budget",
+                    "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "canonical_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "last_observed_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "selector_terminal_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "operational_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "explanation": "direct quote cap reached",
+                    "selection_diagnostics": {
+                        "direct_quote_budget": {"used": 1, "remaining": 0},
+                        "budget_exhausted_stage": "direct_quote",
+                    },
+                }
+            return None
+
+        sel.select = _fake_select
+        plan = _make_plan(timeframe="1d")
+        plan.execution_mode = "live"
+        plan.metadata = {}
+
+        assert sel._select_with_dte_ladder(plan) is None
+        assert probed == [a_exp, b_exp]
+        failure = plan.metadata["selector_failure"]
+        assert failure["reason_code"] == first_reason
+        assert failure["canonical_selector_reason"] == first_reason
+        assert failure["selector_terminal_reason"] == first_reason
+        assert failure["last_observed_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_failure"]["reason_code"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["selection_diagnostics"]["budget_exhausted_stage"] == (
+            "direct_quote"
+        )
+        assert sel._last_failure == failure
+        assert len(plan.metadata["dte_ladder_audit"]["buckets_attempted"]) == 2
+
+    @pytest.mark.parametrize(
+        ("first_reason", "second_reason"),
+        [
+            ("UNTRADEABLE_FOR_ACCOUNT_SIZE", "SPREAD_TOO_WIDE"),
+            ("SPREAD_TOO_WIDE", "UNTRADEABLE_FOR_ACCOUNT_SIZE"),
+        ],
+    )
+    def test_ladder_quality_reduction_uses_fixed_precedence(
+        self, first_reason, second_reason
+    ):
+        """Quality reduction cannot depend on which expiration was last."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 1
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        b_exp = _next_weekday(today, 5)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, b_exp])
+        reasons = iter([first_reason, second_reason])
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            reason = next(reasons)
+            plan.metadata["selector_failure"] = {
+                "reason_code": reason,
+                "canonical_selector_reason": reason,
+                "explanation": reason,
+            }
+            return None
+
+        sel.select = _fake_select
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        assert sel._select_with_dte_ladder(plan) is None
+        assert plan.metadata["selector_failure"]["reason_code"] == (
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+        )
+
     @pytest.mark.parametrize("mode,explicit_flag,expected_fallback", [
         ("paper", False, True),
         ("live", False, False),
