@@ -222,6 +222,37 @@ def test_call_later_fresh_breach_confirms_once():
     assert "quote_age_sec" in decision.reason
 
 
+def test_confirmation_requires_new_quote_after_horizon_not_repeated_polling():
+    pos = _now_call(option_bid=1.45, underlying_price=104.80)
+
+    first = _eval(pos)
+    assert first.reason_code == UNDERLYING_STOP_CONFIRMING
+    first_quote_ts = pos._underlying_stop_breach_quote_ts
+
+    quote_b_et = INCIDENT_ET + timedelta(seconds=8)
+    _advance_underlying(pos, now_et=quote_b_et, price=104.70)
+    quote_b = _eval(pos, quote_b_et)
+    assert quote_b.action == "HOLD", quote_b.reason
+    assert quote_b.reason_code == UNDERLYING_STOP_CONFIRMING
+    quote_b_ts = pos._underlying_stop_breach_quote_ts
+    assert quote_b_ts is not None
+    assert first_quote_ts is not None
+    assert quote_b_ts > first_quote_ts
+    assert pos._underlying_stop_breach_ts == INCIDENT_UTC
+
+    for seconds in (16, 24, 32):
+        repeated = _eval(pos, INCIDENT_ET + timedelta(seconds=seconds))
+        assert repeated.action == "HOLD", repeated.reason
+        assert repeated.reason_code == UNDERLYING_STOP_CONFIRMING
+        assert pos._underlying_stop_breach_quote_ts == quote_b_ts
+
+    quote_c_et = INCIDENT_ET + timedelta(seconds=40)
+    _advance_underlying(pos, now_et=quote_c_et, price=104.60)
+    confirmed = _eval(pos, quote_c_et)
+    assert confirmed.action == "STOP", confirmed.reason
+    assert confirmed.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+
+
 def test_call_breach_recovers_before_confirmation_and_resets():
     pos = _now_call(option_bid=1.70, underlying_price=104.80)
     assert _eval(pos).reason_code == UNDERLYING_STOP_CONFIRMING
@@ -573,3 +604,39 @@ def test_live_technical_stop_requires_durable_position_identity():
     assert second.action == "HOLD", second.reason
     assert second.reason_code == UNDERLYING_STOP_IDENTITY_UNPROVEN
     assert UNDERLYING_TECHNICAL_STOP_CONFIRMED not in second.reason
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "expected_first_code", "can_confirm"),
+    [
+        ("LIVE", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        (" live ", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        ("PAPER", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        ("paper ", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        ("live", UNDERLYING_STOP_CONFIRMING, True),
+        ("paper", UNDERLYING_STOP_CONFIRMING, True),
+    ],
+)
+def test_technical_stop_requires_exact_canonical_execution_mode(
+    execution_mode, expected_first_code, can_confirm,
+):
+    pos = _now_call(
+        option_bid=1.45,
+        underlying_price=104.80,
+        execution_mode=execution_mode,
+    )
+
+    first = _eval(pos)
+    assert first.action == "HOLD", first.reason
+    assert first.reason_code == expected_first_code
+
+    if not can_confirm:
+        assert pos._underlying_stop_breach_ts is None
+        assert pos._underlying_stop_breach_quote_ts is None
+        return
+
+    second_et = INCIDENT_ET + timedelta(seconds=CONFIRM_SECONDS + 1)
+    _advance_underlying(pos, now_et=second_et, price=104.70)
+    confirmed = _eval(pos, second_et)
+    assert confirmed.action == "STOP", confirmed.reason
+    assert confirmed.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED

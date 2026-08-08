@@ -1685,7 +1685,9 @@ def _technical_stop_identity_proven(pos: ManagedPosition) -> bool:
     an explicit mode and option contract; an empty/unknown mode never silently
     authorizes a technical stop.
     """
-    mode = str(getattr(pos, "execution_mode", "") or "").strip().lower()
+    # Execution mode is a durable authority field, not free-form user input.
+    # Do not normalize malformed values into LIVE/PAPER authority.
+    mode = str(getattr(pos, "execution_mode", "") or "")
     contract = str(getattr(pos, "option_symbol", "") or "").strip()
     if mode == "paper":
         return bool(contract)
@@ -1851,15 +1853,20 @@ def evaluate_exit(pos: ManagedPosition, now_et: Optional[datetime] = None) -> Ex
             except Exception:
                 _technical_stop_age_sec = 0.0
 
-            # A confirmation window needs a later fresh observation.  A
-            # single timestamped quote cannot sit on the shelf until the
-            # wall-clock interval expires and certify a breach by itself.
+            # A confirmation window needs a later fresh observation.  Keep the
+            # initial breach clock, but advance the stored observation marker
+            # whenever a newer breached quote arrives before the horizon. A
+            # single quote cannot sit on the shelf until the wall-clock
+            # interval expires and certify a breach by itself.
             _later_quote_observation = True
             if _prior_quote_ts is not None:
                 try:
                     _later_quote_observation = _quote_ts > _prior_quote_ts
                 except Exception:
                     _later_quote_observation = False
+
+            if _later_quote_observation and _quote_ts is not None:
+                pos._underlying_stop_breach_quote_ts = _quote_ts
 
             if (
                 _technical_stop_age_sec >= _UNDERLYING_CONFIRM_SEC

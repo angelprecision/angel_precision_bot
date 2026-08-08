@@ -100,6 +100,12 @@ Acceptable confirmation:
 - two fresh consecutive underlying observations beyond the stop, separated by the normal polling interval; or
 - an existing closed-bar confirmation source already available in the runtime.
 
+The first breach time remains the start of the hysteresis window, while the
+stored latest breached-observation timestamp advances whenever a newer quote is
+seen. Once the wall-clock window has elapsed, the current quote must be newer
+than that stored marker; repeated evaluations of the same quote cannot mature a
+technical stop.
+
 Do not add a provider, background worker, database table, or general-purpose geometry framework.
 
 ## Entry-grace relationship
@@ -126,6 +132,10 @@ Every exit stamp and broker submission must preserve:
 - canonical position/order identity;
 - option symbol and underlying ticker;
 - exact quote provenance.
+
+Technical-stop identity accepts only the exact durable `live` or `paper`
+execution-mode values. Uppercase or whitespace-variant values are ambiguous and
+must return `UNDERLYING_STOP_IDENTITY_UNPROVEN`.
 
 No PAPER midpoint or analytics mark may gain LIVE exit authority.
 
@@ -162,10 +172,12 @@ confirmation timer, hard-exit resolver, entry-grace ordering, and exit-in-flight
 submission fence; no broker, queue, selector, scoring, sizing, or proof-trade
 architecture was added.
 
-The focused deterministic matrix is green locally (`19 passed`), including the
-first-breach winner-protection regression and the confirmed technical-stop
+The focused deterministic matrix is green locally (`26 passed`), including the
+fresh-observation-at-horizon regression, exact execution-mode authority cases,
+first-breach winner-protection regression, and confirmed technical-stop
 submit/idempotency handoff. The adjacent current-main exit suites are also
-green (`438 passed` in `20:38.99`). These are local pre-push results;
+green (`438 passed` in `20:38.99` from the prior pushed head). These are local
+pre-push results;
 exact-head GitHub CI remains the publication gate. This PR stays Draft/HARD
 HOLD and is not authorized to merge or deploy until PR #425 is complete and
 this branch has been rebased again.
