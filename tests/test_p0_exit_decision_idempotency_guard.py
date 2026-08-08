@@ -78,7 +78,8 @@ class _FakeEngine:
 
 
 class _FakeOSM:
-    def __init__(self, active_order=None):
+    def __init__(self, active_order=None, *, client_id=""):
+        self.client_id = client_id
         self.active_order = dict(active_order) if isinstance(active_order, dict) else active_order
         self.active_orders_by_position = {}
         if isinstance(self.active_order, dict):
@@ -91,11 +92,14 @@ class _FakeOSM:
     def create_exit_order(self, **kwargs):
         local_order_id = str(kwargs.get("local_order_id") or "exit-local-created")
         self.active_order = {
+            "client_id": self.client_id,
             "local_order_id": local_order_id,
             "broker_order_id": "",
+            "kind": "EXIT",
             "status": "EXIT_REQUESTED",
             "position_id": kwargs.get("position_id"),
             "qty": kwargs.get("qty"),
+            "execution_mode": kwargs.get("execution_mode"),
             "meta": {},
         }
         self.active_orders_by_position[str(kwargs.get("position_id") or "")] = self.active_order
@@ -453,10 +457,11 @@ def _make_submit_engine(pos, *, callback, active_order=None, mode="LIVE"):
     if isinstance(active_order, dict) and not active_order.get("position_id"):
         active_order = dict(active_order)
         active_order["position_id"] = pos.position_id
+    osm = _FakeOSM(active_order=active_order, client_id=pos.client_id)
     engine = SimpleNamespace(
         _lock=threading.RLock(),
         client_id=pos.client_id,
-        order_state_machine=_FakeOSM(active_order=active_order),
+        order_state_machine=osm,
         osm=None,
         on_exit=callback,
         on_scale=callback,
@@ -1275,10 +1280,14 @@ def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
         pos,
         callback=callback,
         active_order={
+            "client_id": pos.client_id,
+            "kind": "EXIT",
             "status": "EXIT_REQUESTED",
             "local_order_id": "exit-local-reserved",
             "broker_order_id": "",
             "position_id": pos.position_id,
+            "qty": pos.quantity_remaining,
+            "execution_mode": "live",
         },
     )
 

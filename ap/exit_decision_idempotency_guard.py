@@ -195,6 +195,12 @@ def _execution_mode(engine: Any, pos: Any) -> str:
     ).strip().upper()
 
 
+def _runtime_execution_mode(engine: Any, pos: Any) -> str:
+    """Return the independently wired runtime mode in canonical form."""
+    mode = _execution_mode(engine, pos).strip().lower()
+    return mode if mode in {"live", "paper"} else ""
+
+
 def _durable_claim_outage_blocks_submit(engine: Any, pos: Any) -> bool:
     if _execution_mode(engine, pos) != "LIVE":
         return False
@@ -239,15 +245,41 @@ def _claim_local_order_id(pos: Any) -> str:
     return str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
 
 
-def _is_exact_reserved_exit_intent(pos: Any, active_order: dict | None) -> bool:
+def _is_exact_reserved_exit_intent(
+    engine: Any,
+    pos: Any,
+    active_order: dict | None,
+    *,
+    expected_client_id: str,
+) -> bool:
+    """Prove a reserved EXIT row belongs to this exact runtime submission."""
     if not isinstance(active_order, dict):
         return False
-    if str(active_order.get("status") or "").strip().upper() != "EXIT_REQUESTED":
+    runtime_mode = _runtime_execution_mode(engine, pos)
+    durable_mode = active_order.get("execution_mode")
+    if runtime_mode not in {"live", "paper"}:
         return False
-    active_local_order_id = str(active_order.get("local_order_id") or "").strip()
-    if not active_local_order_id or active_local_order_id != _claim_local_order_id(pos):
+    if durable_mode not in {"live", "paper"} or durable_mode != runtime_mode:
         return False
-    if str(active_order.get("broker_order_id") or "").strip():
+    if active_order.get("kind") != "EXIT":
+        return False
+    if active_order.get("status") != "EXIT_REQUESTED":
+        return False
+    expected_client_id = str(expected_client_id or "")
+    if not expected_client_id or active_order.get("client_id") != expected_client_id:
+        return False
+    position_id = str(getattr(pos, "position_id", "") or "")
+    if not position_id or str(active_order.get("position_id") or "") != position_id:
+        return False
+    reserved_local_order_id = _claim_local_order_id(pos)
+    if (
+        not reserved_local_order_id
+        or active_order.get("local_order_id") != reserved_local_order_id
+    ):
+        return False
+    if active_order.get("broker_order_id") not in (None, ""):
+        return False
+    if (_int(active_order.get("qty"), 0) or 0) <= 0:
         return False
     if bool(getattr(pos, "exit_in_flight", False)):
         return False
@@ -261,6 +293,8 @@ def _ensure_local_exit_intent_row(
     generation_key: str,
     exit_generation: int,
 ) -> str:
+    # A pending id is only a lookup pointer. wrap_submit revalidates the
+    # durable row immediately before the broker callback.
     local_order_id = _claim_local_order_id(pos)
     if local_order_id:
         return local_order_id
@@ -1018,20 +1052,40 @@ def _adopt_callback_broker_ownership(
 
     osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
     adopt = getattr(osm, "adopt_broker_owned_exit_request", None) if osm else None
-    if isinstance(active_order, dict) and "execution_mode" in active_order:
-        # The durable EXIT row is the strongest mode authority.  Do not let a
-        # process-wide master-control mode relabel a row from the other mode.
-        raw_expected_mode = str(active_order.get("execution_mode") or "").strip()
-        expected_mode = raw_expected_mode if raw_expected_mode in {"live", "paper"} else ""
+    # Runtime mode is independent authority.  The durable row may confirm it,
+    # but it may not self-authorize a different mode after the broker boundary.
+    runtime_mode = _runtime_execution_mode(engine, pos)
+    durable_mode = (
+        active_order.get("execution_mode")
+        if isinstance(active_order, dict)
+        else None
+    )
+    if runtime_mode not in {"live", "paper"}:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXECUTION_MODE_IDENTITY_CONFLICT",
+            "error": "runtime_execution_mode_unproven",
+        }
+    elif durable_mode not in {"live", "paper"} or durable_mode != runtime_mode:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXECUTION_MODE_IDENTITY_CONFLICT",
+            "error": (
+                "runtime_and_durable_execution_mode_conflict:"
+                f"runtime={runtime_mode}:durable={durable_mode or 'unknown'}"
+            ),
+        }
     else:
-        expected_mode = _execution_mode(engine, pos).strip().lower()
+        result = None
     expected_qty = (active_order or {}).get("qty") if isinstance(active_order, dict) else None
     broker_submitted_ts = identity.get("broker_submitted_ts")
     if not broker_submitted_ts and isinstance(active_order, dict):
         broker_submitted_ts = active_order.get("broker_submitted_ts")
         if not broker_submitted_ts:
             broker_submitted_ts = _claim_meta_dict(active_order).get("broker_submitted_ts")
-    if not callable(adopt):
+    if result is None and not callable(adopt):
         # An exact broker id crossed the external boundary, but the local
         # adoption seam is unavailable.  Treat that as an explicit
         # durability gap so the generation cannot be released as no-submit.
@@ -1041,19 +1095,12 @@ def _adopt_callback_broker_ownership(
             "reason_code": "OSM_ADOPTION_METHOD_UNAVAILABLE",
             "error": "osm_adoption_method_unavailable",
         }
-    elif expected_mode not in {"live", "paper"}:
-        result = {
-            "disposition": "IDENTITY_MISMATCH",
-            "adopted": False,
-            "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
-            "error": "execution_mode_missing_or_invalid",
-        }
-    else:
+    elif result is None:
         try:
             result = adopt(
                 local_order_id,
                 broker_order_id=broker_order_id,
-                execution_mode=expected_mode,
+                execution_mode=runtime_mode,
                 client_id=str(
                     getattr(pos, "client_id", "")
                     or getattr(engine, "client_id", "")
@@ -1289,6 +1336,16 @@ def _active_exit_order(engine: Any, position_id: str) -> dict | None:
     return row if isinstance(row, dict) else None
 
 
+def _active_exit_lookup_wired(engine: Any) -> bool:
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    if osm is None:
+        return False
+    return callable(
+        getattr(osm, "_get_active_exit_order", None)
+        or getattr(osm, "get_active_exit_order", None)
+    )
+
+
 def _terminal_position_snapshot(pos: Any, engine: Any) -> dict | None:
     client_id = str(
         getattr(pos, "client_id", "")
@@ -1424,7 +1481,18 @@ def wrap_precheck(original: Callable[..., bool]) -> Callable[..., bool]:
             except Exception as exc:
                 log.debug("early active-exit lookup unavailable position=%s error=%s", position_id, exc)
                 active_order = None
-            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(pos, active_order):
+            expected_client_id = str(
+                getattr(pos, "client_id", "")
+                or getattr(self, "client_id", "")
+                or getattr(self, "_email", "")
+                or ""
+            ).strip()
+            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(
+                self,
+                pos,
+                active_order,
+                expected_client_id=expected_client_id,
+            ):
                 try:
                     _mark_active_exit_owned(self, pos, active_order)
                 except Exception as exc:
@@ -1471,9 +1539,21 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             claims.add(key)
 
         try:
+            if (
+                _runtime_execution_mode(self, pos) == "live"
+                and not _active_exit_lookup_wired(self)
+            ):
+                log.critical(
+                    "[%s] EXIT_DECISION_ACTIVE_EXIT_LOOKUP_UNWIRED position=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                )
+                return False
+            active_order_lookup_failed = False
             try:
                 active_order = _active_exit_order(self, position_id)
             except Exception as exc:
+                active_order_lookup_failed = True
                 log.warning(
                     "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_LOOKUP_FAILED position=%s error=%s",
                     getattr(pos, "ticker", ""),
@@ -1481,7 +1561,24 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     exc,
                 )
                 active_order = None
-            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(pos, active_order):
+            reserved_local_order_id = _claim_local_order_id(pos)
+            if active_order_lookup_failed or (
+                reserved_local_order_id and active_order is None
+            ):
+                log.critical(
+                    "[%s] EXIT_DECISION_RESERVED_EXIT_IDENTITY_UNPROVEN position=%s local_order_id=%s lookup_failed=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                    reserved_local_order_id,
+                    active_order_lookup_failed,
+                )
+                return False
+            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(
+                self,
+                pos,
+                active_order,
+                expected_client_id=resolved_client,
+            ):
                 try:
                     _mark_active_exit_owned(self, pos, active_order)
                 except Exception as exc:
@@ -1590,6 +1687,43 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             getattr(decision, "action", ""),
                             getattr(decision, "reason_code", ""),
                             claim.get("claim_state", ""),
+                        )
+                        return False
+
+                    # A pending local id is only a pointer. Re-read and prove
+                    # the row after durable claim acquisition, immediately
+                    # before the irreversible callback boundary.
+                    try:
+                        active_order = _active_exit_order(self, position_id)
+                    except Exception as exc:
+                        log.critical(
+                            "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_LOOKUP_FAILED position=%s local_order_id=%s error=%s",
+                            getattr(pos, "ticker", ""),
+                            position_id,
+                            local_order_id,
+                            exc,
+                        )
+                        return False
+                    if not _is_exact_reserved_exit_intent(
+                        self,
+                        pos,
+                        active_order,
+                        expected_client_id=resolved_client,
+                    ):
+                        try:
+                            _mark_active_exit_owned(self, pos, active_order or {})
+                        except Exception as exc:
+                            log.debug(
+                                "[%s] final reserved exit ownership hydration failed position=%s error=%s",
+                                getattr(pos, "ticker", ""),
+                                position_id,
+                                exc,
+                            )
+                        log.critical(
+                            "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s",
+                            getattr(pos, "ticker", ""),
+                            position_id,
+                            local_order_id,
                         )
                         return False
 

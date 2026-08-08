@@ -715,14 +715,337 @@ def _guard_pos(**overrides):
     return SimpleNamespace(**values)
 
 
+def _guard_reserved_order(pos, *, local_order_id="exit-local-reserved", execution_mode="paper", **overrides):
+    order = {
+        "client_id": pos.client_id,
+        "local_order_id": local_order_id,
+        "broker_order_id": "",
+        "position_id": pos.position_id,
+        "kind": "EXIT",
+        "qty": 4,
+        "status": "EXIT_REQUESTED",
+        "execution_mode": execution_mode,
+    }
+    order.update(overrides)
+    return order
+
+
+def _guard_submit_engine(pos, active_order, callback, *, mode="PAPER"):
+    osm = _GuardOSM(active_order)
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=osm,
+        osm=None,
+        master_control=SimpleNamespace(mode=mode),
+        on_scale=callback,
+        on_exit=callback,
+    )
+    engine._extract_exit_order_identity = lambda result: {
+        "accepted": bool(result.get("accepted")),
+        "local_order_id": result.get("local_order_id"),
+        "broker_order_id": result.get("broker_order_id"),
+        "raw_status": result.get("status"),
+    }
+    return engine, osm
+
+
+def _patch_guard_submit_claim(monkeypatch):
+    updates = []
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_args: ("tradefluence|position-guard-1|4|1", 1),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **_kwargs: {"claimed": True},
+    )
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append((generation_key, kwargs)),
+    )
+    return updates
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "durable_mode"),
+    [("LIVE", "paper"), ("PAPER", "live")],
+)
+def test_reserved_mode_mismatch_blocks_before_broker_callback(
+    monkeypatch,
+    runtime_mode,
+    durable_mode,
+):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = _guard_reserved_order(
+        pos,
+        execution_mode=durable_mode,
+    )
+    callback = MagicMock()
+    engine, osm = _guard_submit_engine(
+        pos,
+        active_order,
+        callback,
+        mode=runtime_mode,
+    )
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert callback.call_count == 0
+    assert osm.adopt_broker_owned_exit_request.call_count == 0
+
+
+@pytest.mark.parametrize("durable_mode", ["LIVE", "PAPER", " live ", "", None])
+def test_malformed_reserved_durable_mode_blocks_before_broker_callback(
+    durable_mode,
+):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = _guard_reserved_order(pos, execution_mode=durable_mode)
+    callback = MagicMock()
+    engine, osm = _guard_submit_engine(pos, active_order, callback, mode="LIVE")
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert callback.call_count == 0
+    assert osm.adopt_broker_owned_exit_request.call_count == 0
+
+
+def test_unproven_runtime_mode_blocks_before_broker_callback():
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = _guard_reserved_order(pos, execution_mode="paper")
+    callback = MagicMock()
+    engine, osm = _guard_submit_engine(pos, active_order, callback, mode="UNKNOWN")
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert callback.call_count == 0
+    assert osm.adopt_broker_owned_exit_request.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kind", "ENTRY"),
+        ("client_id", "other-client"),
+        ("position_id", "other-position"),
+        ("qty", 0),
+        ("broker_order_id", "already-owned"),
+    ],
+)
+def test_reserved_identity_mismatch_blocks_before_broker_callback(field, value):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = _guard_reserved_order(pos, **{field: value})
+    callback = MagicMock()
+    engine, osm = _guard_submit_engine(pos, active_order, callback, mode="PAPER")
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert callback.call_count == 0
+    assert osm.adopt_broker_owned_exit_request.call_count == 0
+
+
+def test_reserved_local_id_is_only_a_pointer_when_active_row_is_missing():
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-missing")
+    callback = MagicMock()
+
+    class _NoActiveRowOSM(_GuardOSM):
+        def __init__(self):
+            super().__init__({})
+
+        def get_active_exit_order(self, position_id):
+            return None
+
+    osm = _NoActiveRowOSM()
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=osm,
+        osm=None,
+        master_control=SimpleNamespace(mode="LIVE"),
+        on_scale=callback,
+        on_exit=callback,
+    )
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert callback.call_count == 0
+
+
+def test_live_submit_fails_closed_when_active_exit_lookup_raises():
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-lookup-error")
+    callback = MagicMock()
+
+    class _LookupFailureOSM(_GuardOSM):
+        def __init__(self):
+            super().__init__({})
+
+        def get_active_exit_order(self, position_id):
+            raise RuntimeError("active exit lookup unavailable")
+
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id=pos.client_id,
+        order_state_machine=_LookupFailureOSM(),
+        osm=None,
+        master_control=SimpleNamespace(mode="LIVE"),
+        on_scale=callback,
+        on_exit=callback,
+    )
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert callback.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "durable_mode"),
+    [("LIVE", "live"), ("PAPER", "paper")],
+)
+def test_exact_reserved_mode_allows_one_broker_submit_and_adoption(
+    monkeypatch,
+    runtime_mode,
+    durable_mode,
+):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = _guard_reserved_order(pos, execution_mode=durable_mode)
+    callback_calls = []
+
+    def callback(callback_pos, _decision):
+        callback_calls.append(True)
+        callback_pos.exit_in_flight = True
+        callback_pos.pending_exit_broker_order_id = "broker-exact-1"
+        active_order["broker_order_id"] = "broker-exact-1"
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "EXIT_SUBMITTED",
+            "local_order_id": "exit-local-reserved",
+            "broker_order_id": "broker-exact-1",
+        }
+
+    engine, osm = _guard_submit_engine(
+        pos,
+        active_order,
+        callback,
+        mode=runtime_mode,
+    )
+    osm.adopt_broker_owned_exit_request.return_value = {
+        "disposition": "ADOPTED",
+        "adopted": True,
+        "status": "EXIT_SUBMITTED",
+        "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
+    }
+    updates = _patch_guard_submit_claim(monkeypatch)
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is True
+    assert callback_calls == [True]
+    osm.adopt_broker_owned_exit_request.assert_called_once()
+    assert osm.adopt_broker_owned_exit_request.call_args.kwargs["execution_mode"] == durable_mode
+    assert updates[0][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates[0][1]["broker_order_id"] == "broker-exact-1"
+
+
+@pytest.mark.parametrize(
+    ("runtime_mode", "post_acceptance_mode"),
+    [("LIVE", "paper"), ("PAPER", "live")],
+)
+def test_post_acceptance_mode_conflict_quarantines_broker_owned_claim(
+    monkeypatch,
+    runtime_mode,
+    post_acceptance_mode,
+):
+    pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
+    active_order = _guard_reserved_order(
+        pos,
+        execution_mode=runtime_mode.lower(),
+    )
+    callback_calls = []
+
+    def callback(callback_pos, _decision):
+        callback_calls.append(True)
+        callback_pos.exit_in_flight = True
+        callback_pos.pending_exit_broker_order_id = "broker-mode-conflict"
+        # Simulate a durable row observed in the wrong mode after the broker
+        # accepted the request. The broker id must remain quarantined.
+        active_order["execution_mode"] = post_acceptance_mode
+        active_order["broker_order_id"] = "broker-mode-conflict"
+        return {
+            "ok": True,
+            "accepted": True,
+            "status": "EXIT_SUBMITTED",
+            "local_order_id": "exit-local-reserved",
+            "broker_order_id": "broker-mode-conflict",
+        }
+
+    engine, osm = _guard_submit_engine(
+        pos,
+        active_order,
+        callback,
+        mode=runtime_mode,
+    )
+    updates = _patch_guard_submit_claim(monkeypatch)
+    wrapped = guard.wrap_submit(
+        lambda submit_engine, submit_pos, decision: bool(
+            submit_engine.on_scale(submit_pos, decision)
+        )
+    )
+
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is True
+    assert callback_calls == [True]
+    osm.adopt_broker_owned_exit_request.assert_not_called()
+    assert updates[0][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates[0][1]["local_order_id"] == "exit-local-reserved"
+    assert updates[0][1]["broker_order_id"] == "broker-mode-conflict"
+    assert updates[0][1]["error_text"].startswith(
+        "BROKER_OWNED_DURABILITY_GAP:EXECUTION_MODE_IDENTITY_CONFLICT:"
+    )
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_broker_order_id == "broker-mode-conflict"
+
+
 def test_callback_local_identity_conflict_holds_without_osm_adoption():
     pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
     active_order = {
+        "client_id": pos.client_id,
+        "kind": "EXIT",
         "local_order_id": "exit-local-reserved",
         "broker_order_id": "",
         "status": "EXIT_REQUESTED",
         "position_id": pos.position_id,
         "qty": 4,
+        "execution_mode": "paper",
     }
     osm = _GuardOSM(active_order)
     engine = SimpleNamespace(
@@ -758,11 +1081,14 @@ def test_callback_local_identity_conflict_holds_without_osm_adoption():
 def test_callback_broker_identity_conflict_holds_without_choosing_an_id():
     pos = _guard_pos(pending_exit_local_order_id="exit-local-reserved")
     active_order = {
+        "client_id": pos.client_id,
+        "kind": "EXIT",
         "local_order_id": "exit-local-reserved",
         "broker_order_id": "broker-active-1",
         "status": "EXIT_REQUESTED",
         "position_id": pos.position_id,
         "qty": 4,
+        "execution_mode": "paper",
     }
     osm = _GuardOSM(active_order)
     engine = SimpleNamespace(
@@ -796,6 +1122,8 @@ def test_callback_broker_identity_conflict_holds_without_choosing_an_id():
 def test_submit_wrapper_reconciles_callback_exception_before_reraising(monkeypatch):
     pos = _guard_pos(pending_exit_local_order_id="exit-local-uncertain")
     active_order = {
+        "client_id": pos.client_id,
+        "kind": "EXIT",
         "local_order_id": "exit-local-uncertain",
         "broker_order_id": "",
         "status": "EXIT_REQUESTED",
@@ -866,6 +1194,8 @@ def test_submit_wrapper_reconciles_callback_exception_before_reraising(monkeypat
 def test_submit_wrapper_broker_identity_conflict_keeps_claim_unresolved(monkeypatch):
     pos = _guard_pos(pending_exit_local_order_id="exit-local-conflict")
     active_order = {
+        "client_id": pos.client_id,
+        "kind": "EXIT",
         "local_order_id": "exit-local-conflict",
         "broker_order_id": "",
         "status": "EXIT_REQUESTED",
@@ -1166,12 +1496,14 @@ def test_idempotency_claim_stays_broker_owned_on_adoption_gap(monkeypatch):
         pending_exit_broker_order_id="",
     )
     active_order = {
+        "client_id": "tradefluence",
         "local_order_id": "exit-gap-1",
         "position_id": "position-gap",
         "kind": "EXIT",
         "status": "EXIT_REQUESTED",
         "broker_order_id": "",
         "qty": 4,
+        "execution_mode": "paper",
     }
 
     class _GapOSM:
