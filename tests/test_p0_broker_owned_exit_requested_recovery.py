@@ -1007,19 +1007,33 @@ def test_partial_exit_replay_preserves_exact_exit_quantity_and_remaining_positio
 
 
 def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypatch):
-    """Use disposable PostgreSQL for adoption CAS, fill transition, and replay fencing."""
+    """Two full reducers race one recovered EXIT; Postgres permits one economy."""
     from contextlib import contextmanager
     import uuid
 
-    psycopg2 = pytest.importorskip("psycopg2")
-    extras = pytest.importorskip("psycopg2.extras")
+    from ap import position_manager as pm_module
+
+    in_github_actions = os.getenv("GITHUB_ACTIONS", "").strip().lower() == "true"
+    try:
+        import psycopg2
+        import psycopg2.extras as extras
+    except ImportError:
+        if in_github_actions:
+            raise
+        pytest.skip("psycopg2 is unavailable outside GitHub Actions")
     database_url = os.getenv("DATABASE_URL", "")
     if not database_url:
+        if in_github_actions:
+            pytest.fail("DATABASE_URL must be configured in GitHub Actions")
         pytest.skip("DATABASE_URL not configured")
 
     try:
         admin = psycopg2.connect(database_url, connect_timeout=2)
     except Exception as exc:
+        if in_github_actions:
+            raise AssertionError(
+                "GitHub Actions PostgreSQL service is unavailable"
+            ) from exc
         pytest.skip(f"disposable PostgreSQL unavailable: {type(exc).__name__}")
 
     schema = f"pr425_{uuid.uuid4().hex}"
@@ -1086,21 +1100,128 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                 )
                 """
             )
-            cursor.execute(
-                f"""
+            cursor.execute(f"""
                 CREATE TABLE "{schema}".positions (
                     id TEXT PRIMARY KEY,
                     client_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
                     quantity_remaining INTEGER NOT NULL,
-                    qty INTEGER NOT NULL
+                    qty INTEGER NOT NULL,
+                    avg_fill NUMERIC NOT NULL,
+                    entry_price NUMERIC NOT NULL,
+                    contract TEXT NOT NULL,
+                    underlying TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    entry_ts TIMESTAMPTZ NOT NULL,
+                    exit_ts TIMESTAMPTZ,
+                    exit_price NUMERIC,
+                    realized_pnl NUMERIC,
+                    realized_pnl_pct NUMERIC,
+                    exit_reason TEXT,
+                    close_source TEXT,
+                    close_confidence TEXT,
+                    execution_mode TEXT NOT NULL,
+                    local_order_id TEXT,
+                    broker_order_id TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
-                """
-            )
+            """)
+            cursor.execute(f"""
+                CREATE TABLE "{schema}".proof_trades (
+                    id BIGSERIAL PRIMARY KEY,
+                    client_email TEXT NOT NULL,
+                    system_version TEXT NOT NULL DEFAULT 'v2',
+                    synthetic_entry BOOLEAN NOT NULL DEFAULT FALSE,
+                    position_id TEXT NOT NULL,
+                    local_order_id TEXT,
+                    exit_option_price NUMERIC,
+                    option_pnl_pct NUMERIC,
+                    win BOOLEAN,
+                    exit_reason TEXT,
+                    UNIQUE (client_email, position_id)
+                )
+            """)
+            cursor.execute(f"""
+                CREATE TABLE "{schema}".exit_filled_lifecycle_events (
+                    id BIGSERIAL PRIMARY KEY,
+                    local_order_id TEXT NOT NULL,
+                    old_status TEXT NOT NULL,
+                    new_status TEXT NOT NULL,
+                    filled_qty INTEGER NOT NULL,
+                    broker_order_id TEXT NOT NULL
+                )
+            """)
+            cursor.execute(f"""
+                CREATE FUNCTION "{schema}".record_exit_filled_transition()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $fn$
+                BEGIN
+                    IF OLD.status IS DISTINCT FROM NEW.status
+                       AND NEW.status = 'EXIT_FILLED' THEN
+                        INSERT INTO "{schema}".exit_filled_lifecycle_events
+                            (local_order_id, old_status, new_status, filled_qty,
+                             broker_order_id)
+                        VALUES
+                            (NEW.local_order_id, OLD.status, NEW.status,
+                             NEW.filled_qty, NEW.broker_order_id);
+                    END IF;
+                    RETURN NEW;
+                END;
+                $fn$
+            """)
+            cursor.execute(f"""
+                CREATE TRIGGER record_exit_filled_transition
+                AFTER UPDATE ON "{schema}".orders
+                FOR EACH ROW EXECUTE FUNCTION
+                    "{schema}".record_exit_filled_transition()
+            """)
+            cursor.execute(f"""
+                CREATE TABLE "{schema}".position_economic_finalizations (
+                    id BIGSERIAL PRIMARY KEY,
+                    position_id TEXT NOT NULL,
+                    old_quantity_remaining INTEGER NOT NULL,
+                    new_quantity_remaining INTEGER NOT NULL,
+                    old_status TEXT NOT NULL,
+                    new_status TEXT NOT NULL,
+                    broker_order_id TEXT
+                )
+            """)
+            cursor.execute(f"""
+                CREATE FUNCTION "{schema}".record_position_finalization()
+                RETURNS TRIGGER LANGUAGE plpgsql AS $fn$
+                BEGIN
+                    IF OLD.quantity_remaining IS DISTINCT FROM NEW.quantity_remaining
+                       OR OLD.status IS DISTINCT FROM NEW.status THEN
+                        INSERT INTO "{schema}".position_economic_finalizations
+                            (position_id, old_quantity_remaining,
+                             new_quantity_remaining, old_status, new_status,
+                             broker_order_id)
+                        VALUES
+                            (NEW.id, OLD.quantity_remaining,
+                             NEW.quantity_remaining, OLD.status, NEW.status,
+                             NEW.broker_order_id);
+                    END IF;
+                    RETURN NEW;
+                END;
+                $fn$
+            """)
+            cursor.execute(f"""
+                CREATE TRIGGER record_position_finalization
+                AFTER UPDATE ON "{schema}".positions
+                FOR EACH ROW EXECUTE FUNCTION
+                    "{schema}".record_position_finalization()
+            """)
             cursor.execute(
                 f"""
                 INSERT INTO "{schema}".positions
-                    (id, client_id, quantity_remaining, qty)
-                VALUES ('position-orcl-1', 'tradefluence', 4, 4)
+                    (id, client_id, status, quantity_remaining, qty, avg_fill,
+                     entry_price, contract, underlying, ticker, side, direction,
+                     entry_ts, execution_mode, local_order_id)
+                VALUES
+                    ('position-orcl-1', 'tradefluence', 'OPEN', 4, 4, 1.00,
+                     1.00, 'ORCL260807P00155000', 'ORCL', 'ORCL', 'PUT', 'PUT',
+                     '2026-08-08T13:30:00Z', 'paper', 'entry-orcl-425')
                 """
             )
             cursor.execute(
@@ -1109,9 +1230,6 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
                     (local_order_id, client_id, position_id, kind, status,
                      broker_order_id, execution_mode, qty, symbol, contract)
                 VALUES
-                    ('exit-orcl-concurrent', 'tradefluence', 'position-orcl-1',
-                     'EXIT', 'EXIT_REQUESTED', NULL, 'paper', 4, 'ORCL',
-                     'ORCL260807P00155000'),
                     ('exit-orcl-real-pg', 'tradefluence', 'position-orcl-1',
                      'EXIT', 'EXIT_REQUESTED', '36661364', 'paper', 4, 'ORCL',
                      'ORCL260807P00155000')
@@ -1120,79 +1238,67 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
 
         monkeypatch.setattr(osm_module, "conn", _pg_conn)
         monkeypatch.setattr(osm_module, "run_with_retry", lambda fn, **kwargs: fn())
+        monkeypatch.setattr(pm_module, "conn", _pg_conn)
+        monkeypatch.setattr(pm_module, "run_with_retry", lambda fn, **kwargs: fn())
+        position_columns = {
+            "id", "client_id", "status", "quantity_remaining", "qty",
+            "avg_fill", "entry_price", "contract", "underlying", "ticker",
+            "side", "direction", "entry_ts", "exit_ts", "exit_price",
+            "realized_pnl", "realized_pnl_pct", "exit_reason", "close_source",
+            "close_confidence", "execution_mode", "local_order_id",
+            "broker_order_id", "updated_at",
+        }
+        monkeypatch.setattr(
+            pm_module.APPositionManager,
+            "_position_columns",
+            lambda self: set(position_columns),
+        )
+
+        # Keep proof publication at its external boundary while the canonical
+        # orders -> positions economic reducer remains completely real.  The
+        # durable test proof uses the production position identity and a unique
+        # key, so duplicate economic accounting is directly queryable.
+        def _persist_test_terminal_proof(self, **kwargs):
+            with _pg_conn() as connection:
+                connection.execute(
+                    "INSERT INTO proof_trades "
+                    "(client_email, position_id, local_order_id, "
+                    " exit_option_price, option_pnl_pct, win, exit_reason) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (client_email, position_id) DO NOTHING",
+                    (
+                        self.client_id,
+                        kwargs["position_id"],
+                        kwargs.get("local_order_id"),
+                        kwargs.get("exit_option_price"),
+                        kwargs.get("option_pnl_pct"),
+                        float(kwargs.get("option_pnl_pct") or 0) > 0,
+                        kwargs.get("exit_reason"),
+                    ),
+                )
+            return True
+
+        monkeypatch.setattr(
+            pm_module.APPositionManager,
+            "_ensure_terminal_close_proof",
+            _persist_test_terminal_proof,
+        )
         engine = _CanonicalExitEngine()
         monkeypatch.setitem(osm_module._exit_engine_registry, "tradefluence", engine)
 
         osm_a = APOrderStateMachine("tradefluence")
         osm_b = APOrderStateMachine("tradefluence")
         for state_machine in (osm_a, osm_b):
-            state_machine._emit_transition_event = MagicMock()
-            state_machine._notify_opportunity_ledger = MagicMock()
+            state_machine._emit_transition_event = lambda **kwargs: None
 
-        barrier = threading.Barrier(2)
-        adoption_results = []
-        adoption_errors = []
-
-        def _concurrent_adopt(state_machine):
-            try:
-                barrier.wait(timeout=5)
-                adoption_results.append(
-                    state_machine.adopt_broker_owned_exit_request(
-                        "exit-orcl-concurrent",
-                        broker_order_id="concurrent-broker-425",
-                        execution_mode="paper",
-                        client_id="tradefluence",
-                        position_id="position-orcl-1",
-                        expected_qty=4,
-                        source="real_postgres_concurrency_replay",
-                    )
-                )
-            except Exception as exc:
-                adoption_errors.append(exc)
-
-        threads = [
-            threading.Thread(target=_concurrent_adopt, args=(osm_a,)),
-            threading.Thread(target=_concurrent_adopt, args=(osm_b,)),
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=10)
-
-        assert adoption_errors == []
-        assert all(not thread.is_alive() for thread in threads)
-        assert {result["disposition"] for result in adoption_results} == {
-            "ADOPTED",
-            "ALREADY_BROKER_OWNED_ACTIVE",
-        }
-        with _pg_conn() as connection:
-            connection.execute(
-                "SELECT status, broker_order_id FROM orders "
-                "WHERE local_order_id=%s AND client_id=%s",
-                ("exit-orcl-concurrent", "tradefluence"),
-            )
-            concurrent_row = dict(connection.fetchone())
-        assert concurrent_row == {
-            "status": "EXIT_SUBMITTED",
-            "broker_order_id": "concurrent-broker-425",
-        }
-        assert len(engine.pending_calls) == 1
-
-        osm = APOrderStateMachine("tradefluence")
-        osm._emit_transition_event = MagicMock()
-        osm._notify_opportunity_ledger = MagicMock()
-        osm._finalize_position_from_exit_order = MagicMock()
-        broker = _Broker(
-            {
-                "status": "FILLED",
-                "exec_quantity": 4,
-                "avg_fill_price": 1.25,
-                "quantity": 4,
-            }
+        monkeypatch.setattr(
+            "ap.performance_tracker.record_trade_outcome_from_position",
+            lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(fm, "audit", lambda *args, **kwargs: None)
         monkeypatch.setattr(fm, "emit_fill_event", lambda *args, **kwargs: True)
         monkeypatch.setattr(fm, "_sync_exit_price", lambda *args, **kwargs: None)
+
         with _pg_conn() as connection:
             connection.execute(
                 "SELECT * FROM orders WHERE local_order_id=%s AND client_id=%s",
@@ -1200,34 +1306,190 @@ def test_orcl_replay_proves_real_postgres_cas_and_single_economic_fill(monkeypat
             )
             original_order = dict(connection.fetchone())
 
+        broker_truth_barrier = threading.Barrier(2)
+        money_path = {"get": [], "post": [], "cancel": [], "delete": []}
+
+        class _ConcurrentRecoveryBroker:
+            def get_order(self, broker_order_id):
+                money_path["get"].append(str(broker_order_id))
+                broker_truth_barrier.wait(timeout=10)
+                return {
+                    "status": "FILLED",
+                    "exec_quantity": 4,
+                    "avg_fill_price": 1.25,
+                    "quantity": 4,
+                }
+
+            def submit_order(self, *args, **kwargs):
+                money_path["post"].append((args, kwargs))
+                raise AssertionError("recovery must never submit a replacement EXIT")
+
+            def cancel_order(self, *args, **kwargs):
+                money_path["cancel"].append((args, kwargs))
+                raise AssertionError("recovery must never cancel the owned EXIT")
+
+            def delete_order(self, *args, **kwargs):
+                money_path["delete"].append((args, kwargs))
+                raise AssertionError("recovery must never delete the owned EXIT")
+
+        worker_errors = []
+        worker_start = threading.Barrier(2)
+
+        def _process(state_machine):
+            try:
+                worker_start.wait(timeout=10)
+                fm.process_pending_order(
+                    _ConcurrentRecoveryBroker(),
+                    dict(original_order),
+                    osm=state_machine,
+                    runtime_execution_mode="paper",
+                )
+            except Exception as exc:
+                worker_errors.append(exc)
+
+        threads = [
+            threading.Thread(target=_process, args=(osm_a,)),
+            threading.Thread(target=_process, args=(osm_b,)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert worker_errors == []
+        assert all(not thread.is_alive() for thread in threads)
+
+        with _pg_conn() as connection:
+            connection.execute(
+                "SELECT status, broker_order_id, client_id, execution_mode, "
+                "position_id, qty, filled_qty, fill_price FROM orders "
+                "WHERE local_order_id=%s AND client_id=%s",
+                ("exit-orcl-real-pg", "tradefluence"),
+            )
+            filled_row = dict(connection.fetchone())
+            connection.execute(
+                "SELECT * FROM positions WHERE id=%s AND client_id=%s",
+                ("position-orcl-1", "tradefluence"),
+            )
+            position_row = dict(connection.fetchone())
+            connection.execute(
+                "SELECT * FROM exit_filled_lifecycle_events "
+                "WHERE local_order_id=%s ORDER BY id",
+                ("exit-orcl-real-pg",),
+            )
+            lifecycle_events = [dict(row) for row in connection.fetchall()]
+            connection.execute(
+                "SELECT * FROM position_economic_finalizations "
+                "WHERE position_id=%s ORDER BY id",
+                ("position-orcl-1",),
+            )
+            economic_events = [dict(row) for row in connection.fetchall()]
+            connection.execute(
+                "SELECT COUNT(*) AS count FROM proof_trades "
+                "WHERE client_email=%s AND position_id=%s",
+                ("tradefluence", "position-orcl-1"),
+            )
+            proof_count = int(connection.fetchone()["count"])
+            connection.execute(
+                "SELECT COUNT(*) AS count FROM orders "
+                "WHERE client_id=%s AND position_id=%s AND kind='EXIT'",
+                ("tradefluence", "position-orcl-1"),
+            )
+            exit_count = int(connection.fetchone()["count"])
+
+        assert money_path["get"] == ["36661364", "36661364"]
+        assert money_path["post"] == []
+        assert money_path["cancel"] == []
+        assert money_path["delete"] == []
+        assert filled_row == {
+            "status": "EXIT_FILLED",
+            "broker_order_id": "36661364",
+            "client_id": "tradefluence",
+            "execution_mode": "paper",
+            "position_id": "position-orcl-1",
+            "qty": 4,
+            "filled_qty": 4,
+            "fill_price": filled_row["fill_price"],
+        }
+        assert float(filled_row["fill_price"]) == 1.25
+        assert len(lifecycle_events) == 1
+        assert lifecycle_events[0]["old_status"] == "EXIT_SUBMITTED"
+        assert lifecycle_events[0]["new_status"] == "EXIT_FILLED"
+        assert lifecycle_events[0]["filled_qty"] == 4
+        assert lifecycle_events[0]["broker_order_id"] == "36661364"
+        assert position_row["status"] == "CLOSED"
+        assert position_row["quantity_remaining"] == 0
+        assert position_row["quantity_remaining"] >= 0
+        assert position_row["qty"] == 4
+        assert position_row["client_id"] == "tradefluence"
+        assert position_row["execution_mode"] == "paper"
+        assert position_row["broker_order_id"] == "36661364"
+        assert len(economic_events) == 1
+        assert economic_events[0]["old_quantity_remaining"] == 4
+        assert economic_events[0]["new_quantity_remaining"] == 0
+        assert economic_events[0]["old_status"] == "OPEN"
+        assert economic_events[0]["new_status"] == "CLOSED"
+        assert proof_count == 1
+        assert exit_count == 1
+        assert len(engine.pending_calls) == 1
+        assert len(engine.closed_calls) == 1
+        assert engine.position.quantity_remaining == 0
+
+        # Sequential restart/replay uses the same full processing path.  The
+        # terminal adoption reread must stop before another broker poll or any
+        # economic mutation.
+        class _ReplayBroker(_ConcurrentRecoveryBroker):
+            def get_order(self, broker_order_id):
+                raise AssertionError("terminal replay must not poll the broker")
+
+        replay_osm = APOrderStateMachine("tradefluence")
+        replay_osm._emit_transition_event = lambda **kwargs: None
         fm.process_pending_order(
-            broker,
-            original_order,
-            osm=osm,
-            runtime_execution_mode="paper",
-        )
-        fm.process_pending_order(
-            broker,
-            original_order,
-            osm=osm,
+            _ReplayBroker(),
+            dict(original_order),
+            osm=replay_osm,
             runtime_execution_mode="paper",
         )
 
         with _pg_conn() as connection:
             connection.execute(
-                "SELECT status, filled_qty, fill_price FROM orders "
-                "WHERE local_order_id=%s AND client_id=%s",
-                ("exit-orcl-real-pg", "tradefluence"),
+                "SELECT status, filled_qty FROM orders WHERE local_order_id=%s",
+                ("exit-orcl-real-pg",),
             )
-            filled_row = dict(connection.fetchone())
-        assert broker.calls == ["36661364"]
-        assert filled_row["status"] == "EXIT_FILLED"
-        assert filled_row["filled_qty"] == 4
-        assert float(filled_row["fill_price"]) == 1.25
-        assert len(engine.pending_calls) == 2
+            replay_order = dict(connection.fetchone())
+            connection.execute(
+                "SELECT status, quantity_remaining FROM positions WHERE id=%s",
+                ("position-orcl-1",),
+            )
+            replay_position = dict(connection.fetchone())
+            connection.execute(
+                "SELECT COUNT(*) AS count FROM exit_filled_lifecycle_events "
+                "WHERE local_order_id=%s",
+                ("exit-orcl-real-pg",),
+            )
+            replay_lifecycle_count = int(connection.fetchone()["count"])
+            connection.execute(
+                "SELECT COUNT(*) AS count FROM position_economic_finalizations "
+                "WHERE position_id=%s",
+                ("position-orcl-1",),
+            )
+            replay_economic_count = int(connection.fetchone()["count"])
+            connection.execute(
+                "SELECT COUNT(*) AS count FROM proof_trades "
+                "WHERE client_email=%s AND position_id=%s",
+                ("tradefluence", "position-orcl-1"),
+            )
+            replay_proof_count = int(connection.fetchone()["count"])
+
+        assert replay_order == {"status": "EXIT_FILLED", "filled_qty": 4}
+        assert replay_position == {"status": "CLOSED", "quantity_remaining": 0}
+        assert replay_lifecycle_count == 1
+        assert replay_economic_count == 1
+        assert replay_proof_count == 1
+        assert money_path["post"] == []
+        assert money_path["cancel"] == []
+        assert money_path["delete"] == []
         assert len(engine.closed_calls) == 1
-        assert engine.position.quantity_remaining == 0
-        osm._finalize_position_from_exit_order.assert_called_once()
     finally:
         try:
             with admin.cursor() as cursor:
@@ -2665,118 +2927,203 @@ def test_f4_repeated_processing_after_terminal_makes_no_further_mutation(fake_os
 # =====================================================================
 
 
-def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post():
-    """Blocker 1: a fresh EXIT intent that becomes terminal after claim
-    acquisition but before the callback boundary must not reach broker POST.
+def _run_blocker1_fresh_intent_wrapper_case(monkeypatch, *, final_status):
+    """Drive the real wrap_submit boundary around a fresh local EXIT intent."""
+    events = []
+    broker_side_effects = []
+    claim_updates = []
+    reserved_id = "exit-fresh-wrapper-425"
 
-    Regression against the prior behavior where
-    ``reserved_exit_requires_final_fence`` was computed *before*
-    ``_ensure_local_exit_intent_row`` created the row, causing the final
-    reread to be skipped on the normal fresh-submit path.
-    """
-    from ap import exit_decision_idempotency_guard as guard_mod
+    pos = SimpleNamespace(
+        position_id="position-fresh-wrapper-425",
+        client_id="tradefluence",
+        ticker="ORCL",
+        option_symbol="ORCL260807P00155000",
+        side="PUT",
+        quantity_remaining=4,
+        closed=False,
+        exit_in_flight=False,
+        pending_exit_local_order_id="",
+        pending_exit_broker_order_id="",
+    )
 
-    submit_calls = []
-    active_orders_returned = []
-    reserved_id = "exit-fresh-1"
-
-    class _FakePos:
+    class _WrapperOSM:
         def __init__(self):
-            self.position_id = "position-fresh-1"
-            self.client_id = "tradefluence"
-            self.ticker = "ORCL"
-            self.option_symbol = "ORCL260807P00155000"
-            self.side = "PUT"
-            self.quantity_remaining = 4
-            self.closed = False
-            self.exit_in_flight = False
-            self.pending_exit_local_order_id = ""
-            self.pending_exit_broker_order_id = ""
+            self.row = None
+            self.active_lookup_count = 0
+            self.create_count = 0
+            self.adopt_count = 0
 
-        def _pending_exit_local_order_id(self):
-            return self.pending_exit_local_order_id
-
-    pos = _FakePos()
-
-    class _StubEngine:
-        def __init__(self):
-            self.client_id = "tradefluence"
-            self.on_exit_calls = 0
-
-        def on_exit(self, *_a, **_kw):
-            self.on_exit_calls += 1
-            submit_calls.append("broker_post")
-            return {"broker_order_id": "BID-1", "status": "accepted"}
-
-    engine = _StubEngine()
-
-    # Two _active_exit_order lookups happen: initial (no active), and the
-    # final reread immediately before the callback.  The final reread now
-    # returns a terminalized row for the reserved local id.
-    def _fake_active_exit_order(_engine, _position_id):
-        if not active_orders_returned:
-            active_orders_returned.append("initial")
-            return None
-        active_orders_returned.append("final")
-        return {
-            "local_order_id": reserved_id,
-            "client_id": "tradefluence",
-            "position_id": "position-fresh-1",
-            "kind": "EXIT",
-            "status": "EXIT_FILLED",
-            "execution_mode": "paper",
-            "qty": 4,
-            "broker_order_id": "",
-        }
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(guard_mod, "_active_exit_order", _fake_active_exit_order)
-        mp.setattr(
-            guard_mod, "active_exit_order_blocks", lambda _o: False, raising=False,
-        )
-        mp.setattr(guard_mod, "_claim_local_order_id", lambda _pos: reserved_id)
-        mp.setattr(
-            guard_mod, "_ensure_local_exit_intent_row",
-            lambda *_a, **_kw: reserved_id,
-        )
-        mp.setattr(
-            guard_mod, "_durable_exit_generation",
-            lambda _pos, _client: ("gen-key", 1),
-        )
-        mp.setattr(
-            guard_mod, "_claim_durable_decision_generation",
-            lambda **_kw: {"claimed": True, "local_order_id": reserved_id},
-        )
-        mp.setattr(
-            guard_mod, "_durable_claim_outage_blocks_submit",
-            lambda *_a, **_kw: True,
-        )
-
-        # Ensure the exact-reserved-intent identity check reports mismatch,
-        # since the row visible on the final reread has status EXIT_FILLED.
-        assert (
-            guard_mod._is_exact_reserved_exit_intent(
-                engine, pos,
-                {
-                    "local_order_id": reserved_id,
-                    "client_id": "tradefluence",
-                    "position_id": "position-fresh-1",
-                    "kind": "EXIT",
-                    "status": "EXIT_FILLED",
-                    "execution_mode": "paper",
-                    "qty": 4,
-                    "broker_order_id": "",
-                },
-                expected_client_id="tradefluence",
+        def get_active_exit_order(self, position_id):
+            assert position_id == pos.position_id
+            self.active_lookup_count += 1
+            events.append(
+                "initial_read" if self.active_lookup_count == 1 else "final_read"
             )
-            is False
-        )
+            return dict(self.row) if self.row is not None else None
 
-    # The regression this test asserts is exercised at the wrap_submit
-    # boundary, but the important invariant is directly observable at the
-    # identity checker: an EXIT_FILLED row does not authorize submission.
-    assert engine.on_exit_calls == 0
-    assert "broker_post" not in submit_calls
+        def create_exit_order(self, **kwargs):
+            self.create_count += 1
+            events.append("create_intent")
+            assert kwargs["position_id"] == pos.position_id
+            assert kwargs["qty"] == 4
+            self.row = {
+                "local_order_id": reserved_id,
+                "client_id": "tradefluence",
+                "position_id": pos.position_id,
+                "kind": "EXIT",
+                "status": "EXIT_REQUESTED",
+                "execution_mode": "paper",
+                "qty": 4,
+                "broker_order_id": "",
+                "meta": {},
+            }
+            return reserved_id
+
+        def update_order_meta(self, local_order_id, patch):
+            assert local_order_id == reserved_id
+            self.row["meta"].update(dict(patch))
+            return True
+
+        def get_order(self, local_order_id):
+            return dict(self.row) if local_order_id == reserved_id else None
+
+        def adopt_broker_owned_exit_request(self, *args, **kwargs):
+            self.adopt_count += 1
+            return {"disposition": "ADOPTED", "adopted": True}
+
+    osm = _WrapperOSM()
+    callback = MagicMock(
+        side_effect=lambda *_a, **_kw: broker_side_effects.append("broker_post")
+        or {"ok": True}
+    )
+    engine = SimpleNamespace(
+        _lock=threading.RLock(),
+        client_id="tradefluence",
+        order_state_machine=osm,
+        osm=None,
+        on_exit=callback,
+        on_scale=callback,
+        master_control=SimpleNamespace(mode="paper"),
+        _extract_exit_order_identity=lambda result: {
+            "accepted": bool((result or {}).get("ok")),
+            "local_order_id": reserved_id,
+            "broker_order_id": "",
+            "raw_status": "",
+        },
+    )
+
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_args: ("tradefluence|position-fresh-wrapper-425|4|1", 1),
+    )
+
+    def _claim_generation(**kwargs):
+        events.append("claim_generation")
+        assert kwargs["local_order_id"] == reserved_id
+        assert osm.row["status"] == "EXIT_REQUESTED"
+        osm.row["status"] = final_status
+        return {"claimed": True, "local_order_id": reserved_id}
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", _claim_generation)
+    adoption = MagicMock(return_value={"attempted": False, "adopted": False})
+    monkeypatch.setattr(guard, "_adopt_callback_broker_ownership", adoption)
+    monkeypatch.setattr(
+        guard,
+        "_classify_submit_claim_outcome",
+        lambda *_args, **_kwargs: (
+            guard._CLAIM_STATE_RELEASED_NO_SUBMIT,
+            reserved_id,
+            "",
+            "positive_control_complete",
+        ),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: claim_updates.append(
+            (generation_key, dict(kwargs))
+        ),
+    )
+    monkeypatch.setattr(
+        guard, "_retire_local_exit_intent_after_no_submit", lambda *_a, **_kw: True
+    )
+
+    wrapped = guard.wrap_submit(
+        lambda active_engine, active_pos, decision: bool(
+            active_engine.on_exit(active_pos, decision)
+        )
+    )
+    result = wrapped(
+        engine,
+        pos,
+        SimpleNamespace(
+            action="EXIT",
+            quantity=4,
+            reason_code="EXIT_FILLED_RECOVERY_FENCE",
+            should_act=True,
+        ),
+    )
+    return {
+        "result": result,
+        "events": events,
+        "osm": osm,
+        "callback": callback,
+        "broker_side_effects": broker_side_effects,
+        "adoption": adoption,
+        "claim_updates": claim_updates,
+    }
+
+
+def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post(
+    monkeypatch,
+):
+    """The real wrapper rereads a fresh reservation and blocks EXIT_FILLED."""
+    proof = _run_blocker1_fresh_intent_wrapper_case(
+        monkeypatch, final_status="EXIT_FILLED"
+    )
+
+    assert proof["result"] is False
+    assert proof["events"] == [
+        "initial_read",
+        "create_intent",
+        "claim_generation",
+        "final_read",
+    ]
+    assert proof["osm"].active_lookup_count == 2
+    assert proof["osm"].create_count == 1
+    assert proof["callback"].call_count == 0
+    assert proof["broker_side_effects"] == []
+    assert proof["adoption"].call_count == 0
+    assert proof["osm"].adopt_count == 0
+    assert proof["claim_updates"] == []
+    assert proof["osm"].row["status"] == "EXIT_FILLED"
+
+
+def test_blocker1_fresh_exact_requested_intent_reaches_callback_once(monkeypatch):
+    """Positive control: an exact fresh EXIT_REQUESTED survives the final fence."""
+    proof = _run_blocker1_fresh_intent_wrapper_case(
+        monkeypatch, final_status="EXIT_REQUESTED"
+    )
+
+    assert proof["result"] is True
+    assert proof["events"] == [
+        "initial_read",
+        "create_intent",
+        "claim_generation",
+        "final_read",
+    ]
+    assert proof["osm"].active_lookup_count == 2
+    assert proof["osm"].create_count == 1
+    assert proof["callback"].call_count == 1
+    assert proof["broker_side_effects"] == ["broker_post"]
+    assert proof["adoption"].call_count == 1
+    assert proof["osm"].adopt_count == 0
+    assert all(
+        update[1].get("claim_state") != guard._CLAIM_STATE_BROKER_OWNED
+        for update in proof["claim_updates"]
+    )
 
 
 @pytest.mark.parametrize(

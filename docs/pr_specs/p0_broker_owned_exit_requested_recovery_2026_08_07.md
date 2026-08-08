@@ -101,9 +101,11 @@ It may operate only when all of the following are proven:
 - quantity is positive;
 - the row is not terminal.
 
-The adoption must atomically move only that exact row to `EXIT_SUBMITTED`, preserve the broker id, set `submitted_ts` if missing, preserve existing metadata, and append a diagnostic marker such as:
+The adoption must atomically move only that exact row to `EXIT_SUBMITTED`, preserve the broker id, preserve any existing authoritative `submitted_ts` without synthesizing one, preserve existing metadata, persist `broker_ownership_adopted_at` as recovery provenance/age authority, and append a diagnostic marker such as:
 
 `broker_ownership_adopted_from_exit_requested=true`
+
+Recovery time is not authoritative broker-acceptance time. When the original broker submission time cannot be proven, `submitted_ts` remains null and monitor age uses `broker_ownership_adopted_at`. Broker ownership is proven by the exact nonblank `broker_order_id` and exact recovery identity, not by manufacturing a submission timestamp.
 
 Use an exact CAS predicate. Zero rows means ownership/identity mismatch and returns a non-success result. Database errors remain errors.
 
@@ -168,8 +170,11 @@ Expected first-pass production scope is exactly:
 2. `ap/exit_decision_idempotency_guard.py`
 3. `ap/fill_monitor.py`
 4. `ap/order_monitor.py`
+5. `ap/self_healing.py`
 
-Do not change `ap_exit_engine.py`, `ap/exit_autonomous_recovery.py`, `ap_recovery.py`, `ap_reconciler.py`, or `ap/position_manager.py` unless a real-method restart test proves the four-file correction cannot recover the durable production shape.
+`ap/self_healing.py` is allowed only for narrow runtime execution-mode provenance wiring. It adds no lifecycle owner, no broker behavior, and no generalized self-healing redesign. Missing or unproven execution mode must HOLD rather than default to LIVE.
+
+Do not change `ap_exit_engine.py`, `ap/exit_autonomous_recovery.py`, `ap_recovery.py`, `ap_reconciler.py`, or `ap/position_manager.py` unless a real-method restart test proves the five-file correction cannot recover the durable production shape.
 
 If scope must expand, stop and document why before changing another production file.
 

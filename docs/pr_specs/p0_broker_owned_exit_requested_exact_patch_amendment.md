@@ -8,7 +8,7 @@ Start from current main:
 
 `188f2338de3ca4b3e687aa07fd6b2c5ea4b2ab0b`
 
-Before implementation, confirm main has not moved. If main has moved, re-read the four production files and re-resolve this map before editing. Do not transplant stale hunks by line number.
+Before implementation, confirm main has not moved. If main has moved, re-read the five production files and re-resolve this map before editing. Do not transplant stale hunks by line number.
 
 ## File budget
 
@@ -18,6 +18,9 @@ Production, expected exactly:
 - `ap/exit_decision_idempotency_guard.py`
 - `ap/fill_monitor.py`
 - `ap/order_monitor.py`
+- `ap/self_healing.py`
+
+`ap/self_healing.py` is permitted only for narrow runtime-mode provenance wiring into recovery. It does not become a lifecycle owner, add broker behavior, or authorize a generalized self-healing redesign. Missing or unproven execution mode must HOLD; recovery must never default it to LIVE.
 
 Tests:
 
@@ -52,10 +55,13 @@ Required update:
 ```text
 status = EXIT_SUBMITTED
 broker_order_id = exact broker id
-submitted_ts = COALESCE(submitted_ts, now())
+submitted_ts = preserve an existing authoritative value; do not synthesize one
+broker_ownership_adopted_at = recovery timestamp/provenance
 updated_ts = now()
 meta = non-destructive merge of recovery diagnostic
 ```
+
+The original broker-acceptance time is not necessarily available during recovery. Preserve an authoritative `submitted_ts` when one already exists or is supplied as proven broker evidence; otherwise leave it null. Do not present adoption wall-clock time as broker submission time. `broker_ownership_adopted_at` is the implemented recovery-age authority when original submission time cannot be proven. Broker ownership is established by the exact nonblank `broker_order_id` plus the full recovery identity, not by manufacturing a submission timestamp.
 
 Return a structured disposition or boolean that distinguishes:
 
