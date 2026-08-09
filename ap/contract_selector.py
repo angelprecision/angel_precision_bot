@@ -5827,18 +5827,25 @@ class APContractSelectionEngine:
                 "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
                 "MARKET_DATA_THROTTLE_UNAVAILABLE",
             }
-            _RETRYABLE_DATA_REASONS = {
-                "CHAIN_PROVIDER_ERROR",
-                "CHAIN_PROVIDER_EMPTY_OPTIONS",
-                "CHAIN_PARSE_EMPTY",
-                "NO_EXPIRATION_IN_DTE_WINDOW",
-                "NO_CHAIN_DATA",
-                "CHAIN_ROW_ZERO_BID_ASK",
-                "DIRECT_QUOTE_ZERO_BID_ASK",
-                "QUOTE_FETCH_FAILED",
-                "CHAIN_EMPTY",
-                "DIRECT_QUOTE_UNAVAILABLE",
-            }
+            # P0 amendment: the DTE ladder previously maintained its own
+            # handwritten _RETRYABLE_DATA_REASONS set, independent of the
+            # authoritative ap/selector_retry_policy.py policy table. A new
+            # RETRYABLE_DATA reason added to that table (e.g.
+            # DUPLICATE_QUOTE_CONFLICT_UNRESOLVED) silently fell through to
+            # the generic quality branch below instead of the retryable-data
+            # preservation branch, because this local set was never updated.
+            # That produced two conflicting authorities for the same reason
+            # code depending on which layer consumed it. Deriving directly
+            # from the shared policy makes this structurally impossible to
+            # repeat: any future RETRYABLE_DATA reason is automatically
+            # recognized here with no separate list to maintain or forget.
+            # _TERMINAL_NON_DTE and _OPERATIONAL_STOP_REASONS above are
+            # intentionally still DTE-ladder-specific scoping and are
+            # unaffected -- both checks intercept and return before this
+            # classification is ever reached, so this change cannot alter
+            # their behavior.
+            from ap.selector_retry_policy import is_retryable_selector_reason
+
             _preserved_terminal = None
             _preserved_retryable = None
             _preserved_quality = None
@@ -5961,7 +5968,7 @@ class APContractSelectionEngine:
                                 ticker, _preserved_terminal.get("reason_code"),
                             )
                             return None
-                        elif _reason_code in _RETRYABLE_DATA_REASONS:
+                        elif is_retryable_selector_reason(_reason_code):
                             # Data miss — keep probing, remember this as a candidate
                             # for preservation if no quality reason appears.
                             if _preserved_retryable is None:
