@@ -47,6 +47,10 @@ Target implementation files are expected to be limited to:
 2. `ap/position_quote_monitor.py` only if required to provide fresh underlying truth already consumed by the engine
 3. one focused regression test file
 
+The final exact-head verification also makes the existing soft-exit truth
+fixture clock non-future at CI start time and keeps its current-date 0DTE
+fixtures intact. That is test-only; it adds no production path or lifecycle.
+
 Do not touch:
 
 - scanner scoring;
@@ -177,13 +181,25 @@ submission fence; no broker, queue, selector, scoring, sizing, or proof-trade
 architecture was added.
 
 The final #425 base is `187fb30e43a98de027bb6a05a70e08fdff6ff5d6`; the rebase
-replayed only the existing #403 suffix and required no production conflict
-resolution. The focused deterministic matrix is green locally (`31 passed`), including the
+replayed only the existing #403 suffix, was conflict-free, and required no
+production conflict-resolution edits. The final #403 head is
+`80cbc824be0308fcbeda3a1d92bc2196e5226365`. Cumulative changed files are:
+`ap_exit_engine.py`,
+`docs/pr_specs/p0_underlying_authoritative_exit_geometry.md`,
+`tests/test_p0_underlying_authoritative_exit_geometry.py`, and the existing
+`tests/test_soft_exit_executable_truth.py` fixture-only clock correction.
+
+The focused deterministic matrix is green locally (`31 passed`), including the
 fresh-observation-at-horizon regression, exact execution-mode authority cases,
 first-breach winner-protection regression, confirmed technical-stop
 submit/idempotency handoff, process-death reconfirmation, and post-#425
 broker-owned adoption. The directly affected #425 lifecycle suites are green
-(`399 passed, 2 skipped`). The adjacent current-main exit suites are also green
-(`438 passed` in `20:38.99` from the prior pushed head). These are local
-pre-push results; exact-head GitHub CI remains the publication gate. This PR
-stays Draft/HARD HOLD and is not authorized to merge or deploy.
+(`399 passed, 2 skipped` in `317.36s`). The confirmed-stop integration
+regression records exactly one broker POST, one broker-owned adoption, zero
+cancels, unchanged pre-fill quantity/closed/proof state, and no restart
+resubmission. The deterministic NOW replay remains HOLD with no technical stop.
+
+Exact-head GitHub Actions is green: workflow `p0-tests`, run `31307549629`,
+job `93230157331`, head `80cbc824be0308fcbeda3a1d92bc2196e5226365`.
+This PR stays Draft/HARD HOLD and is not authorized to merge, deploy, approve,
+or mark Ready.
