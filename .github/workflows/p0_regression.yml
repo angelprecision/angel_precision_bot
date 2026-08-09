@@ -45,7 +45,9 @@ jobs:
           psql -h localhost -U postgres -d intelligence_test \
             -f migrations/20260717_exit_decision_generation_claims.sql
           psql -h localhost -U postgres -d intelligence_test \
-            -tAc "SELECT to_regclass('public.exit_decision_generation_claims') IS NOT NULL" \
+            -f migrations/20260809_exit_decision_generation_requested_qty.sql
+          psql -h localhost -U postgres -d intelligence_test \
+            -tAc "SELECT to_regclass('public.exit_decision_generation_claims') IS NOT NULL AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='exit_decision_generation_claims' AND column_name='requested_qty')" \
             | grep -qx t
 
       - name: Validate positions execution-mode migration

@@ -383,6 +383,10 @@ def _claim_durable_decision_generation(
     local_order_id: str = "",
 ) -> dict:
     """Atomically claim one actionable decision for this durable generation."""
+    requested_qty = _strict_positive_int(getattr(decision, "quantity", None))
+    if requested_qty is None:
+        raise ValueError("decision.quantity must be an exact positive integer")
+
     def _claim() -> dict:
         with conn() as c:
             row = c.execute(
@@ -397,7 +401,7 @@ def _claim_durable_decision_generation(
                 "last_error=%s "
                 "WHERE generation_key=%s AND claim_state=%s "
                 "AND claimed_at <= NOW() - (%s * INTERVAL '1 second') "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -431,6 +435,7 @@ def _claim_durable_decision_generation(
                 "client_id=%s, "
                 "position_id=%s, "
                 "remaining_qty=%s, "
+                "requested_qty=%s, "
                 "exit_generation=%s, "
                 "decision_action=%s, "
                 "decision_reason_code=%s, "
@@ -441,13 +446,14 @@ def _claim_durable_decision_generation(
                 "broker_order_id=NULL, "
                 "last_error=NULL "
                 "WHERE generation_key=%s AND claim_state=%s "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
                     client_id,
                     position_id,
                     remaining_qty,
+                    requested_qty,
                     exit_generation,
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
@@ -464,12 +470,12 @@ def _claim_durable_decision_generation(
 
             row = c.execute(
                 "INSERT INTO exit_decision_generation_claims ("
-                "generation_key, client_id, position_id, remaining_qty, "
+                "generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, "
                 "claim_state, claimed_at, released_at, local_order_id, broker_order_id, last_error"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,%s,NULL,NULL) "
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,%s,NULL,NULL) "
                 "ON CONFLICT (generation_key) DO NOTHING "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -477,6 +483,7 @@ def _claim_durable_decision_generation(
                     client_id,
                     position_id,
                     remaining_qty,
+                    requested_qty,
                     exit_generation,
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
@@ -490,7 +497,7 @@ def _claim_durable_decision_generation(
                 return claimed
 
             row = c.execute(
-                "SELECT generation_key, client_id, position_id, remaining_qty, "
+                "SELECT generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at "
                 "FROM exit_decision_generation_claims WHERE generation_key=%s LIMIT 1",
@@ -507,7 +514,7 @@ def _load_durable_decision_generation(generation_key: str) -> dict:
     def _read() -> dict:
         with conn() as c:
             row = c.execute(
-                "SELECT generation_key, client_id, position_id, remaining_qty, "
+                "SELECT generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at "
                 "FROM exit_decision_generation_claims WHERE generation_key=%s LIMIT 1",
@@ -552,7 +559,7 @@ def _acquire_stale_claim_reconciliation(generation_key: str) -> tuple[dict, str]
                 "    OR COALESCE(last_error,'') LIKE %s "
                 "    OR (COALESCE(last_error,'') LIKE %s AND claimed_at <= NOW() - (%s * INTERVAL '1 second'))"
                 "  ) "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -594,7 +601,7 @@ def _finish_stale_claim_reconciliation(
                 "WHERE generation_key=%s "
                 "  AND claim_state=%s "
                 "  AND COALESCE(last_error,'')=%s "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -632,7 +639,7 @@ def reconcile_stale_exit_generation_claim(
     broker_order_id = str(claim.get("broker_order_id") or "").strip()
     position_id = str(claim.get("position_id") or "").strip()
     client_id = str(claim.get("client_id") or "").strip().lower()
-    expected_qty = _int(claim.get("remaining_qty"), 0) or 0
+    expected_qty = _strict_positive_int(claim.get("requested_qty"))
     runtime_osm = osm or getattr(execution_core, "order_state_machine", None) or getattr(execution_core, "osm", None)
     if runtime_osm is None:
         return _finish_stale_claim_reconciliation(
@@ -699,16 +706,6 @@ def reconcile_stale_exit_generation_claim(
             local_order_id=local_order_id,
             broker_order_id=broker_order_id,
         )
-    if expected_qty > 0 and (_int(order.get("qty"), 0) or 0) != expected_qty:
-        return _finish_stale_claim_reconciliation(
-            generation_key,
-            reconciliation_token=token,
-            claim_state=_CLAIM_STATE_AMBIGUOUS,
-            reason="RECONCILE_QTY_MISMATCH",
-            local_order_id=local_order_id,
-            broker_order_id=broker_order_id,
-        )
-
     order_meta = _claim_meta_dict(order)
     if _int(order_meta.get("exit_generation_claim"), 0) != (_int(claim.get("exit_generation"), 0) or 0):
         return _finish_stale_claim_reconciliation(
@@ -737,6 +734,25 @@ def reconcile_stale_exit_generation_claim(
             reconciliation_token=token,
             claim_state=_CLAIM_STATE_RELEASED_NO_SUBMIT,
             local_order_id=local_order_id,
+        )
+
+    if expected_qty is None:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_REQUESTED_QTY_MISSING",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if (_int(order.get("qty"), 0) or 0) != expected_qty:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_QTY_MISMATCH",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
         )
 
     if (
@@ -865,21 +881,85 @@ def _update_durable_decision_generation(
     run_with_retry(_update)
 
 
-def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, error_text: str = "") -> None:
+def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, error_text: str = "") -> bool:
     """Retire one reserved EXIT_REQUESTED row after conclusive no-submit proof."""
     local_order_id = str(local_order_id or "").strip()
     if not local_order_id:
-        return
+        return False
     osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
     if osm is None:
-        return
+        return False
     retire_intent = getattr(osm, "retire_unsubmitted_exit_intent", None)
     if not callable(retire_intent):
-        return
+        return False
     try:
-        retire_intent(local_order_id, last_error=error_text or "NO_POST_ATTEMPTED")
+        return bool(retire_intent(
+            local_order_id,
+            last_error=error_text or "NO_POST_ATTEMPTED",
+        ))
     except Exception:
-        return
+        return False
+
+
+def _exit_order_has_submit_evidence(order: dict | None) -> bool:
+    if not isinstance(order, dict):
+        return False
+    meta = _claim_meta_dict(order)
+    status = str(order.get("status") or "").strip().upper()
+    return bool(
+        _has_proven_broker_order_id(order.get("broker_order_id"))
+        or order.get("submitted_ts")
+        or str(meta.get("submit_intent_at") or "").strip()
+        or str(meta.get("broker_submit_key") or "").strip()
+        or bool(meta.get("split_brain_quarantine"))
+        or bool(meta.get("reconciliation_required"))
+        or status in {
+            "EXIT_SUBMITTED",
+            "EXIT_ACKNOWLEDGED",
+            "EXIT_PARTIAL_FILL",
+            "EXIT_FILLED",
+        }
+    )
+
+
+def _finalize_pre_callback_claim_failure(
+    engine: Any,
+    pos: Any,
+    *,
+    generation_key: str,
+    local_order_id: str,
+    reason: str,
+    active_order: dict | None = None,
+) -> str:
+    """Never leave a claimed generation behind when the callback was not entered."""
+    broker_owned = _exit_order_has_submit_evidence(active_order)
+    claim_state = (
+        _CLAIM_STATE_BROKER_OWNED
+        if broker_owned
+        else _CLAIM_STATE_RELEASED_NO_SUBMIT
+    )
+    broker_order_id = str((active_order or {}).get("broker_order_id") or "").strip()
+    _update_durable_decision_generation(
+        generation_key,
+        claim_state=claim_state,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+        error_text=reason,
+    )
+    if claim_state == _CLAIM_STATE_RELEASED_NO_SUBMIT:
+        retired = _retire_local_exit_intent_after_no_submit(
+            engine,
+            local_order_id,
+            error_text=reason,
+        )
+        if retired or (
+            isinstance(active_order, dict)
+            and not active_exit_order_blocks(active_order)
+        ):
+            _clear_retired_exit_owner(engine, pos, local_order_id)
+    elif isinstance(active_order, dict):
+        _mark_active_exit_owned(engine, pos, active_order)
+    return claim_state
 
 
 def _extract_callback_trace_identity(callback_trace: dict) -> dict:
@@ -1855,21 +1935,13 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                                 local_order_id,
                                 exc,
                             )
-                            try:
-                                _update_durable_decision_generation(
-                                    generation_key,
-                                    claim_state=_CLAIM_STATE_AMBIGUOUS,
-                                    local_order_id=local_order_id,
-                                    error_text=f"FINAL_RESERVED_EXIT_LOOKUP_FAILED:{exc}",
-                                )
-                            except Exception as update_exc:
-                                log.critical(
-                                    "[%s] EXIT_DECISION_FINAL_LOOKUP_RETRY_STATE_FAILED position=%s key=%s error=%s",
-                                    getattr(pos, "ticker", ""),
-                                    position_id,
-                                    generation_key,
-                                    update_exc,
-                                )
+                            _finalize_pre_callback_claim_failure(
+                                self,
+                                pos,
+                                generation_key=generation_key,
+                                local_order_id=local_order_id,
+                                reason=f"FINAL_RESERVED_EXIT_LOOKUP_FAILED:{exc}",
+                            )
                             return False
                         if not _is_exact_reserved_exit_intent(
                             self,
@@ -1878,53 +1950,20 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             expected_client_id=resolved_client,
                             expected_qty=requested_qty,
                         ):
-                            repaired = _retire_proven_unsubmitted_exit(
+                            next_claim_state = _finalize_pre_callback_claim_failure(
                                 self,
                                 pos,
-                                active_order,
-                                reason="EXIT_FINAL_IDENTITY_MISMATCH_NO_SUBMIT",
+                                generation_key=generation_key,
+                                local_order_id=local_order_id,
+                                reason="FINAL_RESERVED_EXIT_IDENTITY_FENCE_FAILED",
+                                active_order=active_order,
                             )
-                            next_claim_state = (
-                                _CLAIM_STATE_RELEASED_NO_SUBMIT
-                                if repaired
-                                else _CLAIM_STATE_AMBIGUOUS
-                            )
-                            try:
-                                _update_durable_decision_generation(
-                                    generation_key,
-                                    claim_state=next_claim_state,
-                                    local_order_id=local_order_id,
-                                    error_text=(
-                                        "FINAL_RESERVED_EXIT_RETIRED_NO_SUBMIT"
-                                        if repaired
-                                        else "FINAL_RESERVED_EXIT_IDENTITY_UNPROVEN"
-                                    ),
-                                )
-                            except Exception as update_exc:
-                                log.critical(
-                                    "[%s] EXIT_DECISION_FINAL_FENCE_RETRY_STATE_FAILED position=%s key=%s state=%s error=%s",
-                                    getattr(pos, "ticker", ""),
-                                    position_id,
-                                    generation_key,
-                                    next_claim_state,
-                                    update_exc,
-                                )
-                            if not repaired:
-                                try:
-                                    _mark_active_exit_owned(self, pos, active_order or {})
-                                except Exception as exc:
-                                    log.debug(
-                                        "[%s] final reserved exit ownership hydration failed position=%s error=%s",
-                                        getattr(pos, "ticker", ""),
-                                        position_id,
-                                        exc,
-                                    )
                             log.critical(
-                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s repaired_no_submit=%s",
+                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s claim_state=%s",
                                 getattr(pos, "ticker", ""),
                                 position_id,
                                 local_order_id,
-                                repaired,
+                                next_claim_state,
                             )
                             return False
 
@@ -1943,6 +1982,14 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             position_id,
                             local_order_id,
                             requested_qty,
+                        )
+                        _finalize_pre_callback_claim_failure(
+                            self,
+                            pos,
+                            generation_key=generation_key,
+                            local_order_id=local_order_id,
+                            reason="RESERVED_CALLBACK_IDENTITY_CARRY_FAILED",
+                            active_order=active_order,
                         )
                         return False
 

@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS exit_decision_generation_claims (
     client_id            TEXT NOT NULL,
     position_id          TEXT NOT NULL,
     remaining_qty        INTEGER NOT NULL CHECK (remaining_qty >= 0),
+    requested_qty        INTEGER CHECK (requested_qty > 0),
     exit_generation      BIGINT NOT NULL CHECK (exit_generation > 0),
     decision_action      TEXT,
     decision_reason_code TEXT,
@@ -29,6 +30,8 @@ ALTER TABLE exit_decision_generation_claims
     ADD COLUMN IF NOT EXISTS last_error TEXT;
 ALTER TABLE exit_decision_generation_claims
     ADD COLUMN IF NOT EXISTS released_at TIMESTAMPTZ;
+ALTER TABLE exit_decision_generation_claims
+    ADD COLUMN IF NOT EXISTS requested_qty INTEGER CHECK (requested_qty > 0);
 
 UPDATE exit_decision_generation_claims
 SET claim_state = COALESCE(NULLIF(claim_state, ''), 'CLAIMED')

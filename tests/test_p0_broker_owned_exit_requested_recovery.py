@@ -3162,9 +3162,10 @@ def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post(
         (
             "tradefluence|position-fresh-wrapper-425|4|1",
             {
-                "claim_state": guard._CLAIM_STATE_AMBIGUOUS,
+                "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
                 "local_order_id": "exit-fresh-wrapper-425",
-                "error_text": "FINAL_RESERVED_EXIT_IDENTITY_UNPROVEN",
+                "broker_order_id": "",
+                "error_text": "FINAL_RESERVED_EXIT_IDENTITY_FENCE_FAILED",
             },
         )
     ]

@@ -211,6 +211,7 @@ class _FakeClaimConnection:
                         "client_id": client_id,
                         "position_id": position_id,
                         "remaining_qty": remaining_qty,
+                        "requested_qty": existing.get("requested_qty"),
                         "exit_generation": exit_generation,
                         "decision_action": decision_action,
                         "decision_reason_code": decision_reason_code,
@@ -230,6 +231,7 @@ class _FakeClaimConnection:
                 client_id,
                 position_id,
                 remaining_qty,
+                requested_qty,
                 exit_generation,
                 decision_action,
                 decision_reason_code,
@@ -245,6 +247,7 @@ class _FakeClaimConnection:
                     "client_id": client_id,
                     "position_id": position_id,
                     "remaining_qty": remaining_qty,
+                    "requested_qty": requested_qty,
                     "exit_generation": exit_generation,
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
@@ -265,6 +268,7 @@ class _FakeClaimConnection:
                 client_id,
                 position_id,
                 remaining_qty,
+                requested_qty,
                 exit_generation,
                 decision_action,
                 decision_reason_code,
@@ -278,6 +282,7 @@ class _FakeClaimConnection:
                     "client_id": client_id,
                     "position_id": position_id,
                     "remaining_qty": remaining_qty,
+                    "requested_qty": requested_qty,
                     "exit_generation": exit_generation,
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
@@ -714,7 +719,7 @@ def test_stale_claim_reconciliation_releases_no_submit_and_allows_retry(
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-1",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
@@ -756,7 +761,7 @@ def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_c
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-1",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
@@ -815,6 +820,75 @@ def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_c
     assert callback.call_count == 0
 
 
+def test_scale_out_stale_recovery_uses_requested_qty_not_remaining_qty(
+    generation_claims_table,
+) -> None:
+    key = "client|position-scale|4|1"
+    guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position-scale",
+        remaining_qty=4,
+        exit_generation=1,
+        decision=_decision(action="SCALE_OUT", quantity=1),
+        local_order_id="exit-scale-1",
+    )
+    durable = guard._load_durable_decision_generation(key)
+    assert durable["remaining_qty"] == 4
+    assert durable["requested_qty"] == 1
+    _mark_claim_stale_ambiguous(key, local_order_id="exit-scale-1")
+    core = SimpleNamespace(
+        order_state_machine=SimpleNamespace(
+            get_order=MagicMock(side_effect=[
+                {
+                    "local_order_id": "exit-scale-1",
+                    "client_id": "client",
+                    "position_id": "position-scale",
+                    "kind": "EXIT",
+                    "status": "EXIT_REQUESTED",
+                    "qty": 1,
+                    "broker_order_id": "",
+                    "submitted_ts": None,
+                    "meta": {
+                        "submit_intent_at": "2026-08-09T12:00:00+00:00",
+                        "broker_submit_key": "exit-scale-1",
+                        "exit_generation_claim": 1,
+                    },
+                },
+                {
+                    "local_order_id": "exit-scale-1",
+                    "client_id": "client",
+                    "position_id": "position-scale",
+                    "kind": "EXIT",
+                    "status": "EXIT_SUBMITTED",
+                    "qty": 1,
+                    "broker_order_id": "broker-scale-1",
+                    "submitted_ts": "2026-08-09T12:00:01+00:00",
+                    "meta": {
+                        "submit_intent_at": "2026-08-09T12:00:00+00:00",
+                        "broker_submit_key": "exit-scale-1",
+                        "exit_generation_claim": 1,
+                    },
+                },
+            ]),
+        ),
+        reconcile_exit_broker_intent=MagicMock(return_value={
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": "broker-scale-1",
+            "status": "EXIT_SUBMITTED",
+        }),
+    )
+
+    reconciled = guard.reconcile_stale_exit_generation_claim(key, execution_core=core)
+
+    assert reconciled["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert "RECONCILE_QTY_MISMATCH" not in str(reconciled.get("last_error") or "")
+    core.reconcile_exit_broker_intent.assert_called_once_with(
+        local_order_id="exit-scale-1"
+    )
+
+
 def test_stale_claim_reconciliation_routes_confirmed_fill_once(
     generation_claims_table,
     monkeypatch,
@@ -826,7 +900,7 @@ def test_stale_claim_reconciliation_routes_confirmed_fill_once(
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-fill",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-fill")
@@ -895,7 +969,7 @@ def test_stale_claim_reconciliation_keeps_ambiguous_when_truth_unavailable(
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-1",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
@@ -1018,18 +1092,32 @@ def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> N
 
 
 def test_durable_claim_migration_is_locked_to_internal_roles() -> None:
-    migration = (
+    migration_path = (
         Path(__file__).resolve().parents[1]
         / "migrations"
         / "20260717_exit_decision_generation_claims.sql"
+    )
+    migration = migration_path.read_text()
+    requested_qty_migration = migration_path.with_name(
+        "20260809_exit_decision_generation_requested_qty.sql"
     ).read_text()
     assert "generation_key       TEXT PRIMARY KEY" in migration
+    assert "requested_qty        INTEGER CHECK (requested_qty > 0)" in migration
+    assert "ADD COLUMN IF NOT EXISTS requested_qty INTEGER CHECK (requested_qty > 0)" in migration
+    assert "ADD COLUMN IF NOT EXISTS requested_qty INTEGER" in requested_qty_migration
     assert "claim_state          TEXT NOT NULL DEFAULT 'CLAIMED'" in migration
     assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')" in migration
     assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated')" in migration
     assert "ENABLE ROW LEVEL SECURITY" in migration
     assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM anon;" in migration
     assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM authenticated;" in migration
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "p0_regression.yml"
+    ).read_text()
+    assert "20260809_exit_decision_generation_requested_qty.sql" in workflow
 
 
 def test_ledger_suppresses_closed_zero_and_inflight_positions() -> None:
@@ -1193,6 +1281,118 @@ def test_malformed_quantity_does_not_make_open_position_inert_then_valid_retry_s
     assert pos.exit_in_flight is False
     assert wrapped(engine, pos, _decision(quantity=1)) is True
     assert callback.call_count == 1
+
+
+def test_final_reread_exception_releases_claim_retires_intent_and_retry_submits(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-after-reread-retry",
+    })
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    normal_lookup = engine.order_state_machine.get_active_exit_order
+    reads = 0
+
+    def fail_final_read(position_id):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("final read unavailable")
+        return normal_lookup(position_id)
+
+    engine.order_state_machine.get_active_exit_order = fail_final_read
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert callback.call_count == 0
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+
+    engine.order_state_machine.get_active_exit_order = normal_lookup
+    assert wrapped(engine, pos, _decision()) is True
+    assert callback.call_count == 1
+
+
+def test_final_identity_mismatch_without_submit_evidence_releases_and_retries(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-after-fence-retry",
+    })
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    real_claim = guard._claim_durable_decision_generation
+
+    def claim_then_corrupt_qty(**kwargs):
+        claimed = real_claim(**kwargs)
+        engine.order_state_machine.active_order["qty"] = 3
+        return claimed
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", claim_then_corrupt_qty)
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is False
+    assert callback.call_count == 0
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", real_claim)
+    assert wrapped(engine, pos, _decision(quantity=1)) is True
+    assert callback.call_count == 1
+
+
+def test_reserved_callback_identity_carry_failure_releases_before_callback(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+
+    class _RejectReservedIdentity:
+        action = "SCALE_OUT"
+        quantity = 1
+        reason_code = "TP_SCALE_OUT"
+        should_act = True
+
+        def __setattr__(self, name, value):
+            if name in {"reserved_local_order_id", "reserved_exit_quantity"}:
+                raise AttributeError("decision identity is immutable")
+            super().__setattr__(name, value)
+
+    callback = MagicMock(side_effect=AssertionError("callback must not run"))
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+
+    result = guard.wrap_submit(_invoke_submit_callback)(
+        engine,
+        pos,
+        _RejectReservedIdentity(),
+    )
+
+    assert result is False
+    callback.assert_not_called()
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
 
 
 def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generation_claims_table, monkeypatch) -> None:
