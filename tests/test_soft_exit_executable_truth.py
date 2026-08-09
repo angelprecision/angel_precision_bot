@@ -138,9 +138,18 @@ def _make_pos(
 
 
 def _et_noon():
-    """Return noon ET as a naive datetime for evaluate_exit()."""
+    """Return a deterministic, non-future ET session clock.
+
+    The exit engine intentionally uses a caller-supplied ET instant for quote
+    freshness and confirmation replay.  Keep the synthetic session time at or
+    before the host wall clock so positions seeded with ``datetime.now()`` do
+    not become an accidental multi-hour stale-quote fixture before 10:00 ET.
+    """
     from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/New_York")).replace(
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if (now_et.hour, now_et.minute, now_et.second) < (15, 55, 0):
+        now_et -= timedelta(days=1)
+    return now_et.replace(
         hour=12, minute=0, second=0, microsecond=0
     )
 
@@ -2161,9 +2170,7 @@ class TestAmendment4HardRiskPreGate:
         # These tests target hard-risk pre-gate ordering, not EOD behavior.
         # Use a deterministic in-session clock so CI start time cannot make
         # the EOD pre-gate short-circuit the assertion.
-        from zoneinfo import ZoneInfo
-        et = ZoneInfo("America/New_York")
-        return datetime.now(et).replace(hour=10, minute=0, second=0, microsecond=0)
+        return _et_noon().replace(hour=10, minute=0, second=0, microsecond=0)
 
     def _make_managed_position(self, *, side="CALL", entry=1.00,
                                 hard_ref_pnl=-0.45, dte=5,
@@ -4002,7 +4009,7 @@ class TestJasonBacReplay:
         eng._positions_by_id = {pos.position_id: pos}
 
         # 10 AM ET — safely outside any EOD pre-gate window.
-        now_et = datetime.now(_ZI("America/New_York")).replace(
+        now_et = _et_noon().replace(
             hour=10, minute=0, second=0, microsecond=0,
         )
         eng._check_all_positions(now_et=now_et)
@@ -4141,8 +4148,7 @@ class TestHardStopAuthorityResolver:
         """EOD force close is independent of quote availability."""
         pos = self._paper_pos_stale_last()
         # Push past 3:50 PM ET.
-        from zoneinfo import ZoneInfo
-        et_now = datetime.now(ZoneInfo("America/New_York")).replace(
+        et_now = _et_noon().replace(
             hour=15, minute=55, second=0, microsecond=0
         )
         decision = evaluate_exit(pos, et_now)
