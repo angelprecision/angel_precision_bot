@@ -1144,6 +1144,32 @@ def test_submit_wrapper_restart_durability_blocks_fresh_engine(generation_claims
     assert callback_count == 1
 
 
+@pytest.mark.parametrize("malformed_qty", ["1", 1.0, True, None, 0, -1])
+def test_submit_wrapper_rejects_non_exact_integer_decision_quantity_before_reservation(
+    malformed_qty,
+    monkeypatch,
+) -> None:
+    callback = MagicMock(side_effect=AssertionError("callback must not run"))
+    generation_read = MagicMock(
+        side_effect=AssertionError("generation must not be read")
+    )
+    monkeypatch.setattr(guard, "_durable_exit_generation", generation_read)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+
+    result = guard.wrap_submit(_invoke_submit_callback)(
+        engine,
+        pos,
+        _decision(quantity=malformed_qty),
+    )
+
+    assert result is False
+    callback.assert_not_called()
+    generation_read.assert_not_called()
+    assert engine.order_state_machine.active_order is None
+    assert pos.pending_exit_local_order_id == ""
+
+
 def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generation_claims_table, monkeypatch) -> None:
     responses = iter([
         {"ok": False, "accepted": False, "status": "ERROR", "error": "NO_POST_ATTEMPTED:validation_failed"},

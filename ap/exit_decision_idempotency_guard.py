@@ -149,6 +149,11 @@ def _int(value: Any, default: int | None = 0) -> int | None:
         return default
 
 
+def _strict_positive_int(value: Any) -> int | None:
+    """Return an economic order quantity only when its identity is exact."""
+    return value if type(value) is int and value > 0 else None
+
+
 def _position_key(pos: Any) -> str:
     return str(
         getattr(pos, "position_id", "")
@@ -312,14 +317,14 @@ def _ensure_local_exit_intent_row(
     contract = str(getattr(pos, "option_symbol", "") or "").strip()
     symbol = str(getattr(pos, "ticker", "") or "").strip()
     direction = str(getattr(pos, "side", "") or "").strip()
-    qty = _int(requested_qty, 0) or 0
+    qty = _strict_positive_int(requested_qty)
     execution_mode = _execution_mode(engine, pos).lower()
     if (
         not position_id
         or not contract
         or not symbol
         or not direction
-        or qty <= 0
+        or qty is None
         or execution_mode not in {"live", "paper"}
     ):
         return ""
@@ -1539,7 +1544,18 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
         ).strip()
         position_id = str(getattr(pos, "position_id", "") or "")
         remaining_qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
-        requested_qty = _int(getattr(decision, "quantity", 0), 0) or 0
+        raw_requested_qty = getattr(decision, "quantity", None)
+        requested_qty = _strict_positive_int(raw_requested_qty)
+        if _decision_should_act(decision) and requested_qty is None:
+            log.critical(
+                "[%s] EXIT_DECISION_QUANTITY_INVALID position=%s action=%s quantity=%r",
+                getattr(pos, "ticker", ""),
+                position_id,
+                getattr(decision, "action", ""),
+                raw_requested_qty,
+            )
+            return False
+        requested_qty = requested_qty or 0
         with self._lock:
             claims = getattr(self, "_ap_exit_submit_claims", None)
             if claims is None:

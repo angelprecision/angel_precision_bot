@@ -9931,10 +9931,13 @@ class APExecutionCore:
                 getattr(decision, "reserved_local_order_id", "") or ""
             ).strip()
             _reserved_scale_qty = getattr(decision, "reserved_exit_quantity", None)
-            try:
-                _reserved_scale_qty = int(_reserved_scale_qty)
-                _decision_scale_qty = int(decision.quantity)
-            except (TypeError, ValueError):
+            _decision_scale_qty = getattr(decision, "quantity", None)
+            if (
+                type(_reserved_scale_qty) is not int
+                or _reserved_scale_qty <= 0
+                or type(_decision_scale_qty) is not int
+                or _decision_scale_qty <= 0
+            ):
                 log.critical(
                     "[%s] SCALE BLOCKED — reserved exit quantity is invalid | local=%s reserved_qty=%r decision_qty=%r",
                     pos.ticker,
@@ -9948,7 +9951,6 @@ class APExecutionCore:
                 )
             if (
                 not _reserved_local_order_id
-                or _reserved_scale_qty <= 0
                 or _reserved_scale_qty != _decision_scale_qty
             ):
                 log.critical(

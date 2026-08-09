@@ -3494,6 +3494,57 @@ def test_production_scale_out_qty_mismatch_holds_before_osm_and_broker():
 
 
 @pytest.mark.parametrize(
+    ("decision_qty", "reserved_qty"),
+    [
+        ("1", 1),
+        (1.0, 1),
+        (True, 1),
+        (1, "1"),
+        (1, 1.0),
+        (1, True),
+    ],
+)
+def test_production_scale_callback_rejects_coerced_quantity_identity(
+    decision_qty,
+    reserved_qty,
+):
+    """The real SCALE callback rejects malformed producer/reservation qty."""
+    from ap_execution_core import APExecutionCore
+
+    osm = SimpleNamespace(
+        submit_exit=MagicMock(side_effect=AssertionError("OSM must not be reached"))
+    )
+    broker = MagicMock()
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.order_state_machine = osm
+    core.broker = broker
+    pos = SimpleNamespace(
+        ticker="ORCL",
+        option_pnl_pct=0.20,
+        signal={"signal_id": "signal-scale-invalid-qty-425"},
+        position_id="position-scale-invalid-qty-425",
+        current_bid=1.15,
+        current_option_price=1.20,
+        option_symbol="ORCL260807P00155000",
+        side="PUT",
+    )
+    decision = SimpleNamespace(
+        action="SCALE_OUT",
+        quantity=decision_qty,
+        reserved_exit_quantity=reserved_qty,
+        reserved_local_order_id="exit-scale-invalid-qty-425",
+        reason="TP SCALE OUT",
+    )
+
+    result = core._on_position_scale(pos, decision)
+
+    assert result["ok"] is False
+    assert result["error"] == "reserved_exit_quantity_invalid"
+    osm.submit_exit.assert_not_called()
+    assert broker.session.post.call_count == 0
+
+
+@pytest.mark.parametrize(
     ("field", "invalid_value"),
     [
         ("local_order_id", "exit-other-425"),
