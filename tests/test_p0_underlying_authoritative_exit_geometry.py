@@ -303,6 +303,44 @@ def test_call_breach_recovers_before_confirmation_and_resets():
     assert pos._underlying_stop_breach_quote_ts is None
 
 
+def test_confirmed_technical_stop_overrides_touched_profit_by_thesis_design():
+    """A twice-confirmed underlying-stop breach outranks touched-profit /
+    profit-floor / scale-out / runner-trail / small-win protection.
+
+    The bot's edge is structural: entries, stops, and targets are set off
+    underlying price action (The Strat), not off unrealized option P&L.
+    Profit-floor logic protects gains while the underlying thesis is still
+    intact; it is not a competing thesis authority. Once the underlying
+    itself has confirmed — via two independent fresh observations — that
+    the stop level was crossed, the thesis is proven dead, and that signal
+    must not be overridden by a downstream option-P&L heuristic. This is
+    the same principle the NOW incident enforces in the other direction
+    (option BID drawdown alone must not manufacture a technical stop).
+
+    Winner-protection retains priority only during the CONFIRMING window
+    (see test_winner_protection_runs_during_first_technical_breach_confirmation);
+    once CONFIRMED, the technical stop is authoritative. This is locked in
+    by design per docs/pr_specs/p0_underlying_authoritative_exit_geometry.md.
+    """
+    pos = _now_call(option_bid=2.10, underlying_price=104.80)
+
+    first = _eval(pos)
+    assert first.reason_code == UNDERLYING_STOP_CONFIRMING
+
+    # Touched-profit becomes independently eligible at the exact moment the
+    # technical stop matures to CONFIRMED on the second fresh observation.
+    pos.touched_profit = True
+    pos.max_profit_seen = 0.20  # would floor touched-profit protection at +8%
+
+    second_et = INCIDENT_ET + timedelta(seconds=CONFIRM_SECONDS + 1)
+    _advance_underlying(pos, now_et=second_et, price=104.70, option_bid=1.50)
+    decision = _eval(pos, second_et)
+
+    assert decision.action == "STOP", decision.reason
+    assert decision.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+    assert "TOUCHED PROFIT" not in decision.reason
+
+
 def test_put_mirror_uses_adverse_upward_geometry_for_confirm_and_recovery():
     pos = _now_call(
         side="PUT",

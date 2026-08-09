@@ -123,9 +123,24 @@ The current five-minute entry grace may defer soft loss exits. It must not:
 
 The first fresh technical-stop breach is remembered for confirmation, but it
 does not preempt existing winner protection. Touched-profit, profit-floor /
-giveback, scale-out, runner-trail, and small-win branches retain priority. If
-none of those branches acts, the engine returns `UNDERLYING_STOP_CONFIRMING`
-as a HOLD; only the confirmed state produces the technical-stop exit.
+giveback, scale-out, runner-trail, and small-win branches retain priority
+**during the CONFIRMING window only**. If none of those branches acts, the
+engine returns `UNDERLYING_STOP_CONFIRMING` as a HOLD.
+
+**Once the technical stop matures to CONFIRMED** (two independent fresh
+underlying observations beyond the stop), it is evaluated ahead of every
+winner-protection branch and fires immediately, without deferring to
+touched-profit, profit-floor, scale-out, runner-trail, or small-win state.
+This is a deliberate design decision, not an oversight: this system's edge
+is structural — entries, stops, and targets are set off underlying price
+action (The Strat), not off unrealized option P&L. Profit-floor logic exists
+to protect gains while the underlying thesis is still intact; it is not a
+competing thesis authority. Once the underlying itself has confirmed that
+the stop level was crossed, the thesis is proven dead, and that signal must
+not be overridden by a downstream P&L heuristic — the same principle this
+PR enforces in the other direction (option BID drawdown alone must not
+manufacture a technical stop). Regression coverage for this exact ordering:
+`test_confirmed_technical_stop_overrides_touched_profit_by_thesis_design`.
 
 ## Client and mode safety
 
@@ -182,24 +197,30 @@ architecture was added.
 
 The final #425 base is `187fb30e43a98de027bb6a05a70e08fdff6ff5d6`; the rebase
 replayed only the existing #403 suffix, was conflict-free, and required no
-production conflict-resolution edits. The final #403 head is
-`80cbc824be0308fcbeda3a1d92bc2196e5226365`. Cumulative changed files are:
+production conflict-resolution edits. Cumulative changed files are:
 `ap_exit_engine.py`,
 `docs/pr_specs/p0_underlying_authoritative_exit_geometry.md`,
 `tests/test_p0_underlying_authoritative_exit_geometry.py`, and the existing
-`tests/test_soft_exit_executable_truth.py` fixture-only clock correction.
+`tests/test_soft_exit_executable_truth.py` fixture-only clock correction. No
+`ap_exit_engine.py` production line changed in this amendment — it closes a
+documentation/test coverage gap only.
 
-The focused deterministic matrix is green locally (`31 passed`), including the
+The focused deterministic matrix is green locally (`32 passed`), including the
 fresh-observation-at-horizon regression, exact execution-mode authority cases,
 first-breach winner-protection regression, confirmed technical-stop
-submit/idempotency handoff, process-death reconfirmation, and post-#425
-broker-owned adoption. The directly affected #425 lifecycle suites are green
-(`399 passed, 2 skipped` in `317.36s`). The confirmed-stop integration
-regression records exactly one broker POST, one broker-owned adoption, zero
-cancels, unchanged pre-fill quantity/closed/proof state, and no restart
-resubmission. The deterministic NOW replay remains HOLD with no technical stop.
+submit/idempotency handoff, process-death reconfirmation, post-#425
+broker-owned adoption, and — added in this amendment —
+`test_confirmed_technical_stop_overrides_touched_profit_by_thesis_design`,
+which locks in that a matured (CONFIRMED) technical stop fires ahead of
+touched-profit/profit-floor/scale-out/runner-trail/small-win protection by
+design (see "Entry-grace relationship" above for the full reasoning). The
+directly affected #425 lifecycle suites are green (`399 passed, 2 skipped` in
+`317.36s`). The confirmed-stop integration regression records exactly one
+broker POST, one broker-owned adoption, zero cancels, unchanged pre-fill
+quantity/closed/proof state, and no restart resubmission. The deterministic
+NOW replay remains HOLD with no technical stop.
 
-Exact-head GitHub Actions is green: workflow `p0-tests`, run `31307549629`,
-job `93230157331`, head `80cbc824be0308fcbeda3a1d92bc2196e5226365`.
 This PR stays Draft/HARD HOLD and is not authorized to merge, deploy, approve,
-or mark Ready.
+or mark Ready. Exact head SHA and CI run for this amendment must be recorded
+in the PR description at time of push, not hardcoded here, so this doc does
+not go stale again.
