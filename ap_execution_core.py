@@ -8859,7 +8859,11 @@ class APExecutionCore:
                     f"[{pos.ticker}] Exit submit failed via OSM | "
                     f"order={exit_res['local_order_id']} error={exit_res['error']}"
                 )
-                return
+                # The broker may already own this order even though the local
+                # EXIT_SUBMITTED transition or split-brain persistence failed.
+                # Preserve the exact broker/local identity for the exit-engine
+                # guard's adoption seam; returning None would strand it.
+                return exit_res
         else:
             log.critical(
                 f"[{pos.ticker}] CLOSE BLOCKED — OSM or position_id missing; "
@@ -9027,6 +9031,7 @@ class APExecutionCore:
         # so the intelligence dataset receives the ACTUAL broker fill P/L,
         # not the estimated submit-time P/L. The signal_id is resolved
         # at finalize time from the staged dict.
+        return exit_res
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
