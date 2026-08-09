@@ -2624,3 +2624,141 @@ def test_durable_claim_infrastructure_failure_does_not_suppress_protective_exit(
     wrapped = guard.wrap_ledger(lambda pos, decision, client_id="": calls.append((pos, decision)) or "written")
     assert wrapped(_pos(), _decision(), client_id="client@example.com") == "written"
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# P2 Race regression: post-retire-CAS pointer reread (PR #425 amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_pointer_retirement_refusal_rereads_live_row_for_broker_hydration(
+    monkeypatch,
+) -> None:
+    """Retirement CAS refused → live reread → _mark_active_exit_owned gets real broker id.
+
+    Race:
+      1. Guard fetches pointed_order with no broker_order_id (stale snapshot).
+      2. Between fetch and CAS, broker evidence appears in the DB.
+      3. CAS is refused (evidence predicate fails).
+      4. Pre-fix: stale pointed_order has no broker_order_id →
+             _exit_order_has_submit_evidence returns False →
+             _mark_active_exit_owned is skipped →
+             pos.pending_exit_broker_order_id stays "".
+      5. Post-fix: guard re-reads live row which carries broker_order_id →
+             _exit_order_has_submit_evidence returns True →
+             _mark_active_exit_owned is called with live row →
+             pos.pending_exit_broker_order_id == "broker-race-99".
+    """
+    _reset_guard_caches()
+
+    stale_order = _pre_callback_order(
+        "exit-race",
+        broker_order_id="",          # stale: no broker evidence yet
+    )
+    stale_order["position_id"] = "drifted-position"  # causes active lookup miss
+
+    live_order = _pre_callback_order(
+        "exit-race",
+        broker_order_id="broker-race-99",   # live: evidence appeared after fetch
+        submit_intent_at="2026-08-09T12:00:00+00:00",
+    )
+    live_order["position_id"] = "drifted-position"
+
+    # Call counter: first call returns stale, subsequent calls return live.
+    call_count: list[int] = [0]
+
+    def _stateful_exit_order_by_local_id(engine: object, local_order_id: str) -> dict | None:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return dict(stale_order)   # initial fetch: pre-CAS snapshot, no broker id
+        return dict(live_order)        # reread after CAS refusal: live row with broker id
+
+    monkeypatch.setattr(guard, "_exit_order_by_local_id", _stateful_exit_order_by_local_id)
+
+    # Retirement CAS always refused: simulates broker evidence arriving after our fetch.
+    monkeypatch.setattr(
+        guard,
+        "_retire_proven_unsubmitted_exit",
+        lambda *_args, **_kwargs: False,
+    )
+
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-race",
+        pending_exit_broker_order_id="",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=None)
+
+    # Disable generation claim so the guard reaches the pointer-reread path cleanly.
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        MagicMock(side_effect=AssertionError("generation must not be claimed")),
+    )
+
+    result = guard.wrap_submit(_invoke_submit_callback)(engine, pos, _decision())
+
+    # Guard returns False (blocked — existing owner must be resolved first).
+    assert result is False
+
+    # Critical: broker identity hydrated from the LIVE reread, not the stale snapshot.
+    assert pos.pending_exit_broker_order_id == "broker-race-99", (
+        "expected live broker id after post-CAS reread; "
+        f"got {pos.pending_exit_broker_order_id!r}"
+    )
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-race"
+
+    # _exit_order_by_local_id called exactly twice: initial fetch + post-CAS reread.
+    assert call_count[0] == 2, (
+        f"expected 2 calls to _exit_order_by_local_id (fetch + reread), got {call_count[0]}"
+    )
+    callback.assert_not_called()
+
+
+def test_reserved_pointer_retirement_refusal_reread_exception_returns_false_safely(
+    monkeypatch,
+) -> None:
+    """If the post-CAS reread itself raises, guard returns False without crashing."""
+    _reset_guard_caches()
+
+    stale_order = _pre_callback_order("exit-race-err")
+    stale_order["position_id"] = "drifted-position"
+
+    call_count: list[int] = [0]
+
+    def _failing_reread(engine: object, local_order_id: str) -> dict | None:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return dict(stale_order)
+        raise RuntimeError("db connection lost during reread")
+
+    monkeypatch.setattr(guard, "_exit_order_by_local_id", _failing_reread)
+    monkeypatch.setattr(
+        guard,
+        "_retire_proven_unsubmitted_exit",
+        lambda *_args, **_kwargs: False,
+    )
+
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-race-err",
+        pending_exit_broker_order_id="",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=None)
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        MagicMock(side_effect=AssertionError("generation must not be claimed")),
+    )
+
+    result = guard.wrap_submit(_invoke_submit_callback)(engine, pos, _decision())
+
+    assert result is False
+    # Broker id must NOT be hydrated from stale data when reread fails.
+    assert pos.pending_exit_broker_order_id == ""
+    callback.assert_not_called()

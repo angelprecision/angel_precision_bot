@@ -1854,8 +1854,31 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         pointed_order,
                         reason="EXIT_RESERVED_POINTER_IDENTITY_MISMATCH_NO_SUBMIT",
                     )
-                    if not repaired and _exit_order_has_submit_evidence(pointed_order):
-                        _mark_active_exit_owned(self, pos, pointed_order)
+                    if not repaired:
+                        # CAS was refused: pointed_order is the pre-CAS snapshot
+                        # and may not carry the broker_order_id that caused the
+                        # refusal (evidence can appear between our initial fetch
+                        # and the atomic CAS).  Re-read the live row so
+                        # _mark_active_exit_owned hydrates the authoritative
+                        # broker identity rather than a potentially stale one.
+                        try:
+                            live_pointed = _exit_order_by_local_id(
+                                self, reserved_local_order_id
+                            )
+                        except Exception as _reread_exc:
+                            log.critical(
+                                "[%s] EXIT_DECISION_POST_RETIRE_REREAD_FAILED"
+                                " position=%s local=%s error=%s",
+                                getattr(pos, "ticker", ""),
+                                position_id,
+                                reserved_local_order_id,
+                                _reread_exc,
+                            )
+                            return False
+                        if live_pointed is not None and _exit_order_has_submit_evidence(
+                            live_pointed
+                        ):
+                            _mark_active_exit_owned(self, pos, live_pointed)
                     return False
                 # Both durable reads succeeded with no row: this is only a
                 # stale in-memory pointer, so release it and reserve afresh.
