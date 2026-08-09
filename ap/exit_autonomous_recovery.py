@@ -38,6 +38,31 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _order_monitor_alive(order_monitor: Any) -> bool:
+    """
+    PR #423 Patch 3: single-cancellation-owner guarantee.
+
+    #423 gives APOrderMonitor its own narrow stale-EXIT watchdog cancel
+    authority (ap/order_monitor.py _handle_stale_exit). Before that PR,
+    this module's ambiguous-multi-match branch (see below) was the only
+    place that could independently cancel a stale exit order, so there was
+    no dual-ownership risk. Now there is: if the order monitor is alive and
+    already working the exact same stale exit, this module must defer to
+    it rather than issue a second independent cancel.
+
+    Returns False (i.e. "assume no owner, act independently") for any
+    monitor reference that doesn't look like a real running APOrderMonitor
+    — a missing/None monitor is not evidence that one is alive elsewhere.
+    """
+    if order_monitor is None:
+        return False
+    try:
+        thread = getattr(order_monitor, "_thread", None)
+        return bool(thread is not None and thread.is_alive())
+    except Exception:
+        return False
+
+
 def _norm(value: Any) -> str:
     return str(value or "").strip()
 
@@ -254,7 +279,10 @@ def _mark_replacement_safe(exit_engine: Any, pid: str, *, reason: str, local_id:
     return RecoveryAction("NOOP", "no_replacement_or_clear_hook_available", pid, local_id, broker_id, details)
 
 
-def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm: Any = None) -> RecoveryAction:
+def recover_exit_position(
+    pos: Any, *, broker: Any, exit_engine: Any = None, osm: Any = None,
+    order_monitor: Any = None,
+) -> RecoveryAction:
     pid = _position_id(pos)
     local_id, pending_broker_id = _pending_identity(pos)
     contract = _position_contract(pos)
@@ -277,7 +305,13 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                         qty=int(getattr(pos, "pending_exit_qty", 0) or 0),
                         reason="autonomous_recovery_confirmed_broker_open_exit",
                     )
-                return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
+                # PR #423 Patch 3: this path never independently cancels (it
+                # only reports/reconfirms open state), so it is safe
+                # regardless of monitor liveness. Tag ownership for
+                # observability per the spec's single-cancellation-owner
+                # requirement.
+                _owner = "order_monitor_stale_exit" if _order_monitor_alive(order_monitor) else "autonomous_recovery"
+                return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh, "recovery_owner": _owner})
             if st == "filled":
                 filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)
                 fill_price = None
@@ -343,6 +377,27 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
         return RecoveryAction("RECOVERED_BROKER_ID", "matched_single_live_exit_order", pid, local_id, recovered_broker_id, {"contract": contract, "quote_health": qh})
 
     if len(matches) > 1:
+        # PR #423 Patch 3: single-cancellation-owner guarantee. This branch
+        # is the one place in this module that independently issues broker
+        # cancels. If the order monitor is alive, it already owns exact
+        # stale-EXIT cancel authority (ap/order_monitor.py _handle_stale_exit
+        # with its own exactly-once in-flight guard) and may be the one that
+        # created this exact ambiguity mid-cancel. Defer to it rather than
+        # risk two independent cancellation attempts racing on the same
+        # broker order. Autonomous recovery only takes the independent-cancel
+        # path when the order monitor is unavailable/dead/unregistered, per
+        # spec Patch 3.
+        if _order_monitor_alive(order_monitor):
+            return RecoveryAction(
+                "CONFIRMED_OPEN",
+                "multiple_live_exit_orders_order_monitor_owns_stale_exit_recovery",
+                pid, local_id, "",
+                {
+                    "match_count": len(matches),
+                    "quote_health": qh,
+                    "recovery_owner": "order_monitor_stale_exit",
+                },
+            )
         cancel_results = []
         all_canceled = True
         for bid, raw in matches:
@@ -357,7 +412,12 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
                 reason="autonomous_recovery_multiple_live_exit_orders_canceled",
                 local_id=local_id,
                 broker_id="",
-                details={"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh},
+                details={
+                    "match_count": len(matches),
+                    "cancel_results": cancel_results,
+                    "quote_health": qh,
+                    "recovery_owner": "autonomous_recovery",
+                },
             )
         return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
 
@@ -396,7 +456,10 @@ def recover_exit_position(pos: Any, *, broker: Any, exit_engine: Any = None, osm
     )
 
 
-def recover_exit_engine(exit_engine: Any, *, broker: Any, osm: Any = None, max_positions: int = 10) -> list[RecoveryAction]:
+def recover_exit_engine(
+    exit_engine: Any, *, broker: Any, osm: Any = None, max_positions: int = 10,
+    order_monitor: Any = None,
+) -> list[RecoveryAction]:
     if exit_engine is None or broker is None:
         return []
     try:
@@ -412,7 +475,7 @@ def recover_exit_engine(exit_engine: Any, *, broker: Any, osm: Any = None, max_p
         if not (getattr(pos, "exit_identity_quarantine", False) or getattr(pos, "last_callback_identity_missing", False) or getattr(pos, "exit_in_flight", False)):
             continue
         try:
-            actions.append(recover_exit_position(pos, broker=broker, exit_engine=exit_engine, osm=osm))
+            actions.append(recover_exit_position(pos, broker=broker, exit_engine=exit_engine, osm=osm, order_monitor=order_monitor))
         except Exception as exc:
             log.exception("autonomous recovery failed for pos=%s: %s", _position_id(pos), exc)
             actions.append(RecoveryAction("ERROR", str(exc), _position_id(pos)))

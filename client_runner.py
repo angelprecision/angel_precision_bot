@@ -2660,7 +2660,13 @@ class ClientRunner(threading.Thread):
             broker = getattr(self, "broker", None)
             if exit_eng is None or broker is None:
                 return
-            actions = recover_exit_engine(exit_eng, broker=broker)
+            # PR #423 Patch 3: pass the live order_monitor reference so
+            # autonomous recovery can defer stale-EXIT cancel ownership to
+            # it when it's alive, avoiding a dual-cancel race on the same
+            # broker order.
+            actions = recover_exit_engine(
+                exit_eng, broker=broker, order_monitor=getattr(self, "order_monitor", None),
+            )
             for action in (actions or []):
                 if action.action not in ("NOOP",):
                     logger.info(

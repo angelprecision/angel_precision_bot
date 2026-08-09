@@ -1387,6 +1387,23 @@ class ManagedPosition:
     last_rejection_ts:    Optional[datetime] = None
     last_exit_rejected:  bool = False
     _exit_stuck_count:   int = 0
+    # PR #423: dedicated replacement-pricing generation. Deliberately
+    # separate from _exit_stuck_count, which has other diagnostic semantics
+    # and is reset on every submit (see _mark_exit_submitted). This field
+    # exists solely to preserve the adaptive-exit-pricing ladder attempt
+    # number across: broker-proven cancel of a stale exit -> replacement
+    # submit -> replacement later becomes stale -> another proven cancel ->
+    # next replacement submit. It must survive submission and must only
+    # reset on proven economic completion (see mark_position_closed /
+    # exactly-once increment in mark_exit_replacement_safe).
+    exit_replace_attempt: int = 0
+    # Exactly-once increment guard: the exact old broker/local order identity
+    # the last exit_replace_attempt increment was granted for. A repeat
+    # mark_exit_replacement_safe() call carrying the SAME proof identity (or
+    # the same blank/forced identity) while the grant is still outstanding
+    # (pending_exit_replace_allowed still True, i.e. not yet consumed by a
+    # new submit) must not increment a second time.
+    _exit_replace_attempt_last_ack_identity: str = ""
     max_profit_seen:      float = 0.0
     closed:               bool  = False
     close_reason:         str   = ""
@@ -3555,6 +3572,64 @@ class APExitEngine:
             )
             return False
 
+    def _persist_exit_replace_attempt_to_db(self, pos) -> bool:
+        """
+        PR #423 Patch 2 (restart requirement): persist exit_replace_attempt
+        under a dedicated nested metadata namespace so the replacement-
+        pricing generation survives a process restart, per the same
+        non-destructive JSONB `meta || patch` merge pattern used for
+        hard_exit_reference and protective-monitoring-state elsewhere in
+        this file. Never overwrites unrelated meta keys.
+
+        Best-effort: any DB error is logged and swallowed. A failed persist
+        here must never block the exactly-once in-memory increment or the
+        exit-replacement handoff — restart-survival is a durability
+        improvement, not a correctness precondition for the current
+        process's exactly-once guarantee (which is enforced in-memory by
+        _exit_replace_attempt_last_ack_identity / pending_exit_replace_allowed).
+        """
+        pid = str(getattr(pos, "position_id", "") or "")
+        client_id = str(getattr(pos, "client_id", "") or getattr(self, "_email", "") or "")
+        if not pid or not client_id:
+            return False
+        try:
+            import json
+            from ap.db import conn, run_with_retry  # local import avoids cycle
+
+            attempt = int(getattr(pos, "exit_replace_attempt", 0) or 0)
+            patch = {
+                "exit_retry_liveness": {
+                    "replace_attempt": attempt,
+                    "last_ack_identity": str(
+                        getattr(pos, "_exit_replace_attempt_last_ack_identity", "") or ""
+                    ),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+
+            def _do_update():
+                with conn() as c:
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND client_id = %s
+                        """,
+                        (json.dumps(patch, default=str), pid, client_id),
+                    )
+                    return c.rowcount
+
+            rowcount = run_with_retry(_do_update) or 0
+            return rowcount > 0
+        except Exception as exc:
+            log.debug(
+                "[exit_eng] _persist_exit_replace_attempt_to_db non-fatal failure for pos=%s: %s",
+                pid, exc,
+            )
+            return False
+
 
     def adopt_canonical_position_identity(
         self,
@@ -5226,6 +5301,19 @@ class APExitEngine:
                 pos.pending_exit_replace_allowed  = False
                 pos.pending_exit_replace_reason   = ""
                 pos.pending_exit_replace_allowed_ts = None
+                # PR #423: reset the replacement-generation counter ONLY on
+                # actual proven economic completion (this is the exact
+                # broker-confirmed-closed authority — never on submit,
+                # acknowledge, cancel, or replacement-safe handoff).
+                pos.exit_replace_attempt = 0
+                pos._exit_replace_attempt_last_ack_identity = ""
+                try:
+                    self._persist_exit_replace_attempt_to_db(pos)
+                except Exception as _perr:
+                    log.debug(
+                        "[exit_eng] exit_replace_attempt reset-persist failed non-fatally: %s",
+                        _perr,
+                    )
                 self._emit_exit_event(
                     pos,
                     decision="CLOSED",
@@ -5586,6 +5674,56 @@ class APExitEngine:
                             broker_order_id=broker_order_id, reason=reason_s,
                         )
                         return
+                    # PR #423: exactly-once exit_replace_attempt increment.
+                    # A repeat call carrying the identical proof identity
+                    # (or the identical blank/forced identity) while the
+                    # prior grant is still outstanding is a duplicate
+                    # notification for the SAME old exit generation — it
+                    # must not advance the pricing-ladder attempt a second
+                    # time. A grant is "outstanding" until a new submit
+                    # consumes it (_mark_exit_submitted resets
+                    # pending_exit_replace_allowed to False).
+                    _call_identity = broker_order_id or local_order_id
+                    _duplicate_grant_for_same_generation = (
+                        bool(pos.pending_exit_replace_allowed)
+                        and _call_identity == (pos._exit_replace_attempt_last_ack_identity or "")
+                    )
+                    if not _duplicate_grant_for_same_generation:
+                        pos.exit_replace_attempt = int(getattr(pos, "exit_replace_attempt", 0) or 0) + 1
+                        pos._exit_replace_attempt_last_ack_identity = _call_identity
+                        # PR #423: best-effort restart-durable persistence of the
+                        # replacement generation. Non-fatal — see method docstring.
+                        try:
+                            self._persist_exit_replace_attempt_to_db(pos)
+                        except Exception as _perr:
+                            log.debug(
+                                "[exit_eng] exit_replace_attempt persist call failed non-fatally: %s",
+                                _perr,
+                            )
+                        # PR #423: retry-exhaustion is observability only —
+                        # it does NOT stop management, invent a market
+                        # order, or silently HOLD an unmanaged open
+                        # position. The pricing ladder itself already
+                        # forces BID at attempt>=3 (see adaptive exit
+                        # pricing), which is the existing executable-BID
+                        # behavior for forced-risk exits the spec requires
+                        # to remain in effect at exhaustion.
+                        _exit_replace_max_attempts = int(
+                            os.getenv("EXIT_REPLACE_MAX_ATTEMPTS", "4")
+                        ) if str(os.getenv("EXIT_REPLACE_MAX_ATTEMPTS", "4")).strip().lstrip("-").isdigit() else 4
+                        if pos.exit_replace_attempt >= _exit_replace_max_attempts:
+                            self._emit_exit_event(
+                                pos, "ALERT", "EXIT_REPLACE_RETRY_EXHAUSTED_BROKER_OPEN",
+                                (
+                                    f"Replacement attempt {pos.exit_replace_attempt} reached "
+                                    f"max ({_exit_replace_max_attempts}) while broker position "
+                                    f"remains open. Protective ownership retained; forced-risk "
+                                    f"exits continue using executable BID pricing."
+                                ),
+                                stage="exit_reconciliation",
+                                extra_inputs={"exit_replace_attempt": pos.exit_replace_attempt},
+                            )
+
                     pos.pending_exit_replace_allowed  = True
                     pos.pending_exit_replace_reason   = reason_s or "external_cancel_or_reconcile_proof"
                     pos.pending_exit_replace_allowed_ts = datetime.now(timezone.utc)
@@ -5603,6 +5741,8 @@ class APExitEngine:
                             "pending_exit_reason": pos.pending_exit_reason,
                             "pending_exit_local_order_id": pos.pending_exit_local_order_id,
                             "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
+                            "exit_replace_attempt": pos.exit_replace_attempt,
+                            "duplicate_grant_suppressed": _duplicate_grant_for_same_generation,
                         },
                     )
                     log.critical(
@@ -6604,6 +6744,34 @@ class APExitEngine:
                     _persisted_href = {}
                     if isinstance(_meta, dict):
                         _persisted_href = _meta.get("hard_exit_reference") or {}
+                    # PR #423 Patch 2 (restart requirement): restore the
+                    # replacement-pricing generation from its dedicated
+                    # nested metadata namespace. Missing key -> 0.
+                    # Malformed key -> fail safely to 0. Never inferred from
+                    # elapsed time, order count, broker status history, or
+                    # _exit_stuck_count.
+                    try:
+                        _retry_liveness_meta = (
+                            _meta.get("exit_retry_liveness") if isinstance(_meta, dict) else None
+                        ) or {}
+                        _restored_attempt = int(
+                            _retry_liveness_meta.get("replace_attempt", 0) or 0
+                        ) if isinstance(_retry_liveness_meta, dict) else 0
+                        if _restored_attempt < 0:
+                            _restored_attempt = 0
+                    except Exception:
+                        _restored_attempt = 0
+                    mp.exit_replace_attempt = _restored_attempt
+                    if isinstance(_retry_liveness_meta, dict):
+                        mp._exit_replace_attempt_last_ack_identity = str(
+                            _retry_liveness_meta.get("last_ack_identity", "") or ""
+                        )
+                    if _restored_attempt > 0:
+                        log.info(
+                            "[exit_eng] SEED_EXIT_REPLACE_ATTEMPT_RESTORED client=%s "
+                            "position_id=%s attempt=%d",
+                            mp.client_id, mp.position_id, _restored_attempt,
+                        )
                     if isinstance(_persisted_href, dict) and _persisted_href.get("price", 0) > 0:
                         try:
                             mp.hard_exit_reference_price    = float(_persisted_href.get("price", 0))
@@ -8479,7 +8647,12 @@ class APExitEngine:
                 _ask  = pos.current_ask if pos.current_ask > _bid else 0.0
                 _mid  = round((_bid + _ask) / 2.0, 2) if _ask > 0 else _bid
                 _spread_pct = ((_ask - _bid) / _bid) if (_ask > 0 and _bid > 0) else 1.0
-                _attempt    = int(getattr(pos, "_exit_stuck_count", 0))
+                # PR #423: use the dedicated replacement generation counter,
+                # not _exit_stuck_count (separate diagnostic semantics,
+                # reset on every submit). exit_replace_attempt survives
+                # submission and only advances on a broker-proven cancel of
+                # the prior generation — see mark_exit_replacement_safe().
+                _attempt    = int(getattr(pos, "exit_replace_attempt", 0))
 
                 # Classify urgency from the exit reason code
                 _code = _classify_exit_decision(decision)

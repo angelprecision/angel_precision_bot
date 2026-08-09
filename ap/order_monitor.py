@@ -251,6 +251,20 @@ ORDER_MONITOR_CAN_ACT = ORDER_MONITOR_MODE in {"active", "actor", "enforce", "en
 # buy-to-open is not a position — leaving it to fill late is the actual risk.
 ALLOW_ENTRY_CANCEL_IN_WATCHDOG = os.getenv("ALLOW_ENTRY_CANCEL_IN_WATCHDOG", "1").strip() == "1"
 
+# PR #423: narrow stale-EXIT watchdog exception. This restores a previously
+# intended exit-liveness mechanism (2026-08-07 AVGO PAPER incident: a stale
+# working 2-lot SELL_TO_CLOSE sat unfilled indefinitely under watchdog mode,
+# later blocking a full-position flatten because the broker still reserved
+# those contracts). This flag authorizes ONLY stale-EXIT cancel/replacement
+# recovery — it does not enable generic watchdog order mutation, stale-ENTRY
+# cancellation (see ALLOW_ENTRY_CANCEL_IN_WATCHDOG above), position
+# reopening, or any other broker mutation. Default is ENABLED because this
+# is restoration of intended safety/liveness behavior, not a new
+# experimental feature.
+ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG = os.getenv(
+    "ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # PHASE 5 WIRE-IN (2026-05-23):
 # After an ENTRY cancel is broker-confirmed, the monitor consults
 # ap.post_cancel_retry.evaluate_retry. If the decision returns ARM, the
@@ -477,6 +491,13 @@ class APOrderMonitor:
         self.client_mode = str(client_mode or "LIVE").strip().upper()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # PR #423: exactly-once stale-EXIT cancel guard. Keyed by exact
+        # broker_order_id. Prevents two overlapping poll cycles that both
+        # observe the same stale working exit from each independently
+        # issuing a broker cancel before the first cancel's terminal proof
+        # lands. Cleared once terminal proof (canceled/filled/error) is
+        # obtained for that exact broker_order_id.
+        self._stale_exit_cancel_inflight: dict[str, datetime] = {}
 
         self.run_id           = os.getenv("AP_RUN_ID", "unknown")
         self.strategy_version = os.getenv("AP_STRATEGY_VERSION", "ap_live_beta")
@@ -496,6 +517,7 @@ class APOrderMonitor:
             "missed_move_price_mult": float(os.getenv("MISSED_MOVE_PRICE_MULT", "1.07")),
             "entry_limit_max_age_seconds": ENTRY_LIMIT_MAX_AGE_SECONDS,
             "allow_entry_cancel_in_watchdog": ALLOW_ENTRY_CANCEL_IN_WATCHDOG,
+            "allow_stale_exit_recovery_in_watchdog": ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG,
             "pending_trigger_cleanup_enabled": PENDING_TRIGGER_CLEANUP_ENABLED,
             "pending_trigger_max_age_seconds": PENDING_TRIGGER_MAX_AGE_SECONDS,
             "pending_trigger_cleanup_dry_run": PENDING_TRIGGER_CLEANUP_DRY_RUN,
@@ -5093,7 +5115,11 @@ class APOrderMonitor:
             f"| {local_order_id} | pos={position_id} | {reason}"
         )
 
-        if not ORDER_MONITOR_CAN_ACT:
+        # PR #423: narrow stale-EXIT watchdog exception. Global watchdog
+        # passivity is otherwise unchanged — this authorizes ONLY the exact
+        # stale-EXIT recovery path below, never generic order mutation.
+        _stale_exit_authorized = ORDER_MONITOR_CAN_ACT or ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG
+        if not _stale_exit_authorized:
             self._alert(
                 f"[WATCHDOG ONLY] Stale exit detected; no cancel/clear/reopen attempted | "
                 f"{self.client_id} | {contract} | {local_order_id} | pos={position_id} | {reason}"
@@ -5103,8 +5129,41 @@ class APOrderMonitor:
                 self.client_id, local_order_id, status, position_id,
             )
             return
+        if not ORDER_MONITOR_CAN_ACT:
+            log.warning(
+                "[%s] WATCHDOG STALE-EXIT RECOVERY EXCEPTION ACTIVE — performing ONLY "
+                "exact stale EXIT recovery (cancel/replace); no other watchdog mutation "
+                "authorized | order=%s status=%s pos=%s",
+                self.client_id, local_order_id, status, position_id,
+            )
 
+        # ── Exact broker order identity is mandatory ────────────────────────
         broker_oid = self._get_broker_order_id(local_order_id)
+        if not broker_oid:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="ALERT",
+                reason_code="STALE_EXIT_BROKER_ID_UNPROVEN",
+                explanation=(
+                    "Stale-exit recovery blocked: no exact durable broker_order_id "
+                    "resolved for this local order. No fuzzy contract/side/qty lookup "
+                    "is permitted."
+                ),
+                contract=contract,
+                position_id=position_id,
+                inputs={"status": status, "age_secs": age_secs},
+            )
+            self._alert(
+                f"STALE_EXIT_BROKER_ID_UNPROVEN | {self.client_id} | {contract} "
+                f"| {local_order_id} | pos={position_id} — cannot cancel without exact broker order id"
+            )
+            log.error(
+                "[%s] STALE_EXIT_BROKER_ID_UNPROVEN — refusing fuzzy cancel | order=%s pos=%s",
+                self.client_id, local_order_id, position_id,
+            )
+            return
+
         broker_status = self._query_broker_order(broker_oid)
 
         broker_owned_recovery = _is_broker_ownership_adopted_row(
@@ -5123,82 +5182,166 @@ class APOrderMonitor:
             )
             return
 
+        # ── Broker fill truth wins before cancel ────────────────────────────
+        # Covers both fully-filled and partially-filled: route through the
+        # existing canonical fill/OSM path and never cancel or replace merely
+        # because the local stale timer fired. Cumulative fill accounting
+        # stays inside _advance_from_broker_status / the canonical reducer —
+        # this helper does not mutate position quantity directly.
         if self._is_executed_status(broker_status):
             log.info(
-                f"[{self.client_id}] Exit actually filled at broker — "
+                f"[{self.client_id}] Exit actually filled/partially filled at broker — "
                 f"advancing state machine: {local_order_id}"
             )
             self._advance_from_broker_status(local_order_id, broker_status, contract)
+            self._stale_exit_cancel_inflight.pop(broker_oid, None)
             return
 
-        cancel_result = None
-        try:
-            cancel_result = self._cancel_broker_order(broker_oid)
-        except Exception as e:
-            log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
-
-        confirmed_status = self._extract_broker_status(cancel_result)
-        is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
-
-        if not is_confirmed_canceled:
-            self._emit_order_event(
-                local_order_id=local_order_id,
-                stage="order_monitor",
-                decision="ALERT",
-                reason_code="MANUAL_INTERVENTION_REQUIRED",
-                explanation="Exit order stuck and cancel not broker-confirmed",
-                contract=contract,
-                position_id=position_id,
-                inputs={"confirmed_status": confirmed_status},
+        # ── Exactly-once cancel guard ────────────────────────────────────────
+        # A second poll cycle observing the same stale exit before the first
+        # cancel's terminal proof has landed must not issue a second broker
+        # cancel call. Instead, re-check broker truth for terminal proof.
+        _now = datetime.now(timezone.utc)
+        _inflight_since = self._stale_exit_cancel_inflight.get(broker_oid)
+        if _inflight_since is not None:
+            _inflight_age = (_now - _inflight_since).total_seconds()
+            log.info(
+                "[%s] STALE_EXIT_CANCEL_ALREADY_IN_PROGRESS — skipping duplicate cancel "
+                "request; awaiting terminal proof | order=%s broker_oid=%s age=%.0fs",
+                self.client_id, local_order_id, broker_oid, _inflight_age,
             )
-            self._alert(
-                f"Exit cancel sent but NOT broker-confirmed | {self.client_id} | "
-                f"{contract} | {local_order_id} | broker_status={confirmed_status or 'unknown'}"
-            )
-
-        if is_confirmed_canceled:
-            self.osm.transition(local_order_id, "CANCELED", last_error=reason)
-
-            if position_id and self.exit_engine:
-                try:
-                    self.exit_engine.clear_exit_in_flight(position_id)
-                    log.warning(
-                        "[%s] clear_exit_in_flight(%s) called — "
-                        "exit engine will retry within 8s",
-                        self.client_id, position_id,
-                    )
-                except Exception as _cef:
-                    log.error(
-                        "[%s] clear_exit_in_flight failed for pos=%s: %s",
-                        self.client_id, position_id, _cef,
-                    )
-
-            if position_id and self.pm:
-                self._guarded_revert_position_open_after_exit_cancel(
-                    position_id=position_id,
-                    canceled_exit_order_id=local_order_id,
+            _recheck_status = self._query_broker_order(broker_oid, bypass_cache=True)
+            if self._is_executed_status(_recheck_status):
+                self._advance_from_broker_status(local_order_id, _recheck_status, contract)
+                self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                return
+            if not self._is_terminal_cancel_status(_recheck_status):
+                # Still no terminal proof — hold, do not re-issue cancel, do
+                # not unlock replacement using elapsed time.
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="HOLD",
+                    reason_code="EXIT_CANCEL_NOT_CONFIRMED_REPLACEMENT_BLOCKED",
+                    explanation="Prior cancel request for this exact broker order still awaiting terminal proof.",
                     contract=contract,
-                    reason=reason,
+                    position_id=position_id,
+                    inputs={"broker_order_id": broker_oid, "inflight_age_sec": _inflight_age},
                 )
+                return
+            # Fall through: fresh query itself now proves terminal cancellation.
+            confirmed_status = _recheck_status
+            is_confirmed_canceled = True
         else:
-            log.error(
-                f"[{self.client_id}] Exit order could not be canceled — "
-                f"MANUAL INTERVENTION REQUIRED | {local_order_id}"
-            )
-            self._emit_order_event(
-                local_order_id=local_order_id,
-                stage="order_monitor",
-                decision="ALERT",
-                reason_code="MANUAL_INTERVENTION_REQUIRED",
-                explanation="Exit order stuck — cancel not broker-confirmed, manual action required",
-                contract=contract,
+            self._stale_exit_cancel_inflight[broker_oid] = _now
+            cancel_result = None
+            try:
+                cancel_result = self._cancel_broker_order(broker_oid)
+            except Exception as e:
+                log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
+
+            # ── Cancel response is NOT terminal proof ────────────────────────
+            # The cancel_order() response alone (network error, timeout,
+            # missing status, unknown/working/open/pending/accepted/
+            # acknowledged/queued/partial fill) never authorizes replacement.
+            # Terminal authority is a FRESH, independent post-cancel broker
+            # GET, issued regardless of what the cancel response itself said.
+            _cancel_response_status = self._extract_broker_status(cancel_result)
+            try:
+                confirmed_status = self._query_broker_order(broker_oid, bypass_cache=True)
+            except Exception as e:
+                log.warning(f"[{self.client_id}] Post-cancel broker GET failed: {e}")
+                confirmed_status = None
+
+            is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
+
+            # A fresh GET that itself proves a fill in the interim must win —
+            # the late-fill race. FILLED beats a pending/attempted cancel.
+            if self._is_executed_status(confirmed_status):
+                log.info(
+                    "[%s] Late-fill race — broker filled during cancel window | order=%s",
+                    self.client_id, local_order_id,
+                )
+                self._advance_from_broker_status(local_order_id, confirmed_status, contract)
+                self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                return
+
+            if not is_confirmed_canceled:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_CANCEL_NOT_CONFIRMED_REPLACEMENT_BLOCKED",
+                    explanation=(
+                        "Exit order cancel requested but NOT independently broker-confirmed "
+                        "via fresh post-cancel GET. Old exit ownership remains protective; "
+                        "replacement is blocked."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "cancel_response_status": _cancel_response_status,
+                        "post_cancel_get_status": confirmed_status,
+                    },
+                )
+                self._alert(
+                    f"Exit cancel sent but NOT independently broker-confirmed | {self.client_id} | "
+                    f"{contract} | {local_order_id} | post_cancel_status={confirmed_status or 'unknown'}"
+                )
+                # Leave the inflight marker set — do not re-issue cancel on
+                # the next stale poll; the next cycle re-checks via the
+                # "already in progress" branch above instead.
+                return
+
+        # ── Broker-confirmed cancellation ───────────────────────────────────
+        self._stale_exit_cancel_inflight.pop(broker_oid, None)
+        self.osm.transition(local_order_id, "CANCELED", last_error=reason)
+
+        if position_id and self.exit_engine:
+            try:
+                self.exit_engine.clear_exit_in_flight(position_id)
+                log.warning(
+                    "[%s] clear_exit_in_flight(%s) called — "
+                    "exit engine will retry within 8s",
+                    self.client_id, position_id,
+                )
+            except Exception as _cef:
+                log.error(
+                    "[%s] clear_exit_in_flight failed for pos=%s: %s",
+                    self.client_id, position_id, _cef,
+                )
+
+        # Cancellation proves only that the order is canceled — it does not
+        # prove no partial fill occurred or that full quantity remains.
+        # _guarded_revert_position_open_after_exit_cancel already declines to
+        # reopen quantity when a newer active replacement exit exists; it
+        # must not reconstruct position state from assumption either.
+        if position_id and self.pm:
+            self._guarded_revert_position_open_after_exit_cancel(
                 position_id=position_id,
-                inputs={"confirmed_status": confirmed_status, "age_secs": age_secs},
+                canceled_exit_order_id=local_order_id,
+                contract=contract,
+                reason=reason,
             )
-            self._alert(
-                f"MANUAL INTERVENTION REQUIRED | {self.client_id} | {contract} "
-                f"| Exit order {local_order_id} stuck and cannot be canceled"
-            )
+
+        # Hand off replacement authority through the identity-safe existing
+        # seam. This is the exactly-once increment point for
+        # ManagedPosition.exit_replace_attempt (ap_exit_engine.py PR #423
+        # Patch 2) — mark_exit_replacement_safe() itself enforces the
+        # exactly-once guarantee via its identity fencing.
+        if position_id and self.exit_engine and hasattr(self.exit_engine, "mark_exit_replacement_safe"):
+            try:
+                self.exit_engine.mark_exit_replacement_safe(
+                    position_id,
+                    reason="order_monitor_stale_exit_broker_confirmed_cancel",
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_oid,
+                )
+            except Exception as _mrs_e:
+                log.error(
+                    "[%s] mark_exit_replacement_safe failed for pos=%s: %s",
+                    self.client_id, position_id, _mrs_e,
+                )
 
     def _guarded_revert_position_open_after_exit_cancel(
         self,
@@ -5369,7 +5512,9 @@ class APOrderMonitor:
             )
             return None  # safe: caller proceeds with position reopen on None
 
-    def _query_broker_order(self, broker_order_id: Optional[str]) -> Optional[str]:
+    def _query_broker_order(
+        self, broker_order_id: Optional[str], *, bypass_cache: bool = False,
+    ) -> Optional[str]:
         if not broker_order_id or not self.broker:
             return None
         def _fetch():
@@ -5394,6 +5539,23 @@ class APOrderMonitor:
                 except Exception:
                     pass
             return None
+        # PR #423: the shared _BROKER_STATUS_CACHE has an 8s TTL, intended to
+        # dedupe fill_monitor/order_monitor polling the same order within a
+        # few seconds. A post-cancel terminal-proof query must NEVER read a
+        # cached pre-cancel status silently — that would defeat the entire
+        # point of "cancel response is not terminal proof" by substituting
+        # a different stale read. Explicitly invalidate this order's cache
+        # entry and force a live fetch whenever fresh proof is required.
+        if bypass_cache:
+            with _BROKER_STATUS_CACHE_LOCK:
+                _BROKER_STATUS_CACHE.pop(broker_order_id, None)
+            status = _fetch()
+            if status is not None:
+                with _BROKER_STATUS_CACHE_LOCK:
+                    _BROKER_STATUS_CACHE[broker_order_id] = (
+                        status, time.monotonic() + _BROKER_STATUS_CACHE_TTL,
+                    )
+            return status
         return _cached_broker_order_status(broker_order_id, _fetch)
 
     def _cancel_broker_order(self, broker_order_id: Optional[str]):
