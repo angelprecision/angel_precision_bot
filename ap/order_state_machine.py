@@ -2177,6 +2177,76 @@ class APOrderStateMachine:
             )
             return False
 
+    def persist_exit_submit_intent(
+        self,
+        local_order_id: str,
+        *,
+        position_id: str,
+        execution_mode: str,
+        contract: str,
+        qty: int,
+        payload_hash: str,
+        broker_submit_key: str,
+    ) -> bool:
+        """Fence one exact EXIT_REQUESTED row before any broker POST."""
+        mode = str(execution_mode or "").strip().lower()
+        submit_key = canonical_broker_submit_key(broker_submit_key)
+        payload_hash = str(payload_hash or "").strip()
+        if (
+            mode not in {"live", "paper"}
+            or not submit_key
+            or not payload_hash
+            or not isinstance(qty, int)
+            or isinstance(qty, bool)
+            or qty <= 0
+        ):
+            return False
+        patch = __import__("json").dumps({
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": now_utc_iso(),
+            "broker_submit_key": submit_key,
+            "broker_submit_payload_hash": payload_hash,
+            "current_owner": f"broker_submit:{submit_key}",
+        })
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders SET "
+                    "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s AND position_id=%s "
+                    "AND kind='EXIT' AND status=%s "
+                    "AND LOWER(COALESCE(execution_mode,''))=%s "
+                    "AND COALESCE(contract,'')=%s AND COALESCE(qty,0)=%s "
+                    "AND COALESCE(broker_order_id,'')='' AND submitted_ts IS NULL "
+                    "AND COALESCE(meta->>'submit_intent_at','')='' "
+                    "AND COALESCE(meta->>'broker_submit_key','')='' "
+                    "AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
+                    "AND COALESCE((meta->>'reconciliation_required')::boolean, false)=false",
+                    (
+                        patch,
+                        local_order_id,
+                        self.client_id,
+                        str(position_id),
+                        OrderStatus.EXIT_REQUESTED,
+                        mode,
+                        str(contract or ""),
+                        qty,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_exit_submit_intent failed order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
+            )
+            return False
+
     def claim_deferred_broker_ready_submit(
         self,
         local_order_id: str,
@@ -6064,6 +6134,76 @@ class APOrderStateMachine:
         # in /orders to confirm the order landed without double-submitting.
         _order_data["tag"] = canonical_broker_submit_key(local_id)
 
+        # Make absence of submit evidence authoritative.  Recovery may retire
+        # an EXIT_REQUESTED row only while this exact CAS has never succeeded;
+        # once it does, every crash/timeout path is broker-ambiguous and must
+        # reconcile by the canonical tag instead of creating a replacement.
+        _exit_payload_hash = hashlib.sha256(
+            json.dumps(_order_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        _intent_getter = getattr(self, "_get_order", None) or getattr(self, "get_order", None)
+
+        def _exit_submit_intent_proven() -> tuple[bool, dict]:
+            row = _intent_getter(local_id) if callable(_intent_getter) else None
+            row = dict(row) if row else {}
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            proven = bool(
+                str(row.get("local_order_id") or "") == str(local_id)
+                and str(row.get("position_id") or "") == str(position_id)
+                and row.get("kind") == "EXIT"
+                and row.get("status") == OrderStatus.EXIT_REQUESTED
+                and row.get("client_id") == self.client_id
+                and str(row.get("execution_mode") or "").strip().lower()
+                    == str(execution_mode or "").strip().lower()
+                and str(row.get("contract") or "") == str(contract or "")
+                and row.get("qty") == requested_qty
+                and not str(row.get("broker_order_id") or "").strip()
+                and not row.get("submitted_ts")
+                and str(meta.get("submit_intent_at") or "").strip()
+                and meta.get("broker_submit_key") == _order_data["tag"]
+                and meta.get("broker_submit_payload_hash") == _exit_payload_hash
+                and meta.get("current_owner") == f"broker_submit:{_order_data['tag']}"
+                and not meta.get("split_brain_quarantine")
+                and not meta.get("reconciliation_required")
+            )
+            return proven, row
+
+        if not self.persist_exit_submit_intent(
+            local_id,
+            position_id=str(position_id),
+            execution_mode=str(execution_mode or ""),
+            contract=str(contract or ""),
+            qty=requested_qty,
+            payload_hash=_exit_payload_hash,
+            broker_submit_key=_order_data["tag"],
+        ):
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_FENCE_LOST",
+                "reconciliation_required": True,
+            }
+
+        _intent_proven, _intent_row = _exit_submit_intent_proven()
+        if not _intent_proven:
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": _intent_row.get("broker_order_id"),
+                "status": _intent_row.get("status") or OrderStatus.ERROR,
+                "error": "EXIT_SUBMIT_INTENT_DURABLE_PROOF_FAILED",
+                "reconciliation_required": True,
+            }
+
         # ── Retry-safe broker submission ──────────────────────────────────────
         # Failure classes:
         #   RETRYABLE_CONNECT_TIMEOUT — no HTTP connection was established
@@ -6097,6 +6237,16 @@ class APOrderStateMachine:
             # POST.  The entry-time check is not enough: another worker could
             # terminalize, replace, mutate, or broker-own the row while broker
             # truth and safety gates run above.
+            latest_intent_proven, latest_intent = _exit_submit_intent_proven()
+            if not latest_intent_proven:
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": latest_intent.get("broker_order_id"),
+                    "status": latest_intent.get("status") or OrderStatus.ERROR,
+                    "error": "EXIT_SUBMIT_INTENT_DURABLE_PROOF_FAILED",
+                    "reconciliation_required": True,
+                }
             if reserved_local_id:
                 latest_reserved = self._get_active_exit_order(position_id)
                 latest_mismatches = _reserved_exit_identity_mismatches(

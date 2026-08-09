@@ -8831,6 +8831,52 @@ class APExecutionCore:
             return
 
         if self.order_state_machine and pos.position_id:
+            _decision_exit_qty = getattr(decision, "quantity", None)
+            _reserved_exit_qty = getattr(decision, "reserved_exit_quantity", None)
+            _remaining_exit_qty = getattr(pos, "quantity_remaining", None)
+            _decision_reserved_local_id = str(
+                getattr(decision, "reserved_local_order_id", "") or ""
+            ).strip()
+            _position_reserved_local_id = str(
+                getattr(pos, "pending_exit_local_order_id", "") or ""
+            ).strip()
+            _bound_local_id = _decision_reserved_local_id or _position_reserved_local_id
+            if (
+                type(_decision_exit_qty) is not int
+                or _decision_exit_qty <= 0
+                or type(_remaining_exit_qty) is not int
+                or _remaining_exit_qty <= 0
+                or _decision_exit_qty != _remaining_exit_qty
+                or (
+                    _reserved_exit_qty is not None
+                    and (
+                        type(_reserved_exit_qty) is not int
+                        or _reserved_exit_qty != _decision_exit_qty
+                    )
+                )
+                or (
+                    _decision_reserved_local_id
+                    and _position_reserved_local_id
+                    and _decision_reserved_local_id != _position_reserved_local_id
+                )
+            ):
+                log.critical(
+                    "[%s] CLOSE BLOCKED — exact reserved exit identity mismatch | decision_qty=%r reserved_qty=%r remaining_qty=%r decision_local=%s position_local=%s",
+                    pos.ticker,
+                    _decision_exit_qty,
+                    _reserved_exit_qty,
+                    _remaining_exit_qty,
+                    _decision_reserved_local_id,
+                    _position_reserved_local_id,
+                )
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "local_order_id": _bound_local_id,
+                    "broker_order_id": None,
+                    "status": "EXIT_REQUESTED" if _bound_local_id else "CLOSE_BLOCKED",
+                    "error": "reserved_exit_identity_mismatch",
+                }
             _price_str = f"${_exit_limit:.2f}" if _exit_limit is not None else "MARKET"
             log.info(
                 f"[{pos.ticker}] {'PAPER' if self.paper else 'LIVE'} CLOSE -- "
@@ -8842,11 +8888,11 @@ class APExecutionCore:
                 contract    = pos.option_symbol,
                 symbol      = pos.ticker,
                 direction   = pos.side,
-                qty         = pos.quantity_remaining,
+                qty         = _decision_exit_qty,
                 limit_price = _exit_limit,  # None = market order for IMMEDIATE exits
                 signal_id   = _sig_id or None,
                 order_type  = "market" if _exit_limit is None else "limit",
-                local_order_id=str(getattr(pos, "pending_exit_local_order_id", "") or "") or None,
+                local_order_id=_bound_local_id or None,
             )
             if exit_res["ok"]:
                 log.info(

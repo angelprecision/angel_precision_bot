@@ -1656,6 +1656,27 @@ class _GuardOSM:
             return self.active_order
         return None
 
+    def get_order(self, local_order_id):
+        if str(self.active_order.get("local_order_id") or "") == str(local_order_id or ""):
+            return self.active_order
+        return None
+
+    def retire_unsubmitted_exit_intent(self, local_order_id, *, last_error):
+        meta = dict(self.active_order.get("meta") or {})
+        if (
+            str(self.active_order.get("local_order_id") or "") != str(local_order_id or "")
+            or self.active_order.get("client_id") != "tradefluence"
+            or self.active_order.get("kind") != "EXIT"
+            or self.active_order.get("status") != "EXIT_REQUESTED"
+            or str(self.active_order.get("broker_order_id") or "")
+            or self.active_order.get("submitted_ts")
+            or str(meta.get("submit_intent_at") or "")
+        ):
+            return False
+        self.active_order["status"] = "ERROR"
+        self.active_order["last_error"] = last_error
+        return True
+
 
 def _guard_pos(**overrides):
     values = {
@@ -3137,7 +3158,16 @@ def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post(
     assert proof["broker_side_effects"] == []
     assert proof["adoption"].call_count == 0
     assert proof["osm"].adopt_count == 0
-    assert proof["claim_updates"] == []
+    assert proof["claim_updates"] == [
+        (
+            "tradefluence|position-fresh-wrapper-425|4|1",
+            {
+                "claim_state": guard._CLAIM_STATE_AMBIGUOUS,
+                "local_order_id": "exit-fresh-wrapper-425",
+                "error_text": "FINAL_RESERVED_EXIT_IDENTITY_UNPROVEN",
+            },
+        )
+    ]
     assert proof["osm"].row["status"] == "EXIT_FILLED"
 
 
@@ -3196,6 +3226,31 @@ def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkey
         def update_order_meta(self, local_order_id, patch):
             assert self.row and local_order_id == self.row["local_order_id"]
             self.row["meta"].update(dict(patch))
+            return True
+
+        def persist_exit_submit_intent(
+            self,
+            local_order_id,
+            *,
+            position_id,
+            execution_mode,
+            contract,
+            qty,
+            payload_hash,
+            broker_submit_key,
+        ):
+            assert self.row and local_order_id == self.row["local_order_id"]
+            assert self.row["position_id"] == position_id
+            assert self.row["execution_mode"] == execution_mode
+            assert self.row["contract"] == contract
+            assert self.row["qty"] == qty
+            self.row["meta"].update({
+                "lifecycle_state": "SUBMITTING",
+                "submit_intent_at": "2026-08-08T12:00:00+00:00",
+                "broker_submit_key": broker_submit_key,
+                "broker_submit_payload_hash": payload_hash,
+                "current_owner": f"broker_submit:{broker_submit_key}",
+            })
             return True
 
         def transition(self, local_order_id, new_status, **kwargs):
@@ -3423,6 +3478,57 @@ def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkey
     assert broker.session.post.call_count == 1
 
 
+def test_osm_exit_submit_intent_cas_binds_exact_durable_identity(monkeypatch):
+    captured = {}
+
+    class _Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params):
+            captured["sql"] = " ".join(str(sql).split())
+            captured["params"] = params
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(osm_module, "conn", lambda: _Cursor())
+    monkeypatch.setattr(osm_module, "run_with_retry", lambda fn, **_kwargs: fn())
+    osm = APOrderStateMachine.__new__(APOrderStateMachine)
+    osm.client_id = "tradefluence"
+
+    assert osm.persist_exit_submit_intent(
+        "exit-intent-exact-425",
+        position_id="position-intent-exact-425",
+        execution_mode="paper",
+        contract="ORCL260807P00155000",
+        qty=1,
+        payload_hash="payload-hash-425",
+        broker_submit_key="exit-intent-exact-425",
+    ) is True
+    assert "kind='EXIT' AND status=%s" in captured["sql"]
+    assert "COALESCE(qty,0)=%s" in captured["sql"]
+    assert "COALESCE(meta->>'submit_intent_at','')=''" in captured["sql"]
+    assert captured["params"][1:] == (
+        "exit-intent-exact-425",
+        "tradefluence",
+        "position-intent-exact-425",
+        "EXIT_REQUESTED",
+        "paper",
+        "ORCL260807P00155000",
+        1,
+    )
+    persisted_meta = json.loads(captured["params"][0])
+    assert persisted_meta["broker_submit_key"] == osm_module.canonical_broker_submit_key(
+        "exit-intent-exact-425"
+    )
+    assert persisted_meta["broker_submit_payload_hash"] == "payload-hash-425"
+    assert persisted_meta["submit_intent_at"]
+
+
 def test_production_scale_out_qty_mismatch_holds_before_osm_and_broker():
     """Durable qty=4 versus SCALE_OUT qty=1 is a zero-POST HOLD."""
     from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition
@@ -3549,6 +3655,81 @@ def test_production_close_callback_returns_broker_identity_for_adoption():
     assert result["local_order_id"] == "exit-close-gap-425"
     assert result["broker_order_id"] == "broker-close-gap-425"
     osm.submit_exit.assert_called_once()
+    assert osm.submit_exit.call_args.kwargs["qty"] == 1
+    assert osm.submit_exit.call_args.kwargs["local_order_id"] == "exit-close-gap-425"
+
+
+@pytest.mark.parametrize(
+    ("reason_code", "urgency"),
+    [
+        ("HARD_STOP", "IMMEDIATE"),
+        ("PROFIT_LOCK", "HIGH"),
+        ("EOD_FORCE_CLOSE", "IMMEDIATE"),
+    ],
+)
+def test_production_close_paths_reuse_exact_reserved_qty_and_local_id(
+    reason_code,
+    urgency,
+):
+    from ap_exit_engine import ExitDecision, ManagedPosition
+    from ap_execution_core import APExecutionCore
+
+    local_id = f"exit-close-{reason_code.lower()}-425"
+    osm = SimpleNamespace(submit_exit=MagicMock(return_value={
+        "ok": False,
+        "local_order_id": local_id,
+        "broker_order_id": f"broker-{reason_code.lower()}-425",
+        "status": "ERROR",
+        "error": "exit_submitted_transition_failed_after_broker_accept",
+        "split_brain": True,
+    }))
+    core = APExecutionCore.__new__(APExecutionCore)
+    core._pos_lock = threading.RLock()
+    core._position_count = 1
+    core._sector_lock = threading.RLock()
+    core._sector_counts = {"OTHER": 1}
+    core.paper = reason_code != "HARD_STOP"
+    core.order_state_machine = osm
+    core.broker = MagicMock()
+    core.master_control = SimpleNamespace()
+    pos = ManagedPosition(
+        ticker="ORCL",
+        option_symbol="ORCL260807P00155000",
+        side="PUT",
+        quantity=2,
+        entry_price=1.00,
+        underlying_entry=155.00,
+        underlying_target=150.00,
+        underlying_stop=158.00,
+        position_id=f"position-{reason_code.lower()}-425",
+        client_id="tradefluence",
+        current_option_price=1.20,
+        current_bid=1.15,
+        current_ask=1.25,
+        current_underlying=153.00,
+        quantity_remaining=2,
+        pending_exit_local_order_id=local_id,
+    )
+    pos.signal = {"signal_id": f"signal-{reason_code.lower()}-425"}
+    decision = ExitDecision(
+        action="CLOSE_ALL",
+        quantity=2,
+        reason=reason_code.replace("_", " "),
+        urgency=urgency,
+        reason_code=reason_code,
+        suggested_limit=1.15,
+    )
+    decision.reserved_local_order_id = local_id
+    decision.reserved_exit_quantity = 2
+
+    core._on_position_close(pos, decision)
+
+    call = osm.submit_exit.call_args.kwargs
+    assert call["qty"] == 2
+    assert call["local_order_id"] == local_id
+    assert call["order_type"] == (
+        "market" if reason_code in {"HARD_STOP", "EOD_FORCE_CLOSE"} else "limit"
+    )
 
 
 @pytest.mark.parametrize(

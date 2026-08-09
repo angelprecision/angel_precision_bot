@@ -99,6 +99,8 @@ class _FakeOSM:
             "status": "EXIT_REQUESTED",
             "position_id": kwargs.get("position_id"),
             "qty": kwargs.get("qty"),
+            "contract": kwargs.get("contract"),
+            "symbol": kwargs.get("symbol"),
             "execution_mode": kwargs.get("execution_mode"),
             "meta": {},
         }
@@ -1168,6 +1170,29 @@ def test_submit_wrapper_rejects_non_exact_integer_decision_quantity_before_reser
     generation_read.assert_not_called()
     assert engine.order_state_machine.active_order is None
     assert pos.pending_exit_local_order_id == ""
+    assert pos.exit_in_flight is False
+
+
+def test_malformed_quantity_does_not_make_open_position_inert_then_valid_retry_submits(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-valid-retry",
+    })
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    assert wrapped(engine, pos, _decision(quantity="1")) is False
+    assert pos.exit_in_flight is False
+    assert wrapped(engine, pos, _decision(quantity=1)) is True
+    assert callback.call_count == 1
 
 
 def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generation_claims_table, monkeypatch) -> None:
@@ -1354,15 +1379,19 @@ def test_submit_wrapper_claim_loser_keeps_shared_reserved_exit_intent(
     monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
     callback = MagicMock()
     wrapped = guard.wrap_submit(_invoke_submit_callback)
-    pos = _pos()
-    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
-
     reserved_local_id = "exit-local-shared"
+    pos = _pos(pending_exit_local_order_id=reserved_local_id)
+    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
     engine.order_state_machine.active_order = {
+        "client_id": pos.client_id,
         "local_order_id": reserved_local_id,
         "broker_order_id": "",
+        "kind": "EXIT",
         "status": "EXIT_REQUESTED",
         "position_id": pos.position_id,
+        "contract": pos.option_symbol,
+        "qty": 1,
+        "execution_mode": "live",
         "meta": {},
     }
     engine.order_state_machine.active_orders_by_position[pos.position_id] = engine.order_state_machine.active_order
@@ -1536,6 +1565,80 @@ def test_submit_wrapper_active_exit_fence_hydrates_and_blocks_submit(generation_
     assert pos.pending_exit_local_order_id == "exit-local-live"
     assert pos.pending_exit_broker_order_id == "exit-broker-live"
     assert _claim_rows() == []
+
+
+def test_unsubmitted_identity_mismatch_is_retired_and_next_tick_submits(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    pos = _pos(pending_exit_local_order_id="exit-local-bad", exit_in_flight=True)
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-repaired",
+    })
+    engine = _make_submit_engine(
+        pos,
+        callback=callback,
+        active_order={
+            "client_id": pos.client_id,
+            "position_id": pos.position_id,
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "local_order_id": "exit-local-bad",
+            "broker_order_id": "",
+            "qty": 3,
+            "contract": pos.option_symbol,
+            "execution_mode": "live",
+            "meta": {},
+        },
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is False
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+    assert callback.call_count == 0
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is True
+    assert callback.call_count == 1
+
+
+def test_identity_mismatch_with_submit_evidence_stays_owned_for_reconciliation(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    pos = _pos()
+    callback = MagicMock()
+    engine = _make_submit_engine(
+        pos,
+        callback=callback,
+        active_order={
+            "client_id": pos.client_id,
+            "position_id": pos.position_id,
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "local_order_id": "exit-local-ambiguous",
+            "broker_order_id": "",
+            "qty": 3,
+            "contract": pos.option_symbol,
+            "execution_mode": "live",
+            "submitted_ts": None,
+            "meta": {"submit_intent_at": "2026-08-08T12:00:00+00:00"},
+        },
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is False
+    assert engine.order_state_machine.active_order["status"] == "EXIT_REQUESTED"
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-local-ambiguous"
+    callback.assert_not_called()
 
 
 def test_submit_wrapper_generation_advances_after_remaining_qty_changes(generation_claims_table, monkeypatch) -> None:

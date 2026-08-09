@@ -1368,6 +1368,17 @@ def _active_exit_order(engine: Any, position_id: str) -> dict | None:
     return row if isinstance(row, dict) else None
 
 
+def _exit_order_by_local_id(engine: Any, local_order_id: str) -> dict | None:
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    if osm is None or not str(local_order_id or "").strip():
+        return None
+    getter = getattr(osm, "_get_order", None) or getattr(osm, "get_order", None)
+    if not callable(getter):
+        return None
+    row = getter(str(local_order_id).strip())
+    return row if isinstance(row, dict) else None
+
+
 def _terminal_position_snapshot(pos: Any, engine: Any) -> dict | None:
     client_id = str(
         getattr(pos, "client_id", "")
@@ -1449,6 +1460,62 @@ def _mark_active_exit_owned(engine: Any, pos: Any, active_order: dict) -> None:
         pos.pending_exit_broker_order_id = str(active_order.get("broker_order_id") or "")
 
 
+def _clear_retired_exit_owner(engine: Any, pos: Any, local_order_id: str) -> None:
+    """Release only the in-memory pointer that named the retired reservation."""
+    retired_id = str(local_order_id or "").strip()
+    with engine._lock:
+        if bool(getattr(pos, "closed", False)):
+            return
+        pending_id = str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
+        if pending_id and pending_id != retired_id:
+            return
+        pos.exit_in_flight = False
+        pos.pending_exit_local_order_id = ""
+        pos.pending_exit_broker_order_id = ""
+        pos.pending_exit_action = ""
+        pos.pending_exit_reason = ""
+        pos.pending_exit_qty = 0
+
+
+def _retire_proven_unsubmitted_exit(
+    engine: Any,
+    pos: Any,
+    active_order: dict | None,
+    *,
+    reason: str,
+) -> bool:
+    """Retire only when OSM atomically proves the row never crossed submit intent."""
+    if not isinstance(active_order, dict):
+        return False
+    local_order_id = str(active_order.get("local_order_id") or "").strip()
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    retire = getattr(osm, "retire_unsubmitted_exit_intent", None) if osm is not None else None
+    if not local_order_id or not callable(retire):
+        return False
+    try:
+        retired = bool(retire(local_order_id, last_error=str(reason or "EXIT_IDENTITY_REPAIR")))
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_UNSUBMITTED_IDENTITY_REPAIR_FAILED position=%s local=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "position_id", ""),
+            local_order_id,
+            exc,
+        )
+        return False
+    if not retired:
+        return False
+    _clear_retired_exit_owner(engine, pos, local_order_id)
+    log.warning(
+        "[%s] EXIT_UNSUBMITTED_IDENTITY_REPAIRED position=%s local=%s reason=%s",
+        getattr(pos, "ticker", ""),
+        getattr(pos, "position_id", ""),
+        local_order_id,
+        reason,
+    )
+    return True
+
+
 def _remove_terminal_broker_flat(engine: Any, pos: Any, terminal: dict) -> None:
     key = _position_key(pos)
     with engine._lock:
@@ -1515,10 +1582,17 @@ def wrap_precheck(original: Callable[..., bool]) -> Callable[..., bool]:
                 active_order,
                 expected_client_id=expected_client_id,
             ):
-                try:
-                    _mark_active_exit_owned(self, pos, active_order)
-                except Exception as exc:
-                    log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
+                repaired = _retire_proven_unsubmitted_exit(
+                    self,
+                    pos,
+                    active_order,
+                    reason="EXIT_PRECHECK_IDENTITY_MISMATCH_NO_SUBMIT",
+                )
+                if not repaired:
+                    try:
+                        _mark_active_exit_owned(self, pos, active_order)
+                    except Exception as exc:
+                        log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
                 continue
 
             terminal = _terminal_position_snapshot(pos, self)
@@ -1589,9 +1663,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             reserved_exit_requires_final_fence = bool(reserved_local_order_id) or active_exit_order_blocks(
                 active_order
             )
-            if active_order_lookup_failed or (
-                reserved_local_order_id and active_order is None
-            ):
+            if active_order_lookup_failed:
                 log.critical(
                     "[%s] EXIT_DECISION_RESERVED_EXIT_IDENTITY_UNPROVEN position=%s local_order_id=%s lookup_failed=%s",
                     getattr(pos, "ticker", ""),
@@ -1600,6 +1672,36 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     active_order_lookup_failed,
                 )
                 return False
+            if reserved_local_order_id and active_order is None:
+                # Resolve the pointer itself before calling it stale.  It may
+                # name a row whose position/client identity drifted and which
+                # therefore cannot appear in the position-scoped active read.
+                try:
+                    pointed_order = _exit_order_by_local_id(self, reserved_local_order_id)
+                except Exception as exc:
+                    log.critical(
+                        "[%s] EXIT_DECISION_RESERVED_POINTER_LOOKUP_FAILED position=%s local=%s error=%s",
+                        getattr(pos, "ticker", ""),
+                        position_id,
+                        reserved_local_order_id,
+                        exc,
+                    )
+                    return False
+                if pointed_order is not None:
+                    repaired = _retire_proven_unsubmitted_exit(
+                        self,
+                        pos,
+                        pointed_order,
+                        reason="EXIT_RESERVED_POINTER_IDENTITY_MISMATCH_NO_SUBMIT",
+                    )
+                    if not repaired:
+                        _clear_retired_exit_owner(self, pos, reserved_local_order_id)
+                    return False
+                # Both durable reads succeeded with no row: this is only a
+                # stale in-memory pointer, so release it and reserve afresh.
+                _clear_retired_exit_owner(self, pos, reserved_local_order_id)
+                reserved_local_order_id = ""
+                reserved_exit_requires_final_fence = False
             if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(
                 self,
                 pos,
@@ -1607,17 +1709,25 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 expected_client_id=resolved_client,
                 expected_qty=requested_qty if _decision_should_act(decision) else None,
             ):
-                try:
-                    _mark_active_exit_owned(self, pos, active_order)
-                except Exception as exc:
-                    log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
+                repaired = _retire_proven_unsubmitted_exit(
+                    self,
+                    pos,
+                    active_order,
+                    reason="EXIT_ACTIVE_IDENTITY_MISMATCH_NO_SUBMIT",
+                )
+                if not repaired:
+                    try:
+                        _mark_active_exit_owned(self, pos, active_order)
+                    except Exception as exc:
+                        log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
                 log.warning(
-                    "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_BLOCKED position=%s local_order_id=%s broker_order_id=%s status=%s",
+                    "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_BLOCKED position=%s local_order_id=%s broker_order_id=%s status=%s repaired_no_submit=%s",
                     getattr(pos, "ticker", ""),
                     position_id,
                     active_order.get("local_order_id"),
                     active_order.get("broker_order_id"),
                     active_order.get("status"),
+                    repaired,
                 )
                 return False
 
@@ -1745,6 +1855,21 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                                 local_order_id,
                                 exc,
                             )
+                            try:
+                                _update_durable_decision_generation(
+                                    generation_key,
+                                    claim_state=_CLAIM_STATE_AMBIGUOUS,
+                                    local_order_id=local_order_id,
+                                    error_text=f"FINAL_RESERVED_EXIT_LOOKUP_FAILED:{exc}",
+                                )
+                            except Exception as update_exc:
+                                log.critical(
+                                    "[%s] EXIT_DECISION_FINAL_LOOKUP_RETRY_STATE_FAILED position=%s key=%s error=%s",
+                                    getattr(pos, "ticker", ""),
+                                    position_id,
+                                    generation_key,
+                                    update_exc,
+                                )
                             return False
                         if not _is_exact_reserved_exit_intent(
                             self,
@@ -1753,20 +1878,53 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             expected_client_id=resolved_client,
                             expected_qty=requested_qty,
                         ):
+                            repaired = _retire_proven_unsubmitted_exit(
+                                self,
+                                pos,
+                                active_order,
+                                reason="EXIT_FINAL_IDENTITY_MISMATCH_NO_SUBMIT",
+                            )
+                            next_claim_state = (
+                                _CLAIM_STATE_RELEASED_NO_SUBMIT
+                                if repaired
+                                else _CLAIM_STATE_AMBIGUOUS
+                            )
                             try:
-                                _mark_active_exit_owned(self, pos, active_order or {})
-                            except Exception as exc:
-                                log.debug(
-                                    "[%s] final reserved exit ownership hydration failed position=%s error=%s",
+                                _update_durable_decision_generation(
+                                    generation_key,
+                                    claim_state=next_claim_state,
+                                    local_order_id=local_order_id,
+                                    error_text=(
+                                        "FINAL_RESERVED_EXIT_RETIRED_NO_SUBMIT"
+                                        if repaired
+                                        else "FINAL_RESERVED_EXIT_IDENTITY_UNPROVEN"
+                                    ),
+                                )
+                            except Exception as update_exc:
+                                log.critical(
+                                    "[%s] EXIT_DECISION_FINAL_FENCE_RETRY_STATE_FAILED position=%s key=%s state=%s error=%s",
                                     getattr(pos, "ticker", ""),
                                     position_id,
-                                    exc,
+                                    generation_key,
+                                    next_claim_state,
+                                    update_exc,
                                 )
+                            if not repaired:
+                                try:
+                                    _mark_active_exit_owned(self, pos, active_order or {})
+                                except Exception as exc:
+                                    log.debug(
+                                        "[%s] final reserved exit ownership hydration failed position=%s error=%s",
+                                        getattr(pos, "ticker", ""),
+                                        position_id,
+                                        exc,
+                                    )
                             log.critical(
-                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s",
+                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s repaired_no_submit=%s",
                                 getattr(pos, "ticker", ""),
                                 position_id,
                                 local_order_id,
+                                repaired,
                             )
                             return False
 
