@@ -55,6 +55,7 @@ REQUIRED_SCHEMA: dict[str, frozenset[str]] = {
     # UPDATE/INSERT/SELECT statements; a missing column fails the claim path.
     "exit_decision_generation_claims": frozenset({
         "generation_key", "client_id", "position_id", "remaining_qty",
+        "requested_qty",
         "exit_generation", "decision_action", "decision_reason_code",
         "claim_state", "local_order_id", "broker_order_id", "last_error",
         "released_at", "claimed_at",

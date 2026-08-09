@@ -425,6 +425,34 @@ class TestFix5PreflightGates:
 # ══════════════════════════════════════════════════════════════════
 
 class TestFix6IntelOutcomeOnFill:
+    def test_close_callback_returns_broker_identity_after_local_persistence_gap(self):
+        """A broker-owned CLOSE_ALL result must reach the adoption seam."""
+        core, osm, _ = _make_core()
+        broker_owned_gap = {
+            "ok": False,
+            "local_order_id": "lo-close-gap-425",
+            "broker_order_id": "br-close-gap-425",
+            "status": "ERROR",
+            "error": "exit_submitted_transition_failed_after_broker_accept",
+            "split_brain": True,
+        }
+        osm.submit_exit.return_value = broker_owned_gap
+        pos = _new_position(pending_exit_local_order_id="lo-close-gap-425")
+        decision = ExitDecision(
+            action="CLOSE_ALL",
+            quantity=1,
+            reason="HARD STOP",
+            urgency="HIGH",
+            reason_code="HARD_STOP",
+            suggested_limit=1.18,
+        )
+
+        result = core._on_position_close(pos, decision)
+
+        assert result == broker_owned_gap
+        assert result["local_order_id"] == "lo-close-gap-425"
+        assert result["broker_order_id"] == "br-close-gap-425"
+
     def test_record_intel_outcome_NOT_called_on_exit_submit(self):
         """_on_position_close (exit submit, not yet filled) must NOT
         call _record_intel_outcome — P/L is estimated at submit."""

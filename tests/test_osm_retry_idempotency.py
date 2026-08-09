@@ -96,8 +96,25 @@ def mock_osm():
         submit_existing_entry     = APOrderStateMachine.submit_existing_entry
 
         # Stubs for behavior outside the unit under test
-        def _get_active_exit_order(self, pid): return None
-        def create_exit_order(self, **kw): return "L-EXIT-001"
+        def _get_active_exit_order(self, pid):
+            if self.row.get("kind") == "EXIT" and self.row.get("position_id") == pid:
+                return dict(self.row)
+            return None
+        def create_exit_order(self, **kw):
+            self.row = {
+                "local_order_id": "L-EXIT-001",
+                "client_id": self.client_id,
+                "position_id": kw["position_id"],
+                "kind": "EXIT",
+                "status": "EXIT_REQUESTED",
+                "execution_mode": kw["execution_mode"],
+                "contract": kw["contract"],
+                "qty": kw["qty"],
+                "broker_order_id": "",
+                "submitted_ts": None,
+                "meta": {},
+            }
+            return "L-EXIT-001"
         def create_entry_order(self, plan, **kw):
             self.row.update({
                 "local_order_id": "L-ENTRY-001",
@@ -127,6 +144,16 @@ def mock_osm():
             self.row["meta"].update({
                 "lifecycle_state": "SUBMITTING",
                 "submit_intent_at": "2026-07-15T09:30:00Z",
+                "broker_submit_key": key,
+                "broker_submit_payload_hash": kwargs["payload_hash"],
+                "current_owner": f"broker_submit:{key}",
+            })
+            return True
+        def persist_exit_submit_intent(self, _local_order_id, **kwargs):
+            key = kwargs["broker_submit_key"]
+            self.row["meta"].update({
+                "lifecycle_state": "SUBMITTING",
+                "submit_intent_at": "2026-08-08T12:00:00Z",
                 "broker_submit_key": key,
                 "broker_submit_payload_hash": kwargs["payload_hash"],
                 "current_owner": f"broker_submit:{key}",

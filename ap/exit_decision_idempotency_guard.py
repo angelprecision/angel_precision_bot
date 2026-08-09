@@ -107,6 +107,11 @@ def _float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _has_proven_broker_order_id(value: Any) -> bool:
+    broker_id = str(value or "").strip()
+    return bool(broker_id and broker_id.upper() != "N/A")
+
+
 # Documented deployment bounds: TTLs are at least one second and at most one
 # day; caches retain at least 128 entries and never exceed 100k entries.
 _ACTION_LEDGER_TTL = _bounded_float_env(
@@ -142,6 +147,11 @@ def _int(value: Any, default: int | None = 0) -> int | None:
         return int(value) if value is not None else default
     except (TypeError, ValueError):
         return default
+
+
+def _strict_positive_int(value: Any) -> int | None:
+    """Return an economic order quantity only when its identity is exact."""
+    return value if type(value) is int and value > 0 else None
 
 
 def _position_key(pos: Any) -> str:
@@ -190,6 +200,12 @@ def _execution_mode(engine: Any, pos: Any) -> str:
     ).strip().upper()
 
 
+def _runtime_execution_mode(engine: Any, pos: Any) -> str:
+    """Return the independently wired runtime mode in canonical form."""
+    mode = _execution_mode(engine, pos).strip().lower()
+    return mode if mode in {"live", "paper"} else ""
+
+
 def _durable_claim_outage_blocks_submit(engine: Any, pos: Any) -> bool:
     if _execution_mode(engine, pos) != "LIVE":
         return False
@@ -234,15 +250,45 @@ def _claim_local_order_id(pos: Any) -> str:
     return str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
 
 
-def _is_exact_reserved_exit_intent(pos: Any, active_order: dict | None) -> bool:
+def _is_exact_reserved_exit_intent(
+    engine: Any,
+    pos: Any,
+    active_order: dict | None,
+    *,
+    expected_client_id: str,
+    expected_qty: int | None = None,
+) -> bool:
+    """Prove a reserved EXIT row belongs to this exact runtime submission."""
     if not isinstance(active_order, dict):
         return False
-    if str(active_order.get("status") or "").strip().upper() != "EXIT_REQUESTED":
+    runtime_mode = _runtime_execution_mode(engine, pos)
+    durable_mode = active_order.get("execution_mode")
+    if runtime_mode not in {"live", "paper"}:
         return False
-    active_local_order_id = str(active_order.get("local_order_id") or "").strip()
-    if not active_local_order_id or active_local_order_id != _claim_local_order_id(pos):
+    if durable_mode not in {"live", "paper"} or durable_mode != runtime_mode:
         return False
-    if str(active_order.get("broker_order_id") or "").strip():
+    if active_order.get("kind") != "EXIT":
+        return False
+    if active_order.get("status") != "EXIT_REQUESTED":
+        return False
+    expected_client_id = str(expected_client_id or "")
+    if not expected_client_id or active_order.get("client_id") != expected_client_id:
+        return False
+    position_id = str(getattr(pos, "position_id", "") or "")
+    if not position_id or str(active_order.get("position_id") or "") != position_id:
+        return False
+    reserved_local_order_id = _claim_local_order_id(pos)
+    if (
+        not reserved_local_order_id
+        or active_order.get("local_order_id") != reserved_local_order_id
+    ):
+        return False
+    if active_order.get("broker_order_id") not in (None, ""):
+        return False
+    durable_qty = _int(active_order.get("qty"), 0) or 0
+    if durable_qty <= 0:
+        return False
+    if expected_qty is not None and durable_qty != expected_qty:
         return False
     if bool(getattr(pos, "exit_in_flight", False)):
         return False
@@ -255,7 +301,10 @@ def _ensure_local_exit_intent_row(
     *,
     generation_key: str,
     exit_generation: int,
+    requested_qty: int,
 ) -> str:
+    # A pending id is only a lookup pointer. wrap_submit revalidates the
+    # durable row immediately before the broker callback.
     local_order_id = _claim_local_order_id(pos)
     if local_order_id:
         return local_order_id
@@ -268,14 +317,14 @@ def _ensure_local_exit_intent_row(
     contract = str(getattr(pos, "option_symbol", "") or "").strip()
     symbol = str(getattr(pos, "ticker", "") or "").strip()
     direction = str(getattr(pos, "side", "") or "").strip()
-    qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
+    qty = _strict_positive_int(requested_qty)
     execution_mode = _execution_mode(engine, pos).lower()
     if (
         not position_id
         or not contract
         or not symbol
         or not direction
-        or qty <= 0
+        or qty is None
         or execution_mode not in {"live", "paper"}
     ):
         return ""
@@ -334,6 +383,10 @@ def _claim_durable_decision_generation(
     local_order_id: str = "",
 ) -> dict:
     """Atomically claim one actionable decision for this durable generation."""
+    requested_qty = _strict_positive_int(getattr(decision, "quantity", None))
+    if requested_qty is None:
+        raise ValueError("decision.quantity must be an exact positive integer")
+
     def _claim() -> dict:
         with conn() as c:
             row = c.execute(
@@ -348,7 +401,7 @@ def _claim_durable_decision_generation(
                 "last_error=%s "
                 "WHERE generation_key=%s AND claim_state=%s "
                 "AND claimed_at <= NOW() - (%s * INTERVAL '1 second') "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -382,6 +435,7 @@ def _claim_durable_decision_generation(
                 "client_id=%s, "
                 "position_id=%s, "
                 "remaining_qty=%s, "
+                "requested_qty=%s, "
                 "exit_generation=%s, "
                 "decision_action=%s, "
                 "decision_reason_code=%s, "
@@ -392,13 +446,14 @@ def _claim_durable_decision_generation(
                 "broker_order_id=NULL, "
                 "last_error=NULL "
                 "WHERE generation_key=%s AND claim_state=%s "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
                     client_id,
                     position_id,
                     remaining_qty,
+                    requested_qty,
                     exit_generation,
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
@@ -415,12 +470,12 @@ def _claim_durable_decision_generation(
 
             row = c.execute(
                 "INSERT INTO exit_decision_generation_claims ("
-                "generation_key, client_id, position_id, remaining_qty, "
+                "generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, "
                 "claim_state, claimed_at, released_at, local_order_id, broker_order_id, last_error"
-                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,%s,NULL,NULL) "
+                ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NULL,%s,NULL,NULL) "
                 "ON CONFLICT (generation_key) DO NOTHING "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -428,6 +483,7 @@ def _claim_durable_decision_generation(
                     client_id,
                     position_id,
                     remaining_qty,
+                    requested_qty,
                     exit_generation,
                     str(getattr(decision, "action", "") or ""),
                     str(getattr(decision, "reason_code", "") or ""),
@@ -441,7 +497,7 @@ def _claim_durable_decision_generation(
                 return claimed
 
             row = c.execute(
-                "SELECT generation_key, client_id, position_id, remaining_qty, "
+                "SELECT generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at "
                 "FROM exit_decision_generation_claims WHERE generation_key=%s LIMIT 1",
@@ -458,7 +514,7 @@ def _load_durable_decision_generation(generation_key: str) -> dict:
     def _read() -> dict:
         with conn() as c:
             row = c.execute(
-                "SELECT generation_key, client_id, position_id, remaining_qty, "
+                "SELECT generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at "
                 "FROM exit_decision_generation_claims WHERE generation_key=%s LIMIT 1",
@@ -503,7 +559,7 @@ def _acquire_stale_claim_reconciliation(generation_key: str) -> tuple[dict, str]
                 "    OR COALESCE(last_error,'') LIKE %s "
                 "    OR (COALESCE(last_error,'') LIKE %s AND claimed_at <= NOW() - (%s * INTERVAL '1 second'))"
                 "  ) "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -545,7 +601,7 @@ def _finish_stale_claim_reconciliation(
                 "WHERE generation_key=%s "
                 "  AND claim_state=%s "
                 "  AND COALESCE(last_error,'')=%s "
-                "RETURNING generation_key, client_id, position_id, remaining_qty, "
+                "RETURNING generation_key, client_id, position_id, remaining_qty, requested_qty, "
                 "exit_generation, decision_action, decision_reason_code, claim_state, "
                 "local_order_id, broker_order_id, last_error, claimed_at, released_at",
                 (
@@ -583,7 +639,7 @@ def reconcile_stale_exit_generation_claim(
     broker_order_id = str(claim.get("broker_order_id") or "").strip()
     position_id = str(claim.get("position_id") or "").strip()
     client_id = str(claim.get("client_id") or "").strip().lower()
-    expected_qty = _int(claim.get("remaining_qty"), 0) or 0
+    expected_qty = _strict_positive_int(claim.get("requested_qty"))
     runtime_osm = osm or getattr(execution_core, "order_state_machine", None) or getattr(execution_core, "osm", None)
     if runtime_osm is None:
         return _finish_stale_claim_reconciliation(
@@ -650,16 +706,6 @@ def reconcile_stale_exit_generation_claim(
             local_order_id=local_order_id,
             broker_order_id=broker_order_id,
         )
-    if expected_qty > 0 and (_int(order.get("qty"), 0) or 0) != expected_qty:
-        return _finish_stale_claim_reconciliation(
-            generation_key,
-            reconciliation_token=token,
-            claim_state=_CLAIM_STATE_AMBIGUOUS,
-            reason="RECONCILE_QTY_MISMATCH",
-            local_order_id=local_order_id,
-            broker_order_id=broker_order_id,
-        )
-
     order_meta = _claim_meta_dict(order)
     if _int(order_meta.get("exit_generation_claim"), 0) != (_int(claim.get("exit_generation"), 0) or 0):
         return _finish_stale_claim_reconciliation(
@@ -688,6 +734,25 @@ def reconcile_stale_exit_generation_claim(
             reconciliation_token=token,
             claim_state=_CLAIM_STATE_RELEASED_NO_SUBMIT,
             local_order_id=local_order_id,
+        )
+
+    if expected_qty is None:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_REQUESTED_QTY_MISSING",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+    if (_int(order.get("qty"), 0) or 0) != expected_qty:
+        return _finish_stale_claim_reconciliation(
+            generation_key,
+            reconciliation_token=token,
+            claim_state=_CLAIM_STATE_AMBIGUOUS,
+            reason="RECONCILE_QTY_MISMATCH",
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
         )
 
     if (
@@ -816,21 +881,165 @@ def _update_durable_decision_generation(
     run_with_retry(_update)
 
 
-def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, error_text: str = "") -> None:
+def _retire_local_exit_intent_after_no_submit(engine: Any, local_order_id: str, error_text: str = "") -> bool:
     """Retire one reserved EXIT_REQUESTED row after conclusive no-submit proof."""
     local_order_id = str(local_order_id or "").strip()
     if not local_order_id:
-        return
+        return False
     osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
     if osm is None:
-        return
+        return False
     retire_intent = getattr(osm, "retire_unsubmitted_exit_intent", None)
     if not callable(retire_intent):
-        return
+        return False
     try:
-        retire_intent(local_order_id, last_error=error_text or "NO_POST_ATTEMPTED")
+        return bool(retire_intent(
+            local_order_id,
+            last_error=error_text or "NO_POST_ATTEMPTED",
+        ))
     except Exception:
-        return
+        return False
+
+
+def _exit_order_has_submit_evidence(order: dict | None) -> bool:
+    if not isinstance(order, dict):
+        return False
+    meta = _claim_meta_dict(order)
+    status = str(order.get("status") or "").strip().upper()
+    return bool(
+        _has_proven_broker_order_id(order.get("broker_order_id"))
+        or order.get("submitted_ts")
+        or str(meta.get("submit_intent_at") or "").strip()
+        or str(meta.get("broker_submit_key") or "").strip()
+        or bool(meta.get("split_brain_quarantine"))
+        or bool(meta.get("reconciliation_required"))
+        or status in {
+            "EXIT_SUBMITTED",
+            "EXIT_ACKNOWLEDGED",
+            "EXIT_PARTIAL_FILL",
+            "EXIT_FILLED",
+        }
+    )
+
+
+def _finalize_pre_callback_claim_failure(
+    engine: Any,
+    pos: Any,
+    *,
+    generation_key: str,
+    local_order_id: str,
+    reason: str,
+    active_order: dict | None = None,
+) -> str:
+    """Never leave a claimed generation behind when the callback was not entered."""
+    def _persist_broker_owned(order: dict) -> str:
+        evidenced_local_id = str(order.get("local_order_id") or "").strip()
+        if not evidenced_local_id:
+            return ""
+        raw_broker_id = str(order.get("broker_order_id") or "").strip()
+        evidenced_broker_id = raw_broker_id if _has_proven_broker_order_id(raw_broker_id) else ""
+        owned_order = dict(order)
+        owned_order["broker_order_id"] = evidenced_broker_id
+        _update_durable_decision_generation(
+            generation_key,
+            claim_state=_CLAIM_STATE_BROKER_OWNED,
+            local_order_id=evidenced_local_id,
+            broker_order_id=evidenced_broker_id,
+            error_text=reason,
+        )
+        _mark_active_exit_owned(engine, pos, owned_order)
+        return _CLAIM_STATE_BROKER_OWNED
+
+    if _exit_order_has_submit_evidence(active_order):
+        owned_state = _persist_broker_owned(active_order or {})
+        if owned_state:
+            return owned_state
+
+    # The retirement CAS is the authority for proven no-submit.  Publishing
+    # RELEASED_NO_SUBMIT before it succeeds creates a race where another
+    # worker can establish submit intent while the generation looks retryable.
+    retired = _retire_local_exit_intent_after_no_submit(
+        engine,
+        local_order_id,
+        error_text=reason,
+    )
+    if retired:
+        _update_durable_decision_generation(
+            generation_key,
+            claim_state=_CLAIM_STATE_RELEASED_NO_SUBMIT,
+            local_order_id=local_order_id,
+            error_text=reason,
+        )
+        _clear_retired_exit_owner(engine, pos, local_order_id)
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT
+
+    # Retirement refusal may mean submit evidence appeared after the first
+    # snapshot.  Re-read both the reserved row and the position-scoped active
+    # row, and bind local/broker identity from one evidenced row only.
+    fresh_orders: list[dict] = []
+    try:
+        reserved_order = _exit_order_by_local_id(engine, local_order_id)
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_PRE_CALLBACK_RESERVED_REREAD_FAILED position=%s local=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "position_id", ""),
+            local_order_id,
+            exc,
+        )
+        reserved_order = None
+    try:
+        position_order = _active_exit_order(
+            engine,
+            str(getattr(pos, "position_id", "") or ""),
+        )
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_PRE_CALLBACK_ACTIVE_REREAD_FAILED position=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "position_id", ""),
+            exc,
+        )
+        position_order = None
+    for order in (reserved_order, position_order):
+        if not isinstance(order, dict) or not _exit_order_has_submit_evidence(order):
+            continue
+        order_local_id = str(order.get("local_order_id") or "").strip()
+        if not order_local_id:
+            continue
+        if all(order is not candidate for candidate in fresh_orders):
+            fresh_orders.append(order)
+
+    evidenced_local_ids = {
+        str(order.get("local_order_id") or "").strip()
+        for order in fresh_orders
+    }
+    evidenced_broker_ids = {
+        str(order.get("broker_order_id") or "").strip()
+        for order in fresh_orders
+        if _has_proven_broker_order_id(order.get("broker_order_id"))
+    }
+    if len(evidenced_local_ids) == 1 and len(evidenced_broker_ids) <= 1:
+        owned_order = next(
+            (
+                order
+                for order in reversed(fresh_orders)
+                if _has_proven_broker_order_id(order.get("broker_order_id"))
+            ),
+            fresh_orders[-1] if fresh_orders else None,
+        )
+        if isinstance(owned_order, dict):
+            owned_state = _persist_broker_owned(owned_order)
+            if owned_state:
+                return owned_state
+
+    _update_durable_decision_generation(
+        generation_key,
+        claim_state=_CLAIM_STATE_AMBIGUOUS,
+        local_order_id=local_order_id,
+        error_text=f"{reason}:RETIREMENT_UNPROVEN",
+    )
+    return _CLAIM_STATE_AMBIGUOUS
 
 
 def _extract_callback_trace_identity(callback_trace: dict) -> dict:
@@ -838,6 +1047,13 @@ def _extract_callback_trace_identity(callback_trace: dict) -> dict:
     result = callback_trace.get("result")
     if not isinstance(result, dict):
         return identity
+
+    nested_order = result.get("order")
+    if isinstance(nested_order, dict):
+        # Adapters may return the canonical identity under ``order`` while
+        # keeping only ``ok``/``status`` at the top level.  Flatten identity
+        # fields only; nested status is not proof of durable persistence.
+        result = {**nested_order, **result}
 
     for source_key, target_key in (
         ("local_order_id", "local_order_id"),
@@ -847,15 +1063,319 @@ def _extract_callback_trace_identity(callback_trace: dict) -> dict:
         ("id", "broker_order_id"),
     ):
         value = result.get(source_key)
-        if value is not None and not identity.get(target_key):
-            identity[target_key] = str(value)
+        existing = str(identity.get(target_key) or "").strip()
+        if value is not None and (
+            not existing
+            or (target_key == "broker_order_id" and not _has_proven_broker_order_id(existing))
+        ):
+            identity[target_key] = str(value).strip()
     if "accepted" not in identity and "accepted" in result:
         identity["accepted"] = bool(result.get("accepted"))
+    if not identity.get("broker_submitted_ts"):
+        # Only consume fields that describe broker order acceptance/creation.
+        # A generic callback timestamp is not sufficient evidence and must
+        # not reset stale-order chronology during recovery.
+        for source_key in (
+            "broker_submitted_ts",
+            "broker_submitted_at",
+            "submitted_ts",
+            "submitted_at",
+            "accepted_ts",
+            "accepted_at",
+            "order_created_at",
+            "create_date",
+        ):
+            value = result.get(source_key)
+            if value is not None and str(value).strip():
+                identity["broker_submitted_ts"] = value
+                identity["broker_submitted_ts_source"] = source_key
+                break
     if not identity.get("raw_status"):
         raw_status = result.get("status") or result.get("raw_status") or result.get("state")
         if raw_status is not None:
             identity["raw_status"] = str(raw_status)
     return identity
+
+
+def _callback_trace_identity_values(callback_trace: dict, *, field_names: tuple[str, ...]) -> list[str]:
+    """Collect all callback/active identity candidates without choosing one."""
+    values: list[str] = []
+    sources = [callback_trace.get("identity")]
+    result = callback_trace.get("result")
+    if isinstance(result, dict):
+        nested_order = result.get("order")
+        if isinstance(nested_order, dict):
+            sources.append(nested_order)
+        sources.append(result)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for field_name in field_names:
+            value = str(source.get(field_name) or "").strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _adopt_callback_broker_ownership(
+    engine: Any,
+    pos: Any,
+    callback_trace: dict,
+) -> dict:
+    """Route callback broker identity through the OSM adoption CAS.
+
+    The external callback is the irreversible boundary.  If it returns an
+    exact broker id while the local EXIT row is still EXIT_REQUESTED, the
+    idempotency claim must remain broker-owned even when the local adoption
+    fails.  This helper deliberately has no broker submit/cancel authority.
+    """
+    identity = _extract_callback_trace_identity(callback_trace)
+    position_id = str(getattr(pos, "position_id", "") or "").strip()
+    try:
+        active_order = _active_exit_order(engine, position_id)
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_BROKER_OWNERSHIP_ACTIVE_ROW_LOOKUP_FAILED position=%s error=%s",
+            getattr(pos, "ticker", ""), position_id, exc,
+        )
+        active_order = None
+
+    callback_local_ids = _callback_trace_identity_values(
+        callback_trace,
+        field_names=("local_order_id", "exit_local_order_id"),
+    )
+    active_local_id = str((active_order or {}).get("local_order_id") or "").strip()
+    reserved_local_id = str(
+        callback_trace.get("reserved_local_order_id") or ""
+    ).strip() or _claim_local_order_id(pos)
+    pending_local_id = str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
+    local_candidates = [
+        value for value in (reserved_local_id, active_local_id, pending_local_id, *callback_local_ids)
+        if value
+    ]
+    local_order_id = (
+        reserved_local_id
+        or active_local_id
+        or pending_local_id
+        or (callback_local_ids[0] if callback_local_ids else "")
+    )
+    local_identity_conflict = bool(
+        local_order_id
+        and any(candidate != local_order_id for candidate in local_candidates)
+    )
+
+    callback_broker_ids = _callback_trace_identity_values(
+        callback_trace,
+        field_names=("broker_order_id", "order_id", "id"),
+    )
+    active_broker_id = str((active_order or {}).get("broker_order_id") or "").strip()
+    pending_broker_id = str(getattr(pos, "pending_exit_broker_order_id", "") or "").strip()
+    broker_candidates = [
+        value
+        for value in (*callback_broker_ids, active_broker_id, pending_broker_id)
+        if _has_proven_broker_order_id(value)
+    ]
+    broker_ids = list(dict.fromkeys(broker_candidates))
+    broker_order_id = broker_ids[0] if len(broker_ids) == 1 else ""
+    broker_identity_conflict = len(broker_ids) > 1
+    if not local_order_id or (not broker_order_id and not broker_identity_conflict):
+        return {
+            "attempted": False,
+            "adopted": False,
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "reason_code": "BROKER_IDENTITY_NOT_RETURNED",
+        }
+
+    if local_identity_conflict or broker_identity_conflict:
+        conflict_parts = []
+        if local_identity_conflict:
+            conflict_parts.append("local=" + ",".join(dict.fromkeys(local_candidates)))
+        if broker_identity_conflict:
+            conflict_parts.append("broker=" + ",".join(broker_ids))
+        try:
+            # Preserve the reserved owner fence even though the conflicting
+            # identity cannot be adopted.  Only a unique broker id may be
+            # copied; multiple ids remain visible as an unresolved conflict.
+            with engine._lock:
+                if not bool(getattr(pos, "closed", False)):
+                    pos.exit_in_flight = True
+                    if local_order_id:
+                        pos.pending_exit_local_order_id = local_order_id
+                    if broker_order_id:
+                        pos.pending_exit_broker_order_id = broker_order_id
+        except Exception as exc:
+            log.warning(
+                "[%s] EXIT_BROKER_OWNERSHIP_CONFLICT_OWNER_MARK_FAILED position=%s error=%s",
+                getattr(pos, "ticker", ""), position_id, exc,
+            )
+        return {
+            "attempted": True,
+            "adopted": False,
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "broker_order_ids": broker_ids,
+            "identity_conflict": True,
+            "reason_code": "EXIT_BROKER_OWNERSHIP_IDENTITY_CONFLICT",
+            "error": ";".join(conflict_parts),
+        }
+
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    adopt = getattr(osm, "adopt_broker_owned_exit_request", None) if osm else None
+    # Runtime mode is independent authority.  The durable row may confirm it,
+    # but it may not self-authorize a different mode after the broker boundary.
+    runtime_mode = _runtime_execution_mode(engine, pos)
+    durable_mode = (
+        active_order.get("execution_mode")
+        if isinstance(active_order, dict)
+        else None
+    )
+    if runtime_mode not in {"live", "paper"}:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXECUTION_MODE_IDENTITY_CONFLICT",
+            "error": "runtime_execution_mode_unproven",
+        }
+    elif durable_mode not in {"live", "paper"} or durable_mode != runtime_mode:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXECUTION_MODE_IDENTITY_CONFLICT",
+            "error": (
+                "runtime_and_durable_execution_mode_conflict:"
+                f"runtime={runtime_mode}:durable={durable_mode or 'unknown'}"
+            ),
+        }
+    else:
+        result = None
+    # Binding audit correction (Blocker 3): the adoption seam requires an
+    # exact positive integer.  Convert here so a malformed durable qty
+    # becomes an explicit durability gap rather than a silent
+    # IDENTITY_MISMATCH from the seam.
+    raw_qty = (active_order or {}).get("qty") if isinstance(active_order, dict) else None
+    expected_qty: int | None = None
+    if isinstance(raw_qty, bool):
+        expected_qty = None
+    elif isinstance(raw_qty, int) and raw_qty > 0:
+        expected_qty = raw_qty
+    else:
+        try:
+            candidate = int(str(raw_qty).strip())
+            if candidate > 0:
+                expected_qty = candidate
+        except (TypeError, ValueError):
+            expected_qty = None
+    broker_submitted_ts = identity.get("broker_submitted_ts")
+    if not broker_submitted_ts and isinstance(active_order, dict):
+        broker_submitted_ts = active_order.get("broker_submitted_ts")
+        if not broker_submitted_ts:
+            broker_submitted_ts = _claim_meta_dict(active_order).get("broker_submitted_ts")
+    if result is None and expected_qty is None:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+            "error": "durable_expected_qty_missing_or_invalid",
+        }
+    if result is None and not callable(adopt):
+        # An exact broker id crossed the external boundary, but the local
+        # adoption seam is unavailable.  Treat that as an explicit
+        # durability gap so the generation cannot be released as no-submit.
+        result = {
+            "disposition": "DB_ERROR",
+            "adopted": False,
+            "reason_code": "OSM_ADOPTION_METHOD_UNAVAILABLE",
+            "error": "osm_adoption_method_unavailable",
+        }
+    elif result is None:
+        try:
+            result = adopt(
+                local_order_id,
+                broker_order_id=broker_order_id,
+                execution_mode=runtime_mode,
+                client_id=str(
+                    getattr(pos, "client_id", "")
+                    or getattr(engine, "client_id", "")
+                    or getattr(engine, "_email", "")
+                    or ""
+                ).strip(),
+                position_id=position_id,
+                expected_qty=expected_qty,
+                broker_submitted_ts=broker_submitted_ts,
+                source="exit_decision_callback",
+            )
+        except Exception as exc:
+            result = {
+                "disposition": "DB_ERROR",
+                "adopted": False,
+                "reason_code": "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                "error": f"{type(exc).__name__}:{exc}",
+            }
+
+    if not isinstance(result, dict):
+        result = {
+            "disposition": "ADOPTED" if bool(result) else "IDENTITY_MISMATCH",
+            "adopted": bool(result),
+            "reason_code": (
+                "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+                if bool(result)
+                else "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED"
+            ),
+        }
+    result = dict(result)
+    result.update({
+        "attempted": True,
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+    })
+    adopted = bool(
+        result.get("adopted")
+        or result.get("disposition") in {
+            "ADOPTED",
+            "ALREADY_BROKER_OWNED_ACTIVE",
+        }
+    )
+    result["adopted"] = adopted
+    result["already_terminal"] = bool(
+        result.get("already_terminal")
+        or result.get("disposition") == "ALREADY_TERMINAL"
+    )
+
+    # Preserve the exact in-memory owner token after broker acceptance.  Do
+    # not overwrite a different already-durable broker identity.
+    durable_broker_id = str((active_order or {}).get("broker_order_id") or "").strip()
+    if not result["already_terminal"] and (
+        not durable_broker_id or durable_broker_id == broker_order_id
+    ):
+        try:
+            _mark_active_exit_owned(
+                engine,
+                pos,
+                {
+                    "local_order_id": local_order_id,
+                    "broker_order_id": broker_order_id,
+                },
+            )
+        except Exception as exc:
+            log.warning(
+                "[%s] EXIT_BROKER_OWNERSHIP_IN_MEMORY_MARK_FAILED position=%s error=%s",
+                getattr(pos, "ticker", ""), position_id, exc,
+            )
+    if not adopted and not result["already_terminal"]:
+        result.setdefault("reason_code", "EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED")
+        result.setdefault("error", "adoption_not_confirmed")
+        log.critical(
+            "[%s] BROKER_OWNED_DURABILITY_GAP client_id=%s position_id=%s local=%s broker=%s disposition=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "client_id", "") or getattr(engine, "client_id", ""),
+            position_id,
+            local_order_id,
+            broker_order_id,
+            result.get("disposition"),
+            result.get("error"),
+        )
+    return result
 
 
 def _classify_submit_claim_outcome(
@@ -879,7 +1399,7 @@ def _classify_submit_claim_outcome(
     active_meta = _claim_meta_dict(active_order or {})
     active_order_status = str((active_order or {}).get("status") or "").strip().upper()
     active_order_has_broker_ownership = bool(
-        str((active_order or {}).get("broker_order_id") or "").strip()
+        _has_proven_broker_order_id((active_order or {}).get("broker_order_id"))
         or (active_order or {}).get("submitted_ts")
         or str(active_meta.get("submit_intent_at") or "").strip()
         or bool(active_meta.get("split_brain_quarantine"))
@@ -899,6 +1419,8 @@ def _classify_submit_claim_outcome(
         or (active_order or {}).get("broker_order_id")
         or ""
     ).strip()
+    if not _has_proven_broker_order_id(broker_order_id):
+        broker_order_id = ""
     raw_status = str(identity.get("raw_status") or callback_trace.get("status") or "").strip().upper()
     error_text = str(callback_trace.get("error") or "")
     if not error_text and callback_trace.get("exception") is not None:
@@ -1006,6 +1528,17 @@ def _active_exit_order(engine: Any, position_id: str) -> dict | None:
     return row if isinstance(row, dict) else None
 
 
+def _exit_order_by_local_id(engine: Any, local_order_id: str) -> dict | None:
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    if osm is None or not str(local_order_id or "").strip():
+        return None
+    getter = getattr(osm, "_get_order", None) or getattr(osm, "get_order", None)
+    if not callable(getter):
+        return None
+    row = getter(str(local_order_id).strip())
+    return row if isinstance(row, dict) else None
+
+
 def _terminal_position_snapshot(pos: Any, engine: Any) -> dict | None:
     client_id = str(
         getattr(pos, "client_id", "")
@@ -1087,6 +1620,62 @@ def _mark_active_exit_owned(engine: Any, pos: Any, active_order: dict) -> None:
         pos.pending_exit_broker_order_id = str(active_order.get("broker_order_id") or "")
 
 
+def _clear_retired_exit_owner(engine: Any, pos: Any, local_order_id: str) -> None:
+    """Release only the in-memory pointer that named the retired reservation."""
+    retired_id = str(local_order_id or "").strip()
+    with engine._lock:
+        if bool(getattr(pos, "closed", False)):
+            return
+        pending_id = str(getattr(pos, "pending_exit_local_order_id", "") or "").strip()
+        if pending_id and pending_id != retired_id:
+            return
+        pos.exit_in_flight = False
+        pos.pending_exit_local_order_id = ""
+        pos.pending_exit_broker_order_id = ""
+        pos.pending_exit_action = ""
+        pos.pending_exit_reason = ""
+        pos.pending_exit_qty = 0
+
+
+def _retire_proven_unsubmitted_exit(
+    engine: Any,
+    pos: Any,
+    active_order: dict | None,
+    *,
+    reason: str,
+) -> bool:
+    """Retire only when OSM atomically proves the row never crossed submit intent."""
+    if not isinstance(active_order, dict):
+        return False
+    local_order_id = str(active_order.get("local_order_id") or "").strip()
+    osm = getattr(engine, "order_state_machine", None) or getattr(engine, "osm", None)
+    retire = getattr(osm, "retire_unsubmitted_exit_intent", None) if osm is not None else None
+    if not local_order_id or not callable(retire):
+        return False
+    try:
+        retired = bool(retire(local_order_id, last_error=str(reason or "EXIT_IDENTITY_REPAIR")))
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_UNSUBMITTED_IDENTITY_REPAIR_FAILED position=%s local=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "position_id", ""),
+            local_order_id,
+            exc,
+        )
+        return False
+    if not retired:
+        return False
+    _clear_retired_exit_owner(engine, pos, local_order_id)
+    log.warning(
+        "[%s] EXIT_UNSUBMITTED_IDENTITY_REPAIRED position=%s local=%s reason=%s",
+        getattr(pos, "ticker", ""),
+        getattr(pos, "position_id", ""),
+        local_order_id,
+        reason,
+    )
+    return True
+
+
 def _remove_terminal_broker_flat(engine: Any, pos: Any, terminal: dict) -> None:
     key = _position_key(pos)
     with engine._lock:
@@ -1141,11 +1730,29 @@ def wrap_precheck(original: Callable[..., bool]) -> Callable[..., bool]:
             except Exception as exc:
                 log.debug("early active-exit lookup unavailable position=%s error=%s", position_id, exc)
                 active_order = None
-            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(pos, active_order):
-                try:
-                    _mark_active_exit_owned(self, pos, active_order)
-                except Exception as exc:
-                    log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
+            expected_client_id = str(
+                getattr(pos, "client_id", "")
+                or getattr(self, "client_id", "")
+                or getattr(self, "_email", "")
+                or ""
+            ).strip()
+            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(
+                self,
+                pos,
+                active_order,
+                expected_client_id=expected_client_id,
+            ):
+                repaired = _retire_proven_unsubmitted_exit(
+                    self,
+                    pos,
+                    active_order,
+                    reason="EXIT_PRECHECK_IDENTITY_MISMATCH_NO_SUBMIT",
+                )
+                if not repaired:
+                    try:
+                        _mark_active_exit_owned(self, pos, active_order)
+                    except Exception as exc:
+                        log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
                 continue
 
             terminal = _terminal_position_snapshot(pos, self)
@@ -1171,6 +1778,18 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
         ).strip()
         position_id = str(getattr(pos, "position_id", "") or "")
         remaining_qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
+        raw_requested_qty = getattr(decision, "quantity", None)
+        requested_qty = _strict_positive_int(raw_requested_qty)
+        if _decision_should_act(decision) and requested_qty is None:
+            log.critical(
+                "[%s] EXIT_DECISION_QUANTITY_INVALID position=%s action=%s quantity=%r",
+                getattr(pos, "ticker", ""),
+                position_id,
+                getattr(decision, "action", ""),
+                raw_requested_qty,
+            )
+            return False
+        requested_qty = requested_qty or 0
         with self._lock:
             claims = getattr(self, "_ap_exit_submit_claims", None)
             if claims is None:
@@ -1188,9 +1807,11 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
             claims.add(key)
 
         try:
+            active_order_lookup_failed = False
             try:
                 active_order = _active_exit_order(self, position_id)
             except Exception as exc:
+                active_order_lookup_failed = True
                 log.warning(
                     "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_LOOKUP_FAILED position=%s error=%s",
                     getattr(pos, "ticker", ""),
@@ -1198,23 +1819,104 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     exc,
                 )
                 active_order = None
-            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(pos, active_order):
+            reserved_local_order_id = _claim_local_order_id(pos)
+            reserved_exit_requires_final_fence = bool(reserved_local_order_id) or active_exit_order_blocks(
+                active_order
+            )
+            if active_order_lookup_failed:
+                log.critical(
+                    "[%s] EXIT_DECISION_RESERVED_EXIT_IDENTITY_UNPROVEN position=%s local_order_id=%s lookup_failed=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                    reserved_local_order_id,
+                    active_order_lookup_failed,
+                )
+                return False
+            if reserved_local_order_id and active_order is None:
+                # Resolve the pointer itself before calling it stale.  It may
+                # name a row whose position/client identity drifted and which
+                # therefore cannot appear in the position-scoped active read.
                 try:
-                    _mark_active_exit_owned(self, pos, active_order)
+                    pointed_order = _exit_order_by_local_id(self, reserved_local_order_id)
                 except Exception as exc:
-                    log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
+                    log.critical(
+                        "[%s] EXIT_DECISION_RESERVED_POINTER_LOOKUP_FAILED position=%s local=%s error=%s",
+                        getattr(pos, "ticker", ""),
+                        position_id,
+                        reserved_local_order_id,
+                        exc,
+                    )
+                    return False
+                if pointed_order is not None:
+                    repaired = _retire_proven_unsubmitted_exit(
+                        self,
+                        pos,
+                        pointed_order,
+                        reason="EXIT_RESERVED_POINTER_IDENTITY_MISMATCH_NO_SUBMIT",
+                    )
+                    if not repaired:
+                        # CAS was refused: pointed_order is the pre-CAS snapshot
+                        # and may not carry the broker_order_id that caused the
+                        # refusal (evidence can appear between our initial fetch
+                        # and the atomic CAS).  Re-read the live row so
+                        # _mark_active_exit_owned hydrates the authoritative
+                        # broker identity rather than a potentially stale one.
+                        try:
+                            live_pointed = _exit_order_by_local_id(
+                                self, reserved_local_order_id
+                            )
+                        except Exception as _reread_exc:
+                            log.critical(
+                                "[%s] EXIT_DECISION_POST_RETIRE_REREAD_FAILED"
+                                " position=%s local=%s error=%s",
+                                getattr(pos, "ticker", ""),
+                                position_id,
+                                reserved_local_order_id,
+                                _reread_exc,
+                            )
+                            return False
+                        if live_pointed is not None and _exit_order_has_submit_evidence(
+                            live_pointed
+                        ):
+                            _mark_active_exit_owned(self, pos, live_pointed)
+                    return False
+                # Both durable reads succeeded with no row: this is only a
+                # stale in-memory pointer, so release it and reserve afresh.
+                _clear_retired_exit_owner(self, pos, reserved_local_order_id)
+                reserved_local_order_id = ""
+                reserved_exit_requires_final_fence = False
+            if active_exit_order_blocks(active_order) and not _is_exact_reserved_exit_intent(
+                self,
+                pos,
+                active_order,
+                expected_client_id=resolved_client,
+                expected_qty=requested_qty if _decision_should_act(decision) else None,
+            ):
+                repaired = _retire_proven_unsubmitted_exit(
+                    self,
+                    pos,
+                    active_order,
+                    reason="EXIT_ACTIVE_IDENTITY_MISMATCH_NO_SUBMIT",
+                )
+                if not repaired:
+                    try:
+                        _mark_active_exit_owned(self, pos, active_order)
+                    except Exception as exc:
+                        log.debug("active exit ownership hydration failed position=%s error=%s", position_id, exc)
                 log.warning(
-                    "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_BLOCKED position=%s local_order_id=%s broker_order_id=%s status=%s",
+                    "[%s] EXIT_DECISION_ACTIVE_EXIT_FENCE_BLOCKED position=%s local_order_id=%s broker_order_id=%s status=%s repaired_no_submit=%s",
                     getattr(pos, "ticker", ""),
                     position_id,
                     active_order.get("local_order_id"),
                     active_order.get("broker_order_id"),
                     active_order.get("status"),
+                    repaired,
                 )
                 return False
 
             generation_key = ""
             exit_generation = 0
+            local_order_id = ""
             if _decision_should_act(decision):
                 try:
                     durable = _durable_exit_generation(pos, resolved_client)
@@ -1240,6 +1942,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         pos,
                         generation_key=generation_key,
                         exit_generation=exit_generation,
+                        requested_qty=requested_qty,
                     )
                     if not local_order_id and _durable_claim_outage_blocks_submit(self, pos):
                         log.critical(
@@ -1309,12 +2012,101 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         )
                         return False
 
+                    # A pending local id is only a pointer. Re-read and prove
+                    # the row after durable claim acquisition, immediately
+                    # before the irreversible callback boundary.
+                    #
+                    # Binding audit correction: this fence must fire for BOTH
+                    # a reservation that existed before this invocation AND a
+                    # fresh EXIT_REQUESTED created by
+                    # ``_ensure_local_exit_intent_row`` during this invocation.
+                    # Gating on ``reserved_exit_requires_final_fence`` (which
+                    # was computed *before* intent-row creation) let the
+                    # normal fresh-submit path — no pre-existing pending id,
+                    # no blocking active EXIT — bypass the reread and reach
+                    # the broker POST after a concurrent worker terminalized,
+                    # replaced, or invalidated the row.  The existence of a
+                    # nonblank ``local_order_id`` here is sufficient.
+                    if local_order_id or reserved_exit_requires_final_fence:
+                        try:
+                            active_order = _active_exit_order(self, position_id)
+                        except Exception as exc:
+                            log.critical(
+                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_LOOKUP_FAILED position=%s local_order_id=%s error=%s",
+                                getattr(pos, "ticker", ""),
+                                position_id,
+                                local_order_id,
+                                exc,
+                            )
+                            _finalize_pre_callback_claim_failure(
+                                self,
+                                pos,
+                                generation_key=generation_key,
+                                local_order_id=local_order_id,
+                                reason=f"FINAL_RESERVED_EXIT_LOOKUP_FAILED:{exc}",
+                            )
+                            return False
+                        if not _is_exact_reserved_exit_intent(
+                            self,
+                            pos,
+                            active_order,
+                            expected_client_id=resolved_client,
+                            expected_qty=requested_qty,
+                        ):
+                            next_claim_state = _finalize_pre_callback_claim_failure(
+                                self,
+                                pos,
+                                generation_key=generation_key,
+                                local_order_id=local_order_id,
+                                reason="FINAL_RESERVED_EXIT_IDENTITY_FENCE_FAILED",
+                                active_order=active_order,
+                            )
+                            log.critical(
+                                "[%s] EXIT_DECISION_FINAL_RESERVED_EXIT_FENCE_BLOCKED position=%s local_order_id=%s claim_state=%s",
+                                getattr(pos, "ticker", ""),
+                                position_id,
+                                local_order_id,
+                                next_claim_state,
+                            )
+                            return False
+
+                    # Carry the exact durable reservation across the real
+                    # APExitEngine callback boundary.  SCALE_OUT must reuse
+                    # this local identity and this quantity; otherwise OSM
+                    # sees its own EXIT_REQUESTED row as a competing exit or
+                    # submits a quantity that is not bound to durable state.
+                    try:
+                        decision.reserved_local_order_id = str(local_order_id or "").strip()
+                        decision.reserved_exit_quantity = int(requested_qty)
+                    except Exception:
+                        log.critical(
+                            "[%s] EXIT_DECISION_RESERVED_CALLBACK_IDENTITY_UNAVAILABLE position=%s local_order_id=%s qty=%s",
+                            getattr(pos, "ticker", ""),
+                            position_id,
+                            local_order_id,
+                            requested_qty,
+                        )
+                        _finalize_pre_callback_claim_failure(
+                            self,
+                            pos,
+                            generation_key=generation_key,
+                            local_order_id=local_order_id,
+                            reason="RESERVED_CALLBACK_IDENTITY_CARRY_FAILED",
+                            active_order=active_order,
+                        )
+                        return False
+
             callback_attr = (
                 "on_scale"
                 if str(getattr(decision, "action", "") or "").upper() == "SCALE_OUT"
                 else "on_exit"
             )
             original_callback = getattr(self, callback_attr, None)
+            reserved_local_order_id = str(
+                local_order_id
+                or getattr(pos, "pending_exit_local_order_id", "")
+                or ""
+            ).strip()
             callback_trace = {
                 "entered": False,
                 "result": None,
@@ -1322,7 +2114,9 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 "identity": {},
                 "status": "",
                 "error": "",
+                "reserved_local_order_id": reserved_local_order_id,
             }
+            callback_exception = None
             if callable(original_callback):
                 with self._lock:
                     callback_lock = getattr(self, "_ap_exit_submit_callback_lock", None)
@@ -1355,10 +2149,26 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     setattr(self, callback_attr, traced_callback)
                     try:
                         callback_returned = bool(original(self, pos, decision, *args, **kwargs))
+                    except Exception as exc:
+                        callback_exception = exc
+                        callback_trace["exception"] = callback_trace.get("exception") or exc
+                        callback_returned = False
                     finally:
                         setattr(self, callback_attr, original_callback)
             else:
-                callback_returned = bool(original(self, pos, decision, *args, **kwargs))
+                try:
+                    callback_returned = bool(original(self, pos, decision, *args, **kwargs))
+                except Exception as exc:
+                    callback_exception = exc
+                    callback_trace["exception"] = exc
+                    callback_returned = False
+
+            adoption_result = _adopt_callback_broker_ownership(
+                self,
+                pos,
+                callback_trace,
+            )
+            callback_trace["adoption"] = adoption_result
 
             if generation_key:
                 claim_state, local_order_id, broker_order_id, error_text = _classify_submit_claim_outcome(
@@ -1367,6 +2177,39 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                     callback_trace,
                     callback_returned,
                 )
+                if (
+                    adoption_result.get("attempted")
+                    and (
+                        adoption_result.get("broker_order_id")
+                        or adoption_result.get("identity_conflict")
+                    )
+                    and not adoption_result.get("adopted")
+                ):
+                    # The broker id is exact acceptance evidence even when the
+                    # local CAS failed.  Never release this generation as
+                    # no-submit; preserve it for restart recovery.
+                    claim_state = _CLAIM_STATE_BROKER_OWNED
+                    local_order_id = str(
+                        adoption_result.get("local_order_id") or local_order_id or ""
+                    ).strip()
+                    if adoption_result.get("identity_conflict"):
+                        # Multiple broker ids are unresolved evidence; never
+                        # persist the classifier's precedence-selected id.
+                        broker_order_id = ""
+                    else:
+                        broker_order_id = str(
+                            adoption_result.get("broker_order_id") or broker_order_id or ""
+                        ).strip()
+                    ownership_error_prefix = (
+                        "BROKER_OWNED_TERMINAL:"
+                        if adoption_result.get("already_terminal")
+                        else "BROKER_OWNED_DURABILITY_GAP:"
+                    )
+                    error_text = (
+                        f"{ownership_error_prefix}"
+                        f"{adoption_result.get('reason_code') or 'adoption_failed'}"
+                        f":{adoption_result.get('error') or 'unconfirmed'}"
+                    )
                 try:
                     _update_durable_decision_generation(
                         generation_key,
@@ -1392,6 +2235,26 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         local_order_id,
                         error_text=error_text,
                     )
+            elif (
+                adoption_result.get("attempted")
+                and (
+                    adoption_result.get("broker_order_id")
+                    or adoption_result.get("identity_conflict")
+                )
+                and not adoption_result.get("adopted")
+            ):
+                # No durable generation row was available, but the callback
+                # still crossed the broker boundary.  Keep the local/in-memory
+                # owner fenced and make the gap operator-visible.
+                log.critical(
+                    "[%s] BROKER_OWNED_DURABILITY_GAP_WITHOUT_GENERATION position=%s local=%s broker=%s",
+                    getattr(pos, "ticker", ""),
+                    position_id,
+                    adoption_result.get("local_order_id"),
+                    adoption_result.get("broker_order_id"),
+                )
+            if callback_exception is not None:
+                raise callback_exception
             return callback_returned
         finally:
             with self._lock:

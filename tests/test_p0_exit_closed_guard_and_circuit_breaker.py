@@ -57,16 +57,54 @@ class _MockOSM:
     def __init__(self):
         self.client_id = "jason@example.com"
         self.transitions = []
+        self.exit_row = None
 
     def _get_active_exit_order(self, position_id):
+        if self.exit_row and self.exit_row["position_id"] == position_id:
+            return dict(self.exit_row)
+        return None
+
+    def _get_order(self, local_order_id):
+        if self.exit_row and self.exit_row["local_order_id"] == local_order_id:
+            return dict(self.exit_row)
         return None
 
     def create_exit_order(self, **kwargs):
         self.create_exit_kwargs = kwargs
+        self.exit_row = {
+            "local_order_id": "L-EXIT-001",
+            "client_id": self.client_id,
+            "position_id": kwargs["position_id"],
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "execution_mode": kwargs["execution_mode"],
+            "contract": kwargs["contract"],
+            "qty": kwargs["qty"],
+            "broker_order_id": "",
+            "submitted_ts": None,
+            "meta": {},
+        }
         return "L-EXIT-001"
+
+    def persist_exit_submit_intent(self, local_order_id, **kwargs):
+        if not self.exit_row or self.exit_row["local_order_id"] != local_order_id:
+            return False
+        key = kwargs["broker_submit_key"]
+        self.exit_row["meta"].update({
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": "2026-08-08T12:00:00+00:00",
+            "broker_submit_key": key,
+            "broker_submit_payload_hash": kwargs["payload_hash"],
+            "current_owner": f"broker_submit:{key}",
+        })
+        return True
 
     def transition(self, local_order_id, new_status, **kwargs):
         self.transitions.append((local_order_id, new_status, kwargs))
+        if self.exit_row and self.exit_row["local_order_id"] == local_order_id:
+            self.exit_row["status"] = new_status
+            if kwargs.get("broker_order_id"):
+                self.exit_row["broker_order_id"] = kwargs["broker_order_id"]
         return True
 
     def _resolve_underlying_symbol(self, *, symbol, contract):

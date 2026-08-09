@@ -80,6 +80,7 @@ def _base_order(**overrides):
         "limit_price": 1.20,
         "reserved_cost": 120.0,
         "status": "ACKNOWLEDGED",
+        "execution_mode": "paper",
         "plan_id": "plan-1",
         "signal_id": "sig-1",
         "tier": "B",

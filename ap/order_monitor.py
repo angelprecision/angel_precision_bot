@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -261,6 +262,140 @@ ALLOW_ENTRY_CANCEL_IN_WATCHDOG = os.getenv("ALLOW_ENTRY_CANCEL_IN_WATCHDOG", "1"
 ENTRY_RETRY_ENABLED = os.getenv("ENTRY_RETRY_ENABLED", "1").strip().lower() in ("1", "true", "yes")
 
 
+def _has_proven_broker_order_id(value) -> bool:
+    broker_id = str(value or "").strip()
+    return bool(broker_id and broker_id.upper() != "N/A")
+
+
+# Statuses that mean "the lookup itself did not produce broker truth".
+# ``_query_broker_order`` returns None on transport failure, missing broker
+# wiring, or an exception, so None/"" belong here rather than in any
+# vocabulary of real broker states.
+_UNPROVEN_BROKER_STATUSES = frozenset({
+    "",
+    "unknown",
+    "error",
+    "unavailable",
+    "not_found",
+    "not found",
+})
+
+# Statuses the monitor has a direct canonical OSM transition for.  These
+# will be advanced by ``_advance_from_broker_status`` on their own.
+_ACTIONABLE_BROKER_STATUSES = frozenset({
+    "pending",
+    "open",
+    "filled",
+    "partially_filled",
+    "partial_fill",
+    "partial_filled",
+    "canceled",
+    "cancelled",
+    "expired",
+    "rejected",
+})
+
+# Statuses that are recognized live broker states with no direct OSM
+# transition but that the pre-existing stale-exit machinery already handles
+# as active broker truth.  Binding audit correction (Blocker 4): these must
+# preserve stale-exit liveness on rows this PR recovered, exactly as they do
+# on ordinary rows.  Recovery provenance may not strand a legitimate working
+# exit indefinitely.
+_RECOGNIZED_ACTIVE_BROKER_STATUSES = frozenset({
+    "working",
+    "accepted",
+    "ack",
+    "acked",
+    "new",
+    "submitted",
+    "held",
+    "hold",
+    "calculated",
+    "ok",
+})
+
+
+def _is_unproven_broker_status(value) -> bool:
+    """True only when the broker status lookup produced no truth at all."""
+    return str(value or "").strip().lower() in _UNPROVEN_BROKER_STATUSES
+
+
+def _is_actionable_broker_status(value) -> bool:
+    """True when the monitor has a canonical transition for this status."""
+    status = str(value or "").strip().lower()
+    return status in _ACTIONABLE_BROKER_STATUSES
+
+
+def _is_recognized_active_broker_status(value) -> bool:
+    """True when this is a live broker state we know is active, but unmapped.
+
+    An ordinary EXIT_SUBMITTED + WORKING row already reaches the existing
+    stale-exit management path.  A #425-recovered row on the same broker
+    truth must reach the same path — recovery provenance does not destroy
+    liveness.
+    """
+    status = str(value or "").strip().lower()
+    return status in _RECOGNIZED_ACTIVE_BROKER_STATUSES
+
+
+def _coerce_meta(order) -> dict:
+    """Return an order's ``meta`` as a dict without raising on bad shapes."""
+    meta = (order or {}).get("meta")
+    if isinstance(meta, dict):
+        return meta
+    if isinstance(meta, (str, bytes, bytearray)):
+        try:
+            decoded = json.loads(meta)
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _is_broker_ownership_adopted_row(order) -> bool:
+    """True when this row's EXIT lifecycle was recovered from EXIT_REQUESTED.
+
+    The marker is written by
+    ``OrderStateMachine.adopt_broker_owned_exit_request`` and is what scopes
+    the #425 HOLD fence to the rows this PR actually owns.
+    """
+    return bool(
+        _coerce_meta(order).get("broker_ownership_adopted_from_exit_requested")
+    )
+
+
+def _broker_ownership_adopted_at(order):
+    """Return the durable adoption timestamp written at recovery, if any."""
+    return _coerce_meta(order).get("broker_ownership_adopted_at")
+
+
+def _requires_broker_owned_exit_fence(value) -> bool:
+    """HOLD predicate, applied only to rows this PR recovered.
+
+    Binding audit correction (Blocker 4): recovery provenance does not
+    destroy stale-exit liveness.  A row this PR recovered fences ONLY when
+    broker truth was not produced at all (transport failure, unknown,
+    unavailable) or when the broker returned an unrecognized string we have
+    no policy for.  Recognized live broker states such as ``working``,
+    ``accepted``, ``new``, ``held``, and ``calculated`` — which the
+    pre-existing stale-exit machinery already treats as active broker truth
+    — must reach that same path for a recovered row.  Otherwise a legitimate
+    working exit would be permanently fenced merely because #425 recovered
+    it.
+
+    This predicate is never consulted for any other row.
+    """
+    if _is_unproven_broker_status(value):
+        return True
+    if _is_actionable_broker_status(value):
+        return False
+    if _is_recognized_active_broker_status(value):
+        return False
+    # Anything else is a broker string with no policy at all — fail closed
+    # rather than pretend it authorizes cancel/reprice.
+    return True
+
+
 class APOrderMonitor:
     """
     Background stale-order monitor per client.
@@ -287,10 +422,10 @@ class APOrderMonitor:
         entry_watcher=None,
         contract_selector=None,
         alert_fn=None,
-        # PR66: "PAPER" or "LIVE". Default is "LIVE" so any call site that
-        # forgets to pass client_mode uses the strict 90s ceiling rather than
-        # the relaxed 180s paper ceiling. Missing wiring fails safe, not relaxed.
-        client_mode: str = "LIVE",
+        # PR66: "PAPER" or "LIVE". Unrelated monitor policy retains its
+        # historical LIVE fallback, while broker-owned EXIT recovery records
+        # whether a valid mode was explicitly wired by the caller.
+        client_mode: str | None = None,
         data_broker=None,
     ):
         self.client_id   = client_id
@@ -302,8 +437,13 @@ class APOrderMonitor:
         self.contract_selector = contract_selector
         self.alert_fn    = alert_fn
         self.data_broker = data_broker or getattr(broker, "data_broker", None)
+        raw_recovery_mode = str(client_mode or "").strip().lower()
+        self._broker_owned_exit_recovery_mode = (
+            raw_recovery_mode if raw_recovery_mode in {"live", "paper"} else ""
+        )
         # PR66: store mode for per-mode max-age selection.
-        # "or LIVE" guards against explicit None/empty being passed — fail safe.
+        # "or LIVE" guards against explicit None/empty being passed — preserve
+        # the legacy monitor policy without granting recovery authority.
         self.client_mode = str(client_mode or "LIVE").strip().upper()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -2238,6 +2378,165 @@ class APOrderMonitor:
                 self.client_id, local_order_id, exc,
             )
 
+    def _adopt_broker_owned_exit_request(self, order: dict) -> tuple[bool, dict]:
+        """Normalize exact broker ownership before status advancement."""
+        local_id = str(order.get("local_order_id") or "").strip()
+        broker_id = str(order.get("broker_order_id") or "").strip()
+        position_id = str(order.get("position_id") or "").strip()
+        execution_mode = str(order.get("execution_mode") or "").strip()
+        runtime_mode = str(
+            getattr(self, "_broker_owned_exit_recovery_mode", "") or ""
+        ).strip().lower()
+        try:
+            expected_qty = int(order.get("qty") or 0)
+        except (TypeError, ValueError):
+            expected_qty = 0
+        if not _has_proven_broker_order_id(broker_id):
+            return False, dict(order)
+
+        adopt = getattr(self.osm, "adopt_broker_owned_exit_request", None)
+        if not local_id or not position_id or expected_qty <= 0:
+            result = {
+                "disposition": "IDENTITY_MISMATCH",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": "local_or_position_identity_missing_or_qty_invalid",
+            }
+        elif not callable(adopt):
+            result = {
+                "disposition": "DB_ERROR",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": "osm_adoption_method_unavailable",
+            }
+        elif execution_mode not in {"live", "paper"}:
+            result = {
+                "disposition": "IDENTITY_MISMATCH",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": "execution_mode_missing_or_invalid",
+            }
+        elif not runtime_mode or runtime_mode != execution_mode:
+            result = {
+                "disposition": "IDENTITY_MISMATCH",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": (
+                    "runtime_execution_mode_unproven_or_conflict:"
+                    f"runtime={runtime_mode or 'unknown'}:durable={execution_mode}"
+                ),
+            }
+        else:
+            broker_submitted_ts = order.get("broker_submitted_ts")
+            try:
+                result = adopt(
+                    local_id,
+                    broker_order_id=broker_id,
+                    execution_mode=execution_mode,
+                    client_id=self.client_id,
+                    position_id=position_id,
+                    expected_qty=expected_qty,
+                    broker_submitted_ts=broker_submitted_ts,
+                    source="order_monitor",
+                )
+            except Exception as exc:
+                result = {
+                    "disposition": "DB_ERROR",
+                    "adopted": False,
+                    "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                    "error": f"{type(exc).__name__}:{exc}",
+                }
+
+        if not isinstance(result, dict):
+            result = {
+                "disposition": "ADOPTED" if bool(result) else "IDENTITY_MISMATCH",
+                "adopted": bool(result),
+            }
+        result = dict(result)
+        adopted = bool(
+            result.get("adopted")
+            or result.get("disposition") in {
+                "ADOPTED",
+                "ALREADY_BROKER_OWNED_ACTIVE",
+            }
+        )
+        if result.get("already_terminal") or result.get("disposition") == "ALREADY_TERMINAL":
+            self._emit_order_event(
+                local_order_id=local_id,
+                stage="order_monitor",
+                decision="CONFIRMED",
+                reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_TERMINAL",
+                explanation=(
+                    "The exact broker-owned EXIT row is already terminal; stopping "
+                    "recovery without replaying broker polling or fill side effects."
+                ),
+                contract=order.get("contract") or order.get("symbol"),
+                position_id=position_id,
+                inputs={
+                    "execution_mode": execution_mode,
+                    "broker_order_id": broker_id,
+                    "source": "order_monitor",
+                },
+            )
+            return False, dict(order)
+        if adopted:
+            try:
+                refreshed = self.osm.get_order(local_id) if callable(getattr(self.osm, "get_order", None)) else None
+            except Exception:
+                refreshed = None
+            merged = dict(order)
+            if isinstance(refreshed, dict):
+                merged.update(refreshed)
+            merged["broker_order_id"] = broker_id
+            merged_status = str(merged.get("status") or "").strip().upper()
+            if not merged_status or merged_status == "EXIT_REQUESTED":
+                merged_status = str(result.get("status") or "EXIT_SUBMITTED").strip().upper()
+            merged["status"] = merged_status
+            self._emit_order_event(
+                local_order_id=local_id,
+                stage="order_monitor",
+                decision="CONFIRMED",
+                reason_code=str(
+                    result.get("reason_code")
+                    or "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+                ),
+                explanation="Exact broker ownership normalized before broker-status advancement.",
+                contract=merged.get("contract") or merged.get("symbol"),
+                position_id=position_id,
+                inputs={
+                    "previous_status": "EXIT_REQUESTED",
+                    "execution_mode": execution_mode,
+                    "broker_order_id": broker_id,
+                    "source": "order_monitor",
+                },
+            )
+            return True, merged
+
+        self._emit_order_event(
+            local_order_id=local_id,
+            stage="order_monitor",
+            decision="ALERT",
+            reason_code="BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+            explanation=(
+                "Broker ownership is present but durable adoption could not be "
+                "proven; no status advancement, cancel, or replacement is allowed."
+            ),
+            contract=order.get("contract") or order.get("symbol"),
+            position_id=position_id,
+            inputs={
+                "execution_mode": execution_mode,
+                "broker_order_id": broker_id,
+                "adoption_disposition": result.get("disposition"),
+                "adoption_error": result.get("error"),
+            },
+        )
+        self._alert(
+            f"BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD | {self.client_id} | "
+            f"{order.get('contract') or order.get('symbol') or '?'} | {local_id} | "
+            f"broker={broker_id}"
+        )
+        return False, dict(order)
+
     def _check_exit_orders(self):
         orders = self._get_active_exit_orders()
         now = datetime.now(timezone.utc)
@@ -2251,16 +2550,60 @@ class APOrderMonitor:
             submitted_ts = self._parse_ts(order.get("submitted_ts"))
             contract = order.get("contract") or order.get("symbol", "?")
 
+            broker_owned_recovery = _is_broker_ownership_adopted_row(order)
+
+            if (
+                str(status or "").strip().upper() == "EXIT_REQUESTED"
+                and _has_proven_broker_order_id(broker_oid)
+            ):
+                adopted, order = self._adopt_broker_owned_exit_request(dict(order))
+                if not adopted:
+                    # A broker-owned row must remain fenced when the exact
+                    # local adoption CAS cannot be proven.  In particular,
+                    # do not run stale-exit cleanup or clear in-flight state.
+                    continue
+                broker_owned_recovery = True
+                status = order.get("status", "EXIT_SUBMITTED")
+                local_id = order.get("local_order_id", local_id)
+                broker_oid = order.get("broker_order_id", broker_oid)
+                position_id = order.get("position_id", position_id)
+                created_ts = self._parse_ts(order.get("created_ts"))
+                submitted_ts = self._parse_ts(order.get("submitted_ts"))
+                contract = order.get("contract") or order.get("symbol", "?")
+
             if not created_ts:
                 continue
 
-            ref_ts = submitted_ts or created_ts
+            # F2 interaction: adoption deliberately leaves ``submitted_ts``
+            # NULL when broker acceptance time was never proven, so a row
+            # recovered today would otherwise age off a ``created_ts`` that
+            # may be days old and be treated as instantly stale — making it
+            # cancel/reprice eligible on the very first pass after recovery.
+            # The durable adoption timestamp is the correct reference for
+            # that window.
+            adoption_ts = (
+                self._parse_ts(_broker_ownership_adopted_at(order))
+                if broker_owned_recovery
+                else None
+            )
+            ref_ts = submitted_ts or adoption_ts or created_ts
             age_secs = (now - ref_ts).total_seconds()
 
             if status in ("EXIT_REQUESTED", "EXIT_SUBMITTED"):
                 if age_secs > TIMEOUT_EXIT_PENDING:
                     broker_status = self._query_broker_order(broker_oid)
-                    if self._is_executed_status(broker_status) or self._is_terminal_failure_status(broker_status):
+                    if broker_owned_recovery and _requires_broker_owned_exit_fence(
+                        broker_status
+                    ):
+                        self._hold_on_unknown_broker_status(
+                            local_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason="stale exit broker status lookup failed or was unknown",
+                        )
+                    elif self._is_executed_status(broker_status) or self._is_terminal_failure_status(broker_status):
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_exit(
@@ -2275,7 +2618,18 @@ class APOrderMonitor:
             elif status == "EXIT_ACKNOWLEDGED":
                 if age_secs > TIMEOUT_EXIT_ACK:
                     broker_status = self._query_broker_order(broker_oid)
-                    if broker_status:
+                    if broker_owned_recovery and _requires_broker_owned_exit_fence(
+                        broker_status
+                    ):
+                        self._hold_on_unknown_broker_status(
+                            local_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason="acknowledged exit broker status lookup failed or was unknown",
+                        )
+                    elif broker_status:
                         self._advance_from_broker_status(local_id, broker_status, contract)
                     else:
                         self._handle_stale_exit(
@@ -3273,6 +3627,38 @@ class APOrderMonitor:
                     f"{contract} | {local_order_id} | broker_status={confirmed_status or 'unknown'}"
                 )
 
+    def _hold_on_unknown_broker_status(
+        self,
+        local_order_id: str,
+        status: str,
+        contract: str,
+        *,
+        position_id: Optional[str],
+        broker_order_id: Optional[str],
+        reason: str,
+    ) -> None:
+        """Hold stale exits when broker truth is unavailable or non-authoritative."""
+        self._emit_order_event(
+            local_order_id=local_order_id,
+            stage="order_monitor",
+            decision="ALERT",
+            reason_code="BROKER_STATUS_UNKNOWN",
+            explanation=(
+                f"{reason}; no cancel, clear, reopen, or replacement is allowed"
+            ),
+            contract=contract,
+            position_id=position_id,
+            inputs={
+                "status": status,
+                "broker_order_id": broker_order_id,
+                "broker_status": "unknown",
+            },
+        )
+        self._alert(
+            f"BROKER_STATUS_UNKNOWN — HOLD | {self.client_id} | {contract} | "
+            f"{local_order_id} | broker={broker_order_id or 'unknown'}"
+        )
+
     def _handle_stale_exit(
         self,
         local_order_id: str,
@@ -3319,6 +3705,22 @@ class APOrderMonitor:
 
         broker_oid = self._get_broker_order_id(local_order_id)
         broker_status = self._query_broker_order(broker_oid)
+
+        broker_owned_recovery = _is_broker_ownership_adopted_row(
+            self.osm.get_order(local_order_id) or {}
+        )
+        if broker_owned_recovery and _requires_broker_owned_exit_fence(
+            broker_status
+        ):
+            self._hold_on_unknown_broker_status(
+                local_order_id,
+                status,
+                contract,
+                position_id=position_id,
+                broker_order_id=broker_oid,
+                reason="stale exit broker status lookup failed or was unknown",
+            )
+            return
 
         if self._is_executed_status(broker_status):
             log.info(
@@ -3663,6 +4065,14 @@ class APOrderMonitor:
         s = self._normalize_broker_status(broker_status)
         order = self.osm.get_order(local_order_id) or {}
         kind = str(order.get("kind") or "").upper()
+        if (
+            kind == "EXIT"
+            and str(order.get("status") or "").strip().upper() == "EXIT_REQUESTED"
+            and _has_proven_broker_order_id(order.get("broker_order_id"))
+        ):
+            adopted, order = self._adopt_broker_owned_exit_request(dict(order))
+            if not adopted:
+                return
         if kind == "EXIT":
             mapping = {
                 "filled": "EXIT_FILLED",
@@ -3686,6 +4096,16 @@ class APOrderMonitor:
         new_status = mapping.get(s)
         if not new_status:
             log.debug(f"[{self.client_id}] Unknown broker status '{s}' — no transition")
+            return
+        current_status = str(order.get("status") or "").strip().upper()
+        if current_status == new_status:
+            log.debug(
+                "[%s] Broker status %s already represented by durable status %s | %s",
+                self.client_id,
+                s,
+                current_status,
+                local_order_id,
+            )
             return
         kwargs = {}
         if s in {"filled", "partially_filled"}:
@@ -3850,7 +4270,10 @@ class APOrderMonitor:
                 c.execute(
                     """
                     SELECT local_order_id, broker_order_id, status, symbol,
-                           contract, position_id, created_ts, submitted_ts,
+                           contract, position_id, qty, execution_mode,
+                           created_ts, submitted_ts,
+                           meta,
+                           meta->>'broker_submitted_ts' AS broker_submitted_ts,
                            fill_price,
                            fill_price AS avg_fill,
                            limit_price AS entry_price,

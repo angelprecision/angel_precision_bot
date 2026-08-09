@@ -280,6 +280,324 @@ def get_pending_orders(client_id: str) -> list[dict]:
     return run_with_retry(_fn)
 
 
+def _has_proven_broker_order_id(value) -> bool:
+    broker_id = str(value or "").strip()
+    return bool(broker_id and broker_id.upper() != "N/A")
+
+
+def _mode_source_state(value) -> tuple[str, str]:
+    """Classify one runtime mode source: ('absent'|'malformed'|'valid', mode).
+
+    ``absent`` covers ``None`` and unset; ``malformed`` covers explicitly
+    present but non-canonical (e.g. ``"LIVE"``, ``"  live  "``, unrelated
+    strings); ``valid`` returns the canonical ``live``/``paper``.
+    """
+    if value is None:
+        return ("absent", "")
+    raw = str(value)
+    stripped = raw.strip().lower()
+    if stripped in {"live", "paper"} and raw == stripped:
+        return ("valid", stripped)
+    if stripped == "":
+        return ("absent", "")
+    return ("malformed", "")
+
+
+def _resolve_runtime_execution_mode(
+    *,
+    runtime_execution_mode=None,
+    exit_engine=None,
+) -> str:
+    """Resolve runtime execution-mode authority with CONFLICT detection.
+
+    Binding audit correction: runtime authority is independent per source.
+    Conflicts and malformed-but-present values must HOLD, never resolve by
+    precedence.  Behavior:
+
+    - zero valid sources -> ``""`` (UNPROVEN / HOLD)
+    - one or more valid sources agreeing -> canonical ``live``/``paper``
+    - two or more valid sources disagreeing -> ``""`` (CONFLICT / HOLD)
+    - any explicitly-present malformed source -> ``""`` (HOLD)
+
+    Durable row mode is not part of this resolution.  Callers apply the
+    exact-equality gate between this result and the row's own
+    ``execution_mode``.
+    """
+    master_control = getattr(exit_engine, "master_control", None)
+    if master_control is not None and hasattr(
+        master_control, "runtime_execution_mode"
+    ):
+        master_control_mode = getattr(
+            master_control, "runtime_execution_mode", None
+        )
+    else:
+        master_control_mode = getattr(master_control, "mode", None)
+    candidates = (
+        runtime_execution_mode,
+        master_control_mode,
+        getattr(exit_engine, "execution_mode", None),
+    )
+    proven: set[str] = set()
+    for candidate in candidates:
+        state, mode = _mode_source_state(candidate)
+        if state == "malformed":
+            return ""
+        if state == "valid":
+            proven.add(mode)
+    if len(proven) != 1:
+        return ""
+    return next(iter(proven))
+
+
+# Backwards-compatible shim: some call sites and tests import this name.
+def _normalize_runtime_execution_mode(value) -> str:
+    state, mode = _mode_source_state(value)
+    return mode if state == "valid" else ""
+
+
+def get_broker_owned_exit_requests(client_id: str) -> list[dict]:
+    """Return only EXIT_REQUESTED rows with exact broker ownership proof.
+
+    These rows are intentionally separate from ``get_pending_orders``: an
+    ordinary EXIT_REQUESTED row is a local pre-submit intent and must never be
+    polled at the broker.  The dedicated predicate is the recovery boundary
+    for a row whose broker handoff returned an exact order id but whose local
+    status remained EXIT_REQUESTED.
+    """
+    if not client_id:
+        raise ValueError("get_broker_owned_exit_requests requires client_id")
+
+    def _fn():
+        with conn() as c:
+            rows = c.execute(
+                """
+                SELECT
+                    client_id,
+                    local_order_id,
+                    broker_order_id,
+                    position_id,
+                    kind,
+                    symbol,
+                    contract,
+                    direction,
+                    qty,
+                    limit_price,
+                    reserved_cost,
+                    status,
+                    created_ts,
+                    plan_id,
+                    signal_id,
+                    tier,
+                    score,
+                    pattern,
+                    stop_underlying,
+                    target_underlying,
+                    trigger_price,
+                    timeframe,
+                    filled_qty,
+                    fill_price,
+                    execution_mode,
+                    filled_ts,
+                    meta,
+                    meta->>'broker_submitted_ts' AS broker_submitted_ts,
+                    meta->>'canonical_signal_id' AS canonical_signal_id,
+                    meta->>'underlying_entry'    AS underlying_entry_meta,
+                    meta->>'entry_underlying'    AS entry_underlying_meta,
+                    meta->>'last_underlying_price' AS last_underlying_price_meta
+                FROM orders
+                WHERE client_id = %s
+                  AND kind = 'EXIT'
+                  AND status = 'EXIT_REQUESTED'
+                  AND execution_mode IN ('live','paper')
+                  AND broker_order_id IS NOT NULL
+                  AND BTRIM(broker_order_id) <> ''
+                  AND UPPER(BTRIM(broker_order_id)) <> 'N/A'
+                  AND qty > 0
+                ORDER BY created_ts ASC
+                """,
+                (client_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    return run_with_retry(_fn)
+
+
+def _adopt_broker_owned_exit_request(
+    osm,
+    order: dict,
+    *,
+    source: str,
+    runtime_execution_mode: str = "",
+) -> tuple[bool, dict, dict]:
+    """Adopt a broker-owned EXIT_REQUESTED row and reload durable truth."""
+    local_id = str(order.get("local_order_id") or "").strip()
+    broker_id = str(order.get("broker_order_id") or "").strip()
+    client_id = str(order.get("client_id") or "").strip()
+    position_id = str(order.get("position_id") or "").strip()
+    execution_mode = str(order.get("execution_mode") or "").strip()
+    runtime_mode = _normalize_runtime_execution_mode(runtime_execution_mode)
+    try:
+        expected_qty = int(order.get("qty") or 0)
+    except (TypeError, ValueError):
+        expected_qty = 0
+
+    if not _has_proven_broker_order_id(broker_id):
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+            "error": "broker_order_id_missing_or_placeholder",
+        }
+        return False, dict(order), result
+
+    adopt = getattr(osm, "adopt_broker_owned_exit_request", None) if osm else None
+    if not local_id or not position_id or expected_qty <= 0:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+            "error": "local_or_position_identity_missing_or_qty_invalid",
+        }
+    elif execution_mode not in {"live", "paper"}:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+            "error": "durable_execution_mode_missing_or_noncanonical",
+        }
+    elif not runtime_mode or runtime_mode != execution_mode:
+        result = {
+            "disposition": "IDENTITY_MISMATCH",
+            "adopted": False,
+            "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+            "error": (
+                "runtime_execution_mode_unproven_or_conflict:"
+                f"runtime={runtime_mode or 'unknown'}:durable={execution_mode}"
+            ),
+        }
+    elif not callable(adopt):
+        result = {
+            "disposition": "DB_ERROR",
+            "adopted": False,
+            "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+            "error": "osm_adoption_method_unavailable",
+        }
+    else:
+        try:
+            broker_submitted_ts = order.get("broker_submitted_ts")
+            result = adopt(
+                local_id,
+                broker_order_id=broker_id,
+                execution_mode=execution_mode,
+                client_id=client_id,
+                position_id=position_id,
+                expected_qty=expected_qty,
+                broker_submitted_ts=broker_submitted_ts,
+                source=source,
+            )
+        except Exception as exc:
+            result = {
+                "disposition": "DB_ERROR",
+                "adopted": False,
+                "reason_code": "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                "error": f"{type(exc).__name__}:{exc}",
+            }
+
+    if not isinstance(result, dict):
+        result = {
+            "disposition": "ADOPTED" if bool(result) else "IDENTITY_MISMATCH",
+            "adopted": bool(result),
+            "reason_code": (
+                "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+                if bool(result)
+                else "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD"
+            ),
+        }
+    result = dict(result)
+    adopted = bool(
+        result.get("adopted")
+        or result.get("disposition") in {
+            "ADOPTED",
+            "ALREADY_BROKER_OWNED_ACTIVE",
+        }
+    )
+    result["adopted"] = adopted
+
+    if result.get("already_terminal") or result.get("disposition") == "ALREADY_TERMINAL":
+        result["already_terminal"] = True
+        emit_fill_event(
+            order,
+            decision="CONFIRMED",
+            reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_TERMINAL",
+            explanation=(
+                "The exact broker-owned EXIT row is already terminal; stopping "
+                "recovery without replaying broker polling or fill side effects."
+            ),
+            result=result,
+            extra_context={"source": source, "previous_status": "EXIT_REQUESTED"},
+        )
+        return False, dict(order), result
+
+    if adopted:
+        try:
+            refreshed = osm.get_order(local_id) if callable(getattr(osm, "get_order", None)) else None
+        except Exception:
+            refreshed = None
+        merged = dict(order)
+        if isinstance(refreshed, dict):
+            merged.update(refreshed)
+        merged["broker_order_id"] = broker_id
+        merged_status = str(merged.get("status") or "").strip().upper()
+        if not merged_status or merged_status == "EXIT_REQUESTED":
+            merged_status = str(result.get("status") or "EXIT_SUBMITTED").strip().upper()
+        merged["status"] = merged_status
+        emit_fill_event(
+            merged,
+            decision="CONFIRMED",
+            reason_code=str(
+                result.get("reason_code")
+                or "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+            ),
+            explanation="Exact broker ownership normalized before canonical broker polling.",
+            result=result,
+            extra_context={"source": source, "previous_status": "EXIT_REQUESTED"},
+        )
+        return True, merged, result
+
+    result.setdefault("reason_code", "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD")
+    result.setdefault("error", "adoption_not_confirmed")
+    emit_fill_event(
+        order,
+        decision="ALERT",
+        reason_code="BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+        explanation=(
+            "Broker ownership is present but durable EXIT lifecycle adoption "
+            "could not be proven; holding without submit/cancel/fill mutation."
+        ),
+        result=result,
+        extra_context={
+            "source": source,
+            "previous_status": "EXIT_REQUESTED",
+            "execution_mode": execution_mode,
+            "position_id": position_id,
+        },
+    )
+    audit(
+        client_id,
+        "CRITICAL",
+        "BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+        {
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "position_id": position_id,
+            "execution_mode": execution_mode,
+            "reason": result.get("error"),
+            "source": source,
+        },
+    )
+    return False, dict(order), result
+
+
 # =============================================================================
 # PR #235 — Fill monitor safety helpers (inlined from prior shim).
 #
@@ -1942,6 +2260,7 @@ def process_pending_order(
     exit_engine=None,
     alert_fn=None,
     data_broker=None,
+    runtime_execution_mode=None,
 ):
     if PRODUCTION_MODE and ALLOW_LEGACY_FILL_MONITOR:
         raise RuntimeError("ALLOW_LEGACY_FILL_MONITOR=1 is forbidden in production/live mode")
@@ -1952,6 +2271,37 @@ def process_pending_order(
     local_id = order["local_order_id"]
     broker_id = order.get("broker_order_id")
     kind = (order.get("kind") or "ENTRY").upper()
+
+    requested_exit_recovery = (
+        kind == "EXIT"
+        and str(order.get("status") or "").strip().upper() == "EXIT_REQUESTED"
+    )
+    if requested_exit_recovery:
+        if not _has_proven_broker_order_id(broker_id):
+            emit_fill_event(
+                order,
+                decision="ALERT",
+                reason_code="BROKER_OWNED_EXIT_REQUEST_RECOVERY_HOLD",
+                explanation=(
+                    "Broker-less EXIT_REQUESTED remains a local intent and is "
+                    "excluded from broker polling."
+                ),
+                result={"reason": "NO_BROKER_ID"},
+            )
+            return
+        adopted, order, _adoption_result = _adopt_broker_owned_exit_request(
+            osm,
+            order,
+            source="fill_monitor",
+            runtime_execution_mode=_resolve_runtime_execution_mode(
+                runtime_execution_mode=runtime_execution_mode,
+                exit_engine=exit_engine,
+            ),
+        )
+        if not adopted:
+            return
+        broker_id = order.get("broker_order_id")
+        kind = (order.get("kind") or "EXIT").upper()
 
     result = check_order_with_broker(broker, order)
     mapped = result.get("status", "UNKNOWN")
@@ -1992,10 +2342,19 @@ def process_pending_order(
         emit_fill_event(
             order,
             decision="CONFIRMED",
+            # F7: the canonical terminal reason code must not fork.  Emitting
+            # a recovery-specific code here made post-adoption fills invisible
+            # to every existing consumer that matches on EXIT_FILLED.
+            # Provenance belongs in context, not in the taxonomy.
             reason_code="ORDER_FILLED" if kind == "ENTRY" else "EXIT_FILLED",
             explanation=f"{kind} filled via broker",
             result=result,
-            extra_context={"osm_status": mapped},
+            extra_context={
+                "osm_status": mapped,
+                "broker_owned_exit_request_recovered": bool(
+                    requested_exit_recovery
+                ),
+            },
         )
 
         ok = False
@@ -2488,6 +2847,7 @@ def fill_monitor_loop(
     client_id: str | None = None,
     alert_fn=None,
     data_broker=None,
+    runtime_execution_mode=None,
 ):
     """Fill monitor must never pause on kill switch — it reconciles reality.
 
@@ -2513,10 +2873,31 @@ def fill_monitor_loop(
         "wired" if pm else "none",
         "wired" if exit_engine else "none",
     )
-
     while not (stop_event and stop_event.is_set()):
         try:
-            pending = get_pending_orders(client_id)
+            # F3: resolve per iteration.  Resolving once before the loop meant
+            # an exit_engine/master_control whose mode was not yet hydrated at
+            # startup pinned the fence to "" for the entire process lifetime,
+            # holding every broker-owned recovery forever — reproducing the
+            # exact stranded-row condition this PR exists to close.
+            resolved_runtime_execution_mode = _resolve_runtime_execution_mode(
+                runtime_execution_mode=runtime_execution_mode,
+                exit_engine=exit_engine,
+            )
+            normal_pending = get_pending_orders(client_id)
+            recovery_pending = get_broker_owned_exit_requests(client_id)
+            pending = []
+            processed_local_order_ids = set()
+            # Prefer the dedicated recovery snapshot when a concurrent query
+            # returns the same local order in both result sets.  It is the
+            # only path allowed to normalize EXIT_REQUESTED ownership.
+            for order in recovery_pending + normal_pending:
+                local_order_id = str(order.get("local_order_id") or "").strip()
+                if local_order_id and local_order_id in processed_local_order_ids:
+                    continue
+                if local_order_id:
+                    processed_local_order_ids.add(local_order_id)
+                pending.append(order)
             for order in pending:
                 try:
                     process_pending_order(
@@ -2527,6 +2908,7 @@ def fill_monitor_loop(
                         exit_engine=exit_engine,
                         alert_fn=alert_fn,
                         data_broker=data_broker,
+                        runtime_execution_mode=resolved_runtime_execution_mode,
                     )
                 except Exception as exc:
                     log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)

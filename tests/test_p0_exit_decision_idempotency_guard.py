@@ -78,7 +78,8 @@ class _FakeEngine:
 
 
 class _FakeOSM:
-    def __init__(self, active_order=None):
+    def __init__(self, active_order=None, *, client_id=""):
+        self.client_id = client_id
         self.active_order = dict(active_order) if isinstance(active_order, dict) else active_order
         self.active_orders_by_position = {}
         if isinstance(self.active_order, dict):
@@ -91,11 +92,16 @@ class _FakeOSM:
     def create_exit_order(self, **kwargs):
         local_order_id = str(kwargs.get("local_order_id") or "exit-local-created")
         self.active_order = {
+            "client_id": self.client_id,
             "local_order_id": local_order_id,
             "broker_order_id": "",
+            "kind": "EXIT",
             "status": "EXIT_REQUESTED",
             "position_id": kwargs.get("position_id"),
             "qty": kwargs.get("qty"),
+            "contract": kwargs.get("contract"),
+            "symbol": kwargs.get("symbol"),
+            "execution_mode": kwargs.get("execution_mode"),
             "meta": {},
         }
         self.active_orders_by_position[str(kwargs.get("position_id") or "")] = self.active_order
@@ -205,6 +211,7 @@ class _FakeClaimConnection:
                         "client_id": client_id,
                         "position_id": position_id,
                         "remaining_qty": remaining_qty,
+                        "requested_qty": existing.get("requested_qty"),
                         "exit_generation": exit_generation,
                         "decision_action": decision_action,
                         "decision_reason_code": decision_reason_code,
@@ -224,6 +231,7 @@ class _FakeClaimConnection:
                 client_id,
                 position_id,
                 remaining_qty,
+                requested_qty,
                 exit_generation,
                 decision_action,
                 decision_reason_code,
@@ -239,6 +247,7 @@ class _FakeClaimConnection:
                     "client_id": client_id,
                     "position_id": position_id,
                     "remaining_qty": remaining_qty,
+                    "requested_qty": requested_qty,
                     "exit_generation": exit_generation,
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
@@ -259,6 +268,7 @@ class _FakeClaimConnection:
                 client_id,
                 position_id,
                 remaining_qty,
+                requested_qty,
                 exit_generation,
                 decision_action,
                 decision_reason_code,
@@ -272,6 +282,7 @@ class _FakeClaimConnection:
                     "client_id": client_id,
                     "position_id": position_id,
                     "remaining_qty": remaining_qty,
+                    "requested_qty": requested_qty,
                     "exit_generation": exit_generation,
                     "decision_action": decision_action,
                     "decision_reason_code": decision_reason_code,
@@ -453,10 +464,11 @@ def _make_submit_engine(pos, *, callback, active_order=None, mode="LIVE"):
     if isinstance(active_order, dict) and not active_order.get("position_id"):
         active_order = dict(active_order)
         active_order["position_id"] = pos.position_id
+    osm = _FakeOSM(active_order=active_order, client_id=pos.client_id)
     engine = SimpleNamespace(
         _lock=threading.RLock(),
         client_id=pos.client_id,
-        order_state_machine=_FakeOSM(active_order=active_order),
+        order_state_machine=osm,
         osm=None,
         on_exit=callback,
         on_scale=callback,
@@ -707,7 +719,7 @@ def test_stale_claim_reconciliation_releases_no_submit_and_allows_retry(
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-1",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
@@ -749,7 +761,7 @@ def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_c
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-1",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
@@ -808,6 +820,75 @@ def test_stale_claim_reconciliation_promotes_broker_owned_and_blocks_duplicate_c
     assert callback.call_count == 0
 
 
+def test_scale_out_stale_recovery_uses_requested_qty_not_remaining_qty(
+    generation_claims_table,
+) -> None:
+    key = "client|position-scale|4|1"
+    guard._claim_durable_decision_generation(
+        generation_key=key,
+        client_id="client",
+        position_id="position-scale",
+        remaining_qty=4,
+        exit_generation=1,
+        decision=_decision(action="SCALE_OUT", quantity=1),
+        local_order_id="exit-scale-1",
+    )
+    durable = guard._load_durable_decision_generation(key)
+    assert durable["remaining_qty"] == 4
+    assert durable["requested_qty"] == 1
+    _mark_claim_stale_ambiguous(key, local_order_id="exit-scale-1")
+    core = SimpleNamespace(
+        order_state_machine=SimpleNamespace(
+            get_order=MagicMock(side_effect=[
+                {
+                    "local_order_id": "exit-scale-1",
+                    "client_id": "client",
+                    "position_id": "position-scale",
+                    "kind": "EXIT",
+                    "status": "EXIT_REQUESTED",
+                    "qty": 1,
+                    "broker_order_id": "",
+                    "submitted_ts": None,
+                    "meta": {
+                        "submit_intent_at": "2026-08-09T12:00:00+00:00",
+                        "broker_submit_key": "exit-scale-1",
+                        "exit_generation_claim": 1,
+                    },
+                },
+                {
+                    "local_order_id": "exit-scale-1",
+                    "client_id": "client",
+                    "position_id": "position-scale",
+                    "kind": "EXIT",
+                    "status": "EXIT_SUBMITTED",
+                    "qty": 1,
+                    "broker_order_id": "broker-scale-1",
+                    "submitted_ts": "2026-08-09T12:00:01+00:00",
+                    "meta": {
+                        "submit_intent_at": "2026-08-09T12:00:00+00:00",
+                        "broker_submit_key": "exit-scale-1",
+                        "exit_generation_claim": 1,
+                    },
+                },
+            ]),
+        ),
+        reconcile_exit_broker_intent=MagicMock(return_value={
+            "disposition": "ALREADY_RECONCILED",
+            "reason_code": "BROKER_ORDER_ADOPTED",
+            "broker_order_id": "broker-scale-1",
+            "status": "EXIT_SUBMITTED",
+        }),
+    )
+
+    reconciled = guard.reconcile_stale_exit_generation_claim(key, execution_core=core)
+
+    assert reconciled["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert "RECONCILE_QTY_MISMATCH" not in str(reconciled.get("last_error") or "")
+    core.reconcile_exit_broker_intent.assert_called_once_with(
+        local_order_id="exit-scale-1"
+    )
+
+
 def test_stale_claim_reconciliation_routes_confirmed_fill_once(
     generation_claims_table,
     monkeypatch,
@@ -819,7 +900,7 @@ def test_stale_claim_reconciliation_routes_confirmed_fill_once(
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-fill",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-fill")
@@ -888,7 +969,7 @@ def test_stale_claim_reconciliation_keeps_ambiguous_when_truth_unavailable(
         position_id="position",
         remaining_qty=3,
         exit_generation=1,
-        decision=_decision(),
+        decision=_decision(quantity=3),
         local_order_id="exit-local-1",
     )
     _mark_claim_stale_ambiguous(key, local_order_id="exit-local-1")
@@ -1011,18 +1092,32 @@ def test_ledger_wrapper_is_independent_of_durable_submit_claim(monkeypatch) -> N
 
 
 def test_durable_claim_migration_is_locked_to_internal_roles() -> None:
-    migration = (
+    migration_path = (
         Path(__file__).resolve().parents[1]
         / "migrations"
         / "20260717_exit_decision_generation_claims.sql"
+    )
+    migration = migration_path.read_text()
+    requested_qty_migration = migration_path.with_name(
+        "20260809_exit_decision_generation_requested_qty.sql"
     ).read_text()
     assert "generation_key       TEXT PRIMARY KEY" in migration
+    assert "requested_qty        INTEGER CHECK (requested_qty > 0)" in migration
+    assert "ADD COLUMN IF NOT EXISTS requested_qty INTEGER CHECK (requested_qty > 0)" in migration
+    assert "ADD COLUMN IF NOT EXISTS requested_qty INTEGER" in requested_qty_migration
     assert "claim_state          TEXT NOT NULL DEFAULT 'CLAIMED'" in migration
     assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon')" in migration
     assert "IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated')" in migration
     assert "ENABLE ROW LEVEL SECURITY" in migration
     assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM anon;" in migration
     assert "REVOKE ALL ON TABLE exit_decision_generation_claims FROM authenticated;" in migration
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "p0_regression.yml"
+    ).read_text()
+    assert "20260809_exit_decision_generation_requested_qty.sql" in workflow
 
 
 def test_ledger_suppresses_closed_zero_and_inflight_positions() -> None:
@@ -1137,6 +1232,405 @@ def test_submit_wrapper_restart_durability_blocks_fresh_engine(generation_claims
     restarted_pos = _pos()
     assert wrapped(_make_submit_engine(restarted_pos, callback=callback), restarted_pos, _decision()) is False
     assert callback_count == 1
+
+
+@pytest.mark.parametrize("malformed_qty", ["1", 1.0, True, None, 0, -1])
+def test_submit_wrapper_rejects_non_exact_integer_decision_quantity_before_reservation(
+    malformed_qty,
+    monkeypatch,
+) -> None:
+    callback = MagicMock(side_effect=AssertionError("callback must not run"))
+    generation_read = MagicMock(
+        side_effect=AssertionError("generation must not be read")
+    )
+    monkeypatch.setattr(guard, "_durable_exit_generation", generation_read)
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+
+    result = guard.wrap_submit(_invoke_submit_callback)(
+        engine,
+        pos,
+        _decision(quantity=malformed_qty),
+    )
+
+    assert result is False
+    callback.assert_not_called()
+    generation_read.assert_not_called()
+    assert engine.order_state_machine.active_order is None
+    assert pos.pending_exit_local_order_id == ""
+    assert pos.exit_in_flight is False
+
+
+def test_malformed_quantity_does_not_make_open_position_inert_then_valid_retry_submits(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-valid-retry",
+    })
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    assert wrapped(engine, pos, _decision(quantity="1")) is False
+    assert pos.exit_in_flight is False
+    assert wrapped(engine, pos, _decision(quantity=1)) is True
+    assert callback.call_count == 1
+
+
+def test_final_reread_exception_releases_claim_retires_intent_and_retry_submits(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-after-reread-retry",
+    })
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    normal_lookup = engine.order_state_machine.get_active_exit_order
+    reads = 0
+
+    def fail_final_read(position_id):
+        nonlocal reads
+        reads += 1
+        if reads == 2:
+            raise RuntimeError("final read unavailable")
+        return normal_lookup(position_id)
+
+    engine.order_state_machine.get_active_exit_order = fail_final_read
+
+    assert wrapped(engine, pos, _decision()) is False
+    assert callback.call_count == 0
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+
+    engine.order_state_machine.get_active_exit_order = normal_lookup
+    assert wrapped(engine, pos, _decision()) is True
+    assert callback.call_count == 1
+
+
+def test_final_identity_mismatch_without_submit_evidence_releases_and_retries(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-after-fence-retry",
+    })
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+    real_claim = guard._claim_durable_decision_generation
+
+    def claim_then_corrupt_qty(**kwargs):
+        claimed = real_claim(**kwargs)
+        engine.order_state_machine.active_order["qty"] = 3
+        return claimed
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", claim_then_corrupt_qty)
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is False
+    assert callback.call_count == 0
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", real_claim)
+    assert wrapped(engine, pos, _decision(quantity=1)) is True
+    assert callback.call_count == 1
+
+
+def test_reserved_callback_identity_carry_failure_releases_before_callback(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    key = "client|position|3|1"
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: (key, 1))
+
+    class _RejectReservedIdentity:
+        action = "SCALE_OUT"
+        quantity = 1
+        reason_code = "TP_SCALE_OUT"
+        should_act = True
+
+        def __setattr__(self, name, value):
+            if name in {"reserved_local_order_id", "reserved_exit_quantity"}:
+                raise AttributeError("decision identity is immutable")
+            super().__setattr__(name, value)
+
+    callback = MagicMock(side_effect=AssertionError("callback must not run"))
+    pos = _pos()
+    engine = _make_submit_engine(pos, callback=callback)
+
+    result = guard.wrap_submit(_invoke_submit_callback)(
+        engine,
+        pos,
+        _RejectReservedIdentity(),
+    )
+
+    assert result is False
+    callback.assert_not_called()
+    assert _claim_rows()[0]["claim_state"] == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+
+
+def _pre_callback_order(
+    local_order_id: str,
+    *,
+    broker_order_id: str = "",
+    submit_intent_at: str = "",
+) -> dict:
+    return {
+        "client_id": "client@example.com",
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+        "kind": "EXIT",
+        "status": "EXIT_REQUESTED",
+        "position_id": "position-1",
+        "qty": 1,
+        "contract": "SPY260716P00751000",
+        "execution_mode": "live",
+        "meta": {"submit_intent_at": submit_intent_at} if submit_intent_at else {},
+    }
+
+
+def test_pre_callback_release_is_persisted_only_after_retirement_succeeds(
+    monkeypatch,
+) -> None:
+    order = _pre_callback_order("exit-A")
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order)
+    events = []
+    real_retire = engine.order_state_machine.retire_unsubmitted_exit_intent
+
+    def retire(local_order_id, *, last_error):
+        events.append(("retire", local_order_id))
+        return real_retire(local_order_id, last_error=last_error)
+
+    def update(generation_key, **kwargs):
+        events.append(("update", kwargs["claim_state"]))
+
+    engine.order_state_machine.retire_unsubmitted_exit_intent = retire
+    monkeypatch.setattr(guard, "_update_durable_decision_generation", update)
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order,
+    )
+
+    assert state == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert events == [
+        ("retire", "exit-A"),
+        ("update", guard._CLAIM_STATE_RELEASED_NO_SUBMIT),
+    ]
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+    callback.assert_not_called()
+
+
+def test_pre_callback_retirement_refusal_with_concurrent_submit_keeps_owner(
+    monkeypatch,
+) -> None:
+    order = _pre_callback_order("exit-A")
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order)
+    updates = []
+
+    def refuse_after_submit_intent(local_order_id, *, last_error):
+        assert local_order_id == "exit-A"
+        engine.order_state_machine.active_order["meta"]["submit_intent_at"] = (
+            "2026-08-09T12:00:00+00:00"
+        )
+        return False
+
+    engine.order_state_machine.retire_unsubmitted_exit_intent = refuse_after_submit_intent
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append(dict(kwargs)),
+    )
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order,
+    )
+
+    assert state == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates == [{
+        "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+        "local_order_id": "exit-A",
+        "broker_order_id": "",
+        "error_text": "FINAL_FENCE_FAILED",
+    }]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-A"
+    callback.assert_not_called()
+
+
+def test_pre_callback_replacement_owner_binds_one_coherent_active_identity(
+    monkeypatch,
+) -> None:
+    order_a = _pre_callback_order("exit-A")
+    order_b = _pre_callback_order(
+        "exit-B",
+        broker_order_id="broker-B",
+        submit_intent_at="2026-08-09T12:00:00+00:00",
+    )
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order_a)
+    updates = []
+
+    def replace_before_refusal(local_order_id, *, last_error):
+        assert local_order_id == "exit-A"
+        engine.order_state_machine.active_order = dict(order_b)
+        engine.order_state_machine.active_orders_by_position["position-1"] = (
+            engine.order_state_machine.active_order
+        )
+        return False
+
+    engine.order_state_machine.retire_unsubmitted_exit_intent = replace_before_refusal
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append(dict(kwargs)),
+    )
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order_a,
+    )
+
+    assert state == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates == [{
+        "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+        "local_order_id": "exit-B",
+        "broker_order_id": "broker-B",
+        "error_text": "FINAL_FENCE_FAILED",
+    }]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-B"
+    assert pos.pending_exit_broker_order_id == "broker-B"
+    callback.assert_not_called()
+
+
+def test_pre_callback_uncertain_retirement_stays_ambiguous_and_fenced(
+    monkeypatch,
+) -> None:
+    order = _pre_callback_order("exit-A")
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order)
+    updates = []
+    engine.order_state_machine.retire_unsubmitted_exit_intent = MagicMock(
+        side_effect=RuntimeError("retirement truth unavailable")
+    )
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append(dict(kwargs)),
+    )
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order,
+    )
+
+    assert state == guard._CLAIM_STATE_AMBIGUOUS
+    assert updates == [{
+        "claim_state": guard._CLAIM_STATE_AMBIGUOUS,
+        "local_order_id": "exit-A",
+        "error_text": "FINAL_FENCE_FAILED:RETIREMENT_UNPROVEN",
+    }]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-A"
+    callback.assert_not_called()
+
+
+def test_reserved_pointer_retirement_refusal_preserves_broker_owned_pointer(
+    monkeypatch,
+) -> None:
+    pointed_order = _pre_callback_order(
+        "exit-A",
+        broker_order_id="broker-A",
+        submit_intent_at="2026-08-09T12:00:00+00:00",
+    )
+    pointed_order["position_id"] = "drifted-position"
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=pointed_order)
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        MagicMock(side_effect=AssertionError("generation must not be claimed")),
+    )
+
+    result = guard.wrap_submit(_invoke_submit_callback)(engine, pos, _decision())
+
+    assert result is False
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-A"
+    assert pos.pending_exit_broker_order_id == "broker-A"
+    callback.assert_not_called()
 
 
 def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generation_claims_table, monkeypatch) -> None:
@@ -1275,10 +1769,14 @@ def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
         pos,
         callback=callback,
         active_order={
+            "client_id": pos.client_id,
+            "kind": "EXIT",
             "status": "EXIT_REQUESTED",
             "local_order_id": "exit-local-reserved",
             "broker_order_id": "",
             "position_id": pos.position_id,
+            "qty": _decision().quantity,
+            "execution_mode": "live",
         },
     )
 
@@ -1319,15 +1817,19 @@ def test_submit_wrapper_claim_loser_keeps_shared_reserved_exit_intent(
     monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
     callback = MagicMock()
     wrapped = guard.wrap_submit(_invoke_submit_callback)
-    pos = _pos()
-    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
-
     reserved_local_id = "exit-local-shared"
+    pos = _pos(pending_exit_local_order_id=reserved_local_id)
+    engine = _make_submit_engine(pos, callback=callback, mode="LIVE")
     engine.order_state_machine.active_order = {
+        "client_id": pos.client_id,
         "local_order_id": reserved_local_id,
         "broker_order_id": "",
+        "kind": "EXIT",
         "status": "EXIT_REQUESTED",
         "position_id": pos.position_id,
+        "contract": pos.option_symbol,
+        "qty": 1,
+        "execution_mode": "live",
         "meta": {},
     }
     engine.order_state_machine.active_orders_by_position[pos.position_id] = engine.order_state_machine.active_order
@@ -1501,6 +2003,80 @@ def test_submit_wrapper_active_exit_fence_hydrates_and_blocks_submit(generation_
     assert pos.pending_exit_local_order_id == "exit-local-live"
     assert pos.pending_exit_broker_order_id == "exit-broker-live"
     assert _claim_rows() == []
+
+
+def test_unsubmitted_identity_mismatch_is_retired_and_next_tick_submits(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    pos = _pos(pending_exit_local_order_id="exit-local-bad", exit_in_flight=True)
+    callback = MagicMock(return_value={
+        "ok": True,
+        "accepted": True,
+        "status": "EXIT_SUBMITTED",
+        "local_order_id": "exit-local-created",
+        "broker_order_id": "exit-broker-repaired",
+    })
+    engine = _make_submit_engine(
+        pos,
+        callback=callback,
+        active_order={
+            "client_id": pos.client_id,
+            "position_id": pos.position_id,
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "local_order_id": "exit-local-bad",
+            "broker_order_id": "",
+            "qty": 3,
+            "contract": pos.option_symbol,
+            "execution_mode": "live",
+            "meta": {},
+        },
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is False
+    assert engine.order_state_machine.active_order["status"] == "ERROR"
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+    assert callback.call_count == 0
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is True
+    assert callback.call_count == 1
+
+
+def test_identity_mismatch_with_submit_evidence_stays_owned_for_reconciliation(
+    generation_claims_table,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(guard, "_durable_exit_generation", lambda *_: ("client|position|3|1", 1))
+    pos = _pos()
+    callback = MagicMock()
+    engine = _make_submit_engine(
+        pos,
+        callback=callback,
+        active_order={
+            "client_id": pos.client_id,
+            "position_id": pos.position_id,
+            "kind": "EXIT",
+            "status": "EXIT_REQUESTED",
+            "local_order_id": "exit-local-ambiguous",
+            "broker_order_id": "",
+            "qty": 3,
+            "contract": pos.option_symbol,
+            "execution_mode": "live",
+            "submitted_ts": None,
+            "meta": {"submit_intent_at": "2026-08-08T12:00:00+00:00"},
+        },
+    )
+    wrapped = guard.wrap_submit(_invoke_submit_callback)
+
+    assert wrapped(engine, pos, _decision(quantity=1)) is False
+    assert engine.order_state_machine.active_order["status"] == "EXIT_REQUESTED"
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-local-ambiguous"
+    callback.assert_not_called()
 
 
 def test_submit_wrapper_generation_advances_after_remaining_qty_changes(generation_claims_table, monkeypatch) -> None:
@@ -1687,14 +2263,15 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
         if index == 1:
             first_callback_entered.set()
             assert callback_release.wait(timeout=2.0)
+        local_order_id = str(pos.pending_exit_local_order_id or "").strip()
+        assert local_order_id
         pos.exit_in_flight = True
-        pos.pending_exit_local_order_id = f"exit-local-{pos.position_id}"
         pos.pending_exit_broker_order_id = f"exit-broker-{pos.position_id}"
         return {
             "ok": True,
             "accepted": True,
             "status": "EXIT_SUBMITTED",
-            "local_order_id": f"exit-local-{pos.position_id}",
+            "local_order_id": local_order_id,
             "broker_order_id": f"exit-broker-{pos.position_id}",
         }
 
@@ -1714,6 +2291,11 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     monkeypatch.setattr(guard.threading, "Lock", fake_thread_lock)
     wrapped = guard.wrap_submit(_invoke_submit_callback)
     engine = _make_submit_engine(_pos(position_id="position-anchor"), callback=callback)
+    engine.order_state_machine.adopt_broker_owned_exit_request = lambda *args, **kwargs: {
+        "disposition": "ADOPTED",
+        "adopted": True,
+        "status": "EXIT_SUBMITTED",
+    }
     pos_a = _pos(position_id="position-a")
     pos_b = _pos(position_id="position-b")
     results = []
@@ -1742,22 +2324,23 @@ def test_submit_wrapper_different_positions_do_not_crosswire_callback_trace(
     assert sorted(results) == [("a", True), ("b", True)]
     assert callback_count == 2
     rows = _claim_rows()
-    assert rows == [
-        {
-            "generation_key": "client|position-a|3|1",
-            "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
-            "local_order_id": "exit-local-position-a",
-            "broker_order_id": "exit-broker-position-a",
-            "last_error": None,
-        },
-        {
-            "generation_key": "client|position-b|3|1",
-            "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
-            "local_order_id": "exit-local-position-b",
-            "broker_order_id": "exit-broker-position-b",
-            "last_error": None,
-        },
+    assert [row["claim_state"] for row in rows] == [
+        guard._CLAIM_STATE_BROKER_OWNED,
+        guard._CLAIM_STATE_BROKER_OWNED,
     ]
+    assert [row["generation_key"] for row in rows] == [
+        "client|position-a|3|1",
+        "client|position-b|3|1",
+    ]
+    assert [row["local_order_id"] for row in rows] == [
+        pos_a.pending_exit_local_order_id,
+        pos_b.pending_exit_local_order_id,
+    ]
+    assert [row["broker_order_id"] for row in rows] == [
+        "exit-broker-position-a",
+        "exit-broker-position-b",
+    ]
+    assert [row["last_error"] for row in rows] == [None, None]
 
 
 def test_submit_wrapper_post_submit_claim_update_failure_does_not_raise(
@@ -2041,3 +2624,141 @@ def test_durable_claim_infrastructure_failure_does_not_suppress_protective_exit(
     wrapped = guard.wrap_ledger(lambda pos, decision, client_id="": calls.append((pos, decision)) or "written")
     assert wrapped(_pos(), _decision(), client_id="client@example.com") == "written"
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# P2 Race regression: post-retire-CAS pointer reread (PR #425 amendment)
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_pointer_retirement_refusal_rereads_live_row_for_broker_hydration(
+    monkeypatch,
+) -> None:
+    """Retirement CAS refused → live reread → _mark_active_exit_owned gets real broker id.
+
+    Race:
+      1. Guard fetches pointed_order with no broker_order_id (stale snapshot).
+      2. Between fetch and CAS, broker evidence appears in the DB.
+      3. CAS is refused (evidence predicate fails).
+      4. Pre-fix: stale pointed_order has no broker_order_id →
+             _exit_order_has_submit_evidence returns False →
+             _mark_active_exit_owned is skipped →
+             pos.pending_exit_broker_order_id stays "".
+      5. Post-fix: guard re-reads live row which carries broker_order_id →
+             _exit_order_has_submit_evidence returns True →
+             _mark_active_exit_owned is called with live row →
+             pos.pending_exit_broker_order_id == "broker-race-99".
+    """
+    _reset_guard_caches()
+
+    stale_order = _pre_callback_order(
+        "exit-race",
+        broker_order_id="",          # stale: no broker evidence yet
+    )
+    stale_order["position_id"] = "drifted-position"  # causes active lookup miss
+
+    live_order = _pre_callback_order(
+        "exit-race",
+        broker_order_id="broker-race-99",   # live: evidence appeared after fetch
+        submit_intent_at="2026-08-09T12:00:00+00:00",
+    )
+    live_order["position_id"] = "drifted-position"
+
+    # Call counter: first call returns stale, subsequent calls return live.
+    call_count: list[int] = [0]
+
+    def _stateful_exit_order_by_local_id(engine: object, local_order_id: str) -> dict | None:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return dict(stale_order)   # initial fetch: pre-CAS snapshot, no broker id
+        return dict(live_order)        # reread after CAS refusal: live row with broker id
+
+    monkeypatch.setattr(guard, "_exit_order_by_local_id", _stateful_exit_order_by_local_id)
+
+    # Retirement CAS always refused: simulates broker evidence arriving after our fetch.
+    monkeypatch.setattr(
+        guard,
+        "_retire_proven_unsubmitted_exit",
+        lambda *_args, **_kwargs: False,
+    )
+
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-race",
+        pending_exit_broker_order_id="",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=None)
+
+    # Disable generation claim so the guard reaches the pointer-reread path cleanly.
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        MagicMock(side_effect=AssertionError("generation must not be claimed")),
+    )
+
+    result = guard.wrap_submit(_invoke_submit_callback)(engine, pos, _decision())
+
+    # Guard returns False (blocked — existing owner must be resolved first).
+    assert result is False
+
+    # Critical: broker identity hydrated from the LIVE reread, not the stale snapshot.
+    assert pos.pending_exit_broker_order_id == "broker-race-99", (
+        "expected live broker id after post-CAS reread; "
+        f"got {pos.pending_exit_broker_order_id!r}"
+    )
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-race"
+
+    # _exit_order_by_local_id called exactly twice: initial fetch + post-CAS reread.
+    assert call_count[0] == 2, (
+        f"expected 2 calls to _exit_order_by_local_id (fetch + reread), got {call_count[0]}"
+    )
+    callback.assert_not_called()
+
+
+def test_reserved_pointer_retirement_refusal_reread_exception_returns_false_safely(
+    monkeypatch,
+) -> None:
+    """If the post-CAS reread itself raises, guard returns False without crashing."""
+    _reset_guard_caches()
+
+    stale_order = _pre_callback_order("exit-race-err")
+    stale_order["position_id"] = "drifted-position"
+
+    call_count: list[int] = [0]
+
+    def _failing_reread(engine: object, local_order_id: str) -> dict | None:
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return dict(stale_order)
+        raise RuntimeError("db connection lost during reread")
+
+    monkeypatch.setattr(guard, "_exit_order_by_local_id", _failing_reread)
+    monkeypatch.setattr(
+        guard,
+        "_retire_proven_unsubmitted_exit",
+        lambda *_args, **_kwargs: False,
+    )
+
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-race-err",
+        pending_exit_broker_order_id="",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=None)
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        MagicMock(side_effect=AssertionError("generation must not be claimed")),
+    )
+
+    result = guard.wrap_submit(_invoke_submit_callback)(engine, pos, _decision())
+
+    assert result is False
+    # Broker id must NOT be hydrated from stale data when reread fails.
+    assert pos.pending_exit_broker_order_id == ""
+    callback.assert_not_called()

@@ -8831,6 +8831,52 @@ class APExecutionCore:
             return
 
         if self.order_state_machine and pos.position_id:
+            _decision_exit_qty = getattr(decision, "quantity", None)
+            _reserved_exit_qty = getattr(decision, "reserved_exit_quantity", None)
+            _remaining_exit_qty = getattr(pos, "quantity_remaining", None)
+            _decision_reserved_local_id = str(
+                getattr(decision, "reserved_local_order_id", "") or ""
+            ).strip()
+            _position_reserved_local_id = str(
+                getattr(pos, "pending_exit_local_order_id", "") or ""
+            ).strip()
+            _bound_local_id = _decision_reserved_local_id or _position_reserved_local_id
+            if (
+                type(_decision_exit_qty) is not int
+                or _decision_exit_qty <= 0
+                or type(_remaining_exit_qty) is not int
+                or _remaining_exit_qty <= 0
+                or _decision_exit_qty != _remaining_exit_qty
+                or (
+                    _reserved_exit_qty is not None
+                    and (
+                        type(_reserved_exit_qty) is not int
+                        or _reserved_exit_qty != _decision_exit_qty
+                    )
+                )
+                or (
+                    _decision_reserved_local_id
+                    and _position_reserved_local_id
+                    and _decision_reserved_local_id != _position_reserved_local_id
+                )
+            ):
+                log.critical(
+                    "[%s] CLOSE BLOCKED — exact reserved exit identity mismatch | decision_qty=%r reserved_qty=%r remaining_qty=%r decision_local=%s position_local=%s",
+                    pos.ticker,
+                    _decision_exit_qty,
+                    _reserved_exit_qty,
+                    _remaining_exit_qty,
+                    _decision_reserved_local_id,
+                    _position_reserved_local_id,
+                )
+                return {
+                    "ok": False,
+                    "accepted": False,
+                    "local_order_id": _bound_local_id,
+                    "broker_order_id": None,
+                    "status": "EXIT_REQUESTED" if _bound_local_id else "CLOSE_BLOCKED",
+                    "error": "reserved_exit_identity_mismatch",
+                }
             _price_str = f"${_exit_limit:.2f}" if _exit_limit is not None else "MARKET"
             log.info(
                 f"[{pos.ticker}] {'PAPER' if self.paper else 'LIVE'} CLOSE -- "
@@ -8842,11 +8888,11 @@ class APExecutionCore:
                 contract    = pos.option_symbol,
                 symbol      = pos.ticker,
                 direction   = pos.side,
-                qty         = pos.quantity_remaining,
+                qty         = _decision_exit_qty,
                 limit_price = _exit_limit,  # None = market order for IMMEDIATE exits
                 signal_id   = _sig_id or None,
                 order_type  = "market" if _exit_limit is None else "limit",
-                local_order_id=str(getattr(pos, "pending_exit_local_order_id", "") or "") or None,
+                local_order_id=_bound_local_id or None,
             )
             if exit_res["ok"]:
                 log.info(
@@ -8859,7 +8905,11 @@ class APExecutionCore:
                     f"[{pos.ticker}] Exit submit failed via OSM | "
                     f"order={exit_res['local_order_id']} error={exit_res['error']}"
                 )
-                return
+                # The broker may already own this order even though the local
+                # EXIT_SUBMITTED transition or split-brain persistence failed.
+                # Preserve the exact broker/local identity for the exit-engine
+                # guard's adoption seam; returning None would strand it.
+                return exit_res
         else:
             log.critical(
                 f"[{pos.ticker}] CLOSE BLOCKED — OSM or position_id missing; "
@@ -9027,6 +9077,7 @@ class APExecutionCore:
         # so the intelligence dataset receives the ACTUAL broker fill P/L,
         # not the estimated submit-time P/L. The signal_id is resolved
         # at finalize time from the staged dict.
+        return exit_res
 
     # ── CALLBACKS: Expire / Invalidate ────────────────────────────────────────
 
@@ -9916,12 +9967,62 @@ class APExecutionCore:
         )
         _sig_id = str(getattr(pos, "signal", {}).get("signal_id", "") or "")
 
+        def _scale_rejected(error: str, local_order_id: str = "") -> dict:
+            return {
+                "ok": False,
+                "accepted": False,
+                "local_order_id": str(local_order_id or ""),
+                "broker_order_id": None,
+                "status": "EXIT_REQUESTED" if local_order_id else "SCALE_BLOCKED",
+                "error": error,
+            }
+
         if self.order_state_machine and pos.position_id:
+            _reserved_local_order_id = str(
+                getattr(decision, "reserved_local_order_id", "") or ""
+            ).strip()
+            _reserved_scale_qty = getattr(decision, "reserved_exit_quantity", None)
+            _decision_scale_qty = getattr(decision, "quantity", None)
+            if (
+                type(_reserved_scale_qty) is not int
+                or _reserved_scale_qty <= 0
+                or type(_decision_scale_qty) is not int
+                or _decision_scale_qty <= 0
+            ):
+                log.critical(
+                    "[%s] SCALE BLOCKED — reserved exit quantity is invalid | local=%s reserved_qty=%r decision_qty=%r",
+                    pos.ticker,
+                    _reserved_local_order_id,
+                    _reserved_scale_qty,
+                    getattr(decision, "quantity", None),
+                )
+                return _scale_rejected(
+                    "reserved_exit_quantity_invalid",
+                    _reserved_local_order_id,
+                )
+            if (
+                not _reserved_local_order_id
+                or _reserved_scale_qty != _decision_scale_qty
+            ):
+                log.critical(
+                    "[%s] SCALE BLOCKED — reserved exit identity mismatch | local=%s reserved_qty=%s decision_qty=%s",
+                    pos.ticker,
+                    _reserved_local_order_id,
+                    _reserved_scale_qty,
+                    _decision_scale_qty,
+                )
+                return _scale_rejected(
+                    "reserved_exit_identity_mismatch",
+                    _reserved_local_order_id,
+                )
             _scale_bid   = getattr(pos, "current_bid", 0) or 0
             _scale_mid   = getattr(pos, "current_option_price", 0) or 0
             if _scale_bid <= 0 and _scale_mid <= 0:
                 log.critical("[%s] SCALE BLOCKED — no valid bid or mid for scale-out", pos.ticker)
-                return
+                return _scale_rejected(
+                    "scale_exit_price_unavailable",
+                    _reserved_local_order_id,
+                )
             _scale_limit = _scale_bid if _scale_bid > 0 else max(round(_scale_mid - 0.01, 2), 0.01)
             scale_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,
@@ -9929,28 +10030,30 @@ class APExecutionCore:
                 contract    = pos.option_symbol,
                 symbol      = pos.ticker,
                 direction   = pos.side,
-                qty         = decision.quantity,
+                qty         = _reserved_scale_qty,
                 limit_price = _scale_limit,
                 signal_id   = _sig_id or None,
+                local_order_id = _reserved_local_order_id,
             )
             if scale_res["ok"]:
                 log.info(
                     f"[{pos.ticker}] Scale exit submitted | "
                     f"local={scale_res['local_order_id']} broker={scale_res['broker_order_id']} "
-                    f"qty={decision.quantity} @ ${_scale_limit:.2f}"
+                    f"qty={_reserved_scale_qty} @ ${_scale_limit:.2f}"
                 )
+                return scale_res
             else:
                 log.error(
                     f"[{pos.ticker}] Scale exit failed via OSM | "
                     f"order={scale_res['local_order_id']} error={scale_res['error']}"
                 )
-                return
+                return scale_res
         else:
             log.critical(
                 f"[{pos.ticker}] SCALE BLOCKED — OSM or position_id missing; "
                 "cannot submit scale-out through production authority"
             )
-            return
+            return _scale_rejected("scale_exit_authority_unavailable")
 
     # ── BROKER HELPERS ────────────────────────────────────────────────────────
 

@@ -66,6 +66,29 @@ except ImportError:
     pg_errors = None
 from ap.utils import now_utc_iso
 
+
+def _normalize_broker_submitted_ts(value) -> str | None:
+    """Normalize an explicitly broker-sourced acceptance timestamp.
+
+    Recovery time is not broker submission time.  Callers may supply this
+    value only when the callback or another exact broker response carries it;
+    otherwise adoption deliberately leaves ``submitted_ts`` NULL so monitor
+    age calculations fall back to the original ``created_ts`` chronology.
+    """
+    if value is None or str(value).strip() == "":
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("broker_submitted_ts must be ISO-8601") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("broker_submitted_ts must be timezone-aware")
+    return parsed.astimezone(timezone.utc).isoformat()
+
 # P0 client-parity (2026-06-04): canonical_signal_id groups the same
 # market opportunity across every active eligible client account so the
 # parity ledger and audit queries can detect fanout failures.
@@ -1261,6 +1284,410 @@ class APOrderStateMachine:
         )
         return True
 
+    def adopt_broker_owned_exit_request(
+        self,
+        local_order_id: str,
+        *,
+        broker_order_id: str,
+        execution_mode: str,
+        # F5: position identity is mandatory.  A blank value has always been
+        # rejected by the identity guard below, so a permissive default only
+        # let callers construct a guaranteed IDENTITY_MISMATCH.
+        position_id: str,
+        # Binding audit correction (Blocker 3): expected_qty is required
+        # authoritative economic identity.  The signature still accepts a
+        # default so a caller that omits it does not TypeError at the seam
+        # itself, but omission — like ``None``, non-integers, or any
+        # non-positive value — deterministically returns IDENTITY_MISMATCH.
+        # Caller-side validation is not sufficient; the OSM seam must own
+        # this invariant.
+        expected_qty: int | None = None,
+        client_id: str | None = None,
+        broker_submitted_ts=None,
+        source: str = "broker_owned_exit_request_recovery",
+    ) -> dict:
+        """Adopt one exact broker-owned EXIT_REQUESTED row into EXIT_SUBMITTED.
+
+        A broker order id is ownership evidence, but it is not permission to
+        weaken the generic transition graph or to fabricate a fill.  This
+        method is the narrow recovery seam for the case where the broker
+        accepted an EXIT and the durable submit handoff did not complete.
+
+        The database CAS owns the safety decision.  It validates client, local
+        order, EXIT kind, requested status, exact execution mode, nonblank
+        position identity, exact position identity, exact expected quantity,
+        and exact-or-empty broker identity in one UPDATE.  Recovery callers
+        must use the returned disposition and must not submit or cancel on a
+        miss.  ``broker_submitted_ts`` is optional exact broker acceptance
+        evidence; when absent, adoption does not stamp recovery time into
+        ``submitted_ts`` and ``broker_ownership_adopted_at`` becomes the
+        monitor's stale-age reference.
+        """
+        local_id = str(local_order_id or "").strip()
+        broker_id = str(broker_order_id or "").strip()
+        mode = str(execution_mode or "").strip()
+        self_client_id = str(self.client_id or "").strip()
+        expected_client = str(
+            self_client_id if client_id is None else client_id
+        ).strip()
+        expected_position = str(position_id or "").strip()
+        source_text = str(source or "").strip()
+        # Binding audit correction (Blocker 3): reject anything that is not
+        # an exact positive integer.  ``bool`` inherits from ``int`` in
+        # Python and is rejected explicitly.  Strings, floats, ``None``,
+        # zero, and negatives all fail closed.
+        expected_qty_value: int | None = None
+        if isinstance(expected_qty, bool) or not isinstance(expected_qty, int):
+            expected_qty_value = None
+        elif expected_qty <= 0:
+            expected_qty_value = None
+        else:
+            expected_qty_value = int(expected_qty)
+
+        try:
+            normalized_broker_submitted_ts = _normalize_broker_submitted_ts(
+                broker_submitted_ts
+            )
+        except ValueError as exc:
+            normalized_broker_submitted_ts = None
+            invalid_submitted_ts_error = str(exc)
+        else:
+            invalid_submitted_ts_error = ""
+
+        def _result(
+            disposition: str,
+            *,
+            reason_code: str,
+            status: str = "",
+            error: str = "",
+            order: dict | None = None,
+            submitted_ts_source: str = "unproven_recovery",
+        ) -> dict:
+            adopted = disposition in {
+                "ADOPTED",
+                "ALREADY_BROKER_OWNED_ACTIVE",
+            }
+            return {
+                "disposition": disposition,
+                "adopted": adopted,
+                "already_adopted": disposition in {
+                    "ALREADY_BROKER_OWNED_ACTIVE",
+                },
+                "already_terminal": disposition == "ALREADY_TERMINAL",
+                "local_order_id": local_id,
+                "broker_order_id": broker_id,
+                "status": status,
+                "reason_code": reason_code,
+                "error": error,
+                "order": order,
+                "broker_submitted_ts": normalized_broker_submitted_ts,
+                "broker_submitted_ts_source": submitted_ts_source,
+            }
+
+        if (
+            not local_id
+            or not broker_id
+            or broker_id.upper() == "N/A"
+            or mode not in {"live", "paper"}
+            or expected_client != self_client_id
+            # F6: the CAS binds the normalized id while the authoritative
+            # reload (_get_order) binds the raw instance id.  Rather than
+            # launder a malformed identity into a money-path mutation, refuse
+            # to adopt when the instance id is not already canonical.
+            or str(self.client_id or "") != self_client_id
+            or not expected_position
+            or not source_text
+            # Binding audit correction (Blocker 3): expected_qty is now
+            # mandatory positive-integer identity.  ``None`` here means the
+            # caller omitted it or supplied a non-positive/non-integer.
+            or expected_qty_value is None
+        ):
+            return _result(
+                "IDENTITY_MISMATCH",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error="invalid_recovery_identity",
+            )
+        if invalid_submitted_ts_error:
+            return _result(
+                "IDENTITY_MISMATCH",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"invalid_broker_submitted_ts:{invalid_submitted_ts_error}",
+            )
+
+        submitted_ts_source = (
+            "broker_acceptance_evidence"
+            if normalized_broker_submitted_ts
+            else "unproven_recovery"
+        )
+        adoption_timestamp = now_utc_iso()
+        diagnostic_payload = {
+            "broker_ownership_adopted_from_exit_requested": True,
+            "broker_ownership_adoption_source": source_text,
+            "broker_ownership_adoption_broker_order_id": broker_id,
+            "broker_ownership_adoption_reason": (
+                "EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED"
+            ),
+            # This is intentionally named as recovery/adoption time.  It must
+            # never be mistaken for historical broker submission chronology.
+            "broker_ownership_adoption_timestamp": adoption_timestamp,
+            "broker_ownership_adopted_at": adoption_timestamp,
+            "broker_ownership_submitted_ts_proven": bool(
+                normalized_broker_submitted_ts
+            ),
+            "broker_ownership_submitted_ts_source": submitted_ts_source,
+            "broker_ownership_stale_age_reference": (
+                "submitted_ts"
+                if normalized_broker_submitted_ts
+                else "broker_ownership_adopted_at"
+            ),
+        }
+        if normalized_broker_submitted_ts:
+            diagnostic_payload["broker_ownership_submitted_ts"] = (
+                normalized_broker_submitted_ts
+            )
+            # F2: the recovery predicates in fill_monitor and order_monitor
+            # read ``meta->>'broker_submitted_ts'``.  Writing only the
+            # ``broker_ownership_`` prefixed key left the read and write
+            # sides permanently disjoint, so proven acceptance evidence
+            # could never survive a round trip.
+            diagnostic_payload["broker_submitted_ts"] = (
+                normalized_broker_submitted_ts
+            )
+
+        diagnostic = json.dumps(
+            diagnostic_payload
+        )
+        sql = (
+            "UPDATE orders SET "
+            "status=%s, "
+            "broker_order_id=%s, "
+            "submitted_ts=COALESCE(submitted_ts, %s::timestamptz), "
+            "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+            "updated_ts=NOW() "
+            "WHERE local_order_id=%s "
+            "  AND client_id=%s "
+            "  AND kind='EXIT' "
+            "  AND status='EXIT_REQUESTED' "
+            "  AND execution_mode=%s "
+            "  AND position_id IS NOT NULL "
+            "  AND BTRIM(position_id::text)<>'' "
+            "  AND position_id::text=%s "
+            # Binding audit correction (Blocker 3): exact quantity identity
+            # is now unconditional at the CAS.  ``qty > 0`` remains as a
+            # sanity predicate, but ``qty=%s`` cannot be omitted.  The
+            # identity guard above already refuses to run this UPDATE
+            # without a proven positive integer.
+            "  AND qty > 0 "
+            "  AND qty=%s "
+            "  AND (broker_order_id IS NULL OR BTRIM(broker_order_id)='' "
+            "       OR broker_order_id=%s)"
+        )
+        params: list = [
+            OrderStatus.EXIT_SUBMITTED,
+            broker_id,
+            normalized_broker_submitted_ts,
+            diagnostic,
+            local_id,
+            # F6: the guard above compares the *stripped* client id, so the
+            # CAS must bind the same value.  Binding raw ``self.client_id``
+            # let a whitespace-padded id pass identity validation and then
+            # match zero rows, misreported as IDENTITY_MISMATCH.
+            self_client_id,
+            mode,
+            expected_position,
+            expected_qty_value,
+            broker_id,
+        ]
+
+        try:
+            def _adopt():
+                with conn() as c:
+                    cur = c.execute(sql, tuple(params))
+                    return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+            rowcount = run_with_retry(_adopt)
+        except Exception as exc:
+            log.critical(
+                "[%s] EXIT broker ownership adoption DB failure | order=%s broker=%s error=%s",
+                self.client_id, local_id, broker_id, exc,
+            )
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"{type(exc).__name__}:{exc}",
+            )
+
+        if rowcount is None:
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error="rowcount_unconfirmed",
+            )
+        try:
+            rowcount_value = int(rowcount)
+        except (TypeError, ValueError, OverflowError):
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error="rowcount_unconfirmed",
+            )
+        if rowcount_value not in {0, 1}:
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"rowcount_unconfirmed:{rowcount_value}",
+            )
+
+        try:
+            latest = self._get_order(local_id)
+        except Exception as exc:
+            log.warning(
+                "[%s] EXIT broker ownership adoption reload failed | order=%s broker=%s error=%s",
+                self.client_id, local_id, broker_id, exc,
+            )
+            return _result(
+                "DB_ERROR",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                error=f"{type(exc).__name__}:{exc}",
+            )
+        latest_dict = dict(latest) if latest else None
+        if rowcount_value > 0:
+            if latest_dict is None:
+                return _result(
+                    "DB_ERROR",
+                    reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                    error="adoption_reload_unconfirmed",
+                )
+            adopted_order = latest_dict
+            self._emit_transition_event(
+                local_order_id=local_id,
+                old_status=OrderStatus.EXIT_REQUESTED,
+                new_status=OrderStatus.EXIT_SUBMITTED,
+                order=adopted_order,
+                decision="CONFIRMED",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
+                explanation=(
+                    "Exact broker ownership adopted after EXIT submit handoff "
+                    "left the durable row in EXIT_REQUESTED."
+                ),
+                broker_order_id=broker_id,
+                extra_inputs={
+                    "execution_mode": mode,
+                    "position_id": expected_position or adopted_order.get("position_id"),
+                    "requested_qty": adopted_order.get("qty"),
+                    "source": source_text,
+                    "broker_submitted_ts": normalized_broker_submitted_ts,
+                    "broker_submitted_ts_source": submitted_ts_source,
+                    "stale_age_reference": diagnostic_payload[
+                        "broker_ownership_stale_age_reference"
+                    ],
+                },
+            )
+            self._handle_exit_engine_hooks(
+                current=adopted_order,
+                new_status=OrderStatus.EXIT_SUBMITTED,
+                position_id=expected_position or adopted_order.get("position_id"),
+                broker_order_id=broker_id,
+                local_order_id=local_id,
+            )
+            return _result(
+                "ADOPTED",
+                reason_code="EXIT_BROKER_OWNERSHIP_ADOPTED_FROM_REQUESTED",
+                status=OrderStatus.EXIT_SUBMITTED,
+                order=adopted_order,
+                submitted_ts_source=submitted_ts_source,
+            )
+
+        if latest_dict:
+            # The reread is an authority check, not a presentation layer.
+            # Preserve durable values exactly; stripping or case-folding here
+            # could launder malformed persisted identity after the strict CAS
+            # correctly rejected it.
+            latest_status = latest_dict.get("status")
+            latest_broker_id = latest_dict.get("broker_order_id")
+            latest_client = latest_dict.get("client_id")
+            latest_mode = latest_dict.get("execution_mode")
+            latest_position = latest_dict.get("position_id")
+            latest_kind = latest_dict.get("kind")
+            try:
+                latest_qty = int(latest_dict.get("qty") or 0)
+            except (TypeError, ValueError):
+                latest_qty = 0
+            latest_identity_matches = bool(
+                latest_client == self_client_id
+                and latest_kind == "EXIT"
+                and latest_mode == mode
+                and latest_position
+                and latest_position == expected_position
+                and latest_qty > 0
+                # Binding audit correction (Blocker 3): reload identity
+                # requires exact quantity equality unconditionally.
+                and expected_qty_value is not None
+                and latest_qty == expected_qty_value
+            )
+            if (
+                latest_status in {
+                    OrderStatus.EXIT_SUBMITTED,
+                    OrderStatus.EXIT_ACKNOWLEDGED,
+                    OrderStatus.EXIT_PARTIAL_FILL,
+                }
+                and latest_broker_id == broker_id
+                and latest_identity_matches
+            ):
+                # The first successful CAS already emitted the transition and
+                # hydrated the exit owner.  A concurrent/replayed adoption is
+                # an idempotent read-only result; repeating the ownership hook
+                # would create duplicate side effects without another durable
+                # mutation.
+                return _result(
+                    "ALREADY_BROKER_OWNED_ACTIVE",
+                    reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_ADOPTED",
+                    status=latest_status,
+                    order=latest_dict,
+                    submitted_ts_source=(
+                        "existing_durable_value"
+                        if latest_dict.get("submitted_ts")
+                        else submitted_ts_source
+                    ),
+                )
+            if latest_status in OrderStatus.TERMINAL:
+                if latest_broker_id == broker_id and latest_identity_matches:
+                    return _result(
+                        "ALREADY_TERMINAL",
+                        reason_code="EXIT_BROKER_OWNERSHIP_ALREADY_TERMINAL",
+                        status=latest_status,
+                        error="order_already_terminal",
+                        order=latest_dict,
+                        submitted_ts_source=(
+                            "existing_durable_value"
+                            if latest_dict.get("submitted_ts")
+                            else submitted_ts_source
+                        ),
+                    )
+                if latest_broker_id and latest_broker_id != broker_id:
+                    return _result(
+                        "IDENTITY_MISMATCH",
+                        reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                        status=latest_status,
+                        error="terminal_broker_order_id_mismatch",
+                        order=latest_dict,
+                    )
+                return _result(
+                    "IDENTITY_MISMATCH",
+                    reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+                    status=latest_status,
+                    error="identity_or_status_mismatch",
+                    order=latest_dict,
+                )
+
+        return _result(
+            "IDENTITY_MISMATCH",
+            reason_code="EXIT_BROKER_OWNERSHIP_ADOPTION_FAILED",
+            status=str((latest_dict or {}).get("status") or ""),
+            error="identity_or_status_mismatch",
+            order=latest_dict,
+        )
+
     # =====================================================================
     # PR81 Final Amendment v2 §3 — opportunity-ledger lifecycle bridge
     # =====================================================================
@@ -1747,6 +2174,76 @@ class APOrderStateMachine:
             log.warning(
                 "[%s] retire_unsubmitted_exit_intent failed for local_order_id=%s: %s",
                 self.client_id, local_order_id, exc,
+            )
+            return False
+
+    def persist_exit_submit_intent(
+        self,
+        local_order_id: str,
+        *,
+        position_id: str,
+        execution_mode: str,
+        contract: str,
+        qty: int,
+        payload_hash: str,
+        broker_submit_key: str,
+    ) -> bool:
+        """Fence one exact EXIT_REQUESTED row before any broker POST."""
+        mode = str(execution_mode or "").strip().lower()
+        submit_key = canonical_broker_submit_key(broker_submit_key)
+        payload_hash = str(payload_hash or "").strip()
+        if (
+            mode not in {"live", "paper"}
+            or not submit_key
+            or not payload_hash
+            or not isinstance(qty, int)
+            or isinstance(qty, bool)
+            or qty <= 0
+        ):
+            return False
+        patch = __import__("json").dumps({
+            "lifecycle_state": "SUBMITTING",
+            "submit_intent_at": now_utc_iso(),
+            "broker_submit_key": submit_key,
+            "broker_submit_payload_hash": payload_hash,
+            "current_owner": f"broker_submit:{submit_key}",
+        })
+
+        def _persist():
+            with conn() as c:
+                cur = c.execute(
+                    "UPDATE orders SET "
+                    "meta=COALESCE(meta, '{}'::jsonb) || %s::jsonb, updated_ts=NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s AND position_id=%s "
+                    "AND kind='EXIT' AND status=%s "
+                    "AND LOWER(COALESCE(execution_mode,''))=%s "
+                    "AND COALESCE(contract,'')=%s AND COALESCE(qty,0)=%s "
+                    "AND COALESCE(broker_order_id,'')='' AND submitted_ts IS NULL "
+                    "AND COALESCE(meta->>'submit_intent_at','')='' "
+                    "AND COALESCE(meta->>'broker_submit_key','')='' "
+                    "AND COALESCE((meta->>'split_brain_quarantine')::boolean, false)=false "
+                    "AND COALESCE((meta->>'reconciliation_required')::boolean, false)=false",
+                    (
+                        patch,
+                        local_order_id,
+                        self.client_id,
+                        str(position_id),
+                        OrderStatus.EXIT_REQUESTED,
+                        mode,
+                        str(contract or ""),
+                        qty,
+                    ),
+                )
+                return int(getattr(cur, "rowcount", getattr(c, "rowcount", 0)) or 0)
+
+        try:
+            return bool(run_with_retry(_persist) > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] persist_exit_submit_intent failed order=%s: %s",
+                self.client_id,
+                local_order_id,
+                exc,
             )
             return False
 
@@ -5192,10 +5689,89 @@ class APOrderStateMachine:
                 execution_mode = None
 
         reserved_local_id = str(local_order_id or "").strip()
+        requested_qty = (
+            qty
+            if isinstance(qty, int) and not isinstance(qty, bool) and qty > 0
+            else None
+        )
+        if requested_qty is None:
+            return {
+                "ok": False,
+                "local_order_id": reserved_local_id or None,
+                "broker_order_id": None,
+                "status": OrderStatus.ERROR,
+                "error": "exit_requested_quantity_invalid",
+            }
+
+        def _reserved_exit_identity_mismatches(order_row) -> list[str]:
+            if not isinstance(order_row, dict):
+                return ["row_missing"]
+            durable_qty_raw = order_row.get("qty")
+            durable_qty = (
+                durable_qty_raw
+                if isinstance(durable_qty_raw, int)
+                and not isinstance(durable_qty_raw, bool)
+                and durable_qty_raw > 0
+                else None
+            )
+            runtime_mode = str(execution_mode or "").strip().lower()
+            mismatches = []
+            if str(order_row.get("local_order_id") or "").strip() != reserved_local_id:
+                mismatches.append("local_order_id")
+            if str(order_row.get("position_id") or "") != str(position_id or ""):
+                mismatches.append("position_id")
+            if order_row.get("kind") != "EXIT":
+                mismatches.append("kind")
+            if order_row.get("status") != OrderStatus.EXIT_REQUESTED:
+                mismatches.append("status")
+            if order_row.get("client_id") != self.client_id:
+                mismatches.append("client_id")
+            if (
+                runtime_mode not in {"live", "paper"}
+                or order_row.get("execution_mode") != runtime_mode
+            ):
+                mismatches.append("execution_mode")
+            if str(order_row.get("contract") or "") != str(contract or ""):
+                mismatches.append("contract")
+            if durable_qty != requested_qty:
+                mismatches.append("qty")
+            if order_row.get("broker_order_id") not in (None, ""):
+                mismatches.append("broker_order_id")
+            return mismatches
+
+        def _reserved_exit_identity_failure(order_row, mismatches: list[str]) -> dict:
+            error_msg = "reserved_exit_identity_mismatch:" + ",".join(mismatches)
+            log.critical(
+                "[%s] submit_exit BLOCKED -- reserved exit identity mismatch | "
+                "pos=%s local=%s fields=%s",
+                self.client_id,
+                position_id,
+                reserved_local_id,
+                ",".join(mismatches),
+            )
+            return {
+                "ok": False,
+                "local_order_id": reserved_local_id,
+                "broker_order_id": (
+                    order_row.get("broker_order_id")
+                    if isinstance(order_row, dict)
+                    else None
+                ),
+                "status": (
+                    order_row.get("status")
+                    if isinstance(order_row, dict)
+                    else OrderStatus.ERROR
+                ),
+                "error": error_msg,
+            }
+
         existing = self._get_active_exit_order(position_id)
         if existing:
             existing  = dict(existing)
-            if reserved_local_id and str(existing.get("local_order_id") or "").strip() == reserved_local_id:
+            if reserved_local_id:
+                mismatches = _reserved_exit_identity_mismatches(existing)
+                if mismatches:
+                    return _reserved_exit_identity_failure(existing, mismatches)
                 local_id = reserved_local_id
             else:
                 error_msg = (f"active_exit_already_exists:"
@@ -5211,13 +5787,27 @@ class APOrderStateMachine:
                         "broker_order_id": existing.get("broker_order_id"),
                         "status": existing.get("status"), "error": error_msg}
         else:
+            if reserved_local_id:
+                error_msg = f"reserved_exit_row_missing:{reserved_local_id}"
+                log.critical(
+                    "[%s] submit_exit BLOCKED -- reserved exit row missing | pos=%s local=%s",
+                    self.client_id,
+                    position_id,
+                    reserved_local_id,
+                )
+                return {
+                    "ok": False,
+                    "local_order_id": reserved_local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.ERROR,
+                    "error": error_msg,
+                }
             local_id = self.create_exit_order(
                 position_id=position_id, contract=contract, symbol=symbol,
                 direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id,
                 limit_price=limit_price, local_order_id=reserved_local_id or None,
                 execution_mode=execution_mode,
             )
-        requested_qty = int(qty or 0)
         broker_truth = resolve_exit_broker_truth(
             broker=broker,
             client_id=self.client_id,
@@ -5544,6 +6134,76 @@ class APOrderStateMachine:
         # in /orders to confirm the order landed without double-submitting.
         _order_data["tag"] = canonical_broker_submit_key(local_id)
 
+        # Make absence of submit evidence authoritative.  Recovery may retire
+        # an EXIT_REQUESTED row only while this exact CAS has never succeeded;
+        # once it does, every crash/timeout path is broker-ambiguous and must
+        # reconcile by the canonical tag instead of creating a replacement.
+        _exit_payload_hash = hashlib.sha256(
+            json.dumps(_order_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        _intent_getter = getattr(self, "_get_order", None) or getattr(self, "get_order", None)
+
+        def _exit_submit_intent_proven() -> tuple[bool, dict]:
+            row = _intent_getter(local_id) if callable(_intent_getter) else None
+            row = dict(row) if row else {}
+            meta = row.get("meta") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            proven = bool(
+                str(row.get("local_order_id") or "") == str(local_id)
+                and str(row.get("position_id") or "") == str(position_id)
+                and row.get("kind") == "EXIT"
+                and row.get("status") == OrderStatus.EXIT_REQUESTED
+                and row.get("client_id") == self.client_id
+                and str(row.get("execution_mode") or "").strip().lower()
+                    == str(execution_mode or "").strip().lower()
+                and str(row.get("contract") or "") == str(contract or "")
+                and row.get("qty") == requested_qty
+                and not str(row.get("broker_order_id") or "").strip()
+                and not row.get("submitted_ts")
+                and str(meta.get("submit_intent_at") or "").strip()
+                and meta.get("broker_submit_key") == _order_data["tag"]
+                and meta.get("broker_submit_payload_hash") == _exit_payload_hash
+                and meta.get("current_owner") == f"broker_submit:{_order_data['tag']}"
+                and not meta.get("split_brain_quarantine")
+                and not meta.get("reconciliation_required")
+            )
+            return proven, row
+
+        if not self.persist_exit_submit_intent(
+            local_id,
+            position_id=str(position_id),
+            execution_mode=str(execution_mode or ""),
+            contract=str(contract or ""),
+            qty=requested_qty,
+            payload_hash=_exit_payload_hash,
+            broker_submit_key=_order_data["tag"],
+        ):
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": None,
+                "status": OrderStatus.EXIT_REQUESTED,
+                "error": "EXIT_SUBMIT_INTENT_FENCE_LOST",
+                "reconciliation_required": True,
+            }
+
+        _intent_proven, _intent_row = _exit_submit_intent_proven()
+        if not _intent_proven:
+            return {
+                "ok": False,
+                "local_order_id": local_id,
+                "broker_order_id": _intent_row.get("broker_order_id"),
+                "status": _intent_row.get("status") or OrderStatus.ERROR,
+                "error": "EXIT_SUBMIT_INTENT_DURABLE_PROOF_FAILED",
+                "reconciliation_required": True,
+            }
+
         # ── Retry-safe broker submission ──────────────────────────────────────
         # Failure classes:
         #   RETRYABLE_CONNECT_TIMEOUT — no HTTP connection was established
@@ -5573,6 +6233,30 @@ class APOrderStateMachine:
         status = ""
 
         for _attempt in range(1, _max_attempts + 1):
+            # Re-read the exact reserved row immediately before every possible
+            # POST.  The entry-time check is not enough: another worker could
+            # terminalize, replace, mutate, or broker-own the row while broker
+            # truth and safety gates run above.
+            latest_intent_proven, latest_intent = _exit_submit_intent_proven()
+            if not latest_intent_proven:
+                return {
+                    "ok": False,
+                    "local_order_id": local_id,
+                    "broker_order_id": latest_intent.get("broker_order_id"),
+                    "status": latest_intent.get("status") or OrderStatus.ERROR,
+                    "error": "EXIT_SUBMIT_INTENT_DURABLE_PROOF_FAILED",
+                    "reconciliation_required": True,
+                }
+            if reserved_local_id:
+                latest_reserved = self._get_active_exit_order(position_id)
+                latest_mismatches = _reserved_exit_identity_mismatches(
+                    dict(latest_reserved) if latest_reserved else None
+                )
+                if latest_mismatches:
+                    return _reserved_exit_identity_failure(
+                        dict(latest_reserved) if latest_reserved else None,
+                        latest_mismatches,
+                    )
             # Re-check active exit on EACH attempt — a concurrent submission
             # or a successful prior attempt that we couldn't confirm could
             # have created one. Never double-submit.
