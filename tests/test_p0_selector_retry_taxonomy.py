@@ -258,6 +258,161 @@ def test_duplicate_conflict_reason_has_runtime_restart_materializer_parity():
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 4b. Direct runtime classifier evidence for DUPLICATE_QUOTE_CONFLICT_UNRESOLVED
+#
+# The parity test above proves attempt=1 end-to-end. These four tests close
+# the remaining evidence gap: attempt 2+, max-attempts exhaustion, past
+# cutoff, and retry-disabled were previously proven only by reading
+# _classify_deferred_breach_retry_decision and confirming it has no
+# per-reason branching (structural guarantee). These tests call the real
+# production classifier directly with the exact canonical reason string —
+# no monkeypatch of the classifier itself, no duplicated logic.
+# ═══════════════════════════════════════════════════════════════════════
+
+_DUPLICATE_QUOTE_CONFLICT_REASON = "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+_GENERIC_RELABEL_REASONS = frozenset({
+    "CONTRACT_SELECTION_QUALITY_REJECT",
+    "UNKNOWN_REJECTION",
+    "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+})
+
+
+def test_duplicate_conflict_attempt_two_remains_retryable():
+    """Attempt 2 (of 5) is still under bounded data-retry authority.
+
+    attempt=2 counts as two attempts already made; the classifier's own
+    contract is `attempt < max_attempts` for retry_schedule, so 2 < 5
+    must still schedule. This directly exercises attempt indexing rather
+    than inferring it from the attempt=1 case.
+    """
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    result = _classify_deferred_breach_retry_decision(
+        _DUPLICATE_QUOTE_CONFLICT_REASON,
+        queue_local_order_id="local-pr408-attempt-2",
+        attempt=2,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+
+    assert result["action"] == "retry_schedule"
+    assert result["reason_code"] == _DUPLICATE_QUOTE_CONFLICT_REASON
+    assert result["retryable_reason"] is True
+    assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
+
+
+def test_duplicate_conflict_max_attempts_reached_is_retry_exhausted():
+    """attempt == max_attempts terminalizes as retry_exhausted, not a
+    generic quality rejection, and the canonical reason stays embedded in
+    the terminal_reason string per the real production contract.
+    """
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    result = _classify_deferred_breach_retry_decision(
+        _DUPLICATE_QUOTE_CONFLICT_REASON,
+        queue_local_order_id="local-pr408-attempt-exhausted",
+        attempt=5,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+
+    assert result["action"] == "retry_exhausted"
+    assert result["reason_code"] == _DUPLICATE_QUOTE_CONFLICT_REASON
+    assert result["retryable_reason"] is True
+    assert result["terminal_reason"] == (
+        f"BREACH_RETRY_EXHAUSTED:{_DUPLICATE_QUOTE_CONFLICT_REASON}"
+    )
+    assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
+    # The canonical reason must be traceable inside the terminal string,
+    # not collapsed into an opaque generic exhaustion marker.
+    assert _DUPLICATE_QUOTE_CONFLICT_REASON in result["terminal_reason"]
+
+
+def test_duplicate_conflict_past_cutoff_does_not_schedule_retry():
+    """Past the wall-clock cutoff, no further retry is scheduled — even
+    when attempt count would otherwise still allow one. past_cutoff takes
+    priority ahead of the attempt/max_attempts check in the real function.
+    """
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    result = _classify_deferred_breach_retry_decision(
+        _DUPLICATE_QUOTE_CONFLICT_REASON,
+        queue_local_order_id="local-pr408-past-cutoff",
+        attempt=2,
+        max_attempts=5,
+        past_cutoff=True,
+        retry_enabled=True,
+    )
+
+    assert result["action"] == "retry_cutoff"
+    assert result["reason_code"] == _DUPLICATE_QUOTE_CONFLICT_REASON
+    assert result["retryable_reason"] is True
+    assert result["terminal_reason"] == (
+        f"breach_retry_cutoff:{_DUPLICATE_QUOTE_CONFLICT_REASON}"
+    )
+    assert result["action"] != "retry_schedule"
+    assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
+    assert _DUPLICATE_QUOTE_CONFLICT_REASON in result["terminal_reason"]
+
+
+def test_duplicate_conflict_retry_disabled_does_not_schedule_retry():
+    """The BREACH_SELECTOR_RETRY_ENABLED kill switch blocks scheduling
+    even on attempt 1 with room remaining and no cutoff reached.
+    """
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    result = _classify_deferred_breach_retry_decision(
+        _DUPLICATE_QUOTE_CONFLICT_REASON,
+        queue_local_order_id="local-pr408-retry-disabled",
+        attempt=1,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=False,
+    )
+
+    assert result["action"] == "retry_disabled"
+    assert result["reason_code"] == _DUPLICATE_QUOTE_CONFLICT_REASON
+    assert result["retryable_reason"] is True
+    assert result["terminal_reason"] == (
+        f"breach_retry_disabled:{_DUPLICATE_QUOTE_CONFLICT_REASON}"
+    )
+    assert result["action"] != "retry_schedule"
+    assert result["reason_code"] not in _GENERIC_RELABEL_REASONS
+    assert _DUPLICATE_QUOTE_CONFLICT_REASON in result["terminal_reason"]
+
+
+def test_duplicate_conflict_is_not_retryable_would_fail_all_four_cases():
+    """Positive control: prove these tests would actually fail if the
+    reason were removed from RETRYABLE_DATA authority, rather than passing
+    for an unrelated reason (e.g. an exception swallowed before the real
+    branch is reached).
+    """
+    from ap_execution_core import _classify_deferred_breach_retry_decision
+
+    _fake_non_retryable_reason = "NOT_A_REGISTERED_RETRYABLE_REASON_XYZ"
+    assert _fake_non_retryable_reason not in RETRYABLE_BREACH_SELECTOR_REASONS
+
+    result = _classify_deferred_breach_retry_decision(
+        _fake_non_retryable_reason,
+        queue_local_order_id="local-pr408-control",
+        attempt=2,
+        max_attempts=5,
+        past_cutoff=False,
+        retry_enabled=True,
+    )
+
+    # An unregistered reason must fall through to terminal_quality, not any
+    # of the four retry-authority actions the real reason produces above.
+    assert result["action"] == "terminal_quality"
+    assert result["retryable_reason"] is False
+    assert result["action"] not in (
+        "retry_schedule", "retry_exhausted", "retry_cutoff", "retry_disabled",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 5. Policy field logical consistency
 # ═══════════════════════════════════════════════════════════════════════
 
