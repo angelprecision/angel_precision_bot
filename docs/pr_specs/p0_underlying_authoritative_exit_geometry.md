@@ -2,9 +2,9 @@
 
 > **DRAFT IMPLEMENTATION CONTRACT ONLY. DO NOT MERGE OR DEPLOY.**
 >
-> Amendment base: current `main` at `188f2338de3ca4b3e687aa07fd6b2c5ea4b2ab0b`
+> Post-#425 amendment base: current `main` at `187fb30e43a98de027bb6a05a70e08fdff6ff5d6`
 >
-> This branch preserves the July 28, 2026 NOW LIVE incident and the smallest safe implementation contract. The amendment is rebased onto current `main`; it remains a draft and must be rebased again after PR #425 is complete.
+> This branch preserves the July 28, 2026 NOW LIVE incident and the smallest safe implementation contract. It is rebased onto the final merged #425 lifecycle and remains a draft/HARD HOLD.
 
 ## Incident
 
@@ -151,6 +151,10 @@ No PAPER midpoint or analytics mark may gain LIVE exit authority.
 8. Duplicate poll after exit submission: no second broker exit.
 9. Stale underlying value numerically beyond stop: no technical-stop exit.
 10. PAPER midpoint below threshold while executable BID is not: no LIVE-style stop authority.
+11. New breached quote before the horizon advances the latest-observation marker; repeated evaluation of that same quote through the horizon remains HOLD; a newer post-horizon quote may confirm.
+12. Process death before technical-stop confirmation clears the in-memory timer; restart requires a fresh post-restart confirmation sequence.
+13. Exact mode authority: `live`/`paper` may proceed under their identity contracts; uppercase, whitespace, empty, NULL, and malformed modes return `UNDERLYING_STOP_IDENTITY_UNPROVEN`.
+14. Post-#425 guarded submit/adoption: one broker POST, one broker-owned adoption, zero cancels, unchanged pre-fill position/proof state, and restart blocked from resubmitting.
 
 ## Acceptance evidence
 
@@ -172,12 +176,14 @@ confirmation timer, hard-exit resolver, entry-grace ordering, and exit-in-flight
 submission fence; no broker, queue, selector, scoring, sizing, or proof-trade
 architecture was added.
 
-The focused deterministic matrix is green locally (`26 passed`), including the
+The final #425 base is `187fb30e43a98de027bb6a05a70e08fdff6ff5d6`; the rebase
+replayed only the existing #403 suffix and required no production conflict
+resolution. The focused deterministic matrix is green locally (`31 passed`), including the
 fresh-observation-at-horizon regression, exact execution-mode authority cases,
-first-breach winner-protection regression, and confirmed technical-stop
-submit/idempotency handoff. The adjacent current-main exit suites are also
-green (`438 passed` in `20:38.99` from the prior pushed head). These are local
-pre-push results;
-exact-head GitHub CI remains the publication gate. This PR stays Draft/HARD
-HOLD and is not authorized to merge or deploy until PR #425 is complete and
-this branch has been rebased again.
+first-breach winner-protection regression, confirmed technical-stop
+submit/idempotency handoff, process-death reconfirmation, and post-#425
+broker-owned adoption. The directly affected #425 lifecycle suites are green
+(`399 passed, 2 skipped`). The adjacent current-main exit suites are also green
+(`438 passed` in `20:38.99` from the prior pushed head). These are local
+pre-push results; exact-head GitHub CI remains the publication gate. This PR
+stays Draft/HARD HOLD and is not authorized to merge or deploy.

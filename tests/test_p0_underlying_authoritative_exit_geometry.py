@@ -253,6 +253,39 @@ def test_confirmation_requires_new_quote_after_horizon_not_repeated_polling():
     assert confirmed.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
 
 
+def test_confirmation_restarts_after_process_death_before_technical_stop():
+    pos = _now_call(option_bid=1.45, underlying_price=104.80)
+    assert _eval(pos).reason_code == UNDERLYING_STOP_CONFIRMING
+
+    quote_b_et = INCIDENT_ET + timedelta(seconds=8)
+    _advance_underlying(pos, now_et=quote_b_et, price=104.70)
+    assert _eval(pos, quote_b_et).reason_code == UNDERLYING_STOP_CONFIRMING
+    assert pos._underlying_stop_breach_ts == INCIDENT_UTC
+
+    # Process death discards the deliberately in-memory confirmation timer;
+    # #403 must not add a durable technical-stop lifecycle just to preserve it.
+    pos._underlying_stop_breach_ts = None
+    pos._underlying_stop_breach_quote_ts = None
+
+    restart_first_et = INCIDENT_ET + timedelta(seconds=20)
+    _advance_underlying(pos, now_et=restart_first_et, price=104.60)
+    restarted_first = _eval(pos, restart_first_et)
+    assert restarted_first.action == "HOLD", restarted_first.reason
+    assert restarted_first.reason_code == UNDERLYING_STOP_CONFIRMING
+    assert pos._underlying_stop_breach_ts == restart_first_et.astimezone(UTC)
+
+    same_quote_et = INCIDENT_ET + timedelta(seconds=52)
+    same_quote = _eval(pos, same_quote_et)
+    assert same_quote.action == "HOLD", same_quote.reason
+    assert same_quote.reason_code == UNDERLYING_STOP_CONFIRMING
+
+    post_restart_quote_et = INCIDENT_ET + timedelta(seconds=60)
+    _advance_underlying(pos, now_et=post_restart_quote_et, price=104.50)
+    confirmed = _eval(pos, post_restart_quote_et)
+    assert confirmed.action == "STOP", confirmed.reason
+    assert confirmed.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+
+
 def test_call_breach_recovers_before_confirmation_and_resets():
     pos = _now_call(option_bid=1.70, underlying_price=104.80)
     assert _eval(pos).reason_code == UNDERLYING_STOP_CONFIRMING
@@ -542,6 +575,223 @@ def test_confirmed_technical_stop_uses_one_real_submit_handoff(monkeypatch):
     assert broker.cancel_calls == []
 
 
+def test_confirmed_technical_stop_uses_post_425_broker_owned_handoff(monkeypatch):
+    """Join #403 evaluation to the final #425 durable submit/adoption fence."""
+    import ap.exit_decision_idempotency_guard as guard
+    import ap.exit_safety as exit_safety_mod
+    import ap_exit_engine as exit_engine_mod
+
+    pos = _now_call(option_bid=1.45, underlying_price=104.80)
+    assert _eval(pos).reason_code == UNDERLYING_STOP_CONFIRMING
+    confirmed_et = INCIDENT_ET + timedelta(seconds=CONFIRM_SECONDS + 1)
+    _advance_underlying(pos, now_et=confirmed_et, price=104.70)
+    decision = _eval(pos, confirmed_et)
+    assert decision.reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+
+    class _BrokerOwnedOSM:
+        def __init__(self):
+            self.active_order = None
+            self.adoption_calls = []
+
+        def _get_active_exit_order(self, position_id):
+            if self.active_order and self.active_order.get("position_id") == position_id:
+                return dict(self.active_order)
+            return None
+
+        get_active_exit_order = _get_active_exit_order
+
+        def get_order(self, local_order_id):
+            if self.active_order and self.active_order.get("local_order_id") == local_order_id:
+                return dict(self.active_order)
+            return None
+
+        def create_exit_order(self, **kwargs):
+            local_order_id = str(kwargs["local_order_id"])
+            self.active_order = {
+                "kind": "EXIT",
+                "status": "EXIT_REQUESTED",
+                "local_order_id": local_order_id,
+                "broker_order_id": "",
+                "client_id": pos.client_id,
+                "position_id": kwargs["position_id"],
+                "execution_mode": kwargs["execution_mode"],
+                "contract": kwargs["contract"],
+                "symbol": kwargs["symbol"],
+                "direction": kwargs["direction"],
+                "qty": kwargs["qty"],
+                "meta": {},
+            }
+            return local_order_id
+
+        def update_order_meta(self, local_order_id, patch):
+            if not self.active_order or self.active_order.get("local_order_id") != local_order_id:
+                return False
+            self.active_order["meta"].update(dict(patch or {}))
+            return True
+
+        def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
+            self.adoption_calls.append((local_order_id, dict(kwargs)))
+            assert self.active_order["status"] == "EXIT_REQUESTED"
+            assert self.active_order["execution_mode"] == kwargs["execution_mode"]
+            assert self.active_order["client_id"] == kwargs["client_id"]
+            assert self.active_order["position_id"] == kwargs["position_id"]
+            assert self.active_order["qty"] == kwargs["expected_qty"]
+            self.active_order["status"] = "EXIT_SUBMITTED"
+            self.active_order["broker_order_id"] = kwargs["broker_order_id"]
+            return {
+                "disposition": "ADOPTED",
+                "adopted": True,
+                "status": "EXIT_SUBMITTED",
+            }
+
+    class _NoSnapshotBroker:
+        def __init__(self):
+            self.post_calls = []
+            self.cancel_calls = []
+
+        def list_positions(self):
+            raise RuntimeError("test broker snapshot unavailable")
+
+        def cancel_order(self, *args, **kwargs):
+            self.cancel_calls.append((args, kwargs))
+
+    broker = _NoSnapshotBroker()
+    osm = _BrokerOwnedOSM()
+    engine = APExitEngine.__new__(APExitEngine)
+    engine.client_id = pos.client_id
+    engine._email = pos.client_id
+    engine._lock = RLock()
+    engine._thread = None
+    engine._running = False
+    engine.run_id = "pr403-post-425-run"
+    engine.strategy_version = "pr403-post-425-test"
+    engine.git_commit = "pr403-post-425-test"
+    engine.master_control = SimpleNamespace(mode="live")
+    engine.on_scale = None
+    engine.order_state_machine = osm
+    engine.osm = None
+    engine.broker = broker
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    engine.hydrate_pending_exit_identity_from_db = lambda *_args, **_kwargs: False
+    engine._emit_exit_event = lambda *args, **kwargs: None
+    engine._clear_degraded_monitoring_state = lambda *args, **kwargs: None
+
+    def _on_exit(callback_pos, callback_decision):
+        broker.post_calls.append((callback_pos, callback_decision))
+        return {
+            "accepted": True,
+            "local_order_id": callback_pos.pending_exit_local_order_id,
+            "broker_order_id": "broker-pr403-post-425",
+            "status": "accepted",
+        }
+
+    engine.on_exit = _on_exit
+    monkeypatch.setattr(
+        exit_engine_mod,
+        "_is_option_quote_stale",
+        lambda _pos, _now: (False, 0.0, "fresh"),
+    )
+    monkeypatch.setattr(
+        exit_safety_mod,
+        "resolve_exit_broker_truth",
+        lambda **kwargs: {
+            "is_fresh_exact": False,
+            "broker_truth_open_qty": None,
+            "audit": {"source": "test"},
+        },
+    )
+    monkeypatch.setattr(
+        exit_safety_mod,
+        "evaluate_exit_submission_safety",
+        lambda **kwargs: {
+            "blocked": False,
+            "reason": None,
+            "position_state": {"entry_ts": None},
+            "circuit_breaker": {"blocked": False, "reason": None},
+        },
+    )
+
+    durable_claim = {"claimed": False, "claim_state": guard._CLAIM_STATE_BROKER_OWNED}
+    updates = []
+
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_args: ("jasoncosby1@gmail.com|pr403-position-1|1|1", 1),
+    )
+
+    def _claim(**kwargs):
+        if durable_claim["claimed"]:
+            return {
+                "claimed": False,
+                "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+                "local_order_id": osm.active_order["local_order_id"],
+                "broker_order_id": osm.active_order["broker_order_id"],
+            }
+        durable_claim["claimed"] = True
+        return {
+            "claimed": True,
+            "claim_state": guard._CLAIM_STATE_CLAIMED,
+            "local_order_id": "",
+            "broker_order_id": "",
+        }
+
+    monkeypatch.setattr(guard, "_claim_durable_decision_generation", _claim)
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append((generation_key, kwargs)),
+    )
+
+    wrapped = guard.wrap_submit(APExitEngine._submit_exit_decision)
+    quantity_before = pos.quantity_remaining
+    proof_before = (pos._proof_staged, pos._proof_finalized, pos.proof_logged)
+
+    assert wrapped(engine, pos, decision) is True
+    assert len(broker.post_calls) == 1
+    assert len(osm.adoption_calls) == 1
+    assert osm.active_order["status"] == "EXIT_SUBMITTED"
+    assert osm.active_order["broker_order_id"] == "broker-pr403-post-425"
+    assert updates[-1][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
+    assert broker.post_calls[0][0].client_id == "jasoncosby1@gmail.com"
+    assert broker.post_calls[0][0].execution_mode == "live"
+    assert broker.post_calls[0][0].position_id == "pr403-position-1"
+    assert broker.post_calls[0][0].option_symbol == "NOW260731C00113000"
+    assert broker.post_calls[0][1].reason_code == UNDERLYING_TECHNICAL_STOP_CONFIRMED
+    assert pos.exit_in_flight is True
+    assert pos.quantity_remaining == quantity_before
+    assert pos.closed is False
+    assert (pos._proof_staged, pos._proof_finalized, pos.proof_logged) == proof_before
+    assert broker.cancel_calls == []
+
+    # Simulate process death/restart with a fresh engine and position object.
+    restarted_pos = _now_call(option_bid=1.45, underlying_price=104.70)
+    restarted_pos.position_id = pos.position_id
+    restarted_engine = APExitEngine.__new__(APExitEngine)
+    restarted_engine.client_id = restarted_pos.client_id
+    restarted_engine._email = restarted_pos.client_id
+    restarted_engine._lock = RLock()
+    restarted_engine._thread = None
+    restarted_engine._running = False
+    restarted_engine.master_control = SimpleNamespace(mode="live")
+    restarted_engine.order_state_machine = osm
+    restarted_engine.osm = None
+    restarted_engine.broker = broker
+    restarted_engine._positions = [restarted_pos]
+    restarted_engine._positions_by_id = {restarted_pos.position_id: restarted_pos}
+    restarted_engine._emit_exit_event = lambda *args, **kwargs: None
+    restarted_engine._clear_degraded_monitoring_state = lambda *args, **kwargs: None
+    restarted_engine.hydrate_pending_exit_identity_from_db = lambda *_args, **_kwargs: False
+    restarted_engine.on_scale = None
+    restarted_engine.on_exit = _on_exit
+
+    assert wrapped(restarted_engine, restarted_pos, decision) is False
+    assert len(broker.post_calls) == 1
+    assert len(osm.adoption_calls) == 1
+    assert broker.cancel_calls == []
+
+
 @pytest.mark.parametrize("execution_mode", ["paper", "live"])
 def test_unproven_midpoint_or_analytics_mark_cannot_authorize_catastrophic_stop(execution_mode):
     pos = _now_call(
@@ -613,6 +863,9 @@ def test_live_technical_stop_requires_durable_position_identity():
         (" live ", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
         ("PAPER", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
         ("paper ", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        ("", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        (None, UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
+        ("malformed", UNDERLYING_STOP_IDENTITY_UNPROVEN, False),
         ("live", UNDERLYING_STOP_CONFIRMING, True),
         ("paper", UNDERLYING_STOP_CONFIRMING, True),
     ],
