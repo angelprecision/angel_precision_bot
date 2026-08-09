@@ -158,6 +158,42 @@ def test_new_generation_after_consumed_grant_increments_again():
     assert pos.exit_replace_attempt == 2
 
 
+def test_exit_replace_attempt_is_bounded_and_persisted_at_configured_max(monkeypatch):
+    """Repeated independently proven generations never create attempt five."""
+    import ap_exit_engine as exit_engine_module
+
+    monkeypatch.setattr(exit_engine_module, "EXIT_REPLACE_MAX_ATTEMPTS", 4)
+    eng = _engine()
+    pos = _pos()
+    _add(eng, pos)
+    persisted_attempts = []
+    eng._persist_exit_replace_attempt_to_db = MagicMock(
+        side_effect=lambda current_pos: persisted_attempts.append(
+            current_pos.exit_replace_attempt
+        ) or True
+    )
+
+    for generation in range(6):
+        if generation:
+            # The prior one-shot grant was consumed by a replacement submit;
+            # these are new, independently identified old generations.
+            pos.pending_exit_replace_allowed = False
+            pos.pending_exit_local_order_id = f"loc-old-{generation}"
+            pos.pending_exit_broker_order_id = f"bro-old-{generation}"
+        eng.mark_exit_replacement_safe(
+            pos.position_id,
+            reason=f"broker-confirmed-cancel-{generation}",
+            local_order_id=pos.pending_exit_local_order_id,
+            broker_order_id=pos.pending_exit_broker_order_id,
+        )
+        assert pos.exit_replace_attempt == min(generation + 1, 4)
+
+    assert exit_engine_module.EXIT_REPLACE_MAX_ATTEMPTS == 4
+    assert pos.exit_replace_attempt == 4
+    assert persisted_attempts == [1, 2, 3, 4, 4, 4]
+    assert 5 not in persisted_attempts
+
+
 # ── Submission must NOT reset the attempt counter ───────────────────────────
 
 def test_mark_exit_submitted_does_not_reset_exit_replace_attempt():

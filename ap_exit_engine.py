@@ -2795,6 +2795,11 @@ LOWEST_EXIT_PRIORITY = len(EXIT_RULE_PRIORITY) + 100
 
 STALE_OPTION_QUOTE_MAX_AGE_SEC = int(os.getenv("EXIT_ENGINE_STALE_OPTION_QUOTE_SEC", "20"))
 
+try:
+    EXIT_REPLACE_MAX_ATTEMPTS = max(1, int(os.getenv("EXIT_REPLACE_MAX_ATTEMPTS", "4")))
+except (TypeError, ValueError, OverflowError):
+    EXIT_REPLACE_MAX_ATTEMPTS = 4
+
 
 def _clamp_env_number(name: str, default: float, min_value: float, max_value: float, *, as_int: bool = False):
     raw = os.getenv(name)
@@ -5796,7 +5801,16 @@ class APExitEngine:
                         # pre-fill quantity.
                         pos.pending_exit_replace_qty = _replacement_qty
                     if not _duplicate_grant_for_same_generation:
-                        pos.exit_replace_attempt = int(getattr(pos, "exit_replace_attempt", 0) or 0) + 1
+                        try:
+                            _prior_exit_replace_attempt = max(
+                                0, int(getattr(pos, "exit_replace_attempt", 0) or 0)
+                            )
+                        except (TypeError, ValueError, OverflowError):
+                            _prior_exit_replace_attempt = 0
+                        pos.exit_replace_attempt = min(
+                            _prior_exit_replace_attempt + 1,
+                            EXIT_REPLACE_MAX_ATTEMPTS,
+                        )
                         pos._exit_replace_attempt_last_ack_identity = _call_identity
                         # PR #423: best-effort restart-durable persistence of the
                         # replacement generation. Non-fatal — see method docstring.
@@ -5815,15 +5829,12 @@ class APExitEngine:
                         # pricing), which is the existing executable-BID
                         # behavior for forced-risk exits the spec requires
                         # to remain in effect at exhaustion.
-                        _exit_replace_max_attempts = int(
-                            os.getenv("EXIT_REPLACE_MAX_ATTEMPTS", "4")
-                        ) if str(os.getenv("EXIT_REPLACE_MAX_ATTEMPTS", "4")).strip().lstrip("-").isdigit() else 4
-                        if pos.exit_replace_attempt >= _exit_replace_max_attempts:
+                        if pos.exit_replace_attempt >= EXIT_REPLACE_MAX_ATTEMPTS:
                             self._emit_exit_event(
                                 pos, "ALERT", "EXIT_REPLACE_RETRY_EXHAUSTED_BROKER_OPEN",
                                 (
                                     f"Replacement attempt {pos.exit_replace_attempt} reached "
-                                    f"max ({_exit_replace_max_attempts}) while broker position "
+                                    f"max ({EXIT_REPLACE_MAX_ATTEMPTS}) while broker position "
                                     f"remains open. Protective ownership retained; forced-risk "
                                     f"exits continue using executable BID pricing."
                                 ),

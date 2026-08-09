@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,7 +17,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost/test")
 os.environ.setdefault("ENCRYPTION_KEY", "ap-pr423-avgo-replay-test")
 
 from ap.order_monitor import APOrderMonitor  # noqa: E402
-from ap_exit_engine import APExitEngine, ManagedPosition  # noqa: E402
+from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition  # noqa: E402
 
 
 class _ReplayBroker:
@@ -24,16 +25,58 @@ class _ReplayBroker:
         self.payloads = [dict(payload) for payload in payloads]
         self.get_calls = []
         self.cancel_calls = []
+        self.submit_calls = []
+        self.orders = {
+            "bro-avgo": {
+                "status": "working",
+                "position_id": "pos-avgo",
+                "kind": "EXIT",
+            },
+        }
+
+    @property
+    def active_exit_broker_ids(self):
+        terminal = {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FILLED"}
+        return {
+            broker_order_id
+            for broker_order_id, order in self.orders.items()
+            if str(order.get("status") or "").upper() not in terminal
+        }
 
     def get_order(self, broker_order_id):
         self.get_calls.append(broker_order_id)
         if not self.payloads:
             return {"status": "unknown"}
-        return dict(self.payloads.pop(0))
+        payload = dict(self.payloads.pop(0))
+        if broker_order_id in self.orders:
+            self.orders[broker_order_id].update(payload)
+        return payload
 
     def cancel_order(self, broker_order_id):
         self.cancel_calls.append(broker_order_id)
         return {"status": "pending"}
+
+    def submit_order(self, **kwargs):
+        """Capture the simulated broker POST and enforce no old/new overlap."""
+        old_order = self.orders["bro-avgo"]
+        old_status = str(old_order.get("status") or "").upper()
+        assert old_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+        active_before = sorted(self.active_exit_broker_ids)
+        assert "bro-avgo" not in active_before
+
+        post = dict(kwargs)
+        post["old_status"] = old_status
+        post["active_broker_ids"] = active_before
+        self.submit_calls.append(post)
+
+        broker_order_id = f"bro-avgo-replacement-{len(self.submit_calls)}"
+        self.orders[broker_order_id] = {
+            "status": "working",
+            "position_id": "pos-avgo",
+            "kind": "EXIT",
+            "qty": int(kwargs["quantity"]),
+        }
+        return {"status": "accepted", "broker_order_id": broker_order_id}
 
 
 class _ReplayOSM:
@@ -51,12 +94,42 @@ class _ReplayOSM:
             "qty": 2,
             "filled_qty": 0,
         }
+        self.orders = {self.order["local_order_id"]: self.order}
         self.transitions = []
 
     def get_order(self, local_order_id):
-        if local_order_id != self.order["local_order_id"]:
-            return None
-        return dict(self.order)
+        order = self.orders.get(local_order_id)
+        return dict(order) if order is not None else None
+
+    def _get_active_exit_order(self, position_id):
+        active_statuses = {
+            "EXIT_REQUESTED",
+            "EXIT_SUBMITTED",
+            "EXIT_ACKNOWLEDGED",
+            "EXIT_PARTIAL_FILL",
+        }
+        for order in self.orders.values():
+            if (
+                order.get("position_id") == position_id
+                and str(order.get("status") or "").upper() in active_statuses
+            ):
+                return dict(order)
+        return None
+
+    get_active_exit_order = _get_active_exit_order
+
+    def record_replacement(self, *, local_order_id, broker_order_id, qty):
+        self.orders[local_order_id] = {
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "kind": "EXIT",
+            "position_id": "pos-avgo",
+            "client_id": "client-avgo",
+            "execution_mode": "paper",
+            "status": "EXIT_SUBMITTED",
+            "qty": int(qty),
+            "filled_qty": 0,
+        }
 
     def transition(self, local_order_id, new_status, **kwargs):
         self.transitions.append((local_order_id, new_status, dict(kwargs)))
@@ -136,6 +209,107 @@ def _monitor(monkeypatch, broker, osm, engine, pm):
     return monitor
 
 
+def _set_fresh_replacement_quote(position):
+    quote_ts = datetime.now(timezone.utc)
+    position.current_bid = 2.00
+    position.current_ask = 2.40
+    position.current_option_price = 2.20
+    position.current_underlying = 350.0
+    position.option_bid_valid = True
+    position.last_quote_update_ts = quote_ts
+    position.last_option_quote_update_ts = quote_ts
+    position.last_underlying_quote_update_ts = quote_ts
+
+
+def _submit_real_replacement(monkeypatch, broker, osm, engine, position, *, expected_qty):
+    """Run the production core submit seam after the real cancel handoff."""
+    import ap.exit_safety as exit_safety_module
+
+    # The broker-truth and submission-safety gates are independently covered;
+    # this replay keeps its single external dependency the captured broker POST.
+    monkeypatch.setattr(
+        exit_safety_module,
+        "resolve_exit_broker_truth",
+        lambda **_: {
+            "is_fresh_exact": False,
+            "broker_truth_open_qty": None,
+            "audit": {"source": "avgo_replay"},
+        },
+    )
+    monkeypatch.setattr(
+        exit_safety_module,
+        "evaluate_exit_submission_safety",
+        lambda **_: {"blocked": False},
+    )
+
+    engine.broker = broker
+    engine._quote_broker = broker
+    engine.order_state_machine = osm
+    engine.osm = osm
+
+    def _on_exit(pos, decision):
+        broker_result = broker.submit_order(
+            position_id=pos.position_id,
+            quantity=decision.quantity,
+            limit_price=decision.suggested_limit,
+        )
+        local_order_id = f"loc-avgo-replacement-{len(broker.submit_calls)}"
+        osm.record_replacement(
+            local_order_id=local_order_id,
+            broker_order_id=broker_result["broker_order_id"],
+            qty=decision.quantity,
+        )
+        return {
+            "status": "EXIT_SUBMITTED",
+            "accepted": True,
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_result["broker_order_id"],
+        }
+
+    engine.on_exit = _on_exit
+    _set_fresh_replacement_quote(position)
+    decision = ExitDecision(
+        action="STOP",
+        quantity=position.quantity_remaining,
+        reason="RUNNER TRAIL",
+        urgency="HIGH",
+        pnl_pct=0.10,
+    )
+
+    # APExitEngine's class method carries the DB-backed idempotency wrapper in
+    # the production import graph.  The wrapper has its own exact-head tests;
+    # this replay invokes the original production core seam so it can prove
+    # pricing, quantity capping, callback submission, and post-submit identity
+    # without replacing APExitEngine or APOrderMonitor with mocks.
+    import ap.exit_decision_idempotency_guard as idempotency_guard
+
+    submit_core = getattr(
+        APExitEngine,
+        idempotency_guard._ORIGINAL_SUBMIT_ATTR,
+        APExitEngine._submit_exit_decision,
+    )
+    assert submit_core(engine, position, decision) is True
+
+    assert decision.reason_code == "RUNNER_TRAIL"
+    assert decision._pricing_meta["attempt"] == 1
+    assert decision._pricing_meta["tier"] == "TRAIL_BETWEEN"
+    assert decision.suggested_limit == 2.07
+    assert len(broker.submit_calls) == 1
+    post = broker.submit_calls[0]
+    assert post["quantity"] == expected_qty
+    assert post["limit_price"] == 2.07
+    assert post["old_status"] == "CANCELED"
+    assert post["active_broker_ids"] == []
+    assert broker.orders["bro-avgo"]["status"].upper() == "CANCELED"
+    assert broker.active_exit_broker_ids == {
+        "bro-avgo-replacement-1",
+    }
+    assert position.exit_in_flight is True
+    assert position.pending_exit_replace_allowed is False
+    assert position.pending_exit_replace_qty == 0
+    assert position.pending_exit_broker_order_id == "bro-avgo-replacement-1"
+
+
 def test_avgo_real_monitor_and_exit_engine_cancel_replay_preserves_identity(monkeypatch):
     engine, position = _engine()
     broker = _ReplayBroker([
@@ -165,6 +339,9 @@ def test_avgo_real_monitor_and_exit_engine_cancel_replay_preserves_identity(monk
     assert position.exit_replace_attempt == 1
     assert position.quantity_remaining == 7
     pm.update_position.assert_not_called()
+    _submit_real_replacement(
+        monkeypatch, broker, osm, engine, position, expected_qty=2,
+    )
 
 
 def test_avgo_partial_fill_replay_cancels_only_unfilled_remainder(monkeypatch):
@@ -198,3 +375,6 @@ def test_avgo_partial_fill_replay_cancels_only_unfilled_remainder(monkeypatch):
     assert position.pending_exit_replace_qty == 1
     assert position.exit_replace_attempt == 1
     pm.update_position.assert_not_called()
+    _submit_real_replacement(
+        monkeypatch, broker, osm, engine, position, expected_qty=1,
+    )
