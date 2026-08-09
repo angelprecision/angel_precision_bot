@@ -95,6 +95,59 @@ Requirements:
 - must never claim the underlying crossed its stored stop;
 - logs the option loss threshold and the exact price authority used.
 
+### `SOFT_LOSS_WATCH` (replaces `THESIS_FAIL_SOFT_STOP`)
+
+**This is an intentional behavior change from pre-#403 main, called out here
+explicitly per independent audit finding.**
+
+Pre-#403 behavior: once the soft-loss confirmation timer matured (breach held
+past `STOP_BREACH_CONFIRM_SECONDS`) and `_underlying_still_confirming()`
+returned False (underlying moved against entry by more than 0.5%), the engine
+returned `THESIS_FAIL_SOFT_STOP` → `action="CLOSE_ALL"`. This fired the exit
+purely from option P&L plus an *entry-relative* underlying-direction check —
+neither of which is the stored, authoritative technical-stop geometry this PR
+establishes.
+
+New behavior: the same confirmed soft-loss state, when the **stored technical
+stop remains CLEAR** (the underlying has not crossed `underlying_stop`),
+returns `SOFT_LOSS_WATCH` → `action="HOLD"`. The position is not closed.
+
+Rationale:
+
+- soft option loss plus adverse underlying movement relative to entry does
+  **not**, by itself, prove structural thesis invalidation;
+- if the stored technical stop remains CLEAR, the underlying has not actually
+  crossed the level the trade's structure was built around, so the bot stays
+  in `SOFT_LOSS_WATCH` / HOLD rather than manufacturing an exit from
+  entry-relative geometry;
+- confirmed underlying technical-stop geometry (`UNDERLYING_TECHNICAL_STOP_CONFIRMED`)
+  remains the authoritative thesis-invalidating stop;
+- `OPTION_CATASTROPHIC_STOP` remains a fully independent premium-loss
+  emergency path, unaffected by this change;
+- the existing `NEVER_GREEN` escalating-stop path remains the existing
+  escalation authority for positions that never establish profit;
+- this intentionally removes the middle-ground `CLOSE_ALL` previously
+  triggered by `THESIS_FAIL_SOFT_STOP` for positions whose stored technical
+  stop has not actually been breached.
+
+This is not a removal of loss protection. Losing positions in this state
+remain covered by three still-active authorities: `OPTION_CATASTROPHIC_STOP`
+(premium-loss airbag), `UNDERLYING_TECHNICAL_STOP_CONFIRMED` (once the stored
+stop is actually crossed and confirmed), and `NEVER_GREEN` escalation. What is
+removed is only the fourth, middle-ground path that could close a position on
+option P&L and entry-relative direction alone, while the stored technical
+stop geometry it was structured around had not been crossed.
+
+Regression coverage: `tests/test_soft_exit_executable_truth.py::TestEvaluateExitExecutableTruth::test_soft_loss_watch_when_technical_stop_clear_and_underlying_not_confirming`
+proves the exact `SOFT_LOSS_WATCH` / HOLD branch with a technical stop that is
+genuinely CLEAR (not merely untested), using the real two-call soft-loss
+timer maturation mechanism. A companion test,
+`test_technical_stop_breach_on_fresh_underlying_enters_confirming`, proves the
+adjacent case — a fresh underlying observation that has actually crossed the
+stored stop enters `UNDERLYING_STOP_CONFIRMING`, not `SOFT_LOSS_WATCH` — so
+the two branches are unambiguously separated by test evidence rather than by
+source-order inference alone.
+
 ## Confirmation policy
 
 The implementation should reuse existing state where possible and avoid a new subsystem.
