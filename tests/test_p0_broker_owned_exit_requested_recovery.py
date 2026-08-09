@@ -3143,6 +3143,7 @@ def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post(
 
 def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkeypatch):
     """Drive APExitEngine -> APExecutionCore._on_position_scale -> real OSM submit."""
+    import ap.authorization as authorization_module
     import ap.exit_safety as exit_safety_module
     from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition
     from ap_execution_core import APExecutionCore
@@ -3249,6 +3250,15 @@ def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkey
         "order": {"id": broker_id, "status": "open"}
     }
     broker.session.post.return_value = response
+
+    # The full P0 process includes legacy tests that replace ap.authorization
+    # in sys.modules.  Bind this regression to its declared PAPER broker mode
+    # so the real OSM boundary checks the durable identity deterministically.
+    monkeypatch.setattr(
+        authorization_module,
+        "execution_mode_for_broker",
+        lambda _broker: "paper",
+    )
 
     monkeypatch.setattr(
         exit_safety_module,
