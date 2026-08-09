@@ -186,3 +186,19 @@ EXIT_REQUESTED + broker id + submitted_ts null
 ## Audit verdict
 
 HARD HOLD until runtime implementation, focused real-method tests, changed-file audit, comments review, exact-head P0 CI, and a fresh independent release verdict are complete.
+
+## Read-only production release preflight
+
+The exact deployed artifact must run:
+
+```text
+BOT_MODE=LIVE python -m ap.broker_owned_exit_recovery_preflight
+```
+
+The command performs no broker calls and no writes. Exit `0` requires strict
+schema attestation, both #425 migration-ledger checksums, exact runtime/durable
+mode identity, positive `requested_qty` identity, no unresolved active claim,
+and no duplicate active EXIT rows for one position. Exit `2` is a release hold;
+exit `1` means the evidence tool itself failed. Capture the complete JSON,
+deployed service SHA, `LIVE_PREFLIGHT_OK`, `LIVE_ENFORCEMENT_OK`, and startup
+manifest/runtime configuration hash together as the release evidence record.
