@@ -2170,7 +2170,9 @@ class TestAmendment4HardRiskPreGate:
         # These tests target hard-risk pre-gate ordering, not EOD behavior.
         # Use a deterministic in-session clock so CI start time cannot make
         # the EOD pre-gate short-circuit the assertion.
-        return _et_noon().replace(hour=10, minute=0, second=0, microsecond=0)
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        return datetime.now(et).replace(hour=10, minute=0, second=0, microsecond=0)
 
     def _make_managed_position(self, *, side="CALL", entry=1.00,
                                 hard_ref_pnl=-0.45, dte=5,
