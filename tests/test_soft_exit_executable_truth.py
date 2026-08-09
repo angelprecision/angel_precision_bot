@@ -32,6 +32,9 @@ from ap_exit_engine import (
     HARD_STOP_PCT,
     IMMEDIATE_TP_PCT,
     SCALE_OUT_1_THRESHOLD,
+    UNDERLYING_STOP_CONFIRMING,
+    UNDERLYING_TECHNICAL_STOP_CONFIRMED,
+    OPTION_CATASTROPHIC_STOP,
 )
 from ap_exit_engine import _classify_exit_decision
 
@@ -138,9 +141,18 @@ def _make_pos(
 
 
 def _et_noon():
-    """Return noon ET as a naive datetime for evaluate_exit()."""
+    """Return a deterministic, non-future ET session clock.
+
+    The exit engine intentionally uses a caller-supplied ET instant for quote
+    freshness and confirmation replay.  Keep the synthetic session time at or
+    before the host wall clock so positions seeded with ``datetime.now()`` do
+    not become an accidental multi-hour stale-quote fixture before 10:00 ET.
+    """
     from zoneinfo import ZoneInfo
-    return datetime.now(ZoneInfo("America/New_York")).replace(
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if (now_et.hour, now_et.minute, now_et.second) < (15, 55, 0):
+        now_et -= timedelta(days=1)
+    return now_et.replace(
         hour=12, minute=0, second=0, microsecond=0
     )
 
@@ -429,16 +441,31 @@ class TestEvaluateExitExecutableTruth:
         ), f"Got {decision.reason_code}: {decision.reason}"
 
     """
-    Test 7: Fresh underlying that genuinely fails confirmation follows existing
-            non-confirmation classification (not a deferred code).
+    Test 7 (corrected): A fresh underlying observation AT/BEYOND the stored
+            technical stop is a genuine technical-stop breach, not a
+            soft-loss non-confirmation. PR #403 audit finding: the prior
+            version of this test used current_underlying == underlying_stop
+            (152.0 == default underlying_stop 152.0) for a PUT, which is
+            `price >= stop` — an actual breach — so it entered
+            UNDERLYING_STOP_CONFIRMING on the very first evaluation. The old
+            manually-armed `pos._stop_breach_ts` (soft-loss timer) was dead
+            code: evaluate_exit() returns from the technical-stop CONFIRMING
+            branch before the soft-loss section is ever reached, so the old
+            assertion ("not a deferred code") passed for the wrong reason.
+            This test now asserts the exact branch it actually proves. The
+            separate SOFT_LOSS_WATCH case (technical stop genuinely CLEAR)
+            is covered by
+            test_soft_loss_watch_when_technical_stop_clear_and_underlying_not_confirming
+            below.
     """
-    def test_genuine_underlying_nonconfirm_fires_soft_stop(self):
-        # PUT position: underlying went UP = thesis broken
+    def test_technical_stop_breach_on_fresh_underlying_enters_confirming(self):
+        # PUT position: underlying at/beyond the stored stop == technical
+        # stop breached (side-aware: PUT breach is price >= stop).
         pos = _make_pos(
             side="PUT",
             entry_price=1.00,
             underlying_entry=150.0,
-            current_underlying=152.0,   # UP from entry — PUT thesis broken
+            current_underlying=152.0,   # == default underlying_stop=152.0 -> breached
             current_bid=0.85,
             current_option_price=0.85,
             option_bid_valid=True,
@@ -448,16 +475,108 @@ class TestEvaluateExitExecutableTruth:
             underlying_fresh=True,
             touched_profit=False,
         )
-        # Manually arm the breach timestamp so we're past the confirmation window
-        from datetime import timezone as _tz
-        pos._stop_breach_ts = datetime.now(_tz.utc) - timedelta(seconds=60)
         now_et = _et_noon().replace(hour=10)
         decision = evaluate_exit(pos, now_et)
-        # Should fire THESIS_FAIL or SOFT_STOP, NOT a deferred code
+        assert decision.action == "HOLD", f"{decision.action}: {decision.reason}"
+        assert decision.reason_code == UNDERLYING_STOP_CONFIRMING, (
+            f"Got {decision.reason_code}: {decision.reason}"
+        )
+        assert pos._underlying_stop_breach_ts is not None, (
+            "technical-stop breach timer must be armed on first fresh breach"
+        )
         assert decision.reason_code not in (
             SOFT_EXIT_DEFERRED_UNDERLYING_UNAVAILABLE,
             SOFT_EXIT_DEFERRED_UNDERLYING_STALE,
         ), f"Got deferred code: {decision.reason_code}"
+
+    """
+    Test 7b: SOFT_LOSS_WATCH / HOLD — the intended replacement for the
+            removed THESIS_FAIL_SOFT_STOP -> CLOSE_ALL path (see
+            docs/pr_specs/p0_underlying_authoritative_exit_geometry.md).
+
+            Constructed so the technical stop is genuinely CLEAR (the
+            underlying is strictly on the safe side of the stored stop —
+            not equal to it), the soft-loss confirmation timer has matured
+            past its window using the real production mechanism (two real
+            evaluate_exit() calls separated in evaluation-clock time, not a
+            manually-armed timestamp), and _underlying_still_confirming()
+            genuinely returns False because the underlying has moved
+            against the entry by more than 0.5%. No higher-priority target,
+            catastrophic-stop, EOD, winner-protection, or never-green
+            branch is eligible in this fixture.
+    """
+    def test_soft_loss_watch_when_technical_stop_clear_and_underlying_not_confirming(self):
+        now_et = _et_noon().replace(hour=10)
+        now_et_utc = now_et.astimezone(_UTC)
+
+        # Anchor opened_at and quote timestamps to the SAME synthetic
+        # evaluation-clock domain as now_et (not real wall-clock). The
+        # engine's _evaluation_now_utc() falls back to real wall-clock
+        # whenever a position timestamp is materially ahead of the
+        # caller-supplied now_et; using _fresh_ts()'s real-wallclock
+        # default here would silently collapse the intended 46s
+        # confirmation gap between the two evaluate_exit() calls below.
+        pos = _make_pos(
+            side="CALL",
+            entry_price=1.00,
+            underlying_entry=150.0,
+            underlying_target=160.0,
+            underlying_stop=145.0,       # CALL stop is BELOW entry
+            current_underlying=148.0,    # strictly ABOVE stop (145) -> technical stop CLEAR
+            current_bid=0.85,            # exec P&L = -15% (soft-loss zone, above -20% deep floor)
+            current_option_price=0.85,
+            option_bid_valid=True,
+            option_quote_fresh=True,
+            exit_executable_pnl_pct=-0.15,
+            underlying_available=True,
+            underlying_fresh=True,
+            touched_profit=False,
+            opened_at=now_et_utc - timedelta(minutes=10),
+            und_ts=now_et_utc - timedelta(seconds=2),
+            opt_ts=now_et_utc - timedelta(seconds=2),
+        )
+
+        # First evaluation: soft-loss policy stamps its own confirmation
+        # timer. The technical-stop breach timer must stay unarmed because
+        # 148.0 has not crossed the stored stop of 145.0.
+        first = evaluate_exit(pos, now_et)
+        assert first.action == "HOLD", f"{first.action}: {first.reason}"
+        assert first.reason_code == "SOFT_LOSS_CONFIRMING", (
+            f"Got {first.reason_code}: {first.reason}"
+        )
+        assert pos._underlying_stop_breach_ts is None, (
+            "technical stop must remain CLEAR — no breach timer should be armed"
+        )
+
+        # Second evaluation, past the soft-loss confirmation window (45s
+        # default). Refresh the quote timestamps to remain fresh at the
+        # new synthetic instant (mirrors QPM re-polling every cycle); the
+        # underlying value itself is unchanged and still strictly clear of
+        # the stop, still not confirming direction per
+        # _underlying_still_confirming().
+        second_et = now_et + timedelta(seconds=46)
+        second_et_utc = second_et.astimezone(_UTC)
+        pos.last_underlying_quote_update_ts = second_et_utc - timedelta(seconds=2)
+        pos.lastunderlyingquoteupdatets = pos.last_underlying_quote_update_ts
+        pos.last_option_quote_update_ts = second_et_utc - timedelta(seconds=2)
+        pos.lastoptionquoteupdatets = pos.last_option_quote_update_ts
+        pos.last_option_bid_update_ts = second_et_utc - timedelta(seconds=2)
+        pos.lastoptionbidupdatets = pos.last_option_bid_update_ts
+        decision = evaluate_exit(pos, second_et)
+
+        assert decision.action == "HOLD", f"{decision.action}: {decision.reason}"
+        assert decision.reason_code == "SOFT_LOSS_WATCH", (
+            f"Got {decision.reason_code}: {decision.reason}"
+        )
+        assert pos._underlying_stop_breach_ts is None, (
+            "technical stop must remain CLEAR throughout"
+        )
+        assert decision.reason_code != "THESIS_FAIL_SOFT_STOP"
+        assert decision.reason_code != UNDERLYING_STOP_CONFIRMING
+        assert decision.reason_code != UNDERLYING_TECHNICAL_STOP_CONFIRMED
+        assert decision.reason_code != OPTION_CATASTROPHIC_STOP
+        assert "SOFT_LOSS_WATCH" in decision.reason
+        assert "stored underlying stop not confirmed" in decision.reason
 
     """
     Test 8: Entry grace protects young loss exits without suppressing winners
@@ -4002,7 +4121,7 @@ class TestJasonBacReplay:
         eng._positions_by_id = {pos.position_id: pos}
 
         # 10 AM ET — safely outside any EOD pre-gate window.
-        now_et = datetime.now(_ZI("America/New_York")).replace(
+        now_et = _et_noon().replace(
             hour=10, minute=0, second=0, microsecond=0,
         )
         eng._check_all_positions(now_et=now_et)
@@ -4141,8 +4260,7 @@ class TestHardStopAuthorityResolver:
         """EOD force close is independent of quote availability."""
         pos = self._paper_pos_stale_last()
         # Push past 3:50 PM ET.
-        from zoneinfo import ZoneInfo
-        et_now = datetime.now(ZoneInfo("America/New_York")).replace(
+        et_now = _et_noon().replace(
             hour=15, minute=55, second=0, microsecond=0
         )
         decision = evaluate_exit(pos, et_now)
