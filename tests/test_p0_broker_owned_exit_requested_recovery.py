@@ -3493,6 +3493,64 @@ def test_production_scale_out_qty_mismatch_holds_before_osm_and_broker():
     assert broker.session.post.call_count == 0
 
 
+def test_production_close_callback_returns_broker_identity_for_adoption():
+    """CLOSE_ALL must preserve broker ownership across local persistence gaps."""
+    from ap_exit_engine import ExitDecision, ManagedPosition
+    from ap_execution_core import APExecutionCore
+
+    broker_owned_gap = {
+        "ok": False,
+        "local_order_id": "exit-close-gap-425",
+        "broker_order_id": "broker-close-gap-425",
+        "status": "ERROR",
+        "error": "exit_submitted_transition_failed_after_broker_accept",
+        "split_brain": True,
+    }
+    osm = SimpleNamespace(submit_exit=MagicMock(return_value=broker_owned_gap))
+    core = APExecutionCore.__new__(APExecutionCore)
+    core._pos_lock = threading.RLock()
+    core._position_count = 1
+    core._sector_lock = threading.RLock()
+    core._sector_counts = {"OTHER": 1}
+    core.paper = True
+    core.order_state_machine = osm
+    core.broker = MagicMock()
+    pos = ManagedPosition(
+        ticker="ORCL",
+        option_symbol="ORCL260807P00155000",
+        side="PUT",
+        quantity=1,
+        entry_price=1.00,
+        underlying_entry=155.00,
+        underlying_target=150.00,
+        underlying_stop=158.00,
+        position_id="position-close-gap-425",
+        client_id="tradefluence",
+        current_option_price=1.20,
+        current_bid=1.15,
+        current_ask=1.25,
+        current_underlying=153.00,
+        quantity_remaining=1,
+        pending_exit_local_order_id="exit-close-gap-425",
+    )
+    pos.signal = {"signal_id": "signal-close-gap-425"}
+    decision = ExitDecision(
+        action="CLOSE_ALL",
+        quantity=1,
+        reason="HARD STOP",
+        urgency="HIGH",
+        reason_code="HARD_STOP",
+        suggested_limit=1.15,
+    )
+
+    result = core._on_position_close(pos, decision)
+
+    assert result == broker_owned_gap
+    assert result["local_order_id"] == "exit-close-gap-425"
+    assert result["broker_order_id"] == "broker-close-gap-425"
+    osm.submit_exit.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("decision_qty", "reserved_qty"),
     [
