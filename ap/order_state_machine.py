@@ -5619,10 +5619,33 @@ class APOrderStateMachine:
                 execution_mode = None
 
         reserved_local_id = str(local_order_id or "").strip()
+        requested_qty = int(qty or 0)
         existing = self._get_active_exit_order(position_id)
         if existing:
             existing  = dict(existing)
             if reserved_local_id and str(existing.get("local_order_id") or "").strip() == reserved_local_id:
+                durable_qty = int(existing.get("qty") or 0)
+                if requested_qty <= 0 or durable_qty != requested_qty:
+                    error_msg = (
+                        "reserved_exit_quantity_mismatch:"
+                        f"{reserved_local_id}:durable={durable_qty}:requested={requested_qty}"
+                    )
+                    log.critical(
+                        "[%s] submit_exit BLOCKED -- reserved exit quantity mismatch | "
+                        "pos=%s local=%s durable_qty=%s requested_qty=%s",
+                        self.client_id,
+                        position_id,
+                        reserved_local_id,
+                        durable_qty,
+                        requested_qty,
+                    )
+                    return {
+                        "ok": False,
+                        "local_order_id": reserved_local_id,
+                        "broker_order_id": existing.get("broker_order_id"),
+                        "status": existing.get("status"),
+                        "error": error_msg,
+                    }
                 local_id = reserved_local_id
             else:
                 error_msg = (f"active_exit_already_exists:"
@@ -5644,7 +5667,6 @@ class APOrderStateMachine:
                 limit_price=limit_price, local_order_id=reserved_local_id or None,
                 execution_mode=execution_mode,
             )
-        requested_qty = int(qty or 0)
         broker_truth = resolve_exit_broker_truth(
             broker=broker,
             client_id=self.client_id,

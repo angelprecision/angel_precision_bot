@@ -1756,7 +1756,7 @@ def test_reserved_mode_mismatch_blocks_before_broker_callback(
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is False
     assert callback.call_count == 0
     assert osm.adopt_broker_owned_exit_request.call_count == 0
 
@@ -1775,7 +1775,7 @@ def test_malformed_reserved_durable_mode_blocks_before_broker_callback(
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is False
     assert callback.call_count == 0
     assert osm.adopt_broker_owned_exit_request.call_count == 0
 
@@ -1791,7 +1791,7 @@ def test_unproven_runtime_mode_blocks_before_broker_callback():
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is False
     assert callback.call_count == 0
     assert osm.adopt_broker_owned_exit_request.call_count == 0
 
@@ -1817,7 +1817,7 @@ def test_reserved_identity_mismatch_blocks_before_broker_callback(field, value):
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is False
     assert callback.call_count == 0
     assert osm.adopt_broker_owned_exit_request.call_count == 0
 
@@ -1849,7 +1849,7 @@ def test_reserved_local_id_is_only_a_pointer_when_active_row_is_missing():
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is False
     assert callback.call_count == 0
 
 
@@ -1879,7 +1879,7 @@ def test_live_submit_fails_closed_when_active_exit_lookup_raises():
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is False
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is False
     assert callback.call_count == 0
 
 
@@ -1928,7 +1928,7 @@ def test_exact_reserved_mode_allows_one_broker_submit_and_adoption(
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is True
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is True
     assert callback_calls == [True]
     osm.adopt_broker_owned_exit_request.assert_called_once()
     assert osm.adopt_broker_owned_exit_request.call_args.kwargs["execution_mode"] == durable_mode
@@ -1981,7 +1981,7 @@ def test_post_acceptance_mode_conflict_quarantines_broker_owned_claim(
         )
     )
 
-    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", should_act=True)) is True
+    assert wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True)) is True
     assert callback_calls == [True]
     osm.adopt_broker_owned_exit_request.assert_not_called()
     assert updates[0][1]["claim_state"] == guard._CLAIM_STATE_BROKER_OWNED
@@ -2139,7 +2139,7 @@ def test_submit_wrapper_reconciles_callback_exception_before_reraising(monkeypat
     )
 
     with pytest.raises(RuntimeError, match="submit response uncertain"):
-        wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=1, should_act=True))
+        wrapped(engine, pos, SimpleNamespace(action="SCALE_OUT", quantity=4, should_act=True))
 
     adoption.assert_called_once()
     assert adoption.call_args.kwargs["broker_order_id"] == "broker-uncertain-1"
@@ -2159,7 +2159,7 @@ def test_submit_wrapper_broker_identity_conflict_keeps_claim_unresolved(monkeypa
         "broker_order_id": "",
         "status": "EXIT_REQUESTED",
         "position_id": pos.position_id,
-        "qty": 4,
+        "qty": 1,
         "execution_mode": "paper",
     }
     osm = _GuardOSM(active_order)
@@ -2461,7 +2461,7 @@ def test_idempotency_claim_stays_broker_owned_on_adoption_gap(monkeypatch):
         "kind": "EXIT",
         "status": "EXIT_REQUESTED",
         "broker_order_id": "",
-        "qty": 4,
+        "qty": 1,
         "execution_mode": "paper",
     }
 
@@ -3139,6 +3139,266 @@ def test_blocker1_fresh_intent_terminalized_before_callback_blocks_broker_post(
     assert proof["osm"].adopt_count == 0
     assert proof["claim_updates"] == []
     assert proof["osm"].row["status"] == "EXIT_FILLED"
+
+
+def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkeypatch):
+    """Drive APExitEngine -> APExecutionCore._on_position_scale -> real OSM submit."""
+    import ap.exit_safety as exit_safety_module
+    from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition
+    from ap_execution_core import APExecutionCore
+
+    reserved_id = "exit-scale-production-425"
+    broker_id = "broker-scale-production-425"
+
+    class _ProductionScaleOSM:
+        submit_exit = APOrderStateMachine.submit_exit
+
+        def __init__(self):
+            self.client_id = "tradefluence"
+            self.row = None
+            self.create_calls = []
+            self.transitions = []
+            self.adopt_calls = []
+
+        def create_exit_order(self, **kwargs):
+            self.create_calls.append(dict(kwargs))
+            assert kwargs["local_order_id"] == reserved_id
+            self.row = {
+                "client_id": self.client_id,
+                "local_order_id": reserved_id,
+                "broker_order_id": "",
+                "position_id": kwargs["position_id"],
+                "kind": "EXIT",
+                "contract": kwargs["contract"],
+                "symbol": kwargs["symbol"],
+                "direction": kwargs["direction"],
+                "qty": kwargs["qty"],
+                "status": "EXIT_REQUESTED",
+                "execution_mode": kwargs["execution_mode"],
+                "meta": {},
+            }
+            return reserved_id
+
+        def get_active_exit_order(self, position_id):
+            if self.row and self.row["position_id"] == position_id:
+                return dict(self.row)
+            return None
+
+        def _get_active_exit_order(self, position_id):
+            return self.get_active_exit_order(position_id)
+
+        def get_order(self, local_order_id):
+            if self.row and self.row["local_order_id"] == local_order_id:
+                return dict(self.row)
+            return None
+
+        def update_order_meta(self, local_order_id, patch):
+            assert self.row and local_order_id == self.row["local_order_id"]
+            self.row["meta"].update(dict(patch))
+            return True
+
+        def transition(self, local_order_id, new_status, **kwargs):
+            assert self.row and local_order_id == self.row["local_order_id"]
+            self.transitions.append((local_order_id, new_status, dict(kwargs)))
+            self.row["status"] = new_status
+            if kwargs.get("broker_order_id"):
+                self.row["broker_order_id"] = str(kwargs["broker_order_id"])
+            return True
+
+        def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
+            self.adopt_calls.append((local_order_id, dict(kwargs)))
+            assert local_order_id == reserved_id
+            assert kwargs["expected_qty"] == 1
+            return {
+                "disposition": "ALREADY_BROKER_OWNED_ACTIVE",
+                "adopted": False,
+                "already_broker_owned": True,
+            }
+
+        def retire_unsubmitted_exit_intent(self, local_order_id, *, last_error):
+            raise AssertionError(
+                f"successful scale reservation must not retire: {local_order_id} {last_error}"
+            )
+
+        @staticmethod
+        def _resolve_underlying_symbol(*, symbol, contract):
+            return symbol
+
+        @staticmethod
+        def _is_broker_accept_status(status):
+            return status in {"open", "pending", "accepted", "ok"}
+
+        @staticmethod
+        def _emit_transition_event(**_kwargs):
+            return None
+
+        @staticmethod
+        def _flag_split_brain_order(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def _lookup_order_by_tag(*_args, **_kwargs):
+            return None
+
+    osm = _ProductionScaleOSM()
+    broker = MagicMock()
+    broker.base_url = "https://sandbox.tradier.com"
+    broker.account_id = "paper-account"
+    response = MagicMock(status_code=200, text="")
+    response.json.return_value = {
+        "order": {"id": broker_id, "status": "open"}
+    }
+    broker.session.post.return_value = response
+
+    monkeypatch.setattr(
+        exit_safety_module,
+        "resolve_exit_broker_truth",
+        lambda **_kwargs: {
+            "is_fresh_exact": True,
+            "broker_truth_open_qty": 4,
+            "audit": {},
+        },
+    )
+    monkeypatch.setattr(
+        exit_safety_module,
+        "evaluate_exit_submission_safety",
+        lambda **_kwargs: {"blocked": False, "reason": None},
+    )
+    monkeypatch.setattr(
+        osm_module,
+        "resolve_exit_broker_truth",
+        exit_safety_module.resolve_exit_broker_truth,
+    )
+    monkeypatch.setattr(
+        osm_module,
+        "evaluate_exit_submission_safety",
+        exit_safety_module.evaluate_exit_submission_safety,
+    )
+
+    pos = ManagedPosition(
+        ticker="ORCL",
+        option_symbol="ORCL260807P00155000",
+        side="PUT",
+        quantity=4,
+        entry_price=1.00,
+        underlying_entry=155.00,
+        underlying_target=150.00,
+        underlying_stop=158.00,
+        position_id="position-scale-production-425",
+        client_id="tradefluence",
+        execution_mode="paper",
+        current_option_price=1.20,
+        current_bid=1.15,
+        current_ask=1.25,
+        current_underlying=153.00,
+        quantity_remaining=4,
+        last_option_quote_update_ts=datetime.now(timezone.utc),
+    )
+    pos.signal = {"signal_id": "signal-scale-production-425"}
+    decision = ExitDecision(
+        action="SCALE_OUT",
+        quantity=1,
+        reason="TP SCALE OUT",
+        urgency="NORMAL",
+        pnl_pct=0.20,
+    )
+
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.order_state_machine = osm
+    core.broker = broker
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._lock = threading.RLock()
+    engine._positions = [pos]
+    engine._positions_by_id = {pos.position_id: pos}
+    engine.client_id = "tradefluence"
+    engine._email = "tradefluence"
+    engine.master_control = SimpleNamespace(mode="paper")
+    engine.broker = broker
+    engine.order_state_machine = osm
+    engine.osm = None
+    engine.on_scale = core._on_position_scale
+    engine.on_exit = None
+    engine._can_submit_exit = lambda *_args, **_kwargs: True
+    engine._clear_degraded_monitoring_state = lambda *_args, **_kwargs: None
+    engine._emit_exit_event = lambda *_args, **_kwargs: None
+    engine._emit_degraded_critical = lambda *_args, **_kwargs: None
+    engine._mark_exit_submitted = lambda active_pos, active_decision, **kwargs: (
+        setattr(active_pos, "exit_in_flight", True),
+        setattr(active_pos, "pending_exit_action", active_decision.action),
+        setattr(active_pos, "pending_exit_qty", active_decision.quantity),
+        setattr(
+            active_pos,
+            "pending_exit_local_order_id",
+            str(kwargs.get("local_order_id") or ""),
+        ),
+        setattr(
+            active_pos,
+            "pending_exit_broker_order_id",
+            str(kwargs.get("broker_order_id") or ""),
+        ),
+    )
+
+    monkeypatch.setattr(
+        guard,
+        "uuid",
+        SimpleNamespace(uuid4=lambda: reserved_id),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        lambda *_args: ("tradefluence|position-scale-production-425|4|1", 1),
+    )
+    monkeypatch.setattr(
+        guard,
+        "_claim_durable_decision_generation",
+        lambda **kwargs: {
+            "claimed": True,
+            "local_order_id": kwargs["local_order_id"],
+        },
+    )
+    claim_updates = []
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: claim_updates.append(
+            (generation_key, dict(kwargs))
+        ),
+    )
+
+    original_submit = getattr(
+        APExitEngine,
+        guard._ORIGINAL_SUBMIT_ATTR,
+        APExitEngine._submit_exit_decision,
+    )
+    result = guard.wrap_submit(original_submit)(engine, pos, decision)
+
+    assert result is True
+    assert len(osm.create_calls) == 1
+    assert osm.create_calls[0]["qty"] == 1
+    assert osm.row["local_order_id"] == reserved_id
+    assert osm.row["qty"] == 1
+    assert osm.row["broker_order_id"] == broker_id
+    assert broker.session.post.call_count == 1
+    posted = broker.session.post.call_args.kwargs["data"]
+    assert posted["quantity"] == 1
+    assert posted["tag"] == osm_module.canonical_broker_submit_key(reserved_id)
+    assert osm.adopt_calls == [
+        (
+            reserved_id,
+            {
+                "broker_order_id": broker_id,
+                "execution_mode": "paper",
+                "client_id": "tradefluence",
+                "position_id": pos.position_id,
+                "expected_qty": 1,
+                "broker_submitted_ts": None,
+                "source": "exit_decision_callback",
+            },
+        )
+    ]
+    assert claim_updates[-1][1]["local_order_id"] == reserved_id
+    assert claim_updates[-1][1]["broker_order_id"] == broker_id
 
 
 def test_blocker1_fresh_exact_requested_intent_reaches_callback_once(monkeypatch):

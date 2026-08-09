@@ -1286,7 +1286,7 @@ def test_submit_wrapper_allows_exact_reserved_exit_request_through_fence(
             "local_order_id": "exit-local-reserved",
             "broker_order_id": "",
             "position_id": pos.position_id,
-            "qty": pos.quantity_remaining,
+            "qty": _decision().quantity,
             "execution_mode": "live",
         },
     )

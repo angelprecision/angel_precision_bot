@@ -9916,12 +9916,60 @@ class APExecutionCore:
         )
         _sig_id = str(getattr(pos, "signal", {}).get("signal_id", "") or "")
 
+        def _scale_rejected(error: str, local_order_id: str = "") -> dict:
+            return {
+                "ok": False,
+                "accepted": False,
+                "local_order_id": str(local_order_id or ""),
+                "broker_order_id": None,
+                "status": "EXIT_REQUESTED" if local_order_id else "SCALE_BLOCKED",
+                "error": error,
+            }
+
         if self.order_state_machine and pos.position_id:
+            _reserved_local_order_id = str(
+                getattr(decision, "reserved_local_order_id", "") or ""
+            ).strip()
+            _reserved_scale_qty = getattr(decision, "reserved_exit_quantity", None)
+            try:
+                _reserved_scale_qty = int(_reserved_scale_qty)
+                _decision_scale_qty = int(decision.quantity)
+            except (TypeError, ValueError):
+                log.critical(
+                    "[%s] SCALE BLOCKED — reserved exit quantity is invalid | local=%s reserved_qty=%r decision_qty=%r",
+                    pos.ticker,
+                    _reserved_local_order_id,
+                    _reserved_scale_qty,
+                    getattr(decision, "quantity", None),
+                )
+                return _scale_rejected(
+                    "reserved_exit_quantity_invalid",
+                    _reserved_local_order_id,
+                )
+            if (
+                not _reserved_local_order_id
+                or _reserved_scale_qty <= 0
+                or _reserved_scale_qty != _decision_scale_qty
+            ):
+                log.critical(
+                    "[%s] SCALE BLOCKED — reserved exit identity mismatch | local=%s reserved_qty=%s decision_qty=%s",
+                    pos.ticker,
+                    _reserved_local_order_id,
+                    _reserved_scale_qty,
+                    _decision_scale_qty,
+                )
+                return _scale_rejected(
+                    "reserved_exit_identity_mismatch",
+                    _reserved_local_order_id,
+                )
             _scale_bid   = getattr(pos, "current_bid", 0) or 0
             _scale_mid   = getattr(pos, "current_option_price", 0) or 0
             if _scale_bid <= 0 and _scale_mid <= 0:
                 log.critical("[%s] SCALE BLOCKED — no valid bid or mid for scale-out", pos.ticker)
-                return
+                return _scale_rejected(
+                    "scale_exit_price_unavailable",
+                    _reserved_local_order_id,
+                )
             _scale_limit = _scale_bid if _scale_bid > 0 else max(round(_scale_mid - 0.01, 2), 0.01)
             scale_res = self.order_state_machine.submit_exit(
                 broker      = self.broker,
@@ -9929,28 +9977,30 @@ class APExecutionCore:
                 contract    = pos.option_symbol,
                 symbol      = pos.ticker,
                 direction   = pos.side,
-                qty         = decision.quantity,
+                qty         = _reserved_scale_qty,
                 limit_price = _scale_limit,
                 signal_id   = _sig_id or None,
+                local_order_id = _reserved_local_order_id,
             )
             if scale_res["ok"]:
                 log.info(
                     f"[{pos.ticker}] Scale exit submitted | "
                     f"local={scale_res['local_order_id']} broker={scale_res['broker_order_id']} "
-                    f"qty={decision.quantity} @ ${_scale_limit:.2f}"
+                    f"qty={_reserved_scale_qty} @ ${_scale_limit:.2f}"
                 )
+                return scale_res
             else:
                 log.error(
                     f"[{pos.ticker}] Scale exit failed via OSM | "
                     f"order={scale_res['local_order_id']} error={scale_res['error']}"
                 )
-                return
+                return scale_res
         else:
             log.critical(
                 f"[{pos.ticker}] SCALE BLOCKED — OSM or position_id missing; "
                 "cannot submit scale-out through production authority"
             )
-            return
+            return _scale_rejected("scale_exit_authority_unavailable")
 
     # ── BROKER HELPERS ────────────────────────────────────────────────────────
 

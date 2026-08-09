@@ -251,6 +251,7 @@ def _is_exact_reserved_exit_intent(
     active_order: dict | None,
     *,
     expected_client_id: str,
+    expected_qty: int | None = None,
 ) -> bool:
     """Prove a reserved EXIT row belongs to this exact runtime submission."""
     if not isinstance(active_order, dict):
@@ -279,7 +280,10 @@ def _is_exact_reserved_exit_intent(
         return False
     if active_order.get("broker_order_id") not in (None, ""):
         return False
-    if (_int(active_order.get("qty"), 0) or 0) <= 0:
+    durable_qty = _int(active_order.get("qty"), 0) or 0
+    if durable_qty <= 0:
+        return False
+    if expected_qty is not None and durable_qty != expected_qty:
         return False
     if bool(getattr(pos, "exit_in_flight", False)):
         return False
@@ -292,6 +296,7 @@ def _ensure_local_exit_intent_row(
     *,
     generation_key: str,
     exit_generation: int,
+    requested_qty: int,
 ) -> str:
     # A pending id is only a lookup pointer. wrap_submit revalidates the
     # durable row immediately before the broker callback.
@@ -307,7 +312,7 @@ def _ensure_local_exit_intent_row(
     contract = str(getattr(pos, "option_symbol", "") or "").strip()
     symbol = str(getattr(pos, "ticker", "") or "").strip()
     direction = str(getattr(pos, "side", "") or "").strip()
-    qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
+    qty = _int(requested_qty, 0) or 0
     execution_mode = _execution_mode(engine, pos).lower()
     if (
         not position_id
@@ -1534,6 +1539,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
         ).strip()
         position_id = str(getattr(pos, "position_id", "") or "")
         remaining_qty = _int(getattr(pos, "quantity_remaining", 0), 0) or 0
+        requested_qty = _int(getattr(decision, "quantity", 0), 0) or 0
         with self._lock:
             claims = getattr(self, "_ap_exit_submit_claims", None)
             if claims is None:
@@ -1583,6 +1589,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                 pos,
                 active_order,
                 expected_client_id=resolved_client,
+                expected_qty=requested_qty if _decision_should_act(decision) else None,
             ):
                 try:
                     _mark_active_exit_owned(self, pos, active_order)
@@ -1626,6 +1633,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         pos,
                         generation_key=generation_key,
                         exit_generation=exit_generation,
+                        requested_qty=requested_qty,
                     )
                     if not local_order_id and _durable_claim_outage_blocks_submit(self, pos):
                         log.critical(
@@ -1727,6 +1735,7 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                             pos,
                             active_order,
                             expected_client_id=resolved_client,
+                            expected_qty=requested_qty,
                         ):
                             try:
                                 _mark_active_exit_owned(self, pos, active_order or {})
@@ -1744,6 +1753,24 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                                 local_order_id,
                             )
                             return False
+
+                    # Carry the exact durable reservation across the real
+                    # APExitEngine callback boundary.  SCALE_OUT must reuse
+                    # this local identity and this quantity; otherwise OSM
+                    # sees its own EXIT_REQUESTED row as a competing exit or
+                    # submits a quantity that is not bound to durable state.
+                    try:
+                        decision.reserved_local_order_id = str(local_order_id or "").strip()
+                        decision.reserved_exit_quantity = int(requested_qty)
+                    except Exception:
+                        log.critical(
+                            "[%s] EXIT_DECISION_RESERVED_CALLBACK_IDENTITY_UNAVAILABLE position=%s local_order_id=%s qty=%s",
+                            getattr(pos, "ticker", ""),
+                            position_id,
+                            local_order_id,
+                            requested_qty,
+                        )
+                        return False
 
             callback_attr = (
                 "on_scale"
