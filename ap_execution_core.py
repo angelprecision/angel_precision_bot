@@ -145,6 +145,7 @@ MAX_POSITIONS       = int(os.getenv("MAX_POSITIONS", "7"))
 from ap.selector_retry_policy import (
     RETRYABLE_BREACH_SELECTOR_REASONS,
     is_retryable_selector_reason as _is_retryable_selector_reason,  # noqa: F401 – re-exported
+    is_operational_request_budget_reason as _is_operational_request_budget_reason,
 )
 # NOTE: NO_VALID_PLAYBOOK_DTE_CONTRACT is NOT in RETRYABLE_BREACH_SELECTOR_REASONS.
 # It is the DTE-ladder aggregation reason and may reflect structural quality
@@ -1011,15 +1012,30 @@ def _build_deferred_retry_schedule_meta(
     try:
         from ap.selector_retry_policy import classify_retry_reason_taxonomy
         _last_quality = None
+        _audit_operational_reason = None
         if isinstance(selector_audit, dict):
             _last_quality = (
                 selector_audit.get("last_candidate_reject_reason")
                 or selector_audit.get("best_candidate_reject_reason")
                 or selector_audit.get("last_reject_reason")
             )
+            _candidate_operational_reason = selector_audit.get("operational_reason")
+            if _is_operational_request_budget_reason(_candidate_operational_reason):
+                _audit_operational_reason = str(_candidate_operational_reason).strip()
         _taxonomy = classify_retry_reason_taxonomy(
             reason_code, last_candidate_quality_reason=_last_quality,
         )
+        # The selector may have reduced a request-budget stop to a different
+        # canonical retry reason (for example, a zero-quote data miss). Keep
+        # the operational dimension from the selector audit when carrying the
+        # attempt into the durable retry row.
+        if _audit_operational_reason:
+            _taxonomy = dict(_taxonomy)
+            _taxonomy.update({
+                "retry_class": "OPERATIONAL_REQUEST_BUDGET",
+                "operational_reason": _audit_operational_reason,
+                "may_retry_with_fresh_budget": True,
+            })
     except Exception:
         _taxonomy = {
             "reason_code": str(reason_code or ""),
@@ -1029,6 +1045,11 @@ def _build_deferred_retry_schedule_meta(
             "operational_reason": None,
             "may_retry_with_fresh_budget": False,
         }
+    _selector_canonical_reason = None
+    if isinstance(selector_audit, dict):
+        _selector_canonical_reason = str(
+            selector_audit.get("canonical_selector_reason") or ""
+        ).strip() or None
     return {
         "deferred_retry_scheduled": True,
         "deferred_retry_reason_code": str(reason_code or ""),
@@ -1066,7 +1087,13 @@ def _build_deferred_retry_schedule_meta(
         # P0 §5: honest taxonomy — both operational and candidate-quality
         # dimensions preserved together on the durable row.
         "retry_class": _taxonomy["retry_class"],
-        "selector_terminal_reason": _taxonomy["selector_terminal_reason"],
+        # Prefer the selector's explicit canonical reduction. The taxonomy
+        # fallback remains for legacy callers that only supplied a raw
+        # reason_code plus last-candidate quality evidence.
+        "selector_terminal_reason": (
+            _selector_canonical_reason
+            or _taxonomy["selector_terminal_reason"]
+        ),
         "operational_reason": _taxonomy["operational_reason"],
         "may_retry_with_fresh_budget": _taxonomy["may_retry_with_fresh_budget"],
     }
@@ -5493,6 +5520,8 @@ class APExecutionCore:
                     caller-supplied override values.
                     override_reason_code is used when the selector succeeded
                     but post-selection validation failed (DEFERRED unresolved).
+                    The returned last-error label remains
+                    ``breach_time_contract_selection:<canonical_reason>``.
                     """
                     _sf = None
                     _rc = None
@@ -5517,17 +5546,127 @@ class APExecutionCore:
                     if override_stage:
                         _st = override_stage
 
-                    _error = (
-                        f"breach_time_contract_selection:{_rc}"
-                        if _rc
-                        else "breach_time_contract_selection_no_result"
-                    )
                     import datetime as _dt
                     _sf_dict = _sf if isinstance(_sf, dict) else {}
+                    _plan_meta = (
+                        approved_plan.get("metadata")
+                        if isinstance(approved_plan, dict)
+                        else getattr(approved_plan, "metadata", None)
+                    )
+                    _attached_sf = (
+                        _plan_meta.get("selector_failure")
+                        if isinstance(_plan_meta, dict)
+                        else None
+                    )
+                    _attached_sf_dict = (
+                        _attached_sf if isinstance(_attached_sf, dict) else {}
+                    )
+
+                    def _text_reason(*values):
+                        for _value in values:
+                            if _value is None:
+                                continue
+                            _candidate = str(_value).strip()
+                            if _candidate:
+                                return _candidate
+                        return None
+
+                    def _failure_field(_name: str):
+                        return (
+                            _sf_dict.get(_name)
+                            or _attached_sf_dict.get(_name)
+                        )
+
+                    # The selector is the only reducer.  Its attached failure
+                    # carries the final canonical result; execution core may
+                    # preserve adjacent evidence and classify the lifecycle,
+                    # but it must not derive a new canonical reason from reject
+                    # buckets, best-candidate payloads, or the last raw event.
+                    _attached_reason = _text_reason(
+                        _attached_sf_dict.get("reason_code")
+                    )
+                    _explicit_canonical_reason = _text_reason(
+                        _attached_sf_dict.get("canonical_selector_reason"),
+                        _sf_dict.get("canonical_selector_reason"),
+                    )
+                    if override_reason_code:
+                        _canonical_selector_reason = str(override_reason_code).strip()
+                    else:
+                        _canonical_selector_reason = _text_reason(
+                            _explicit_canonical_reason,
+                            _attached_reason,
+                            _sf_dict.get("reason_code"),
+                        )
+
+                    _last_observed_selector_reason = _text_reason(
+                        _attached_sf_dict.get("last_observed_selector_reason"),
+                        _sf_dict.get("last_observed_selector_reason"),
+                        _rc,
+                        _attached_reason,
+                    )
+                    _operational_reason = _text_reason(
+                        _attached_sf_dict.get("operational_reason"),
+                        _sf_dict.get("operational_reason"),
+                    )
+                    if _operational_reason and not _is_operational_request_budget_reason(
+                        _operational_reason
+                    ):
+                        _operational_reason = None
+
+                    _explicit_last_candidate_reason = _text_reason(
+                        _attached_sf_dict.get("last_candidate_reject_reason"),
+                        _sf_dict.get("last_candidate_reject_reason"),
+                    )
+                    _explicit_best_candidate_reason = _text_reason(
+                        _attached_sf_dict.get("best_candidate_reject_reason"),
+                        _sf_dict.get("best_candidate_reject_reason"),
+                    )
+                    _explicit_last_reject_reason = _text_reason(
+                        _attached_sf_dict.get("last_reject_reason"),
+                        _sf_dict.get("last_reject_reason"),
+                    )
+                    _selector_terminal_reason = _text_reason(
+                        _attached_sf_dict.get("selector_terminal_reason"),
+                        _sf_dict.get("selector_terminal_reason"),
+                        _canonical_selector_reason,
+                    )
+                    _best_rejected = _failure_field("best_rejected_candidate")
+                    _best_candidate_reason = _explicit_best_candidate_reason
+                    _top_reject_buckets = _failure_field("top_reject_buckets")
+                    _last_quality_reason = _text_reason(
+                        _explicit_last_candidate_reason,
+                        _explicit_best_candidate_reason,
+                        _explicit_last_reject_reason,
+                    )
+                    _error = (
+                        f"breach_time_contract_selection:{_canonical_selector_reason}"
+                        if _canonical_selector_reason
+                        else "breach_time_contract_selection_no_result"
+                    )
+
                     _audit: dict = {
-                        "reason_code":         _rc,
-                        "stage":               _st,
-                        "explanation":         _ex,
+                        # ``reason_code`` is the canonical reduced reason used
+                        # by the retry owner. Keep the final loop/event reason
+                        # separately so a later budget stop cannot overwrite a
+                        # proven terminal candidate-quality result.
+                        "reason_code":         _canonical_selector_reason,
+                        "canonical_selector_reason": _canonical_selector_reason,
+                        "last_observed_selector_reason": _last_observed_selector_reason,
+                        "last_candidate_reject_reason": (
+                            _explicit_last_candidate_reason or _last_quality_reason
+                        ),
+                        "best_candidate_reject_reason": (
+                            _explicit_best_candidate_reason
+                            or _best_candidate_reason
+                            or _last_quality_reason
+                        ),
+                        "last_reject_reason": (
+                            _explicit_last_reject_reason or _last_quality_reason
+                        ),
+                        "selector_terminal_reason": _canonical_selector_reason,
+                        "operational_reason": _operational_reason,
+                        "stage":               _st or _attached_sf_dict.get("stage"),
+                        "explanation":         _ex or _attached_sf_dict.get("explanation"),
                         "budget":              float(getattr(approved_plan, "max_position_usd", 0) or 0),
                         "ticker":              ticker,
                         "side":                str(getattr(approved_plan, "side", "") or ""),
@@ -5535,35 +5674,38 @@ class APExecutionCore:
                         "contract_before":     _contract_sym_raw or None,
                         "selected_contract":   _sel_contract or None,
                         "timestamp":           _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                        "raw_selector_reason": _sf_dict.get("raw_reason"),
+                        "raw_selector_reason": _failure_field("raw_reason"),
                         # P0 PR #302: pass through selector_failure fields that
                         # were previously lost (not included in audit dict).
-                        "chain_rows":            int(_sf_dict.get("chain_rows") or 0),
-                        "survivor_count":        int(_sf_dict.get("survivor_count") or 0),
-                        "top_reject_buckets":    _sf_dict.get("top_reject_buckets") or {},
-                        "best_rejected_candidate": _sf_dict.get("best_rejected_candidate"),
-                        "quote_source":          _sf_dict.get("quote_source") or "unknown",
-                        "tradier_base_url":      _sf_dict.get("tradier_base_url") or "",
-                        "sandbox_mode":          bool(_sf_dict.get("sandbox_mode", False)),
+                        "chain_rows":            int(_failure_field("chain_rows") or 0),
+                        "survivor_count":        int(_failure_field("survivor_count") or 0),
+                        "top_reject_buckets":    _top_reject_buckets or {},
+                        "best_rejected_candidate": _best_rejected,
+                        "selection_diagnostics": (
+                            _failure_field("selection_diagnostics") or {}
+                        ),
+                        "quote_source":          _failure_field("quote_source") or "unknown",
+                        "tradier_base_url":      _failure_field("tradier_base_url") or "",
+                        "sandbox_mode":          bool(_failure_field("sandbox_mode")),
                         # Fix 3: failure classification
-                        "selector_failure_class": _sf_dict.get("selector_failure_class"),
-                        "data_failure":           bool(_sf_dict.get("data_failure", False)),
-                        "quality_failure":        bool(_sf_dict.get("quality_failure", False)),
+                        "selector_failure_class": _failure_field("selector_failure_class"),
+                        "data_failure":           bool(_failure_field("data_failure")),
+                        "quality_failure":        bool(_failure_field("quality_failure")),
                         # Fix 4: chain quote validity
-                        "chain_quote_validity":   _sf_dict.get("selector_chain_quote_validity"),
+                        "chain_quote_validity":   _failure_field("selector_chain_quote_validity"),
                         "nonzero_quote_rows":     int(
-                            (_sf_dict.get("selector_chain_quote_validity") or {})
+                            (_failure_field("selector_chain_quote_validity") or {})
                             .get("rows_with_bid_and_ask_gt_zero") or 0
                         ),
                         "zero_quote_ratio":       float(
-                            (_sf_dict.get("selector_chain_quote_validity") or {})
+                            (_failure_field("selector_chain_quote_validity") or {})
                             .get("zero_quote_ratio") or 0.0
                         ),
                         # Fix 2: direct quote recovery
                         "direct_quote_recovery_attempted": bool(
-                            _sf_dict.get("direct_quote_recovery_attempted", False)),
+                            _failure_field("direct_quote_recovery_attempted")),
                         "direct_quote_recovery_selected":  bool(
-                            _sf_dict.get("direct_quote_recovery_selected", False)),
+                            _failure_field("direct_quote_recovery_selected")),
                     }
                     # P0 (2026-07-02): config provability. Production ran for
                     # multiple sessions with the DTE ladder silently disabled

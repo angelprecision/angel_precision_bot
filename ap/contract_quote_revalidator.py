@@ -125,6 +125,10 @@ _CHAIN_REJECT_REASONS_TO_REVALIDATE = frozenset({
     "missing_bid_ask",
     "low_volume_0",
     "low_oi_0",
+    # A valid-price duplicate OCC is not authoritative until one normalized
+    # direct quote resolves the conflict. The selector invokes the same
+    # bounded revalidator once for the whole normalized OCC group.
+    "DUPLICATE_QUOTE_CONFLICT",
 })
 
 
@@ -864,6 +868,14 @@ def revalidate_with_direct_quote(
         "direct_bid":                      None,
         "direct_ask":                      None,
         "direct_mid":                      None,
+        "direct_volume":                   None,
+        "direct_open_interest":            None,
+        # The deployed Tradier quote adapter requests greeks=false. Keep the
+        # absence explicit so duplicate-delta authority fails closed rather
+        # than being inferred from a chain representation.
+        "direct_delta":                    None,
+        "direct_bid_size":                 None,
+        "direct_ask_size":                 None,
         "direct_quote_age_ms":             None,
         "direct_quote_fetch_latency_ms":   None,
         "direct_quote_fetched_at":         None,
@@ -995,6 +1007,10 @@ def revalidate_with_direct_quote(
             audit["direct_mid"] = (float(quote["bid"]) + float(quote["ask"])) / 2.0
         except (TypeError, ValueError):
             audit["direct_mid"] = None
+    audit["direct_volume"] = quote.get("volume")
+    audit["direct_open_interest"] = quote.get("open_interest")
+    audit["direct_bid_size"] = quote.get("bid_size")
+    audit["direct_ask_size"] = quote.get("ask_size")
 
     if not direct_quote_is_valid(quote):
         _ctx_persist_attempt(

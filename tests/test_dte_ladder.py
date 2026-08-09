@@ -375,6 +375,169 @@ class TestLadderRouting:
         assert result is None
         assert sel._last_failure["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
         assert plan.metadata["selector_failure"]["reason_code"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        failure = plan.metadata["selector_failure"]
+        assert failure["canonical_selector_reason"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert failure["last_observed_selector_reason"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert failure["selector_terminal_reason"] == "CHAIN_PROVIDER_EMPTY_EXPIRATIONS"
+        assert failure["operational_reason"] is None
+
+    def test_ladder_budget_failure_preserves_operational_selector_truth(self):
+        """An expiration-cap stop must not lose the selector-owned budget reason."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = "live"
+        sel.deferred_dte_legacy_fallback = False
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+        sel._fetch_expirations_list = MagicMock(
+            side_effect=mod.SelectorRequestBudgetExhausted(
+                "expirations", "expiration_calls=3 limit=3"
+            )
+        )
+        plan = _make_plan()
+        plan.execution_mode = "live"
+        plan.metadata = {"deferred_breach_selection": True}
+
+        result = sel._select_with_dte_ladder(plan)
+
+        assert result is None
+        failure = plan.metadata["selector_failure"]
+        assert failure["reason_code"] == "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        assert failure["canonical_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["last_observed_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["selector_terminal_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+
+    @pytest.mark.parametrize(
+        "first_reason",
+        ["UNTRADEABLE_FOR_ACCOUNT_SIZE", "DIRECT_QUOTE_ZERO_BID_ASK"],
+    )
+    def test_ladder_operational_stop_keeps_prior_canonical_reason(
+        self, first_reason
+    ):
+        """A later budget stop ends probing without erasing earlier truth."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = "live"
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 1
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        b_exp = _next_weekday(today, 5)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, b_exp])
+        probed = []
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            probed.append(expiration_override)
+            if len(probed) == 1:
+                plan.metadata["selector_failure"] = {
+                    "stage": "quality_filter",
+                    "reason_code": first_reason,
+                    "canonical_selector_reason": first_reason,
+                    "last_observed_selector_reason": first_reason,
+                    "selector_terminal_reason": first_reason,
+                    "operational_reason": None,
+                    "explanation": "first expiration had a truthful selector result",
+                    "selection_diagnostics": {
+                        "direct_quote_budget": {"used": 0, "remaining": 1},
+                    },
+                }
+            else:
+                plan.metadata["selector_failure"] = {
+                    "stage": "selector_request_budget",
+                    "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "canonical_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "last_observed_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "selector_terminal_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "operational_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "explanation": "direct quote cap reached",
+                    "selection_diagnostics": {
+                        "direct_quote_budget": {"used": 1, "remaining": 0},
+                        "budget_exhausted_stage": "direct_quote",
+                    },
+                }
+            return None
+
+        sel.select = _fake_select
+        plan = _make_plan(timeframe="1d")
+        plan.execution_mode = "live"
+        plan.metadata = {}
+
+        assert sel._select_with_dte_ladder(plan) is None
+        assert probed == [a_exp, b_exp]
+        failure = plan.metadata["selector_failure"]
+        assert failure["reason_code"] == first_reason
+        assert failure["canonical_selector_reason"] == first_reason
+        assert failure["selector_terminal_reason"] == first_reason
+        assert failure["last_observed_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_failure"]["reason_code"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["selection_diagnostics"]["budget_exhausted_stage"] == (
+            "direct_quote"
+        )
+        assert sel._last_failure == failure
+        assert len(plan.metadata["dte_ladder_audit"]["buckets_attempted"]) == 2
+
+    @pytest.mark.parametrize(
+        ("first_reason", "second_reason"),
+        [
+            ("UNTRADEABLE_FOR_ACCOUNT_SIZE", "SPREAD_TOO_WIDE"),
+            ("SPREAD_TOO_WIDE", "UNTRADEABLE_FOR_ACCOUNT_SIZE"),
+        ],
+    )
+    def test_ladder_quality_reduction_uses_fixed_precedence(
+        self, first_reason, second_reason
+    ):
+        """Quality reduction cannot depend on which expiration was last."""
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 1
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        b_exp = _next_weekday(today, 5)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, b_exp])
+        reasons = iter([first_reason, second_reason])
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            reason = next(reasons)
+            plan.metadata["selector_failure"] = {
+                "reason_code": reason,
+                "canonical_selector_reason": reason,
+                "explanation": reason,
+            }
+            return None
+
+        sel.select = _fake_select
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        assert sel._select_with_dte_ladder(plan) is None
+        assert plan.metadata["selector_failure"]["reason_code"] == (
+            "UNTRADEABLE_FOR_ACCOUNT_SIZE"
+        )
 
     @pytest.mark.parametrize("mode,explicit_flag,expected_fallback", [
         ("paper", False, True),
@@ -699,6 +862,401 @@ class TestAmendmentGateOrdering:
         assert result is None
         assert sel._last_failure["reason_code"] == "SPREAD_TOO_WIDE"
         assert plan.metadata["selector_failure"]["reason_code"] == "SPREAD_TOO_WIDE"
+
+    # ─────────────────────────────────────────────────────────────────────
+    # P0 amendment: DUPLICATE_QUOTE_CONFLICT_UNRESOLVED taxonomy defect
+    #
+    # The DTE ladder previously classified this authoritative RETRYABLE_DATA
+    # reason via a stale local handwritten set that omitted it, so it fell
+    # into the generic quality-reduction branch instead of the
+    # retryable-data preservation branch. The following four tests directly
+    # execute _select_with_dte_ladder (not source inspection, not policy
+    # table membership alone) and prove the corrected behavior across the
+    # four failure-timing/precedence scenarios the ladder must handle.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def test_ladder_classifies_duplicate_conflict_as_retryable_not_quality(self):
+        """Test A: baseline contract -- a single DUPLICATE_QUOTE_CONFLICT_
+        UNRESOLVED probe with no competing reason must surface unchanged,
+        with data_failure=True/quality_failure=False, and must never be
+        converted to NO_VALID_PLAYBOOK_DTE_CONTRACT or
+        PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT.
+
+        Note: for a SOLO probe, the final surfaced dict is byte-identical
+        regardless of which internal ladder variable (_preserved_quality vs
+        _preserved_retryable) held it -- both paths do a plain dict copy of
+        the single occupant. This test alone does NOT distinguish the two
+        code paths; it is a baseline behavioral contract. Test B below is
+        the test that actually distinguishes pre-fix from post-fix behavior
+        (probe order matters -- see its docstring), verified by reverting
+        the production fix and confirming Test B fails while this one still
+        passes either way.
+        """
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp])
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            plan.metadata["selector_failure"] = {
+                "reason_code": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                "canonical_selector_reason": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                "explanation": "conflicting duplicate OCC representations",
+                # Real values from _classify_selector_failure for this exact
+                # reason (ap/contract_selector.py "data_quality_zero_quotes").
+                "data_failure": True,
+                "quality_failure": False,
+            }
+            return None
+        sel.select = _fake_select
+
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
+
+        assert result is None
+        failure = sel._last_failure
+        assert failure["reason_code"] == "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        assert failure["canonical_selector_reason"] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert failure["data_failure"] is True
+        assert failure["quality_failure"] is False
+        assert failure["reason_code"] != "NO_VALID_PLAYBOOK_DTE_CONTRACT"
+        assert failure["reason_code"] != "PLAYBOOK_NO_FULLY_ELIGIBLE_CONTRACT"
+
+    def test_ladder_preserves_duplicate_conflict_across_all_transient_buckets(self):
+        """Test B: a genuinely retryable data miss observed FIRST, followed
+        by DUPLICATE_QUOTE_CONFLICT_UNRESOLVED observed SECOND, must still
+        surface the FIRST retryable-data reason -- matching the existing
+        first-observed-wins contract already proven by
+        test_ladder_preserves_retryable_data_reason_when_all_probes_data_miss
+        above for two reasons that were always correctly classified.
+
+        Probe order is deliberately chosen to make the defect observable:
+        pre-fix, DUPLICATE_QUOTE_CONFLICT_UNRESOLVED fell into the generic
+        quality branch, and the ladder's post-loop reduction checks
+        _preserved_quality before _preserved_retryable unconditionally. That
+        meant a duplicate-conflict reason observed SECOND could silently
+        displace a genuinely-retryable FIRST reason merely by landing in the
+        quality slot -- inverting the intended first-observed-wins contract
+        for retryable-data misses. Verified: this exact test fails against
+        the pre-fix code (final reason becomes
+        DUPLICATE_QUOTE_CONFLICT_UNRESOLVED instead of CHAIN_PARSE_EMPTY).
+        """
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        c_exp = _next_weekday(today, 14)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            plan.metadata["selector_failure"] = {
+                "reason_code": (
+                    "CHAIN_PARSE_EMPTY"
+                    if expiration_override == a_exp else
+                    "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+                ),
+                "canonical_selector_reason": (
+                    "CHAIN_PARSE_EMPTY"
+                    if expiration_override == a_exp else
+                    "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+                ),
+                "data_failure": True,
+                "quality_failure": False,
+                "explanation": "transient data miss",
+            }
+            return None
+
+        sel.select = _fake_select
+
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
+
+        assert result is None
+        # First-observed retryable-data reason must win -- the same contract
+        # already proven for two always-correctly-classified reasons.
+        assert sel._last_failure["reason_code"] == "CHAIN_PARSE_EMPTY"
+        assert sel._last_failure["data_failure"] is True
+        assert sel._last_failure["quality_failure"] is False
+
+    def test_ladder_genuine_quality_rejection_outranks_earlier_duplicate_conflict(self):
+        """Test C: existing documented precedence (see
+        test_ladder_prefers_later_quality_reason_over_earlier_retryable_miss
+        above) says a genuine usable-chain quality verdict from a later
+        expiration outranks an earlier transient data miss. This proves that
+        contract still holds when the earlier transient miss is specifically
+        DUPLICATE_QUOTE_CONFLICT_UNRESOLVED -- the fix must not change this
+        existing precedence, only the category the duplicate-conflict reason
+        itself enters before reduction.
+
+        Note: this scenario does not independently distinguish pre-fix from
+        post-fix behavior -- SPREAD_TOO_WIDE wins in both cases, because the
+        ladder's final reduction always prefers any populated
+        _preserved_quality slot over _preserved_retryable regardless of this
+        fix (verified by reverting the production fix and confirming this
+        test still passes). It documents an important invariant that must
+        NOT change, not the defect itself -- see Test B for the actual
+        regression proof.
+        """
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 2
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        c_exp = _next_weekday(today, 14)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            if expiration_override == a_exp:
+                plan.metadata["selector_failure"] = {
+                    "reason_code": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                    "canonical_selector_reason": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                    "data_failure": True,
+                    "quality_failure": False,
+                    "explanation": "conflicting duplicate OCC representations",
+                }
+            else:
+                plan.metadata["selector_failure"] = {
+                    "reason_code": "SPREAD_TOO_WIDE",
+                    "canonical_selector_reason": "SPREAD_TOO_WIDE",
+                    "data_failure": False,
+                    "quality_failure": True,
+                    "explanation": "usable chain, no contract passed spread gate",
+                }
+            return None
+
+        sel.select = _fake_select
+
+        plan = _make_plan(timeframe="1d")
+        plan.metadata = {}
+        result = sel._select_with_dte_ladder(plan)
+
+        assert result is None
+        assert sel._last_failure["reason_code"] == "SPREAD_TOO_WIDE"
+        assert plan.metadata["selector_failure"]["reason_code"] == "SPREAD_TOO_WIDE"
+        # The duplicate-conflict reason still had a chance to be preserved as
+        # retryable-data -- it just lost to a stronger genuine quality
+        # verdict per existing precedence, exactly as CHAIN_PROVIDER_EMPTY_OPTIONS
+        # does in the analogous existing test above.
+
+    def test_ladder_operational_stop_after_duplicate_conflict_keeps_prior_truth(self):
+        """Test D: a later request-budget/throttle operational stop must not
+        convert an earlier DUPLICATE_QUOTE_CONFLICT_UNRESOLVED verdict into
+        generic quality, must stop further provider work, and must keep the
+        operational reason separately diagnosable -- mirroring the existing
+        contract already proven for other first_reason values in
+        test_ladder_operational_stop_keeps_prior_canonical_reason above.
+
+        Note: this scenario does not independently distinguish pre-fix from
+        post-fix behavior either -- with only one prior probe observed
+        before the operational stop, _prior_failure resolves to the same
+        dict content whether it came from _preserved_quality (pre-fix) or
+        _preserved_retryable (post-fix). Verified by reverting the
+        production fix and confirming this test still passes. It documents
+        the operational-stop contract must survive the fix unchanged, not
+        the defect itself -- see Test B for the actual regression proof.
+        """
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+        sel = object.__new__(mod.APContractSelectionEngine)
+        sel.mode = "live"
+        sel.dte_ladder_enabled = True
+        sel.dte_bucket_a_max = 2
+        sel.dte_bucket_b_max = 7
+        sel.dte_ladder_probe_per_bucket = 1
+        sel._last_failure = None
+        sel._last_dte_ladder_audit = None
+
+        today = date.today()
+        a_exp = _next_weekday(today, 1)
+        b_exp = _next_weekday(today, 5)
+        sel._fetch_expirations_list = MagicMock(return_value=[a_exp, b_exp])
+        probed = []
+
+        def _fake_select(plan, *, expiration_override=None, request_context=None):
+            probed.append(expiration_override)
+            if len(probed) == 1:
+                plan.metadata["selector_failure"] = {
+                    "stage": "quality_filter",
+                    "reason_code": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                    "canonical_selector_reason": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                    "last_observed_selector_reason": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                    "selector_terminal_reason": "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED",
+                    "operational_reason": None,
+                    "data_failure": True,
+                    "quality_failure": False,
+                    "explanation": "conflicting duplicate OCC representations",
+                    "selection_diagnostics": {
+                        "direct_quote_budget": {"used": 1, "remaining": 0},
+                    },
+                }
+            else:
+                plan.metadata["selector_failure"] = {
+                    "stage": "selector_request_budget",
+                    "reason_code": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "canonical_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "last_observed_selector_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "selector_terminal_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "operational_reason": "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+                    "explanation": "direct quote cap reached",
+                    "selection_diagnostics": {
+                        "direct_quote_budget": {"used": 1, "remaining": 0},
+                        "budget_exhausted_stage": "direct_quote",
+                    },
+                }
+            return None
+
+        sel.select = _fake_select
+        plan = _make_plan(timeframe="1d")
+        plan.execution_mode = "live"
+        plan.metadata = {}
+
+        assert sel._select_with_dte_ladder(plan) is None
+        # Provider work stopped after the operational-stop probe -- no third
+        # expiration was attempted even though _fetch_expirations_list
+        # returned two.
+        assert probed == [a_exp, b_exp]
+        failure = plan.metadata["selector_failure"]
+        assert failure["reason_code"] == "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        assert failure["canonical_selector_reason"] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert failure["selector_terminal_reason"] == (
+            "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED"
+        )
+        assert failure["data_failure"] is True
+        assert failure["quality_failure"] is False
+        # Operational reason stays separately diagnosable, not merged into
+        # the canonical selector verdict.
+        assert failure["last_observed_selector_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_reason"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert failure["operational_failure"]["reason_code"] == (
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED"
+        )
+        assert sel._last_failure == failure
+
+    def test_ladder_retryable_data_authority_matches_shared_policy_for_all_reasons(self):
+        """Step 8 taxonomy parity guard: any reason the authoritative shared
+        selector retry policy classifies as RETRYABLE_DATA must win the
+        first-observed-retryable-wins contract the same way an
+        always-correctly-classified reason does -- not just
+        DUPLICATE_QUOTE_CONFLICT_UNRESOLVED. This is a behavioral guard, not
+        a source/string inspection: for every authoritative RETRYABLE_DATA
+        reason not already intercepted earlier in the ladder's own chain
+        (_TERMINAL_NON_DTE, _OPERATIONAL_STOP_REASONS -- intentional
+        DTE-ladder-specific narrowing per this PR's step 3/4 constraints,
+        unaffected by this fix), it drives a real two-probe sequence through
+        _select_with_dte_ladder with a known-good anchor reason FIRST and
+        the reason under test SECOND, using the same paired-order pattern
+        that makes Test B a genuine regression proof (a solo-probe guard
+        would pass identically before and after the fix, since the ladder's
+        post-loop reduction only diverges when two populated preservation
+        slots compete -- see Test A/C/D docstrings). Verified this guard
+        fails for DUPLICATE_QUOTE_CONFLICT_UNRESOLVED against the reverted
+        pre-fix code and passes against the fixed code for every reason
+        under test.
+        """
+        from ap.selector_retry_policy import _POLICY_TABLE, RETRYABLE_DATA
+
+        mod = _load_selector({"DEFERRED_DTE_LADDER": "1"})
+
+        _terminal_non_dte = {
+            "EARNINGS_LOCKOUT", "EARNINGS_GUARD_ERROR",
+            "INVALID_PLAN", "UNSUPPORTED_INDEX_MAPPING",
+            "CHAIN_AUTH_ERROR",
+            "CHAIN_PROVIDER_EMPTY_EXPIRATIONS",
+        }
+        _operational_stop = {
+            "SELECTOR_REQUEST_BUDGET_EXHAUSTED",
+            "MARKET_DATA_THROTTLE_UNAVAILABLE",
+        }
+        _anchor_reason = "CHAIN_PARSE_EMPTY"
+        _reasons_under_test = sorted(
+            code for code, policy in _POLICY_TABLE.items()
+            if policy.classification == RETRYABLE_DATA
+            and code not in _terminal_non_dte
+            and code not in _operational_stop
+            and code != _anchor_reason
+        )
+        assert _reasons_under_test, (
+            "policy table produced zero RETRYABLE_DATA reasons to test -- "
+            "this guard would silently pass on an empty set"
+        )
+        assert "DUPLICATE_QUOTE_CONFLICT_UNRESOLVED" in _reasons_under_test
+
+        for reason in _reasons_under_test:
+            sel = object.__new__(mod.APContractSelectionEngine)
+            sel.dte_ladder_enabled = True
+            sel.dte_bucket_a_max = 2
+            sel.dte_bucket_b_max = 7
+            sel.dte_ladder_probe_per_bucket = 2
+            sel._last_failure = None
+            sel._last_dte_ladder_audit = None
+
+            today = date.today()
+            a_exp = _next_weekday(today, 1)
+            c_exp = _next_weekday(today, 14)
+            sel._fetch_expirations_list = MagicMock(return_value=[a_exp, c_exp])
+
+            def _fake_select(
+                plan, *, expiration_override=None, request_context=None,
+                _reason=reason,
+            ):
+                plan.metadata["selector_failure"] = {
+                    "reason_code": _anchor_reason if expiration_override == a_exp else _reason,
+                    "canonical_selector_reason": (
+                        _anchor_reason if expiration_override == a_exp else _reason
+                    ),
+                    "data_failure": True,
+                    "quality_failure": False,
+                    "explanation": "taxonomy parity probe",
+                }
+                return None
+            sel.select = _fake_select
+
+            plan = _make_plan(timeframe="1d")
+            plan.metadata = {}
+            result = sel._select_with_dte_ladder(plan)
+
+            assert result is None, f"reason={reason} unexpectedly selected"
+            # The anchor (first-observed, always-correctly-classified) must
+            # win -- if `reason` is misclassified as quality, it would
+            # hijack the final answer via the quality-checked-first
+            # reduction despite being observed second.
+            assert sel._last_failure["reason_code"] == _anchor_reason, (
+                f"reason={reason} hijacked the final answer from the "
+                f"first-observed anchor {_anchor_reason!r} (got "
+                f"{sel._last_failure['reason_code']!r}); this indicates "
+                f"{reason} is not correctly classified as retryable-data "
+                f"by the DTE ladder"
+            )
 
 
 class TestDeferredPlanIntegration:

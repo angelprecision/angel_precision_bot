@@ -448,7 +448,7 @@ class TestCandidateOrderingAndReasonHonesty:
         assert ctx.direct_quote_candidate_ranking[0]["original_index"] == 100
         assert ctx.direct_quote_candidate_ranking[0]["directional_strike_fit"] is True
 
-    def test_original_index_breaks_exact_ties(self):
+    def test_duplicate_occ_rows_stay_visible_to_quality_resolution(self):
         ctx = _ctx(20)
         chain = [_option(0), _option(1)]
 
@@ -461,7 +461,39 @@ class TestCandidateOrderingAndReasonHonesty:
             request_context=ctx,
         )
 
+        # Duplicate rows are not discarded before the quality loop. The
+        # canonical OCC revalidation set, not this ranking helper, owns the
+        # one-call direct-quote cap.
         assert [row["_provider_index"] for row in ordered] == [0, 1]
+        assert ctx.direct_quote_duplicate_symbols == [chain[0]["symbol"]]
+
+    def test_interleaved_duplicate_occ_rows_are_grouped_by_financial_quality(self):
+        """Duplicate resolution must not depend on rows being adjacent."""
+        stale = _option(0, oi=1000, volume=1000)
+        usable = _option(1, oi=100, volume=100)
+        usable["symbol"] = f" {stale['symbol'].lower()} "
+        usable["bid"] = 1.10
+        usable["ask"] = 1.11
+        interleaver = _option(2, oi=500, volume=500)
+        interleaver["symbol"] = interleaver["symbol"].replace("SPY", "QQQ", 1)
+        expected_duplicate = stale["symbol"]
+        observed = []
+
+        for chain in ([stale, interleaver, usable], [usable, interleaver, stale]):
+            ctx = _ctx(20)
+            ordered = _order_chain_for_direct_quote_recovery(
+                list(chain),
+                direction="CALL",
+                underlying_price=450.0,
+                target_delta=0.40,
+                today=date(2026, 7, 21),
+                request_context=ctx,
+            )
+            observed.append([row["symbol"] for row in ordered])
+            assert ctx.direct_quote_duplicate_symbols == [expected_duplicate]
+
+        assert observed[0] == observed[1]
+        assert observed[0] == [usable["symbol"], stale["symbol"], interleaver["symbol"]]
 
     def test_budget_skip_keeps_original_reason_and_counts_unattempted(self):
         broker = MagicMock()
