@@ -2761,6 +2761,46 @@ def test_f3_runtime_mode_resolves_per_iteration(monkeypatch):
     assert observed[1] == "paper"
 
 
+def test_fill_monitor_does_not_launder_malformed_explicit_mode_on_replay(
+    monkeypatch,
+):
+    """A malformed present source must HOLD on every loop iteration."""
+    exit_engine = SimpleNamespace(
+        master_control=SimpleNamespace(
+            mode="PAPER",
+            runtime_execution_mode="paper",
+        )
+    )
+    observed = []
+    stop_event = threading.Event()
+
+    monkeypatch.setattr(fm, "get_pending_orders", lambda client_id: [])
+    monkeypatch.setattr(
+        fm,
+        "get_broker_owned_exit_requests",
+        lambda client_id: [_row(broker_order_id="36661364")],
+    )
+
+    def _fake_process(broker, order, **kwargs):
+        observed.append(kwargs.get("runtime_execution_mode"))
+        if len(observed) >= 2:
+            stop_event.set()
+
+    monkeypatch.setattr(fm, "process_pending_order", _fake_process)
+
+    fm.fill_monitor_loop(
+        MagicMock(),
+        poll_seconds=0.01,
+        client_id="tradefluence",
+        osm=MagicMock(),
+        exit_engine=exit_engine,
+        stop_event=stop_event,
+        runtime_execution_mode="PAPER",
+    )
+
+    assert observed == ["", ""]
+
+
 def test_f6_whitespace_padded_client_id_binds_the_normalized_value(fake_osm_db):
     """F6: the CAS must bind the same client id the guard validated."""
     db, osm = fake_osm_db
@@ -3230,6 +3270,55 @@ def test_blocker2_explicit_argument_conflicts_with_source():
         runtime_execution_mode="live", exit_engine=engine
     )
     assert result == ""
+
+
+def test_runtime_mode_reconciles_runner_and_master_control_canonical_provenance():
+    """The production uppercase enum is not itself normalized into authority."""
+    master_control = SimpleNamespace(
+        mode="PAPER",
+        runtime_execution_mode="paper",
+    )
+    engine = SimpleNamespace(master_control=master_control, execution_mode=None)
+
+    assert fm._resolve_runtime_execution_mode(
+        runtime_execution_mode="paper",
+        exit_engine=engine,
+    ) == "paper"
+
+
+def test_client_runner_passes_exact_canonical_mode_to_fill_monitor(monkeypatch):
+    """Drive the real production runner boundary that starts fill_monitor."""
+    import client_runner
+
+    calls = []
+    runner = client_runner.ClientRunner.__new__(client_runner.ClientRunner)
+    runner.mode = "PAPER"
+    runner.email = "tradefluence"
+    runner.stopped = threading.Event()
+    runner.order_state_machine = SimpleNamespace(client_id="tradefluence")
+    runner.position_manager = SimpleNamespace(client_id="tradefluence")
+    runner.master_control = SimpleNamespace(mode="PAPER")
+    runner.reconciler = None
+    exit_engine = SimpleNamespace(master_control=runner.master_control)
+
+    def _fill_monitor_loop(**kwargs):
+        calls.append(kwargs)
+        runner.stopped.set()
+
+    monkeypatch.setattr(fm, "fill_monitor_loop", _fill_monitor_loop)
+
+    runner._start_fill_monitor(MagicMock(), exit_engine)
+    runner.fill_monitor_thread.join(timeout=2)
+
+    assert not runner.fill_monitor_thread.is_alive()
+    assert len(calls) == 1
+    assert calls[0]["runtime_execution_mode"] == "paper"
+    assert runner.master_control.mode == "PAPER"
+    assert runner.master_control.runtime_execution_mode == "paper"
+    assert fm._resolve_runtime_execution_mode(
+        runtime_execution_mode=calls[0]["runtime_execution_mode"],
+        exit_engine=exit_engine,
+    ) == "paper"
 
 
 def test_blocker2_runtime_conflict_blocks_broker_get(monkeypatch):

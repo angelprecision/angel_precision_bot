@@ -116,6 +116,7 @@ jobs:
             tests/test_p0_rearm_watcher_required_routing.py \
             tests/test_p0_pr418_preflight_coverage_parity.py \
             tests/test_p0_broker_owned_exit_requested_recovery.py \
+            tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
             tests/test_p0_pending_trigger_restart_recovery.py \

@@ -171,10 +171,13 @@ Expected first-pass production scope is exactly:
 3. `ap/fill_monitor.py`
 4. `ap/order_monitor.py`
 5. `ap/self_healing.py`
+6. `client_runner.py`
 
 `ap/self_healing.py` is allowed only for narrow runtime execution-mode provenance wiring. It adds no lifecycle owner, no broker behavior, and no generalized self-healing redesign. Missing or unproven execution mode must HOLD rather than default to LIVE.
 
-Do not change `ap_exit_engine.py`, `ap/exit_autonomous_recovery.py`, `ap_recovery.py`, `ap_reconciler.py`, or `ap/position_manager.py` unless a real-method restart test proves the five-file correction cannot recover the durable production shape.
+`client_runner.py` is allowed only for the production fill-monitor mode boundary proven necessary by the final audit: map exact runner enum `LIVE`/`PAPER` to canonical `live`/`paper`, retain that value as master-control runtime provenance, and pass it explicitly to `fill_monitor_loop`. No whitespace or case normalization is permitted, and the change adds no lifecycle owner or broker behavior.
+
+Do not change `ap_exit_engine.py`, `ap/exit_autonomous_recovery.py`, `ap_recovery.py`, `ap_reconciler.py`, or `ap/position_manager.py` unless a real-method restart test proves the six-file correction cannot recover the durable production shape.
 
 If scope must expand, stop and document why before changing another production file.
 

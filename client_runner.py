@@ -4243,6 +4243,17 @@ class ClientRunner(threading.Thread):
     def _start_fill_monitor(self, broker, exit_eng):
         from ap.fill_monitor import fill_monitor_loop
 
+        # The runner's mode is an uppercase operational enum.  Recovery needs
+        # an independently proven canonical database mode without teaching the
+        # fill monitor to accept or normalize malformed taxonomy.  Map only the
+        # two exact runner values; anything else remains unproven and HOLDs.
+        runtime_execution_mode = {
+            "LIVE": "live",
+            "PAPER": "paper",
+        }.get(self.mode, "")
+        if self.master_control is not None:
+            self.master_control.runtime_execution_mode = runtime_execution_mode
+
         restart_sleep = float(os.getenv("FILL_MONITOR_RESTART_SLEEP_SEC", "2"))
 
         _fm_crash_count = 0
@@ -4265,6 +4276,7 @@ class ClientRunner(threading.Thread):
                         exit_engine=exit_eng,
                         stop_event=self.stopped,
                         client_id=self.email,
+                        runtime_execution_mode=runtime_execution_mode,
                     )
                     if self.stopped.is_set():
                         break

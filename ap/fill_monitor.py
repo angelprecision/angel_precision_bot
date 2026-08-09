@@ -324,9 +324,17 @@ def _resolve_runtime_execution_mode(
     ``execution_mode``.
     """
     master_control = getattr(exit_engine, "master_control", None)
+    if master_control is not None and hasattr(
+        master_control, "runtime_execution_mode"
+    ):
+        master_control_mode = getattr(
+            master_control, "runtime_execution_mode", None
+        )
+    else:
+        master_control_mode = getattr(master_control, "mode", None)
     candidates = (
         runtime_execution_mode,
-        getattr(master_control, "mode", None),
+        master_control_mode,
         getattr(exit_engine, "execution_mode", None),
     )
     proven: set[str] = set()
@@ -2839,6 +2847,7 @@ def fill_monitor_loop(
     client_id: str | None = None,
     alert_fn=None,
     data_broker=None,
+    runtime_execution_mode=None,
 ):
     """Fill monitor must never pause on kill switch — it reconciles reality.
 
@@ -2871,7 +2880,8 @@ def fill_monitor_loop(
             # startup pinned the fence to "" for the entire process lifetime,
             # holding every broker-owned recovery forever — reproducing the
             # exact stranded-row condition this PR exists to close.
-            runtime_execution_mode = _resolve_runtime_execution_mode(
+            resolved_runtime_execution_mode = _resolve_runtime_execution_mode(
+                runtime_execution_mode=runtime_execution_mode,
                 exit_engine=exit_engine,
             )
             normal_pending = get_pending_orders(client_id)
@@ -2898,7 +2908,7 @@ def fill_monitor_loop(
                         exit_engine=exit_engine,
                         alert_fn=alert_fn,
                         data_broker=data_broker,
-                        runtime_execution_mode=runtime_execution_mode,
+                        runtime_execution_mode=resolved_runtime_execution_mode,
                     )
                 except Exception as exc:
                     log.exception("Failed to process order %s: %s", order.get("local_order_id"), exc)

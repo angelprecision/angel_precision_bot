@@ -8,7 +8,7 @@ Start from current main:
 
 `188f2338de3ca4b3e687aa07fd6b2c5ea4b2ab0b`
 
-Before implementation, confirm main has not moved. If main has moved, re-read the five production files and re-resolve this map before editing. Do not transplant stale hunks by line number.
+Before implementation, confirm main has not moved. If main has moved, re-read the six production files and re-resolve this map before editing. Do not transplant stale hunks by line number.
 
 ## File budget
 
@@ -19,12 +19,16 @@ Production, expected exactly:
 - `ap/fill_monitor.py`
 - `ap/order_monitor.py`
 - `ap/self_healing.py`
+- `client_runner.py`
 
 `ap/self_healing.py` is permitted only for narrow runtime-mode provenance wiring into recovery. It does not become a lifecycle owner, add broker behavior, or authorize a generalized self-healing redesign. Missing or unproven execution mode must HOLD; recovery must never default it to LIVE.
+
+`client_runner.py` is permitted only to pass the runner's exact, URL-proven operational mode into `fill_monitor_loop` as canonical lowercase runtime provenance. The boundary maps only exact `LIVE` and `PAPER`; it does not trim, case-fold, or otherwise launder malformed taxonomy. This wiring adds no lifecycle owner and no broker behavior.
 
 Tests:
 
 - one focused `tests/test_p0_broker_owned_exit_requested_recovery.py`
+- the adjacent `tests/test_fill_monitor_mvp_hardening.py`
 - `.github/workflows/p0_regression.yml` only to add that test if the workflow does not already collect it
 
 No other production file without a documented HARD HOLD dependency finding.
