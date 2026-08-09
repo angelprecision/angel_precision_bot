@@ -932,34 +932,114 @@ def _finalize_pre_callback_claim_failure(
     active_order: dict | None = None,
 ) -> str:
     """Never leave a claimed generation behind when the callback was not entered."""
-    broker_owned = _exit_order_has_submit_evidence(active_order)
-    claim_state = (
-        _CLAIM_STATE_BROKER_OWNED
-        if broker_owned
-        else _CLAIM_STATE_RELEASED_NO_SUBMIT
-    )
-    broker_order_id = str((active_order or {}).get("broker_order_id") or "").strip()
-    _update_durable_decision_generation(
-        generation_key,
-        claim_state=claim_state,
-        local_order_id=local_order_id,
-        broker_order_id=broker_order_id,
-        error_text=reason,
-    )
-    if claim_state == _CLAIM_STATE_RELEASED_NO_SUBMIT:
-        retired = _retire_local_exit_intent_after_no_submit(
-            engine,
-            local_order_id,
+    def _persist_broker_owned(order: dict) -> str:
+        evidenced_local_id = str(order.get("local_order_id") or "").strip()
+        if not evidenced_local_id:
+            return ""
+        raw_broker_id = str(order.get("broker_order_id") or "").strip()
+        evidenced_broker_id = raw_broker_id if _has_proven_broker_order_id(raw_broker_id) else ""
+        owned_order = dict(order)
+        owned_order["broker_order_id"] = evidenced_broker_id
+        _update_durable_decision_generation(
+            generation_key,
+            claim_state=_CLAIM_STATE_BROKER_OWNED,
+            local_order_id=evidenced_local_id,
+            broker_order_id=evidenced_broker_id,
             error_text=reason,
         )
-        if retired or (
-            isinstance(active_order, dict)
-            and not active_exit_order_blocks(active_order)
-        ):
-            _clear_retired_exit_owner(engine, pos, local_order_id)
-    elif isinstance(active_order, dict):
-        _mark_active_exit_owned(engine, pos, active_order)
-    return claim_state
+        _mark_active_exit_owned(engine, pos, owned_order)
+        return _CLAIM_STATE_BROKER_OWNED
+
+    if _exit_order_has_submit_evidence(active_order):
+        owned_state = _persist_broker_owned(active_order or {})
+        if owned_state:
+            return owned_state
+
+    # The retirement CAS is the authority for proven no-submit.  Publishing
+    # RELEASED_NO_SUBMIT before it succeeds creates a race where another
+    # worker can establish submit intent while the generation looks retryable.
+    retired = _retire_local_exit_intent_after_no_submit(
+        engine,
+        local_order_id,
+        error_text=reason,
+    )
+    if retired:
+        _update_durable_decision_generation(
+            generation_key,
+            claim_state=_CLAIM_STATE_RELEASED_NO_SUBMIT,
+            local_order_id=local_order_id,
+            error_text=reason,
+        )
+        _clear_retired_exit_owner(engine, pos, local_order_id)
+        return _CLAIM_STATE_RELEASED_NO_SUBMIT
+
+    # Retirement refusal may mean submit evidence appeared after the first
+    # snapshot.  Re-read both the reserved row and the position-scoped active
+    # row, and bind local/broker identity from one evidenced row only.
+    fresh_orders: list[dict] = []
+    try:
+        reserved_order = _exit_order_by_local_id(engine, local_order_id)
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_PRE_CALLBACK_RESERVED_REREAD_FAILED position=%s local=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "position_id", ""),
+            local_order_id,
+            exc,
+        )
+        reserved_order = None
+    try:
+        position_order = _active_exit_order(
+            engine,
+            str(getattr(pos, "position_id", "") or ""),
+        )
+    except Exception as exc:
+        log.warning(
+            "[%s] EXIT_PRE_CALLBACK_ACTIVE_REREAD_FAILED position=%s error=%s",
+            getattr(pos, "ticker", ""),
+            getattr(pos, "position_id", ""),
+            exc,
+        )
+        position_order = None
+    for order in (reserved_order, position_order):
+        if not isinstance(order, dict) or not _exit_order_has_submit_evidence(order):
+            continue
+        order_local_id = str(order.get("local_order_id") or "").strip()
+        if not order_local_id:
+            continue
+        if all(order is not candidate for candidate in fresh_orders):
+            fresh_orders.append(order)
+
+    evidenced_local_ids = {
+        str(order.get("local_order_id") or "").strip()
+        for order in fresh_orders
+    }
+    evidenced_broker_ids = {
+        str(order.get("broker_order_id") or "").strip()
+        for order in fresh_orders
+        if _has_proven_broker_order_id(order.get("broker_order_id"))
+    }
+    if len(evidenced_local_ids) == 1 and len(evidenced_broker_ids) <= 1:
+        owned_order = next(
+            (
+                order
+                for order in reversed(fresh_orders)
+                if _has_proven_broker_order_id(order.get("broker_order_id"))
+            ),
+            fresh_orders[-1] if fresh_orders else None,
+        )
+        if isinstance(owned_order, dict):
+            owned_state = _persist_broker_owned(owned_order)
+            if owned_state:
+                return owned_state
+
+    _update_durable_decision_generation(
+        generation_key,
+        claim_state=_CLAIM_STATE_AMBIGUOUS,
+        local_order_id=local_order_id,
+        error_text=f"{reason}:RETIREMENT_UNPROVEN",
+    )
+    return _CLAIM_STATE_AMBIGUOUS
 
 
 def _extract_callback_trace_identity(callback_trace: dict) -> dict:
@@ -1774,8 +1854,8 @@ def wrap_submit(original: Callable[..., bool]) -> Callable[..., bool]:
                         pointed_order,
                         reason="EXIT_RESERVED_POINTER_IDENTITY_MISMATCH_NO_SUBMIT",
                     )
-                    if not repaired:
-                        _clear_retired_exit_owner(self, pos, reserved_local_order_id)
+                    if not repaired and _exit_order_has_submit_evidence(pointed_order):
+                        _mark_active_exit_owned(self, pos, pointed_order)
                     return False
                 # Both durable reads succeeded with no row: this is only a
                 # stale in-memory pointer, so release it and reserve afresh.

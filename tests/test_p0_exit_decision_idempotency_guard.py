@@ -1395,6 +1395,244 @@ def test_reserved_callback_identity_carry_failure_releases_before_callback(
     assert pos.pending_exit_local_order_id == ""
 
 
+def _pre_callback_order(
+    local_order_id: str,
+    *,
+    broker_order_id: str = "",
+    submit_intent_at: str = "",
+) -> dict:
+    return {
+        "client_id": "client@example.com",
+        "local_order_id": local_order_id,
+        "broker_order_id": broker_order_id,
+        "kind": "EXIT",
+        "status": "EXIT_REQUESTED",
+        "position_id": "position-1",
+        "qty": 1,
+        "contract": "SPY260716P00751000",
+        "execution_mode": "live",
+        "meta": {"submit_intent_at": submit_intent_at} if submit_intent_at else {},
+    }
+
+
+def test_pre_callback_release_is_persisted_only_after_retirement_succeeds(
+    monkeypatch,
+) -> None:
+    order = _pre_callback_order("exit-A")
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order)
+    events = []
+    real_retire = engine.order_state_machine.retire_unsubmitted_exit_intent
+
+    def retire(local_order_id, *, last_error):
+        events.append(("retire", local_order_id))
+        return real_retire(local_order_id, last_error=last_error)
+
+    def update(generation_key, **kwargs):
+        events.append(("update", kwargs["claim_state"]))
+
+    engine.order_state_machine.retire_unsubmitted_exit_intent = retire
+    monkeypatch.setattr(guard, "_update_durable_decision_generation", update)
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order,
+    )
+
+    assert state == guard._CLAIM_STATE_RELEASED_NO_SUBMIT
+    assert events == [
+        ("retire", "exit-A"),
+        ("update", guard._CLAIM_STATE_RELEASED_NO_SUBMIT),
+    ]
+    assert pos.exit_in_flight is False
+    assert pos.pending_exit_local_order_id == ""
+    callback.assert_not_called()
+
+
+def test_pre_callback_retirement_refusal_with_concurrent_submit_keeps_owner(
+    monkeypatch,
+) -> None:
+    order = _pre_callback_order("exit-A")
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order)
+    updates = []
+
+    def refuse_after_submit_intent(local_order_id, *, last_error):
+        assert local_order_id == "exit-A"
+        engine.order_state_machine.active_order["meta"]["submit_intent_at"] = (
+            "2026-08-09T12:00:00+00:00"
+        )
+        return False
+
+    engine.order_state_machine.retire_unsubmitted_exit_intent = refuse_after_submit_intent
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append(dict(kwargs)),
+    )
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order,
+    )
+
+    assert state == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates == [{
+        "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+        "local_order_id": "exit-A",
+        "broker_order_id": "",
+        "error_text": "FINAL_FENCE_FAILED",
+    }]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-A"
+    callback.assert_not_called()
+
+
+def test_pre_callback_replacement_owner_binds_one_coherent_active_identity(
+    monkeypatch,
+) -> None:
+    order_a = _pre_callback_order("exit-A")
+    order_b = _pre_callback_order(
+        "exit-B",
+        broker_order_id="broker-B",
+        submit_intent_at="2026-08-09T12:00:00+00:00",
+    )
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order_a)
+    updates = []
+
+    def replace_before_refusal(local_order_id, *, last_error):
+        assert local_order_id == "exit-A"
+        engine.order_state_machine.active_order = dict(order_b)
+        engine.order_state_machine.active_orders_by_position["position-1"] = (
+            engine.order_state_machine.active_order
+        )
+        return False
+
+    engine.order_state_machine.retire_unsubmitted_exit_intent = replace_before_refusal
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append(dict(kwargs)),
+    )
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order_a,
+    )
+
+    assert state == guard._CLAIM_STATE_BROKER_OWNED
+    assert updates == [{
+        "claim_state": guard._CLAIM_STATE_BROKER_OWNED,
+        "local_order_id": "exit-B",
+        "broker_order_id": "broker-B",
+        "error_text": "FINAL_FENCE_FAILED",
+    }]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-B"
+    assert pos.pending_exit_broker_order_id == "broker-B"
+    callback.assert_not_called()
+
+
+def test_pre_callback_uncertain_retirement_stays_ambiguous_and_fenced(
+    monkeypatch,
+) -> None:
+    order = _pre_callback_order("exit-A")
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=order)
+    updates = []
+    engine.order_state_machine.retire_unsubmitted_exit_intent = MagicMock(
+        side_effect=RuntimeError("retirement truth unavailable")
+    )
+    monkeypatch.setattr(
+        guard,
+        "_update_durable_decision_generation",
+        lambda generation_key, **kwargs: updates.append(dict(kwargs)),
+    )
+
+    state = guard._finalize_pre_callback_claim_failure(
+        engine,
+        pos,
+        generation_key="client|position|3|1",
+        local_order_id="exit-A",
+        reason="FINAL_FENCE_FAILED",
+        active_order=order,
+    )
+
+    assert state == guard._CLAIM_STATE_AMBIGUOUS
+    assert updates == [{
+        "claim_state": guard._CLAIM_STATE_AMBIGUOUS,
+        "local_order_id": "exit-A",
+        "error_text": "FINAL_FENCE_FAILED:RETIREMENT_UNPROVEN",
+    }]
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-A"
+    callback.assert_not_called()
+
+
+def test_reserved_pointer_retirement_refusal_preserves_broker_owned_pointer(
+    monkeypatch,
+) -> None:
+    pointed_order = _pre_callback_order(
+        "exit-A",
+        broker_order_id="broker-A",
+        submit_intent_at="2026-08-09T12:00:00+00:00",
+    )
+    pointed_order["position_id"] = "drifted-position"
+    pos = _pos(
+        exit_in_flight=True,
+        pending_exit_local_order_id="exit-A",
+        pending_exit_qty=1,
+    )
+    callback = MagicMock(side_effect=AssertionError("broker callback must not run"))
+    engine = _make_submit_engine(pos, callback=callback, active_order=pointed_order)
+    monkeypatch.setattr(
+        guard,
+        "_durable_exit_generation",
+        MagicMock(side_effect=AssertionError("generation must not be claimed")),
+    )
+
+    result = guard.wrap_submit(_invoke_submit_callback)(engine, pos, _decision())
+
+    assert result is False
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_local_order_id == "exit-A"
+    assert pos.pending_exit_broker_order_id == "broker-A"
+    callback.assert_not_called()
+
+
 def test_submit_wrapper_releases_claim_on_conclusive_pre_submit_failure(generation_claims_table, monkeypatch) -> None:
     responses = iter([
         {"ok": False, "accepted": False, "status": "ERROR", "error": "NO_POST_ATTEMPTED:validation_failed"},
