@@ -20,7 +20,12 @@ os.environ.setdefault("ENCRYPTION_KEY", "ap-pr423-exit-replace-attempt-test")
 
 import pytest  # noqa: E402
 
-from ap_exit_engine import APExitEngine, ManagedPosition  # noqa: E402
+from ap_exit_engine import (  # noqa: E402
+    APExitEngine,
+    ExitDecision,
+    ManagedPosition,
+    _restore_exit_replace_attempt_from_meta,
+)
 
 
 def _engine() -> APExitEngine:
@@ -66,6 +71,24 @@ def test_exit_replace_attempt_field_exists_separate_from_exit_stuck_count():
         "exit_replace_attempt must not be aliased to/derived from "
         "_exit_stuck_count; they have independent semantics."
     )
+
+
+def test_partial_replacement_cap_limits_next_submit_to_unfilled_remainder():
+    eng = _engine()
+    pos = _pos(
+        pending_exit_replace_allowed=True,
+        pending_exit_replace_qty=1,
+        last_exit_signal_ts=None,
+    )
+    _add(eng, pos)
+    eng._can_submit_exit = MagicMock(return_value=False)
+
+    decision = ExitDecision(
+        action="STOP", quantity=7, reason="replacement", urgency="HIGH", pnl_pct=-0.5,
+    )
+    assert eng._submit_exit_decision(pos, decision) is False
+    assert decision.quantity == 1
+    eng._can_submit_exit.assert_called_once()
 
 
 # ── mark_exit_replacement_safe increments exactly once per proven cancel ───
@@ -274,6 +297,58 @@ def test_persist_exit_replace_attempt_failure_is_nonfatal(monkeypatch):
         "in-memory exactly-once increment must succeed even when the "
         "best-effort DB persist fails"
     )
+
+
+@pytest.mark.parametrize(
+    "raw_meta, expected",
+    [
+        ({}, {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
+        ({"exit_retry_liveness": {"replace_attempt": "bad", "replace_quantity": -3}},
+         {"replace_attempt": 0, "last_ack_identity": "", "replace_quantity": 0}),
+        ({"exit_retry_liveness": {"replace_attempt": 2, "last_ack_identity": "bro-old", "replace_quantity": 1}},
+         {"replace_attempt": 2, "last_ack_identity": "bro-old", "replace_quantity": 1}),
+        ('{"exit_retry_liveness": {"replace_attempt": 3, "replace_quantity": 2}}',
+         {"replace_attempt": 3, "last_ack_identity": "", "replace_quantity": 2}),
+    ],
+)
+def test_restore_exit_replace_attempt_helper_is_fail_safe(raw_meta, expected):
+    assert _restore_exit_replace_attempt_from_meta(raw_meta) == expected
+
+
+def test_seed_from_db_restores_retry_generation_and_replacement_cap(monkeypatch):
+    eng = _engine()
+    eng.hydrate_pending_exit_identity_from_db = MagicMock(return_value=False)
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return [{
+                "id": "pos-restart",
+                "client_id": "client-1",
+                "underlying": "AVGO",
+                "contract": "AVGO260814C00350000",
+                "direction": "CALL",
+                "qty": 7,
+                "quantity_remaining": 5,
+                "avg_fill": 2.49,
+                "underlying_entry": 350.0,
+                "target_underlying": 360.0,
+                "stop_underlying": 340.0,
+                "execution_mode": "paper",
+                "meta": {
+                    "exit_retry_liveness": {
+                        "replace_attempt": 2,
+                        "last_ack_identity": "bro-old",
+                        "replace_quantity": 1,
+                    }
+                },
+            }]
+
+    eng.seed_from_db(_PositionManager())
+    restored = eng.get_position("pos-restart")
+    assert restored is not None
+    assert restored.exit_replace_attempt == 2
+    assert restored._exit_replace_attempt_last_ack_identity == "bro-old"
+    assert restored.pending_exit_replace_qty == 1
 
 
 if __name__ == "__main__":

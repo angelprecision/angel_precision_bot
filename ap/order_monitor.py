@@ -5165,6 +5165,7 @@ class APOrderMonitor:
             return
 
         broker_status = self._query_broker_order(broker_oid)
+        _partial_remainder_qty = 0
 
         broker_owned_recovery = _is_broker_ownership_adopted_row(
             self.osm.get_order(local_order_id) or {}
@@ -5183,19 +5184,38 @@ class APOrderMonitor:
             return
 
         # ── Broker fill truth wins before cancel ────────────────────────────
-        # Covers both fully-filled and partially-filled: route through the
-        # existing canonical fill/OSM path and never cancel or replace merely
-        # because the local stale timer fired. Cumulative fill accounting
-        # stays inside _advance_from_broker_status / the canonical reducer —
-        # this helper does not mutate position quantity directly.
+        # A full fill still wins immediately.  A partial fill is first routed
+        # through the canonical OSM/fill hook so durable quantity truth is
+        # advanced, then this exact stale-order seam may cancel only the
+        # broker-unfilled remainder.  This helper never mutates position
+        # quantity directly.
         if self._is_executed_status(broker_status):
-            log.info(
-                f"[{self.client_id}] Exit actually filled/partially filled at broker — "
-                f"advancing state machine: {local_order_id}"
-            )
-            self._advance_from_broker_status(local_order_id, broker_status, contract)
-            self._stale_exit_cancel_inflight.pop(broker_oid, None)
-            return
+            if self._normalize_broker_status(broker_status) == "partially_filled":
+                _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                    local_order_id, broker_oid, contract,
+                )
+                if _partial_remainder_qty is None:
+                    # Preserve the existing fill-truth-wins behavior when the
+                    # payload does not contain exact cumulative fill data.
+                    self._advance_from_broker_status(local_order_id, broker_status, contract)
+                    self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                    return
+                if _partial_remainder_qty <= 0:
+                    self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                    return
+                log.info(
+                    "[%s] Exit partially filled; canceling only broker-unfilled remainder | "
+                    "order=%s remainder=%s",
+                    self.client_id, local_order_id, _partial_remainder_qty,
+                )
+            else:
+                log.info(
+                    f"[{self.client_id}] Exit actually filled at broker — "
+                    f"advancing state machine: {local_order_id}"
+                )
+                self._advance_from_broker_status(local_order_id, broker_status, contract)
+                self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                return
 
         # ── Exactly-once cancel guard ────────────────────────────────────────
         # A second poll cycle observing the same stale exit before the first
@@ -5212,9 +5232,17 @@ class APOrderMonitor:
             )
             _recheck_status = self._query_broker_order(broker_oid, bypass_cache=True)
             if self._is_executed_status(_recheck_status):
-                self._advance_from_broker_status(local_order_id, _recheck_status, contract)
-                self._stale_exit_cancel_inflight.pop(broker_oid, None)
-                return
+                if self._normalize_broker_status(_recheck_status) == "partially_filled":
+                    _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                        local_order_id, broker_oid, contract,
+                    )
+                    if _partial_remainder_qty is None or _partial_remainder_qty <= 0:
+                        self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                        return
+                else:
+                    self._advance_from_broker_status(local_order_id, _recheck_status, contract)
+                    self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                    return
             if not self._is_terminal_cancel_status(_recheck_status):
                 # Still no terminal proof — hold, do not re-issue cancel, do
                 # not unlock replacement using elapsed time.
@@ -5258,13 +5286,21 @@ class APOrderMonitor:
             # A fresh GET that itself proves a fill in the interim must win —
             # the late-fill race. FILLED beats a pending/attempted cancel.
             if self._is_executed_status(confirmed_status):
-                log.info(
-                    "[%s] Late-fill race — broker filled during cancel window | order=%s",
-                    self.client_id, local_order_id,
-                )
-                self._advance_from_broker_status(local_order_id, confirmed_status, contract)
-                self._stale_exit_cancel_inflight.pop(broker_oid, None)
-                return
+                if self._normalize_broker_status(confirmed_status) == "partially_filled":
+                    _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                        local_order_id, broker_oid, contract,
+                    )
+                    if _partial_remainder_qty is None or _partial_remainder_qty <= 0:
+                        self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                        return
+                else:
+                    log.info(
+                        "[%s] Late-fill race — broker filled during cancel window | order=%s",
+                        self.client_id, local_order_id,
+                    )
+                    self._advance_from_broker_status(local_order_id, confirmed_status, contract)
+                    self._stale_exit_cancel_inflight.pop(broker_oid, None)
+                    return
 
             if not is_confirmed_canceled:
                 self._emit_order_event(
@@ -5295,13 +5331,41 @@ class APOrderMonitor:
 
         # ── Broker-confirmed cancellation ───────────────────────────────────
         self._stale_exit_cancel_inflight.pop(broker_oid, None)
+
+        # Mark replacement authority BEFORE OSM enters CANCELED.  The real
+        # OSM terminal hook clears the old pending identity synchronously; if
+        # the grant is recorded afterward, identity fencing correctly rejects
+        # it as an unidentified/stale generation.
+        if position_id and self.exit_engine and hasattr(self.exit_engine, "mark_exit_replacement_safe"):
+            try:
+                self.exit_engine.mark_exit_replacement_safe(
+                    position_id,
+                    reason="order_monitor_stale_exit_broker_confirmed_cancel",
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_oid,
+                    replacement_qty=_partial_remainder_qty,
+                )
+            except Exception as _mrs_e:
+                log.error(
+                    "[%s] mark_exit_replacement_safe failed for pos=%s: %s",
+                    self.client_id, position_id, _mrs_e,
+                )
+
         self.osm.transition(local_order_id, "CANCELED", last_error=reason)
 
         if position_id and self.exit_engine:
             try:
-                self.exit_engine.clear_exit_in_flight(position_id)
+                # Pass the exact identity through the real APExitEngine
+                # guard; a position with pending identity must never accept
+                # a blank clear call.
+                self.exit_engine.clear_exit_in_flight(
+                    position_id,
+                    reason=reason,
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_oid,
+                )
                 log.warning(
-                    "[%s] clear_exit_in_flight(%s) called — "
+                    "[%s] clear_exit_in_flight(%s) called with exact identity — "
                     "exit engine will retry within 8s",
                     self.client_id, position_id,
                 )
@@ -5311,37 +5375,18 @@ class APOrderMonitor:
                     self.client_id, position_id, _cef,
                 )
 
-        # Cancellation proves only that the order is canceled — it does not
-        # prove no partial fill occurred or that full quantity remains.
-        # _guarded_revert_position_open_after_exit_cancel already declines to
-        # reopen quantity when a newer active replacement exit exists; it
-        # must not reconstruct position state from assumption either.
-        if position_id and self.pm:
+        # In watchdog mode this stale-exit seam owns only broker order
+        # cancellation and replacement authorization.  It must not call the
+        # generic position reopen fallback, which can mutate durable economic
+        # state without a fill-sized proof. Actor mode retains its existing
+        # guarded reopen behavior.
+        if position_id and self.pm and ORDER_MONITOR_CAN_ACT:
             self._guarded_revert_position_open_after_exit_cancel(
                 position_id=position_id,
                 canceled_exit_order_id=local_order_id,
                 contract=contract,
                 reason=reason,
             )
-
-        # Hand off replacement authority through the identity-safe existing
-        # seam. This is the exactly-once increment point for
-        # ManagedPosition.exit_replace_attempt (ap_exit_engine.py PR #423
-        # Patch 2) — mark_exit_replacement_safe() itself enforces the
-        # exactly-once guarantee via its identity fencing.
-        if position_id and self.exit_engine and hasattr(self.exit_engine, "mark_exit_replacement_safe"):
-            try:
-                self.exit_engine.mark_exit_replacement_safe(
-                    position_id,
-                    reason="order_monitor_stale_exit_broker_confirmed_cancel",
-                    local_order_id=local_order_id,
-                    broker_order_id=broker_oid,
-                )
-            except Exception as _mrs_e:
-                log.error(
-                    "[%s] mark_exit_replacement_safe failed for pos=%s: %s",
-                    self.client_id, position_id, _mrs_e,
-                )
 
     def _guarded_revert_position_open_after_exit_cancel(
         self,
@@ -5754,7 +5799,12 @@ class APOrderMonitor:
             _pos_id = (order or {}).get("position_id")
             if _pos_id and self.exit_engine:
                 try:
-                    self.exit_engine.clear_exit_in_flight(_pos_id)
+                    self.exit_engine.clear_exit_in_flight(
+                        _pos_id,
+                        reason=f"broker_terminal_status={s}",
+                        local_order_id=(order or {}).get("local_order_id") or local_order_id,
+                        broker_order_id=(order or {}).get("broker_order_id") or "",
+                    )
                     log.warning(
                         "[%s] clear_exit_in_flight(%s) from broker status=%s — "
                         "exit engine will retry",
@@ -5768,7 +5818,7 @@ class APOrderMonitor:
             # Revert position to OPEN so the exit engine can re-submit.
             # Without this, the position stays CLOSING and the exit engine
             # never re-submits even after clearing in-flight.
-            if _pos_id and self.pm:
+            if _pos_id and self.pm and ORDER_MONITOR_CAN_ACT:
                 try:
                     self._guarded_revert_position_open_after_exit_cancel(
                         position_id=_pos_id,
@@ -5781,6 +5831,150 @@ class APOrderMonitor:
                         "[%s] _guarded_revert failed after broker terminal exit status=%s pos=%s: %s",
                         self.client_id, s, _pos_id, _e3,
                     )
+
+    def _query_broker_order_payload(self, broker_order_id: Optional[str]) -> Optional[dict]:
+        """Fetch the exact broker payload needed for cumulative fill truth.
+
+        ``_query_broker_order`` intentionally returns only normalized status
+        and is cached for polling.  Partial-fill recovery needs the raw
+        cumulative quantity and average fill, so it performs a direct read
+        without reusing that status-only cache.
+        """
+        if not broker_order_id or not self.broker:
+            return None
+        try:
+            if hasattr(self.broker, "get_order"):
+                raw = self.broker.get_order(broker_order_id)
+                if isinstance(raw, dict):
+                    return dict(raw)
+            if hasattr(self.broker, "order_status"):
+                raw = self.broker.order_status(broker_order_id)
+                if raw:
+                    return {"status": raw}
+        except Exception as exc:
+            log.warning(
+                "[%s] exact broker fill payload lookup failed | broker_order_id=%s: %s",
+                self.client_id, broker_order_id, exc,
+            )
+        return None
+
+    def _apply_broker_partial_exit_fill(
+        self,
+        local_order_id: str,
+        broker_order_id: str,
+        contract: str,
+    ) -> Optional[int]:
+        """Apply broker cumulative partial fill through the canonical OSM hook.
+
+        Returns the durable unfilled remainder, zero when no remainder should
+        be canceled, or ``None`` when exact fill/quantity proof is unavailable.
+        The order monitor never mutates position quantity directly.
+        """
+        order = dict(self.osm.get_order(local_order_id) or {})
+        if str(order.get("kind") or "").upper() != "EXIT":
+            return None
+        raw = self._query_broker_order_payload(broker_order_id)
+        if not raw:
+            return None
+        raw_status = self._normalize_broker_status(raw)
+        if raw_status != "partially_filled":
+            # A direct read that changed to a terminal status is still broker
+            # truth, but this helper must not reinterpret it as a partial.
+            log.warning(
+                "[%s] partial-fill payload changed status before OSM apply | local=%s status=%s",
+                self.client_id, local_order_id, raw_status or "unknown",
+            )
+            return 0
+
+        cumulative_raw = None
+        for key in ("exec_quantity", "filled_quantity", "filled_qty"):
+            if key in raw and raw.get(key) is not None:
+                cumulative_raw = raw.get(key)
+                break
+        try:
+            cumulative_filled = int(cumulative_raw)
+            requested_qty = int(order.get("qty") or order.get("quantity") or 0)
+            previous_filled = int(order.get("filled_qty") or 0)
+        except (TypeError, ValueError):
+            cumulative_filled = 0
+            requested_qty = 0
+            previous_filled = 0
+
+        if cumulative_filled <= 0 or requested_qty <= 0:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="BROKER_PARTIAL_FILL_QTY_UNPROVEN",
+                explanation=(
+                    "Broker reported PARTIALLY_FILLED but exact positive cumulative "
+                    "fill quantity or requested quantity was unavailable."
+                ),
+                contract=contract,
+                position_id=order.get("position_id"),
+                inputs={
+                    "broker_order_id": broker_order_id,
+                    "cumulative_filled": cumulative_raw,
+                    "requested_qty": order.get("qty") or order.get("quantity"),
+                },
+            )
+            return None
+        if cumulative_filled < previous_filled or cumulative_filled > requested_qty:
+            self._emit_order_event(
+                local_order_id=local_order_id,
+                stage="order_monitor",
+                decision="HOLD",
+                reason_code="BROKER_PARTIAL_FILL_QTY_INVALID",
+                explanation="Broker cumulative partial fill regressed or exceeded order quantity.",
+                contract=contract,
+                position_id=order.get("position_id"),
+                inputs={
+                    "broker_order_id": broker_order_id,
+                    "cumulative_filled": cumulative_filled,
+                    "previous_filled": previous_filled,
+                    "requested_qty": requested_qty,
+                },
+            )
+            return None
+
+        fill_price = raw.get("avg_fill_price")
+        if fill_price is None:
+            fill_price = raw.get("avg_fill")
+        if fill_price is None:
+            fill_price = raw.get("price")
+        current_status = str(order.get("status") or "").strip().upper()
+        try:
+            if cumulative_filled > previous_filled:
+                if current_status == "EXIT_PARTIAL_FILL" and hasattr(self.osm, "apply_fill_update"):
+                    ok = self.osm.apply_fill_update(
+                        local_order_id=local_order_id,
+                        cumulative_filled=cumulative_filled,
+                        fill_price=fill_price,
+                        broker_order_id=broker_order_id,
+                    )
+                else:
+                    ok = self.osm.transition(
+                        local_order_id,
+                        "EXIT_PARTIAL_FILL",
+                        filled_qty=cumulative_filled,
+                        fill_price=fill_price,
+                        broker_order_id=broker_order_id,
+                    )
+                if ok is False:
+                    return None
+        except Exception as exc:
+            log.error(
+                "[%s] canonical OSM partial-fill apply failed | local=%s: %s",
+                self.client_id, local_order_id, exc,
+            )
+            return None
+
+        updated = dict(self.osm.get_order(local_order_id) or {})
+        durable_filled = int(updated.get("filled_qty") or cumulative_filled or 0)
+        durable_qty = int(updated.get("qty") or requested_qty or 0)
+        if durable_filled < cumulative_filled or durable_qty <= 0:
+            return None
+        return max(0, durable_qty - durable_filled)
 
     def _get_broker_order_id(self, local_order_id: str) -> Optional[str]:
         try:

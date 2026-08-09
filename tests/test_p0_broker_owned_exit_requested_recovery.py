@@ -2327,7 +2327,10 @@ def test_actor_mode_stale_open_exit_keeps_existing_cancel_logic_reachable(monkey
     order = _row(status="EXIT_SUBMITTED", broker_order_id="36661364")
     osm = _MonitorOSM(order)
     monitor = _monitor(order, osm, _Broker({"status": "OPEN"}))
-    monitor._query_broker_order = MagicMock(return_value="open")
+    # _check_exit_orders performs the first read, stale recovery performs a
+    # second pre-cancel read, and the third read is the independent
+    # post-cancel terminal proof required by PR #423.
+    monitor._query_broker_order = MagicMock(side_effect=["open", "open", "canceled"])
     monitor._cancel_broker_order = MagicMock(return_value={"status": "canceled"})
     monitor._guarded_revert_position_open_after_exit_cancel = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
@@ -2352,6 +2355,7 @@ def test_watchdog_mode_stale_open_exit_alerts_without_cancel(monkeypatch):
     monitor._cancel_broker_order = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
     monkeypatch.setattr(om, "ORDER_MONITOR_CAN_ACT", False)
+    monkeypatch.setattr(om, "ALLOW_STALE_EXIT_RECOVERY_IN_WATCHDOG", False)
 
     monitor._check_exit_orders()
 

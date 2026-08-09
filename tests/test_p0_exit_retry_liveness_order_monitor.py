@@ -99,11 +99,17 @@ def test_watchdog_stale_exit_recovery_enabled_by_default_cancels_and_confirms(mo
     get_calls = [c for c in call_log if c[0] == "get"]
     assert len(get_calls) == 2, "must perform pre-cancel GET AND independent post-cancel GET"
     osm.transition.assert_called_once_with("loc-avgo", "CANCELED", last_error="stale exit AVGO scale-out qty=2")
-    exit_engine.clear_exit_in_flight.assert_called_once_with("pos-avgo")
+    exit_engine.clear_exit_in_flight.assert_called_once_with(
+        "pos-avgo",
+        reason="stale exit AVGO scale-out qty=2",
+        local_order_id="loc-avgo",
+        broker_order_id="bro-avgo",
+    )
     exit_engine.mark_exit_replacement_safe.assert_called_once()
     _, kwargs = exit_engine.mark_exit_replacement_safe.call_args
     assert kwargs["local_order_id"] == "loc-avgo"
     assert kwargs["broker_order_id"] == "bro-avgo"
+    pm.update_position.assert_not_called()
 
 
 def test_watchdog_flag_explicitly_disabled_still_suppresses(monkeypatch):

@@ -1470,6 +1470,10 @@ class ManagedPosition:
     pending_exit_replace_allowed: bool = False
     pending_exit_replace_reason: str = ""
     pending_exit_replace_allowed_ts: Optional[datetime] = None
+    # When a stale exit was partially filled, replacement must cover only the
+    # broker-confirmed unfilled remainder of that exact old order.  Zero means
+    # there is no tranche-specific cap for the next replacement.
+    pending_exit_replace_qty: int = 0
     exit_identity_quarantine_alert_count: int = 0
     last_exit_identity_quarantine_alert_ts: Optional[datetime] = None
     last_exit_clear_reason: str = ""
@@ -3410,6 +3414,74 @@ def _is_same_or_equivalent_runner_protection(pending_reason: str, new_reason: st
     return _is_runner_protective_reason(pending_reason) and _is_runner_protective_reason(new_reason)
 
 
+def _restore_exit_replace_attempt_from_meta(raw_meta) -> dict[str, object]:
+    """Parse the durable retry-liveness namespace without inventing authority.
+
+    Restart hydration must tolerate JSON strings, missing namespaces, malformed
+    values, negative counters, and unrelated metadata.  The helper returns only
+    the dedicated retry fields; callers remain responsible for applying them to
+    a live ``ManagedPosition``.
+    """
+    import json
+
+    meta = raw_meta or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta) if meta.strip() else {}
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    namespace = meta.get("exit_retry_liveness") or {}
+    if not isinstance(namespace, dict):
+        namespace = {}
+
+    try:
+        attempt = int(namespace.get("replace_attempt", 0) or 0)
+        if attempt < 0:
+            attempt = 0
+    except Exception:
+        attempt = 0
+
+    try:
+        replace_qty = int(namespace.get("replace_quantity", 0) or 0)
+        if replace_qty < 0:
+            replace_qty = 0
+    except Exception:
+        replace_qty = 0
+
+    return {
+        "replace_attempt": attempt,
+        "last_ack_identity": str(namespace.get("last_ack_identity", "") or ""),
+        "replace_quantity": replace_qty,
+    }
+
+
+def _cap_exit_decision_to_replacement_remainder(pos, decision) -> int:
+    """Cap a replacement decision before any submit wrapper validates it."""
+    try:
+        replacement_cap = int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
+        requested_qty = int(getattr(decision, "quantity", 0) or 0)
+    except Exception:
+        return 0
+    if (
+        getattr(pos, "pending_exit_replace_allowed", False)
+        and replacement_cap > 0
+        and requested_qty > replacement_cap
+    ):
+        log.warning(
+            "[%s] Capping replacement exit to broker-unfilled remainder | "
+            "pos=%s requested=%s remainder=%s",
+            getattr(pos, "ticker", "?"),
+            getattr(pos, "position_id", "?"),
+            requested_qty,
+            replacement_cap,
+        )
+        decision.quantity = replacement_cap
+    return replacement_cap
+
+
 class APExitEngine:
     """
     Manages all open positions with time-aware exit logic.
@@ -3602,6 +3674,9 @@ class APExitEngine:
                     "replace_attempt": attempt,
                     "last_ack_identity": str(
                         getattr(pos, "_exit_replace_attempt_last_ack_identity", "") or ""
+                    ),
+                    "replace_quantity": max(
+                        0, int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
                     ),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
@@ -5301,6 +5376,7 @@ class APExitEngine:
                 pos.pending_exit_replace_allowed  = False
                 pos.pending_exit_replace_reason   = ""
                 pos.pending_exit_replace_allowed_ts = None
+                pos.pending_exit_replace_qty = 0
                 # PR #423: reset the replacement-generation counter ONLY on
                 # actual proven economic completion (this is the exact
                 # broker-confirmed-closed authority — never on submit,
@@ -5369,6 +5445,13 @@ class APExitEngine:
                         broker_order_id=broker_order_id, reason=reason_s,
                     )
                     return
+                _clear_identity = broker_order_id or local_order_id
+                _preserve_replacement_grant = bool(
+                    getattr(pos, "pending_exit_replace_allowed", False)
+                    and _clear_identity
+                    and _clear_identity
+                    == str(getattr(pos, "_exit_replace_attempt_last_ack_identity", "") or "")
+                )
                 pos.exit_in_flight   = False
                 pos.pending_exit_reason = ""
                 pos.pending_exit_action = ""
@@ -5392,9 +5475,16 @@ class APExitEngine:
                 pos.last_callback_identity_missing_ts = None
                 pos.exit_identity_quarantine          = False
                 pos.last_exit_identity_quarantine_resolved_ts = datetime.now(timezone.utc)
-                pos.pending_exit_replace_allowed   = False
-                pos.pending_exit_replace_reason    = ""
-                pos.pending_exit_replace_allowed_ts = None
+                # A stale-exit handoff marks the exact old generation safe
+                # before the OSM terminal hook calls this method.  Preserve
+                # that one-shot grant (and its remaining tranche cap) while
+                # clearing the old identity; an unrelated clear must still
+                # revoke any pending grant fail-closed.
+                if not _preserve_replacement_grant:
+                    pos.pending_exit_replace_allowed   = False
+                    pos.pending_exit_replace_reason    = ""
+                    pos.pending_exit_replace_allowed_ts = None
+                    pos.pending_exit_replace_qty = 0
                 self._assert_position_invariants(pos, "clear_exit_in_flight")
                 self._emit_exit_event(
                     pos,
@@ -5638,6 +5728,7 @@ class APExitEngine:
         pos.pending_exit_replace_allowed    = False
         pos.pending_exit_replace_reason     = ""
         pos.pending_exit_replace_allowed_ts = None
+        pos.pending_exit_replace_qty        = 0
 
     def mark_exit_replacement_safe(
         self,
@@ -5688,6 +5779,22 @@ class APExitEngine:
                         bool(pos.pending_exit_replace_allowed)
                         and _call_identity == (pos._exit_replace_attempt_last_ack_identity or "")
                     )
+                    try:
+                        _replacement_qty = int(kwargs.get("replacement_qty", 0) or 0)
+                    except Exception:
+                        _replacement_qty = 0
+                    if _replacement_qty <= 0:
+                        _replacement_qty = max(
+                            0,
+                            int(getattr(pos, "pending_exit_qty", 0) or 0)
+                            - int(getattr(pos, "pending_exit_filled_qty", 0) or 0),
+                        )
+                    if _replacement_qty > 0:
+                        # The grant carries the exact unfilled remainder when
+                        # broker truth proved a partial fill before cancel.
+                        # A replacement may never silently restore the old
+                        # pre-fill quantity.
+                        pos.pending_exit_replace_qty = _replacement_qty
                     if not _duplicate_grant_for_same_generation:
                         pos.exit_replace_attempt = int(getattr(pos, "exit_replace_attempt", 0) or 0) + 1
                         pos._exit_replace_attempt_last_ack_identity = _call_identity
@@ -6481,6 +6588,7 @@ class APExitEngine:
             pos.pending_exit_replace_allowed    = False
             pos.pending_exit_replace_reason     = ""
             pos.pending_exit_replace_allowed_ts = None
+            pos.pending_exit_replace_qty        = 0
 
             stale_enough = flight_sec >= 20.0
             new_code     = _classify_exit_decision(ExitDecision("CLOSE_ALL", 0, reason or "", "IMMEDIATE"))
@@ -6746,26 +6854,17 @@ class APExitEngine:
                         _persisted_href = _meta.get("hard_exit_reference") or {}
                     # PR #423 Patch 2 (restart requirement): restore the
                     # replacement-pricing generation from its dedicated
-                    # nested metadata namespace. Missing key -> 0.
-                    # Malformed key -> fail safely to 0. Never inferred from
-                    # elapsed time, order count, broker status history, or
+                    # nested metadata namespace. Missing/malformed values
+                    # fail safely to zero; the helper never infers authority
+                    # from elapsed time, order count, broker history, or
                     # _exit_stuck_count.
-                    try:
-                        _retry_liveness_meta = (
-                            _meta.get("exit_retry_liveness") if isinstance(_meta, dict) else None
-                        ) or {}
-                        _restored_attempt = int(
-                            _retry_liveness_meta.get("replace_attempt", 0) or 0
-                        ) if isinstance(_retry_liveness_meta, dict) else 0
-                        if _restored_attempt < 0:
-                            _restored_attempt = 0
-                    except Exception:
-                        _restored_attempt = 0
+                    _retry_liveness = _restore_exit_replace_attempt_from_meta(_meta)
+                    _restored_attempt = int(_retry_liveness["replace_attempt"])
                     mp.exit_replace_attempt = _restored_attempt
-                    if isinstance(_retry_liveness_meta, dict):
-                        mp._exit_replace_attempt_last_ack_identity = str(
-                            _retry_liveness_meta.get("last_ack_identity", "") or ""
-                        )
+                    mp._exit_replace_attempt_last_ack_identity = str(
+                        _retry_liveness["last_ack_identity"] or ""
+                    )
+                    mp.pending_exit_replace_qty = int(_retry_liveness["replace_quantity"])
                     if _restored_attempt > 0:
                         log.info(
                             "[exit_eng] SEED_EXIT_REPLACE_ATTEMPT_RESTORED client=%s "
@@ -8567,6 +8666,12 @@ class APExitEngine:
 
         # 1) Short critical section: validate and capture submit snapshot.
         with self._lock:
+            # A broker-confirmed partial fill grants replacement only for the
+            # exact unfilled remainder.  Apply the cap before the in-flight
+            # override consumes the one-shot grant, and keep all quantity
+            # accounting in the canonical OSM/fill path.
+            _replacement_cap = _cap_exit_decision_to_replacement_remainder(pos, decision)
+
             if not self._can_submit_exit(
                 pos, now_utc,
                 reason=decision.reason,

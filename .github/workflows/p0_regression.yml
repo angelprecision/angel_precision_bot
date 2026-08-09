@@ -122,6 +122,10 @@ jobs:
             tests/test_p0_broker_owned_exit_recovery_preflight.py \
             tests/test_p0_post_cancel_entry_retry_liveness.py \
             tests/test_phase9_retry_wire_in.py \
+            tests/test_p0_exit_retry_liveness_order_monitor.py \
+            tests/test_p0_exit_retry_liveness_exit_engine.py \
+            tests/test_p0_exit_retry_liveness_autonomous_recovery.py \
+            tests/test_p0_exit_retry_liveness_avgo_replay.py \
             tests/test_fill_monitor_mvp_hardening.py \
             tests/test_p0_seam4_e2e_deferred_lifecycle.py \
             tests/test_p0_intelligence_postgres.py \
