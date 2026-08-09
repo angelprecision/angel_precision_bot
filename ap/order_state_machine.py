@@ -5619,33 +5619,89 @@ class APOrderStateMachine:
                 execution_mode = None
 
         reserved_local_id = str(local_order_id or "").strip()
-        requested_qty = int(qty or 0)
+        requested_qty = (
+            qty
+            if isinstance(qty, int) and not isinstance(qty, bool) and qty > 0
+            else None
+        )
+        if requested_qty is None:
+            return {
+                "ok": False,
+                "local_order_id": reserved_local_id or None,
+                "broker_order_id": None,
+                "status": OrderStatus.ERROR,
+                "error": "exit_requested_quantity_invalid",
+            }
+
+        def _reserved_exit_identity_mismatches(order_row) -> list[str]:
+            if not isinstance(order_row, dict):
+                return ["row_missing"]
+            durable_qty_raw = order_row.get("qty")
+            durable_qty = (
+                durable_qty_raw
+                if isinstance(durable_qty_raw, int)
+                and not isinstance(durable_qty_raw, bool)
+                and durable_qty_raw > 0
+                else None
+            )
+            runtime_mode = str(execution_mode or "").strip().lower()
+            mismatches = []
+            if str(order_row.get("local_order_id") or "").strip() != reserved_local_id:
+                mismatches.append("local_order_id")
+            if str(order_row.get("position_id") or "") != str(position_id or ""):
+                mismatches.append("position_id")
+            if order_row.get("kind") != "EXIT":
+                mismatches.append("kind")
+            if order_row.get("status") != OrderStatus.EXIT_REQUESTED:
+                mismatches.append("status")
+            if order_row.get("client_id") != self.client_id:
+                mismatches.append("client_id")
+            if (
+                runtime_mode not in {"live", "paper"}
+                or order_row.get("execution_mode") != runtime_mode
+            ):
+                mismatches.append("execution_mode")
+            if str(order_row.get("contract") or "") != str(contract or ""):
+                mismatches.append("contract")
+            if durable_qty != requested_qty:
+                mismatches.append("qty")
+            if order_row.get("broker_order_id") not in (None, ""):
+                mismatches.append("broker_order_id")
+            return mismatches
+
+        def _reserved_exit_identity_failure(order_row, mismatches: list[str]) -> dict:
+            error_msg = "reserved_exit_identity_mismatch:" + ",".join(mismatches)
+            log.critical(
+                "[%s] submit_exit BLOCKED -- reserved exit identity mismatch | "
+                "pos=%s local=%s fields=%s",
+                self.client_id,
+                position_id,
+                reserved_local_id,
+                ",".join(mismatches),
+            )
+            return {
+                "ok": False,
+                "local_order_id": reserved_local_id,
+                "broker_order_id": (
+                    order_row.get("broker_order_id")
+                    if isinstance(order_row, dict)
+                    else None
+                ),
+                "status": (
+                    order_row.get("status")
+                    if isinstance(order_row, dict)
+                    else OrderStatus.ERROR
+                ),
+                "error": error_msg,
+            }
+
         existing = self._get_active_exit_order(position_id)
         if existing:
             existing  = dict(existing)
-            if reserved_local_id and str(existing.get("local_order_id") or "").strip() == reserved_local_id:
-                durable_qty = int(existing.get("qty") or 0)
-                if requested_qty <= 0 or durable_qty != requested_qty:
-                    error_msg = (
-                        "reserved_exit_quantity_mismatch:"
-                        f"{reserved_local_id}:durable={durable_qty}:requested={requested_qty}"
-                    )
-                    log.critical(
-                        "[%s] submit_exit BLOCKED -- reserved exit quantity mismatch | "
-                        "pos=%s local=%s durable_qty=%s requested_qty=%s",
-                        self.client_id,
-                        position_id,
-                        reserved_local_id,
-                        durable_qty,
-                        requested_qty,
-                    )
-                    return {
-                        "ok": False,
-                        "local_order_id": reserved_local_id,
-                        "broker_order_id": existing.get("broker_order_id"),
-                        "status": existing.get("status"),
-                        "error": error_msg,
-                    }
+            if reserved_local_id:
+                mismatches = _reserved_exit_identity_mismatches(existing)
+                if mismatches:
+                    return _reserved_exit_identity_failure(existing, mismatches)
                 local_id = reserved_local_id
             else:
                 error_msg = (f"active_exit_already_exists:"
@@ -5661,6 +5717,21 @@ class APOrderStateMachine:
                         "broker_order_id": existing.get("broker_order_id"),
                         "status": existing.get("status"), "error": error_msg}
         else:
+            if reserved_local_id:
+                error_msg = f"reserved_exit_row_missing:{reserved_local_id}"
+                log.critical(
+                    "[%s] submit_exit BLOCKED -- reserved exit row missing | pos=%s local=%s",
+                    self.client_id,
+                    position_id,
+                    reserved_local_id,
+                )
+                return {
+                    "ok": False,
+                    "local_order_id": reserved_local_id,
+                    "broker_order_id": None,
+                    "status": OrderStatus.ERROR,
+                    "error": error_msg,
+                }
             local_id = self.create_exit_order(
                 position_id=position_id, contract=contract, symbol=symbol,
                 direction=direction, qty=qty, plan_id=plan_id, signal_id=signal_id,
@@ -6022,6 +6093,20 @@ class APOrderStateMachine:
         status = ""
 
         for _attempt in range(1, _max_attempts + 1):
+            # Re-read the exact reserved row immediately before every possible
+            # POST.  The entry-time check is not enough: another worker could
+            # terminalize, replace, mutate, or broker-own the row while broker
+            # truth and safety gates run above.
+            if reserved_local_id:
+                latest_reserved = self._get_active_exit_order(position_id)
+                latest_mismatches = _reserved_exit_identity_mismatches(
+                    dict(latest_reserved) if latest_reserved else None
+                )
+                if latest_mismatches:
+                    return _reserved_exit_identity_failure(
+                        dict(latest_reserved) if latest_reserved else None,
+                        latest_mismatches,
+                    )
             # Re-check active exit on EACH attempt — a concurrent submission
             # or a successful prior attempt that we couldn't confirm could
             # have created one. Never double-submit.

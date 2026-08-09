@@ -3371,7 +3371,8 @@ def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkey
         guard._ORIGINAL_SUBMIT_ATTR,
         APExitEngine._submit_exit_decision,
     )
-    result = guard.wrap_submit(original_submit)(engine, pos, decision)
+    guarded_submit = guard.wrap_submit(original_submit)
+    result = guarded_submit(engine, pos, decision)
 
     assert result is True
     assert len(osm.create_calls) == 1
@@ -3379,6 +3380,9 @@ def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkey
     assert osm.row["local_order_id"] == reserved_id
     assert osm.row["qty"] == 1
     assert osm.row["broker_order_id"] == broker_id
+    assert osm.row["client_id"] == "tradefluence"
+    assert osm.row["execution_mode"] == "paper"
+    assert osm.row["position_id"] == pos.position_id
     assert broker.session.post.call_count == 1
     posted = broker.session.post.call_args.kwargs["data"]
     assert posted["quantity"] == 1
@@ -3399,6 +3403,170 @@ def test_production_scale_out_reuses_exact_reserved_identity_and_quantity(monkey
     ]
     assert claim_updates[-1][1]["local_order_id"] == reserved_id
     assert claim_updates[-1][1]["broker_order_id"] == broker_id
+
+    # Replay the same economic SCALE_OUT generation through the same real
+    # producer-to-broker chain.  The already broker-owned durable row must
+    # fence the replay before any second create or POST.
+    replay_result = guarded_submit(engine, pos, decision)
+    assert replay_result is False
+    assert len(osm.create_calls) == 1
+    assert broker.session.post.call_count == 1
+
+
+def test_production_scale_out_qty_mismatch_holds_before_osm_and_broker():
+    """Durable qty=4 versus SCALE_OUT qty=1 is a zero-POST HOLD."""
+    from ap_exit_engine import APExitEngine, ExitDecision, ManagedPosition
+    from ap_execution_core import APExecutionCore
+
+    reserved_id = "exit-scale-mismatch-425"
+    pos = ManagedPosition(
+        ticker="ORCL",
+        option_symbol="ORCL260807P00155000",
+        side="PUT",
+        quantity=4,
+        entry_price=1.00,
+        underlying_entry=155.00,
+        underlying_target=150.00,
+        underlying_stop=158.00,
+        position_id="position-scale-mismatch-425",
+        client_id="tradefluence",
+        execution_mode="paper",
+        current_option_price=1.20,
+        current_bid=1.15,
+        current_ask=1.25,
+        current_underlying=153.00,
+        quantity_remaining=4,
+        pending_exit_local_order_id=reserved_id,
+    )
+    decision = ExitDecision(
+        action="SCALE_OUT",
+        quantity=1,
+        reason="TP SCALE OUT",
+        urgency="NORMAL",
+        pnl_pct=0.20,
+    )
+    active_order = _guard_reserved_order(
+        pos,
+        local_order_id=reserved_id,
+        execution_mode="paper",
+        qty=4,
+    )
+    osm = _GuardOSM(active_order)
+    osm.submit_exit = MagicMock(side_effect=AssertionError("OSM must not be reached"))
+    broker = MagicMock()
+
+    core = APExecutionCore.__new__(APExecutionCore)
+    core.order_state_machine = osm
+    core.broker = broker
+
+    engine = APExitEngine.__new__(APExitEngine)
+    engine._lock = threading.RLock()
+    engine.client_id = "tradefluence"
+    engine._email = "tradefluence"
+    engine.master_control = SimpleNamespace(mode="paper")
+    engine.order_state_machine = osm
+    engine.osm = None
+    engine.on_scale = core._on_position_scale
+    engine.on_exit = None
+
+    original_submit = getattr(
+        APExitEngine,
+        guard._ORIGINAL_SUBMIT_ATTR,
+        APExitEngine._submit_exit_decision,
+    )
+    result = guard.wrap_submit(original_submit)(engine, pos, decision)
+
+    assert result is False
+    assert active_order["qty"] == 4
+    assert active_order["broker_order_id"] == ""
+    osm.submit_exit.assert_not_called()
+    assert broker.session.post.call_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("local_order_id", "exit-other-425"),
+        ("position_id", "position-other-425"),
+        ("kind", "ENTRY"),
+        ("status", "EXIT_SUBMITTED"),
+        ("client_id", "jason"),
+        ("execution_mode", "live"),
+        ("contract", "ORCL260807C00155000"),
+        ("qty", 4),
+        ("broker_order_id", "broker-already-owned-425"),
+    ],
+)
+def test_osm_reserved_exit_identity_mismatch_never_posts(field, invalid_value):
+    """OSM independently enforces every reserved identity field at POST."""
+    reserved_id = "exit-osm-boundary-425"
+    position_id = "position-osm-boundary-425"
+    contract = "ORCL260807P00155000"
+    row = {
+        "client_id": "tradefluence",
+        "local_order_id": reserved_id,
+        "broker_order_id": "",
+        "position_id": position_id,
+        "kind": "EXIT",
+        "contract": contract,
+        "qty": 1,
+        "status": "EXIT_REQUESTED",
+        "execution_mode": "paper",
+    }
+    row[field] = invalid_value
+
+    class _BoundaryOSM:
+        submit_exit = APOrderStateMachine.submit_exit
+        client_id = "tradefluence"
+
+        def _get_active_exit_order(self, _position_id):
+            return dict(row)
+
+    broker = MagicMock()
+    result = _BoundaryOSM().submit_exit(
+        broker=broker,
+        position_id=position_id,
+        contract=contract,
+        symbol="ORCL",
+        direction="PUT",
+        qty=1,
+        limit_price=1.15,
+        execution_mode="paper",
+        local_order_id=reserved_id,
+    )
+
+    assert result["ok"] is False
+    assert result["error"].startswith("reserved_exit_identity_mismatch:")
+    assert field in result["error"]
+    assert broker.session.post.call_count == 0
+
+
+def test_osm_reserved_exit_id_without_durable_row_never_posts():
+    """A caller cannot fabricate a reservation by supplying an orphan ID."""
+    class _MissingReservedOSM:
+        submit_exit = APOrderStateMachine.submit_exit
+        client_id = "tradefluence"
+
+        @staticmethod
+        def _get_active_exit_order(_position_id):
+            return None
+
+    broker = MagicMock()
+    result = _MissingReservedOSM().submit_exit(
+        broker=broker,
+        position_id="position-osm-missing-425",
+        contract="ORCL260807P00155000",
+        symbol="ORCL",
+        direction="PUT",
+        qty=1,
+        limit_price=1.15,
+        execution_mode="paper",
+        local_order_id="exit-osm-missing-425",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "reserved_exit_row_missing:exit-osm-missing-425"
+    assert broker.session.post.call_count == 0
 
 
 def test_blocker1_fresh_exact_requested_intent_reaches_callback_once(monkeypatch):
