@@ -806,6 +806,30 @@ def test_tradier_list_positions_malformed_top_level_payload_raises(payload):
 
 
 @pytest.mark.parametrize(
+    "row",
+    [
+        {"symbol": "AVGO260814C00350000", "cost_basis": 1.0},
+        {"quantity": 2, "cost_basis": 1.0},
+    ],
+    ids=["missing_quantity", "missing_symbol"],
+)
+def test_tradier_list_positions_missing_row_field_raises(row):
+    from ap.brokers.tradier import TradierBroker, TradierConfig
+
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="acct",
+        )
+    )
+    broker._get = MagicMock(return_value={"positions": {"position": [row]}})
+
+    with pytest.raises(ValueError, match="TRADIER_POSITIONS_PAYLOAD_MALFORMED"):
+        broker.list_positions()
+
+
+@pytest.mark.parametrize(
     "payload",
     [{"orders": None}, {"orders": {"order": None}}, {"orders": {"order": []}}],
 )
@@ -878,6 +902,53 @@ def test_recovery_with_malformed_real_tradier_order_snapshot_is_noop():
     assert osm.transitions == []
     assert position.closed is False
     assert position.exit_in_flight is True
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"symbol": "AVGO260814C00350000", "cost_basis": 1.0},
+        {"quantity": 2, "cost_basis": 1.0},
+    ],
+    ids=["missing_quantity", "missing_symbol"],
+)
+def test_recovery_with_missing_tradier_position_field_blocks_all_mutation(row):
+    from ap.brokers.tradier import TradierBroker, TradierConfig
+
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="acct",
+        )
+    )
+
+    def _get(endpoint):
+        if endpoint.endswith("/orders"):
+            return {"orders": {"order": []}}
+        return {"positions": {"position": [row]}}
+
+    broker._get = MagicMock(side_effect=_get)
+    exit_engine = MagicMock()
+    osm = _DurableOSM(broker_id="")
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_position_query_unavailable"
+    assert action.details["broker_truth_unavailable"] is True
+    assert action.details["replacement_blocked"] is True
+    exit_engine.mark_position_closed.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.finalize_exit_replacement_safe.assert_not_called()
+    exit_engine.clear_exit_in_flight.assert_not_called()
+    assert osm.transitions == []
 
 
 def test_cancel_ack_without_fresh_exact_order_proof_does_not_unlock_replacement():

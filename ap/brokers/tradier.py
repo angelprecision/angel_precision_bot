@@ -505,15 +505,26 @@ class TradierBroker(BrokerAdapter):
                 raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
             result = []
             for p in pos_list:
+                symbol = p.get("symbol")
+                quantity = p.get("quantity")
+                if (
+                    "symbol" not in p
+                    or not isinstance(symbol, str)
+                    or not symbol.strip()
+                    or "quantity" not in p
+                    or quantity is None
+                    or (isinstance(quantity, str) and not quantity.strip())
+                ):
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
                 result.append({
-                    "symbol":     p.get("symbol", ""),
-                    "quantity":   float(p.get("quantity", 0)),
+                    "symbol":     symbol,
+                    "quantity":   float(quantity),
                     "cost_basis": float(p.get("cost_basis", 0)),
                     "side":       (lambda sym: (
                         "CALL" if (len(sym) >= 15 and sym[-9] == "C") else
                         "PUT"  if (len(sym) >= 15 and sym[-9] == "P") else
                         "CALL" if "C" in sym else "PUT"
-                    ))(str(p.get("symbol", ""))),
+                    ))(symbol),
                     "raw":        p,
                 })
             return result
