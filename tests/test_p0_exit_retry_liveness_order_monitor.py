@@ -554,6 +554,96 @@ def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_rem
     assert mark_kwargs["replacement_qty"] != 2
 
 
+def test_cancel_to_canceled_with_same_durable_partial_fill_preserves_remainder(monkeypatch):
+    """A terminal cancel repeating durable partial truth still hands off its remainder."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+
+    class _AlreadyPartialFillOSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-durable-partial",
+                "kind": "EXIT",
+                "position_id": "pos-durable-partial",
+                "broker_order_id": "bro-durable-partial",
+                "status": "EXIT_PARTIAL_FILL",
+                "qty": 2,
+                "filled_qty": 1,
+                "meta": {},
+            }
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            if local_order_id != self.row["local_order_id"]:
+                return None
+            row = dict(self.row)
+            row["meta"] = dict(self.row["meta"])
+            return row
+
+        def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+            if (
+                local_order_id != self.row["local_order_id"]
+                or broker_order_id != self.row["broker_order_id"]
+            ):
+                return False
+            self.row["meta"]["stale_exit_cancel_liveness"] = {
+                "broker_order_id": broker_order_id,
+                "attempt": int(attempt),
+                "updated_at": "test",
+            }
+            return True
+
+        def transition(self, local_order_id, status, **kwargs):
+            if local_order_id != self.row["local_order_id"]:
+                return False
+            self.transitions.append((local_order_id, status, kwargs))
+            self.row["status"] = status
+            return True
+
+    broker = MagicMock()
+    pre_cancel = {
+        "status": "partially_filled",
+        "exec_quantity": 1,
+        "avg_fill_price": 1.25,
+    }
+    broker.get_order.side_effect = [
+        pre_cancel,
+        pre_cancel,
+        {"status": "canceled", "exec_quantity": 1, "avg_fill_price": 1.25},
+    ]
+    broker.cancel_order.return_value = {"status": "canceled"}
+    osm = _AlreadyPartialFillOSM()
+    exit_engine = MagicMock()
+    exit_engine.mark_exit_replacement_safe.return_value = True
+    exit_engine.finalize_exit_replacement_safe.return_value = True
+
+    mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+    mon._advance_from_broker_status = MagicMock()
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    mon._get_newer_active_exit_order = MagicMock(return_value=None)
+
+    mon._handle_stale_exit(
+        local_order_id="loc-durable-partial",
+        status="EXIT_PARTIAL_FILL",
+        contract="AAPL260814C00200000",
+        age_secs=120.0,
+        position_id="pos-durable-partial",
+        reason="durable partial truth repeated at cancel",
+    )
+
+    assert broker.get_order.call_count == 3
+    assert broker.cancel_order.call_count == 1
+    assert osm.row["filled_qty"] == 1
+    assert [status for _, status, _ in osm.transitions] == ["CANCELED"]
+    assert osm.transitions[-1][2]["broker_order_id"] == "bro-durable-partial"
+    mon._advance_from_broker_status.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_called_once()
+    _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
+    assert mark_kwargs["replacement_qty"] == 1
+    exit_engine.finalize_exit_replacement_safe.assert_called_once()
+    exit_engine.clear_exit_in_flight.assert_called_once()
+
+
 def test_rejected_is_terminal_stale_exit_cancel_proof():
     mon = _monitor()
 

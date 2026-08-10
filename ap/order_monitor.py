@@ -6419,10 +6419,10 @@ class APOrderMonitor:
                             # CANCELED+exec_quantity cannot lose the late fill.
                             raw_status = "partially_filled"
                         else:
-                            self._advance_from_broker_status(
-                                local_order_id, raw_status, contract
-                            )
-                            return 0
+                            # The durable partial fill already accounts for this
+                            # cumulative broker truth. Preserve its remainder
+                            # for the staged replacement handoff.
+                            return requested_qty - cumulative_filled
 
                 if raw_status == "filled":
                     cumulative_raw = None
