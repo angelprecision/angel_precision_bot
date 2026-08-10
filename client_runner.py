@@ -4517,7 +4517,9 @@ def route_signal_to_all_clients(signal: dict):
             ):
                 logger.warning(
                     "ROUTE_WARN [%s]: runner alive but entries_allowed=%s degraded=%s — "
-                    "signal queued anyway, will execute when gate clears",
+                    "route_decision=QUEUED broker_submission=NOT_ATTEMPTED; "
+                    "signal queued anyway, will execute when gate clears; "
+                    "routing log is not broker-outcome evidence",
                     email,
                     runner.entries_allowed.is_set(),
                     runner.degraded.is_set(),
