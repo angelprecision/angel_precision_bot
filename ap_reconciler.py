@@ -28,7 +28,7 @@ Checks:
 
   Positions:
     E. DB OPEN/CLOSING → broker position missing
-       → evidence-based close only after filled exit evidence or three-pass ghost confirm
+       → close only after exact filled EXIT evidence; broker-flat passes remain HOLD diagnostics
     F. DB qty vs broker qty mismatch
        → alert
     G. Broker OPEN → DB missing
@@ -77,6 +77,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import threading
@@ -1287,7 +1288,11 @@ class APBrokerReconciler:
             )
 
         # Endpoint 2: recent fill evidence. Prefer to advance OSM so OSM owns hooks.
-        recent_fill = self._get_recent_exit_fill(contract, underlying)
+        recent_fill = self._get_recent_exit_fill(
+            contract,
+            position_id=pos_id,
+            execution_mode=order.get("execution_mode") or "",
+        )
         if recent_fill:
             fill_qty = self._safe_int(recent_fill.get("filled_qty"), requested_qty or 0)
             fill_px  = self._safe_float(recent_fill.get("fill_price"), 0.0)
@@ -1412,9 +1417,10 @@ class APBrokerReconciler:
 
             recent_fill = self._get_recent_exit_fill(
                 contract,
-                self._norm_underlying(
-                    order.get("underlying") or order.get("ticker") or self._norm_underlying(contract)
-                ),
+                position_id=str(
+                    order.get("position_id") or order.get("positionId") or ""
+                ).strip(),
+                execution_mode=order.get("execution_mode") or "",
             )
             if recent_fill:
                 self._alert(
@@ -2927,8 +2933,20 @@ class APBrokerReconciler:
             log.error("[%s] Failed to fetch DB open/closing positions: %s", self.client_id, e)
             return []
 
-    def _get_recent_exit_fill(self, contract: str, underlying: str) -> Optional[dict]:
-        """Look up the most recent filled EXIT order for this contract."""
+    def _get_recent_exit_fill(
+        self,
+        contract: str,
+        *,
+        position_id: str,
+        execution_mode: str,
+    ) -> Optional[dict]:
+        """Return one exact, economically usable broker EXIT fill, if proven."""
+        contract = self._norm_contract(contract)
+        position_id = str(position_id or "").strip()
+        mode = _normalize_execution_mode(execution_mode)
+        if not contract or not position_id or mode is None:
+            return None
+
         try:
             from ap.db import conn, run_with_retry
 
@@ -2936,19 +2954,67 @@ class APBrokerReconciler:
                 with conn() as c:
                     c.execute(
                         """
-                        SELECT fill_price, filled_qty, updated_ts
+                        SELECT broker_order_id,
+                               local_order_id,
+                               position_id,
+                               contract,
+                               execution_mode,
+                               fill_price,
+                               filled_qty,
+                               filled_ts,
+                               updated_ts
                         FROM   orders
                         WHERE  client_id = %s
+                          AND  LOWER(TRIM(COALESCE(execution_mode, ''))) = %s
                           AND  kind = 'EXIT'
-                          AND  status IN ('FILLED', 'EXIT_FILLED')
-                          AND  (contract = %s OR symbol = %s OR symbol = %s)
-                        ORDER  BY updated_ts DESC
-                        LIMIT  1
+                          AND  status IN ('FILLED', 'EXIT_FILLED', 'EXIT_PARTIAL_FILL')
+                          AND  UPPER(TRIM(COALESCE(contract, ''))) = %s
+                          AND  position_id::text = %s
+                        ORDER  BY COALESCE(filled_ts, updated_ts) DESC
+                        LIMIT  2
                         """,
-                        (self.client_id, contract, contract, underlying),
+                        (self.client_id, mode, contract, position_id),
                     )
-                    row = c.fetchone()
-                    return dict(row) if row else None
+                    rows = c.fetchall() or []
+
+                    # More than one exact candidate is unresolved economic truth;
+                    # never newest-wins two fills for the same position identity.
+                    if len(rows) > 1:
+                        self._alert(
+                            "RECONCILER_EXIT_FILL_IDENTITY_AMBIGUOUS | "
+                            f"client={self.client_id} mode={mode} "
+                            f"position_id={position_id} contract={contract} "
+                            f"candidate_count={len(rows)}"
+                        )
+                        return None
+
+                    if not rows:
+                        return None
+
+                    row = dict(rows[0])
+                    broker_order_id = str(row.get("broker_order_id") or "").strip()
+                    if (
+                        not broker_order_id
+                        or broker_order_id.lower() in {"none", "null"}
+                        or self._norm_contract(row.get("contract")) != contract
+                        or str(row.get("position_id") or "").strip() != position_id
+                        or _normalize_execution_mode(row.get("execution_mode")) != mode
+                    ):
+                        return None
+
+                    try:
+                        fill_price = float(row.get("fill_price"))
+                        filled_qty = float(row.get("filled_qty"))
+                    except (TypeError, ValueError):
+                        return None
+                    if (
+                        not math.isfinite(fill_price)
+                        or not math.isfinite(filled_qty)
+                        or fill_price <= 0
+                        or filled_qty <= 0
+                    ):
+                        return None
+                    return row
 
             return run_with_retry(_fetch)
         except Exception as e:
@@ -2956,14 +3022,11 @@ class APBrokerReconciler:
             return None
 
     def _mark_ghost_seen(self, contract: str) -> bool:
-        """Three-pass ghost detection to reduce false closes from broker API gaps."""
+        """Track repeated broker-flat observations for diagnostics."""
         key   = self._norm_contract(contract)
         count = int(self._ghost_tracker.get(key, 0)) + 1
         self._ghost_tracker[key] = count
-        if count >= 3:
-            del self._ghost_tracker[key]
-            return True
-        return False
+        return count >= 3
 
     def _reconcile_positions(self, summary: dict):
         """
@@ -2971,7 +3034,8 @@ class APBrokerReconciler:
 
         Policy:
           1. Match DB positions by exact contract symbol first.
-          2. Auto-close DB positions only with filled exit evidence or three-pass ghost confirm.
+          2. Auto-close DB positions only with exact filled EXIT evidence; broker-flat
+             observations without that evidence remain open for manual-close recovery.
           3. Import broker-open positions missing from DB so restarts cannot orphan trades.
 
         FIX-7: db_underlyings removed — it was constructed and passed to
@@ -3090,7 +3154,12 @@ class APBrokerReconciler:
         summary: dict,
     ) -> None:
         pos_id    = pos.get("id") or pos.get("position_id")
-        exit_fill = self._get_recent_exit_fill(contract, underlying)
+        position_mode = _normalize_execution_mode(pos.get("execution_mode"))
+        exit_fill = self._get_recent_exit_fill(
+            contract,
+            position_id=str(pos_id or "").strip(),
+            execution_mode=position_mode or "",
+        )
 
         if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
             exit_px          = float(exit_fill["fill_price"])
@@ -3113,30 +3182,22 @@ class APBrokerReconciler:
                 return
 
             pass_count = int(self._ghost_tracker.get(self._norm_contract(contract), 0)) + 1
-            if not self._mark_ghost_seen(contract):
-                log.warning(
-                    "[%s] GHOST_PASS_%d | %s | broker has no position — waiting for stronger evidence",
-                    self.client_id, pass_count, contract,
-                )
-                summary["positions_alerted"] += 1
-                return
-            _current_px = self._get_current_option_price(contract)
-            if _current_px > 0:
-                exit_px          = _current_px
-                close_confidence = "MEDIUM_THREE_PASS_CURRENT_MARK"
-                log.warning(
-                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit — "
-                    "auto-closing at current mark $%.4f",
-                    self.client_id, contract, _current_px,
-                )
-            else:
-                exit_px          = entry_px
-                close_confidence = "MEDIUM_THREE_PASS_NO_EXIT_EVIDENCE"
-                log.warning(
-                    "[%s] GHOST_PASS_3 | %s | no broker position, no active exit, "
-                    "no live quote — auto-closing at entry price (P&L = $0)",
-                    self.client_id, contract,
-                )
+            self._mark_ghost_seen(contract)
+            log.warning(
+                "[%s] GHOST_PASS_%d | %s | broker has no position — "
+                "exact broker EXIT fill still required",
+                self.client_id, pass_count, contract,
+            )
+            self._alert(
+                "BROKER_POSITION_MISSING_EXIT_FILL_UNPROVEN | "
+                f"client_id={self.client_id} execution_mode={position_mode or '?'} "
+                f"position_id={str(pos_id or '') or '?'} contract={contract or '?'} "
+                f"underlying={underlying or '?'} ghost_pass={pass_count} "
+                "local_active_exit=false broker_working_exit=false "
+                "reason=exact_broker_exit_fill_missing"
+            )
+            summary["positions_alerted"] += 1
+            return
 
         # Lifecycle visibility: ghost/autoclose is a major data-correction event.
         # Record it before the DB row is changed so a future trace can explain
@@ -3184,8 +3245,8 @@ class APBrokerReconciler:
     ) -> None:
         """
         P0-PARTIAL-CLOSE: Extracted auto-close DB write.
-        Called by _handle_db_position_missing_at_broker after three-pass ghost
-        confirmation. The ONLY place that writes RECONCILER_AUTO_CLOSE to positions.
+        Called by _handle_db_position_missing_at_broker after exact EXIT evidence
+        is accepted. The ONLY place that writes RECONCILER_AUTO_CLOSE to positions.
 
         Rule: status=CLOSED iff quantity_remaining becomes 0.
               Otherwise status=PARTIAL (broker is flat but prior scale-outs exist).
