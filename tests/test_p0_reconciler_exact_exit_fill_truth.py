@@ -24,7 +24,8 @@ MODE_LIVE = "live"
 MODE_PAPER = "paper"
 POSITION_ID = "position-c-135"
 TARGET_CONTRACT = "C260814C00135000"
-OLD_CONTRACT = "C260807P00097000"
+OLD_CONTRACT = "C260807P00134000"
+OLD_BROKER_ORDER_ID = "36637227"
 
 
 class _ExitCursor:
@@ -133,14 +134,23 @@ def _position(*, mode: str = MODE_LIVE) -> dict:
 def test_exact_c_incident_old_same_ticker_fill_is_not_evidence(monkeypatch):
     cursor = _install_exit_rows(
         monkeypatch,
-        [_exit_row(contract=OLD_CONTRACT, position_id="old-put-position", fill_price=0.71)],
+        [
+            _exit_row(
+                contract=OLD_CONTRACT,
+                position_id="old-put-position",
+                mode=MODE_PAPER,
+                broker_order_id=OLD_BROKER_ORDER_ID,
+                fill_price=0.71,
+                filled_qty=21,
+            )
+        ],
     )
-    rec = _reconciler()
+    rec = _reconciler(mode=MODE_PAPER)
 
     result = rec._get_recent_exit_fill(
         TARGET_CONTRACT,
         position_id=POSITION_ID,
-        execution_mode=MODE_LIVE,
+        execution_mode=MODE_PAPER,
     )
 
     assert result is None
@@ -237,6 +247,128 @@ def test_multiple_exact_candidates_hold_without_newest_wins(monkeypatch):
     ) is None
     assert any(
         "RECONCILER_EXIT_FILL_IDENTITY_AMBIGUOUS" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
+def _run_exact_fill_handler(
+    *,
+    quantity_remaining: int,
+    filled_qty: int,
+    status: str = "EXIT_FILLED",
+    fill_price: float = 1.95,
+):
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    rec._get_recent_exit_fill = MagicMock(
+        return_value=_exit_row(
+            filled_qty=filled_qty,
+            status=status,
+            fill_price=fill_price,
+        )
+    )
+    rec._execute_reconciler_close = MagicMock()
+    rec._record_reconciler_rejection = MagicMock()
+    pos = _position()
+    pos["quantity_remaining"] = quantity_remaining
+    pos["qty"] = quantity_remaining
+    summary = _empty_summary(CLIENT)
+
+    rec._handle_db_position_missing_at_broker(
+        pos=pos,
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=quantity_remaining,
+        entry_px=2.33,
+        summary=summary,
+    )
+    return rec, summary
+
+
+@pytest.mark.parametrize("status", ["EXIT_FILLED", "EXIT_PARTIAL_FILL"])
+def test_partial_exact_exit_fill_cannot_price_remaining_position(status: str):
+    rec, summary = _run_exact_fill_handler(
+        quantity_remaining=4,
+        filled_qty=2,
+        status=status,
+        fill_price=4.79,
+    )
+
+    rec._execute_reconciler_close.assert_not_called()
+    rec._record_reconciler_rejection.assert_not_called()
+    assert summary["positions_alerted"] == 1
+    assert any(
+        "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN" in call.args[0]
+        and "filled_qty=2" in call.args[0]
+        and "quantity_remaining=4" in call.args[0]
+        for call in rec._alert.call_args_list
+    )
+
+
+def test_exact_exit_fill_equal_to_remaining_quantity_can_authorize_close():
+    rec, summary = _run_exact_fill_handler(
+        quantity_remaining=2,
+        filled_qty=2,
+        fill_price=4.79,
+    )
+
+    rec._execute_reconciler_close.assert_called_once()
+    assert rec._execute_reconciler_close.call_args.kwargs["exact_exit_fill_qty"] == 2
+    rec._record_reconciler_rejection.assert_called_once()
+    assert summary["positions_alerted"] == 0
+
+
+def test_close_rechecks_remaining_quantity_before_mutating_positions(monkeypatch):
+    rec = _reconciler()
+    rec._alert = MagicMock()
+    summary = _empty_summary(CLIENT)
+    updates: list[tuple] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            compact = " ".join(str(sql).split()).upper()
+            if "FOR UPDATE" in compact:
+                self._row = {"quantity_remaining": 4, "qty": 4}
+            elif compact.startswith("UPDATE POSITIONS"):
+                updates.append((sql, params))
+
+        def fetchone(self):
+            return getattr(self, "_row", None)
+
+    cursor = _Cursor()
+
+    class _Connection:
+        def __enter__(self):
+            return cursor
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(db_mod, "conn", lambda: _Connection())
+    monkeypatch.setattr(db_mod, "run_with_retry", lambda fn: fn())
+
+    rec._execute_reconciler_close(
+        pos=_position(),
+        contract=TARGET_CONTRACT,
+        underlying="C",
+        db_qty=4,
+        entry_px=2.33,
+        exit_px=4.79,
+        close_confidence="HIGH",
+        summary=summary,
+        exact_exit_fill_qty=2,
+    )
+
+    assert updates == []
+    assert summary["positions_alerted"] == 1
+    assert any(
+        "position_remaining_changed_before_close" in call.args[0]
         for call in rec._alert.call_args_list
     )
 
@@ -345,6 +477,7 @@ def test_existing_exact_bot_exit_fill_still_reaches_existing_close_path(monkeypa
     close_kwargs = rec._execute_reconciler_close.call_args.kwargs
     assert close_kwargs["exit_px"] == 1.95
     assert close_kwargs["close_confidence"] == "HIGH"
+    assert close_kwargs["exact_exit_fill_qty"] == 9
     rec._record_reconciler_rejection.assert_called_once()
 
 
@@ -362,11 +495,11 @@ def test_strict_manual_close_selector_keeps_exact_target_stc_fill():
                 "last_fill_date": "2026-08-10T19:00:00+00:00",
             },
             {
-                "id": "TR-071",
+                "id": OLD_BROKER_ORDER_ID,
                 "symbol": OLD_CONTRACT,
                 "side": "sell_to_close",
                 "status": "filled",
-                "filled_quantity": 9,
+                "filled_quantity": 21,
                 "avg_fill_price": 0.71,
                 "last_fill_date": "2026-08-10T19:01:00+00:00",
             },

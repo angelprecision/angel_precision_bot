@@ -3162,6 +3162,42 @@ class APBrokerReconciler:
         )
 
         if exit_fill and float(exit_fill.get("fill_price") or 0) > 0:
+            try:
+                filled_qty_value = float(exit_fill.get("filled_qty"))
+            except (TypeError, ValueError):
+                filled_qty_value = 0.0
+
+            raw_remaining = pos.get("quantity_remaining")
+            if raw_remaining is None:
+                raw_remaining = pos.get("qty") or db_qty
+            try:
+                remaining_value = float(raw_remaining)
+            except (TypeError, ValueError):
+                remaining_value = 0.0
+
+            if (
+                not math.isfinite(filled_qty_value)
+                or not filled_qty_value.is_integer()
+                or filled_qty_value <= 0
+                or not math.isfinite(remaining_value)
+                or not remaining_value.is_integer()
+                or remaining_value <= 0
+                or int(filled_qty_value) != int(remaining_value)
+            ):
+                self._alert(
+                    "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN | "
+                    f"client_id={self.client_id} "
+                    f"execution_mode={position_mode or '?'} "
+                    f"position_id={str(pos_id or '') or '?'} "
+                    f"contract={contract or '?'} "
+                    f"filled_qty={filled_qty_value:g} "
+                    f"quantity_remaining={remaining_value:g} "
+                    "reason=single_exit_fill_does_not_cover_unresolved_position"
+                )
+                summary["positions_alerted"] += 1
+                return
+
+            filled_qty = int(filled_qty_value)
             exit_px          = float(exit_fill["fill_price"])
             close_confidence = "HIGH"
             log.info(
@@ -3227,6 +3263,7 @@ class APBrokerReconciler:
             exit_px=exit_px,
             close_confidence=close_confidence,
             summary=summary,
+            exact_exit_fill_qty=filled_qty,
             side=side if "side" in dir() else (pos.get("side") or pos.get("direction") or "CALL"),
         )
 
@@ -3241,6 +3278,7 @@ class APBrokerReconciler:
         exit_px: float,
         close_confidence: str,
         summary: dict,
+        exact_exit_fill_qty: int | None = None,
         side: str = "CALL",
     ) -> None:
         """
@@ -3296,6 +3334,16 @@ class APBrokerReconciler:
                         current_remaining = _stored_qty
                     else:
                         current_remaining = int(_stored_remaining)
+
+                    if (
+                        exact_exit_fill_qty is not None
+                        and int(exact_exit_fill_qty) != current_remaining
+                    ):
+                        return {
+                            "blocked_reason": "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN",
+                            "filled_qty": int(exact_exit_fill_qty),
+                            "quantity_remaining": current_remaining,
+                        }
 
                     # How many contracts does this auto-close account for?
                     # Broker says zero — so we close whatever is remaining.
@@ -3363,6 +3411,18 @@ class APBrokerReconciler:
 
         if _result is None:
             log.warning("[%s] RECONCILE close: pos %s not found during lock-fetch", self.client_id, pos_id)
+            summary["positions_alerted"] += 1
+            return
+
+        if _result.get("blocked_reason"):
+            self._alert(
+                "RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN | "
+                f"client_id={self.client_id} contract={contract or '?'} "
+                f"position_id={str(pos_id or '') or '?'} "
+                f"filled_qty={_result.get('filled_qty')} "
+                f"quantity_remaining={_result.get('quantity_remaining')} "
+                "reason=position_remaining_changed_before_close"
+            )
             summary["positions_alerted"] += 1
             return
 

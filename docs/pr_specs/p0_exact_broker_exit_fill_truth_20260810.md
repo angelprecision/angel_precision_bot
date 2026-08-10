@@ -16,7 +16,7 @@ Base at branch creation: `main` / `570a56933615cbac82e3256c0e350119eca80c0d`.
 - canonical proof row instead recorded exit approximately `$0.71`, approximately `-69.5%`
 - proof row carried no authoritative broker exit order id/timestamp and used `RECONCILER_AUTO_CLOSE | HIGH | broker_position_missing`
 
-The `$0.71` value was traced to an older, different C option trade: `C260807P00097000`. That older contract had a filled EXIT around `$0.71`.
+The `$0.71` value was traced to an older, different C option trade: `C260807P00134000`. The stale row was broker order `36637227`, a PAPER PUT EXIT for 21 contracts with 21 filled at `$0.71`.
 
 This is not a stale-quote/display bug. Realized economic truth was attributed from the wrong OCC contract.
 
@@ -193,6 +193,19 @@ exit_fill = self._get_recent_exit_fill(
 
 If exact fill exists, existing close/finalization may continue.
 
+Before exact fill evidence can authorize finalization, the single fill must cover
+the position's current unresolved quantity:
+
+- resolve current `quantity_remaining` (falling back to stored `qty` only when
+  `quantity_remaining` is NULL, matching the existing close path);
+- require `filled_qty == quantity_remaining` exactly;
+- an `EXIT_PARTIAL_FILL` or any smaller positive fill is not sufficient;
+- on mismatch or unreadable quantity, emit
+  `RECONCILER_EXIT_FILL_QTY_COVERAGE_UNPROVEN` and HOLD without a position,
+  realized-P&L, or `proof_trades` mutation;
+- do not aggregate multiple fills in this PR. Multiple exact candidates remain
+  ambiguity HOLD.
+
 If exact fill does **not** exist:
 
 - preserve the existing active local/broker EXIT guard;
@@ -245,7 +258,7 @@ Use production-shaped dict rows / PostgreSQL where the existing test harness mak
 
 Required cases:
 
-1. **Exact C incident**: target position `C260814C00135000`, older filled EXIT `C260807P00097000` at `0.71`, same client/ticker. `_get_recent_exit_fill()` must return `None` for target position.
+1. **Exact C incident**: target position `C260814C00135000`, older PAPER filled EXIT `C260807P00134000` / broker order `36637227` / 21 contracts at `0.71`, same client/ticker. `_get_recent_exit_fill()` must return `None` for target position.
 2. Exact target EXIT for `C260814C00135000` at `1.95`, matching `position_id`, mode and client -> returned.
 3. Exact contract but wrong `position_id` -> rejected.
 4. Exact contract/position but PAPER row queried by LIVE reconciler -> rejected.
@@ -260,6 +273,9 @@ Required cases:
 13. Existing exact bot `EXIT_FILLED` row with exact position identity still allows generic reconcile finalization.
 14. No broker submit call.
 15. No broker cancel call.
+16. Exact EXIT fill qty 2 vs current remaining 4 -> coverage HOLD, no close/proof mutation.
+17. `EXIT_PARTIAL_FILL` qty 2 vs current remaining 4 -> coverage HOLD.
+18. Exact EXIT fill qty 2 vs current remaining 2 -> existing close path remains functional.
 
 ## Explicit non-goals
 
