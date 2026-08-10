@@ -8976,6 +8976,14 @@ class APExecutionCore:
             _decision_exit_qty = getattr(decision, "quantity", None)
             _reserved_exit_qty = getattr(decision, "reserved_exit_quantity", None)
             _remaining_exit_qty = getattr(pos, "quantity_remaining", None)
+            _replacement_cap = (
+                int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
+                if getattr(pos, "pending_exit_replace_allowed", False)
+                else 0
+            )
+            _expected_exit_qty = (
+                _replacement_cap if _replacement_cap > 0 else _remaining_exit_qty
+            )
             _decision_reserved_local_id = str(
                 getattr(decision, "reserved_local_order_id", "") or ""
             ).strip()
@@ -8988,12 +8996,14 @@ class APExecutionCore:
                 or _decision_exit_qty <= 0
                 or type(_remaining_exit_qty) is not int
                 or _remaining_exit_qty <= 0
-                or _decision_exit_qty != _remaining_exit_qty
+                or type(_expected_exit_qty) is not int
+                or _expected_exit_qty <= 0
+                or _decision_exit_qty != _expected_exit_qty
                 or (
                     _reserved_exit_qty is not None
                     and (
                         type(_reserved_exit_qty) is not int
-                        or _reserved_exit_qty != _decision_exit_qty
+                        or _reserved_exit_qty != _expected_exit_qty
                     )
                 )
                 or (
@@ -9003,11 +9013,13 @@ class APExecutionCore:
                 )
             ):
                 log.critical(
-                    "[%s] CLOSE BLOCKED — exact reserved exit identity mismatch | decision_qty=%r reserved_qty=%r remaining_qty=%r decision_local=%s position_local=%s",
+                    "[%s] CLOSE BLOCKED — exact reserved exit identity mismatch | decision_qty=%r reserved_qty=%r remaining_qty=%r expected_qty=%r replacement_cap=%r decision_local=%s position_local=%s",
                     pos.ticker,
                     _decision_exit_qty,
                     _reserved_exit_qty,
                     _remaining_exit_qty,
+                    _expected_exit_qty,
+                    _replacement_cap,
                     _decision_reserved_local_id,
                     _position_reserved_local_id,
                 )

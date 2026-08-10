@@ -98,7 +98,13 @@ def test_watchdog_stale_exit_recovery_enabled_by_default_cancels_and_confirms(mo
     assert broker.cancel_order.call_count == 1
     get_calls = [c for c in call_log if c[0] == "get"]
     assert len(get_calls) == 2, "must perform pre-cancel GET AND independent post-cancel GET"
-    osm.transition.assert_called_once_with("loc-avgo", "CANCELED", last_error="stale exit AVGO scale-out qty=2")
+    osm.transition.assert_called_once_with(
+        "loc-avgo",
+        "CANCELED",
+        broker_order_id="bro-avgo",
+        position_id="pos-avgo",
+        last_error="stale exit AVGO scale-out qty=2",
+    )
     exit_engine.clear_exit_in_flight.assert_called_once_with(
         "pos-avgo",
         reason="stale exit AVGO scale-out qty=2",
@@ -328,6 +334,236 @@ def test_duplicate_monitor_invocation_no_double_cancel(monkeypatch):
     assert broker.cancel_order.call_count == 1, "second invocation must not re-issue cancel"
     osm.transition.assert_called_once()
     exit_engine.mark_exit_replacement_safe.assert_called_once()
+
+
+def test_lost_cancel_gets_one_bounded_exact_retry_then_one_replacement(monkeypatch):
+    """A lost DELETE must not strand the exact stale exit forever."""
+    import ap.order_monitor as om_mod
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS", 0)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_MAX_ATTEMPTS", 2)
+
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},  # first pre-cancel proof
+        {"status": "working"},  # first post-cancel proof: DELETE was lost
+        {"status": "working"},  # fresh proof before bounded re-cancel
+        {"status": "canceled"},  # second post-cancel terminal proof
+    ]
+    broker.cancel_order.return_value = {"ok": False, "status": "unknown"}
+    osm = MagicMock()
+    osm.get_order.return_value = {
+        "kind": "EXIT",
+        "position_id": "pos-retry",
+        "broker_order_id": "bro-retry",
+    }
+    exit_engine = MagicMock()
+    mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    mon._get_newer_active_exit_order = MagicMock(return_value=None)
+
+    for _ in range(2):
+        mon._handle_stale_exit(
+            local_order_id="loc-retry",
+            status="WORKING",
+            contract="AVGO260814C00350000",
+            age_secs=120.0,
+            position_id="pos-retry",
+            reason="lost cancel retry",
+        )
+
+    assert [call.args for call in broker.cancel_order.call_args_list] == [
+        ("bro-retry",),
+        ("bro-retry",),
+    ], "the retry must target the exact original broker order"
+    assert osm.transition.call_count == 1
+    assert exit_engine.mark_exit_replacement_safe.call_count == 1
+    assert exit_engine.finalize_exit_replacement_safe.call_count == 1
+    assert exit_engine.clear_exit_in_flight.call_count == 1
+    assert mon._stale_exit_cancel_inflight == {}
+    assert mon._stale_exit_cancel_attempts == {}
+
+
+def test_late_fill_wins_over_bounded_recancel(monkeypatch):
+    """A fill discovered during the retry window beats cancellation/replacement."""
+    import ap.order_monitor as om_mod
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS", 0)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_MAX_ATTEMPTS", 2)
+
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {"status": "working"},
+        {"status": "working"},
+        {"status": "filled"},
+    ]
+    broker.cancel_order.return_value = {"ok": False, "status": "unknown"}
+    osm = MagicMock()
+    osm.get_order.return_value = {
+        "kind": "EXIT",
+        "position_id": "pos-late-fill",
+        "broker_order_id": "bro-late-fill",
+    }
+    exit_engine = MagicMock()
+    mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    mon._advance_from_broker_status = MagicMock()
+
+    for _ in range(2):
+        mon._handle_stale_exit(
+            local_order_id="loc-late-fill",
+            status="WORKING",
+            contract="AVGO260814C00350000",
+            age_secs=120.0,
+            position_id="pos-late-fill",
+            reason="late fill during cancel retry",
+        )
+
+    assert broker.cancel_order.call_count == 2
+    mon._advance_from_broker_status.assert_called_once()
+    osm.transition.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.clear_exit_in_flight.assert_not_called()
+    assert mon._stale_exit_cancel_inflight == {}
+    assert mon._stale_exit_cancel_attempts == {}
+
+
+def test_failed_osm_cancel_transition_revokes_staged_grant_and_keeps_owner(monkeypatch):
+    """Broker cancel proof alone must not clear or authorize replacement."""
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {"status": "canceled"},
+    ]
+    broker.cancel_order.return_value = {"status": "pending"}
+    osm = MagicMock()
+    osm.get_order.side_effect = [
+        {
+            "kind": "EXIT",
+            "position_id": "pos-osm-fail",
+            "broker_order_id": "bro-osm-fail",
+            "status": "EXIT_ACKNOWLEDGED",
+        },
+        {
+            "kind": "EXIT",
+            "position_id": "pos-osm-fail",
+            "broker_order_id": "bro-osm-fail",
+            "status": "EXIT_ACKNOWLEDGED",
+        },
+        {
+            "kind": "EXIT",
+            "position_id": "pos-osm-fail",
+            "broker_order_id": "bro-osm-fail",
+            "status": "EXIT_ACKNOWLEDGED",
+        },
+    ]
+    osm.transition.return_value = False
+    engine = APExitEngine(broker=broker)
+    engine._emit_exit_event = MagicMock()
+    engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    position = ManagedPosition(
+        ticker="AVGO", option_symbol="AVGO260814C00350000", side="CALL", quantity=7,
+        entry_price=2.49, underlying_entry=350.0, underlying_target=360.0,
+        underlying_stop=340.0, position_id="pos-osm-fail", client_id="client-1",
+        execution_mode="paper", exit_in_flight=True,
+        pending_exit_local_order_id="loc-osm-fail",
+        pending_exit_broker_order_id="bro-osm-fail", pending_exit_qty=2,
+    )
+    engine._positions.append(position)
+    engine._positions_by_id[position.position_id] = position
+
+    mon = _monitor(broker=broker, osm=osm, exit_engine=engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+
+    mon._handle_stale_exit(
+        local_order_id="loc-osm-fail", status="WORKING",
+        contract="AVGO260814C00350000", age_secs=120.0,
+        position_id="pos-osm-fail", reason="OSM CAS lost",
+    )
+
+    assert position.exit_in_flight is True
+    assert position.pending_exit_replace_allowed is False
+    assert position.pending_exit_replace_durable_pending is False
+    assert position.exit_replace_attempt == 0
+    assert "bro-osm-fail" in mon._stale_exit_cancel_inflight
+    engine._persist_exit_replace_attempt_to_db.assert_not_called()
+
+
+def test_osm_transition_miss_accepts_exact_terminal_reread(monkeypatch):
+    """A concurrent exact CANCELED CAS winner is durable-success evidence."""
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {"status": "canceled"},
+    ]
+    broker.cancel_order.return_value = {"status": "pending"}
+    osm = MagicMock()
+    osm.get_order.side_effect = [
+        {
+            "local_order_id": "loc-osm-reread",
+            "kind": "EXIT",
+            "position_id": "pos-osm-reread",
+            "broker_order_id": "bro-osm-reread",
+            "status": "EXIT_ACKNOWLEDGED",
+        },
+        {
+            "local_order_id": "loc-osm-reread",
+            "kind": "EXIT",
+            "position_id": "pos-osm-reread",
+            "broker_order_id": "bro-osm-reread",
+            "status": "EXIT_ACKNOWLEDGED",
+        },
+        {
+            "local_order_id": "loc-osm-reread",
+            "kind": "EXIT",
+            "position_id": "pos-osm-reread",
+            "broker_order_id": "bro-osm-reread",
+            "status": "CANCELED",
+        },
+    ]
+    osm.transition.return_value = False
+    engine = APExitEngine(broker=broker)
+    engine._emit_exit_event = MagicMock()
+    engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    position = ManagedPosition(
+        ticker="AVGO", option_symbol="AVGO260814C00350000", side="CALL", quantity=7,
+        entry_price=2.49, underlying_entry=350.0, underlying_target=360.0,
+        underlying_stop=340.0, position_id="pos-osm-reread", client_id="client-1",
+        execution_mode="paper", exit_in_flight=True,
+        pending_exit_local_order_id="loc-osm-reread",
+        pending_exit_broker_order_id="bro-osm-reread", pending_exit_qty=2,
+    )
+    engine._positions.append(position)
+    engine._positions_by_id[position.position_id] = position
+    mon = _monitor(broker=broker, osm=osm, exit_engine=engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+
+    mon._handle_stale_exit(
+        local_order_id="loc-osm-reread", status="WORKING",
+        contract="AVGO260814C00350000", age_secs=120.0,
+        position_id="pos-osm-reread", reason="concurrent OSM winner",
+    )
+
+    assert osm.transition.call_count == 1
+    assert osm.get_order.call_count == 3
+    assert position.exit_replace_attempt == 1
+    assert position.exit_in_flight is False
+    assert position.pending_exit_replace_allowed is True
+    assert position.pending_exit_replace_durable_pending is False
+    assert mon._stale_exit_cancel_inflight == {}
 
 
 def test_paper_and_live_identity_preserved_through_handoff(monkeypatch):

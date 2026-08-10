@@ -1,8 +1,11 @@
 # tests/test_p0_exit_retry_liveness_avgo_replay.py
 # =============================================================================
-# PR #423 integration proof: a real APOrderMonitor and a real APExitEngine
+# PR #423 component replay: a real APOrderMonitor and a real APExitEngine
 # share the stale-exit cancel/replacement handoff for the motivating AVGO
-# qty=7 / scale-out qty=2 shape.
+# qty=7 / scale-out qty=2 shape.  This file deliberately uses a compact OSM
+# and a direct broker-capture callback.  The real idempotency -> execution
+# core -> OSM submit -> broker POST path is proved separately by
+# test_p0_exit_retry_liveness_production_shape.py.
 # =============================================================================
 
 from __future__ import annotations
@@ -80,7 +83,11 @@ class _ReplayBroker:
 
 
 class _ReplayOSM:
-    """Small durable-state stand-in that invokes the real exit-engine hooks."""
+    """Test-only OSM stand-in that invokes the real exit-engine hooks.
+
+    This is component evidence for the monitor/engine handoff, not a claim
+    that the production OSM submit boundary is exercised.
+    """
 
     def __init__(self, exit_engine, *, partial=False):
         self.exit_engine = exit_engine
@@ -221,12 +228,17 @@ def _set_fresh_replacement_quote(position):
     position.last_underlying_quote_update_ts = quote_ts
 
 
-def _submit_real_replacement(monkeypatch, broker, osm, engine, position, *, expected_qty):
-    """Run the production core submit seam after the real cancel handoff."""
+def _submit_component_replacement(monkeypatch, broker, osm, engine, position, *, expected_qty):
+    """Exercise the engine pricing/quantity seam with a test callback.
+
+    The callback intentionally captures a simulated POST directly.  Full
+    production-shaped submission evidence lives in the companion test.
+    """
     import ap.exit_safety as exit_safety_module
 
     # The broker-truth and submission-safety gates are independently covered;
-    # this replay keeps its single external dependency the captured broker POST.
+    # this component replay keeps its external dependency to a captured,
+    # simulated broker POST.
     monkeypatch.setattr(
         exit_safety_module,
         "resolve_exit_broker_truth",
@@ -276,11 +288,9 @@ def _submit_real_replacement(monkeypatch, broker, osm, engine, position, *, expe
         pnl_pct=0.10,
     )
 
-    # APExitEngine's class method carries the DB-backed idempotency wrapper in
-    # the production import graph.  The wrapper has its own exact-head tests;
-    # this replay invokes the original production core seam so it can prove
-    # pricing, quantity capping, callback submission, and post-submit identity
-    # without replacing APExitEngine or APOrderMonitor with mocks.
+    # Run the underlying engine seam directly so this component replay proves
+    # pricing, quantity capping, and post-cancel identity without presenting
+    # the test callback as the production OSM/broker submission path.
     import ap.exit_decision_idempotency_guard as idempotency_guard
 
     submit_core = getattr(
@@ -339,7 +349,7 @@ def test_avgo_real_monitor_and_exit_engine_cancel_replay_preserves_identity(monk
     assert position.exit_replace_attempt == 1
     assert position.quantity_remaining == 7
     pm.update_position.assert_not_called()
-    _submit_real_replacement(
+    _submit_component_replacement(
         monkeypatch, broker, osm, engine, position, expected_qty=2,
     )
 
@@ -375,6 +385,6 @@ def test_avgo_partial_fill_replay_cancels_only_unfilled_remainder(monkeypatch):
     assert position.pending_exit_replace_qty == 1
     assert position.exit_replace_attempt == 1
     pm.update_position.assert_not_called()
-    _submit_real_replacement(
+    _submit_component_replacement(
         monkeypatch, broker, osm, engine, position, expected_qty=1,
     )

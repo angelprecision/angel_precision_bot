@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 os.environ.setdefault(
@@ -107,6 +108,57 @@ def test_mark_exit_replacement_safe_increments_attempt_once():
 
     assert pos.exit_replace_attempt == 1
     assert pos.pending_exit_replace_allowed is True
+
+
+def test_stale_exit_replacement_generation_waits_for_durable_fence():
+    eng = _engine()
+    pos = _pos()
+    _add(eng, pos)
+
+    assert eng.mark_exit_replacement_safe(
+        "pos-avgo-1",
+        reason="broker cancel staged",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        defer_attempt=True,
+    ) is True
+    assert pos.exit_replace_attempt == 0
+    assert pos.pending_exit_replace_allowed is True
+    assert pos.pending_exit_replace_durable_pending is True
+    assert eng._can_submit_exit(pos, datetime.now(timezone.utc), allow_inflight_override=True) is False
+
+    assert eng.finalize_exit_replacement_safe(
+        "pos-avgo-1",
+        reason="OSM CANCELED durable",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+    ) is True
+    assert pos.exit_replace_attempt == 1
+    assert pos.pending_exit_replace_durable_pending is False
+
+
+def test_staged_replacement_can_be_revoked_without_clearing_old_owner():
+    eng = _engine()
+    pos = _pos()
+    _add(eng, pos)
+
+    eng.mark_exit_replacement_safe(
+        "pos-avgo-1",
+        reason="broker cancel staged",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        defer_attempt=True,
+    )
+    assert eng.revoke_exit_replacement_safe(
+        "pos-avgo-1",
+        reason="OSM transition failed",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+    ) is True
+    assert pos.exit_in_flight is True
+    assert pos.pending_exit_replace_allowed is False
+    assert pos.pending_exit_replace_durable_pending is False
+    assert pos.exit_replace_attempt == 0
 
 
 def test_duplicate_mark_exit_replacement_safe_same_identity_does_not_double_increment():
@@ -345,6 +397,8 @@ def test_persist_exit_replace_attempt_failure_is_nonfatal(monkeypatch):
          {"replace_attempt": 2, "last_ack_identity": "bro-old", "replace_quantity": 1}),
         ('{"exit_retry_liveness": {"replace_attempt": 3, "replace_quantity": 2}}',
          {"replace_attempt": 3, "last_ack_identity": "", "replace_quantity": 2}),
+        ({"exit_retry_liveness": {"replace_attempt": 999}},
+         {"replace_attempt": 4, "last_ack_identity": "", "replace_quantity": 0}),
     ],
 )
 def test_restore_exit_replace_attempt_helper_is_fail_safe(raw_meta, expected):

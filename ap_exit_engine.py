@@ -1474,6 +1474,11 @@ class ManagedPosition:
     # broker-confirmed unfilled remainder of that exact old order.  Zero means
     # there is no tranche-specific cap for the next replacement.
     pending_exit_replace_qty: int = 0
+    # A stale-exit replacement grant is staged before the OSM CANCELED hook
+    # because that hook clears the old identity.  While this fence is true the
+    # grant is visible only as a staged handoff and cannot be consumed by a
+    # replacement submit until the OSM transition has returned durable success.
+    pending_exit_replace_durable_pending: bool = False
     exit_identity_quarantine_alert_count: int = 0
     last_exit_identity_quarantine_alert_ts: Optional[datetime] = None
     last_exit_clear_reason: str = ""
@@ -3448,6 +3453,10 @@ def _restore_exit_replace_attempt_from_meta(raw_meta) -> dict[str, object]:
             attempt = 0
     except Exception:
         attempt = 0
+    # Restart metadata is untrusted input.  Runtime increments already clamp
+    # this counter; hydration must preserve the same invariant after a
+    # corrupted or legacy row is loaded.
+    attempt = min(attempt, EXIT_REPLACE_MAX_ATTEMPTS)
 
     try:
         replace_qty = int(namespace.get("replace_quantity", 0) or 0)
@@ -5382,6 +5391,7 @@ class APExitEngine:
                 pos.pending_exit_replace_reason   = ""
                 pos.pending_exit_replace_allowed_ts = None
                 pos.pending_exit_replace_qty = 0
+                pos.pending_exit_replace_durable_pending = False
                 # PR #423: reset the replacement-generation counter ONLY on
                 # actual proven economic completion (this is the exact
                 # broker-confirmed-closed authority — never on submit,
@@ -5490,6 +5500,7 @@ class APExitEngine:
                     pos.pending_exit_replace_reason    = ""
                     pos.pending_exit_replace_allowed_ts = None
                     pos.pending_exit_replace_qty = 0
+                    pos.pending_exit_replace_durable_pending = False
                 self._assert_position_invariants(pos, "clear_exit_in_flight")
                 self._emit_exit_event(
                     pos,
@@ -5618,6 +5629,7 @@ class APExitEngine:
                     pos.pending_exit_replace_allowed  = False
                     pos.pending_exit_replace_reason   = ""
                     pos.pending_exit_replace_allowed_ts = None
+                    pos.pending_exit_replace_durable_pending = False
 
                 if (
                     (pos.pending_exit_action or "").upper() == "SCALE_OUT"
@@ -5734,6 +5746,49 @@ class APExitEngine:
         pos.pending_exit_replace_reason     = ""
         pos.pending_exit_replace_allowed_ts = None
         pos.pending_exit_replace_qty        = 0
+        pos.pending_exit_replace_durable_pending = False
+
+    def _commit_exit_replacement_generation_locked(
+        self,
+        pos: ManagedPosition,
+        *,
+        reason: str,
+        proof_identity: str,
+    ) -> None:
+        """Commit one replacement generation after its durable OSM fence.
+
+        The caller owns ``self._lock``.  Keeping the increment and its
+        persistence in one helper prevents the pre-transition staging call
+        from accidentally becoming the durable generation authority.
+        """
+        try:
+            prior_attempt = max(0, int(getattr(pos, "exit_replace_attempt", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            prior_attempt = 0
+        pos.exit_replace_attempt = min(
+            prior_attempt + 1,
+            EXIT_REPLACE_MAX_ATTEMPTS,
+        )
+        pos._exit_replace_attempt_last_ack_identity = proof_identity
+        try:
+            self._persist_exit_replace_attempt_to_db(pos)
+        except Exception as _perr:
+            log.debug(
+                "[exit_eng] exit_replace_attempt persist call failed non-fatally: %s",
+                _perr,
+            )
+        if pos.exit_replace_attempt >= EXIT_REPLACE_MAX_ATTEMPTS:
+            self._emit_exit_event(
+                pos, "ALERT", "EXIT_REPLACE_RETRY_EXHAUSTED_BROKER_OPEN",
+                (
+                    f"Replacement attempt {pos.exit_replace_attempt} reached "
+                    f"max ({EXIT_REPLACE_MAX_ATTEMPTS}) while broker position "
+                    "remains open. Protective ownership retained; forced-risk "
+                    "exits continue using executable BID pricing."
+                ),
+                stage="exit_reconciliation",
+                extra_inputs={"exit_replace_attempt": pos.exit_replace_attempt, "reason": reason},
+            )
 
     def mark_exit_replacement_safe(
         self,
@@ -5745,12 +5800,16 @@ class APExitEngine:
         force: bool = False,
         reconciled: bool = False,
         **kwargs,
-    ) -> None:
+    ) -> bool:
         if not position_id:
-            return
+            return False
         reason_s        = str(reason or "")
         local_order_id  = str(local_order_id or "")
         broker_order_id = str(broker_order_id or "")
+        defer_attempt = bool(
+            kwargs.get("defer_attempt")
+            or kwargs.get("durable_transition_pending")
+        )
         force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
         if "NEGATIVE_BROKER_CHECK" in reason_s.upper() or "RECONCILER" in reason_s.upper():
             force = force or not bool(local_order_id or broker_order_id)
@@ -5769,7 +5828,7 @@ class APExitEngine:
                             local_order_id=local_order_id,
                             broker_order_id=broker_order_id, reason=reason_s,
                         )
-                        return
+                        return False
                     # PR #423: exactly-once exit_replace_attempt increment.
                     # A repeat call carrying the identical proof identity
                     # (or the identical blank/forced identity) while the
@@ -5801,46 +5860,21 @@ class APExitEngine:
                         # pre-fill quantity.
                         pos.pending_exit_replace_qty = _replacement_qty
                     if not _duplicate_grant_for_same_generation:
-                        try:
-                            _prior_exit_replace_attempt = max(
-                                0, int(getattr(pos, "exit_replace_attempt", 0) or 0)
-                            )
-                        except (TypeError, ValueError, OverflowError):
-                            _prior_exit_replace_attempt = 0
-                        pos.exit_replace_attempt = min(
-                            _prior_exit_replace_attempt + 1,
-                            EXIT_REPLACE_MAX_ATTEMPTS,
-                        )
                         pos._exit_replace_attempt_last_ack_identity = _call_identity
-                        # PR #423: best-effort restart-durable persistence of the
-                        # replacement generation. Non-fatal — see method docstring.
-                        try:
-                            self._persist_exit_replace_attempt_to_db(pos)
-                        except Exception as _perr:
-                            log.debug(
-                                "[exit_eng] exit_replace_attempt persist call failed non-fatally: %s",
-                                _perr,
+                        if not defer_attempt:
+                            # Normal external/reconciler callers retain the
+                            # existing immediate behavior. The stale-exit
+                            # monitor passes defer_attempt=True and commits
+                            # only after OSM durable success.
+                            self._commit_exit_replacement_generation_locked(
+                                pos,
+                                reason=reason_s,
+                                proof_identity=_call_identity,
                             )
-                        # PR #423: retry-exhaustion is observability only —
-                        # it does NOT stop management, invent a market
-                        # order, or silently HOLD an unmanaged open
-                        # position. The pricing ladder itself already
-                        # forces BID at attempt>=3 (see adaptive exit
-                        # pricing), which is the existing executable-BID
-                        # behavior for forced-risk exits the spec requires
-                        # to remain in effect at exhaustion.
-                        if pos.exit_replace_attempt >= EXIT_REPLACE_MAX_ATTEMPTS:
-                            self._emit_exit_event(
-                                pos, "ALERT", "EXIT_REPLACE_RETRY_EXHAUSTED_BROKER_OPEN",
-                                (
-                                    f"Replacement attempt {pos.exit_replace_attempt} reached "
-                                    f"max ({EXIT_REPLACE_MAX_ATTEMPTS}) while broker position "
-                                    f"remains open. Protective ownership retained; forced-risk "
-                                    f"exits continue using executable BID pricing."
-                                ),
-                                stage="exit_reconciliation",
-                                extra_inputs={"exit_replace_attempt": pos.exit_replace_attempt},
-                            )
+                    if defer_attempt:
+                        pos.pending_exit_replace_durable_pending = True
+                    elif not _duplicate_grant_for_same_generation:
+                        pos.pending_exit_replace_durable_pending = False
 
                     pos.pending_exit_replace_allowed  = True
                     pos.pending_exit_replace_reason   = reason_s or "external_cancel_or_reconcile_proof"
@@ -5861,6 +5895,9 @@ class APExitEngine:
                             "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
                             "exit_replace_attempt": pos.exit_replace_attempt,
                             "duplicate_grant_suppressed": _duplicate_grant_for_same_generation,
+                            "durable_transition_pending": (
+                                pos.pending_exit_replace_durable_pending
+                            ),
                         },
                     )
                     log.critical(
@@ -5869,7 +5906,129 @@ class APExitEngine:
                         local_order_id or "?", broker_order_id or "?",
                         pos.pending_exit_replace_reason, force,
                     )
-                    return
+                    return True
+            return False
+
+    def finalize_exit_replacement_safe(
+        self,
+        position_id: str,
+        *,
+        reason: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        force: bool = False,
+        reconciled: bool = False,
+        **kwargs,
+    ) -> bool:
+        """Commit a staged replacement grant after durable OSM success."""
+        if not position_id:
+            return False
+        reason_s = str(reason or "")
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        proof_identity = broker_order_id or local_order_id
+        with self._lock:
+            pos = self._positions_by_id.get(str(position_id or ""))
+            if pos is None or pos.closed:
+                return False
+            if not force and not self._exit_identity_matches(
+                pos,
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                allow_missing_when_no_pending_identity=True,
+            ):
+                self._reject_stale_exit_hook(
+                    pos,
+                    hook_name="finalize_exit_replacement_safe",
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    reason=reason_s,
+                )
+                return False
+            if (
+                not getattr(pos, "pending_exit_replace_allowed", False)
+                or proof_identity
+                != str(getattr(pos, "_exit_replace_attempt_last_ack_identity", "") or "")
+            ):
+                return False
+            if not getattr(pos, "pending_exit_replace_durable_pending", False):
+                return True
+            self._commit_exit_replacement_generation_locked(
+                pos,
+                reason=reason_s,
+                proof_identity=proof_identity,
+            )
+            pos.pending_exit_replace_durable_pending = False
+            self._emit_exit_event(
+                pos,
+                "ALERT",
+                "EXIT_REPLACEMENT_DURABILITY_COMMITTED",
+                "Replacement authority committed after exact durable OSM cancellation proof.",
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "proof_local_order_id": local_order_id,
+                    "proof_broker_order_id": broker_order_id,
+                    "exit_replace_attempt": pos.exit_replace_attempt,
+                },
+            )
+            return True
+
+    def revoke_exit_replacement_safe(
+        self,
+        position_id: str,
+        *,
+        reason: str = "",
+        local_order_id: str = "",
+        broker_order_id: str = "",
+        force: bool = False,
+        reconciled: bool = False,
+        **kwargs,
+    ) -> bool:
+        """Revoke a staged grant when durable OSM cancellation is unproven."""
+        if not position_id:
+            return False
+        reason_s = str(reason or "")
+        local_order_id = str(local_order_id or "")
+        broker_order_id = str(broker_order_id or "")
+        force = bool(force or reconciled or kwargs.get("force") or kwargs.get("reconciled"))
+        with self._lock:
+            pos = self._positions_by_id.get(str(position_id or ""))
+            if pos is None or pos.closed:
+                return False
+            if not force and not self._exit_identity_matches(
+                pos,
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                allow_missing_when_no_pending_identity=False,
+            ):
+                self._reject_stale_exit_hook(
+                    pos,
+                    hook_name="revoke_exit_replacement_safe",
+                    local_order_id=local_order_id,
+                    broker_order_id=broker_order_id,
+                    reason=reason_s,
+                )
+                return False
+            pos.pending_exit_replace_allowed = False
+            pos.pending_exit_replace_reason = ""
+            pos.pending_exit_replace_allowed_ts = None
+            pos.pending_exit_replace_qty = 0
+            pos.pending_exit_replace_durable_pending = False
+            pos._exit_replace_attempt_last_ack_identity = ""
+            self._emit_exit_event(
+                pos,
+                "ALERT",
+                "EXIT_REPLACEMENT_GRANT_REVOKED_DURABILITY_UNCONFIRMED",
+                "Replacement grant revoked because durable OSM cancellation was not proven.",
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "proof_local_order_id": local_order_id,
+                    "proof_broker_order_id": broker_order_id,
+                    "reason": reason_s,
+                },
+            )
+            return True
 
     def _eligible_for_new_exit(self, pos: ManagedPosition, now_utc: datetime) -> bool:
         return self._can_submit_exit(pos, now_utc, reason=pos.pending_exit_reason or "poll")
@@ -6508,6 +6667,26 @@ class APExitEngine:
                 getattr(pos, "option_symbol", "?"),
                 getattr(pos, "adoption_identity_quarantine_reason", "")
                 or getattr(pos, "adoptionidentityquarantinereason", ""),
+            )
+            return False
+
+        # PR #423 amendment: the stale-exit monitor stages replacement
+        # authority before the OSM CANCELED hook so that the hook can clear the
+        # old identity without erasing the grant.  Staging is not durable
+        # success; never consume that grant until the monitor finalizes the
+        # exact OSM transition.
+        if getattr(pos, "pending_exit_replace_durable_pending", False):
+            self._emit_exit_event(
+                pos,
+                "HOLD",
+                "EXIT_REPLACEMENT_DURABILITY_PENDING",
+                "Replacement blocked until durable OSM cancellation success is proven.",
+                stage="exit_submission",
+                extra_inputs={
+                    "pending_exit_local_order_id": pos.pending_exit_local_order_id,
+                    "pending_exit_broker_order_id": pos.pending_exit_broker_order_id,
+                    "pending_exit_replace_qty": pos.pending_exit_replace_qty,
+                },
             )
             return False
 
@@ -8579,6 +8758,9 @@ class APExitEngine:
                         if getattr(pos, "last_exit_identity_quarantine_alert_ts", None) else ""
                     ),
                     "pending_exit_replace_allowed":    getattr(pos, "pending_exit_replace_allowed", False),
+                    "pending_exit_replace_durable_pending": getattr(
+                        pos, "pending_exit_replace_durable_pending", False
+                    ),
                     "pending_exit_replace_reason":     getattr(pos, "pending_exit_replace_reason", ""),
                     "pending_exit_replace_allowed_ts": (
                         pos.pending_exit_replace_allowed_ts.isoformat()

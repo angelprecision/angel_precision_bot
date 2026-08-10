@@ -296,6 +296,16 @@ ORDER_MONITOR_MODE=watchdog
 => no duplicate old/new broker exit overlap
 ```
 
+The AVGO component replay is not a substitute for production-shaped submit
+evidence. `tests/test_p0_exit_retry_liveness_avgo_replay.py` covers the real
+monitor/exit-engine cancel handoff with a compact OSM and direct broker-capture
+callback. `tests/test_p0_exit_retry_liveness_production_shape.py` crosses the
+full production-shaped replacement chain: real monitor and OSM cancellation,
+real exit-engine handoff, installed idempotency wrapper, real
+`APExecutionCore` callback, real OSM reservation/submit path, and exact broker
+POST. Its database connection and broker responses remain explicit test
+boundaries; PostgreSQL/release proof is still separate.
+
 ## No-scope-creep assertions
 
 The final diff should contain zero changes to:
