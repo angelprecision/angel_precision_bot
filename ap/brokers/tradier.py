@@ -417,9 +417,15 @@ class TradierBroker(BrokerAdapter):
         broker query before deciding that a new POST is safe.
         """
         j = self._get(f"/v1/accounts/{self.cfg.account_id}/orders")
-        node = j.get("orders") if isinstance(j, dict) else None
-        orders = node.get("order") if isinstance(node, dict) else node
-        if orders is None:
+        if not isinstance(j, dict) or "orders" not in j:
+            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        node = j["orders"]
+        if node is None or node == "null":
+            return []
+        if not isinstance(node, dict) or "order" not in node:
+            raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+        orders = node["order"]
+        if orders is None or orders == "null":
             return []
         if isinstance(orders, dict):
             if not orders:
@@ -479,11 +485,19 @@ class TradierBroker(BrokerAdapter):
         """
         try:
             resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
-            positions = resp.get("positions", {})
-            if not positions or positions == "null":
+            if not isinstance(resp, dict) or "positions" not in resp:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            positions = resp["positions"]
+            if positions is None or positions == "null":
                 return []
-            pos_list = positions.get("position", [])
+            if not isinstance(positions, dict) or "position" not in positions:
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
+            pos_list = positions["position"]
+            if pos_list is None or pos_list == "null":
+                return []
             if isinstance(pos_list, dict):
+                if not pos_list:
+                    raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
                 pos_list = [pos_list]
             if not isinstance(pos_list, list) or any(
                 not isinstance(p, dict) or not p for p in pos_list

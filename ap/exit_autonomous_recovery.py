@@ -42,6 +42,10 @@ STALE_EXIT_RECOVERY_AGE_SECONDS = max(
 )
 
 
+class _BrokerSnapshotUnavailable(RuntimeError):
+    """A broker order snapshot was not available as authoritative truth."""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -311,20 +315,28 @@ def _list_open_orders(broker: Any) -> tuple[bool, list[dict]]:
 
 def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
     if not broker_order_id:
-        return None
+        raise _BrokerSnapshotUnavailable("missing broker order id")
     method = getattr(broker, "get_order", None)
     if not callable(method):
         log.warning("broker.get_order missing during autonomous recovery")
-        return None
+        raise _BrokerSnapshotUnavailable("broker.get_order unavailable")
     try:
         raw = method(broker_order_id)
-        if isinstance(raw, dict):
-            return dict(raw)
-        log.warning("broker.get_order(%s) returned non-dict payload: %r", broker_order_id, raw)
-        return None
     except Exception as exc:
         log.warning("broker.get_order(%s) failed: %s", broker_order_id, exc)
-        return None
+        raise _BrokerSnapshotUnavailable(
+            f"broker.get_order failed for {broker_order_id}"
+        ) from exc
+    if not isinstance(raw, dict) or not raw or not _status(raw):
+        log.warning(
+            "broker.get_order(%s) returned unavailable payload: %r",
+            broker_order_id,
+            raw,
+        )
+        raise _BrokerSnapshotUnavailable(
+            f"broker.get_order returned malformed payload for {broker_order_id}"
+        )
+    return dict(raw)
 
 
 def _matching_open_exit_orders(
@@ -413,9 +425,15 @@ def _cancel_order_with_proof(
     confirmed_payload: Optional[dict] = None
 
     for attempt in range(max(1, int(max_retries))):
-        confirmed = _get_order(broker, broker_order_id)
+        try:
+            confirmed = _get_order(broker, broker_order_id)
+        except _BrokerSnapshotUnavailable:
+            confirmed = None
         confirmed_payload = confirmed
-        confirmed_status = _status(confirmed or {}) if confirmed else status_val
+        # The cancel response is only a request acknowledgement.  A fresh
+        # exact GET is the terminal proof; an unavailable GET must never fall
+        # back to the response's optimistic ``canceled`` status.
+        confirmed_status = _status(confirmed or {}) if confirmed else ""
         if confirmed_status in CANCEL_CONFIRMED_STATUSES:
             raw["confirmed_status"] = confirmed_status
             raw["confirmation_attempts"] = attempt + 1
@@ -425,6 +443,7 @@ def _cancel_order_with_proof(
 
     # If broker accepted cancel but status has not propagated, do NOT unlock.
     raw["confirmed_status"] = confirmed_status
+    raw["cancel_response_status"] = status_val
     raw["confirmation_attempts"] = max_retries
     raw["confirmed_payload"] = confirmed_payload
     raw["ok_flag"] = ok_flag
@@ -444,6 +463,18 @@ def _pending_identity(pos: Any) -> tuple[str, str]:
         _norm(getattr(pos, "pending_exit_local_order_id", "")),
         _norm(getattr(pos, "pending_exit_broker_order_id", "")),
     )
+
+
+def _position_close_confirmed(pos: Any) -> bool:
+    """Verify the real exit engine mutated the position to closed state."""
+    if not all(hasattr(pos, attr) for attr in ("closed", "quantity_remaining", "exit_in_flight")):
+        return False
+    if not bool(getattr(pos, "closed", False)) or bool(getattr(pos, "exit_in_flight", False)):
+        return False
+    try:
+        return int(float(getattr(pos, "quantity_remaining", 0) or 0)) == 0
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
@@ -749,7 +780,10 @@ def _recover_known_open_exit_when_monitor_unavailable(
         # The first GET established that the order is currently open.  Once
         # the retry interval has elapsed, require another fresh recognized
         # live proof before consuming the next durable cancel attempt.
-        fresh_raw = _get_order(broker, broker_id)
+        try:
+            fresh_raw = _get_order(broker, broker_id)
+        except _BrokerSnapshotUnavailable:
+            fresh_raw = None
         fresh_status = _status(fresh_raw or {})
         if fresh_status == "partially_filled":
             return RecoveryAction(
@@ -832,7 +866,24 @@ def recover_exit_position(
         # stale-age proof from before that reconciliation so a dead monitor can
         # still take the bounded autonomous handoff.
         pre_reconciliation_age_seconds = _exit_age_seconds(pos, osm, local_id)
-        raw = _get_order(broker, pending_broker_id)
+        try:
+            raw = _get_order(broker, pending_broker_id)
+        except _BrokerSnapshotUnavailable as exc:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_exact_order_query_unavailable",
+                pid,
+                local_id,
+                pending_broker_id,
+                {
+                    "quote_health": qh,
+                    "broker_truth_unavailable": True,
+                    "exact_order_query_available": False,
+                    "broker_mutation_blocked": True,
+                    "replacement_blocked": True,
+                    "error": str(exc),
+                },
+            )
         if raw:
             st = _status(raw)
             if st in OPEN_BROKER_STATUSES:
@@ -879,15 +930,62 @@ def recover_exit_position(
                     except Exception:
                         pass
                 if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                    exit_engine.mark_position_closed(
+                    try:
+                        exit_engine.mark_position_closed(
+                            pid,
+                            reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
+                            qty_filled=filled_qty,
+                            fill_price=fill_price,
+                            local_order_id=local_id,
+                            broker_order_id=pending_broker_id,
+                            cumulative_filled=filled_qty,
+                            reconciled=True,
+                        )
+                    except Exception as _close_exc:
+                        log.warning(
+                            "exit_autonomous_recovery: broker-filled close failed: %s",
+                            _close_exc,
+                        )
+                        return RecoveryAction(
+                            "NOOP",
+                            "autonomous_recovery_broker_filled_close_failed",
+                            pid,
+                            local_id,
+                            pending_broker_id,
+                            {
+                                "status": st,
+                                "filled_qty": filled_qty,
+                                "quote_health": qh,
+                                "replacement_blocked": True,
+                            },
+                        )
+                else:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_close_hook_unavailable",
                         pid,
-                        reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
-                        qty_filled=filled_qty,
-                        fill_price=fill_price,
-                        local_order_id=local_id,
-                        broker_order_id=pending_broker_id,
-                        cumulative_filled=filled_qty,
-                        reconciled=True,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "quote_health": qh,
+                            "replacement_blocked": True,
+                        },
+                    )
+                if not _position_close_confirmed(pos):
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_broker_filled_close_unconfirmed",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "quote_health": qh,
+                            "replacement_blocked": True,
+                        },
                     )
                 return RecoveryAction("MARKED_CLOSED", "broker_order_filled", pid, local_id, pending_broker_id, {"status": st, "filled_qty": filled_qty, "quote_health": qh})
             if st in TERMINAL_BROKER_STATUSES:
@@ -926,18 +1024,14 @@ def recover_exit_position(
                     return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_bid, {"old_status": st, "contract": contract, "quote_health": qh})
                 if len(other_matches) > 1:
                     return RecoveryAction("NOOP", "multiple_different_open_exits_block_replacement", pid, local_id, pending_broker_id, {"old_status": st, "matches": [m[0] for m in other_matches], "quote_health": qh})
-                return _mark_replacement_safe(
-                    exit_engine,
-                    pid,
-                    osm=osm,
-                    reason=f"autonomous_recovery_broker_terminal_{st}",
-                    local_id=local_id,
-                    broker_id=pending_broker_id,
-                    details={"status": st, "quote_health": qh},
-                )
-            return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
+                # Do not authorize replacement from terminal status plus zero
+                # other orders alone.  Fall through to the shared negative-
+                # proof path so an authoritative flat position closes and an
+                # unavailable position snapshot blocks all mutation.
+            else:
+                return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
 
-    # Missing broker id: scan open orders for matching exit order.
+    # No exact live exit remains: scan open orders for a matching exit order.
     open_orders_available, matches = _matching_open_exit_orders(broker, contract)
 
     if not open_orders_available:
@@ -1124,45 +1218,7 @@ def recover_exit_position(
                 },
             )
 
-        if not hasattr(pos, "closed") or not hasattr(pos, "quantity_remaining") or not hasattr(pos, "exit_in_flight"):
-            return RecoveryAction(
-                "NOOP",
-                "autonomous_recovery_broker_flat_close_unconfirmed",
-                pid,
-                local_id,
-                "",
-                {
-                    "contract": contract,
-                    "quote_health": qh,
-                    "source": "negative_proof_position_check",
-                    "broker_truth_unavailable": False,
-                    "open_order_query_available": True,
-                    "position_query_available": True,
-                    "replacement_blocked": True,
-                },
-            )
-        if not bool(getattr(pos, "closed", False)) or bool(getattr(pos, "exit_in_flight", False)):
-            return RecoveryAction(
-                "NOOP",
-                "autonomous_recovery_broker_flat_close_unconfirmed",
-                pid,
-                local_id,
-                "",
-                {
-                    "contract": contract,
-                    "quote_health": qh,
-                    "source": "negative_proof_position_check",
-                    "broker_truth_unavailable": False,
-                    "open_order_query_available": True,
-                    "position_query_available": True,
-                    "replacement_blocked": True,
-                },
-            )
-        try:
-            remaining = int(float(getattr(pos, "quantity_remaining", 0) or 0))
-        except (TypeError, ValueError, OverflowError):
-            remaining = 1
-        if remaining != 0:
+        if not _position_close_confirmed(pos):
             return RecoveryAction(
                 "NOOP",
                 "autonomous_recovery_broker_flat_close_unconfirmed",
