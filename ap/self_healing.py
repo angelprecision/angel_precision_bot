@@ -390,11 +390,17 @@ class APSelfHealingSystem:
             exit_eng = getattr(core, "exit_eng", None)
             broker = getattr(core, "broker", None)
             osm = getattr(runner, "order_state_machine", None)
+            order_monitor = getattr(runner, "order_monitor", None)
             if not (exit_eng and broker):
                 health.record_error("autonomous recovery skipped: missing exit_eng or broker")
                 return actions
             from ap.exit_autonomous_recovery import recover_exit_engine
-            actions = recover_exit_engine(exit_engine=exit_eng, broker=broker, osm=osm)
+            actions = recover_exit_engine(
+                exit_engine=exit_eng,
+                broker=broker,
+                osm=osm,
+                order_monitor=order_monitor,
+            )
             if actions:
                 summary = ", ".join(f"{getattr(a, 'position_id', '?')}:{getattr(a, 'action', '?')}" for a in actions[:8])
                 health.record_error(f"autonomous recovery actions: {summary}")

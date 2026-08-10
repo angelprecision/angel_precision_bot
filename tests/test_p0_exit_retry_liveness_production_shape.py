@@ -46,11 +46,47 @@ class _MemoryCursor:
     def __init__(self, db):
         self.db = db
         self.rowcount = 1
+        self._result = None
 
     def execute(self, sql, params=()):
         normalized = " ".join(str(sql).split()).upper()
         params = tuple(params or ())
         self.rowcount = 1
+        self._result = None
+
+        if normalized.startswith("SELECT BROKER_ORDER_ID, META FROM ORDERS"):
+            local_id, client_id = str(params[0]), str(params[1])
+            row = self.db.rows.get(local_id)
+            if row is None or str(row.get("client_id") or "") != client_id:
+                self._result = None
+            else:
+                self._result = {
+                    "broker_order_id": row.get("broker_order_id"),
+                    "meta": dict(row.get("meta") or {}),
+                }
+            return self
+
+        if (
+            normalized.startswith("UPDATE ORDERS SET META")
+            and "AND BROKER_ORDER_ID=%S" in normalized
+        ):
+            patch = json.loads(str(params[0]))
+            local_id, client_id, broker_id = str(params[1]), str(params[2]), str(params[3])
+            row = self.db.rows.get(local_id)
+            if (
+                row is None
+                or str(row.get("client_id") or "") != client_id
+                or str(row.get("broker_order_id") or "") != broker_id
+            ):
+                self.rowcount = 0
+                return self
+            marker = (row.get("meta") or {}).get("stale_exit_cancel_liveness")
+            proposed = int(patch["stale_exit_cancel_liveness"]["attempt"])
+            if marker is not None and int(marker.get("attempt", -1)) >= proposed:
+                self.rowcount = 0
+                return self
+            row.setdefault("meta", {}).update(patch)
+            return self
 
         if normalized.startswith("INSERT INTO ORDERS"):
             local_id, client_id, position_id = str(params[0]), str(params[1]), str(params[2])
@@ -123,7 +159,9 @@ class _MemoryCursor:
         return self
 
     def fetchone(self):
-        return None
+        result = self._result
+        self._result = None
+        return result
 
     def fetchall(self):
         return []
@@ -407,6 +445,8 @@ def test_avgo_replacement_crosses_real_production_submit_shape(monkeypatch):
         assert position.pending_exit_replace_durable_pending is False
         assert position.pending_exit_replace_qty == 2
         assert position.exit_replace_attempt == 1
+        assert rows[old_local_id]["meta"]["stale_exit_cancel_liveness"]["attempt"] == 1
+        assert osm.persist_stale_exit_cancel_attempt(old_local_id, old_broker_id, 1) is False
 
         decision = ExitDecision(
             action="STOP",

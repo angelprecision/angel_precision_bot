@@ -2139,6 +2139,113 @@ class APOrderStateMachine:
             )
             return False
 
+    def persist_stale_exit_cancel_attempt(
+        self,
+        local_order_id: str,
+        broker_order_id: str,
+        attempt: int,
+    ) -> bool:
+        """Atomically advance the exact stale-exit cancel-attempt fence.
+
+        The stale-exit recovery path must persist its next generation before
+        issuing a broker DELETE.  A plain ``update_order_meta`` merge is not
+        sufficient because two monitor/recovery workers can read the same
+        attempt and then write out of order.  Lock the exact OSM row, reject
+        malformed or mismatched existing markers, and update only when the
+        proposed attempt is strictly greater than the durable one.
+
+        ``False`` is fail-closed: the caller must not issue a broker cancel.
+        """
+        local_id = str(local_order_id or "").strip()
+        broker_id = str(broker_order_id or "").strip()
+        if isinstance(attempt, bool):
+            return False
+        if isinstance(attempt, int):
+            attempt_i = attempt
+        elif isinstance(attempt, str) and attempt.strip().isdigit():
+            attempt_i = int(attempt.strip())
+        else:
+            return False
+        if not local_id or not broker_id or attempt_i <= 0:
+            return False
+
+        import json as _json_local
+
+        patch = {
+            "stale_exit_cancel_liveness": {
+                "broker_order_id": broker_id,
+                "attempt": attempt_i,
+                "updated_at": now_utc_iso(),
+            }
+        }
+        try:
+            patch_json = _json_local.dumps(patch, default=str)
+        except Exception:
+            return False
+
+        def _fn():
+            with conn() as c:
+                row = c.execute(
+                    "SELECT broker_order_id, meta FROM orders "
+                    "WHERE local_order_id=%s AND client_id=%s FOR UPDATE",
+                    (local_id, self.client_id),
+                ).fetchone()
+                if not row:
+                    return 0
+                if str(row.get("broker_order_id") or "").strip() != broker_id:
+                    return 0
+
+                raw_meta = row.get("meta") or {}
+                if isinstance(raw_meta, str):
+                    try:
+                        raw_meta = _json_local.loads(raw_meta) if raw_meta.strip() else {}
+                    except Exception:
+                        return 0
+                if not isinstance(raw_meta, dict):
+                    return 0
+
+                marker = raw_meta.get("stale_exit_cancel_liveness")
+                if marker is not None:
+                    if not isinstance(marker, dict):
+                        return 0
+                    if str(marker.get("broker_order_id") or "").strip() != broker_id:
+                        return 0
+                    raw_attempt = marker.get("attempt")
+                    if isinstance(raw_attempt, bool):
+                        return 0
+                    if isinstance(raw_attempt, int):
+                        existing_attempt = raw_attempt
+                    elif isinstance(raw_attempt, str) and raw_attempt.strip().isdigit():
+                        existing_attempt = int(raw_attempt.strip())
+                    else:
+                        return 0
+                    if existing_attempt < 0 or existing_attempt >= attempt_i:
+                        return 0
+
+                cur = c.execute(
+                    "UPDATE orders "
+                    "SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                    "    updated_ts = NOW() "
+                    "WHERE local_order_id=%s AND client_id=%s "
+                    "  AND broker_order_id=%s",
+                    (patch_json, local_id, self.client_id, broker_id),
+                )
+                return getattr(cur, "rowcount", getattr(c, "rowcount", None))
+
+        try:
+            rowcount = run_with_retry(_fn)
+            return bool(rowcount and rowcount > 0)
+        except Exception as exc:
+            log.warning(
+                "[%s] monotonic stale-exit cancel-attempt persist failed "
+                "for local_order_id=%s broker_order_id=%s: %s",
+                self.client_id,
+                local_id,
+                broker_id,
+                exc,
+            )
+            return False
+
     def retire_unsubmitted_exit_intent(self, local_order_id: str, *, last_error: str) -> bool:
         """Atomically retire one EXIT_REQUESTED row only if no submit evidence exists."""
         error_text = str(last_error or "NO_POST_ATTEMPTED")

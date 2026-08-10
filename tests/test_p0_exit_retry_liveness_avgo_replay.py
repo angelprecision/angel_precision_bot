@@ -116,6 +116,28 @@ class _ReplayOSM:
         order.setdefault("meta", {}).update(dict(meta_patch or {}))
         return True
 
+    def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+        order = self.orders.get(local_order_id)
+        if order is None or order.get("broker_order_id") != broker_order_id:
+            return False
+        marker_key = "stale_exit_cancel_liveness"
+        marker = order.setdefault("meta", {}).get(marker_key)
+        if marker is not None:
+            if not isinstance(marker, dict) or marker.get("broker_order_id") != broker_order_id:
+                return False
+            try:
+                existing_attempt = int(marker["attempt"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if existing_attempt < 0 or existing_attempt >= int(attempt):
+                return False
+        order["meta"][marker_key] = {
+            "broker_order_id": broker_order_id,
+            "attempt": int(attempt),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return True
+
     def _get_active_exit_order(self, position_id):
         active_statuses = {
             "EXIT_REQUESTED",

@@ -2665,7 +2665,10 @@ class ClientRunner(threading.Thread):
             # it when it's alive, avoiding a dual-cancel race on the same
             # broker order.
             actions = recover_exit_engine(
-                exit_eng, broker=broker, order_monitor=getattr(self, "order_monitor", None),
+                exit_eng,
+                broker=broker,
+                osm=getattr(self, "order_state_machine", None),
+                order_monitor=getattr(self, "order_monitor", None),
             )
             for action in (actions or []):
                 if action.action not in ("NOOP",):

@@ -144,25 +144,22 @@ def _read_stale_exit_cancel_liveness(
 def _persist_stale_exit_cancel_attempt(
     osm: Any, local_order_id: str, broker_order_id: str, attempt: int,
 ) -> bool:
-    """Persist one exact-order cancel attempt before issuing the broker DELETE."""
+    """Persist one exact-order cancel attempt before issuing the broker DELETE.
+
+    This money-path fence deliberately does not fall back to the generic
+    ``update_order_meta`` merge.  The caller may have read an older snapshot,
+    so only the OSM's row-locked monotonic writer can authorize the DELETE.
+    """
     if not osm or not local_order_id or not broker_order_id:
         return False
-    updater = getattr(osm, "update_order_meta", None)
-    if not callable(updater):
+    persister = getattr(osm, "persist_stale_exit_cancel_attempt", None)
+    if not callable(persister):
         return False
     try:
-        return bool(
-            updater(
-                local_order_id,
-                {
-                    STALE_EXIT_CANCEL_LIVENESS_META_KEY: {
-                        "broker_order_id": _norm(broker_order_id),
-                        "attempt": max(0, int(attempt)),
-                        "updated_at": _now().isoformat(),
-                    }
-                },
-            )
-        )
+        attempt_i = int(attempt)
+        if attempt_i <= 0:
+            return False
+        return bool(persister(local_order_id, _norm(broker_order_id), attempt_i))
     except Exception as exc:
         log.error(
             "durable stale-exit cancel-attempt persist failed | local=%s broker=%s: %s",
@@ -557,9 +554,11 @@ def _recover_known_open_exit_when_monitor_unavailable(
     broker_id: str,
     status: str,
     quote_health_payload: dict,
+    age_seconds: Optional[float] = None,
 ) -> RecoveryAction:
     """Bounded exact cancel fallback for a stale known broker-owned exit."""
-    age_seconds = _exit_age_seconds(pos, osm, local_id)
+    if age_seconds is None:
+        age_seconds = _exit_age_seconds(pos, osm, local_id)
     if age_seconds is None or age_seconds < STALE_EXIT_RECOVERY_AGE_SECONDS:
         return RecoveryAction(
             "CONFIRMED_OPEN",
@@ -642,6 +641,11 @@ def recover_exit_position(
 
     # Exact broker identity path.
     if pending_broker_id:
+        # APExitEngine.set_pending_exit_order() refreshes its in-memory signal
+        # timestamp while it adopts the exact broker identity.  Preserve the
+        # stale-age proof from before that reconciliation so a dead monitor can
+        # still take the bounded autonomous handoff.
+        pre_reconciliation_age_seconds = _exit_age_seconds(pos, osm, local_id)
         raw = _get_order(broker, pending_broker_id)
         if raw:
             st = _status(raw)
@@ -676,6 +680,7 @@ def recover_exit_position(
                     broker_id=pending_broker_id,
                     status=st,
                     quote_health_payload=qh,
+                    age_seconds=pre_reconciliation_age_seconds,
                 )
             if st == "filled":
                 filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)

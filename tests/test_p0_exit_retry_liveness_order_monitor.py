@@ -81,6 +81,30 @@ class _DurableCancelOSM:
         self.row["meta"].update(meta_patch)
         return True
 
+    def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+        if (
+            local_order_id != self.row["local_order_id"]
+            or broker_order_id != self.row["broker_order_id"]
+        ):
+            return False
+        marker_key = "stale_exit_cancel_liveness"
+        marker = self.row["meta"].get(marker_key)
+        if marker is not None:
+            if not isinstance(marker, dict) or marker.get("broker_order_id") != broker_order_id:
+                return False
+            try:
+                existing_attempt = int(marker["attempt"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if existing_attempt < 0 or existing_attempt >= int(attempt):
+                return False
+        self.row["meta"][marker_key] = {
+            "broker_order_id": broker_order_id,
+            "attempt": int(attempt),
+            "updated_at": "test",
+        }
+        return True
+
     def transition(self, local_order_id, status, **kwargs):
         self.transitions.append((local_order_id, status, kwargs))
         if local_order_id != self.row["local_order_id"]:
