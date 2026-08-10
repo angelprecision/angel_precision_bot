@@ -422,9 +422,13 @@ class TradierBroker(BrokerAdapter):
         if orders is None:
             return []
         if isinstance(orders, dict):
-            return [orders]
+            if not orders:
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+            return [dict(orders)]
         if isinstance(orders, list):
-            return [order for order in orders if isinstance(order, dict)]
+            if any(not isinstance(order, dict) or not order for order in orders):
+                raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
+            return [dict(order) for order in orders]
         raise ValueError("TRADIER_ORDERS_PAYLOAD_MALFORMED")
 
     def close_position(self, position_id: str) -> BrokerOrderResponse:
@@ -469,7 +473,9 @@ class TradierBroker(BrokerAdapter):
         """
         Return open positions from Tradier account.
         Returns list of dicts with: symbol, quantity, cost_basis, side
-        Returns [] if no positions or on error.
+        Returns [] only when the positions query succeeds and the account is
+        flat. Provider/transport failures are propagated so recovery callers
+        cannot mistake unavailable truth for broker-flat truth.
         """
         try:
             resp = self._get(f"/v1/accounts/{self.cfg.account_id}/positions")
@@ -479,6 +485,10 @@ class TradierBroker(BrokerAdapter):
             pos_list = positions.get("position", [])
             if isinstance(pos_list, dict):
                 pos_list = [pos_list]
+            if not isinstance(pos_list, list) or any(
+                not isinstance(p, dict) or not p for p in pos_list
+            ):
+                raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")
             result = []
             for p in pos_list:
                 result.append({
@@ -495,4 +505,4 @@ class TradierBroker(BrokerAdapter):
             return result
         except Exception as e:
             log.error("TRADIER_LIST_POSITIONS_FAILED | error=%s", e)
-            return []
+            raise

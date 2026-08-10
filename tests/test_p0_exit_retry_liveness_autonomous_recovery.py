@@ -5,7 +5,8 @@
 # which broker order belongs to the local OSM generation. Autonomous recovery
 # must therefore perform zero broker mutation and grant zero replacement
 # authority whenever more than one live candidate exists, regardless of
-# order-monitor health.
+# order-monitor health. Broker query failure is also unavailable truth, not an
+# authoritative empty snapshot.
 # =============================================================================
 
 from __future__ import annotations
@@ -318,10 +319,10 @@ def test_ambiguous_multi_match_never_cancels_without_exact_identity(monkeypatch)
     monkeypatch.setattr(
         rec_mod,
         "_matching_open_exit_orders",
-        lambda broker, contract, exclude_broker_id=None: [
+        lambda broker, contract, exclude_broker_id=None: (True, [
             ("bro-a", {"status": "working", "quantity": 2}),
             ("bro-b", {"status": "working", "quantity": 2}),
-        ],
+        ]),
     )
 
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
@@ -364,7 +365,7 @@ def test_ambiguous_multi_match_with_partial_fill_blocks_all_broker_mutation(monk
     monkeypatch.setattr(
         rec_mod,
         "_matching_open_exit_orders",
-        lambda broker, contract, exclude_broker_id=None: [
+        lambda broker, contract, exclude_broker_id=None: (True, [
             (
                 "bro-working",
                 {
@@ -380,7 +381,7 @@ def test_ambiguous_multi_match_with_partial_fill_blocks_all_broker_mutation(monk
                     "exec_quantity": 1,
                 },
             ),
-        ],
+        ]),
     )
 
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
@@ -406,6 +407,246 @@ def test_ambiguous_multi_match_with_partial_fill_blocks_all_broker_mutation(monk
     exit_engine.finalize_exit_replacement_safe.assert_not_called()
     exit_engine.clear_exit_in_flight.assert_not_called()
     assert osm.transitions == []
+
+
+class _BrokerSnapshots:
+    def __init__(self, *, orders=None, positions=None):
+        self.orders = orders
+        self.positions = positions
+        self.list_orders_calls = 0
+        self.list_positions_calls = 0
+        self.cancel_calls = 0
+
+    def list_orders(self):
+        self.list_orders_calls += 1
+        if isinstance(self.orders, BaseException):
+            raise self.orders
+        return self.orders
+
+    def list_positions(self):
+        self.list_positions_calls += 1
+        if isinstance(self.positions, BaseException):
+            raise self.positions
+        return self.positions
+
+    def cancel_order(self, broker_order_id):
+        self.cancel_calls += 1
+        return {"status": "canceled", "broker_order_id": broker_order_id}
+
+
+def _recovery_position(**overrides):
+    defaults = dict(
+        position_id="pos-snapshot",
+        option_symbol="AVGO260814C00350000",
+        pending_exit_local_order_id="loc-snapshot",
+        pending_exit_broker_order_id="",
+        pending_exit_qty=2,
+        contracts=2,
+        quantity_remaining=2,
+        exit_in_flight=True,
+        closed=False,
+        last_exit_signal_ts=None,
+        last_callback_identity_missing_ts=None,
+    )
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def test_open_order_query_failure_is_noop_and_does_not_mutate_or_check_positions():
+    broker = _BrokerSnapshots(
+        orders=ConnectionError("Tradier orders unavailable"),
+        positions=[{"symbol": "AVGO260814C00350000", "quantity": 2}],
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(broker_id="")
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_open_order_query_unavailable"
+    assert action.details["broker_truth_unavailable"] is True
+    assert action.details["replacement_blocked"] is True
+    assert broker.list_positions_calls == 0
+    assert broker.cancel_calls == 0
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.finalize_exit_replacement_safe.assert_not_called()
+    exit_engine.clear_exit_in_flight.assert_not_called()
+    assert osm.transitions == []
+
+
+def test_authoritative_zero_orders_and_held_position_allows_recovery():
+    broker = _BrokerSnapshots(
+        orders=[],
+        positions=[{"symbol": "AVGO260814C00350000", "quantity": 2}],
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(
+        local_id="loc-snapshot",
+        broker_id="",
+        position_id="pos-snapshot",
+    )
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "REPLACEMENT_SAFE"
+    assert action.details["open_order_query_available"] is True
+    assert action.details["position_query_available"] is True
+    assert broker.list_orders_calls == 1
+    assert broker.list_positions_calls == 1
+    exit_engine.mark_exit_replacement_safe.assert_called_once()
+    assert len(osm.transitions) == 1
+
+
+def test_position_query_failure_after_authoritative_zero_orders_is_noop():
+    broker = _BrokerSnapshots(
+        orders=[],
+        positions=TimeoutError("Tradier positions unavailable"),
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(broker_id="")
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_position_query_unavailable"
+    assert action.details["open_order_query_available"] is True
+    assert action.details["position_query_available"] is False
+    exit_engine.mark_position_closed.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    assert osm.transitions == []
+
+
+def test_authoritative_zero_orders_and_flat_position_uses_real_close_contract_and_verifies_state():
+    broker = _BrokerSnapshots(orders=[], positions=[])
+    position = _recovery_position()
+    exit_engine = MagicMock()
+
+    def _mark_closed(position_id, **kwargs):
+        assert position_id == position.position_id
+        assert kwargs["reason"] == "AUTONOMOUS_RECOVERY_BROKER_FLAT"
+        assert kwargs["qty_filled"] == 2
+        assert kwargs["fill_price"] is None
+        assert kwargs["local_order_id"] == "loc-snapshot"
+        assert kwargs["broker_order_id"] == ""
+        assert kwargs["reconciled"] is True
+        position.closed = True
+        position.quantity_remaining = 0
+        position.exit_in_flight = False
+
+    exit_engine.mark_position_closed.side_effect = _mark_closed
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=_DurableOSM(broker_id=""),
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "MARKED_CLOSED"
+    assert action.reason == "autonomous_recovery_contract_flat_at_broker"
+    exit_engine.mark_position_closed.assert_called_once()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+def test_authoritative_flat_position_closes_through_real_exit_engine():
+    broker = _BrokerSnapshots(orders=[], positions=[])
+    position = _production_callsite_position()
+    exit_engine = APExitEngine(broker=broker, email="client-self-healing")
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine._positions = [position]
+    exit_engine._positions_by_id[position.position_id] = position
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=None,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "MARKED_CLOSED"
+    assert position.closed is True
+    assert position.quantity_remaining == 0
+    assert position.exit_in_flight is False
+    assert position.position_id not in exit_engine._positions_by_id
+
+
+def test_broker_flat_close_not_claimed_when_engine_does_not_confirm_closure():
+    broker = _BrokerSnapshots(orders=[], positions=[])
+    position = _recovery_position()
+    exit_engine = MagicMock()
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=_DurableOSM(broker_id=""),
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_broker_flat_close_unconfirmed"
+    exit_engine.mark_position_closed.assert_called_once()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+def test_malformed_position_snapshot_is_unavailable_not_flat():
+    broker = _BrokerSnapshots(
+        orders=[],
+        positions=[{"symbol": "AVGO260814C00350000", "quantity": "not-a-number"}],
+    )
+    exit_engine = MagicMock()
+    osm = _DurableOSM(broker_id="")
+
+    action = recover_exit_position(
+        _recovery_position(),
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_recovery_position_query_unavailable"
+    exit_engine.mark_position_closed.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    assert osm.transitions == []
+
+
+def test_tradier_position_transport_failure_is_not_coerced_to_empty_snapshot():
+    from ap.brokers.tradier import TradierBroker, TradierConfig
+
+    broker = TradierBroker(
+        TradierConfig(
+            base_url="https://api.tradier.com",
+            access_token="test-token",
+            account_id="acct",
+        )
+    )
+    broker._get = MagicMock(side_effect=ConnectionError("positions unavailable"))
+
+    with pytest.raises(ConnectionError):
+        broker.list_positions()
 
 
 def test_exact_broker_cancel_blocked_when_osm_broker_identity_mismatches(monkeypatch):
@@ -600,7 +841,7 @@ def test_terminal_autonomous_path_uses_durable_osm_handoff(monkeypatch):
     pos = _pos(pending_exit_broker_order_id="bro-terminal")
 
     monkeypatch.setattr(rec_mod, "_get_order", lambda broker, bid: {"status": "canceled"})
-    monkeypatch.setattr(rec_mod, "_matching_open_exit_orders", lambda *args, **kwargs: [])
+    monkeypatch.setattr(rec_mod, "_matching_open_exit_orders", lambda *args, **kwargs: (True, []))
     terminal_osm = _DurableOSM(broker_id="bro-terminal")
     terminal_action = recover_exit_position(
         pos, broker=broker, exit_engine=exit_engine, osm=terminal_osm,

@@ -8,8 +8,8 @@ Safety rules
 1. Never clear an exit quarantine by time alone.
 2. Never authorize replacement if ANY matching live broker exit order is found.
 3. Prefer fill/close truth when broker/DB evidence exists.
-4. On ambiguous matching live exits, try broker cancel first and only unlock after
-   cancel proof or terminal broker confirmation.
+4. On ambiguous matching live exits, do not mutate broker or durable state;
+   identity ambiguity is a zero-mutation hold.
 5. If broker truth is ambiguous, alert/no-op.
 6. Quote staleness is reported as a kill-switch signal for new entries, not a
    reason to guess exit truth.
@@ -18,6 +18,7 @@ Safety rules
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -234,29 +235,78 @@ def _dt_age_seconds(dt: Any) -> Optional[float]:
         return None
 
 
-def _list_open_orders(broker: Any) -> list[dict]:
+def _normalize_broker_rows(raw: Any, *, container_keys: tuple[str, ...]) -> Optional[list[dict]]:
+    """Normalize a broker collection without turning malformed truth into empty truth."""
+    if isinstance(raw, list):
+        if any(not isinstance(item, dict) or not item for item in raw):
+            return None
+        return [dict(item) for item in raw]
+
+    if isinstance(raw, dict):
+        for key in container_keys:
+            if key not in raw:
+                continue
+            node = raw.get(key)
+            if node in (None, "null"):
+                return []
+            if isinstance(node, list):
+                if any(not isinstance(item, dict) or not item for item in node):
+                    return None
+                return [dict(item) for item in node]
+            if isinstance(node, dict):
+                for child_key in ("order", "orders", "position", "positions", "items", "results", "data"):
+                    if child_key not in node:
+                        continue
+                    child = node.get(child_key)
+                    if child in (None, "null"):
+                        return []
+                    if isinstance(child, dict):
+                        return [dict(child)] if child else []
+                    if isinstance(child, list):
+                        if any(not isinstance(item, dict) or not item for item in child):
+                            return None
+                        return [dict(item) for item in child]
+                    return None
+                return [] if not node else None
+            return None
+
+        return [dict(raw)] if raw else None
+
+    return None
+
+
+def _list_open_orders(broker: Any) -> tuple[bool, list[dict]]:
+    """Return ``(available, orders)``; unavailable is never represented by ``[]``."""
+    found_method = False
     for method_name in ("list_open_orders", "get_open_orders", "list_orders", "orders"):
         method = getattr(broker, method_name, None)
         if not callable(method):
             continue
+        found_method = True
         try:
             try:
                 result = method(status="open")
             except TypeError:
                 result = method()
-            if result is None:
-                log.warning("broker.%s returned None during autonomous recovery", method_name)
+            rows = _normalize_broker_rows(
+                result,
+                container_keys=("orders", "data", "results", "items"),
+            )
+            if rows is None:
+                log.warning("broker.%s returned malformed data during autonomous recovery", method_name)
                 continue
-            if isinstance(result, dict):
-                for key in ("orders", "data", "results", "items"):
-                    if isinstance(result.get(key), list):
-                        return [dict(x) for x in result[key] if isinstance(x, dict)]
-                return [result]
-            if isinstance(result, list):
-                return [dict(x) for x in result if isinstance(x, dict)]
+            if not all(
+                _broker_order_id(row) and _contract(row) and _status(row)
+                for row in rows
+            ):
+                log.warning("broker.%s returned structurally incomplete order data during autonomous recovery", method_name)
+                continue
+            return True, rows
         except Exception as exc:
             log.warning("broker.%s failed during autonomous recovery: %s", method_name, exc)
-    return []
+    if not found_method:
+        log.warning("broker has no open-order query during autonomous recovery")
+    return False, []
 
 
 def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
@@ -277,9 +327,14 @@ def _get_order(broker: Any, broker_order_id: str) -> Optional[dict]:
         return None
 
 
-def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id: str = "") -> list[tuple[str, dict]]:
+def _matching_open_exit_orders(
+    broker: Any, contract: str, *, exclude_broker_id: str = "",
+) -> tuple[bool, list[tuple[str, dict]]]:
     matches: list[tuple[str, dict]] = []
-    for raw in _list_open_orders(broker):
+    available, rows = _list_open_orders(broker)
+    if not available:
+        return False, matches
+    for raw in rows:
         if contract and _contract(raw) != contract:
             continue
         if not _is_exit_like(raw):
@@ -291,7 +346,46 @@ def _matching_open_exit_orders(broker: Any, contract: str, *, exclude_broker_id:
         if not bid or (exclude_broker_id and bid == exclude_broker_id):
             continue
         matches.append((bid, raw))
-    return matches
+    return True, matches
+
+
+def _list_broker_positions(broker: Any) -> tuple[bool, list[dict]]:
+    """Return ``(available, positions)``; an unavailable snapshot is not flat."""
+    method = getattr(broker, "list_positions", None)
+    if not callable(method):
+        log.warning("broker has no position query during autonomous recovery")
+        return False, []
+    try:
+        rows = _normalize_broker_rows(
+            method(),
+            container_keys=("positions", "data", "results", "items"),
+        )
+        if rows is None:
+            log.warning("broker.list_positions returned malformed data during autonomous recovery")
+            return False, []
+        for row in rows:
+            if not _contract(row):
+                log.warning("broker.list_positions returned position without a contract during autonomous recovery")
+                return False, []
+            quantity_present = any(
+                key in row for key in ("quantity", "qty", "position_qty", "long_quantity")
+            )
+            if not quantity_present:
+                log.warning("broker.list_positions returned position without quantity during autonomous recovery")
+                return False, []
+            try:
+                quantity = float(
+                    row.get("quantity", row.get("qty", row.get("position_qty", row.get("long_quantity"))))
+                )
+                if not math.isfinite(quantity):
+                    raise ValueError("non-finite quantity")
+            except (TypeError, ValueError, OverflowError):
+                log.warning("broker.list_positions returned non-numeric quantity during autonomous recovery")
+                return False, []
+        return True, rows
+    except Exception as exc:
+        log.warning("broker.list_positions failed during autonomous recovery: %s", exc)
+        return False, []
 
 
 def _cancel_order_with_proof(
@@ -799,7 +893,26 @@ def recover_exit_position(
             if st in TERMINAL_BROKER_STATUSES:
                 # CRITICAL safety: terminal status for the old pending id is NOT enough.
                 # Scan broker for a different live exit on the same contract before allowing replacement.
-                other_matches = _matching_open_exit_orders(broker, contract, exclude_broker_id=pending_broker_id)
+                open_orders_available, other_matches = _matching_open_exit_orders(
+                    broker, contract, exclude_broker_id=pending_broker_id,
+                )
+                if not open_orders_available:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_open_order_query_unavailable",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "contract": contract,
+                            "quote_health": qh,
+                            "broker_truth_unavailable": True,
+                            "open_order_query_available": False,
+                            "broker_mutation_blocked": True,
+                            "replacement_blocked": True,
+                        },
+                    )
                 if len(other_matches) == 1:
                     other_bid, other_raw = other_matches[0]
                     if exit_engine and hasattr(exit_engine, "set_pending_exit_order"):
@@ -825,7 +938,24 @@ def recover_exit_position(
             return RecoveryAction("NOOP", "broker_order_ambiguous_status", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh})
 
     # Missing broker id: scan open orders for matching exit order.
-    matches = _matching_open_exit_orders(broker, contract)
+    open_orders_available, matches = _matching_open_exit_orders(broker, contract)
+
+    if not open_orders_available:
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_open_order_query_unavailable",
+            pid,
+            local_id,
+            pending_broker_id,
+            {
+                "contract": contract,
+                "quote_health": qh,
+                "broker_truth_unavailable": True,
+                "open_order_query_available": False,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
+        )
 
     if len(matches) == 1:
         recovered_broker_id, raw = matches[0]
@@ -886,26 +1016,182 @@ def recover_exit_position(
     # Before marking replacement safe, verify the contract is still held.
     # If position is flat at the broker (exit filled, callback dropped), close it
     # instead of spawning a duplicate sell-to-close that Tradier will reject.
-    try:
-        _broker_positions = broker.list_positions() if hasattr(broker, "list_positions") else []
-        _contract_held = any(
-            str(p.get("symbol") or "").upper() == str(contract or "").upper()
-            for p in (_broker_positions or [])
-            if int(p.get("quantity") or 0) != 0
+    positions_available, broker_positions = _list_broker_positions(broker)
+    if not positions_available:
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_recovery_position_query_unavailable",
+            pid,
+            local_id,
+            pending_broker_id,
+            {
+                "contract": contract,
+                "quote_health": qh,
+                "broker_truth_unavailable": True,
+                "open_order_query_available": True,
+                "position_query_available": False,
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
         )
-        if not _contract_held and contract:
-            # Position is flat at broker — exit filled but callback was dropped.
-            # Mark position closed rather than allowing a duplicate exit submission.
-            if exit_engine and hasattr(exit_engine, "mark_position_closed"):
-                exit_engine.mark_position_closed(pid, exit_price=None, filled_qty=getattr(pos, "contracts", 0))
+
+    def _broker_position_quantity(row: dict) -> float:
+        for key in ("quantity", "qty", "position_qty", "long_quantity"):
+            if key in row:
+                try:
+                    return float(row.get(key) or 0)
+                except (TypeError, ValueError, OverflowError):
+                    return 0.0
+        return 0.0
+
+    _contract_held = any(
+        _contract(p) == contract and _broker_position_quantity(p) != 0
+        for p in broker_positions
+    )
+    if not _contract_held and contract:
+        # Position is flat at broker — exit filled but callback was dropped.
+        # Use the actual mark_position_closed contract and verify the engine
+        # performed the close before claiming economic completion.
+        close_qty = (
+            getattr(pos, "pending_exit_qty", 0)
+            or getattr(pos, "contracts", 0)
+            or getattr(pos, "quantity_remaining", 0)
+        )
+        try:
+            close_qty = int(float(close_qty or 0))
+        except (TypeError, ValueError, OverflowError):
             return RecoveryAction(
-                "MARKED_CLOSED",
-                "autonomous_recovery_contract_flat_at_broker",
-                pid, local_id, "",
-                {"contract": contract, "quote_health": qh, "source": "negative_proof_position_check"},
+                "NOOP",
+                "autonomous_recovery_broker_flat_close_quantity_unavailable",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "broker_truth_unavailable": False,
+                    "open_order_query_available": True,
+                    "position_query_available": True,
+                    "replacement_blocked": True,
+                },
             )
-    except Exception as _bp_exc:
-        log.debug("exit_autonomous_recovery: broker position check failed (non-fatal): %s", _bp_exc)
+        close_hook = getattr(exit_engine, "mark_position_closed", None) if exit_engine else None
+        if not callable(close_hook):
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_broker_flat_close_hook_unavailable",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "broker_truth_unavailable": False,
+                    "open_order_query_available": True,
+                    "position_query_available": True,
+                    "replacement_blocked": True,
+                },
+            )
+        try:
+            close_hook(
+                pid,
+                reason="AUTONOMOUS_RECOVERY_BROKER_FLAT",
+                qty_filled=close_qty,
+                fill_price=None,
+                local_order_id=local_id,
+                broker_order_id="",
+                cumulative_filled=close_qty,
+                reconciled=True,
+            )
+        except Exception as _close_exc:
+            log.warning("exit_autonomous_recovery: broker-flat close failed: %s", _close_exc)
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_broker_flat_close_failed",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "broker_truth_unavailable": False,
+                    "open_order_query_available": True,
+                    "position_query_available": True,
+                    "replacement_blocked": True,
+                },
+            )
+
+        if not hasattr(pos, "closed") or not hasattr(pos, "quantity_remaining") or not hasattr(pos, "exit_in_flight"):
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_broker_flat_close_unconfirmed",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "broker_truth_unavailable": False,
+                    "open_order_query_available": True,
+                    "position_query_available": True,
+                    "replacement_blocked": True,
+                },
+            )
+        if not bool(getattr(pos, "closed", False)) or bool(getattr(pos, "exit_in_flight", False)):
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_broker_flat_close_unconfirmed",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "broker_truth_unavailable": False,
+                    "open_order_query_available": True,
+                    "position_query_available": True,
+                    "replacement_blocked": True,
+                },
+            )
+        try:
+            remaining = int(float(getattr(pos, "quantity_remaining", 0) or 0))
+        except (TypeError, ValueError, OverflowError):
+            remaining = 1
+        if remaining != 0:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_recovery_broker_flat_close_unconfirmed",
+                pid,
+                local_id,
+                "",
+                {
+                    "contract": contract,
+                    "quote_health": qh,
+                    "source": "negative_proof_position_check",
+                    "broker_truth_unavailable": False,
+                    "open_order_query_available": True,
+                    "position_query_available": True,
+                    "replacement_blocked": True,
+                },
+            )
+        return RecoveryAction(
+            "MARKED_CLOSED",
+            "autonomous_recovery_contract_flat_at_broker",
+            pid, local_id, "",
+            {
+                "contract": contract,
+                "quote_health": qh,
+                "source": "negative_proof_position_check",
+                "broker_truth_unavailable": False,
+                "open_order_query_available": True,
+                "position_query_available": True,
+            },
+        )
 
     return _mark_replacement_safe(
         exit_engine,
@@ -914,7 +1200,12 @@ def recover_exit_position(
         reason="autonomous_recovery_no_matching_live_exit_order",
         local_id=local_id,
         broker_id="",
-        details={"contract": contract, "quote_health": qh},
+        details={
+            "contract": contract,
+            "quote_health": qh,
+            "open_order_query_available": True,
+            "position_query_available": True,
+        },
     )
 
 
