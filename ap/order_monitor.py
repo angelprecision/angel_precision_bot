@@ -5182,9 +5182,8 @@ class APOrderMonitor:
         broker_status = self._query_broker_order(broker_oid)
         _partial_remainder_qty = 0
 
-        broker_owned_recovery = _is_broker_ownership_adopted_row(
-            self.osm.get_order(local_order_id) or {}
-        )
+        _stale_order_row = self.osm.get_order(local_order_id) or {}
+        broker_owned_recovery = _is_broker_ownership_adopted_row(_stale_order_row)
         if broker_owned_recovery and _requires_broker_owned_exit_fence(
             broker_status
         ):
@@ -5272,13 +5271,100 @@ class APOrderMonitor:
             self._clear_stale_exit_cancel_state(broker_oid)
             return True
 
+        _now = datetime.now(timezone.utc)
+
+        # The in-memory maps prevent overlapping poll cycles from issuing a
+        # duplicate DELETE, but they cannot survive a monitor/process restart.
+        # Restore the exact broker-order attempt fence from OSM metadata before
+        # allowing any further cancel attempt.  Import locally to keep the
+        # recovery module independent of monitor construction/import order.
+        _durable_cancel_attempt = 0
+        _durable_cancel_updated_at = None
+        try:
+            from ap.exit_autonomous_recovery import _read_stale_exit_cancel_liveness
+
+            _durable_liveness = _read_stale_exit_cancel_liveness(
+                self.osm, local_order_id, broker_oid, order=_stale_order_row,
+            )
+            _durable_cancel_attempt = max(
+                0, int(_durable_liveness.get("attempt", 0) or 0)
+            )
+            _updated_at = str(_durable_liveness.get("updated_at") or "").strip()
+            if _updated_at:
+                _durable_cancel_updated_at = datetime.fromisoformat(
+                    _updated_at.replace("Z", "+00:00")
+                )
+                if _durable_cancel_updated_at.tzinfo is None:
+                    _durable_cancel_updated_at = _durable_cancel_updated_at.replace(
+                        tzinfo=timezone.utc
+                    )
+                else:
+                    _durable_cancel_updated_at = _durable_cancel_updated_at.astimezone(
+                        timezone.utc
+                    )
+        except Exception as _durable_liveness_error:
+            log.warning(
+                "[%s] durable stale-exit cancel-attempt read failed; refusing restart reset | "
+                "order=%s broker=%s error=%s",
+                self.client_id, local_order_id, broker_oid, _durable_liveness_error,
+            )
+
+        if _durable_cancel_attempt > 0:
+            self._stale_exit_cancel_attempts[broker_oid] = max(
+                _durable_cancel_attempt,
+                int(self._stale_exit_cancel_attempts.get(broker_oid, 0) or 0),
+            )
+            self._stale_exit_cancel_inflight.setdefault(
+                broker_oid, _durable_cancel_updated_at or _now,
+            )
+
+        def _persist_cancel_attempt(attempt: int) -> bool:
+            """Persist the bounded generation before issuing broker DELETE."""
+            try:
+                from ap.exit_autonomous_recovery import _persist_stale_exit_cancel_attempt
+
+                persisted = bool(
+                    _persist_stale_exit_cancel_attempt(
+                        self.osm, local_order_id, broker_oid, attempt,
+                    )
+                )
+            except Exception as _persist_error:
+                log.error(
+                    "[%s] durable stale-exit cancel-attempt write failed | order=%s "
+                    "broker=%s attempt=%s error=%s",
+                    self.client_id, local_order_id, broker_oid, attempt, _persist_error,
+                )
+                persisted = False
+            if not persisted:
+                self._emit_order_event(
+                    local_order_id=local_order_id,
+                    stage="order_monitor",
+                    decision="ALERT",
+                    reason_code="EXIT_CANCEL_ATTEMPT_DURABILITY_UNCONFIRMED",
+                    explanation=(
+                        "The exact stale-exit cancel attempt could not be durably "
+                        "recorded; no broker DELETE was issued."
+                    ),
+                    contract=contract,
+                    position_id=position_id,
+                    inputs={
+                        "broker_order_id": broker_oid,
+                        "cancel_attempt": attempt,
+                        "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    },
+                )
+                self._alert(
+                    f"EXIT CANCEL ATTEMPT DURABILITY UNCONFIRMED — cancel blocked | "
+                    f"{self.client_id} | {contract} | {local_order_id} | broker={broker_oid}"
+                )
+            return persisted
+
         # ── Bounded exact-identity cancel owner ─────────────────────────────
         # A second poll cycle observing the same stale exit before the first
         # cancel's terminal proof has landed must first obtain a fresh broker
         # proof.  A recognized live proof can authorize one later re-cancel,
         # but only up to the explicit bound; unknown status never authorizes a
         # DELETE and terminal proof is still required before replacement.
-        _now = datetime.now(timezone.utc)
         _inflight_since = self._stale_exit_cancel_inflight.get(broker_oid)
         if _inflight_since is not None:
             _inflight_age = max(0.0, (_now - _inflight_since).total_seconds())
@@ -5358,7 +5444,10 @@ class APOrderMonitor:
                 )
                 return
             else:
-                _cancel_attempt += 1
+                _next_cancel_attempt = _cancel_attempt + 1
+                if not _persist_cancel_attempt(_next_cancel_attempt):
+                    return
+                _cancel_attempt = _next_cancel_attempt
                 self._stale_exit_cancel_attempts[broker_oid] = _cancel_attempt
                 self._stale_exit_cancel_inflight[broker_oid] = _now
                 log.warning(
@@ -5392,6 +5481,8 @@ class APOrderMonitor:
                     )
                     return
         else:
+            if not _persist_cancel_attempt(1):
+                return
             self._stale_exit_cancel_inflight[broker_oid] = _now
             self._stale_exit_cancel_attempts[broker_oid] = 1
             _cancel_response_status, confirmed_status = _cancel_and_prove()

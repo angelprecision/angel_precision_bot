@@ -1618,6 +1618,12 @@ class _MonitorOSM:
     def get_order(self, local_order_id):
         return dict(self.order) if local_order_id == self.order["local_order_id"] else None
 
+    def update_order_meta(self, local_order_id, meta_patch):
+        if local_order_id != self.order["local_order_id"]:
+            return False
+        self.order.setdefault("meta", {}).update(dict(meta_patch or {}))
+        return True
+
     def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
         self.adopt_calls.append((local_order_id, kwargs))
         if not self.adopt:

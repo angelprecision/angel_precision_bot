@@ -54,6 +54,41 @@ def _actor_mode(monkeypatch):
     monkeypatch.setattr(om_mod, "ORDER_MONITOR_CAN_ACT", True)
 
 
+class _DurableCancelOSM:
+    """Durable row double used to model a monitor/process restart."""
+
+    def __init__(self):
+        self.row = {
+            "local_order_id": "loc-restart",
+            "kind": "EXIT",
+            "position_id": "pos-restart",
+            "broker_order_id": "bro-restart",
+            "status": "EXIT_ACKNOWLEDGED",
+            "meta": {},
+        }
+        self.transitions = []
+
+    def get_order(self, local_order_id):
+        if local_order_id != self.row["local_order_id"]:
+            return None
+        row = dict(self.row)
+        row["meta"] = dict(self.row["meta"])
+        return row
+
+    def update_order_meta(self, local_order_id, meta_patch):
+        if local_order_id != self.row["local_order_id"]:
+            return False
+        self.row["meta"].update(meta_patch)
+        return True
+
+    def transition(self, local_order_id, status, **kwargs):
+        self.transitions.append((local_order_id, status, kwargs))
+        if local_order_id != self.row["local_order_id"]:
+            return False
+        self.row["status"] = status
+        return True
+
+
 # ── 1. Watchdog stale-EXIT recovery allowed by default ──────────────────────
 
 def test_watchdog_stale_exit_recovery_enabled_by_default_cancels_and_confirms(monkeypatch):
@@ -384,6 +419,60 @@ def test_lost_cancel_gets_one_bounded_exact_retry_then_one_replacement(monkeypat
     assert exit_engine.clear_exit_in_flight.call_count == 1
     assert mon._stale_exit_cancel_inflight == {}
     assert mon._stale_exit_cancel_attempts == {}
+
+
+def test_bounded_cancel_attempt_survives_monitor_restart(monkeypatch):
+    """A new monitor process must resume the durable bound, not reset to 1."""
+    import ap.order_monitor as om_mod
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS", 0)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_MAX_ATTEMPTS", 2)
+
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},  # monitor 1: initial proof
+        {"status": "working"},  # monitor 1: post-cancel proof lost
+        {"status": "working"},  # monitor 2: initial proof after restart
+        {"status": "working"},  # monitor 2: fresh retry authorization proof
+        {"status": "canceled"},  # monitor 2: independent post-cancel proof
+        {"status": "working"},  # monitor 3: initial proof after exhaustion
+        {"status": "working"},  # monitor 3: fresh proof, no third DELETE allowed
+    ]
+    broker.cancel_order.return_value = {"status": "pending"}
+    osm = _DurableCancelOSM()
+    exit_engine = MagicMock()
+
+    def _run_new_monitor():
+        mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+        mon._emit_order_event = MagicMock()
+        mon._alert = MagicMock()
+        with om_mod._BROKER_STATUS_CACHE_LOCK:
+            om_mod._BROKER_STATUS_CACHE.pop("bro-restart", None)
+        mon._handle_stale_exit(
+            local_order_id="loc-restart",
+            status="WORKING",
+            contract="AVGO260814C00350000",
+            age_secs=120.0,
+            position_id="pos-restart",
+            reason="restart-boundary retry",
+        )
+        return mon
+
+    first = _run_new_monitor()
+    assert broker.cancel_order.call_count == 1
+    assert first._stale_exit_cancel_attempts["bro-restart"] == 1
+    assert osm.row["meta"]["stale_exit_cancel_liveness"]["attempt"] == 1
+
+    second = _run_new_monitor()
+    assert broker.cancel_order.call_count == 2
+    assert osm.row["meta"]["stale_exit_cancel_liveness"]["attempt"] == 2
+    assert len(osm.transitions) == 1
+    assert second._stale_exit_cancel_inflight == {}
+
+    _run_new_monitor()
+    assert broker.cancel_order.call_count == 2
+    assert osm.row["meta"]["stale_exit_cancel_liveness"]["attempt"] == 2
 
 
 def test_late_fill_wins_over_bounded_recancel(monkeypatch):

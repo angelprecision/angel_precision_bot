@@ -32,6 +32,13 @@ CANCEL_CONFIRMED_STATUSES = {"canceled", "cancelled", "rejected", "expired"}
 QUOTE_STALE_WARN_SEC = int(os.getenv("EXIT_RECOVERY_QUOTE_STALE_SEC", "30"))
 CANCEL_PROOF_RETRIES = int(os.getenv("EXIT_RECOVERY_CANCEL_RETRIES", "3"))
 CANCEL_PROOF_DELAY_SEC = float(os.getenv("EXIT_RECOVERY_CANCEL_DELAY_SEC", "1.0"))
+STALE_EXIT_CANCEL_LIVENESS_META_KEY = "stale_exit_cancel_liveness"
+STALE_EXIT_CANCEL_MAX_ATTEMPTS = max(
+    1, int(os.getenv("ORDER_STALE_EXIT_CANCEL_MAX_ATTEMPTS", "2"))
+)
+STALE_EXIT_RECOVERY_AGE_SECONDS = max(
+    0, int(os.getenv("ORDER_TIMEOUT_EXIT_PENDING", "45"))
+)
 
 
 def _now() -> datetime:
@@ -60,6 +67,107 @@ def _order_monitor_alive(order_monitor: Any) -> bool:
         thread = getattr(order_monitor, "_thread", None)
         return bool(thread is not None and thread.is_alive())
     except Exception:
+        return False
+
+
+def _order_row(osm: Any, local_order_id: str) -> dict:
+    """Read one durable OSM order snapshot, fail-closed."""
+    if not osm or not local_order_id:
+        return {}
+    getter = getattr(osm, "get_order", None)
+    if not callable(getter):
+        return {}
+    try:
+        row = getter(local_order_id)
+        if row is None:
+            return {}
+        try:
+            row = dict(row)
+        except Exception:
+            return {}
+        return row
+    except Exception:
+        return {}
+
+
+def _order_meta(osm: Any, local_order_id: str) -> dict:
+    """Read one durable OSM order metadata snapshot, fail-closed."""
+    row = _order_row(osm, local_order_id)
+    if not row:
+        return {}
+    raw_meta = row.get("meta") or {}
+    if isinstance(raw_meta, str):
+        import json
+        try:
+            raw_meta = json.loads(raw_meta) if raw_meta.strip() else {}
+        except Exception:
+            raw_meta = {}
+    return dict(raw_meta) if isinstance(raw_meta, dict) else {}
+
+
+def _metadata_from_order_row(order: dict) -> dict:
+    raw_meta = (order or {}).get("meta") or {}
+    if isinstance(raw_meta, str):
+        import json
+        try:
+            raw_meta = json.loads(raw_meta) if raw_meta.strip() else {}
+        except Exception:
+            raw_meta = {}
+    return dict(raw_meta) if isinstance(raw_meta, dict) else {}
+
+
+def _read_stale_exit_cancel_liveness(
+    osm: Any, local_order_id: str, broker_order_id: str, *, order: Optional[dict] = None,
+) -> dict:
+    """Load the exact broker-order cancel-attempt fence from durable OSM meta."""
+    broker_order_id = _norm(broker_order_id)
+    if order is None:
+        metadata = _order_meta(osm, local_order_id)
+    else:
+        metadata = _metadata_from_order_row(order)
+    payload = metadata.get(STALE_EXIT_CANCEL_LIVENESS_META_KEY) or {}
+    if not isinstance(payload, dict):
+        return {"attempt": 0, "broker_order_id": "", "updated_at": ""}
+    if _norm(payload.get("broker_order_id")) != broker_order_id:
+        return {"attempt": 0, "broker_order_id": "", "updated_at": ""}
+    try:
+        attempt = max(0, int(payload.get("attempt", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        attempt = 0
+    return {
+        "attempt": attempt,
+        "broker_order_id": broker_order_id,
+        "updated_at": _norm(payload.get("updated_at")),
+    }
+
+
+def _persist_stale_exit_cancel_attempt(
+    osm: Any, local_order_id: str, broker_order_id: str, attempt: int,
+) -> bool:
+    """Persist one exact-order cancel attempt before issuing the broker DELETE."""
+    if not osm or not local_order_id or not broker_order_id:
+        return False
+    updater = getattr(osm, "update_order_meta", None)
+    if not callable(updater):
+        return False
+    try:
+        return bool(
+            updater(
+                local_order_id,
+                {
+                    STALE_EXIT_CANCEL_LIVENESS_META_KEY: {
+                        "broker_order_id": _norm(broker_order_id),
+                        "attempt": max(0, int(attempt)),
+                        "updated_at": _now().isoformat(),
+                    }
+                },
+            )
+        )
+    except Exception as exc:
+        log.error(
+            "durable stale-exit cancel-attempt persist failed | local=%s broker=%s: %s",
+            local_order_id, broker_order_id, exc,
+        )
         return False
 
 
@@ -257,26 +365,267 @@ class RecoveryAction:
     details: dict = field(default_factory=dict)
 
 
-def _mark_replacement_safe(exit_engine: Any, pid: str, *, reason: str, local_id: str, broker_id: str, details: dict) -> RecoveryAction:
-    if exit_engine and hasattr(exit_engine, "mark_exit_replacement_safe"):
-        exit_engine.mark_exit_replacement_safe(
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _exit_age_seconds(pos: Any, osm: Any, local_id: str) -> Optional[float]:
+    """Use the same stale-age authority as the monitor, without inventing age."""
+    for attr in ("last_exit_signal_ts", "last_callback_identity_missing_ts"):
+        age = _dt_age_seconds(getattr(pos, attr, None))
+        if age is not None:
+            return age
+    row = _order_row(osm, local_id)
+    for key in ("submitted_ts", "created_ts"):
+        age = _dt_age_seconds(_parse_timestamp(row.get(key)))
+        if age is not None:
+            return age
+    return None
+
+
+def _durable_osm_terminal_row(
+    osm: Any, *, local_id: str, broker_id: str, position_id: str,
+) -> bool:
+    if not osm or not local_id:
+        return False
+    getter = getattr(osm, "get_order", None)
+    if not callable(getter):
+        return False
+    try:
+        row = getter(local_id)
+        row = dict(row) if row is not None else {}
+    except Exception:
+        return False
+    row_local = _norm(row.get("local_order_id") or local_id)
+    row_broker = _norm(row.get("broker_order_id"))
+    row_position = _norm(row.get("position_id"))
+    row_status = _norm(row.get("status")).upper()
+    return (
+        row_local == _norm(local_id)
+        and (not broker_id or row_broker == _norm(broker_id))
+        and (not position_id or row_position == _norm(position_id))
+        and row_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED"}
+    )
+
+
+def _mark_replacement_safe(
+    exit_engine: Any,
+    pid: str,
+    *,
+    osm: Any,
+    reason: str,
+    local_id: str,
+    broker_id: str,
+    details: dict,
+    replacement_qty: int = 0,
+) -> RecoveryAction:
+    """Commit replacement authority only after the exact durable OSM fence."""
+    if not osm or not local_id:
+        return RecoveryAction(
+            "NOOP", "durable_osm_cancel_identity_unproven", pid, local_id, broker_id, details,
+        )
+    if not exit_engine:
+        return RecoveryAction(
+            "NOOP", "missing_exit_engine_durable_handoff", pid, local_id, broker_id, details,
+        )
+    mark = getattr(exit_engine, "mark_exit_replacement_safe", None)
+    finalize = getattr(exit_engine, "finalize_exit_replacement_safe", None)
+    revoke = getattr(exit_engine, "revoke_exit_replacement_safe", None)
+    clear = getattr(exit_engine, "clear_exit_in_flight", None)
+    transition = getattr(osm, "transition", None)
+    if not all(callable(fn) for fn in (mark, finalize, revoke, clear, transition)):
+        return RecoveryAction(
+            "NOOP", "durable_replacement_fence_unavailable", pid, local_id, broker_id, details,
+        )
+
+    force_reconciled = not bool(broker_id)
+    try:
+        staged = bool(
+            mark(
+                pid,
+                reason=reason,
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+                replacement_qty=replacement_qty,
+                defer_attempt=True,
+                reconciled=force_reconciled,
+            )
+        )
+    except Exception as exc:
+        log.error("autonomous replacement staging failed for pos=%s: %s", pid, exc)
+        staged = False
+    if not staged:
+        return RecoveryAction(
+            "NOOP", "replacement_grant_not_staged", pid, local_id, broker_id, details,
+        )
+
+    try:
+        transition_ok = bool(
+            transition(
+                local_id,
+                "CANCELED",
+                broker_order_id=broker_id or None,
+                position_id=pid,
+                last_error=reason,
+            )
+        )
+    except Exception as exc:
+        log.error("autonomous durable OSM CANCELED transition failed for order=%s: %s", local_id, exc)
+        transition_ok = False
+
+    if not transition_ok:
+        transition_ok = _durable_osm_terminal_row(
+            osm, local_id=local_id, broker_id=broker_id, position_id=pid,
+        )
+    if not transition_ok:
+        try:
+            revoke(
+                pid,
+                reason="autonomous_osm_cancel_transition_not_durable",
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+                force=force_reconciled,
+            )
+        except Exception as exc:
+            log.error("autonomous replacement revoke failed for pos=%s: %s", pid, exc)
+        return RecoveryAction(
+            "NOOP", "durable_osm_cancel_unproven", pid, local_id, broker_id, details,
+        )
+
+    try:
+        finalized = bool(
+            finalize(
+                pid,
+                reason="autonomous_osm_cancel_durable_success",
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+                reconciled=force_reconciled,
+            )
+        )
+    except Exception as exc:
+        log.error("autonomous replacement finalize failed for pos=%s: %s", pid, exc)
+        finalized = False
+    if not finalized:
+        try:
+            revoke(
+                pid,
+                reason="autonomous_replacement_generation_commit_failed",
+                local_order_id=local_id,
+                broker_order_id=broker_id,
+                force=True,
+            )
+        except Exception as exc:
+            log.error("autonomous replacement revoke after finalize failure failed for pos=%s: %s", pid, exc)
+        return RecoveryAction(
+            "NOOP", "replacement_generation_commit_failed", pid, local_id, broker_id, details,
+        )
+
+    try:
+        clear(
             pid,
             reason=reason,
             local_order_id=local_id,
             broker_order_id=broker_id,
-            reconciled=True,
+            reconciled=force_reconciled,
         )
-        return RecoveryAction("REPLACEMENT_SAFE", reason, pid, local_id, broker_id, details)
-    if exit_engine and hasattr(exit_engine, "clear_exit_in_flight"):
-        exit_engine.clear_exit_in_flight(
-            pid,
-            reason=reason,
-            local_order_id=local_id,
-            broker_order_id=broker_id,
-            reconciled=True,
+    except Exception as exc:
+        log.error("autonomous exact clear failed for pos=%s: %s", pid, exc)
+        return RecoveryAction(
+            "NOOP", "exact_exit_clear_failed", pid, local_id, broker_id, details,
         )
-        return RecoveryAction("CLEARED_IN_FLIGHT", reason, pid, local_id, broker_id, details)
-    return RecoveryAction("NOOP", "no_replacement_or_clear_hook_available", pid, local_id, broker_id, details)
+    committed_details = dict(details or {})
+    committed_details["durable_osm_transition"] = "CANCELED"
+    committed_details["replacement_generation_committed"] = True
+    return RecoveryAction("REPLACEMENT_SAFE", reason, pid, local_id, broker_id, committed_details)
+
+
+def _recover_known_open_exit_when_monitor_unavailable(
+    pos: Any,
+    *,
+    broker: Any,
+    exit_engine: Any,
+    osm: Any,
+    local_id: str,
+    broker_id: str,
+    status: str,
+    quote_health_payload: dict,
+) -> RecoveryAction:
+    """Bounded exact cancel fallback for a stale known broker-owned exit."""
+    age_seconds = _exit_age_seconds(pos, osm, local_id)
+    if age_seconds is None or age_seconds < STALE_EXIT_RECOVERY_AGE_SECONDS:
+        return RecoveryAction(
+            "CONFIRMED_OPEN",
+            "broker_order_still_open_monitor_unavailable_age_unproven",
+            _position_id(pos), local_id, broker_id,
+            {
+                "status": status,
+                "quote_health": quote_health_payload,
+                "recovery_owner": "autonomous_recovery",
+                "age_seconds": age_seconds,
+                "stale_age_required": STALE_EXIT_RECOVERY_AGE_SECONDS,
+            },
+        )
+    if status == "partially_filled":
+        return RecoveryAction(
+            "CONFIRMED_OPEN",
+            "partial_fill_requires_canonical_fill_monitor",
+            _position_id(pos), local_id, broker_id,
+            {"status": status, "quote_health": quote_health_payload},
+        )
+
+    liveness = _read_stale_exit_cancel_liveness(osm, local_id, broker_id)
+    prior_attempt = int(liveness.get("attempt", 0) or 0)
+    if prior_attempt >= STALE_EXIT_CANCEL_MAX_ATTEMPTS:
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_exit_cancel_attempts_exhausted",
+            _position_id(pos), local_id, broker_id,
+            {
+                "status": status,
+                "cancel_attempt": prior_attempt,
+                "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                "quote_health": quote_health_payload,
+            },
+        )
+    next_attempt = prior_attempt + 1
+    if not _persist_stale_exit_cancel_attempt(osm, local_id, broker_id, next_attempt):
+        return RecoveryAction(
+            "NOOP",
+            "autonomous_cancel_attempt_durability_unconfirmed",
+            _position_id(pos), local_id, broker_id,
+            {"status": status, "cancel_attempt": next_attempt, "quote_health": quote_health_payload},
+        )
+    ok, proof = _cancel_order_with_proof(broker, broker_id)
+    details = {
+        "status": status,
+        "cancel_attempt": next_attempt,
+        "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+        "cancel_proof": proof,
+        "quote_health": quote_health_payload,
+        "recovery_owner": "autonomous_recovery",
+    }
+    if not ok:
+        return RecoveryAction(
+            "NOOP", "autonomous_cancel_not_proven", _position_id(pos), local_id, broker_id, details,
+        )
+    return _mark_replacement_safe(
+        exit_engine,
+        _position_id(pos),
+        osm=osm,
+        reason="autonomous_recovery_stale_known_exit_canceled",
+        local_id=local_id,
+        broker_id=broker_id,
+        details=details,
+        replacement_qty=max(0, int(getattr(pos, "pending_exit_qty", 0) or 0)),
+    )
 
 
 def recover_exit_position(
@@ -305,13 +654,29 @@ def recover_exit_position(
                         qty=int(getattr(pos, "pending_exit_qty", 0) or 0),
                         reason="autonomous_recovery_confirmed_broker_open_exit",
                     )
-                # PR #423 Patch 3: this path never independently cancels (it
-                # only reports/reconfirms open state), so it is safe
-                # regardless of monitor liveness. Tag ownership for
-                # observability per the spec's single-cancellation-owner
-                # requirement.
-                _owner = "order_monitor_stale_exit" if _order_monitor_alive(order_monitor) else "autonomous_recovery"
-                return RecoveryAction("CONFIRMED_OPEN", "broker_order_still_open", pid, local_id, pending_broker_id, {"status": st, "quote_health": qh, "recovery_owner": _owner})
+                if _order_monitor_alive(order_monitor):
+                    return RecoveryAction(
+                        "CONFIRMED_OPEN",
+                        "broker_order_still_open",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "quote_health": qh,
+                            "recovery_owner": "order_monitor_stale_exit",
+                        },
+                    )
+                return _recover_known_open_exit_when_monitor_unavailable(
+                    pos,
+                    broker=broker,
+                    exit_engine=exit_engine,
+                    osm=osm,
+                    local_id=local_id,
+                    broker_id=pending_broker_id,
+                    status=st,
+                    quote_health_payload=qh,
+                )
             if st == "filled":
                 filled_qty = _qty(raw) or int(getattr(pos, "pending_exit_qty", 0) or 0)
                 fill_price = None
@@ -354,6 +719,7 @@ def recover_exit_position(
                 return _mark_replacement_safe(
                     exit_engine,
                     pid,
+                    osm=osm,
                     reason=f"autonomous_recovery_broker_terminal_{st}",
                     local_id=local_id,
                     broker_id=pending_broker_id,
@@ -409,6 +775,7 @@ def recover_exit_position(
             return _mark_replacement_safe(
                 exit_engine,
                 pid,
+                osm=osm,
                 reason="autonomous_recovery_multiple_live_exit_orders_canceled",
                 local_id=local_id,
                 broker_id="",
@@ -449,6 +816,7 @@ def recover_exit_position(
     return _mark_replacement_safe(
         exit_engine,
         pid,
+        osm=osm,
         reason="autonomous_recovery_no_matching_live_exit_order",
         local_id=local_id,
         broker_id="",

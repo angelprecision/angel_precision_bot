@@ -76,7 +76,9 @@ class _MemoryCursor:
             self.db.created_reservations += 1
             return self
 
-        if normalized.startswith("UPDATE ORDERS SET META="):
+        if normalized.startswith("UPDATE ORDERS SET META=") or normalized.startswith(
+            "UPDATE ORDERS SET META ="
+        ):
             # persist_exit_submit_intent() has eight parameters; the ordinary
             # metadata merge used by the wrapper has three.
             patch = json.loads(str(params[0]))

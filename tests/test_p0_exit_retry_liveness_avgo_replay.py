@@ -100,6 +100,7 @@ class _ReplayOSM:
             "status": "EXIT_ACKNOWLEDGED",
             "qty": 2,
             "filled_qty": 0,
+            "meta": {},
         }
         self.orders = {self.order["local_order_id"]: self.order}
         self.transitions = []
@@ -107,6 +108,13 @@ class _ReplayOSM:
     def get_order(self, local_order_id):
         order = self.orders.get(local_order_id)
         return dict(order) if order is not None else None
+
+    def update_order_meta(self, local_order_id, meta_patch):
+        order = self.orders.get(local_order_id)
+        if order is None:
+            return False
+        order.setdefault("meta", {}).update(dict(meta_patch or {}))
+        return True
 
     def _get_active_exit_order(self, position_id):
         active_statuses = {
@@ -136,6 +144,7 @@ class _ReplayOSM:
             "status": "EXIT_SUBMITTED",
             "qty": int(qty),
             "filled_qty": 0,
+            "meta": {},
         }
 
     def transition(self, local_order_id, new_status, **kwargs):
