@@ -6422,7 +6422,7 @@ class APOrderMonitor:
                             # The durable partial fill already accounts for this
                             # cumulative broker truth. Preserve its remainder
                             # for the staged replacement handoff.
-                            return requested_qty - cumulative_filled
+                            return max(0, requested_qty - previous_filled)
 
                 if raw_status == "filled":
                     cumulative_raw = None

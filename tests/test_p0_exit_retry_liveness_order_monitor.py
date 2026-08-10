@@ -554,9 +554,11 @@ def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_rem
     assert mark_kwargs["replacement_qty"] != 2
 
 
-def test_cancel_to_canceled_with_same_durable_partial_fill_preserves_remainder(monkeypatch):
+def test_canceled_after_already_durable_partial_fill_preserves_remainder(monkeypatch):
     """A terminal cancel repeating durable partial truth still hands off its remainder."""
     _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+
+    events = []
 
     class _AlreadyPartialFillOSM:
         def __init__(self):
@@ -597,6 +599,8 @@ def test_cancel_to_canceled_with_same_durable_partial_fill_preserves_remainder(m
                 return False
             self.transitions.append((local_order_id, status, kwargs))
             self.row["status"] = status
+            if status == "CANCELED":
+                events.append("osm_terminal_success")
             return True
 
     broker = MagicMock()
@@ -613,8 +617,15 @@ def test_cancel_to_canceled_with_same_durable_partial_fill_preserves_remainder(m
     broker.cancel_order.return_value = {"status": "canceled"}
     osm = _AlreadyPartialFillOSM()
     exit_engine = MagicMock()
-    exit_engine.mark_exit_replacement_safe.return_value = True
-    exit_engine.finalize_exit_replacement_safe.return_value = True
+    exit_engine.mark_exit_replacement_safe.side_effect = (
+        lambda *args, **kwargs: events.append("mark_replacement_safe") or True
+    )
+    exit_engine.finalize_exit_replacement_safe.side_effect = (
+        lambda *args, **kwargs: events.append("finalize_replacement_safe") or True
+    )
+    exit_engine.clear_exit_in_flight.side_effect = (
+        lambda *args, **kwargs: events.append("clear_exit_in_flight")
+    )
 
     mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
     mon._advance_from_broker_status = MagicMock()
@@ -640,8 +651,21 @@ def test_cancel_to_canceled_with_same_durable_partial_fill_preserves_remainder(m
     exit_engine.mark_exit_replacement_safe.assert_called_once()
     _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
     assert mark_kwargs["replacement_qty"] == 1
+    assert mark_kwargs["replacement_qty"] != 0
+    assert mark_kwargs["replacement_qty"] != 2
     exit_engine.finalize_exit_replacement_safe.assert_called_once()
-    exit_engine.clear_exit_in_flight.assert_called_once()
+    assert events == [
+        "mark_replacement_safe",
+        "osm_terminal_success",
+        "finalize_replacement_safe",
+        "clear_exit_in_flight",
+    ]
+    exit_engine.clear_exit_in_flight.assert_called_once_with(
+        "pos-durable-partial",
+        reason="durable partial truth repeated at cancel",
+        local_order_id="loc-durable-partial",
+        broker_order_id="bro-durable-partial",
+    )
 
 
 def test_rejected_is_terminal_stale_exit_cancel_proof():
