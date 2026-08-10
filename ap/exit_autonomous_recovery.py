@@ -168,6 +168,20 @@ def _persist_stale_exit_cancel_attempt(
         return False
 
 
+def _stale_exit_cancel_retry_after_seconds() -> Optional[int]:
+    """Use OrderMonitor's configured retry interval for autonomous retries."""
+    try:
+        from ap.order_monitor import STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS
+
+        return max(0, int(STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS))
+    except Exception as exc:
+        log.error(
+            "unable to read OrderMonitor stale-exit cancel retry interval: %s",
+            exc,
+        )
+        return None
+
+
 def _norm(value: Any) -> str:
     return str(value or "").strip()
 
@@ -594,6 +608,84 @@ def _recover_known_open_exit_when_monitor_unavailable(
                 "quote_health": quote_health_payload,
             },
         )
+    if prior_attempt > 0:
+        updated_at = _parse_timestamp(liveness.get("updated_at"))
+        retry_after = _stale_exit_cancel_retry_after_seconds()
+        if updated_at is None:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_exit_cancel_retry_marker_timestamp_invalid",
+                _position_id(pos), local_id, broker_id,
+                {
+                    "status": status,
+                    "cancel_attempt": prior_attempt,
+                    "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    "updated_at": liveness.get("updated_at"),
+                    "quote_health": quote_health_payload,
+                },
+            )
+        if retry_after is None:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_exit_cancel_retry_interval_unavailable",
+                _position_id(pos), local_id, broker_id,
+                {
+                    "status": status,
+                    "cancel_attempt": prior_attempt,
+                    "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    "quote_health": quote_health_payload,
+                },
+            )
+        elapsed = (_now() - updated_at).total_seconds()
+        if elapsed < retry_after:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_exit_cancel_retry_not_due",
+                _position_id(pos), local_id, broker_id,
+                {
+                    "status": status,
+                    "cancel_attempt": prior_attempt,
+                    "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    "elapsed_sec": elapsed,
+                    "retry_after_sec": retry_after,
+                    "quote_health": quote_health_payload,
+                },
+            )
+
+        # The first GET established that the order is currently open.  Once
+        # the retry interval has elapsed, require another fresh recognized
+        # live proof before consuming the next durable cancel attempt.
+        fresh_raw = _get_order(broker, broker_id)
+        fresh_status = _status(fresh_raw or {})
+        if fresh_status == "partially_filled":
+            return RecoveryAction(
+                "CONFIRMED_OPEN",
+                "partial_fill_requires_canonical_fill_monitor",
+                _position_id(pos), local_id, broker_id,
+                {
+                    "status": status,
+                    "fresh_status": fresh_status,
+                    "cancel_attempt": prior_attempt,
+                    "retry_after_sec": retry_after,
+                    "quote_health": quote_health_payload,
+                },
+            )
+        if fresh_status not in OPEN_BROKER_STATUSES:
+            return RecoveryAction(
+                "NOOP",
+                "autonomous_exit_cancel_retry_working_proof_missing",
+                _position_id(pos), local_id, broker_id,
+                {
+                    "status": status,
+                    "fresh_status": fresh_status,
+                    "cancel_attempt": prior_attempt,
+                    "cancel_max_attempts": STALE_EXIT_CANCEL_MAX_ATTEMPTS,
+                    "elapsed_sec": elapsed,
+                    "retry_after_sec": retry_after,
+                    "quote_health": quote_health_payload,
+                },
+            )
+        status = fresh_status
     next_attempt = prior_attempt + 1
     if not _persist_stale_exit_cancel_attempt(osm, local_id, broker_id, next_attempt):
         return RecoveryAction(

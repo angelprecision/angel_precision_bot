@@ -434,6 +434,87 @@ def test_single_open_order_dead_monitor_uses_bounded_exact_cancel_and_durable_ha
     )
 
 
+def test_autonomous_retry_waits_for_fresh_marker_interval_and_working_proof(monkeypatch):
+    """A fresh attempt-1 marker blocks autonomous attempt 2 until due and re-proven."""
+    import ap.exit_autonomous_recovery as rec_mod
+    import ap.order_monitor as om_mod
+
+    monkeypatch.setattr(rec_mod, "STALE_EXIT_RECOVERY_AGE_SECONDS", 45)
+    monkeypatch.setattr(rec_mod, "STALE_EXIT_CANCEL_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(om_mod, "STALE_EXIT_CANCEL_RETRY_AFTER_SECONDS", 15)
+
+    base = datetime(2026, 8, 10, 12, 0, tzinfo=timezone.utc)
+    now = {"value": base + timedelta(seconds=10)}
+    monkeypatch.setattr(rec_mod, "_now", lambda: now["value"])
+
+    pos = _pos(
+        pending_exit_broker_order_id="bro-known",
+        last_exit_signal_ts=base - timedelta(seconds=120),
+    )
+    osm = _DurableOSM()
+    assert rec_mod._persist_stale_exit_cancel_attempt(osm, "loc-1", "bro-known", 1)
+    osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["updated_at"] = base.isoformat()
+
+    broker = MagicMock()
+    broker.get_order.return_value = {"status": "working"}
+    cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
+    monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
+
+    action_before_due = recover_exit_position(
+        pos,
+        broker=broker,
+        exit_engine=MagicMock(),
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action_before_due.reason == "autonomous_exit_cancel_retry_not_due"
+    cancel_spy.assert_not_called()
+    assert osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["attempt"] == 1
+
+    now["value"] = base + timedelta(seconds=15)
+    action_after_due = recover_exit_position(
+        pos,
+        broker=broker,
+        exit_engine=MagicMock(),
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action_after_due.action == "REPLACEMENT_SAFE"
+    assert broker.get_order.call_count == 3  # initial proof, blocked proof, retry proof
+    assert cancel_spy.call_count == 1
+    assert osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["attempt"] == 2
+
+
+def test_autonomous_retry_missing_marker_timestamp_fails_closed(monkeypatch):
+    """An existing durable attempt without a valid timestamp cannot consume another attempt."""
+    import ap.exit_autonomous_recovery as rec_mod
+
+    monkeypatch.setattr(rec_mod, "STALE_EXIT_RECOVERY_AGE_SECONDS", 45)
+    pos = _pos(
+        pending_exit_broker_order_id="bro-known",
+        last_exit_signal_ts=datetime.now(timezone.utc) - timedelta(seconds=120),
+    )
+    osm = _DurableOSM()
+    assert rec_mod._persist_stale_exit_cancel_attempt(osm, "loc-1", "bro-known", 1)
+    osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY].pop("updated_at")
+
+    cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
+    monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
+    action = recover_exit_position(
+        pos,
+        broker=MagicMock(get_order=MagicMock(return_value={"status": "working"})),
+        exit_engine=MagicMock(),
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.reason == "autonomous_exit_cancel_retry_marker_timestamp_invalid"
+    cancel_spy.assert_not_called()
+    assert osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["attempt"] == 1
+
+
 def test_terminal_and_multi_match_autonomous_paths_use_durable_osm_handoff(monkeypatch):
     """Every autonomous replacement release path must cross OSM CANCELED."""
     import ap.exit_autonomous_recovery as rec_mod
