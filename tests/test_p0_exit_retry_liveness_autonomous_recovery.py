@@ -139,6 +139,13 @@ class _DurableOSM:
         self.transitions.append((local_order_id, status, kwargs))
         if local_order_id != self.row["local_order_id"]:
             return False
+        supplied_broker_id = kwargs.get("broker_order_id")
+        if (
+            supplied_broker_id
+            and self.row["broker_order_id"]
+            and supplied_broker_id != self.row["broker_order_id"]
+        ):
+            return False
         self.row["status"] = status
         self.row["broker_order_id"] = kwargs.get("broker_order_id") or self.row["broker_order_id"]
         self.row["position_id"] = kwargs.get("position_id") or self.row["position_id"]
@@ -1079,7 +1086,7 @@ def test_autonomous_retry_missing_marker_timestamp_fails_closed(monkeypatch):
 
 
 def test_terminal_autonomous_path_uses_durable_osm_handoff(monkeypatch):
-    """The exact terminal release path must cross OSM CANCELED."""
+    """The exact terminal generation stays attached to every durable handoff."""
     import ap.exit_autonomous_recovery as rec_mod
 
     exit_engine = MagicMock()
@@ -1097,7 +1104,54 @@ def test_terminal_autonomous_path_uses_durable_osm_handoff(monkeypatch):
         order_monitor=_dead_monitor(),
     )
     assert terminal_action.action == "REPLACEMENT_SAFE"
+    assert terminal_action.broker_order_id == "bro-terminal"
     assert terminal_osm.transitions[0][1] == "CANCELED"
+    assert terminal_osm.transitions[0][2]["broker_order_id"] == "bro-terminal"
+    for hook in (
+        exit_engine.mark_exit_replacement_safe,
+        exit_engine.finalize_exit_replacement_safe,
+        exit_engine.clear_exit_in_flight,
+    ):
+        _, hook_kwargs = hook.call_args
+        assert hook_kwargs["broker_order_id"] == "bro-terminal"
+
+
+def test_terminal_autonomous_path_rejects_changed_osm_broker_generation(monkeypatch):
+    """A stale terminal proof cannot cancel or clear a newer durable generation."""
+    import ap.exit_autonomous_recovery as rec_mod
+
+    exit_engine = MagicMock()
+    broker = MagicMock()
+    broker.list_positions.return_value = [
+        {"symbol": "AVGO260814C00350000", "quantity": 2},
+    ]
+    pos = _pos(pending_exit_broker_order_id="bro-old")
+
+    monkeypatch.setattr(rec_mod, "_get_order", lambda broker, bid: {"status": "canceled"})
+    monkeypatch.setattr(rec_mod, "_matching_open_exit_orders", lambda *args, **kwargs: (True, []))
+    terminal_osm = _DurableOSM(broker_id="bro-old")
+
+    def _advance_durable_generation(*args, **kwargs):
+        terminal_osm.row["broker_order_id"] = "bro-new"
+        return True
+
+    exit_engine.mark_exit_replacement_safe.side_effect = _advance_durable_generation
+
+    action = recover_exit_position(
+        pos, broker=broker, exit_engine=exit_engine, osm=terminal_osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "durable_osm_cancel_unproven"
+    assert action.broker_order_id == "bro-old"
+    assert terminal_osm.row["status"] == "EXIT_ACKNOWLEDGED"
+    assert terminal_osm.row["broker_order_id"] == "bro-new"
+    assert terminal_osm.transitions[0][2]["broker_order_id"] == "bro-old"
+    exit_engine.mark_exit_replacement_safe.assert_called_once()
+    exit_engine.finalize_exit_replacement_safe.assert_not_called()
+    exit_engine.clear_exit_in_flight.assert_not_called()
+    exit_engine.revoke_exit_replacement_safe.assert_called_once()
 
 
 if __name__ == "__main__":

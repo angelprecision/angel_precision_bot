@@ -859,6 +859,8 @@ def recover_exit_position(
     if not broker or not pid:
         return RecoveryAction("NOOP", "missing_broker_or_position_id", pid, local_id, pending_broker_id, {"quote_health": qh})
 
+    terminal_exact_broker_id = ""
+
     # Exact broker identity path.
     if pending_broker_id:
         # APExitEngine.set_pending_exit_order() refreshes its in-memory signal
@@ -1024,6 +1026,7 @@ def recover_exit_position(
                     return RecoveryAction("CONFIRMED_OPEN", "different_broker_exit_still_open", pid, local_id, other_bid, {"old_status": st, "contract": contract, "quote_health": qh})
                 if len(other_matches) > 1:
                     return RecoveryAction("NOOP", "multiple_different_open_exits_block_replacement", pid, local_id, pending_broker_id, {"old_status": st, "matches": [m[0] for m in other_matches], "quote_health": qh})
+                terminal_exact_broker_id = pending_broker_id
                 # Do not authorize replacement from terminal status plus zero
                 # other orders alone.  Fall through to the shared negative-
                 # proof path so an authoritative flat position closes and an
@@ -1255,7 +1258,7 @@ def recover_exit_position(
         osm=osm,
         reason="autonomous_recovery_no_matching_live_exit_order",
         local_id=local_id,
-        broker_id="",
+        broker_id=terminal_exact_broker_id,
         details={
             "contract": contract,
             "quote_health": qh,
