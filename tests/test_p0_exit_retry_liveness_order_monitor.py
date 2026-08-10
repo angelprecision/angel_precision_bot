@@ -322,6 +322,17 @@ def test_cancel_post_cancel_get_failure_blocks_replacement(monkeypatch):
     exit_engine.mark_exit_replacement_safe.assert_not_called()
 
 
+def test_rejected_is_terminal_stale_exit_cancel_proof():
+    mon = _monitor()
+
+    assert mon._is_terminal_cancel_status("rejected") is True
+    assert mon._is_terminal_cancel_status({"status": "rejected"}) is True
+
+    assert mon._is_terminal_cancel_status("working") is False
+    assert mon._is_terminal_cancel_status("partially_filled") is False
+    assert mon._is_terminal_cancel_status("filled") is False
+
+
 def test_cancel_races_with_full_fill_fill_wins(monkeypatch):
     _watchdog_mode(monkeypatch, stale_exit_recovery=True)
     broker = MagicMock()

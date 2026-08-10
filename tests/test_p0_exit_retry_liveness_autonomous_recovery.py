@@ -1,11 +1,11 @@
 # tests/test_p0_exit_retry_liveness_autonomous_recovery.py
 # =============================================================================
-# P0 regression: PR #423 Patch 3 — single-cancellation-owner guarantee.
-# When APOrderMonitor is alive, ap.exit_autonomous_recovery must never
-# independently cancel a broker exit order it might already be working;
-# it must defer and report recovery_owner=order_monitor_stale_exit. When
-# the monitor is unavailable/dead/unregistered, autonomous recovery keeps
-# its existing exact-identity-fenced independent-cancel fallback.
+# P0 regression: PR #423 — ambiguous broker exit identity is diagnostics-only.
+# Contract/side matching can discover candidate orders, but it cannot prove
+# which broker order belongs to the local OSM generation. Autonomous recovery
+# must therefore perform zero broker mutation and grant zero replacement
+# authority whenever more than one live candidate exists, regardless of
+# order-monitor health.
 # =============================================================================
 
 from __future__ import annotations
@@ -312,63 +312,139 @@ def test_self_healing_callsite_dead_monitor_completes_durable_exact_replacement_
     assert engine._persist_exit_replace_attempt_to_db.call_count == 1
 
 
-def test_ambiguous_multi_match_defers_when_order_monitor_alive(monkeypatch):
-    """
-    Two ambiguous open exit orders found for the contract, but the order
-    monitor is alive: autonomous recovery must NOT independently cancel
-    either one, and must report ownership deferred to the order monitor.
-    """
+def test_ambiguous_multi_match_never_cancels_without_exact_identity(monkeypatch):
     import ap.exit_autonomous_recovery as rec_mod
 
     monkeypatch.setattr(
-        rec_mod, "_matching_open_exit_orders",
+        rec_mod,
+        "_matching_open_exit_orders",
         lambda broker, contract, exclude_broker_id=None: [
-            ("bro-a", {"status": "working"}), ("bro-b", {"status": "working"}),
+            ("bro-a", {"status": "working", "quantity": 2}),
+            ("bro-b", {"status": "working", "quantity": 2}),
         ],
     )
+
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
     monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
 
-    broker = MagicMock()
-    pos = _pos()
-    action = recover_exit_position(
-        pos, broker=broker, exit_engine=MagicMock(),
-        order_monitor=_alive_monitor(),
-    )
+    for order_monitor in (_alive_monitor(), _dead_monitor(), None):
+        cancel_spy.reset_mock()
 
-    cancel_spy.assert_not_called()
-    assert action.action == "CONFIRMED_OPEN"
-    assert action.details.get("recovery_owner") == "order_monitor_stale_exit"
+        exit_engine = MagicMock()
+        osm = _DurableOSM(broker_id="")
+
+        action = recover_exit_position(
+            _pos(pending_exit_broker_order_id=""),
+            broker=MagicMock(),
+            exit_engine=exit_engine,
+            osm=osm,
+            order_monitor=order_monitor,
+        )
+
+        assert action.action == "NOOP"
+        assert action.reason == "multiple_live_exit_orders_identity_ambiguous"
+        assert action.details["match_count"] == 2
+        assert action.details["broker_mutation_blocked"] is True
+        assert action.details["replacement_blocked"] is True
+        assert {
+            item["broker_order_id"]
+            for item in action.details["matches"]
+        } == {"bro-a", "bro-b"}
+
+        cancel_spy.assert_not_called()
+        exit_engine.mark_exit_replacement_safe.assert_not_called()
+        exit_engine.finalize_exit_replacement_safe.assert_not_called()
+        exit_engine.clear_exit_in_flight.assert_not_called()
+        assert osm.transitions == []
 
 
-def test_ambiguous_multi_match_cancels_independently_when_order_monitor_dead(monkeypatch):
-    """
-    Same ambiguous-multi-match shape, but the order monitor is dead/absent:
-    autonomous recovery retains its existing independent-cancel fallback
-    (unchanged behavior from before #423).
-    """
+def test_ambiguous_multi_match_with_partial_fill_blocks_all_broker_mutation(monkeypatch):
     import ap.exit_autonomous_recovery as rec_mod
 
     monkeypatch.setattr(
-        rec_mod, "_matching_open_exit_orders",
+        rec_mod,
+        "_matching_open_exit_orders",
         lambda broker, contract, exclude_broker_id=None: [
-            ("bro-a", {"status": "working"}), ("bro-b", {"status": "working"}),
+            (
+                "bro-working",
+                {
+                    "status": "working",
+                    "quantity": 2,
+                },
+            ),
+            (
+                "bro-partial",
+                {
+                    "status": "partially_filled",
+                    "quantity": 2,
+                    "exec_quantity": 1,
+                },
+            ),
         ],
     )
+
     cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
     monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
 
     exit_engine = MagicMock()
-    broker = MagicMock()
-    pos = _pos()
+    osm = _DurableOSM(broker_id="")
 
-    for om in (_dead_monitor(), None):
-        cancel_spy.reset_mock()
-        action = recover_exit_position(
-            pos, broker=broker, exit_engine=exit_engine, order_monitor=om,
-        )
-        assert cancel_spy.call_count == 2, f"expected independent cancel fallback for order_monitor={om}"
-        assert action.action in ("REPLACEMENT_SAFE", "CLEARED_IN_FLIGHT", "NOOP")
+    action = recover_exit_position(
+        _pos(pending_exit_broker_order_id=""),
+        broker=MagicMock(),
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "multiple_live_exit_orders_identity_ambiguous"
+    assert action.details["broker_mutation_blocked"] is True
+
+    cancel_spy.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.finalize_exit_replacement_safe.assert_not_called()
+    exit_engine.clear_exit_in_flight.assert_not_called()
+    assert osm.transitions == []
+
+
+def test_exact_broker_cancel_blocked_when_osm_broker_identity_mismatches(monkeypatch):
+    import ap.exit_autonomous_recovery as rec_mod
+
+    monkeypatch.setattr(rec_mod, "STALE_EXIT_RECOVERY_AGE_SECONDS", 45)
+
+    pos = _pos(
+        pending_exit_broker_order_id="bro-position",
+        last_exit_signal_ts=datetime.now(timezone.utc) - timedelta(seconds=120),
+    )
+
+    # Durable OSM says this local order belongs to a DIFFERENT broker order.
+    osm = _DurableOSM(broker_id="bro-osm")
+
+    broker = MagicMock()
+    broker.get_order.return_value = {"status": "working"}
+
+    cancel_spy = MagicMock(return_value=(True, {"status": "canceled"}))
+    monkeypatch.setattr(rec_mod, "_cancel_order_with_proof", cancel_spy)
+
+    exit_engine = MagicMock()
+
+    action = recover_exit_position(
+        pos,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "NOOP"
+    assert action.reason == "autonomous_cancel_attempt_durability_unconfirmed"
+
+    cancel_spy.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+    assert osm.row["meta"] == {}
+    assert osm.transitions == []
 
 
 def test_single_open_order_path_defers_to_live_monitor(monkeypatch):
@@ -515,8 +591,8 @@ def test_autonomous_retry_missing_marker_timestamp_fails_closed(monkeypatch):
     assert osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["attempt"] == 1
 
 
-def test_terminal_and_multi_match_autonomous_paths_use_durable_osm_handoff(monkeypatch):
-    """Every autonomous replacement release path must cross OSM CANCELED."""
+def test_terminal_autonomous_path_uses_durable_osm_handoff(monkeypatch):
+    """The exact terminal release path must cross OSM CANCELED."""
     import ap.exit_autonomous_recovery as rec_mod
 
     exit_engine = MagicMock()
@@ -532,29 +608,6 @@ def test_terminal_and_multi_match_autonomous_paths_use_durable_osm_handoff(monke
     )
     assert terminal_action.action == "REPLACEMENT_SAFE"
     assert terminal_osm.transitions[0][1] == "CANCELED"
-
-    monkeypatch.setattr(
-        rec_mod,
-        "_matching_open_exit_orders",
-        lambda *args, **kwargs: [
-            ("bro-a", {"status": "working"}),
-            ("bro-b", {"status": "working"}),
-        ],
-    )
-    monkeypatch.setattr(
-        rec_mod, "_cancel_order_with_proof",
-        lambda broker, broker_id: (True, {"status": "canceled"}),
-    )
-    multi_osm = _DurableOSM(broker_id="")
-    multi_action = recover_exit_position(
-        _pos(pending_exit_broker_order_id=""),
-        broker=broker,
-        exit_engine=exit_engine,
-        osm=multi_osm,
-        order_monitor=_dead_monitor(),
-    )
-    assert multi_action.action == "REPLACEMENT_SAFE"
-    assert multi_osm.transitions[0][1] == "CANCELED"
 
 
 if __name__ == "__main__":

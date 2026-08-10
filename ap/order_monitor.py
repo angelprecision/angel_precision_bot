@@ -6018,7 +6018,11 @@ class APOrderMonitor:
         return aliases.get(s, s)
 
     def _is_terminal_cancel_status(self, raw_status) -> bool:
-        return self._normalize_broker_status(raw_status) in {"canceled", "expired"}
+        return self._normalize_broker_status(raw_status) in {
+            "canceled",
+            "expired",
+            "rejected",
+        }
 
     def _is_terminal_failure_status(self, raw_status) -> bool:
         return self._normalize_broker_status(raw_status) in {

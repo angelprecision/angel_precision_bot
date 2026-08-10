@@ -840,50 +840,47 @@ def recover_exit_position(
         return RecoveryAction("RECOVERED_BROKER_ID", "matched_single_live_exit_order", pid, local_id, recovered_broker_id, {"contract": contract, "quote_health": qh})
 
     if len(matches) > 1:
-        # PR #423 Patch 3: single-cancellation-owner guarantee. This branch
-        # is the one place in this module that independently issues broker
-        # cancels. If the order monitor is alive, it already owns exact
-        # stale-EXIT cancel authority (ap/order_monitor.py _handle_stale_exit
-        # with its own exactly-once in-flight guard) and may be the one that
-        # created this exact ambiguity mid-cancel. Defer to it rather than
-        # risk two independent cancellation attempts racing on the same
-        # broker order. Autonomous recovery only takes the independent-cancel
-        # path when the order monitor is unavailable/dead/unregistered, per
-        # spec Patch 3.
-        if _order_monitor_alive(order_monitor):
-            return RecoveryAction(
-                "CONFIRMED_OPEN",
-                "multiple_live_exit_orders_order_monitor_owns_stale_exit_recovery",
-                pid, local_id, "",
-                {
-                    "match_count": len(matches),
-                    "quote_health": qh,
-                    "recovery_owner": "order_monitor_stale_exit",
-                },
-            )
-        cancel_results = []
-        all_canceled = True
-        for bid, raw in matches:
-            ok, proof = _cancel_order_with_proof(broker, bid)
-            cancel_results.append({"broker_order_id": bid, "ok": ok, "proof": proof})
-            if not ok:
-                all_canceled = False
-        if all_canceled:
-            return _mark_replacement_safe(
-                exit_engine,
-                pid,
-                osm=osm,
-                reason="autonomous_recovery_multiple_live_exit_orders_canceled",
-                local_id=local_id,
-                broker_id="",
-                details={
-                    "match_count": len(matches),
-                    "cancel_results": cancel_results,
-                    "quote_health": qh,
-                    "recovery_owner": "autonomous_recovery",
-                },
-            )
-        return RecoveryAction("NOOP", "multiple_live_exit_orders_cancel_not_proven", pid, local_id, "", {"match_count": len(matches), "cancel_results": cancel_results, "quote_health": qh})
+        # P0 safety invariant:
+        # Contract/side matching is discovery evidence only. It is NOT
+        # sufficient authority to mutate broker orders. When more than one
+        # live exit matches the position contract, there is no provable
+        # one-to-one mapping between the local OSM generation and any broker
+        # order. Therefore autonomous recovery must perform ZERO broker
+        # mutations regardless of order-monitor health.
+        match_details = [
+            {
+                "broker_order_id": bid,
+                "status": _status(raw),
+                "qty": _qty(raw),
+            }
+            for bid, raw in matches
+        ]
+
+        log.error(
+            "ambiguous live exit identity — refusing broker mutation | "
+            "position_id=%s local_order_id=%s contract=%s matches=%s",
+            pid,
+            local_id,
+            contract,
+            [m["broker_order_id"] for m in match_details],
+        )
+
+        return RecoveryAction(
+            "NOOP",
+            "multiple_live_exit_orders_identity_ambiguous",
+            pid,
+            local_id,
+            "",
+            {
+                "contract": contract,
+                "match_count": len(matches),
+                "matches": match_details,
+                "quote_health": qh,
+                "recovery_owner": "none_identity_ambiguous",
+                "broker_mutation_blocked": True,
+                "replacement_blocked": True,
+            },
+        )
 
     # Negative proof: no matching open sell-to-close order currently at broker.
     # Before marking replacement safe, verify the contract is still held.
