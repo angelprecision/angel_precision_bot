@@ -417,6 +417,13 @@ def test_avgo_replacement_crosses_real_production_submit_shape(monkeypatch):
         )
         assert getattr(APExitEngine, idempotency_guard._ORIGINAL_SUBMIT_ATTR) is not APExitEngine._submit_exit_decision
         assert engine._submit_exit_decision(position, decision) is True
+        assert core._position_count == 1
+        assert core._sector_counts["OTHER"] == 1
+        assert position.quantity_remaining == 7
+        assert position._proof_staged is None
+        assert position._proof_finalized is False
+        assert position.proof_logged is False
+        assert position._integrity_logged is False
     finally:
         unregister_exit_engine("client-avgo")
 

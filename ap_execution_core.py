@@ -8722,12 +8722,35 @@ class APExecutionCore:
             log.debug("[%s] _on_position_close called but pos.closed=True — skipping", pos.ticker)
             return
 
-        with self._pos_lock:
-            self._position_count = max(0, self._position_count - 1)
+        # A stale-exit replacement grant may authorize only the old broker
+        # tranche's unfilled remainder (for example, 2 of a 7-contract
+        # position). The caller still arrives through ``on_exit`` because
+        # the original decision was not SCALE_OUT, but this callback is not a
+        # full-position close for bookkeeping or terminal-proof purposes.
+        try:
+            _replacement_qty = int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
+            _remaining_before_close = int(getattr(pos, "quantity_remaining", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            _replacement_qty = 0
+            _remaining_before_close = 0
+        _is_partial_replacement = bool(
+            getattr(pos, "pending_exit_replace_allowed", False)
+            and 0 < _replacement_qty < _remaining_before_close
+        )
 
-        sector = getattr(pos, "signal", {}).get("correlation_bucket", "OTHER")
-        with self._sector_lock:
-            self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
+        if not _is_partial_replacement:
+            with self._pos_lock:
+                self._position_count = max(0, self._position_count - 1)
+
+            sector = getattr(pos, "signal", {}).get("correlation_bucket", "OTHER")
+            with self._sector_lock:
+                self._sector_counts[sector] = max(0, self._sector_counts.get(sector, 0) - 1)
+        else:
+            log.info(
+                "[%s] PARTIAL_REPLACEMENT_CONTINUATION — preserving full-position "
+                "bookkeeping/proof context | replacement_qty=%s remaining_qty=%s",
+                pos.ticker, _replacement_qty, _remaining_before_close,
+            )
 
         # ── EXIT SUBMISSION ─────────────────────────────────────────────────
         sig = getattr(pos, "signal", {})
@@ -9070,6 +9093,13 @@ class APExecutionCore:
                 f"cannot submit sell_to_close through production authority | {decision.reason}"
             )
             return
+
+        if _is_partial_replacement:
+            # This broker POST owns only a replacement tranche. Leave the
+            # full-close cooldown, integrity marker, and terminal proof
+            # staging untouched until the remaining position is actually
+            # closed by a later broker-confirmed generation.
+            return exit_res
 
         # Always compute option P&L from option prices — never from pos.entry_price
         # which can be seeded from avg_fill (which sometimes stored underlying price).
