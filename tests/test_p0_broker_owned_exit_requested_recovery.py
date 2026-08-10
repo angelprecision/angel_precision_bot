@@ -1624,6 +1624,30 @@ class _MonitorOSM:
         self.order.setdefault("meta", {}).update(dict(meta_patch or {}))
         return True
 
+    def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+        if (
+            local_order_id != self.order["local_order_id"]
+            or broker_order_id != self.order.get("broker_order_id")
+        ):
+            return False
+        marker_key = "stale_exit_cancel_liveness"
+        marker = self.order.setdefault("meta", {}).get(marker_key)
+        if marker is not None:
+            if not isinstance(marker, dict) or marker.get("broker_order_id") != broker_order_id:
+                return False
+            try:
+                existing_attempt = int(marker["attempt"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if existing_attempt < 0 or existing_attempt >= int(attempt):
+                return False
+        self.order["meta"][marker_key] = {
+            "broker_order_id": broker_order_id,
+            "attempt": int(attempt),
+            "updated_at": "test",
+        }
+        return True
+
     def adopt_broker_owned_exit_request(self, local_order_id, **kwargs):
         self.adopt_calls.append((local_order_id, kwargs))
         if not self.adopt:
