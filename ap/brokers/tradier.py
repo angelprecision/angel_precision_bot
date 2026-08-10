@@ -513,6 +513,7 @@ class TradierBroker(BrokerAdapter):
                     or not symbol.strip()
                     or "quantity" not in p
                     or quantity is None
+                    or isinstance(quantity, bool)
                     or (isinstance(quantity, str) and not quantity.strip())
                 ):
                     raise ValueError("TRADIER_POSITIONS_PAYLOAD_MALFORMED")

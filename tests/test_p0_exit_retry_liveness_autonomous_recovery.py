@@ -810,10 +810,11 @@ def test_tradier_list_positions_malformed_top_level_payload_raises(payload):
     [
         {"symbol": "AVGO260814C00350000", "cost_basis": 1.0},
         {"quantity": 2, "cost_basis": 1.0},
+        {"symbol": "AVGO260814C00350000", "quantity": False, "cost_basis": 1.0},
     ],
-    ids=["missing_quantity", "missing_symbol"],
+    ids=["missing_quantity", "missing_symbol", "boolean_quantity"],
 )
-def test_tradier_list_positions_missing_row_field_raises(row):
+def test_tradier_list_positions_malformed_row_field_raises(row):
     from ap.brokers.tradier import TradierBroker, TradierConfig
 
     broker = TradierBroker(
@@ -909,10 +910,11 @@ def test_recovery_with_malformed_real_tradier_order_snapshot_is_noop():
     [
         {"symbol": "AVGO260814C00350000", "cost_basis": 1.0},
         {"quantity": 2, "cost_basis": 1.0},
+        {"symbol": "AVGO260814C00350000", "quantity": False, "cost_basis": 1.0},
     ],
-    ids=["missing_quantity", "missing_symbol"],
+    ids=["missing_quantity", "missing_symbol", "boolean_quantity"],
 )
-def test_recovery_with_missing_tradier_position_field_blocks_all_mutation(row):
+def test_recovery_with_malformed_tradier_position_field_blocks_all_mutation(row):
     from ap.brokers.tradier import TradierBroker, TradierConfig
 
     broker = TradierBroker(
