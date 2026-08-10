@@ -2358,9 +2358,12 @@ def test_actor_mode_stale_open_exit_keeps_existing_cancel_logic_reachable(monkey
     osm = _MonitorOSM(order)
     monitor = _monitor(order, osm, _Broker({"status": "OPEN"}))
     # _check_exit_orders performs the first read, stale recovery performs a
-    # second pre-cancel read, and the third read is the independent
+    # second fresh pre-cancel read, and the raw payload is the independent
     # post-cancel terminal proof required by PR #423.
-    monitor._query_broker_order = MagicMock(side_effect=["open", "open", "canceled"])
+    monitor._query_broker_order = MagicMock(side_effect=["open", "open"])
+    monitor._query_broker_order_payload = MagicMock(
+        return_value={"status": "canceled", "exec_quantity": 0}
+    )
     monitor._cancel_broker_order = MagicMock(return_value={"status": "canceled"})
     monitor._guarded_revert_position_open_after_exit_cancel = MagicMock()
     monkeypatch.setattr(om, "TIMEOUT_EXIT_PENDING", 0)
