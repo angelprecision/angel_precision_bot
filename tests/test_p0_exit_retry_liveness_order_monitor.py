@@ -305,7 +305,7 @@ def test_watchdog_flag_explicitly_disabled_still_suppresses(monkeypatch):
     broker.cancel_order.assert_not_called()
 
 
-def test_global_actor_mode_still_works_without_the_new_flag(monkeypatch):
+def test_actor_mode_terminal_pre_cancel_proof_does_not_issue_delete(monkeypatch):
     import ap.order_monitor as om_mod
     monkeypatch.setattr(om_mod, "ORDER_MONITOR_MODE", "actor")
     monkeypatch.setattr(om_mod, "ORDER_MONITOR_CAN_ACT", True)
@@ -313,7 +313,6 @@ def test_global_actor_mode_still_works_without_the_new_flag(monkeypatch):
 
     broker = MagicMock()
     broker.get_order.return_value = {"status": "canceled"}
-    broker.cancel_order.return_value = {"status": "pending"}
     osm = MagicMock()
     osm.get_order.return_value = {"kind": "EXIT", "position_id": "pos-3", "broker_order_id": "bro-3"}
     exit_engine = MagicMock()
@@ -327,7 +326,47 @@ def test_global_actor_mode_still_works_without_the_new_flag(monkeypatch):
         local_order_id="loc-3", status="WORKING", contract="AAPL260814C00200000",
         age_secs=120.0, position_id="pos-3", reason="test",
     )
-    broker.cancel_order.assert_called_once()
+    broker.cancel_order.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    assert mon._emit_order_event.call_args.kwargs["reason_code"] == "BROKER_STATUS_UNKNOWN"
+
+
+@pytest.mark.parametrize("snapshot", ["error", "unknown"], ids=["error", "unknown"])
+def test_pre_cancel_broker_truth_failure_blocks_delete_and_replacement(monkeypatch, snapshot):
+    """A known broker ID is not enough to authorize DELETE without live proof."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    broker = MagicMock()
+    if snapshot == "error":
+        broker.get_order.side_effect = ConnectionError("pre-cancel read timeout")
+    else:
+        broker.get_order.return_value = {"status": "provider_unknown"}
+    osm = MagicMock()
+    osm.get_order.return_value = {
+        "kind": "EXIT",
+        "position_id": "pos-pre-cancel",
+        "broker_order_id": "bro-pre-cancel",
+    }
+    exit_engine = MagicMock()
+
+    mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+
+    mon._handle_stale_exit(
+        local_order_id="loc-pre-cancel",
+        status="WORKING",
+        contract="AAPL260814C00200000",
+        age_secs=120.0,
+        position_id="pos-pre-cancel",
+        reason="pre-cancel truth unavailable",
+    )
+
+    broker.cancel_order.assert_not_called()
+    exit_engine.mark_exit_replacement_safe.assert_not_called()
+    exit_engine.finalize_exit_replacement_safe.assert_not_called()
+    exit_engine.clear_exit_in_flight.assert_not_called()
+    osm.transition.assert_not_called()
+    assert mon._emit_order_event.call_args.kwargs["reason_code"] == "BROKER_STATUS_UNKNOWN"
 
 
 def test_missing_broker_id_blocks_with_named_diagnostic(monkeypatch):
@@ -429,6 +468,90 @@ def test_cancel_post_cancel_get_failure_blocks_replacement(monkeypatch):
     # ...but the fresh post-cancel GET failed, so replacement must still be blocked.
     osm.transition.assert_not_called()
     exit_engine.mark_exit_replacement_safe.assert_not_called()
+
+
+def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_remainder(monkeypatch):
+    """A fill earned during DELETE must be durable before CANCELED handoff."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+
+    class _PartialFillOSM:
+        def __init__(self):
+            self.row = {
+                "local_order_id": "loc-canceled-partial",
+                "kind": "EXIT",
+                "position_id": "pos-canceled-partial",
+                "broker_order_id": "bro-canceled-partial",
+                "status": "EXIT_ACKNOWLEDGED",
+                "qty": 2,
+                "filled_qty": 0,
+                "meta": {},
+            }
+            self.transitions = []
+
+        def get_order(self, local_order_id):
+            if local_order_id != self.row["local_order_id"]:
+                return None
+            row = dict(self.row)
+            row["meta"] = dict(self.row["meta"])
+            return row
+
+        def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+            if (
+                local_order_id != self.row["local_order_id"]
+                or broker_order_id != self.row["broker_order_id"]
+            ):
+                return False
+            self.row["meta"]["stale_exit_cancel_liveness"] = {
+                "broker_order_id": broker_order_id,
+                "attempt": int(attempt),
+                "updated_at": "test",
+            }
+            return True
+
+        def transition(self, local_order_id, status, **kwargs):
+            if local_order_id != self.row["local_order_id"]:
+                return False
+            self.transitions.append((local_order_id, status, kwargs))
+            self.row["status"] = status
+            if status in {"EXIT_PARTIAL_FILL", "EXIT_FILLED"}:
+                self.row["filled_qty"] = int(kwargs.get("filled_qty") or 0)
+            return True
+
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {"status": "canceled", "exec_quantity": 1, "avg_fill_price": 1.25},
+    ]
+    broker.cancel_order.return_value = {"status": "canceled"}
+    osm = _PartialFillOSM()
+    exit_engine = MagicMock()
+    exit_engine.mark_exit_replacement_safe.return_value = True
+    exit_engine.finalize_exit_replacement_safe.return_value = True
+
+    mon = _monitor(broker=broker, osm=osm, exit_engine=exit_engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    mon._get_newer_active_exit_order = MagicMock(return_value=None)
+
+    mon._handle_stale_exit(
+        local_order_id="loc-canceled-partial",
+        status="EXIT_ACKNOWLEDGED",
+        contract="AAPL260814C00200000",
+        age_secs=120.0,
+        position_id="pos-canceled-partial",
+        reason="late partial fill during cancel",
+    )
+
+    assert broker.cancel_order.call_count == 1
+    assert osm.row["filled_qty"] == 1
+    assert osm.transitions[0][1] == "EXIT_PARTIAL_FILL"
+    assert osm.transitions[0][2]["broker_order_id"] == "bro-canceled-partial"
+    assert osm.transitions[-1][1] == "CANCELED"
+    assert osm.transitions[-1][2]["broker_order_id"] == "bro-canceled-partial"
+    exit_engine.mark_exit_replacement_safe.assert_called_once()
+    _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
+    assert mark_kwargs["replacement_qty"] == 1
+    assert mark_kwargs["replacement_qty"] != 2
 
 
 def test_rejected_is_terminal_stale_exit_cancel_proof():
@@ -577,10 +700,8 @@ def test_bounded_cancel_attempt_survives_monitor_restart(monkeypatch):
     broker.get_order.side_effect = [
         {"status": "working"},  # monitor 1: initial proof
         {"status": "working"},  # monitor 1: post-cancel proof lost
-        {"status": "working"},  # monitor 2: initial proof after restart
-        {"status": "working"},  # monitor 2: fresh retry authorization proof
+        {"status": "working"},  # monitor 2: fresh retry proof after restart
         {"status": "canceled"},  # monitor 2: independent post-cancel proof
-        {"status": "working"},  # monitor 3: initial proof after exhaustion
         {"status": "working"},  # monitor 3: fresh proof, no third DELETE allowed
     ]
     broker.cancel_order.return_value = {"status": "pending"}
@@ -802,7 +923,10 @@ def test_osm_transition_miss_accepts_exact_terminal_reread(monkeypatch):
 def test_paper_and_live_identity_preserved_through_handoff(monkeypatch):
     _actor_mode(monkeypatch)
     broker = MagicMock()
-    broker.get_order.return_value = {"status": "canceled"}
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {"status": "canceled", "exec_quantity": 0},
+    ]
     broker.cancel_order.return_value = {"status": "pending"}
     osm = MagicMock()
     osm.get_order.return_value = {"kind": "EXIT", "position_id": "pos-live-1", "broker_order_id": "bro-live-1"}

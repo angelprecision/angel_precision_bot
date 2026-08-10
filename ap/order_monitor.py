@@ -5208,23 +5208,12 @@ class APOrderMonitor:
             )
             return
 
-        broker_status = self._query_broker_order(broker_oid)
+        # The first cancel is authorized only by a fresh recognized live
+        # snapshot. Do not let cached/unknown status fall through to DELETE
+        # merely because the durable broker identity is known.
+        broker_status = self._query_broker_order(broker_oid, bypass_cache=True)
         _partial_remainder_qty = 0
-
         _stale_order_row = self.osm.get_order(local_order_id) or {}
-        broker_owned_recovery = _is_broker_ownership_adopted_row(_stale_order_row)
-        if broker_owned_recovery and _requires_broker_owned_exit_fence(
-            broker_status
-        ):
-            self._hold_on_unknown_broker_status(
-                local_order_id,
-                status,
-                contract,
-                position_id=position_id,
-                broker_order_id=broker_oid,
-                reason="stale exit broker status lookup failed or was unknown",
-            )
-            return
 
         # ── Broker fill truth wins before cancel ────────────────────────────
         # A full fill still wins immediately.  A partial fill is first routed
@@ -5261,7 +5250,7 @@ class APOrderMonitor:
                 return
 
         def _cancel_and_prove():
-            """Issue one exact cancel and require a fresh broker GET proof."""
+            """Issue one exact cancel and require a fresh raw broker proof."""
             cancel_result = None
             try:
                 cancel_result = self._cancel_broker_order(broker_oid)
@@ -5269,20 +5258,80 @@ class APOrderMonitor:
                 log.warning(f"[{self.client_id}] Exit broker cancel failed: {e}")
             cancel_response_status = self._extract_broker_status(cancel_result)
             try:
-                confirmed = self._query_broker_order(broker_oid, bypass_cache=True)
+                confirmed_payload = self._query_broker_order_payload(broker_oid)
             except Exception as e:
                 log.warning(f"[{self.client_id}] Post-cancel broker GET failed: {e}")
-                confirmed = None
-            return cancel_response_status, confirmed
+                confirmed_payload = None
+            confirmed_status = self._extract_broker_status(confirmed_payload)
+            return cancel_response_status, confirmed_status, confirmed_payload
 
-        def _handle_late_fill(confirmed) -> bool:
+        def _handle_late_fill(confirmed, confirmed_payload=None) -> bool:
             """Apply fresh fill truth; return True when the caller must stop."""
             nonlocal _partial_remainder_qty
+
+            # A terminal cancel payload can still carry a cumulative fill
+            # earned during the DELETE race. Reconcile that raw quantity
+            # before accepting CANCELED or staging replacement authority.
+            if (
+                confirmed_payload
+                and self._is_terminal_cancel_status(confirmed_payload)
+                and any(
+                    key in confirmed_payload
+                    for key in ("exec_quantity", "filled_quantity", "filled_qty")
+                )
+            ):
+                cumulative_raw = next(
+                    (
+                        confirmed_payload.get(key)
+                        for key in ("exec_quantity", "filled_quantity", "filled_qty")
+                        if key in confirmed_payload
+                    ),
+                    None,
+                )
+                try:
+                    cumulative_filled = int(cumulative_raw)
+                except (TypeError, ValueError, OverflowError):
+                    cumulative_filled = None
+                if cumulative_filled is None or cumulative_filled < 0:
+                    self._hold_on_unknown_broker_status(
+                        local_order_id,
+                        status,
+                        contract,
+                        position_id=position_id,
+                        broker_order_id=broker_oid,
+                        reason="terminal cancel payload cumulative fill was invalid",
+                    )
+                    return True
+                if cumulative_filled > 0:
+                    _partial_remainder_qty = self._apply_broker_partial_exit_fill(
+                        local_order_id,
+                        broker_oid,
+                        contract,
+                        raw_payload=confirmed_payload,
+                    )
+                    if _partial_remainder_qty is None:
+                        self._hold_on_unknown_broker_status(
+                            local_order_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason="terminal cancel cumulative fill could not be durably applied",
+                        )
+                        return True
+                    if _partial_remainder_qty <= 0:
+                        self._clear_stale_exit_cancel_state(broker_oid)
+                        return True
+                    return False
+
             if not self._is_executed_status(confirmed):
                 return False
             if self._normalize_broker_status(confirmed) == "partially_filled":
                 _partial_remainder_qty = self._apply_broker_partial_exit_fill(
-                    local_order_id, broker_oid, contract,
+                    local_order_id,
+                    broker_oid,
+                    contract,
+                    raw_payload=confirmed_payload,
                 )
                 if _partial_remainder_qty is None:
                     self._advance_from_broker_status(local_order_id, confirmed, contract)
@@ -5347,6 +5396,26 @@ class APOrderMonitor:
                 broker_oid, _durable_cancel_updated_at or _now,
             )
 
+        # A first DELETE is permitted only when this invocation has a fresh,
+        # recognized live proof. If a prior durable/in-memory cancel attempt
+        # exists, the bounded retry branch below performs its own fresh proof.
+        if (
+            not self._stale_exit_cancel_inflight.get(broker_oid)
+            and not self._is_live_stale_exit_broker_status(broker_status)
+        ):
+            self._hold_on_unknown_broker_status(
+                local_order_id,
+                status,
+                contract,
+                position_id=position_id,
+                broker_order_id=broker_oid,
+                reason=(
+                    "fresh pre-cancel broker lookup did not establish a "
+                    "recognized live state"
+                ),
+            )
+            return
+
         def _persist_cancel_attempt(attempt: int) -> bool:
             """Persist the bounded generation before issuing broker DELETE."""
             try:
@@ -5398,7 +5467,10 @@ class APOrderMonitor:
         if _inflight_since is not None:
             _inflight_age = max(0.0, (_now - _inflight_since).total_seconds())
             _cancel_attempt = int(self._stale_exit_cancel_attempts.get(broker_oid, 1) or 1)
-            _recheck_status = self._query_broker_order(broker_oid, bypass_cache=True)
+            # The initial fresh GET above is itself the retry authorization
+            # proof. Reuse it so a second GET cannot consume a newer broker
+            # transition before the bounded retry decision is made.
+            _recheck_status = broker_status
             if _handle_late_fill(_recheck_status):
                 return
             if self._is_terminal_cancel_status(_recheck_status):
@@ -5485,9 +5557,13 @@ class APOrderMonitor:
                     self.client_id, local_order_id, broker_oid,
                     _cancel_attempt, STALE_EXIT_CANCEL_MAX_ATTEMPTS,
                 )
-                _cancel_response_status, confirmed_status = _cancel_and_prove()
+                (
+                    _cancel_response_status,
+                    confirmed_status,
+                    confirmed_payload,
+                ) = _cancel_and_prove()
                 is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
-                if _handle_late_fill(confirmed_status):
+                if _handle_late_fill(confirmed_status, confirmed_payload):
                     return
                 if not is_confirmed_canceled:
                     self._emit_order_event(
@@ -5514,9 +5590,13 @@ class APOrderMonitor:
                 return
             self._stale_exit_cancel_inflight[broker_oid] = _now
             self._stale_exit_cancel_attempts[broker_oid] = 1
-            _cancel_response_status, confirmed_status = _cancel_and_prove()
+            (
+                _cancel_response_status,
+                confirmed_status,
+                confirmed_payload,
+            ) = _cancel_and_prove()
             is_confirmed_canceled = self._is_terminal_cancel_status(confirmed_status)
-            if _handle_late_fill(confirmed_status):
+            if _handle_late_fill(confirmed_status, confirmed_payload):
                 return
             if not is_confirmed_canceled:
                 self._emit_order_event(
@@ -6263,6 +6343,7 @@ class APOrderMonitor:
         local_order_id: str,
         broker_order_id: str,
         contract: str,
+        raw_payload: Optional[dict] = None,
     ) -> Optional[int]:
         """Apply broker cumulative partial fill through the canonical OSM hook.
 
@@ -6273,7 +6354,11 @@ class APOrderMonitor:
         order = dict(self.osm.get_order(local_order_id) or {})
         if str(order.get("kind") or "").upper() != "EXIT":
             return None
-        raw = self._query_broker_order_payload(broker_order_id)
+        raw = (
+            dict(raw_payload)
+            if isinstance(raw_payload, dict)
+            else self._query_broker_order_payload(broker_order_id)
+        )
         if not raw:
             return None
         raw_status = self._normalize_broker_status(raw)
@@ -6287,6 +6372,58 @@ class APOrderMonitor:
             if raw_status in {
                 "filled", "canceled", "expired", "rejected",
             }:
+                if raw_payload is not None and raw_status in {
+                    "canceled", "expired", "rejected"
+                }:
+                    cumulative_raw = next(
+                        (
+                            raw.get(key)
+                            for key in ("exec_quantity", "filled_quantity", "filled_qty")
+                            if key in raw
+                        ),
+                        None,
+                    )
+                    if cumulative_raw is not None:
+                        try:
+                            cumulative_filled = int(cumulative_raw)
+                            requested_qty = int(
+                                order.get("qty") or order.get("quantity") or 0
+                            )
+                            previous_filled = int(order.get("filled_qty") or 0)
+                        except (TypeError, ValueError, OverflowError):
+                            log.warning(
+                                "[%s] terminal cancel payload has invalid cumulative fill "
+                                "| local=%s cumulative=%s",
+                                self.client_id, local_order_id, cumulative_raw,
+                            )
+                            return None
+                        if (
+                            requested_qty <= 0
+                            or cumulative_filled < previous_filled
+                            or cumulative_filled > requested_qty
+                        ):
+                            log.warning(
+                                "[%s] terminal cancel payload cumulative fill is outside "
+                                "durable order bounds | local=%s cumulative=%s previous=%s requested=%s",
+                                self.client_id,
+                                local_order_id,
+                                cumulative_filled,
+                                previous_filled,
+                                requested_qty,
+                            )
+                            return None
+                        if cumulative_filled == requested_qty:
+                            raw_status = "filled"
+                        elif cumulative_filled > previous_filled:
+                            # Reuse the canonical partial-fill path below so
+                            # CANCELED+exec_quantity cannot lose the late fill.
+                            raw_status = "partially_filled"
+                        else:
+                            self._advance_from_broker_status(
+                                local_order_id, raw_status, contract
+                            )
+                            return 0
+
                 if raw_status == "filled":
                     cumulative_raw = None
                     for key in ("exec_quantity", "filled_quantity", "filled_qty"):
@@ -6343,17 +6480,19 @@ class APOrderMonitor:
                         order.get("filled_qty"),
                     )
 
-                self._advance_from_broker_status(local_order_id, raw_status, contract)
-                return 0
+                if raw_status != "partially_filled":
+                    self._advance_from_broker_status(local_order_id, raw_status, contract)
+                    return 0
 
-            # A non-terminal regression/alias is not safe to reinterpret as a
-            # partial fill.  Returning None makes the caller hold rather than
-            # issuing a cancel from contradictory broker truth.
-            log.warning(
-                "[%s] partial-fill payload changed status before OSM apply | local=%s status=%s",
-                self.client_id, local_order_id, raw_status or "unknown",
-            )
-            return None
+            if raw_status != "partially_filled":
+                # A non-terminal regression/alias is not safe to reinterpret as
+                # a partial fill. Returning None makes the caller hold rather
+                # than issuing a cancel from contradictory broker truth.
+                log.warning(
+                    "[%s] partial-fill payload changed status before OSM apply | local=%s status=%s",
+                    self.client_id, local_order_id, raw_status or "unknown",
+                )
+                return None
 
         cumulative_raw = None
         for key in ("exec_quantity", "filled_quantity", "filled_qty"):
