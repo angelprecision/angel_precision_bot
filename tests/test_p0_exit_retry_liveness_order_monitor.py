@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -175,6 +176,114 @@ def test_watchdog_stale_exit_recovery_enabled_by_default_cancels_and_confirms(mo
     assert kwargs["local_order_id"] == "loc-avgo"
     assert kwargs["broker_order_id"] == "bro-avgo"
     pm.update_position.assert_not_called()
+
+
+@pytest.mark.parametrize("broker_status", ["open", "working", "accepted", "queued"])
+def test_check_exit_orders_routes_aged_ack_live_status_to_stale_owner(
+    monkeypatch, broker_status
+):
+    """The production poller must reach stale recovery for every live ACK alias."""
+    import ap.order_monitor as om_mod
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    monkeypatch.setattr(om_mod, "TIMEOUT_EXIT_ACK", 0)
+    old_ts = datetime.now(timezone.utc) - timedelta(seconds=30)
+    order = {
+        "local_order_id": "loc-ack-live",
+        "broker_order_id": "bro-ack-live",
+        "position_id": "pos-ack-live",
+        "contract": "AVGO260814C00350000",
+        "status": "EXIT_ACKNOWLEDGED",
+        "created_ts": old_ts,
+        "submitted_ts": old_ts,
+    }
+    mon = _monitor(osm=MagicMock())
+    mon._get_active_exit_orders = MagicMock(return_value=[order])
+    mon._query_broker_order = MagicMock(return_value=broker_status)
+    mon._handle_stale_exit = MagicMock()
+
+    mon._check_exit_orders()
+
+    mon._query_broker_order.assert_called_once_with("bro-ack-live")
+    mon._handle_stale_exit.assert_called_once()
+    assert mon._handle_stale_exit.call_args.args[0:2] == (
+        "loc-ack-live", "EXIT_ACKNOWLEDGED",
+    )
+
+
+def test_check_exit_orders_routes_aged_partial_fill_to_remainder_owner(monkeypatch):
+    """A durable partial row cannot strand its broker-working remainder."""
+    import ap.order_monitor as om_mod
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    monkeypatch.setattr(om_mod, "TIMEOUT_PARTIAL_FILL", 0)
+    old_ts = datetime.now(timezone.utc) - timedelta(seconds=30)
+    order = {
+        "local_order_id": "loc-partial-live",
+        "broker_order_id": "bro-partial-live",
+        "position_id": "pos-partial-live",
+        "contract": "AVGO260814C00350000",
+        "status": "EXIT_PARTIAL_FILL",
+        "created_ts": old_ts,
+        "submitted_ts": old_ts,
+    }
+    mon = _monitor(osm=MagicMock())
+    mon._get_active_exit_orders = MagicMock(return_value=[order])
+    mon._query_broker_order = MagicMock(return_value="working")
+    mon._handle_stale_exit = MagicMock()
+
+    mon._check_exit_orders()
+
+    mon._handle_stale_exit.assert_called_once()
+    assert mon._handle_stale_exit.call_args.args[0:2] == (
+        "loc-partial-live", "EXIT_PARTIAL_FILL",
+    )
+
+
+def test_partial_to_filled_reread_applies_canonical_full_fill_truth(monkeypatch):
+    """A newer raw FILLED payload must not be converted into a zero remainder."""
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    osm = MagicMock()
+    osm.get_order.return_value = {
+        "kind": "EXIT",
+        "position_id": "pos-race",
+        "broker_order_id": "bro-race",
+        "status": "EXIT_PARTIAL_FILL",
+        "qty": 2,
+        "filled_qty": 1,
+    }
+    osm.transition.return_value = True
+    mon = _monitor(osm=osm)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+    mon._query_broker_order = MagicMock(return_value="partially_filled")
+    mon._advance_from_broker_status = MagicMock()
+    mon._query_broker_order_payload = MagicMock(
+        return_value={
+            "status": "filled",
+            "exec_quantity": 2,
+            "avg_fill_price": 2.55,
+        }
+    )
+
+    mon._handle_stale_exit(
+        local_order_id="loc-race",
+        status="EXIT_PARTIAL_FILL",
+        contract="AVGO260814C00350000",
+        age_secs=120.0,
+        position_id="pos-race",
+        reason="partial to filled race",
+    )
+
+    osm.transition.assert_called_once_with(
+        "loc-race",
+        "EXIT_FILLED",
+        filled_qty=2,
+        fill_price=2.55,
+        broker_order_id="bro-race",
+    )
+    mon._advance_from_broker_status.assert_not_called()
+    assert mon.broker.cancel_order.called is False
 
 
 def test_watchdog_flag_explicitly_disabled_still_suppresses(monkeypatch):

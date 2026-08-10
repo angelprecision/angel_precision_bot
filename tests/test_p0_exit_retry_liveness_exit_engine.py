@@ -29,9 +29,14 @@ from ap_exit_engine import (  # noqa: E402
 )
 
 
-def _engine() -> APExitEngine:
+def _engine(*, durable_persist=True) -> APExitEngine:
     eng = APExitEngine(broker=MagicMock())
     eng._emit_exit_event = MagicMock()
+    if durable_persist:
+        # Most unit cases are about the in-memory generation protocol.  The
+        # persistence-specific cases opt out so they exercise the real DB
+        # seam explicitly.
+        eng._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
     return eng
 
 
@@ -135,6 +140,29 @@ def test_stale_exit_replacement_generation_waits_for_durable_fence():
     ) is True
     assert pos.exit_replace_attempt == 1
     assert pos.pending_exit_replace_durable_pending is False
+
+
+def test_staged_replacement_finalize_blocks_when_generation_persist_fails():
+    eng = _engine()
+    pos = _pos()
+    _add(eng, pos)
+    eng._persist_exit_replace_attempt_to_db = MagicMock(return_value=False)
+
+    assert eng.mark_exit_replacement_safe(
+        "pos-avgo-1",
+        reason="broker cancel staged",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        defer_attempt=True,
+    ) is True
+    assert eng.finalize_exit_replacement_safe(
+        "pos-avgo-1",
+        reason="OSM CANCELED durable",
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+    ) is False
+    assert pos.exit_replace_attempt == 0
+    assert pos.pending_exit_replace_durable_pending is True
 
 
 def test_staged_replacement_can_be_revoked_without_clearing_old_owner():
@@ -267,7 +295,7 @@ def test_mark_exit_submitted_does_not_reset_exit_replace_attempt():
     assert pos._exit_stuck_count == 0
 
 
-# ── Only proven economic completion resets the counter ─────────────────────
+# ── Proven economic completion resets the counter ──────────────────────────
 
 def test_mark_position_closed_resets_exit_replace_attempt():
     eng = _engine()
@@ -288,6 +316,32 @@ def test_mark_position_closed_resets_exit_replace_attempt():
 
     assert pos.exit_replace_attempt == 0
     assert pos._exit_replace_attempt_last_ack_identity == ""
+
+
+def test_completed_scale_out_resets_and_persists_replacement_generation():
+    eng = _engine()
+    pos = _pos(
+        pending_exit_action="SCALE_OUT",
+        pending_exit_filled_qty=0,
+        exit_replace_attempt=3,
+        _exit_replace_attempt_last_ack_identity="bro-old-1",
+    )
+    _add(eng, pos)
+
+    eng.note_partial_exit_fill(
+        "pos-avgo-1",
+        qty_filled=2,
+        fill_price=2.10,
+        local_order_id="loc-old-1",
+        broker_order_id="bro-old-1",
+        cumulative_filled=2,
+    )
+
+    assert pos.quantity_remaining == 5
+    assert pos.exit_in_flight is False
+    assert pos.exit_replace_attempt == 0
+    assert pos._exit_replace_attempt_last_ack_identity == ""
+    eng._persist_exit_replace_attempt_to_db.assert_called_once_with(pos)
 
 
 # ── Pricing ladder reads exit_replace_attempt, not _exit_stuck_count ───────
@@ -326,7 +380,7 @@ def test_persist_exit_replace_attempt_uses_nondestructive_meta_merge(monkeypatch
     metadata namespace via the existing non-destructive JSONB `meta || patch`
     merge, never overwriting unrelated meta keys.
     """
-    eng = _engine()
+    eng = _engine(durable_persist=False)
     pos = _pos()
     _add(eng, pos)
     pos.exit_replace_attempt = 2
@@ -363,10 +417,9 @@ def test_persist_exit_replace_attempt_uses_nondestructive_meta_merge(monkeypatch
     # the SQL itself merges (||) rather than replaces the meta column.
 
 
-def test_persist_exit_replace_attempt_failure_is_nonfatal(monkeypatch):
-    """A DB error during persistence must not raise or block the in-memory
-    exactly-once increment that already happened."""
-    eng = _engine()
+def test_persist_exit_replace_attempt_failure_blocks_replacement(monkeypatch):
+    """A DB error must fail closed before replacement authority is granted."""
+    eng = _engine(durable_persist=False)
     pos = _pos()
     _add(eng, pos)
 
@@ -377,14 +430,12 @@ def test_persist_exit_replace_attempt_failure_is_nonfatal(monkeypatch):
 
     monkeypatch.setattr(db_mod, "conn", _boom)
 
-    # Should not raise.
-    eng.mark_exit_replacement_safe(
+    accepted = eng.mark_exit_replacement_safe(
         "pos-avgo-1", reason="proof", local_order_id="loc-old-1", broker_order_id="bro-old-1",
     )
-    assert pos.exit_replace_attempt == 1, (
-        "in-memory exactly-once increment must succeed even when the "
-        "best-effort DB persist fails"
-    )
+    assert accepted is False
+    assert pos.exit_replace_attempt == 0
+    assert pos.pending_exit_replace_allowed is False
 
 
 @pytest.mark.parametrize(

@@ -2696,8 +2696,44 @@ class APOrderMonitor:
                             broker_order_id=broker_oid,
                             reason="acknowledged exit broker status lookup failed or was unknown",
                         )
-                    elif broker_status:
+                    elif self._is_filled_status(broker_status) or self._is_terminal_failure_status(
+                        broker_status
+                    ):
                         self._advance_from_broker_status(local_id, broker_status, contract)
+                    elif self._is_live_stale_exit_broker_status(broker_status):
+                        # A live broker acknowledgement is exactly the stale
+                        # working-exit path.  Passing it through
+                        # _advance_from_broker_status() alone is insufficient:
+                        # statuses such as WORKING/ACCEPTED/QUEUED are not
+                        # lifecycle transitions, and OPEN maps back to the
+                        # current EXIT_ACKNOWLEDGED state.  Route every
+                        # recognized live proof through the exact cancel/
+                        # replacement owner instead.
+                        self._handle_stale_exit(
+                            local_id, status, contract, age_secs,
+                            position_id=position_id,
+                            reason=(
+                                f"EXIT_ACKNOWLEDGED for {age_secs:.0f}s > {TIMEOUT_EXIT_ACK}s "
+                                f"— broker status={self._normalize_broker_status(broker_status)} "
+                                "still live — ESCALATING"
+                            ),
+                        )
+                    elif broker_status:
+                        # Do not let a truthy but unrecognized broker string
+                        # authorize a cancel.  Unknown broker truth remains a
+                        # fail-closed hold until a recognized live or terminal
+                        # proof is available.
+                        self._hold_on_unknown_broker_status(
+                            local_id,
+                            status,
+                            contract,
+                            position_id=position_id,
+                            broker_order_id=broker_oid,
+                            reason=(
+                                "acknowledged exit broker status was not a recognized "
+                                f"live or terminal state: {broker_status!r}"
+                            ),
+                        )
                     else:
                         self._handle_stale_exit(
                             local_id, status, contract, age_secs,
@@ -2710,25 +2746,18 @@ class APOrderMonitor:
 
             elif status == "EXIT_PARTIAL_FILL":
                 if age_secs > TIMEOUT_PARTIAL_FILL:
-                    # INTENTIONALLY PASSIVE — exit partial fills are NOT auto-retried.
-                    # The filled portion is closed; auto-retrying the remainder risks
-                    # double-exit on already-closed contracts.
-                    # Policy: alert at CRITICAL level, require manual review.
-                    self._emit_order_event(
-                        local_order_id=local_id,
-                        stage="order_monitor",
-                        decision="ALERT",
-                        reason_code="PARTIAL_FILL_STALLED",
-                        explanation=f"EXIT_PARTIAL_FILL stalled for {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s",
-                        contract=contract,
+                    # A durable partial-fill row still owns an exact broker
+                    # order identity.  It must enter the same stale-exit
+                    # owner so only the broker-unfilled remainder can be
+                    # canceled/replaced; alert-only handling strands that
+                    # remainder indefinitely.
+                    self._handle_stale_exit(
+                        local_id, status, contract, age_secs,
                         position_id=position_id,
-                        inputs={"status": status, "age_secs": age_secs},
-                        thresholds={"timeout_partial_fill": TIMEOUT_PARTIAL_FILL},
-                    )
-                    self._alert(
-                        f"🚨 EXIT PARTIAL_FILL STALLED | {self.client_id} | {contract} "
-                        f"| {local_id} | {age_secs:.0f}s | pos={position_id} "
-                        f"| MANUAL INTERVENTION REQUIRED"
+                        reason=(
+                            f"EXIT_PARTIAL_FILL for {age_secs:.0f}s > {TIMEOUT_PARTIAL_FILL}s "
+                            "— recovering only the broker-unfilled remainder"
+                        ),
                     )
 
     def _check_stale_entry_cancel(
@@ -6249,13 +6278,82 @@ class APOrderMonitor:
             return None
         raw_status = self._normalize_broker_status(raw)
         if raw_status != "partially_filled":
-            # A direct read that changed to a terminal status is still broker
-            # truth, but this helper must not reinterpret it as a partial.
+            # The status-only poll can report PARTIALLY_FILLED immediately
+            # before this raw payload read observes a terminal transition.
+            # Do not return zero and silently discard that newer truth: route
+            # a filled payload through the canonical full-fill OSM hook when
+            # exact cumulative quantity is present, otherwise preserve the
+            # existing status-level reconciliation fallback.
+            if raw_status in {
+                "filled", "canceled", "expired", "rejected",
+            }:
+                if raw_status == "filled":
+                    cumulative_raw = None
+                    for key in ("exec_quantity", "filled_quantity", "filled_qty"):
+                        if key in raw and raw.get(key) is not None:
+                            cumulative_raw = raw.get(key)
+                            break
+                    try:
+                        cumulative_filled = int(cumulative_raw)
+                        requested_qty = int(
+                            order.get("qty") or order.get("quantity") or 0
+                        )
+                        previous_filled = int(order.get("filled_qty") or 0)
+                    except (TypeError, ValueError):
+                        cumulative_filled = 0
+                        requested_qty = 0
+                        previous_filled = 0
+
+                    fill_price = raw.get("avg_fill_price")
+                    if fill_price is None:
+                        fill_price = raw.get("avg_fill")
+                    if fill_price is None:
+                        fill_price = raw.get("price")
+
+                    if (
+                        cumulative_filled > 0
+                        and requested_qty > 0
+                        and previous_filled <= cumulative_filled <= requested_qty
+                    ):
+                        try:
+                            ok = self.osm.transition(
+                                local_order_id,
+                                "EXIT_FILLED",
+                                filled_qty=cumulative_filled,
+                                fill_price=fill_price,
+                                broker_order_id=broker_order_id,
+                            )
+                            if ok is False:
+                                return None
+                        except Exception as exc:
+                            log.error(
+                                "[%s] canonical OSM full-fill apply failed | local=%s: %s",
+                                self.client_id, local_order_id, exc,
+                            )
+                            return None
+                        return 0
+
+                    log.warning(
+                        "[%s] broker filled payload lacks valid cumulative quantity; "
+                        "deferring to fill monitor | local=%s cumulative=%s requested=%s previous=%s",
+                        self.client_id,
+                        local_order_id,
+                        cumulative_raw,
+                        order.get("qty") or order.get("quantity"),
+                        order.get("filled_qty"),
+                    )
+
+                self._advance_from_broker_status(local_order_id, raw_status, contract)
+                return 0
+
+            # A non-terminal regression/alias is not safe to reinterpret as a
+            # partial fill.  Returning None makes the caller hold rather than
+            # issuing a cancel from contradictory broker truth.
             log.warning(
                 "[%s] partial-fill payload changed status before OSM apply | local=%s status=%s",
                 self.client_id, local_order_id, raw_status or "unknown",
             )
-            return 0
+            return None
 
         cumulative_raw = None
         for key in ("exec_quantity", "filled_quantity", "filled_qty"):

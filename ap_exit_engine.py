@@ -1394,8 +1394,9 @@ class ManagedPosition:
     # number across: broker-proven cancel of a stale exit -> replacement
     # submit -> replacement later becomes stale -> another proven cancel ->
     # next replacement submit. It must survive submission and must only
-    # reset on proven economic completion (see mark_position_closed /
-    # exactly-once increment in mark_exit_replacement_safe).
+    # reset on proven economic completion (see mark_position_closed and
+    # completed scale-outs in note_partial_exit_fill / exactly-once increment
+    # in mark_exit_replacement_safe).
     exit_replace_attempt: int = 0
     # Exactly-once increment guard: the exact old broker/local order identity
     # the last exit_replace_attempt increment was granted for. A repeat
@@ -3667,12 +3668,10 @@ class APExitEngine:
         hard_exit_reference and protective-monitoring-state elsewhere in
         this file. Never overwrites unrelated meta keys.
 
-        Best-effort: any DB error is logged and swallowed. A failed persist
-        here must never block the exactly-once in-memory increment or the
-        exit-replacement handoff — restart-survival is a durability
-        improvement, not a correctness precondition for the current
-        process's exactly-once guarantee (which is enforced in-memory by
-        _exit_replace_attempt_last_ack_identity / pending_exit_replace_allowed).
+        A replacement-generation increment is not authoritative until this
+        write succeeds.  Callers fail closed when the row cannot be updated;
+        otherwise a process restart could hydrate the old counter and reuse a
+        stale pricing rung for a live replacement.
         """
         pid = str(getattr(pos, "position_id", "") or "")
         client_id = str(getattr(pos, "client_id", "") or getattr(self, "_email", "") or "")
@@ -3714,7 +3713,7 @@ class APExitEngine:
             return rowcount > 0
         except Exception as exc:
             log.debug(
-                "[exit_eng] _persist_exit_replace_attempt_to_db non-fatal failure for pos=%s: %s",
+                "[exit_eng] _persist_exit_replace_attempt_to_db failed for pos=%s: %s",
                 pid, exc,
             )
             return False
@@ -5402,7 +5401,7 @@ class APExitEngine:
                     self._persist_exit_replace_attempt_to_db(pos)
                 except Exception as _perr:
                     log.debug(
-                        "[exit_eng] exit_replace_attempt reset-persist failed non-fatally: %s",
+                        "[exit_eng] exit_replace_attempt reset-persist failed after closed proof: %s",
                         _perr,
                     )
                 self._emit_exit_event(
@@ -5560,6 +5559,7 @@ class APExitEngine:
             fill_price = None
 
         applied_delta = 0
+        _reset_exit_replace_attempt_pos = None
         # PR-A / BUG-3: O(1) lookup via self._positions_by_id (was O(n) scan).
         with self._lock:
             _matched = self._positions_by_id.get(str(position_id or ""))
@@ -5679,6 +5679,13 @@ class APExitEngine:
                     pos.last_applied_exit_cum_fill = 0
                     pos.last_exit_signal_ts = None
                     pos._exit_stuck_count   = 0
+                    # A completed scale-out is economic completion for the
+                    # old exit generation even when the position remains
+                    # open.  The next exit must start at ladder rung zero;
+                    # retain the reset for the out-of-lock durability write.
+                    pos.exit_replace_attempt = 0
+                    pos._exit_replace_attempt_last_ack_identity = ""
+                    _reset_exit_replace_attempt_pos = pos
 
                 self._assert_position_invariants(pos, "note_partial_exit_fill")
                 self._emit_exit_event(
@@ -5713,6 +5720,21 @@ class APExitEngine:
                 _rwr_s(_save_scale)
             except Exception as _se:
                 log.debug("[exit_eng] scale/qty persist failed (non-critical): %s", _se)
+        if _reset_exit_replace_attempt_pos is not None:
+            try:
+                if not self._persist_exit_replace_attempt_to_db(
+                    _reset_exit_replace_attempt_pos
+                ):
+                    log.error(
+                        "[exit_eng] completed exit generation reset was not durably persisted | pos=%s",
+                        getattr(_reset_exit_replace_attempt_pos, "position_id", ""),
+                    )
+            except Exception as _reset_err:
+                log.error(
+                    "[exit_eng] completed exit generation reset persist failed | pos=%s error=%s",
+                    getattr(_reset_exit_replace_attempt_pos, "position_id", ""),
+                    _reset_err,
+                )
         log.info("[exit_eng] Exit fill noted | pos_id=%s qty_delta=%d", position_id, int(applied_delta or qty_filled or 0))
 
     def _mark_exit_submitted(
@@ -5754,7 +5776,7 @@ class APExitEngine:
         *,
         reason: str,
         proof_identity: str,
-    ) -> None:
+    ) -> bool:
         """Commit one replacement generation after its durable OSM fence.
 
         The caller owns ``self._lock``.  Keeping the increment and its
@@ -5762,21 +5784,52 @@ class APExitEngine:
         from accidentally becoming the durable generation authority.
         """
         try:
-            prior_attempt = max(0, int(getattr(pos, "exit_replace_attempt", 0) or 0))
+            prior_attempt = min(
+                max(0, int(getattr(pos, "exit_replace_attempt", 0) or 0)),
+                EXIT_REPLACE_MAX_ATTEMPTS,
+            )
         except (TypeError, ValueError, OverflowError):
             prior_attempt = 0
+        prior_identity = str(
+            getattr(pos, "_exit_replace_attempt_last_ack_identity", "") or ""
+        )
         pos.exit_replace_attempt = min(
             prior_attempt + 1,
             EXIT_REPLACE_MAX_ATTEMPTS,
         )
         pos._exit_replace_attempt_last_ack_identity = proof_identity
         try:
-            self._persist_exit_replace_attempt_to_db(pos)
+            persisted = bool(self._persist_exit_replace_attempt_to_db(pos))
         except Exception as _perr:
-            log.debug(
-                "[exit_eng] exit_replace_attempt persist call failed non-fatally: %s",
+            log.error(
+                "[exit_eng] exit_replace_attempt persist failed; replacement blocked | "
+                "pos=%s error=%s",
+                getattr(pos, "position_id", ""),
                 _perr,
             )
+            persisted = False
+        if not persisted:
+            # Restore the pre-commit in-memory state.  The caller must not
+            # expose replacement authority for a generation that a restart
+            # could not hydrate.
+            pos.exit_replace_attempt = prior_attempt
+            pos._exit_replace_attempt_last_ack_identity = prior_identity
+            self._emit_exit_event(
+                pos,
+                "HOLD",
+                "EXIT_REPLACE_ATTEMPT_DURABILITY_UNCONFIRMED",
+                (
+                    "Replacement generation blocked because exit_replace_attempt "
+                    "could not be durably persisted; old exit ownership remains fenced."
+                ),
+                stage="exit_reconciliation",
+                extra_inputs={
+                    "reason": reason,
+                    "proof_identity": proof_identity,
+                    "prior_attempt": prior_attempt,
+                },
+            )
+            return False
         if pos.exit_replace_attempt >= EXIT_REPLACE_MAX_ATTEMPTS:
             self._emit_exit_event(
                 pos, "ALERT", "EXIT_REPLACE_RETRY_EXHAUSTED_BROKER_OPEN",
@@ -5789,6 +5842,7 @@ class APExitEngine:
                 stage="exit_reconciliation",
                 extra_inputs={"exit_replace_attempt": pos.exit_replace_attempt, "reason": reason},
             )
+        return True
 
     def mark_exit_replacement_safe(
         self,
@@ -5847,6 +5901,9 @@ class APExitEngine:
                         _replacement_qty = int(kwargs.get("replacement_qty", 0) or 0)
                     except Exception:
                         _replacement_qty = 0
+                    _prior_replacement_qty = max(
+                        0, int(getattr(pos, "pending_exit_replace_qty", 0) or 0)
+                    )
                     if _replacement_qty <= 0:
                         _replacement_qty = max(
                             0,
@@ -5860,17 +5917,20 @@ class APExitEngine:
                         # pre-fill quantity.
                         pos.pending_exit_replace_qty = _replacement_qty
                     if not _duplicate_grant_for_same_generation:
-                        pos._exit_replace_attempt_last_ack_identity = _call_identity
-                        if not defer_attempt:
+                        if defer_attempt:
+                            pos._exit_replace_attempt_last_ack_identity = _call_identity
+                        else:
                             # Normal external/reconciler callers retain the
                             # existing immediate behavior. The stale-exit
                             # monitor passes defer_attempt=True and commits
                             # only after OSM durable success.
-                            self._commit_exit_replacement_generation_locked(
+                            if not self._commit_exit_replacement_generation_locked(
                                 pos,
                                 reason=reason_s,
                                 proof_identity=_call_identity,
-                            )
+                            ):
+                                pos.pending_exit_replace_qty = _prior_replacement_qty
+                                return False
                     if defer_attempt:
                         pos.pending_exit_replace_durable_pending = True
                     elif not _duplicate_grant_for_same_generation:
@@ -5954,11 +6014,12 @@ class APExitEngine:
                 return False
             if not getattr(pos, "pending_exit_replace_durable_pending", False):
                 return True
-            self._commit_exit_replacement_generation_locked(
+            if not self._commit_exit_replacement_generation_locked(
                 pos,
                 reason=reason_s,
                 proof_identity=proof_identity,
-            )
+            ):
+                return False
             pos.pending_exit_replace_durable_pending = False
             self._emit_exit_event(
                 pos,
