@@ -33,6 +33,29 @@ from ap_exit_engine import (  # noqa: E402
 def _engine(*, durable_persist=True) -> APExitEngine:
     eng = APExitEngine(broker=MagicMock())
     eng._emit_exit_event = MagicMock()
+    def _fake_exit_fill_consumption(
+        pos, *, local_order_id, broker_order_id, cumulative_filled_qty,
+        prior_cumulative_filled=None,
+    ):
+        prior = int(prior_cumulative_filled or 0)
+        delta = max(0, int(cumulative_filled_qty) - prior)
+        return {
+            "ok": True,
+            "applied_delta": delta,
+            "applied_cumulative_qty": int(cumulative_filled_qty),
+            "quantity_remaining": int(pos.quantity_remaining) - delta,
+            "identity": {
+                "position_id": pos.position_id,
+                "client_id": pos.client_id,
+                "execution_mode": pos.execution_mode,
+                "local_order_id": local_order_id,
+                "broker_order_id": broker_order_id,
+                "replacement_generation": 0,
+            },
+        }
+    eng._persist_exit_fill_consumption_to_db = MagicMock(
+        side_effect=_fake_exit_fill_consumption
+    )
     if durable_persist:
         # Most unit cases are about the in-memory generation protocol.  The
         # persistence-specific cases opt out so they exercise the real DB

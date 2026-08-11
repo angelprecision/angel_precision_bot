@@ -1465,6 +1465,11 @@ class ManagedPosition:
     pending_exit_action:  str   = ""
     pending_exit_qty:     int   = 0
     pending_exit_filled_qty: int = 0
+    # Durable bridge between the exact OSM cumulative fill and the position
+    # ledger's consumed cumulative fill.  The JSONB value is an identity-bound
+    # runtime mirror; it is never authority until the position-row CAS write
+    # succeeds.
+    exit_fill_consumption: dict = field(default_factory=dict)
     pending_scale_counted: bool = False
     pending_exit_local_order_id: str = ""
     pending_exit_broker_order_id: str = ""
@@ -2842,6 +2847,7 @@ EXIT_REPLACEMENT_STATES = {
     EXIT_REPLACEMENT_STATE_OWNED,
 }
 EXIT_REPLACEMENT_MODES = {"live", "paper"}
+EXIT_FILL_CONSUMPTION_META_KEY = "exit_fill_consumption"
 
 
 def _clamp_env_number(name: str, default: float, min_value: float, max_value: float, *, as_int: bool = False):
@@ -3572,6 +3578,72 @@ def _parse_exit_retry_liveness_namespace(namespace) -> tuple[Optional[dict], str
     return lifecycle, "ok"
 
 
+def _parse_exit_fill_consumption_namespace(namespace) -> tuple[Optional[dict], str]:
+    """Validate the durable position-side cumulative-fill watermark.
+
+    This namespace is intentionally bound to the exact local/broker exit
+    identity.  A cumulative number without that identity could be carried
+    across an exit-generation handoff and consume a replacement twice.
+    """
+    if not isinstance(namespace, dict):
+        return None, "missing_or_malformed_namespace"
+    required_ids = {}
+    for field_name in (
+        "position_id", "client_id", "execution_mode",
+        "local_order_id", "broker_order_id",
+    ):
+        parsed = _strict_lifecycle_id(namespace.get(field_name))
+        if parsed is None:
+            return None, f"invalid_{field_name}"
+        required_ids[field_name] = parsed
+    if required_ids["execution_mode"] not in EXIT_REPLACEMENT_MODES:
+        return None, "invalid_execution_mode"
+    applied = _strict_lifecycle_int(
+        namespace.get("applied_cumulative_qty"), minimum=0,
+    )
+    generation = _strict_lifecycle_int(
+        namespace.get("replacement_generation", 0), minimum=0,
+        maximum=EXIT_REPLACEMENT_GENERATION_MAX,
+    )
+    if applied is None or generation is None:
+        return None, "invalid_applied_cumulative_or_generation"
+    updated_at = namespace.get("updated_at", "")
+    if updated_at not in ("", None):
+        if not isinstance(updated_at, str) or not updated_at.strip():
+            return None, "invalid_updated_at"
+        try:
+            datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        except Exception:
+            return None, "invalid_updated_at"
+    return {
+        **required_ids,
+        "replacement_generation": generation,
+        "applied_cumulative_qty": applied,
+        "updated_at": updated_at or "",
+    }, "ok"
+
+
+def _restore_exit_fill_consumption_from_meta(raw_meta) -> tuple[dict, bool, str]:
+    """Hydrate the exact position-side fill watermark without inference."""
+    import json
+
+    meta = raw_meta or {}
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta) if meta.strip() else {}
+        except Exception:
+            return {}, False, "malformed_meta"
+    if not isinstance(meta, dict):
+        return {}, False, "malformed_meta"
+    namespace = meta.get(EXIT_FILL_CONSUMPTION_META_KEY)
+    if namespace is None:
+        return {}, True, "missing"
+    parsed, error = _parse_exit_fill_consumption_namespace(namespace)
+    if parsed is None:
+        return {}, False, error
+    return parsed, True, "ok"
+
+
 def _restore_exit_replace_attempt_from_meta(raw_meta) -> dict[str, object]:
     """Parse the durable retry-liveness namespace without inventing authority.
 
@@ -4147,6 +4219,278 @@ class APExitEngine:
                 pid, exc,
             )
             return False
+
+
+    def _exit_fill_consumption_identity(
+        self,
+        pos,
+        *,
+        local_order_id: str,
+        broker_order_id: str,
+    ) -> tuple[Optional[dict], str]:
+        """Build the exact identity for one exit-generation watermark."""
+        pid = str(getattr(pos, "position_id", "") or "")
+        client_id = str(getattr(pos, "client_id", "") or "")
+        execution_mode = str(getattr(pos, "execution_mode", "") or "")
+        local_id = str(local_order_id or "")
+        broker_id = str(broker_order_id or "")
+        if (
+            not pid or not client_id or client_id != client_id.strip()
+            or execution_mode not in EXIT_REPLACEMENT_MODES
+            or not local_id or local_id != local_id.strip()
+            or not broker_id or broker_id != broker_id.strip()
+        ):
+            return None, "exit_fill_identity_unproven"
+
+        lifecycle, lifecycle_valid, lifecycle_reason = self._replacement_lifecycle_for_position(pos)
+        if not lifecycle_valid:
+            return None, f"replacement_lifecycle_{lifecycle_reason}"
+        generation = int(lifecycle.get("replacement_generation") or 0)
+        if lifecycle.get("state") != EXIT_REPLACEMENT_STATE_NONE:
+            known_pairs = {
+                (
+                    str(lifecycle.get("old_local_order_id") or ""),
+                    str(lifecycle.get("old_broker_order_id") or ""),
+                ),
+                (
+                    str(lifecycle.get("new_local_order_id") or ""),
+                    str(lifecycle.get("new_broker_order_id") or ""),
+                ),
+            }
+            if (local_id, broker_id) not in known_pairs:
+                return None, "exit_fill_generation_identity_mismatch"
+        return {
+            "position_id": pid,
+            "client_id": client_id,
+            "execution_mode": execution_mode,
+            "local_order_id": local_id,
+            "broker_order_id": broker_id,
+            "replacement_generation": generation,
+        }, "ok"
+
+    def _persist_exit_fill_consumption_to_db(
+        self,
+        pos,
+        *,
+        local_order_id: str,
+        broker_order_id: str,
+        cumulative_filled_qty: int,
+        prior_cumulative_filled: Optional[int] = None,
+    ) -> dict:
+        """Atomically consume a cumulative exit fill into the position row.
+
+        ``orders.filled_qty`` is the OSM-side watermark.  This method owns the
+        second durable watermark on ``positions.meta`` and updates it in the
+        same row-locked transaction as ``quantity_remaining``.  A replay with
+        the same identity/cumulative value therefore returns zero delta and
+        cannot consume the contract twice.
+        """
+        if type(cumulative_filled_qty) is not int or cumulative_filled_qty < 0:
+            return {"ok": False, "reason": "exit_fill_cumulative_quantity_invalid"}
+        if prior_cumulative_filled is not None and (
+            type(prior_cumulative_filled) is not int or prior_cumulative_filled < 0
+        ):
+            return {"ok": False, "reason": "exit_fill_prior_cumulative_quantity_invalid"}
+
+        identity, identity_reason = self._exit_fill_consumption_identity(
+            pos,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+        )
+        if identity is None:
+            return {"ok": False, "reason": identity_reason}
+
+        try:
+            import json
+            from ap.db import conn, run_with_retry  # local import avoids cycles
+
+            target_cumulative = cumulative_filled_qty
+            pid = identity["position_id"]
+            client_id = identity["client_id"]
+            execution_mode = identity["execution_mode"]
+
+            def _do_update():
+                with conn() as c:
+                    c.execute(
+                        """
+                        SELECT quantity_remaining, qty, meta
+                        FROM positions
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND execution_mode = %s
+                        FOR UPDATE
+                        """,
+                        (pid, client_id, execution_mode),
+                    )
+                    row = c.fetchone()
+                    if not row:
+                        return {"ok": False, "reason": "position_row_unavailable"}
+                    row = dict(row)
+                    stored, stored_valid, stored_reason = _restore_exit_fill_consumption_from_meta(
+                        row.get("meta")
+                    )
+                    if not stored_valid:
+                        return {
+                            "ok": False,
+                            "reason": "position_applied_cumulative_malformed",
+                            "error": stored_reason,
+                        }
+
+                    same_identity = bool(stored) and all(
+                        str(stored.get(field_name) or "") == str(identity[field_name] or "")
+                        for field_name in (
+                            "position_id", "client_id", "execution_mode",
+                            "local_order_id", "broker_order_id",
+                            "replacement_generation",
+                        )
+                    )
+                    if stored and same_identity:
+                        applied_cumulative = int(stored["applied_cumulative_qty"])
+                    elif stored:
+                        # A different exact order identity is a new exit
+                        # generation.  Its cumulative fill starts at zero;
+                        # the old generation's watermark remains proof only
+                        # for its own local/broker pair.
+                        applied_cumulative = 0
+                    else:
+                        # A nonzero prior OSM watermark without a position-side
+                        # watermark is an unprovable crash boundary.  Do not
+                        # guess whether the prior contract was already consumed.
+                        if prior_cumulative_filled not in (None, 0):
+                            return {
+                                "ok": False,
+                                "reason": "position_applied_cumulative_unavailable",
+                                "prior_cumulative_filled": prior_cumulative_filled,
+                            }
+                        applied_cumulative = 0
+
+                    if target_cumulative < applied_cumulative:
+                        return {
+                            "ok": False,
+                            "reason": "position_applied_cumulative_regressed",
+                            "stored_applied_cumulative": applied_cumulative,
+                            "requested_cumulative": target_cumulative,
+                        }
+
+                    raw_remaining = row.get("quantity_remaining")
+                    if raw_remaining is None:
+                        raw_remaining = row.get("qty")
+                    if type(raw_remaining) is not int or raw_remaining < 0:
+                        return {
+                            "ok": False,
+                            "reason": "position_quantity_remaining_unavailable",
+                        }
+                    delta = target_cumulative - applied_cumulative
+                    if delta > raw_remaining:
+                        return {
+                            "ok": False,
+                            "reason": "exit_fill_exceeds_position_remaining",
+                            "applied_delta": delta,
+                            "quantity_remaining": raw_remaining,
+                        }
+                    new_remaining = raw_remaining - delta
+                    payload = {
+                        **identity,
+                        "applied_cumulative_qty": target_cumulative,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                    c.execute(
+                        """
+                        UPDATE positions
+                        SET quantity_remaining = %s,
+                            meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb,
+                            updated_at = NOW()
+                        WHERE id = %s
+                          AND client_id = %s
+                          AND execution_mode = %s
+                        RETURNING quantity_remaining, meta
+                        """,
+                        (
+                            new_remaining,
+                            json.dumps({EXIT_FILL_CONSUMPTION_META_KEY: payload}),
+                            pid,
+                            client_id,
+                            execution_mode,
+                        ),
+                    )
+                    updated = c.fetchone()
+                    if not updated:
+                        return {"ok": False, "reason": "position_consumption_update_unconfirmed"}
+                    updated = dict(updated)
+                    stored_after, valid_after, reason_after = _restore_exit_fill_consumption_from_meta(
+                        updated.get("meta")
+                    )
+                    if (
+                        not valid_after
+                        or not stored_after
+                        or not all(
+                            str(stored_after.get(field_name) or "")
+                            == str(identity[field_name] or "")
+                            for field_name in (
+                                "position_id", "client_id", "execution_mode",
+                                "local_order_id", "broker_order_id",
+                                "replacement_generation",
+                            )
+                        )
+                        or stored_after.get("applied_cumulative_qty") != target_cumulative
+                    ):
+                        return {
+                            "ok": False,
+                            "reason": "position_consumption_watermark_unconfirmed",
+                            "error": reason_after,
+                        }
+                    return {
+                        "ok": True,
+                        "applied_delta": delta,
+                        "applied_cumulative_qty": target_cumulative,
+                        "quantity_remaining": int(updated.get("quantity_remaining") or 0),
+                        "identity": identity,
+                    }
+
+            result = run_with_retry(_do_update)
+            if not isinstance(result, dict) or not result.get("ok"):
+                return dict(result or {"ok": False, "reason": "position_consumption_unconfirmed"})
+            pos.exit_fill_consumption = dict(
+                result.get("identity") or identity,
+                applied_cumulative_qty=int(result["applied_cumulative_qty"]),
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            pos.quantity_remaining = int(result["quantity_remaining"])
+            return result
+        except Exception as exc:
+            log.critical(
+                "[exit_eng] durable exit-fill position consumption failed | pos=%s "
+                "local=%s broker=%s cumulative=%s error=%s",
+                identity.get("position_id", "") if identity else getattr(pos, "position_id", ""),
+                local_order_id,
+                broker_order_id,
+                cumulative_filled_qty,
+                exc,
+                exc_info=True,
+            )
+            return {"ok": False, "reason": "position_consumption_persistence_error", "error": type(exc).__name__}
+
+    def reconcile_exit_fill_consumption(
+        self,
+        position_id: str,
+        *,
+        local_order_id: str,
+        broker_order_id: str,
+        cumulative_filled_qty: int,
+        prior_cumulative_filled: Optional[int] = None,
+    ) -> dict:
+        """Recovery-facing wrapper for the durable position fill bridge."""
+        with self._lock:
+            pos = self._positions_by_id.get(str(position_id or ""))
+            if pos is None or pos.closed:
+                return {"ok": False, "reason": "position_runtime_unavailable"}
+            return self._persist_exit_fill_consumption_to_db(
+                pos,
+                local_order_id=local_order_id,
+                broker_order_id=broker_order_id,
+                cumulative_filled_qty=cumulative_filled_qty,
+                prior_cumulative_filled=prior_cumulative_filled,
+            )
 
 
     def _persist_replacement_lifecycle(
@@ -6289,9 +6633,44 @@ class APExitEngine:
                         # beyond that durable baseline and advance the local
                         # watermark to the broker cumulative value.
                         prev = max(prev, prior_cumulative_filled)
-                    delta = max(0, cum - prev)
+                    durable_consumption = self._persist_exit_fill_consumption_to_db(
+                        pos,
+                        local_order_id=local_order_id or pos.pending_exit_local_order_id,
+                        broker_order_id=broker_order_id or pos.pending_exit_broker_order_id,
+                        cumulative_filled_qty=cum,
+                        prior_cumulative_filled=prior_cumulative_filled,
+                    )
+                    if not durable_consumption.get("ok"):
+                        self._emit_exit_event(
+                            pos,
+                            decision="HOLD",
+                            reason_code="EXIT_FILL_POSITION_DURABILITY_UNCONFIRMED",
+                            explanation=(
+                                "Broker/OSM cumulative fill was not applied to the "
+                                "durable position ledger; recovery remains blocked."
+                            ),
+                            stage="exit_reconciliation",
+                            extra_inputs={
+                                "order_key": order_key,
+                                "cumulative_filled_qty": cum,
+                                "prior_cumulative_filled": prior_cumulative_filled,
+                                "local_order_id": local_order_id,
+                                "broker_order_id": broker_order_id,
+                                "durability_result": durable_consumption,
+                            },
+                        )
+                        return
+                    delta = int(durable_consumption.get("applied_delta") or 0)
                     pos.last_applied_exit_cum_fill_by_order[order_key] = max(prev, cum)
                     pos.last_applied_exit_cum_fill = max(int(pos.last_applied_exit_cum_fill or 0), cum)
+                    pos.pending_exit_filled_qty = max(
+                        int(pos.pending_exit_filled_qty or 0), cum,
+                    )
+                    # The row-locked bridge is the durable quantity authority;
+                    # sync the runtime mirror even on a zero-delta replay.
+                    pos.quantity_remaining = int(
+                        durable_consumption["quantity_remaining"]
+                    )
                 else:
                     delta = max(0, int(qty_filled or 0))
                     prev  = int(pos.last_applied_exit_cum_fill_by_order.get(order_key, 0) or 0)
@@ -6317,8 +6696,9 @@ class APExitEngine:
                 applied_delta = delta
                 if fill_price is not None:
                     pos.current_option_price = float(fill_price)
-                pos.pending_exit_filled_qty += delta
-                pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
+                if cumulative_filled_qty is None:
+                    pos.pending_exit_filled_qty += delta
+                    pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
                 pos.last_applied_exit_local_order_id  = local_order_id  or pos.pending_exit_local_order_id  or pos.last_applied_exit_local_order_id
                 pos.last_applied_exit_broker_order_id = broker_order_id or pos.pending_exit_broker_order_id or pos.last_applied_exit_broker_order_id
                 if local_order_id or broker_order_id or pos.pending_exit_local_order_id or pos.pending_exit_broker_order_id:
@@ -8184,6 +8564,23 @@ class APExitEngine:
                     _persisted_href = {}
                     if isinstance(_meta, dict):
                         _persisted_href = _meta.get("hard_exit_reference") or {}
+                    _fill_consumption, _fill_consumption_valid, _fill_consumption_reason = (
+                        _restore_exit_fill_consumption_from_meta(_meta)
+                    )
+                    if _fill_consumption_valid:
+                        mp.exit_fill_consumption = dict(_fill_consumption)
+                    else:
+                        # A malformed position-side watermark cannot be
+                        # treated as zero.  Recovery will hold until the
+                        # exact durable bridge is repaired or re-established.
+                        mp.exit_fill_consumption = {}
+                        log.critical(
+                            "[exit_eng] SEED_EXIT_FILL_CONSUMPTION_INVALID client=%s "
+                            "position_id=%s error=%s",
+                            mp.client_id,
+                            mp.position_id,
+                            _fill_consumption_reason,
+                        )
                     # PR #423 Patch 2 (restart requirement): restore the
                     # replacement-pricing generation from its dedicated
                     # nested metadata namespace. Missing/malformed values

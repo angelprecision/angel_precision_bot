@@ -72,6 +72,53 @@ class _MemoryCursor:
                 }
             return self
 
+        if normalized.startswith(
+            "SELECT QUANTITY_REMAINING, QTY, META FROM POSITIONS"
+        ):
+            position_id, client_id, execution_mode = (
+                str(params[0]),
+                str(params[1]),
+                str(params[2]).lower(),
+            )
+            row = self.db.positions.get(position_id)
+            if (
+                row is None
+                or str(row.get("client_id") or "") != client_id
+                or str(row.get("execution_mode") or "").lower() != execution_mode
+            ):
+                self._result = None
+            else:
+                self._result = {
+                    "quantity_remaining": row.get("quantity_remaining"),
+                    "qty": row.get("qty"),
+                    "meta": json.loads(json.dumps(row.get("meta") or {})),
+                }
+            return self
+
+        if normalized.startswith("UPDATE POSITIONS SET QUANTITY_REMAINING"):
+            new_remaining = int(params[0])
+            patch = json.loads(str(params[1]))
+            position_id, client_id, execution_mode = (
+                str(params[2]),
+                str(params[3]),
+                str(params[4]).lower(),
+            )
+            row = self.db.positions.get(position_id)
+            if (
+                row is None
+                or str(row.get("client_id") or "") != client_id
+                or str(row.get("execution_mode") or "").lower() != execution_mode
+            ):
+                self.rowcount = 0
+                return self
+            row["quantity_remaining"] = new_remaining
+            row.setdefault("meta", {}).update(patch)
+            self._result = {
+                "quantity_remaining": new_remaining,
+                "meta": json.loads(json.dumps(row.get("meta") or {})),
+            }
+            return self
+
         if (
             normalized.startswith("UPDATE ORDERS SET META")
             and "AND BROKER_ORDER_ID=%S" in normalized
@@ -189,6 +236,7 @@ class _MemoryConnection:
 class _MemoryOrderDB:
     def __init__(self):
         self.rows = {}
+        self.positions = {}
         self.created_reservations = 0
 
     def conn(self):
@@ -620,7 +668,26 @@ def test_fresh_process_replays_durable_pending_replacement_once(monkeypatch):
         "old_broker_order_id": old_broker_id,
         "last_ack_identity": old_broker_id,
     }
-    durable_meta = {"unrelated": {"keep": True}, "exit_retry_liveness": dict(lifecycle)}
+    durable_meta = {
+        "unrelated": {"keep": True},
+        "exit_retry_liveness": dict(lifecycle),
+        "exit_fill_consumption": {
+            "position_id": position_id,
+            "client_id": client_id,
+            "execution_mode": "paper",
+            "local_order_id": old_local_id,
+            "broker_order_id": old_broker_id,
+            "replacement_generation": 1,
+            "applied_cumulative_qty": 1,
+        },
+    }
+    db.positions[position_id] = {
+        "client_id": client_id,
+        "execution_mode": "paper",
+        "qty": 5,
+        "quantity_remaining": 5,
+        "meta": json.loads(json.dumps(durable_meta)),
+    }
 
     def _position_row():
         return {

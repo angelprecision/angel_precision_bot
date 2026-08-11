@@ -158,6 +158,46 @@ def _engine(position, osm, *, persist=True):
     engine._positions.append(position)
     engine._positions_by_id[position.position_id] = position
     engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=persist)
+    def _persist_fill_consumption(
+        pos,
+        *,
+        local_order_id,
+        broker_order_id,
+        cumulative_filled_qty,
+        prior_cumulative_filled=None,
+    ):
+        marker = dict(getattr(pos, "exit_fill_consumption", {}) or {})
+        same_identity = (
+            marker.get("local_order_id") == local_order_id
+            and marker.get("broker_order_id") == broker_order_id
+        )
+        applied = int(marker.get("applied_cumulative_qty", 0) or 0) if same_identity else 0
+        if not marker and prior_cumulative_filled is not None:
+            applied = int(prior_cumulative_filled)
+        delta = max(0, int(cumulative_filled_qty) - applied)
+        pos.quantity_remaining = max(0, int(pos.quantity_remaining) - delta)
+        pos.exit_fill_consumption = {
+            "position_id": POSITION_ID,
+            "client_id": CLIENT_ID,
+            "execution_mode": "paper",
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "replacement_generation": int(
+                (getattr(pos, "exit_retry_liveness", {}) or {}).get(
+                    "replacement_generation", 0
+                )
+                or 0
+            ),
+            "applied_cumulative_qty": int(cumulative_filled_qty),
+        }
+        return {
+            "ok": True,
+            "applied_delta": delta,
+            "applied_cumulative_qty": int(cumulative_filled_qty),
+            "quantity_remaining": int(pos.quantity_remaining),
+        }
+
+    engine._persist_exit_fill_consumption_to_db = _persist_fill_consumption
     engine._sync_replacement_runtime_from_lifecycle(position, revalidated=False)
     return engine
 

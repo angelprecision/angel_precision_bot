@@ -198,6 +198,23 @@ def _engine(*, partial=False):
     engine = APExitEngine(broker=MagicMock())
     engine._emit_exit_event = MagicMock()
     engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    def _persist_fill(
+        pos, *, local_order_id, broker_order_id, cumulative_filled_qty,
+        prior_cumulative_filled=None,
+    ):
+        delta = max(0, int(cumulative_filled_qty) - int(prior_cumulative_filled or 0))
+        pos.quantity_remaining = max(0, int(pos.quantity_remaining or 0) - delta)
+        return {
+            "ok": True,
+            "applied_delta": delta,
+            "applied_cumulative_qty": int(cumulative_filled_qty),
+            "quantity_remaining": pos.quantity_remaining,
+            "identity": {
+                "local_order_id": local_order_id,
+                "broker_order_id": broker_order_id,
+            },
+        }
+    engine._persist_exit_fill_consumption_to_db = MagicMock(side_effect=_persist_fill)
     position = ManagedPosition(
         ticker="AVGO",
         option_symbol="AVGO260814C00350000",

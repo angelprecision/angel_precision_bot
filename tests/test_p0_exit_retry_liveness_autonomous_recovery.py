@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import copy
+import json
 import os
 import sys
 import threading
@@ -174,6 +176,121 @@ class _DurableOSM:
                 broker_order_id=self.row["broker_order_id"],
             )
         return True
+
+
+class _PositionDurabilityStore:
+    """Small row-locked positions-table double for restart crash tests."""
+
+    def __init__(self, *, quantity_remaining, qty=7, meta=None):
+        self.quantity_remaining = int(quantity_remaining)
+        self.qty = int(qty)
+        self.meta = copy.deepcopy(meta or {})
+
+
+class _PositionDurabilityCursor:
+    def __init__(self, store):
+        self.store = store
+        self.result = None
+
+    def execute(self, statement, params=()):
+        normalized = " ".join(str(statement).split()).upper()
+        if normalized.startswith("SELECT QUANTITY_REMAINING"):
+            self.result = {
+                "quantity_remaining": self.store.quantity_remaining,
+                "qty": self.store.qty,
+                "meta": copy.deepcopy(self.store.meta),
+            }
+            return
+        if normalized.startswith("UPDATE POSITIONS"):
+            self.store.quantity_remaining = int(params[0])
+            patch = json.loads(params[1])
+            self.store.meta.update(copy.deepcopy(patch))
+            self.result = {
+                "quantity_remaining": self.store.quantity_remaining,
+                "meta": copy.deepcopy(self.store.meta),
+            }
+            return
+        raise AssertionError(f"unexpected SQL in position bridge test: {statement}")
+
+    def fetchone(self):
+        return copy.deepcopy(self.result)
+
+
+class _PositionDurabilityConnection:
+    def __init__(self, store):
+        self.cursor = _PositionDurabilityCursor(store)
+
+    def __enter__(self):
+        return self.cursor
+
+    def __exit__(self, *args):
+        return False
+
+
+def _patch_position_durability(monkeypatch, store):
+    import ap.db as db_module
+
+    monkeypatch.setattr(
+        db_module,
+        "conn",
+        lambda: _PositionDurabilityConnection(store),
+    )
+    monkeypatch.setattr(db_module, "run_with_retry", lambda fn, *a, **k: fn())
+
+
+def _fake_runtime_exit_fill_consumption(
+    pos, *, local_order_id, broker_order_id, cumulative_filled_qty,
+    prior_cumulative_filled=None,
+):
+    stored = getattr(pos, "exit_fill_consumption", {}) or {}
+    same_identity = (
+        stored.get("local_order_id") == local_order_id
+        and stored.get("broker_order_id") == broker_order_id
+    )
+    prior = (
+        int(stored.get("applied_cumulative_qty") or 0)
+        if same_identity
+        else int(prior_cumulative_filled or 0)
+    )
+    cumulative = int(cumulative_filled_qty)
+    delta = max(0, cumulative - prior)
+    pos.exit_fill_consumption = _fill_consumption_marker(
+        position_id=pos.position_id,
+        client_id=pos.client_id,
+        execution_mode=pos.execution_mode,
+        local_id=local_order_id,
+        broker_id=broker_order_id,
+        applied=cumulative,
+    )
+    pos.quantity_remaining = int(pos.quantity_remaining) - delta
+    return {
+        "ok": True,
+        "applied_delta": delta,
+        "applied_cumulative_qty": cumulative,
+        "quantity_remaining": int(pos.quantity_remaining),
+        "identity": dict(pos.exit_fill_consumption),
+    }
+
+
+def _configure_mock_position_bridge(exit_engine, position, cumulative=0):
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_delta": 0,
+        "applied_cumulative_qty": int(cumulative),
+        "quantity_remaining": int(getattr(position, "quantity_remaining", 0) or 0),
+    }
+
+
+def _fill_consumption_marker(*, position_id, client_id, execution_mode, local_id, broker_id, applied):
+    return {
+        "position_id": position_id,
+        "client_id": client_id,
+        "execution_mode": execution_mode,
+        "local_order_id": local_id,
+        "broker_order_id": broker_id,
+        "replacement_generation": 0,
+        "applied_cumulative_qty": applied,
+    }
 
 
 TRADIER_OPTION_CONTRACT = "SPY180720C00274000"
@@ -355,6 +472,9 @@ def _production_callsite_runner(*, broker, position, osm, order_monitor):
     engine = APExitEngine(broker=broker, email="client-self-healing")
     engine._emit_exit_event = MagicMock()
     engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    engine._persist_exit_fill_consumption_to_db = MagicMock(
+        side_effect=_fake_runtime_exit_fill_consumption
+    )
     engine._positions = [position]
     engine._positions_by_id[position.position_id] = position
     osm.exit_engine = engine
@@ -877,6 +997,12 @@ def test_terminal_cancel_uses_proven_partial_fill_for_replacement_qty():
     position.quantity_remaining = 7
     position.contracts = 7
     exit_engine = MagicMock()
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_delta": 0,
+        "applied_cumulative_qty": 1,
+        "quantity_remaining": 7,
+    }
     osm = _DurableOSM(
         local_id=position.pending_exit_local_order_id,
         broker_id="bro-canceled",
@@ -897,14 +1023,14 @@ def test_terminal_cancel_uses_proven_partial_fill_for_replacement_qty():
 
     assert action.action == "REPLACEMENT_SAFE"
     assert action.details["terminal_filled_qty"] == 1
-    assert action.details["terminal_fill_source"] == "broker_snapshot"
+    assert action.details["terminal_fill_source"] == "terminal_fill_consumption_reconciled"
     exit_engine.mark_exit_replacement_safe.assert_called_once()
     _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
     assert mark_kwargs["replacement_qty"] == 1
     assert position.quantity_remaining == 7
 
 
-def test_terminal_cancel_monotonic_late_fill_is_applied_before_replacement():
+def test_terminal_cancel_monotonic_late_fill_is_applied_before_replacement(monkeypatch):
     """Broker cumulative 2 advances durable OSM cumulative 1 by one contract."""
     class _TerminalLateFillBroker:
         def get_order(self, broker_order_id):
@@ -929,10 +1055,28 @@ def test_terminal_cancel_monotonic_late_fill_is_applied_before_replacement():
     position.pending_exit_action = "SCALE_OUT"
     position.pending_exit_qty = 3
     position.pending_exit_filled_qty = 1
+    marker = _fill_consumption_marker(
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        applied=1,
+    )
+    position.exit_fill_consumption = dict(marker)
+    store = _PositionDurabilityStore(
+        quantity_remaining=6,
+        qty=7,
+        meta={"exit_fill_consumption": marker},
+    )
+    _patch_position_durability(monkeypatch, store)
 
     exit_engine = APExitEngine(broker=broker, email="client-self-healing")
     exit_engine._emit_exit_event = MagicMock()
     exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine._persist_exit_fill_consumption_to_db = MagicMock(
+        side_effect=_fake_runtime_exit_fill_consumption
+    )
     exit_engine.add_position(position)
     mark_spy = MagicMock(wraps=exit_engine.mark_exit_replacement_safe)
     exit_engine.mark_exit_replacement_safe = mark_spy
@@ -958,13 +1102,223 @@ def test_terminal_cancel_monotonic_late_fill_is_applied_before_replacement():
 
     assert action.action == "REPLACEMENT_SAFE"
     assert action.details["terminal_filled_qty"] == 2
-    assert action.details["terminal_fill_source"] == "broker_snapshot_late_fill_reconciled"
+    assert action.details["terminal_fill_source"] == "terminal_fill_consumption_reconciled"
     assert action.details["late_fill_delta"] == 1
     assert mark_spy.call_args.kwargs["replacement_qty"] == 1
     assert osm.row["filled_qty"] == 2
     assert position.quantity_remaining == 5
     assert position.closed is False
     assert position.exit_in_flight is False
+
+
+def test_partial_fill_persists_position_consumption_watermark(monkeypatch):
+    position = _production_callsite_position()
+    position.quantity = 7
+    position.quantity_remaining = 7
+    position.pending_exit_action = "SCALE_OUT"
+    position.pending_exit_qty = 3
+    store = _PositionDurabilityStore(quantity_remaining=7, qty=7)
+    _patch_position_durability(monkeypatch, store)
+
+    exit_engine = APExitEngine(broker=MagicMock(), email=position.client_id)
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine.add_position(position)
+
+    exit_engine.note_partial_exit_fill(
+        position.position_id,
+        qty_filled=1,
+        local_order_id=position.pending_exit_local_order_id,
+        broker_order_id=position.pending_exit_broker_order_id,
+        cumulative_filled=1,
+        prior_cumulative_filled=0,
+    )
+
+    assert store.quantity_remaining == 6
+    assert store.meta["exit_fill_consumption"]["applied_cumulative_qty"] == 1
+    assert position.quantity_remaining == 6
+
+
+def test_seed_from_db_rehydrates_position_fill_consumption_watermark():
+    marker = _fill_consumption_marker(
+        position_id="pos-restart-watermark",
+        client_id="client-restart-watermark",
+        execution_mode="paper",
+        local_id="loc-restart-watermark",
+        broker_id="bro-restart-watermark",
+        applied=1,
+    )
+    exit_engine = APExitEngine(broker=MagicMock(), email="client-restart-watermark")
+    exit_engine.hydrate_pending_exit_identity_from_db = MagicMock(return_value=False)
+
+    class _PositionManager:
+        def get_active_positions(self):
+            return [{
+                "id": "pos-restart-watermark",
+                "client_id": "client-restart-watermark",
+                "underlying": "AVGO",
+                "contract": "AVGO260814C00350000",
+                "direction": "CALL",
+                "qty": 7,
+                "quantity_remaining": 6,
+                "avg_fill": 2.49,
+                "underlying_entry": 350.0,
+                "target_underlying": 360.0,
+                "stop_underlying": 340.0,
+                "execution_mode": "paper",
+                "meta": {"exit_fill_consumption": marker},
+            }]
+
+    exit_engine.seed_from_db(_PositionManager())
+    restored = exit_engine.get_position("pos-restart-watermark")
+    assert restored is not None
+    assert restored.quantity_remaining == 6
+    assert restored.exit_fill_consumption["local_order_id"] == "loc-restart-watermark"
+    assert restored.exit_fill_consumption["broker_order_id"] == "bro-restart-watermark"
+    assert restored.exit_fill_consumption["applied_cumulative_qty"] == 1
+
+
+def test_terminal_cancel_restart_replays_osm_commit_before_position_consumption(monkeypatch):
+    """OSM=2 / position watermark=1 consumes exactly one contract after restart."""
+    class _TerminalBroker:
+        def get_order(self, broker_order_id):
+            return {
+                "id": broker_order_id,
+                "contract": "AVGO260814C00350000",
+                "status": "canceled",
+                "exec_quantity": 2,
+            }
+
+        def list_open_orders(self):
+            return []
+
+        def list_positions(self):
+            return [{"symbol": "AVGO260814C00350000", "quantity": 5}]
+
+    position = _production_callsite_position()
+    position.quantity = 7
+    position.quantity_remaining = 6
+    position.pending_exit_action = "SCALE_OUT"
+    position.pending_exit_qty = 3
+    position.pending_exit_filled_qty = 2
+    marker = _fill_consumption_marker(
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        applied=1,
+    )
+    position.exit_fill_consumption = dict(marker)
+    store = _PositionDurabilityStore(
+        quantity_remaining=6,
+        qty=7,
+        meta={"exit_fill_consumption": marker},
+    )
+    _patch_position_durability(monkeypatch, store)
+
+    exit_engine = APExitEngine(broker=_TerminalBroker(), email=position.client_id)
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine.add_position(position)
+    osm = _DurableOSM(
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        qty=3,
+        filled_qty=2,
+    )
+    osm.row["status"] = "EXIT_PARTIAL_FILL"
+
+    action = recover_exit_position(
+        position,
+        broker=exit_engine.broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "REPLACEMENT_SAFE"
+    assert action.details["terminal_fill_source"] == "terminal_fill_consumption_reconciled"
+    assert action.details["position_consumption_delta"] == 1
+    assert action.details["position_applied_cumulative_filled"] == 2
+    assert action.details["terminal_filled_qty"] == 2
+    assert store.quantity_remaining == 5
+    assert store.meta["exit_fill_consumption"]["applied_cumulative_qty"] == 2
+    assert position.quantity_remaining == 5
+    assert position.pending_exit_replace_qty == 1
+
+
+def test_terminal_cancel_restart_after_position_consumption_is_idempotent(monkeypatch):
+    """A replay after the position CAS does not consume the contract twice."""
+    class _TerminalBroker:
+        def get_order(self, broker_order_id):
+            return {
+                "id": broker_order_id,
+                "contract": "AVGO260814C00350000",
+                "status": "canceled",
+                "exec_quantity": 2,
+            }
+
+        def list_open_orders(self):
+            return []
+
+        def list_positions(self):
+            return [{"symbol": "AVGO260814C00350000", "quantity": 5}]
+
+    position = _production_callsite_position()
+    position.quantity = 7
+    position.quantity_remaining = 5
+    position.pending_exit_action = "SCALE_OUT"
+    position.pending_exit_qty = 3
+    position.pending_exit_filled_qty = 2
+    marker = _fill_consumption_marker(
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        applied=2,
+    )
+    position.exit_fill_consumption = dict(marker)
+    store = _PositionDurabilityStore(
+        quantity_remaining=5,
+        qty=7,
+        meta={"exit_fill_consumption": marker},
+    )
+    _patch_position_durability(monkeypatch, store)
+
+    exit_engine = APExitEngine(broker=_TerminalBroker(), email=position.client_id)
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine.add_position(position)
+    osm = _DurableOSM(
+        local_id=position.pending_exit_local_order_id,
+        broker_id=position.pending_exit_broker_order_id,
+        position_id=position.position_id,
+        client_id=position.client_id,
+        execution_mode=position.execution_mode,
+        qty=3,
+        filled_qty=2,
+    )
+    osm.row["status"] = "EXIT_PARTIAL_FILL"
+
+    action = recover_exit_position(
+        position,
+        broker=exit_engine.broker,
+        exit_engine=exit_engine,
+        osm=osm,
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "REPLACEMENT_SAFE"
+    assert action.details["position_consumption_delta"] == 0
+    assert action.details["position_applied_cumulative_filled"] == 2
+    assert store.quantity_remaining == 5
+    assert store.meta["exit_fill_consumption"]["applied_cumulative_qty"] == 2
+    assert position.quantity_remaining == 5
+    assert action.details["terminal_filled_qty"] == 2
 
 
 def test_exact_filled_order_is_not_claimed_closed_without_engine_confirmation():
@@ -1022,6 +1376,9 @@ def test_exact_filled_scale_out_uses_real_engine_partial_fill_accounting():
     exit_engine = APExitEngine(broker=broker, email="client-self-healing")
     exit_engine._emit_exit_event = MagicMock()
     exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    exit_engine._persist_exit_fill_consumption_to_db = MagicMock(
+        side_effect=_fake_runtime_exit_fill_consumption
+    )
     partial_fill_spy = MagicMock(wraps=exit_engine.note_partial_exit_fill)
     close_spy = MagicMock(wraps=exit_engine.mark_position_closed)
     exit_engine.note_partial_exit_fill = partial_fill_spy
@@ -1661,6 +2018,12 @@ def test_single_open_order_dead_monitor_uses_bounded_exact_cancel_and_durable_ha
     )
     osm = _DurableOSM()
     exit_engine = MagicMock()
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_delta": 0,
+        "applied_cumulative_qty": 0,
+        "quantity_remaining": 2,
+    }
 
     action = recover_exit_position(
         pos,
@@ -1773,10 +2136,17 @@ def test_autonomous_retry_waits_for_fresh_marker_interval_and_working_proof(monk
     assert osm.row["meta"][rec_mod.STALE_EXIT_CANCEL_LIVENESS_META_KEY]["attempt"] == 1
 
     now["value"] = base + timedelta(seconds=15)
+    exit_engine_after = MagicMock()
+    exit_engine_after.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_delta": 0,
+        "applied_cumulative_qty": 0,
+        "quantity_remaining": 2,
+    }
     action_after_due = recover_exit_position(
         pos,
         broker=broker,
-        exit_engine=MagicMock(),
+        exit_engine=exit_engine_after,
         osm=osm,
         order_monitor=_dead_monitor(),
     )
@@ -1828,6 +2198,12 @@ def test_terminal_autonomous_path_uses_durable_osm_handoff(monkeypatch):
     import ap.exit_autonomous_recovery as rec_mod
 
     exit_engine = MagicMock()
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_delta": 0,
+        "applied_cumulative_qty": 0,
+        "quantity_remaining": 2,
+    }
     broker = MagicMock()
     broker.list_positions.return_value = [
         {"symbol": "AVGO260814C00350000", "quantity": 2},
@@ -1867,6 +2243,12 @@ def test_terminal_autonomous_path_rejects_changed_osm_broker_generation(monkeypa
     import ap.exit_autonomous_recovery as rec_mod
 
     exit_engine = MagicMock()
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_delta": 0,
+        "applied_cumulative_qty": 0,
+        "quantity_remaining": 2,
+    }
     broker = MagicMock()
     broker.list_positions.return_value = [
         {"symbol": "AVGO260814C00350000", "quantity": 2},
