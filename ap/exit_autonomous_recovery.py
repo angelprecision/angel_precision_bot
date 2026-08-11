@@ -694,6 +694,14 @@ def _position_close_confirmed(pos: Any) -> bool:
         return False
 
 
+def _strict_managed_quantity_remaining(pos: Any) -> Optional[int]:
+    """Read the managed remainder without coercing ambiguous local state."""
+    value = getattr(pos, "quantity_remaining", None)
+    if type(value) is not int or value <= 0:
+        return None
+    return value
+
+
 def quote_health(pos: Any, *, stale_sec: int = QUOTE_STALE_WARN_SEC) -> dict:
     option_age = _dt_age_seconds(getattr(pos, "last_option_quote_update_ts", None) or getattr(pos, "last_quote_update_ts", None))
     underlying_age = _dt_age_seconds(getattr(pos, "last_underlying_quote_update_ts", None) or getattr(pos, "last_quote_update_ts", None))
@@ -1802,9 +1810,138 @@ def recover_exit_position(
                             fill_price = parsed
                     except Exception:
                         pass
-                if exit_engine and hasattr(exit_engine, "mark_position_closed"):
+
+                managed_remaining = _strict_managed_quantity_remaining(pos)
+                if managed_remaining is None:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_managed_position_remainder_unproven",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "quote_health": qh,
+                            "broker_mutation_blocked": True,
+                            "replacement_blocked": True,
+                        },
+                    )
+
+                if filled_qty > managed_remaining:
+                    return RecoveryAction(
+                        "NOOP",
+                        "autonomous_recovery_filled_quantity_exceeds_managed_remainder",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "quantity_remaining": managed_remaining,
+                            "quote_health": qh,
+                            "position_mutation_blocked": True,
+                            "replacement_blocked": True,
+                        },
+                    )
+
+                # A broker order can be FILLED while representing only a
+                # scale-out tranche.  Route that exact cumulative fill through
+                # the canonical accounting hook; mark_position_closed() is a
+                # full-position authority and unconditionally zeros the local
+                # remainder once invoked.
+                if filled_qty < managed_remaining:
+                    partial_fill_hook = getattr(exit_engine, "note_partial_exit_fill", None) if exit_engine else None
+                    if not callable(partial_fill_hook):
+                        return RecoveryAction(
+                            "NOOP",
+                            "autonomous_recovery_partial_fill_hook_unavailable",
+                            pid,
+                            local_id,
+                            pending_broker_id,
+                            {
+                                "status": st,
+                                "filled_qty": filled_qty,
+                                "quantity_remaining": managed_remaining,
+                                "quote_health": qh,
+                                "position_mutation_blocked": True,
+                                "replacement_blocked": True,
+                            },
+                        )
                     try:
-                        exit_engine.mark_position_closed(
+                        partial_fill_hook(
+                            pid,
+                            qty_filled=filled_qty,
+                            fill_price=fill_price,
+                            local_order_id=local_id,
+                            broker_order_id=pending_broker_id,
+                            cumulative_filled=filled_qty,
+                        )
+                    except Exception as _partial_exc:
+                        log.warning(
+                            "exit_autonomous_recovery: broker-filled partial accounting failed: %s",
+                            _partial_exc,
+                        )
+                        return RecoveryAction(
+                            "NOOP",
+                            "autonomous_recovery_broker_filled_partial_accounting_failed",
+                            pid,
+                            local_id,
+                            pending_broker_id,
+                            {
+                                "status": st,
+                                "filled_qty": filled_qty,
+                                "quantity_remaining": managed_remaining,
+                                "quote_health": qh,
+                                "replacement_blocked": True,
+                            },
+                        )
+
+                    remaining_after = _strict_managed_quantity_remaining(pos)
+                    tranche_completed = (
+                        remaining_after is not None
+                        and not bool(getattr(pos, "closed", False))
+                        and not bool(getattr(pos, "exit_in_flight", False))
+                        and type(getattr(pos, "pending_exit_qty", None)) is int
+                        and getattr(pos, "pending_exit_qty", None) == 0
+                    )
+                    if not tranche_completed:
+                        return RecoveryAction(
+                            "NOOP",
+                            "autonomous_recovery_broker_filled_partial_accounting_unconfirmed",
+                            pid,
+                            local_id,
+                            pending_broker_id,
+                            {
+                                "status": st,
+                                "filled_qty": filled_qty,
+                                "quantity_remaining": remaining_after,
+                                "quote_health": qh,
+                                "position_mutation_blocked": True,
+                                "replacement_blocked": True,
+                            },
+                        )
+                    return RecoveryAction(
+                        "CONFIRMED_OPEN",
+                        "broker_order_filled_partial_position",
+                        pid,
+                        local_id,
+                        pending_broker_id,
+                        {
+                            "status": st,
+                            "filled_qty": filled_qty,
+                            "quantity_remaining_before": managed_remaining,
+                            "quantity_remaining": remaining_after,
+                            "exit_tranche_completed": True,
+                            "full_position_proof": False,
+                            "quote_health": qh,
+                        },
+                    )
+
+                close_hook = getattr(exit_engine, "mark_position_closed", None) if exit_engine else None
+                if callable(close_hook):
+                    try:
+                        close_hook(
                             pid,
                             reason="AUTONOMOUS_RECOVERY_BROKER_FILLED",
                             qty_filled=filled_qty,

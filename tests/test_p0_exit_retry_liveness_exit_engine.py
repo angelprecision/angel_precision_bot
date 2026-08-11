@@ -398,7 +398,9 @@ def test_mark_exit_submitted_does_not_reset_exit_replace_attempt():
 
 def test_mark_position_closed_resets_exit_replace_attempt():
     eng = _engine()
-    pos = _pos()
+    # mark_position_closed() is the full-position close authority; keep this
+    # counter-reset test's proven fill equal to the managed remainder.
+    pos = _pos(quantity=2, quantity_remaining=2)
     _add(eng, pos)
     pos.exit_replace_attempt = 3
     pos._exit_replace_attempt_last_ack_identity = "bro-old-1"

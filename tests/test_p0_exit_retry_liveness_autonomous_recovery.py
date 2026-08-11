@@ -691,6 +691,59 @@ def test_exact_filled_order_is_not_claimed_closed_without_engine_confirmation():
     assert position.exit_in_flight is True
 
 
+def test_exact_filled_scale_out_uses_real_engine_partial_fill_accounting():
+    """A filled tranche must reduce the remainder, not finalize the position."""
+    broker = MagicMock()
+    broker.get_order.return_value = {
+        "id": "bro-filled",
+        "status": "filled",
+        "contract": "AVGO260814C00350000",
+        "quantity": 2,
+        "filled_qty": 2,
+    }
+    position = _production_callsite_position()
+    position.quantity = 7
+    position.quantity_remaining = 7
+    position.pending_exit_broker_order_id = "bro-filled"
+    position.pending_exit_action = "SCALE_OUT"
+    position.pending_exit_qty = 2
+    position.pending_exit_filled_qty = 0
+
+    exit_engine = APExitEngine(broker=broker, email="client-self-healing")
+    exit_engine._emit_exit_event = MagicMock()
+    exit_engine._persist_exit_replace_attempt_to_db = MagicMock(return_value=True)
+    partial_fill_spy = MagicMock(wraps=exit_engine.note_partial_exit_fill)
+    close_spy = MagicMock(wraps=exit_engine.mark_position_closed)
+    exit_engine.note_partial_exit_fill = partial_fill_spy
+    exit_engine.mark_position_closed = close_spy
+    exit_engine.add_position(position)
+
+    action = recover_exit_position(
+        position,
+        broker=broker,
+        exit_engine=exit_engine,
+        osm=_DurableOSM(
+            local_id=position.pending_exit_local_order_id,
+            broker_id="bro-filled",
+            position_id=position.position_id,
+        ),
+        order_monitor=_dead_monitor(),
+    )
+
+    assert action.action == "CONFIRMED_OPEN"
+    assert action.reason == "broker_order_filled_partial_position"
+    partial_fill_spy.assert_called_once()
+    assert partial_fill_spy.call_args.kwargs["cumulative_filled"] == 2
+    close_spy.assert_not_called()
+    assert position.quantity_remaining == 5
+    assert position.closed is False
+    assert position.scale_outs_done == 1
+    assert position.pending_exit_qty == 0
+    assert position.exit_in_flight is False
+    assert exit_engine.active_positions() == [position]
+    assert exit_engine._can_submit_exit(position, datetime.now(timezone.utc)) is True
+
+
 @pytest.mark.parametrize(
     "payload",
     [
