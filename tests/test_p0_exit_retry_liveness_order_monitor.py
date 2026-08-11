@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -130,6 +131,150 @@ class _DurableCancelOSM:
             return False
         self.row["status"] = status
         return True
+
+
+class _TerminalPartialFillOSM:
+    """Durable OSM double whose exit hook is intentionally not invoked."""
+
+    def __init__(self, *, position_id, local_order_id, broker_order_id):
+        self.row = {
+            "local_order_id": local_order_id,
+            "kind": "EXIT",
+            "position_id": position_id,
+            "broker_order_id": broker_order_id,
+            "status": "EXIT_ACKNOWLEDGED",
+            "qty": 2,
+            "filled_qty": 0,
+            "meta": {},
+        }
+        self.transitions = []
+
+    def get_order(self, local_order_id):
+        if local_order_id != self.row["local_order_id"]:
+            return None
+        row = dict(self.row)
+        row["meta"] = dict(self.row["meta"])
+        return row
+
+    def persist_stale_exit_cancel_attempt(self, local_order_id, broker_order_id, attempt):
+        if (
+            local_order_id != self.row["local_order_id"]
+            or broker_order_id != self.row["broker_order_id"]
+        ):
+            return False
+        self.row["meta"]["stale_exit_cancel_liveness"] = {
+            "broker_order_id": broker_order_id,
+            "attempt": int(attempt),
+            "updated_at": "test",
+        }
+        return True
+
+    def transition(self, local_order_id, status, **kwargs):
+        if local_order_id != self.row["local_order_id"]:
+            return False
+        self.transitions.append((local_order_id, status, dict(kwargs)))
+        self.row["status"] = status
+        if status in {"EXIT_PARTIAL_FILL", "EXIT_FILLED"}:
+            self.row["filled_qty"] = int(kwargs.get("filled_qty") or 0)
+        return True
+
+
+class _PositionFillDB:
+    """Small SQL-shaped store for the real APExitEngine fill bridge."""
+
+    def __init__(self, *, quantity_remaining=7, meta=None, row_present=True):
+        self.row = (
+            {
+                "quantity_remaining": quantity_remaining,
+                "qty": 7,
+                "meta": dict(meta or {}),
+            }
+            if row_present
+            else None
+        )
+        self.applied_deltas = []
+        self.update_count = 0
+
+    def connection(self):
+        return _PositionFillConnection(self)
+
+
+class _PositionFillConnection:
+    def __init__(self, store):
+        self.store = store
+        self.result = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, statement, params=()):
+        statement = str(statement)
+        if "SELECT quantity_remaining, qty, meta" in statement:
+            self.result = None if self.store.row is None else dict(self.store.row)
+            return
+        if "UPDATE positions" in statement:
+            if self.store.row is None:
+                raise AssertionError("position update reached without a position row")
+            new_remaining, meta_json, *_ = params
+            self.store.applied_deltas.append(
+                self.store.row["quantity_remaining"] - int(new_remaining)
+            )
+            self.store.row["quantity_remaining"] = int(new_remaining)
+            self.store.row["meta"].update(json.loads(meta_json))
+            self.store.update_count += 1
+            self.result = {
+                "quantity_remaining": self.store.row["quantity_remaining"],
+                "meta": dict(self.store.row["meta"]),
+            }
+            return
+        raise AssertionError(f"unexpected SQL in position bridge test: {statement}")
+
+    def fetchone(self):
+        return self.result
+
+
+def _real_fill_engine(*, position_id, local_order_id, broker_order_id, quantity_remaining):
+    from ap_exit_engine import APExitEngine, ManagedPosition
+
+    engine = APExitEngine(broker=MagicMock(), email="mon@test.local")
+    engine._emit_exit_event = MagicMock()
+    engine._persist_replacement_lifecycle = MagicMock(return_value=True)
+    engine.clear_exit_in_flight = MagicMock()
+    position = ManagedPosition(
+        ticker="AAPL",
+        option_symbol="AAPL260814C00200000",
+        side="CALL",
+        quantity=7,
+        entry_price=1.0,
+        underlying_entry=200.0,
+        underlying_target=210.0,
+        underlying_stop=190.0,
+        position_id=position_id,
+        client_id="mon@test.local",
+        execution_mode="paper",
+        quantity_remaining=quantity_remaining,
+        exit_in_flight=True,
+        pending_exit_local_order_id=local_order_id,
+        pending_exit_broker_order_id=broker_order_id,
+        pending_exit_qty=2,
+    )
+    engine._positions.append(position)
+    engine._positions_by_id[position_id] = position
+    return engine, position
+
+
+def _install_position_fill_db(monkeypatch, store):
+    import ap.db as db_module
+
+    monkeypatch.setattr(db_module, "conn", store.connection)
+    monkeypatch.setattr(
+        db_module,
+        "run_with_retry",
+        lambda fn, *args, **kwargs: fn(*args, **kwargs),
+    )
 
 
 def _install_replacement_lookup_db(monkeypatch, outcomes):
@@ -788,6 +933,11 @@ def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_rem
     broker.cancel_order.return_value = {"status": "canceled"}
     osm = _PartialFillOSM()
     exit_engine = MagicMock()
+    exit_engine.reconcile_exit_fill_consumption.return_value = {
+        "ok": True,
+        "applied_cumulative_qty": 1,
+        "quantity_remaining": 6,
+    }
     exit_engine.mark_exit_replacement_safe.return_value = True
     exit_engine.finalize_exit_replacement_safe.return_value = True
 
@@ -811,10 +961,134 @@ def test_cancel_to_canceled_with_cumulative_partial_fill_caps_replacement_to_rem
     assert osm.transitions[0][2]["broker_order_id"] == "bro-canceled-partial"
     assert osm.transitions[-1][1] == "CANCELED"
     assert osm.transitions[-1][2]["broker_order_id"] == "bro-canceled-partial"
+    exit_engine.reconcile_exit_fill_consumption.assert_called_once_with(
+        "pos-canceled-partial",
+        local_order_id="loc-canceled-partial",
+        broker_order_id="bro-canceled-partial",
+        cumulative_filled_qty=1,
+        prior_cumulative_filled=0,
+    )
     exit_engine.mark_exit_replacement_safe.assert_called_once()
     _, mark_kwargs = exit_engine.mark_exit_replacement_safe.call_args
     assert mark_kwargs["replacement_qty"] == 1
     assert mark_kwargs["replacement_qty"] != 2
+
+
+@pytest.mark.parametrize(
+    "bridge_case",
+    ["hook_already_consumed", "hook_failed_direct_repair", "bridge_unavailable"],
+)
+def test_terminal_decimal_partial_fill_requires_position_watermark_before_replacement(
+    monkeypatch, bridge_case,
+):
+    """Terminal new-fill recovery cannot grant a remainder on OSM proof alone."""
+    from ap_exit_engine import EXIT_FILL_CONSUMPTION_META_KEY
+
+    _watchdog_mode(monkeypatch, stale_exit_recovery=True)
+    position_id = f"pos-terminal-bridge-{bridge_case}"
+    local_order_id = f"loc-terminal-bridge-{bridge_case}"
+    broker_order_id = f"bro-terminal-bridge-{bridge_case}"
+
+    if bridge_case == "hook_already_consumed":
+        engine, position = _real_fill_engine(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            quantity_remaining=6,
+        )
+        consumed_marker = {
+            "position_id": position_id,
+            "client_id": "mon@test.local",
+            "execution_mode": "paper",
+            "local_order_id": local_order_id,
+            "broker_order_id": broker_order_id,
+            "replacement_generation": 0,
+            "applied_cumulative_qty": 1,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        store = _PositionFillDB(
+            quantity_remaining=6,
+            meta={EXIT_FILL_CONSUMPTION_META_KEY: consumed_marker},
+        )
+        expected_deltas = [0]
+        expected_remaining = 6
+    elif bridge_case == "hook_failed_direct_repair":
+        engine, position = _real_fill_engine(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            quantity_remaining=7,
+        )
+        store = _PositionFillDB(quantity_remaining=7)
+        expected_deltas = [1]
+        expected_remaining = 6
+    else:
+        engine, position = _real_fill_engine(
+            position_id=position_id,
+            local_order_id=local_order_id,
+            broker_order_id=broker_order_id,
+            quantity_remaining=7,
+        )
+        store = _PositionFillDB(quantity_remaining=7, row_present=False)
+        expected_deltas = []
+        expected_remaining = 7
+
+    _install_position_fill_db(monkeypatch, store)
+    broker = MagicMock()
+    broker.get_order.side_effect = [
+        {"status": "working"},
+        {
+            "status": "canceled",
+            "quantity": 2.0,
+            "exec_quantity": 1.0,
+            "remaining_quantity": 1.0,
+            "avg_fill_price": 1.25,
+        },
+    ]
+    broker.cancel_order.return_value = {"status": "canceled"}
+    osm = _TerminalPartialFillOSM(
+        position_id=position_id,
+        local_order_id=local_order_id,
+        broker_order_id=broker_order_id,
+    )
+    mon = _monitor(broker=broker, osm=osm, exit_engine=engine)
+    mon._emit_order_event = MagicMock()
+    mon._alert = MagicMock()
+
+    mon._handle_stale_exit(
+        local_order_id=local_order_id,
+        status="EXIT_ACKNOWLEDGED",
+        contract="AAPL260814C00200000",
+        age_secs=120.0,
+        position_id=position_id,
+        reason="terminal decimal partial fill bridge boundary",
+    )
+
+    assert broker.cancel_order.call_count == 1
+    assert broker.submit_order.call_count == 0
+    assert broker.place_order.call_count == 0
+    assert position.quantity_remaining == expected_remaining
+    assert store.row is None or store.row["quantity_remaining"] == expected_remaining
+    assert store.applied_deltas == expected_deltas
+    assert osm.row["filled_qty"] == 1
+    assert osm.transitions[0][1] == "EXIT_PARTIAL_FILL"
+
+    lifecycle, lifecycle_valid, lifecycle_reason = engine._replacement_lifecycle_for_position(position)
+    assert lifecycle_valid, lifecycle_reason
+    if bridge_case == "bridge_unavailable":
+        assert [status for _, status, _ in osm.transitions] == ["EXIT_PARTIAL_FILL"]
+        assert lifecycle["state"] == "NONE"
+        assert position.pending_exit_replace_allowed is False
+        assert any(
+            call.kwargs.get("reason_code") == "EXIT_FILL_POSITION_DURABILITY_UNCONFIRMED"
+            for call in mon._emit_order_event.call_args_list
+        )
+    else:
+        assert [status for _, status, _ in osm.transitions] == [
+            "EXIT_PARTIAL_FILL", "CANCELED",
+        ]
+        assert lifecycle["state"] == "REPLACEMENT_PENDING"
+        assert lifecycle["replace_quantity"] == 1
 
 
 def test_canceled_after_already_durable_partial_fill_preserves_remainder(monkeypatch):

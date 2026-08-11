@@ -6488,12 +6488,13 @@ class APOrderMonitor:
         cumulative_filled: int,
         previous_filled: int,
     ) -> bool:
-        """Prove the position-side watermark before accepting a fill replay.
+        """Prove the position-side watermark before accepting cumulative fill truth.
 
         A durable OSM watermark is not proof that the position quantity was
-        consumed before a process died. Equal cumulative broker truth is
-        therefore routed through the row-locked exit-fill bridge before the
-        monitor can hand off a replacement or clear the old generation.
+        consumed before a process died. Newly advanced and equal cumulative
+        broker truth are therefore routed through the row-locked exit-fill
+        bridge before the monitor can hand off a replacement or clear the old
+        generation.
         """
         if cumulative_filled <= 0:
             return True
@@ -6512,11 +6513,11 @@ class APOrderMonitor:
                     cumulative_filled_qty=cumulative_filled,
                     prior_cumulative_filled=previous_filled,
                 )
-                reason = "durable position fill replay was not confirmed"
+                reason = "durable position fill consumption was not confirmed"
             except Exception as exc:
                 reason = f"durable position fill replay raised {type(exc).__name__}"
                 log.error(
-                    "[%s] replayed exit fill durability bridge failed | local=%s broker=%s: %s",
+                    "[%s] exit fill durability bridge failed | local=%s broker=%s: %s",
                     self.client_id, local_order_id, broker_order_id, exc,
                 )
 
@@ -6534,8 +6535,8 @@ class APOrderMonitor:
                 decision="HOLD",
                 reason_code="EXIT_FILL_POSITION_DURABILITY_UNCONFIRMED",
                 explanation=(
-                    "A replayed broker cumulative fill matched the durable OSM watermark, "
-                    "but the position-side fill watermark was not independently confirmed; "
+                    "A broker cumulative fill was not independently confirmed in the "
+                    "position-side fill watermark after OSM processing; "
                     "replacement and terminal cleanup remain blocked."
                 ),
                 contract=contract,
@@ -6864,7 +6865,11 @@ class APOrderMonitor:
             or durable_qty <= 0
         ):
             return None
-        if cumulative_filled == previous_filled and not self._reconcile_replayed_exit_fill(
+        # OSM persistence is not proof that the position-side cumulative
+        # watermark consumed this fill.  Require the idempotent durable bridge
+        # for newly advanced fills as well as equal-watermark replays before a
+        # positive remainder can authorize replacement.
+        if not self._reconcile_replayed_exit_fill(
             order=order,
             local_order_id=local_order_id,
             broker_order_id=broker_order_id,
